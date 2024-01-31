@@ -613,7 +613,7 @@ cc_library(
     name = "mlir_to_hlo",
     srcs = ["mlir_to_hlo.cc"],
     hdrs = ["mlir_to_hlo.h"],
-    visibility = [":friends"],
+    visibility = ["//visibility:public"],
     deps = [
         "//xla:debug_options_flags",
         "//xla:util",
