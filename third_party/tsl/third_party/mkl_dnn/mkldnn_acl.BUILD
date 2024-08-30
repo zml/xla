@@ -3,6 +3,7 @@ load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
 exports_files(["LICENSE"])
 
 _DNNL_COPTS_THREADPOOL = [
+    "-Xclang",
     "-fopenmp-simd",
     "-fexceptions",
     "-UUSE_MKL",
@@ -10,6 +11,7 @@ _DNNL_COPTS_THREADPOOL = [
 ]
 
 _DNNL_COPTS_OMP = [
+    "-Xclang",
     "-fopenmp",
     "-fexceptions",
     "-UUSE_MKL",
