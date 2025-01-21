@@ -46,6 +46,14 @@ filegroup(
 )
 
 filegroup(
+    name = "libnvptxcompiler",
+    srcs = [
+        "lib/libnvptxcompiler_static.a",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "bin",
     srcs = glob([
         "bin/**",
