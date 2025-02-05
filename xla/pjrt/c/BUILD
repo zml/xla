@@ -69,7 +69,12 @@ cc_library(
         ":pjrt_c_api_wrapper_impl",
         "//xla/ffi:execution_context",
         "//xla/ffi:type_id_registry",
+        "//xla/ffi:ffi_api",
+        "//xla/ffi/api:c_api",
+        "//xla/ffi/api:ffi",
+        "//xla/service:custom_call_target_registry",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )
 
