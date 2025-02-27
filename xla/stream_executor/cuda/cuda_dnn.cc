@@ -5064,7 +5064,8 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   cudnn_frontend::graph::SDPA_attributes sdpa_options;
   sdpa_options.set_name("flash_attention")
       .set_is_inference(stats_descriptor == std::nullopt)
-      .set_causal_mask(is_causal);
+      .set_causal_mask(is_causal)
+      .set_attn_scale(scale);
 
   // Setting bias
   if (bias_descriptor.has_value()) {
