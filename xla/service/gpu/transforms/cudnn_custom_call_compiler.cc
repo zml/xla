@@ -133,10 +133,26 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
   }
 
   std::optional<se::dnn::TensorDescriptor> bias;
-  if (kind == CudnnfMHAKind::kScaleBiasSoftmax ||
-      kind == CudnnfMHAKind::kScaleBiasSoftmaxDropout) {
-    const HloInstruction &bias_hlo = *custom_call->operand(3);
-    TF_ASSIGN_OR_RETURN(bias, TensorDescriptorFor(bias_hlo.shape()));
+  //if (kind == CudnnfMHAKind::kScaleBiasSoftmax ||
+  //    kind == CudnnfMHAKind::kScaleBiasSoftmaxDropout) {
+  //  const HloInstruction &bias_hlo = *custom_call->operand(3);
+  //  TF_ASSIGN_OR_RETURN(bias, TensorDescriptorFor(bias_hlo.shape()));
+  //}
+
+  std::optional<se::dnn::TensorDescriptor> sequence_length_q;
+  std::optional<se::dnn::TensorDescriptor> sequence_length_kv;
+  std::optional<se::dnn::TensorDescriptor> page_table_k;
+  std::optional<se::dnn::TensorDescriptor> page_table_v;
+
+  if (custom_call->operand_count() == 7) {
+    TF_ASSIGN_OR_RETURN(sequence_length_q,
+                       TensorDescriptorFor(custom_call->operand(3)->shape()));
+    TF_ASSIGN_OR_RETURN(sequence_length_kv,
+                       TensorDescriptorFor(custom_call->operand(4)->shape()));
+    TF_ASSIGN_OR_RETURN(page_table_k,
+                       TensorDescriptorFor(custom_call->operand(5)->shape()));
+    TF_ASSIGN_OR_RETURN(page_table_v,
+                       TensorDescriptorFor(custom_call->operand(6)->shape()));
   }
 
   const double dropout_rate = config.dropout_rate();
@@ -148,13 +164,16 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
 
   const int sliding_window_length = config.sliding_window_length();
   const int max_seg_per_batch = config.max_seg_per_batch();
+  std::optional<int> max_sequence_length_kv = config.max_sequence_length_kv();
   TF_ASSIGN_OR_RETURN(
       se::gpu::CudnnGraph graph,
       se::gpu::GetCudnnFlashAttentionOperationGraph(
-          dnn_support, lhs_bmm1, rhs_bmm1, rhs_bmm2, output, bias, activation,
+          dnn_support, lhs_bmm1, rhs_bmm1, rhs_bmm2, output, bias, sequence_length_q,
+          sequence_length_kv, activation,
           static_cast<float>(config.fmha_scale()), dropout_rate > 0.0,
           dropout_rate, dnn_mask_type, sliding_window_length,
-          max_seg_per_batch));
+          page_table_k, page_table_v,
+          max_sequence_length_kv, max_seg_per_batch));
   return graph;
 }
 
