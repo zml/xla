@@ -4981,9 +4981,14 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     const dnn::MatmulTensorDescriptor& v_descriptor,
     const dnn::TensorDescriptor& o_descriptor,
     const std::optional<dnn::TensorDescriptor> bias_descriptor,
+    const std::optional<dnn::TensorDescriptor> sequence_length_q,
+    const std::optional<dnn::TensorDescriptor> sequence_length_kv,
     const std::optional<dnn::TensorDescriptor> stats_descriptor, double scale,
     const bool use_dropout, const std::optional<double> dropout_rate,
     const dnn::FMHAMaskKind mask_type, const int sliding_window_length,
+    const std::optional<dnn::TensorDescriptor> page_table_k,
+    const std::optional<dnn::TensorDescriptor> page_table_v,
+    const std::optional<int> max_sequence_length_kv,
     const int max_seg_per_batch) {
   using cudnn_frontend::graph::Tensor_attributes;
 
@@ -5020,6 +5025,11 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   std::vector<int64_t> v_dims =
       v_descriptor.GetCudnnCompatibleDimensions(false);
 
+
+  VLOG(4) << "\n GetCudnnCompatibleDimensions: q_dims: " << absl::StrJoin(q_dims, ",");
+  VLOG(4) << "\n GetCudnnCompatibleDimensions: k_dims: " << absl::StrJoin(k_dims, ",");
+  VLOG(4) << "\n GetCudnnCompatibleDimensions: v_dims: " << absl::StrJoin(v_dims, ",");
+
   if (max_seg_per_batch > 1) {
     FixDimsForRaggedOffset(q_dims, max_seg_per_batch);
     FixDimsForRaggedOffset(k_dims, max_seg_per_batch);
@@ -5032,7 +5042,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
                        .set_dim(q_dims)
                        .set_stride(q_descriptor.GetCudnnCompatibleStrides(true))
                        .set_uid(next_uid()));
-
+  VLOG(4) << "\n q_strides: " << absl::StrJoin(q_descriptor.GetCudnnCompatibleStrides(true), ",");
+  VLOG(4) << "\n k_strides: " << absl::StrJoin(k_descriptor.GetCudnnCompatibleStrides(true), ",");
+  VLOG(4) << "\n v_strides: " << absl::StrJoin(v_descriptor.GetCudnnCompatibleStrides(false), ",");
   std::shared_ptr<Tensor_attributes> k_tensor =
       graph.tensor(Tensor_attributes()
                        .set_name("K")
@@ -5068,27 +5080,27 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   // Setting actual seqlen
   bool is_padding = mask_type == dnn::FMHAMaskKind::PADDING ||
                     mask_type == dnn::FMHAMaskKind::PADDING_CAUSAL;
-  if (is_padding || max_seg_per_batch > 1) {
-    // Get batch size
-    auto b = q_dims[0];
-    auto seq_q_tensor =
-        graph.tensor(Tensor_attributes()
-                         .set_name("seq_q")
-                         .set_dim({b, 1, 1, 1})
-                         .set_stride({1, 1, 1, 1})
-                         .set_uid(next_uid())
-                         .set_data_type(cudnn_frontend::DataType_t::INT32));
-    auto seq_kv_tensor =
-        graph.tensor(Tensor_attributes()
-                         .set_name("seq_kv")
-                         .set_dim({b, 1, 1, 1})
-                         .set_stride({1, 1, 1, 1})
-                         .set_uid(next_uid())
-                         .set_data_type(cudnn_frontend::DataType_t::INT32));
-    sdpa_options.set_padding_mask(true);
-    sdpa_options.set_seq_len_q(seq_q_tensor);
-    sdpa_options.set_seq_len_kv(seq_kv_tensor);
-  }
+  //if (is_padding || max_seg_per_batch > 1) {
+  //  // Get batch size
+  //  auto b = q_dims[0];
+  //  auto seq_q_tensor =
+  //      graph.tensor(Tensor_attributes()
+  //                       .set_name("seq_q")
+  //                       .set_dim({b, 1, 1, 1})
+  //                       .set_stride({1, 1, 1, 1})
+  //                       .set_uid(next_uid())
+  //                       .set_data_type(cudnn_frontend::DataType_t::INT32));
+  //  auto seq_kv_tensor =
+  //      graph.tensor(Tensor_attributes()
+  //                       .set_name("seq_kv")
+  //                       .set_dim({b, 1, 1, 1})
+  //                       .set_stride({1, 1, 1, 1})
+  //                       .set_uid(next_uid())
+  //                       .set_data_type(cudnn_frontend::DataType_t::INT32));
+  //  sdpa_options.set_padding_mask(true);
+  //  sdpa_options.set_seq_len_q(seq_q_tensor);
+  //  sdpa_options.set_seq_len_kv(seq_kv_tensor);
+  //}
 
   std::shared_ptr<Tensor_attributes> offset_q;
   if (max_seg_per_batch > 1) {
@@ -5139,6 +5151,40 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
   if (sliding_window_length > 0) {
     sdpa_options.set_sliding_window_length(sliding_window_length);
   }
+
+  if (sequence_length_q && sequence_length_kv && page_table_k && page_table_v && max_sequence_length_kv) {
+    auto seq_q = graph.tensor(Tensor_attributes()
+        .set_name("seq_q")
+        .set_uid(next_uid())
+        .set_dim(sequence_length_q->dimensions())
+        .set_stride(sequence_length_q->GetLogicalStrides())
+        .set_data_type(cudnn_frontend::DataType_t::INT32));
+    auto seq_kv = graph.tensor(Tensor_attributes()
+        .set_name("seq_kv")
+        .set_uid(next_uid())
+        .set_dim(sequence_length_kv->dimensions())
+        .set_stride(sequence_length_kv->GetLogicalStrides())
+        .set_data_type(cudnn_frontend::DataType_t::INT32));
+    sdpa_options.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
+
+    auto page_table_k_ = graph.tensor(Tensor_attributes()
+              .set_name("page_table_k")
+              .set_uid(next_uid())
+              .set_dim(page_table_k->dimensions())
+              .set_stride(page_table_k->GetLogicalStrides())
+              .set_data_type(cudnn_frontend::DataType_t::INT32));
+    auto page_table_v_ = graph.tensor(Tensor_attributes()
+              .set_name("page_table_v")
+              .set_uid(next_uid())
+              .set_dim(page_table_v->dimensions())
+              .set_stride(page_table_v->GetLogicalStrides())
+              .set_data_type(cudnn_frontend::DataType_t::INT32));
+
+    sdpa_options.set_paged_attention_k_table(page_table_k_);
+    sdpa_options.set_paged_attention_v_table(page_table_v_);
+    sdpa_options.set_paged_attention_max_seq_len_kv(max_sequence_length_kv.value());
+  }
+
   // Add SDPA to the graph.
   auto [o_tensor, stats_tensor] =
       graph.sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);

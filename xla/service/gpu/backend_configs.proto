@@ -283,6 +283,8 @@ message CudnnfMHABackendConfig {
   // Only used with packed layout
   // ignored if the valued <= 1
   int32 max_seg_per_batch = 25;
+
+  optional int32 max_sequence_length_kv = 26;
 }
 
 // Backend config for a general custom call instruction, e.g. XLA FFI.

@@ -79,6 +79,11 @@ config_setting(
     },
 )
 
+cc_import(
+    name = "nvptxcompiler",
+    static_library = "@cuda_nvcc//:libnvptxcompiler",
+)
+
 cc_library(
     name = "cuda_platform_id",
     srcs = ["cuda_platform_id.cc"],
@@ -123,7 +128,12 @@ cc_library(
             "@tsl//tsl/platform:errors",
             "@tsl//tsl/platform:status",
             "@tsl//tsl/platform:statusor",
-        ] + tf_additional_cuda_platform_deps(),
+        ] + tf_additional_cuda_platform_deps() + select({
+            ":libnvptxcompiler_support_enabled": [
+                ":nvptxcompiler",
+            ],
+            "//conditions:default": [],
+        }),
     alwayslink = True,  # Registers itself with the PlatformManager.
 )
 
