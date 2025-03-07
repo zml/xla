@@ -4988,20 +4988,21 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     const dnn::FMHAMaskKind mask_type, const int sliding_window_length,
     const std::optional<dnn::TensorDescriptor> page_table_k,
     const std::optional<dnn::TensorDescriptor> page_table_v,
+    const std::optional<dnn::TensorDescriptor> ragged_offset_descriptor,
     const std::optional<int> max_sequence_length_kv,
     const int max_seg_per_batch) {
   using cudnn_frontend::graph::Tensor_attributes;
 
 #if CUDNN_VERSION >= 90000
-  VLOG(4) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
+  VLOG(2) << "\n bmm1_lhs(q): " << q_descriptor.ToString()
           << "\n bmm1_rhs(k): " << k_descriptor.ToString()
           << "\n bmm2_rhs(v): " << v_descriptor.ToString()
           << "\n out(o): " << o_descriptor.ToString();
   if (bias_descriptor) {
-    VLOG(4) << "\n bias(b): " << bias_descriptor->ToString();
+    VLOG(2) << "\n bias(b): " << bias_descriptor->ToString();
   }
   if (stats_descriptor) {
-    VLOG(4) << "\n activation(s): " << stats_descriptor->ToString();
+    VLOG(2) << "\n activation(s): " << stats_descriptor->ToString();
   }
 
   cudnn_frontend::graph::Graph graph;
@@ -5026,9 +5027,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
       v_descriptor.GetCudnnCompatibleDimensions(false);
 
 
-  VLOG(4) << "\n GetCudnnCompatibleDimensions: q_dims: " << absl::StrJoin(q_dims, ",");
-  VLOG(4) << "\n GetCudnnCompatibleDimensions: k_dims: " << absl::StrJoin(k_dims, ",");
-  VLOG(4) << "\n GetCudnnCompatibleDimensions: v_dims: " << absl::StrJoin(v_dims, ",");
+  VLOG(2) << "\n GetCudnnCompatibleDimensions: q_dims: " << absl::StrJoin(q_dims, ",");
+  VLOG(2) << "\n GetCudnnCompatibleDimensions: k_dims: " << absl::StrJoin(k_dims, ",");
+  VLOG(2) << "\n GetCudnnCompatibleDimensions: v_dims: " << absl::StrJoin(v_dims, ",");
 
   if (max_seg_per_batch > 1) {
     FixDimsForRaggedOffset(q_dims, max_seg_per_batch);
@@ -5042,9 +5043,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
                        .set_dim(q_dims)
                        .set_stride(q_descriptor.GetCudnnCompatibleStrides(true))
                        .set_uid(next_uid()));
-  VLOG(4) << "\n q_strides: " << absl::StrJoin(q_descriptor.GetCudnnCompatibleStrides(true), ",");
-  VLOG(4) << "\n k_strides: " << absl::StrJoin(k_descriptor.GetCudnnCompatibleStrides(true), ",");
-  VLOG(4) << "\n v_strides: " << absl::StrJoin(v_descriptor.GetCudnnCompatibleStrides(false), ",");
+  VLOG(2) << "\n q_strides: " << absl::StrJoin(q_descriptor.GetCudnnCompatibleStrides(true), ",");
+  VLOG(2) << "\n k_strides: " << absl::StrJoin(k_descriptor.GetCudnnCompatibleStrides(true), ",");
+  VLOG(2) << "\n v_strides: " << absl::StrJoin(v_descriptor.GetCudnnCompatibleStrides(false), ",");
   std::shared_ptr<Tensor_attributes> k_tensor =
       graph.tensor(Tensor_attributes()
                        .set_name("K")
@@ -5185,6 +5186,22 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     sdpa_options.set_paged_attention_max_seq_len_kv(max_sequence_length_kv.value());
   }
 
+  std::shared_ptr<Tensor_attributes> ragged_offset_tensor;
+  if (ragged_offset_descriptor) {
+      ragged_offset_tensor = graph.tensor(Tensor_attributes()
+        .set_name("ragged_offset")
+        .set_uid(next_uid())
+        .set_dim(ragged_offset_descriptor->dimensions())
+        .set_stride(ragged_offset_descriptor->GetLogicalStrides())
+        .set_data_type(cudnn_frontend::DataType_t::INT32));
+  }
+
+  if (ragged_offset_tensor) {
+    q_tensor->set_ragged_offset(ragged_offset_tensor);
+  }
+
+  graph.set_max_total_seq_len_q(1);
+
   // Add SDPA to the graph.
   auto [o_tensor, stats_tensor] =
       graph.sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);
@@ -5195,6 +5212,11 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     FixDimsForRaggedOffset(o_dims, max_seg_per_batch);
     o_tensor->set_ragged_offset(offset_q);
   }
+
+  //if (ragged_offset_tensor) {
+  //  o_tensor->set_ragged_offset(ragged_offset_tensor);
+  //}
+
   // Set output attributes.
   o_tensor->set_name("O")
       .set_output(true)
@@ -5227,7 +5249,7 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
                                   /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  VLOG(4) << "\b flash attention operation graph: " << cudnnGraph.Graph();
+  VLOG(2) << "\b flash attention operation graph: " << cudnnGraph.Graph();
   return cudnnGraph;
 #else
   return absl::UnimplementedError(
@@ -5359,8 +5381,8 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionF8OperationGraph(
                                   /*allow_tf32=*/true}));
   TF_RETURN_IF_ERROR(cudnnGraph.Build(dnn_support, /*plan_id=*/std::nullopt));
 
-  VLOG(4) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
-  VLOG(4) << "\b flash attention operation graph: " << cudnnGraph.Graph();
+  VLOG(2) << "\b workspace size:" << cudnnGraph.Graph().get_workspace_size();
+  VLOG(2) << "\b flash attention operation graph: " << cudnnGraph.Graph();
 
   return cudnnGraph;
 #else
@@ -8670,6 +8692,7 @@ absl::Status CudnnGraph::Execute(Stream& stream,
   if (graph_.get_workspace_size() > 0 || operands.back().size() == 0) {
     operands_without_workspace = operands.first(operands.size() - 1);
   }
+
   auto next_uid = [uid = 0]() mutable -> int { return CuDnnTensorUID(uid++); };
   for (DeviceMemoryBase operand : operands_without_workspace) {
     tensor_to_ptr_map[next_uid()] = operand.opaque();

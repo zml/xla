@@ -50,3 +50,21 @@ index 1fa458d..8c37d10 100644
  
  #include "backend_descriptor.h"
  #include "../knobs.h"
+
+diff --git a/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h b/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h
+index 12209a6..8daf423 100644
+--- a/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h
++++ b/include/cudnn_frontend/node/scaled_dot_product_flash_attention.h
+@@ -202,10 +202,8 @@ class SDPANode : public NodeCRTP<SDPANode> {
+         int64_t d_qk = attributes.inputs.at(input_names::Q)->get_dim()[3];
+         int64_t d_v  = attributes.inputs.at(input_names::V)->get_dim()[3];
+
+-        bool const is_ragged = attributes.inputs.at(input_names::Q)->get_ragged_offset() ||
+-                               attributes.inputs.at(input_names::K)->get_ragged_offset() ||
+-                               attributes.inputs.at(input_names::V)->get_ragged_offset() ||
+-                               attributes.outputs.at(output_names::O)->get_ragged_offset();
++        bool const is_ragged = attributes.inputs.at(input_names::K)->get_ragged_offset() ||
++                               attributes.inputs.at(input_names::V)->get_ragged_offset();
+
+         auto const& bias_mask = attributes.inputs.find(input_names::Bias);
+         bool const is_bias   = (bias_mask != attributes.inputs.end() && bias_mask->second != nullptr);

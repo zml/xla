@@ -712,6 +712,7 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     const dnn::FMHAMaskKind mask_type, const int sliding_window_length,
     const std::optional<dnn::TensorDescriptor> page_table_k,
     const std::optional<dnn::TensorDescriptor> page_table_v,
+    const std::optional<dnn::TensorDescriptor> ragged_offset_descriptor,
     const std::optional<int> max_sequence_length_kv,
     const int max_seg_per_batch);
 

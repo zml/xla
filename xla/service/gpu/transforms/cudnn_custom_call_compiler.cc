@@ -143,8 +143,9 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
   std::optional<se::dnn::TensorDescriptor> sequence_length_kv;
   std::optional<se::dnn::TensorDescriptor> page_table_k;
   std::optional<se::dnn::TensorDescriptor> page_table_v;
+  std::optional<se::dnn::TensorDescriptor> ragged_offset;
 
-  if (custom_call->operand_count() == 7) {
+  //if (custom_call->operand_count() == 8) {
     TF_ASSIGN_OR_RETURN(sequence_length_q,
                        TensorDescriptorFor(custom_call->operand(3)->shape()));
     TF_ASSIGN_OR_RETURN(sequence_length_kv,
@@ -153,7 +154,9 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
                        TensorDescriptorFor(custom_call->operand(5)->shape()));
     TF_ASSIGN_OR_RETURN(page_table_v,
                        TensorDescriptorFor(custom_call->operand(6)->shape()));
-  }
+    TF_ASSIGN_OR_RETURN(ragged_offset,
+                       TensorDescriptorFor(custom_call->operand(7)->shape()));
+  //}
 
   const double dropout_rate = config.dropout_rate();
 
@@ -172,7 +175,7 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
           sequence_length_kv, activation,
           static_cast<float>(config.fmha_scale()), dropout_rate > 0.0,
           dropout_rate, dnn_mask_type, sliding_window_length,
-          page_table_k, page_table_v,
+          page_table_k, page_table_v, ragged_offset,
           max_sequence_length_kv, max_seg_per_batch));
   return graph;
 }
