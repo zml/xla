@@ -77,8 +77,14 @@ absl::Status TritonToLLVM(
     mlir::triton::nvidia_gpu::ClusterInfo* out_cluster_info) {
   mlir::PassManager pm(module.getContext());
   pm.enableVerifier();
+
+  stream_executor::DeviceDescription device_info;
+  TF_ASSIGN_OR_RETURN(stream_executor::GpuComputeCapability gpu_compute_capability,
+    stream_executor::CudaComputeCapability::FromString(arch_name));
+  device_info.set_gpu_compute_capability(gpu_compute_capability);
+
   TF_RETURN_IF_ERROR(
-      xla::gpu::CreateTritonPipeline(&pm, std::string(arch_name), num_warps,
+      xla::gpu::CreateTritonPipeline(&pm, device_info, num_warps,
                                      num_ctas, num_stages, *out_cluster_info,
                                      /*is_xla_fusion=*/false));
   return pm.run(module).succeeded()

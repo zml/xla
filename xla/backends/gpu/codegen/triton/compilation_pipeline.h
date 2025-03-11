@@ -21,6 +21,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "mlir/Pass/PassManager.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/util.h"
 
 namespace mlir::triton::nvidia_gpu {
 
