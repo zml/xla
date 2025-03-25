@@ -5200,8 +5200,6 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     q_tensor->set_ragged_offset(ragged_offset_tensor);
   }
 
-  graph.set_max_total_seq_len_q(1);
-
   // Add SDPA to the graph.
   auto [o_tensor, stats_tensor] =
       graph.sdpa(q_tensor, k_tensor, v_tensor, sdpa_options);
