@@ -5211,9 +5211,9 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionOperationGraph(
     o_tensor->set_ragged_offset(offset_q);
   }
 
-  //if (ragged_offset_tensor) {
-  //  o_tensor->set_ragged_offset(ragged_offset_tensor);
-  //}
+  if (ragged_offset_tensor) {
+    o_tensor->set_ragged_offset(ragged_offset_tensor);
+  }
 
   // Set output attributes.
   o_tensor->set_name("O")

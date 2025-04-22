@@ -108,9 +108,20 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
   const xla::gpu::CudnnfMHABackendConfig &config =
       gpu_config.cudnn_fmha_backend_config();
 
+  Shape q_shape = custom_call->operand(0)->shape();
+  Shape ragged_offset_shape = custom_call->operand(5)->shape();
+  std::vector<int64_t> fake_dimensions = {ragged_offset_shape.dimensions()[0], q_shape.dimensions()[1], config.max_input_len(), q_shape.dimensions()[3]};
+  Shape fake_shape(q_shape.element_type(), fake_dimensions, {false, false, false, false}, {});
+  *fake_shape.mutable_layout() = Layout({3, 1, 2, 0});
+
+  Shape fake_shape_output(q_shape.element_type(), fake_dimensions, {false, false, false, false}, {});
+  *fake_shape_output.mutable_layout() = Layout({3, 1, 2, 0});
+
+  VLOG(0) << fake_shape.ToString(true);
+
   TF_ASSIGN_OR_RETURN(
       MatmulTensorDescriptor lhs_bmm1,
-      MatmulTensorDescriptorFor(custom_call->operand(0)->shape(),
+      MatmulTensorDescriptorFor(fake_shape,
                                 config.bmm1_dot_dimension_numbers(), LHS));
   TF_ASSIGN_OR_RETURN(
       MatmulTensorDescriptor rhs_bmm1,
@@ -122,7 +133,12 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
                                 config.bmm2_dot_dimension_numbers(), RHS));
   TF_ASSIGN_OR_RETURN(
       TensorDescriptor output,
-      TensorDescriptorFor(ShapeUtil::GetSubshape(custom_call->shape(), {0})));
+      TensorDescriptorFor(fake_shape));
+
+  VLOG(0) << absl::StrFormat("{dimensions: %s strides: %s}", 
+        absl::StrJoin(lhs_bmm1.GetCudnnCompatibleStrides(true), ","),
+        absl::StrJoin(lhs_bmm1.GetCudnnCompatibleDimensions(true), ",")
+    );
 
   std::optional<se::dnn::TensorDescriptor> activation;
   const bool has_activation =
@@ -145,7 +161,7 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
   std::optional<se::dnn::TensorDescriptor> page_table_v;
   std::optional<se::dnn::TensorDescriptor> ragged_offset;
 
-  //if (custom_call->operand_count() == 8) {
+  if (custom_call->operand_count() == 8) {
     TF_ASSIGN_OR_RETURN(sequence_length_q,
                        TensorDescriptorFor(custom_call->operand(3)->shape()));
     TF_ASSIGN_OR_RETURN(sequence_length_kv,
@@ -156,7 +172,7 @@ absl::StatusOr<se::gpu::CudnnGraph> BuildGraphForCustomCallToForwardFMHA(
                        TensorDescriptorFor(custom_call->operand(6)->shape()));
     TF_ASSIGN_OR_RETURN(ragged_offset,
                        TensorDescriptorFor(custom_call->operand(7)->shape()));
-  //}
+  }
 
   const double dropout_rate = config.dropout_rate();
 
