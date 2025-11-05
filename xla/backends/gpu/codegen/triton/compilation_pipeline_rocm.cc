@@ -123,6 +123,7 @@ static void MakeLLIR(mlir::OpPassManager* pm,
                      const stream_executor::RocmComputeCapability& rocm_cc,
                      int num_stages) {
   const int custom_lds_size = 0;
+  pm->addPass(mt::gpu::createTritonGPUAllocateWarpGroups());
   pm->addPass(mlir::triton::AMD::createOptimizeLDSUsagePass(
       rocm_cc.gfx_version(), custom_lds_size));
   pm->addPass(mlir::createSCFToControlFlowPass());
