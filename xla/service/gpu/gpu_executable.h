@@ -422,6 +422,12 @@ class GpuExecutable : public Executable {
   // executable is destroyed.
   absl::flat_hash_map<stream_executor::StreamExecutor*, se::ScopedModuleHandle>
       module_handles_ ABSL_GUARDED_BY(module_handle_mutex_);
+
+  // Set of executors this executable has been run on. Used in the destructor
+  // to take reader locks on GetGpuMutex, preventing cuModuleUnload from racing
+  // with the DelayKernel used during autotuning profiling.
+  absl::flat_hash_set<stream_executor::StreamExecutor*> executors_
+      ABSL_GUARDED_BY(module_handle_mutex_);
   // Cache of constant buffer allocation maps used by `ResolveConstantGlobals`.
   absl::flat_hash_map<stream_executor::StreamExecutor*,
                       std::unique_ptr<BufferAllocToDeviceMemoryMap>>
