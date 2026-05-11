@@ -553,10 +553,22 @@ xla_test(
     ],
 )
 
-cc_library(
+sycl_library(
     name = "sycl_blas_lt_plugin",
     srcs = ["sycl_blas_lt.cc"],
     hdrs = ["sycl_blas_lt.h"],
+    textual_hdrs = ["@oneapi//:all"],
+    copts = [
+        "-isystemexternal/oneapi/mkl/2025.1/include",
+    ],
+    linkopts = [
+        "-Lexternal/oneapi/mkl/2025.1/lib",
+        "-Wl,-rpath,/home/steeve/xla/bazel-xla/external/oneapi/mkl/2025.1/lib",
+        "-lmkl_sycl_blas",
+        "-lmkl_intel_ilp64",
+        "-lmkl_sequential",
+        "-lmkl_core",
+    ],
     tags = [
         "gpu",
         "oneapi-only",
@@ -570,6 +582,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/gpu:gpu_blas_lt",
         "//xla/stream_executor/platform:initialize",
+        ":sycl_stream",
     ],
     alwayslink = True,
 )
