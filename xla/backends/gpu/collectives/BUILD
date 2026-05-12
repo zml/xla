@@ -1,5 +1,5 @@
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm_is_configured")
-load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl_is_configured")
+load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl_is_configured", "sycl_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_is_configured")
 load("//xla/tests:build_defs.bzl", "xla_test")
@@ -672,10 +672,19 @@ cc_library(
     alwayslink = True,  # registers collectives implementation
 )
 
-cc_library(
+sycl_library(
     name = "oneccl_collectives",
     srcs = ["oneccl_collectives.cc"],
     hdrs = ["oneccl_collectives.h"],
+    textual_hdrs = ["@oneapi//:all"],
+    copts = [
+        "-isystemexternal/oneapi/ccl/2021.15/include",
+    ],
+    linkopts = [
+        "-Lexternal/oneapi/ccl/2021.15/lib",
+        "-Wl,-rpath,/home/steeve/xla/bazel-xla/external/oneapi/ccl/2021.15/lib",
+        "-lccl",
+    ],
     tags = [
         "gpu",
         "oneapi-only",
@@ -683,15 +692,37 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         ":gpu_collectives",
+        ":gpu_communicator",
+        "//xla:future",
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla:types",
+        "//xla:util",
+        "//xla:xla_data_proto_cc",
         "//xla/core/collectives",
         "//xla/core/collectives:clique_id",
         "//xla/core/collectives:clique_key",
         "//xla/core/collectives:collectives_registry",
         "//xla/core/collectives:communicator",
         "//xla/core/collectives:rank_id",
+        "//xla/core/collectives:reduction_kind",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/sycl:sycl_executor",
+        "//xla/stream_executor/sycl:sycl_stream",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:logging",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@tsl//tsl/platform:casts",
     ],
     alwayslink = True,  # registers collectives implementation
 )

@@ -37,36 +37,27 @@ class OnecclCollectives : public GpuCollectives {
  public:
   bool IsImplemented() const final { return true; }
 
-  absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final {
-    return absl::OkStatus();
-  }
+  absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final;
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
   CreateCommunicators(const CliqueKey& clique_key,
                       const std::optional<CliqueIds>& clique_ids,
                       absl::Span<const DeviceRank> ranks,
-                      const Collectives::Config& config) final {
-    return absl::OkStatus();
-  }
+                      const Collectives::Config& config) final;
 
-  absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator() final {
-    return absl::OkStatus();
-  }
+  absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator() final;
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(
       absl::Span<const Communicator* const> comms, int32_t color,
       absl::Span<const RankId> keys, const Collectives::Config& config,
-      absl::Span<const DeviceRank> ranks) final {
-    return absl::OkStatus();
-  }
-  absl::StatusOr<void*> Allocate(uint64_t bytes) final {
-    return absl::OkStatus();
-  }
+      absl::Span<const DeviceRank> ranks) final;
 
-  absl::Status Deallocate(void* location) final { return absl::OkStatus(); }
+  absl::StatusOr<void*> Allocate(uint64_t bytes) final;
+
+  absl::Status Deallocate(void* location) final;
 
   absl::StatusOr<CliqueIdCallback> InitializeTopology(
-      const Topology& topology) {
+      const Topology& topology) final {
     return nullptr;
   }
 };
