@@ -46,6 +46,7 @@ class SyclEvent : public Event {
   static absl::StatusOr<SyclEvent> Create(StreamExecutor* executor);
 
   ::sycl::event GetEvent() const { return event_; }
+  void SetEvent(const ::sycl::event& event) { event_ = event; }
 
   // We don't need a destructor for ::sycl::event since it is handled by the
   // SYCL runtime.
