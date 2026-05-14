@@ -37,6 +37,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "oneapi/ccl.h"
 #include "oneapi/ccl.hpp"
 #include "tsl/platform/casts.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"

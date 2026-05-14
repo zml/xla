@@ -676,15 +676,6 @@ sycl_library(
     name = "oneccl_collectives",
     srcs = ["oneccl_collectives.cc"],
     hdrs = ["oneccl_collectives.h"],
-    textual_hdrs = ["@oneapi//:all"],
-    copts = [
-        "-isystemexternal/oneapi/ccl/2021.15/include",
-    ],
-    linkopts = [
-        "-Lexternal/oneapi/ccl/2021.15/lib",
-        "-Wl,-rpath,/home/steeve/xla/bazel-xla/external/oneapi/ccl/2021.15/lib",
-        "-lccl",
-    ],
     tags = [
         "gpu",
         "oneapi-only",
@@ -722,6 +713,7 @@ sycl_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@oneccl//:libs",
         "@tsl//tsl/platform:casts",
     ],
     alwayslink = True,  # registers collectives implementation
