@@ -62,8 +62,14 @@ absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
         std::move(shared_module), *matmul_config, std::move(metallib));
   }
 
-  return BuildMetalElementwiseExecutable(
-      std::shared_ptr<HloModule>(std::move(module)));
+  auto shared_module = std::shared_ptr<HloModule>(std::move(module));
+  absl::StatusOr<std::unique_ptr<Executable>> reduction =
+      BuildMetalReductionExecutable(shared_module);
+  if (reduction.ok()) {
+    return std::move(*reduction);
+  }
+
+  return BuildMetalElementwiseExecutable(std::move(shared_module));
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<Executable>>>

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -204,6 +205,42 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseWhereCall() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
+                                              float init_value) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  switch (opcode) {
+    case HloOpcode::kAdd:
+      Add(lhs, rhs);
+      break;
+    case HloOpcode::kMaximum:
+      Max(lhs, rhs);
+      break;
+    case HloOpcode::kMinimum:
+      Min(lhs, rhs);
+      break;
+    default:
+      return absl::InvalidArgumentError("Unexpected reduction opcode.");
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduction");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<float>(&builder, init_value), reducer, {0});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 void ExpectMatchesReference(const Literal& actual, const Literal& lhs,
                             const Literal& rhs, bool relu) {
   ASSERT_TRUE(ShapeUtil::Compatible(
@@ -249,6 +286,13 @@ void ExpectMatchesReshapeSliceReference(const Literal& actual,
           << "at (" << row << ", " << col << ")";
     }
   }
+}
+
+void ExpectScalarNear(const Literal& actual, float expected,
+                      float tolerance = 1.0e-6f) {
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {})));
+  EXPECT_NEAR(actual.Get<float>({}), expected, tolerance);
 }
 
 TEST(MetalGpuExecutableTest, Dot) {
@@ -575,6 +619,50 @@ TEST(MetalGpuExecutableTest, ElementwiseReshapeSlice) {
   }
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesReshapeSliceReference(actual, MakeElementwiseLhs());
+}
+
+TEST(MetalGpuExecutableTest, ReductionSum) {
+  auto result = ExecuteMetalReduction(HloOpcode::kAdd, 0.0f);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  float expected = 0.0f;
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected += input.Get<float>({i});
+  }
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionMaximum) {
+  auto result = ExecuteMetalReduction(
+      HloOpcode::kMaximum, -std::numeric_limits<float>::infinity());
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  float expected = -std::numeric_limits<float>::infinity();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected = std::max(expected, input.Get<float>({i}));
+  }
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionMinimum) {
+  auto result = ExecuteMetalReduction(
+      HloOpcode::kMinimum, std::numeric_limits<float>::infinity());
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  float expected = std::numeric_limits<float>::infinity();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected = std::min(expected, input.Get<float>({i}));
+  }
+  ExpectScalarNear(actual, expected);
 }
 
 }  // namespace

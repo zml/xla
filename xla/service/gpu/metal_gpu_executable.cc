@@ -71,6 +71,26 @@ struct ElementwiseParams {
   uint32_t reserved2;
 };
 
+struct ReductionParams {
+  uint32_t num_elements;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+};
+
+enum class ReductionKind {
+  kAdd,
+  kMaximum,
+  kMinimum,
+};
+
+struct MetalReductionConfig {
+  int64_t parameter_number = 0;
+  int64_t num_elements = 0;
+  float init_value = 0.0f;
+  ReductionKind kind = ReductionKind::kAdd;
+};
+
 bool IsF32Rank2Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.dimensions().size() == 2;
 }
@@ -852,6 +872,250 @@ absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module) {
 absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
   return CompileMetalAirToMetallib(get_matmul_air_direct(),
                                    "metal_matmul_air");
+}
+
+absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
+    const HloModule& module) {
+  const HloInstruction* root = module.entry_computation()->root_instruction();
+  if (root->opcode() != HloOpcode::kReduce) {
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction supports only reduce roots.");
+  }
+  if (!IsScalarLikeF32(root->shape()) || root->operand_count() != 2 ||
+      root->dimensions().size() != 1 || root->dimensions()[0] != 0) {
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction currently supports only single f32 array "
+        "to f32 scalar reductions over dimension 0.");
+  }
+
+  const HloInstruction* input = root->operand(0);
+  const HloInstruction* init = root->operand(1);
+  if (input->opcode() != HloOpcode::kParameter || !IsF32Array(input->shape()) ||
+      input->shape().dimensions().size() != 1 || !init->IsConstant() ||
+      !IsScalarLikeF32(init->shape())) {
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction currently supports only rank-1 f32 "
+        "parameter inputs and scalar f32 constant init values.");
+  }
+
+  const HloInstruction* reducer = root->to_apply()->root_instruction();
+  ReductionKind kind;
+  switch (reducer->opcode()) {
+    case HloOpcode::kAdd:
+      kind = ReductionKind::kAdd;
+      break;
+    case HloOpcode::kMaximum:
+      kind = ReductionKind::kMaximum;
+      break;
+    case HloOpcode::kMinimum:
+      kind = ReductionKind::kMinimum;
+      break;
+    default:
+      return absl::UnimplementedError(absl::StrFormat(
+          "Metal direct AIR reduction does not support reducer opcode %s.",
+          HloOpcodeString(reducer->opcode())));
+  }
+
+  MetalReductionConfig config;
+  config.parameter_number = input->parameter_number();
+  config.num_elements = ShapeUtil::ElementsIn(input->shape());
+  config.init_value = init->literal().Get<float>({});
+  config.kind = kind;
+  return config;
+}
+
+std::string ReductionUpdate(ReductionKind kind) {
+  switch (kind) {
+    case ReductionKind::kAdd:
+      return "  %new_acc = fadd fast float %acc, %value\n";
+    case ReductionKind::kMaximum:
+      return R"(  %cmp = fcmp fast ogt float %value, %acc
+  %new_acc = select i1 %cmp, float %value, float %acc
+)";
+    case ReductionKind::kMinimum:
+      return R"(  %cmp = fcmp fast olt float %value, %acc
+  %new_acc = select i1 %cmp, float %value, float %acc
+)";
+  }
+}
+
+std::string BuildReductionAir(const MetalReductionConfig& config) {
+  return absl::StrFormat(R"(
+source_filename = "xla/service/gpu/metal_reduction_air"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024-n8:16:32"
+target triple = "air64_v27-apple-macosx15.0.0"
+
+%%struct.ReductionParams = type { i32, i32, i32, i32 }
+
+define void @reduce_f32(
+    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %%arg0,
+    float addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %%out,
+    %%struct.ReductionParams addrspace(2)* nocapture noundef readonly align 4 dereferenceable(16) "air-buffer-no-alias" %%params,
+    <3 x i32> noundef %%gid) local_unnamed_addr #0 {
+entry:
+  %%idx32 = extractelement <3 x i32> %%gid, i64 0
+  %%is_leader = icmp eq i32 %%idx32, 0
+  br i1 %%is_leader, label %%body, label %%exit
+
+body:
+  %%n_ptr = getelementptr inbounds %%struct.ReductionParams, %%struct.ReductionParams addrspace(2)* %%params, i64 0, i32 0
+  %%n = load i32, i32 addrspace(2)* %%n_ptr, align 4
+  br label %%loop
+
+loop:
+  %%i = phi i32 [ 0, %%body ], [ %%next, %%loop_body ]
+  %%acc = phi float [ %s, %%body ], [ %%new_acc, %%loop_body ]
+  %%in_bounds = icmp ult i32 %%i, %%n
+  br i1 %%in_bounds, label %%loop_body, label %%done
+
+loop_body:
+  %%i64 = zext i32 %%i to i64
+  %%ptr = getelementptr inbounds float, float addrspace(1)* %%arg0, i64 %%i64
+  %%value = load float, float addrspace(1)* %%ptr, align 4
+%s  %%next = add i32 %%i, 1
+  br label %%loop
+
+done:
+  store float %%acc, float addrspace(1)* %%out, align 4
+  br label %%exit
+
+exit:
+  ret void
+}
+
+attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-pointer"="all" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
+!air.compile_options = !{!18, !19, !20}
+!llvm.ident = !{!21}
+!air.version = !{!22}
+!air.language_version = !{!23}
+!air.source_file_name = !{!24}
+
+!0 = !{void (float addrspace(1)*, float addrspace(1)*, %%struct.ReductionParams addrspace(2)*, <3 x i32>)* @reduce_f32, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"arg0"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"ReductionParams", !"air.arg_name", !"params"}
+!6 = !{i32 0, i32 4, i32 0, !"uint", !"num_elements", i32 4, i32 4, i32 0, !"uint", !"reserved0", i32 8, i32 4, i32 0, !"uint", !"reserved1", i32 12, i32 4, i32 0, !"uint", !"reserved2"}
+!7 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+!10 = !{i32 1, !"wchar_size", i32 4}
+!11 = !{i32 7, !"air.max_device_buffers", i32 31}
+!12 = !{i32 7, !"air.max_constant_buffers", i32 31}
+!13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+!14 = !{i32 7, !"air.max_textures", i32 128}
+!15 = !{i32 7, !"air.max_read_write_textures", i32 8}
+!16 = !{i32 7, !"air.max_samplers", i32 16}
+!17 = !{i32 7, !"frame-pointer", i32 2}
+!18 = !{!"air.compile.denorms_disable"}
+!19 = !{!"air.compile.fast_math_enable"}
+!20 = !{!"air.compile.framebuffer_fetch_enable"}
+!21 = !{!"xla direct AIR reduction"}
+!22 = !{i32 2, i32 7, i32 0}
+!23 = !{!"Metal", i32 3, i32 2, i32 0}
+!24 = !{!"xla/service/gpu/metal_reduction_air"}
+)",
+                         FloatLiteral(config.init_value),
+                         ReductionUpdate(config.kind));
+}
+
+class MetalReductionExecutable final : public Executable {
+ public:
+  MetalReductionExecutable(std::shared_ptr<HloModule> module,
+                           MetalReductionConfig config,
+                           std::vector<uint8_t> metallib)
+      : Executable(std::move(module)),
+        config_(config),
+        result_shape_(this->module()
+                          .entry_computation()
+                          ->root_instruction()
+                          ->shape()),
+        metallib_(std::move(metallib)) {}
+
+  Shape result_shape() const override { return result_shape_; }
+
+  absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
+      const ServiceExecutableRunOptions* run_options,
+      std::vector<ExecutionInput> arguments) override {
+    se::Stream* stream = run_options->stream();
+    if (stream == nullptr) {
+      return absl::InvalidArgumentError("Metal reduction requires a stream.");
+    }
+    se::StreamExecutor* executor = stream->parent();
+    se::DeviceAddressAllocator* allocator = run_options->allocator();
+    if (allocator == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal reduction requires an allocator.");
+    }
+    if (config_.parameter_number >= arguments.size()) {
+      return absl::InvalidArgumentError(
+          "Metal reduction parameter number is out of bounds.");
+    }
+
+    const int device_ordinal = run_options->device_ordinal() != -1
+                                   ? run_options->device_ordinal()
+                                   : executor->device_ordinal();
+    const int64_t output_size = ShapeUtil::ByteSizeOf(result_shape_, 8);
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> output_buffer,
+                        allocator->Allocate(device_ordinal, output_size));
+    se::DeviceAddressBase output = *output_buffer;
+
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> params_buffer,
+                        allocator->Allocate(device_ordinal,
+                                            sizeof(ReductionParams)));
+    se::DeviceAddressBase params_address = *params_buffer;
+    ReductionParams params{static_cast<uint32_t>(config_.num_elements), 0, 0,
+                           0};
+    TF_RETURN_IF_ERROR(
+        stream->Memcpy(&params_address, &params, sizeof(ReductionParams)));
+
+    se::DeviceAddressBase input =
+        arguments[config_.parameter_number].Buffer({}).AsDeviceAddress();
+    if (input.is_null()) {
+      return absl::InvalidArgumentError("Metal reduction input buffer is null.");
+    }
+
+    auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+        std::vector<uint8_t>(metallib_.begin(), metallib_.end()), "reduce_f32",
+        /*arity=*/3);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        executor->LoadKernel(spec));
+
+    se::KernelArgsPackedArray kernel_args(/*num_args=*/3);
+    kernel_args.add_argument(input);
+    kernel_args.add_argument(output);
+    kernel_args.add_argument(params_address);
+
+    TF_RETURN_IF_ERROR(kernel->Launch(se::ThreadDim(1, 1, 1),
+                                      se::BlockDim(1, 1, 1), stream,
+                                      kernel_args));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+    ExecutionOutput result(result_shape_, allocator, device_ordinal,
+                           executor->device_ordinal());
+    static_cast<ShapedBuffer*>(result.MutableResult())
+        ->set_buffer(output_buffer.Release(), {});
+    result.Commit();
+    return std::move(result);
+  }
+
+ private:
+  MetalReductionConfig config_;
+  Shape result_shape_;
+  std::vector<uint8_t> metallib_;
+};
+
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalReductionExecutable(
+    std::shared_ptr<HloModule> module) {
+  TF_ASSIGN_OR_RETURN(MetalReductionConfig config,
+                      MatchMetalReduction(*module));
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
+                      CompileMetalAirToMetallib(BuildReductionAir(config),
+                                                "metal_reduction_air"));
+  return std::make_unique<MetalReductionExecutable>(
+      std::move(module), config, std::move(metallib));
 }
 
 class MetalElementwiseExecutable final : public Executable {
