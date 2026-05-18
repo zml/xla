@@ -1503,8 +1503,9 @@ entry:
   %in = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %limited
   %value = load float, ptr %in, align 4
   %sine = call float @__nv_sinf(float %value)
+  %logged = call float @__nv_fast_logf(float %sine)
   %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
-  store float %sine, ptr %out, align 4
+  store float %logged, ptr %out, align 4
   ret void
 }
 
@@ -1513,6 +1514,7 @@ declare i32 @llvm.smin.i32(i32, i32)
 declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.umin.i32(i32, i32)
 declare float @__nv_sinf(float)
+declare float @__nv_fast_logf(float)
 
 !nvvm.annotations = !{!0}
 !0 = !{ptr @calls, !"kernel", i32 1}
@@ -1540,6 +1542,8 @@ declare float @__nv_sinf(float)
             std::string::npos)
       << msl;
   EXPECT_NE(msl.find("sin("), std::string::npos) << msl;
+  EXPECT_NE(msl.find("log("), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("__nv_fast_logf"), std::string::npos) << msl;
 }
 
 TEST(MetalMslEmitterTest, EmitsLogicalRightShiftWithUnsignedType) {

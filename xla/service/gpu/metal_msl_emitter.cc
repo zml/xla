@@ -2342,8 +2342,12 @@ class FunctionEmitter {
     if (name == "__nv_sqrtf") return UnaryMathCall("sqrt", call);
     if (name == "__nv_sinf") return UnaryMathCall("sin", call);
     if (name == "__nv_cosf") return UnaryMathCall("cos", call);
-    if (name == "__nv_expf") return UnaryMathCall("exp", call);
-    if (name == "__nv_logf") return UnaryMathCall("log", call);
+    if (name == "__nv_expf" || name == "__nv_fast_expf") {
+      return UnaryMathCall("exp", call);
+    }
+    if (name == "__nv_logf" || name == "__nv_fast_logf") {
+      return UnaryMathCall("log", call);
+    }
     if (name == "__nv_log1pf") return Log1pCall(call);
     if (name == "__nv_floorf") return UnaryMathCall("floor", call);
     if (name == "__nv_ceilf") return UnaryMathCall("ceil", call);
@@ -2797,6 +2801,12 @@ class FunctionEmitter {
     if (name == "__nv_sqrtf") {
       return InlineSimpleUnaryCall("sqrt", nested_call, outer_call);
     }
+    if (name == "__nv_expf" || name == "__nv_fast_expf") {
+      return InlineSimpleUnaryCall("exp", nested_call, outer_call);
+    }
+    if (name == "__nv_logf" || name == "__nv_fast_logf") {
+      return InlineSimpleUnaryCall("log", nested_call, outer_call);
+    }
     if (name == "__nv_floorf") {
       return InlineSimpleUnaryCall("floor", nested_call, outer_call);
     }
@@ -3050,6 +3060,12 @@ class FunctionEmitter {
     }
     if (name == "__nv_sqrtf") {
       return InlineNestedUnaryCall("sqrt", call, nested_call, outer_call);
+    }
+    if (name == "__nv_expf" || name == "__nv_fast_expf") {
+      return InlineNestedUnaryCall("exp", call, nested_call, outer_call);
+    }
+    if (name == "__nv_logf" || name == "__nv_fast_logf") {
+      return InlineNestedUnaryCall("log", call, nested_call, outer_call);
     }
     if (name == "__nv_floorf") {
       return InlineNestedUnaryCall("floor", call, nested_call, outer_call);
