@@ -3786,6 +3786,7 @@ xla_cc_test(
         ":metal_gpu_compiler",
         ":gpu_transfer_manager",
         "//xla/client:client_library",
+        "//xla/hlo/builder/lib:math",
         "//xla/hlo/builder:xla_builder",
         "//xla:literal",
         "//xla:literal_comparison",

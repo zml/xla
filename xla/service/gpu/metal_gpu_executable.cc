@@ -425,8 +425,20 @@ class ElementwiseAirEmitter {
         return EmitUnary(instr, "fneg fast float", body);
       case HloOpcode::kAbs:
         return EmitAbs(instr, body);
+      case HloOpcode::kAcos:
+        return EmitIntrinsicUnary(instr, "air.fast_acos.f32", body);
+      case HloOpcode::kAcosh:
+        return EmitIntrinsicUnary(instr, "air.fast_acosh.f32", body);
+      case HloOpcode::kAsin:
+        return EmitIntrinsicUnary(instr, "air.fast_asin.f32", body);
+      case HloOpcode::kAsinh:
+        return EmitIntrinsicUnary(instr, "air.fast_asinh.f32", body);
+      case HloOpcode::kAtanh:
+        return EmitIntrinsicUnary(instr, "air.fast_atanh.f32", body);
       case HloOpcode::kCos:
         return EmitIntrinsicUnary(instr, "air.fast_cos.f32", body);
+      case HloOpcode::kCosh:
+        return EmitIntrinsicUnary(instr, "air.fast_cosh.f32", body);
       case HloOpcode::kExp:
         return EmitIntrinsicUnary(instr, "air.fast_exp.f32", body);
       case HloOpcode::kExpm1:
@@ -439,8 +451,12 @@ class ElementwiseAirEmitter {
         return EmitLogistic(instr, body);
       case HloOpcode::kSin:
         return EmitIntrinsicUnary(instr, "air.fast_sin.f32", body);
+      case HloOpcode::kSinh:
+        return EmitIntrinsicUnary(instr, "air.fast_sinh.f32", body);
       case HloOpcode::kSqrt:
         return EmitIntrinsicUnary(instr, "air.fast_sqrt.f32", body);
+      case HloOpcode::kTan:
+        return EmitIntrinsicUnary(instr, "air.fast_tan.f32", body);
       case HloOpcode::kTanh:
         return EmitIntrinsicUnary(instr, "air.fast_tanh.f32", body);
       case HloOpcode::kRsqrt:
@@ -1566,8 +1582,14 @@ target triple = "air64_v27-apple-macosx15.0.0"
 %%struct.ElementwiseParams = type { i32, i32, i32, i32 }
 
 declare float @air.fast_cos.f32(float) local_unnamed_addr #1
+declare float @air.fast_acos.f32(float) local_unnamed_addr #1
+declare float @air.fast_acosh.f32(float) local_unnamed_addr #1
 declare float @air.fast_atan2.f32(float, float) local_unnamed_addr #1
+declare float @air.fast_asin.f32(float) local_unnamed_addr #1
+declare float @air.fast_asinh.f32(float) local_unnamed_addr #1
+declare float @air.fast_atanh.f32(float) local_unnamed_addr #1
 declare float @air.fast_ceil.f32(float) local_unnamed_addr #1
+declare float @air.fast_cosh.f32(float) local_unnamed_addr #1
 declare float @air.fast_exp.f32(float) local_unnamed_addr #1
 declare float @air.fast_floor.f32(float) local_unnamed_addr #1
 declare float @air.fast_log.f32(float) local_unnamed_addr #1
@@ -1576,7 +1598,9 @@ declare float @air.fast_rint.f32(float) local_unnamed_addr #1
 declare float @air.fast_round.f32(float) local_unnamed_addr #1
 declare float @air.fast_rsqrt.f32(float) local_unnamed_addr #1
 declare float @air.fast_sin.f32(float) local_unnamed_addr #1
+declare float @air.fast_sinh.f32(float) local_unnamed_addr #1
 declare float @air.fast_sqrt.f32(float) local_unnamed_addr #1
+declare float @air.fast_tan.f32(float) local_unnamed_addr #1
 declare float @air.fast_tanh.f32(float) local_unnamed_addr #1
 declare float @air.sign.f32(float) local_unnamed_addr #1
 

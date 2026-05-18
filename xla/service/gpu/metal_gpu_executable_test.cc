@@ -24,6 +24,7 @@ limitations under the License.
 #include "xla/array2d.h"
 #include "xla/client/client.h"
 #include "xla/client/client_library.h"
+#include "xla/hlo/builder/lib/math.h"
 #include "xla/hlo/builder/xla_builder.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/literal.h"
@@ -677,6 +678,143 @@ TEST(MetalGpuExecutableTest, ElementwiseCos) {
   Literal input = MakeElementwiseLhs();
   ExpectMatchesElementwiseReference(
       actual, [&](int64_t i) { return std::cos(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTan) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_tan",
+      [](XlaBuilder*, XlaOp input) { Tan(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::tan(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAsin) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_asin",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp scaled = Mul(input, Broadcast(ConstantR0<float>(builder, 0.25f),
+                                           {kElementCount}));
+        Asin(scaled, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) { return std::asin(input.Get<float>({i}) * 0.25f); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAcos) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_acos",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp scaled = Mul(input, Broadcast(ConstantR0<float>(builder, 0.25f),
+                                           {kElementCount}));
+        Acos(scaled, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) { return std::acos(input.Get<float>({i}) * 0.25f); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSinh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_sinh",
+      [](XlaBuilder*, XlaOp input) {
+        Sinh(input, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::sinh(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseCosh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_cosh",
+      [](XlaBuilder*, XlaOp input) {
+        Cosh(input, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::cosh(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAsinh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_asinh",
+      [](XlaBuilder*, XlaOp input) {
+        Asinh(input, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::asinh(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAcosh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_acosh",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp shifted = Add(input, Broadcast(ConstantR0<float>(builder, 3.5f),
+                                            {kElementCount}));
+        Acosh(shifted, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::acosh(input.Get<float>({i}) + 3.5f); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAtanh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_atanh",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp scaled = Mul(input, Broadcast(ConstantR0<float>(builder, 0.25f),
+                                           {kElementCount}));
+        Atanh(scaled, /*result_accuracy=*/std::nullopt, /*expand=*/false);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) { return std::atanh(input.Get<float>({i}) * 0.25f); },
       1.0e-5f);
 }
 
