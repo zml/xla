@@ -599,7 +599,19 @@ class FunctionEmitter {
                             constant_int->getType()->isIntegerTy(1));
     }
     if (auto* constant_fp = llvm::dyn_cast<llvm::ConstantFP>(value)) {
-      double as_double = constant_fp->getValueAPF().convertToDouble();
+      const llvm::APFloat& as_apfloat = constant_fp->getValueAPF();
+      if (as_apfloat.isInfinity() || as_apfloat.isNaN()) {
+        std::string sign = as_apfloat.isNegative() ? "-" : "";
+        std::string literal = as_apfloat.isInfinity() ? "INFINITY" : "NAN";
+        if (value->getType()->isHalfTy()) {
+          return absl::StrCat("half(", sign, literal, ")");
+        }
+        if (value->getType()->isFloatTy()) {
+          return absl::StrCat("float(", sign, literal, ")");
+        }
+        return absl::StrCat("double(", sign, literal, ")");
+      }
+      double as_double = as_apfloat.convertToDouble();
       if (value->getType()->isHalfTy()) {
         return absl::StrFormat("half(%.9g)", as_double);
       }
@@ -888,6 +900,17 @@ class FunctionEmitter {
     if (name.starts_with("llvm.cos.")) return UnaryMathCall("cos", call);
     if (name.starts_with("llvm.exp.")) return UnaryMathCall("exp", call);
     if (name.starts_with("llvm.log.")) return UnaryMathCall("log", call);
+    if (name.starts_with("llvm.maximum.")) return BinaryMathCall("max", call);
+    if (name.starts_with("llvm.minimum.")) return BinaryMathCall("min", call);
+    if (name.starts_with("llvm.smax.")) return BinaryMathCall("max", call);
+    if (name.starts_with("llvm.smin.")) return BinaryMathCall("min", call);
+
+    if (name == "__nv_fabsf") return UnaryMathCall("fabs", call);
+    if (name == "__nv_sqrtf") return UnaryMathCall("sqrt", call);
+    if (name == "__nv_sinf") return UnaryMathCall("sin", call);
+    if (name == "__nv_cosf") return UnaryMathCall("cos", call);
+    if (name == "__nv_expf") return UnaryMathCall("exp", call);
+    if (name == "__nv_logf") return UnaryMathCall("log", call);
 
     return Unsupported(function_, "call", call);
   }
@@ -924,7 +947,39 @@ class FunctionEmitter {
                           InlineSimpleValue(binary->getOperand(1), call));
       return BinaryExprWithOperands(*binary, lhs, rhs);
     }
+    if (auto* nested_call = llvm::dyn_cast<llvm::CallInst>(value)) {
+      return InlineSimpleCall(*nested_call, call);
+    }
     return Unsupported(function_, "inline value", *value);
+  }
+
+  absl::StatusOr<std::string> InlineSimpleCall(
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    const llvm::Function* callee = nested_call.getCalledFunction();
+    if (callee == nullptr) return Unsupported(function_, "inline call", nested_call);
+    llvm::StringRef name = callee->getName();
+    if (name.starts_with("llvm.maximum.") || name.starts_with("llvm.smax.")) {
+      return InlineSimpleBinaryCall("max", nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
+      return InlineSimpleBinaryCall("min", nested_call, outer_call);
+    }
+    return Unsupported(function_, "inline call", nested_call);
+  }
+
+  absl::StatusOr<std::string> InlineSimpleBinaryCall(
+      absl::string_view msl_name, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (nested_call.arg_size() != 2) {
+      return Unsupported(function_, "inline binary call", nested_call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string lhs,
+        InlineSimpleValue(nested_call.getArgOperand(0), outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string rhs,
+        InlineSimpleValue(nested_call.getArgOperand(1), outer_call));
+    return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
   }
 
   absl::StatusOr<std::string> UnaryMathCall(absl::string_view msl_name,
@@ -932,6 +987,14 @@ class FunctionEmitter {
     if (call.arg_size() != 1) return Unsupported(function_, "math call", call);
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(call.getArgOperand(0)));
     return absl::StrCat(msl_name, "(", operand, ")");
+  }
+
+  absl::StatusOr<std::string> BinaryMathCall(absl::string_view msl_name,
+                                             const llvm::CallInst& call) {
+    if (call.arg_size() != 2) return Unsupported(function_, "math call", call);
+    TF_ASSIGN_OR_RETURN(std::string lhs, Expr(call.getArgOperand(0)));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Expr(call.getArgOperand(1)));
+    return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
   }
 
   absl::StatusOr<std::string> VoidCallStatement(const llvm::CallInst& call) {

@@ -210,6 +210,35 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("0f"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsValidInfinityConstantLiteral) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @constant(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %gep = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %tid
+  store float 0xFFF0000000000000, ptr %gep, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @constant, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float(-INFINITY)"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("-inf"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsInlineReducerAndShuffleDown) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -255,6 +284,41 @@ declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32)
 
   EXPECT_NE(msl.find("simd_shuffle_down("), std::string::npos) << msl;
   EXPECT_NE(msl.find("float(0) +"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsLibdeviceAndMinMaxCalls) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @calls(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %limited = call i32 @llvm.smin.i32(i32 %tid, i32 4)
+  %in = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %limited
+  %value = load float, ptr %in, align 4
+  %sine = call float @__nv_sinf(float %value)
+  %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
+  store float %sine, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.smin.i32(i32, i32)
+declare float @__nv_sinf(float)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @calls, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("min(v0, 4)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("sin(v2)"), std::string::npos) << msl;
 }
 
 }  // namespace
