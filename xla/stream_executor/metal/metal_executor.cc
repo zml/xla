@@ -63,6 +63,22 @@ bool Contains(const MetalExecutor::Allocation& allocation, const void* ptr) {
   return value >= base && value < base + allocation.size;
 }
 
+bool IsMetallib(absl::Span<const uint8_t> payload) {
+  constexpr char kMetallibMagic[] = "MTLB";
+  return payload.size() >= 4 &&
+         std::memcmp(payload.data(), kMetallibMagic, 4) == 0;
+}
+
+absl::StatusOr<void*> LoadMetalLibrary(void* device,
+                                       absl::Span<const uint8_t> payload) {
+  if (IsMetallib(payload)) {
+    return LoadLibraryFromData(device, payload);
+  }
+  std::string source(reinterpret_cast<const char*>(payload.data()),
+                     payload.size());
+  return CompileLibrary(device, source);
+}
+
 }  // namespace
 
 MetalExecutor::~MetalExecutor() {
@@ -92,15 +108,17 @@ absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernel(
     const KernelLoaderSpec& spec) {
   if (!spec.has_cuda_cubin_in_memory()) {
     return absl::UnimplementedError(
-        "Metal only loads MSL source from the opaque in-memory binary slot.");
+        "Metal only loads metallib data or MSL source from the opaque "
+        "in-memory binary slot.");
   }
-  auto msl = spec.cuda_cubin_in_memory();
-  if (!msl.has_value()) {
+  auto payload = spec.cuda_cubin_in_memory();
+  if (!payload.has_value()) {
     return absl::InvalidArgumentError("Metal kernel payload is empty.");
   }
-  TF_ASSIGN_OR_RETURN(auto kernel, LoadKernelFromMsl(msl->cubin_bytes,
-                                                     spec.kernel_name(),
-                                                     spec.arity()));
+  TF_ASSIGN_OR_RETURN(auto kernel,
+                      LoadKernelFromLibraryPayload(payload->cubin_bytes,
+                                                   spec.kernel_name(),
+                                                   spec.arity()));
   if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
           spec.kernel_args_packing())) {
     kernel->set_args_packing(
@@ -119,11 +137,11 @@ absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernel(
   return kernel;
 }
 
-absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernelFromMsl(
-    absl::Span<const uint8_t> msl, const std::string& kernel_name,
+absl::StatusOr<std::unique_ptr<Kernel>>
+MetalExecutor::LoadKernelFromLibraryPayload(
+    absl::Span<const uint8_t> payload, const std::string& kernel_name,
     size_t arity) {
-  std::string source(reinterpret_cast<const char*>(msl.data()), msl.size());
-  TF_ASSIGN_OR_RETURN(void* library, CompileLibrary(device_, source));
+  TF_ASSIGN_OR_RETURN(void* library, LoadMetalLibrary(device_, payload));
   TF_ASSIGN_OR_RETURN(void* function, NewFunction(library, kernel_name));
   TF_ASSIGN_OR_RETURN(void* pipeline, NewComputePipeline(device_, function));
 
@@ -141,11 +159,11 @@ absl::StatusOr<ModuleHandle> MetalExecutor::LoadModule(
     const MultiModuleLoaderSpec& spec) {
   if (!spec.has_cuda_cubin_in_memory()) {
     return absl::UnimplementedError(
-        "Metal only loads MSL source from the opaque in-memory binary slot.");
+        "Metal only loads metallib data or MSL source from the opaque "
+        "in-memory binary slot.");
   }
-  absl::Span<const uint8_t> msl = spec.cuda_cubin_in_memory();
-  std::string source(reinterpret_cast<const char*>(msl.data()), msl.size());
-  TF_ASSIGN_OR_RETURN(void* library, CompileLibrary(device_, source));
+  absl::Span<const uint8_t> payload = spec.cuda_cubin_in_memory();
+  TF_ASSIGN_OR_RETURN(void* library, LoadMetalLibrary(device_, payload));
   ModuleHandle handle(library);
   absl::MutexLock lock(modules_mu_);
   loaded_modules_.emplace(handle.id(), library);

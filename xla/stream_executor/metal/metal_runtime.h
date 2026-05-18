@@ -56,6 +56,8 @@ void ReleaseObject(void* object);
 absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
                                       void** contents);
 absl::StatusOr<void*> CompileLibrary(void* device, absl::string_view source);
+absl::StatusOr<void*> LoadLibraryFromData(void* device,
+                                          absl::Span<const uint8_t> data);
 absl::StatusOr<void*> NewFunction(void* library, absl::string_view name);
 absl::StatusOr<void*> NewComputePipeline(void* device, void* function);
 absl::StatusOr<void*> Launch(void* command_queue, void* pipeline,

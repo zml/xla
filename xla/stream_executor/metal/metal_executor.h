@@ -107,8 +107,8 @@ class MetalExecutor : public gpu::GpuExecutor {
   absl::StatusOr<Allocation> ResolveAllocation(const void* ptr) const;
 
  private:
-  absl::StatusOr<std::unique_ptr<Kernel>> LoadKernelFromMsl(
-      absl::Span<const uint8_t> msl, const std::string& kernel_name,
+  absl::StatusOr<std::unique_ptr<Kernel>> LoadKernelFromLibraryPayload(
+      absl::Span<const uint8_t> payload, const std::string& kernel_name,
       size_t arity);
 
   void* device_ = nullptr;

@@ -48,11 +48,15 @@ limitations under the License.
 #include "xla/pjrt/c/pjrt_c_api_shardings_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/c/pjrt_c_api_stream_extension.h"
+#if (GOOGLE_CUDA || TENSORFLOW_USE_ROCM) && !TENSORFLOW_USE_METAL
 #include "xla/pjrt/c/pjrt_c_api_triton_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_triton_internal.h"
+#endif
 #include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
 #include "xla/pjrt/extensions/abi_version/gpu_abi_version_extension.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/pjrt/extensions/cross_host_transfers/pjrt_c_api_cross_host_transfers_extension.h"
+#endif
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/gpu/se_gpu_topology_description.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -581,14 +585,25 @@ const PJRT_Api* GetGpuPjrtApi() {
   static PJRT_MemoryDescriptions_Extension memory_descriptions_extension =
       pjrt::CreateMemoryDescriptionsExtension(&ffi_extension.base);
 
+#if TENSORFLOW_USE_METAL
+  static PJRT_Shardings_Extension shardings_extension =
+      pjrt::CreateShardingsExtension(&memory_descriptions_extension.base);
+#else
+#if (GOOGLE_CUDA || TENSORFLOW_USE_ROCM) && !TENSORFLOW_USE_METAL
   static PJRT_Triton_Extension triton_extension =
       pjrt::CreateTritonExtension(&memory_descriptions_extension.base);
 
   static PJRT_CrossHostTransfers_Extension cross_host_transfers_extension =
       pjrt::CreateCrossHostTransfersExtension(&triton_extension.base);
+#else
+  static PJRT_CrossHostTransfers_Extension cross_host_transfers_extension =
+      pjrt::CreateCrossHostTransfersExtension(
+          &memory_descriptions_extension.base);
+#endif
 
   static PJRT_Shardings_Extension shardings_extension =
       pjrt::CreateShardingsExtension(&cross_host_transfers_extension.base);
+#endif
 
   static PJRT_AbiVersion_Extension abi_version_extension =
       pjrt::CreateGpuAbiVersionExtension(&shardings_extension.base);

@@ -16,59 +16,49 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_METAL_GPU_COMPILER_H_
 #define XLA_SERVICE_GPU_METAL_GPU_COMPILER_H_
 
-#include <optional>
-#include <string>
+#include <memory>
 #include <vector>
 
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "llvm/IR/Module.h"
-#include "xla/hlo/ir/hlo_module.h"
-#include "xla/service/gpu/gpu_compiler.h"
-#include "xla/stream_executor/device_description.h"
-#include "xla/stream_executor/semantic_version.h"
+#include "xla/service/compiler.h"
+#include "xla/service/executable.h"
+#include "xla/service/hlo_cost_analysis.h"
+#include "xla/service/hlo_module_config.h"
+#include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
 
 namespace xla {
 namespace gpu {
 
-class MetalGpuCompiler : public GpuCompiler {
+// Metal compiler entry point for the direct AIR backend.
+//
+// This intentionally does not inherit from GpuCompiler: the generic GPU
+// compiler target currently brings in CUDA/NVPTX/Triton/NVHopper dependencies.
+// Direct AIR lowering should be wired here without passing through that stack.
+class MetalGpuCompiler : public Compiler {
  public:
-  MetalGpuCompiler();
+  MetalGpuCompiler() = default;
 
-  absl::Status OptimizeHloConvolutionCanonicalization(
-      HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
-      se::dnn::VersionInfo dnn_version,
-      const se::SemanticVersion& toolkit_version,
-      CompilationStats* compilation_stats) override;
+  se::Platform::Id PlatformId() const override;
 
-  void AddPaddingForGpublasGemms(
-      HloPassPipeline& pipeline, const DebugOptions& debug_options,
-      const se::GpuComputeCapability& gpu_version) override;
+  absl::StatusOr<std::unique_ptr<HloModule>> RunHloPasses(
+      std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
+      const CompileOptions& options) override;
 
-  absl::Status AddConvAndGemmAutotuningPass(
-      HloPassPipeline* pipeline, HloModule* hlo_module,
-      const se::GpuComputeCapability& gpu_version,
-      const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
-      se::StreamExecutor* stream_exec,
-      const Compiler::GpuTargetConfig* target_config,
-      const MultiProcessKeyValueStore& key_value_store,
-      const se::SemanticVersion& toolkit_version, const AliasInfo* alias_info,
-      const DebugOptions& debug_options, mlir::MLIRContext* mlir_context,
-      HloCostAnalysis::ShapeSizeFunction shape_size_fn) override;
+  absl::StatusOr<std::unique_ptr<Executable>> RunBackend(
+      std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
+      const CompileOptions& options) override;
 
-  absl::StatusOr<BackendCompileResult> CompileTargetBinary(
-      const HloModuleConfig& module_config, llvm::Module* llvm_module,
-      const stream_executor::DeviceDescription& device_description,
-      bool relocatable, const HloModule* debug_module,
-      std::optional<int> shard_number) override;
+  absl::StatusOr<std::vector<std::unique_ptr<Executable>>> Compile(
+      std::unique_ptr<HloModule> hlo_module,
+      std::vector<se::StreamExecutor*> stream_exec,
+      const CompileOptions& options) override;
 
-  std::vector<std::string> GetLLVMCommandLineOptions(
-      const DebugOptions& debug_options) const override;
+  absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
+  CompileAheadOfTime(std::unique_ptr<HloModule> module,
+                     const AotCompilationOptions& options) override;
 
-  bool EnableFusionAutotuning() const override { return false; }
-  bool EnableGemmCustomCalls() const override { return false; }
-  bool RequiresDnnSupport() const override { return false; }
+  HloCostAnalysis::ShapeSizeFunction ShapeSizeBytesFunction() const override;
 
  private:
   MetalGpuCompiler(const MetalGpuCompiler&) = delete;

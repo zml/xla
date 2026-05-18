@@ -15,11 +15,13 @@ limitations under the License.
 
 #include "xla/stream_executor/metal/metal_runtime.h"
 
+#import <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -172,6 +174,41 @@ absl::StatusOr<void*> CompileLibrary(void* device, absl::string_view source) {
   if (library == nil) {
     return absl::InternalError(
         absl::StrCat("Metal failed to compile MSL source: ",
+                     ErrorMessage(error)));
+  }
+  return RetainObj(library);
+}
+
+absl::StatusOr<void*> LoadLibraryFromData(void* device,
+                                          absl::Span<const uint8_t> data) {
+  if (data.empty()) {
+    return absl::InvalidArgumentError("Metal library data is empty.");
+  }
+  void* bytes = std::malloc(data.size());
+  if (bytes == nullptr) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("Failed to allocate ", data.size(),
+                     " bytes for Metal library data."));
+  }
+  std::memcpy(bytes, data.data(), data.size());
+
+  dispatch_data_t library_data =
+      dispatch_data_create(bytes, data.size(),
+                           dispatch_get_global_queue(
+                               QOS_CLASS_USER_INITIATED, /*flags=*/0),
+                           DISPATCH_DATA_DESTRUCTOR_FREE);
+  if (library_data == nil) {
+    std::free(bytes);
+    return absl::InternalError("Failed to create Metal library data object.");
+  }
+
+  NSError* error = nil;
+  id<MTLLibrary> library =
+      [Obj<id<MTLDevice>>(device) newLibraryWithData:library_data
+                                               error:&error];
+  if (library == nil) {
+    return absl::InternalError(
+        absl::StrCat("Metal failed to load library data: ",
                      ErrorMessage(error)));
   }
   return RetainObj(library);

@@ -46,18 +46,22 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/cpu/target_machine_options.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/backends/gpu/collectives/gpu_clique.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#endif
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/client/local_client.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/core/collectives/clique_id.h"
 #include "xla/core/collectives/collectives.h"
 #include "xla/core/collectives/collectives_registry.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
+#endif
 #include "xla/executable_run_options.h"
 #include "xla/future.h"
 #include "xla/hlo/builder/xla_computation.h"
@@ -124,20 +128,25 @@ limitations under the License.
 #include "tsl/platform/fingerprint.h"
 #include "tsl/platform/numa.h"
 #include "tsl/platform/protobuf.h"
-#include "tsl/profiler/lib/nvtx_utils.h"
 #include "tsl/profiler/lib/traceme.h"
+
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
+#include "xla/pjrt/gpu/gpu_metrics.h"
+#endif
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
     defined(TENSORFLOW_USE_METAL)
 #include "xla/debug_options_flags.h"
-#include "xla/pjrt/gpu/gpu_metrics.h"
+#endif
+
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
 #include "xla/pjrt/proto/compile_options.pb.h"
 #include "xla/pjrt/stream_executor_executable.pb.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/xla.pb.h"
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
@@ -300,12 +309,19 @@ std::optional<PjRtPluginAttributes> StreamExecutorGpuClient::plugin_attributes()
   PjRtPluginAttributes attrs;
   attrs.pjrt_c_api_major_version = 0;
   attrs.pjrt_c_api_minor_version = 0;
+#if TENSORFLOW_USE_METAL
+  attrs.attributes["supports_cross_host_transfers"] = PjRtValueType(false);
+#else
   attrs.attributes["supports_cross_host_transfers"] = PjRtValueType(true);
+#endif
   return attrs;
 }
 
 void StreamExecutorGpuClient::UpdateGlobalProcessInfo(
     absl::Span<xla::coordination::TaskInfo> infos) {
+#if TENSORFLOW_USE_METAL
+  return;
+#else
   if (!abort_collectives_on_failure_) {
     return;
   }
@@ -313,6 +329,7 @@ void StreamExecutorGpuClient::UpdateGlobalProcessInfo(
   if (!s.ok()) {
     LOG(WARNING) << s;
   }
+#endif
 }
 
 absl::StatusOr<std::unique_ptr<PjRtClient::AsyncHostToDeviceTransferManager>>
@@ -379,6 +396,48 @@ absl::Status StreamExecutorGpuClient::UpdateCompileOptionsInternal(
   }
   return absl::OkStatus();
 }
+
+#if TENSORFLOW_USE_METAL
+
+absl::StatusOr<std::vector<Future<>>>
+StreamExecutorGpuClient::CrossHostSendBuffers(
+    absl::Span<PjRtBuffer* const> buffers,
+    absl::Span<const GlobalDeviceId> dst_global_device_ids,
+    std::vector<CrossHostTransferKey> transfer_keys) {
+  return absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+StreamExecutorGpuClient::CrossHostReceiveBuffers(
+    xla::PjRtDevice* device, absl::Span<const xla::Shape> shapes,
+    absl::Span<const GlobalDeviceId> src_global_device_ids,
+    std::vector<CrossHostTransferKey> transfer_keys) {
+  return absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+}
+
+void StreamExecutorGpuClient::ScheduleRemoteSend(
+    PjRtMemorySpace* memory_space, PjRtRawBufferRef raw_buffer,
+    std::vector<tsl::RCReference<tsl::AsyncValue>> definition_events,
+    tsl::RCReference<PjRtDeviceEventPromise> usage_event_promise,
+    Future<std::string> serialized_descriptor,
+    PjRtBuffer::RemoteSendCallback on_done) {
+  absl::Status status = absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+  usage_event_promise->SetError(status);
+  std::move(on_done)(status, /*sends_were_enqueued=*/false);
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
+    absl::Span<const Shape> shapes, PjRtDevice* device,
+    PjRtCrossHostRecvNotifier notifier) {
+  return absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+}
+
+#else
 
 // ==== Start cross-host transfer implementations ==== //
 
@@ -1426,6 +1485,8 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
 
 // ==== End cross-host transfer implementations ==== //
 
+#endif  // TENSORFLOW_USE_METAL
+
 absl::StatusOr<const xla::PjRtTopologyDescription*>
 StreamExecutorGpuClient::GetTopologyDescription() const {
   if (!topology_.has_value()) {
@@ -1714,6 +1775,9 @@ GetStreamExecutorGpuDeviceAllocator(
 void NameDeviceAndLauncherThread(const LocalTopologyProto& node,
                                  const DeviceProto& device_proto,
                                  WorkerThread* launcher_thread) {
+#if !defined(GOOGLE_CUDA) && !defined(TENSORFLOW_USE_ROCM)
+  return;
+#else
   auto suffix = absl::StrFormat(
       ":#global=%d,local=%d,process=%d,partition=%d#",
       device_proto.global_device_id(), device_proto.local_device_ordinal(),
@@ -1728,6 +1792,7 @@ void NameDeviceAndLauncherThread(const LocalTopologyProto& node,
   launcher_thread->Schedule([name = absl::StrCat("XlaLauncher", suffix)] {
     tsl::profiler::NameCurrentThread(name);
   });
+#endif
 }
 
 }  // namespace
@@ -2205,8 +2270,7 @@ std::vector<std::unique_ptr<PjRtStreamExecutorDevice>> BuildLocalDevices(
   return devices;
 }
 
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_METAL)
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
 static absl::Status CheckAlignment(const BufferAllocation& allocation,
                                    se::DeviceAddressBase buffer, int arg_idx) {
   const int64_t expected_alignment = [&] {
@@ -2227,7 +2291,7 @@ static absl::Status CheckAlignment(const BufferAllocation& allocation,
   }
   return absl::OkStatus();
 }
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 absl::StatusOr<PjRtStreamExecutorExecutionOutput>
 StreamExecutorGpuClient::RunAsync(
@@ -2236,8 +2300,7 @@ StreamExecutorGpuClient::RunAsync(
     absl::Span<const PjRtRawBufferRef> results,
     ExecutableRunOptions run_options_inp, bool parameter_is_tupled_arguments,
     absl::Span<const Shape> executable_parameter_shapes) {
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_METAL)
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
   std::vector<const Shape*> argument_shapes;
   argument_shapes.reserve(flat_arguments.size());
   for (const Shape& arg_shape : executable_parameter_shapes) {
@@ -2478,7 +2541,7 @@ StreamExecutorGpuClient::RunAsync(
   return PjRtStreamExecutorClient::RunAsync(
       exec, device, flat_arguments, results, std::move(run_options_inp),
       parameter_is_tupled_arguments, executable_parameter_shapes);
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 }
 
 absl::StatusOr<std::unique_ptr<PjRtRuntimeAbiVersion>>

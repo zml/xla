@@ -598,8 +598,6 @@ cc_library(
         ":pjrt_c_api_shardings_extension_hdrs",
         ":pjrt_c_api_status_utils",
         ":pjrt_c_api_stream_extension_hdrs",
-        ":pjrt_c_api_triton_extension_hdrs",
-        ":pjrt_c_api_triton_internal",
         ":pjrt_c_api_wrapper_impl",
         "//xla/backends/cpu:target_machine_options",
         "//xla/backends/profiler:profiler_backends",  # To register the Host Tracers for GPU Plugin.
@@ -617,18 +615,14 @@ cc_library(
         "//xla/pjrt:pjrt_device_description",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt/extensions/abi_version:gpu_abi_version_extension",
-        "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
         "//xla/pjrt/gpu:gpu_helpers",
         "//xla/pjrt/gpu:se_gpu_pjrt_client",
-        "//xla/pjrt/gpu:se_gpu_pjrt_compiler",  # buildcleaner: keep to register GPU AOT compiler
         "//xla/pjrt/gpu:se_gpu_topology_description",
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_allocator_config",
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_client_options",
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_pjrt_client",
         "//xla/python:custom_call_batch_partitioner",
         "//xla/python:custom_partition_callback",
-        "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
-        "//xla/python:inspect_sharding",  # To register "InspectSharding" custom partitioning handler.
         "//xla/service:compiler",
         "//xla/service:custom_call_target_registry",
         "//xla/service:gpu_topology",
@@ -642,8 +636,25 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_protobuf//:protobuf",
+    ] + if_macos([], [
+        ":pjrt_c_api_gpu_internal_non_metal_deps",
+    ]),
+)
+
+cc_library(
+    name = "pjrt_c_api_gpu_internal_non_metal_deps",
+    deps = [
+        "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
+        "//xla/pjrt/gpu:se_gpu_pjrt_compiler",  # buildcleaner: keep to register GPU AOT compiler
+        "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
+        "//xla/python:inspect_sharding",  # To register "InspectSharding" custom partitioning handler.
     ] + if_cuda_is_configured([
+        ":pjrt_c_api_triton_extension_hdrs",
+        ":pjrt_c_api_triton_internal",
         "@local_config_cuda//cuda:cuda_headers",
+    ]) + if_rocm_is_configured([
+        ":pjrt_c_api_triton_extension_hdrs",
+        ":pjrt_c_api_triton_internal",
     ]),
 )
 
@@ -663,6 +674,19 @@ cc_library(
 )
 
 # PJRT GPU plugin. Can be configured to be built for CUDA, ROCM, SYCL, or Metal.
+cc_library(
+    name = "pjrt_c_api_gpu_plugin_non_macos_deps",
+    deps = [
+        "//xla/service:gpu_plugin",
+    ] + if_cuda_is_configured([
+        "//xla/stream_executor:cuda_platform",
+    ]) + if_rocm_is_configured([
+        "//xla/stream_executor:rocm_platform",
+    ]) + if_sycl_is_configured([
+        "//xla/stream_executor:sycl_platform",
+    ]),
+)
+
 xla_cc_binary(
     name = "pjrt_c_api_gpu_plugin",
     additional_linker_inputs = [
@@ -687,15 +711,11 @@ xla_cc_binary(
     ],
     deps = [
         ":pjrt_c_api_gpu",
-        "//xla/service:gpu_plugin",
-    ] + if_cuda_is_configured([
-        "//xla/stream_executor:cuda_platform",
-    ]) + if_rocm_is_configured([
-        "//xla/stream_executor:rocm_platform",
-    ]) + if_sycl_is_configured([
-        "//xla/stream_executor:sycl_platform",
-    ]) + if_macos([
+    ] + if_macos([
+        "//xla/service:gpu_metal_plugin",
         "//xla/stream_executor:metal_platform",
+    ], [
+        ":pjrt_c_api_gpu_plugin_non_macos_deps",
     ]),
 )
 

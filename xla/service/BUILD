@@ -1626,6 +1626,17 @@ cc_library(
 )
 
 cc_library(
+    name = "gpu_metal_plugin",
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        ":service",
+        "//xla/service/gpu:gpu_transfer_manager",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:all_runtime",
+    ],
+)
+
+cc_library(
     name = "gpu_plugin_stub",
 )
 
