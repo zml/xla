@@ -51,18 +51,22 @@ void FillInputs(float* a, float* b, size_t a_count, size_t b_count) {
 }
 
 double ReferenceElement(const float* a, const float* b, uint32_t m, uint32_t n,
-                        uint32_t k, uint32_t row, uint32_t col) {
+                        uint32_t k, uint32_t row, uint32_t col, bool relu) {
   (void)m;
   double sum = 0.0;
   for (uint32_t kk = 0; kk < k; ++kk) {
     sum += static_cast<double>(a[row * k + kk]) *
            static_cast<double>(b[kk * n + col]);
   }
-  return sum;
+  return relu ? std::max(0.0, sum) : sum;
+}
+
+bool KernelUsesRelu(const std::string& function_name) {
+  return function_name.find("relu") != std::string::npos;
 }
 
 bool ValidateResult(const float* a, const float* b, const float* c, uint32_t m,
-                    uint32_t n, uint32_t k) {
+                    uint32_t n, uint32_t k, bool relu) {
   const uint64_t full_check_ops = uint64_t{2} * m * n * k;
   std::vector<std::pair<uint32_t, uint32_t>> points;
   if (full_check_ops <= uint64_t{2} * 256 * 256 * 256) {
@@ -83,7 +87,7 @@ bool ValidateResult(const float* a, const float* b, const float* c, uint32_t m,
   double max_abs = 0.0;
   double max_rel = 0.0;
   for (auto [row, col] : points) {
-    const double expected = ReferenceElement(a, b, m, n, k, row, col);
+    const double expected = ReferenceElement(a, b, m, n, k, row, col, relu);
     const double actual = c[row * n + col];
     const double abs_err = std::abs(actual - expected);
     const double rel_err = abs_err / std::max(1.0, std::abs(expected));
@@ -105,11 +109,13 @@ bool ValidateResult(const float* a, const float* b, const float* c, uint32_t m,
 
 DispatchShape ShapeForKernel(const std::string& function_name, uint32_t m,
                              uint32_t n, uint32_t k) {
-  if (function_name == "matmul_simdgroup_8x8") {
+  if (function_name == "matmul_simdgroup_8x8" ||
+      function_name == "matmul_relu_simdgroup_8x8") {
     if ((m % 16) != 0 || (n % 32) != 0 || (k % 8) != 0) {
       std::fprintf(stderr,
-                   "matmul_simdgroup_8x8 requires M multiple of 16, N "
-                   "multiple of 32, and K multiple of 8\n");
+                   "%s requires M multiple of 16, N multiple of 32, and K "
+                   "multiple of 8\n",
+                   function_name.c_str());
       std::exit(2);
     }
     return {MTLSizeMake((n + 31) / 32, (m + 15) / 16, 1),
@@ -171,6 +177,7 @@ int main(int argc, char** argv) {
 
     const char* metallib_path = argv[1];
     const std::string function_name = argv[2];
+    const bool relu = KernelUsesRelu(function_name);
     MatmulParams params = {
         ParseU32(argv[3], "M"), ParseU32(argv[4], "N"),
         ParseU32(argv[5], "K"), 0};
@@ -244,7 +251,7 @@ int main(int argc, char** argv) {
     if (!ValidateResult(static_cast<const float*>(a.contents),
                         static_cast<const float*>(b.contents),
                         static_cast<const float*>(c.contents), params.m,
-                        params.n, params.k)) {
+                        params.n, params.k, relu)) {
       return 1;
     }
 

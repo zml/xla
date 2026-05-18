@@ -66,6 +66,65 @@ store:
   ret void
 }
 
+define void @matmul_relu_simdgroup_8x8(
+    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %a,
+    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %b,
+    float addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %c,
+    %struct.MatmulParams addrspace(2)* nocapture noundef readonly align 4 dereferenceable(16) "air-buffer-no-alias" %params,
+    <3 x i32> noundef %group_id,
+    i32 noundef %simdgroup_id) local_unnamed_addr #0 {
+entry:
+  %local_tile_y = lshr i32 %simdgroup_id, 2
+  %group_y = extractelement <3 x i32> %group_id, i64 1
+  %tile_y_base = shl i32 %group_y, 1
+  %tile_y = add i32 %tile_y_base, %local_tile_y
+  %row = shl i32 %tile_y, 3
+  %group_x = extractelement <3 x i32> %group_id, i64 0
+  %group_col_base = shl i32 %group_x, 5
+  %sg_shifted = shl i32 %simdgroup_id, 3
+  %local_col = and i32 %sg_shifted, 24
+  %col = or i32 %group_col_base, %local_col
+  %zero = tail call fast <64 x float> @air.simdgroup_matrix_8x8_init_filled.v64f32.f32(float 0.000000e+00) #3
+  %k_ptr = getelementptr inbounds %struct.MatmulParams, %struct.MatmulParams addrspace(2)* %params, i64 0, i32 2
+  %k = load i32, i32 addrspace(2)* %k_ptr, align 4
+  %n_ptr = getelementptr inbounds %struct.MatmulParams, %struct.MatmulParams addrspace(2)* %params, i64 0, i32 1
+  %n = load i32, i32 addrspace(2)* %n_ptr, align 4
+  %k_is_zero = icmp eq i32 %k, 0
+  br i1 %k_is_zero, label %store, label %loop
+
+loop:
+  %base = phi i32 [ 0, %entry ], [ %next_base, %loop ]
+  %acc = phi <64 x float> [ %zero, %entry ], [ %acc_next, %loop ]
+  %a_row_offset = mul i32 %row, %k
+  %a_index32 = add i32 %a_row_offset, %base
+  %a_index = zext i32 %a_index32 to i64
+  %a_ptr = getelementptr inbounds float, float addrspace(1)* %a, i64 %a_index
+  %k64 = zext i32 %k to i64
+  %a_tile = tail call fast <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p1f32(float addrspace(1)* nocapture readonly %a_ptr, i64 %k64, <2 x i64> zeroinitializer, i1 false) #4
+  %b_row_offset = mul i32 %base, %n
+  %b_index32 = add i32 %b_row_offset, %col
+  %b_index = zext i32 %b_index32 to i64
+  %b_ptr = getelementptr inbounds float, float addrspace(1)* %b, i64 %b_index
+  %n64 = zext i32 %n to i64
+  %b_tile = tail call fast <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p1f32(float addrspace(1)* nocapture readonly %b_ptr, i64 %n64, <2 x i64> zeroinitializer, i1 false) #4
+  %acc_next = tail call fast <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %a_tile, <64 x float> %b_tile, <64 x float> %acc) #3
+  %next_base = add i32 %base, 8
+  %more = icmp ult i32 %next_base, %k
+  br i1 %more, label %loop, label %store
+
+store:
+  %final_acc = phi <64 x float> [ %zero, %entry ], [ %acc_next, %loop ]
+  %relu_mask = fcmp fast ogt <64 x float> %final_acc, zeroinitializer
+  %relu_acc = select <64 x i1> %relu_mask, <64 x float> %final_acc, <64 x float> zeroinitializer
+  %c_row_offset = mul i32 %row, %n
+  %c_index32 = add i32 %c_row_offset, %col
+  %c_index = zext i32 %c_index32 to i64
+  %c_ptr = getelementptr inbounds float, float addrspace(1)* %c, i64 %c_index
+  %n64_store = zext i32 %n to i64
+  tail call void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float> %relu_acc, float addrspace(1)* nocapture writeonly %c_ptr, i64 %n64_store, <2 x i64> zeroinitializer, i1 false) #5
+  ret void
+}
+
 declare <64 x float> @air.simdgroup_matrix_8x8_init_filled.v64f32.f32(float) local_unnamed_addr #1
 declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p1f32(float addrspace(1)* nocapture readonly, i64, <2 x i64>, i1) local_unnamed_addr #2
 declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>) local_unnamed_addr #1
@@ -79,7 +138,7 @@ attributes #4 = { convergent nounwind readonly willreturn }
 attributes #5 = { convergent nounwind willreturn writeonly }
 attributes #6 = { convergent mustprogress nounwind willreturn writeonly }
 
-!air.kernel = !{!0}
+!air.kernel = !{!0, !25}
 !llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
 !air.compile_options = !{!18, !19, !20}
 !llvm.ident = !{!21}
@@ -112,3 +171,4 @@ attributes #6 = { convergent mustprogress nounwind willreturn writeonly }
 !22 = !{i32 2, i32 7, i32 0}
 !23 = !{!"Metal", i32 3, i32 2, i32 0}
 !24 = !{!"xla/service/gpu/metal_air_experiment/matmul_air_direct.ll"}
+!25 = !{void (float addrspace(1)*, float addrspace(1)*, float addrspace(1)*, %struct.MatmulParams addrspace(2)*, <3 x i32>, i32)* @matmul_relu_simdgroup_8x8, !1, !2}

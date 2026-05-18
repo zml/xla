@@ -190,10 +190,13 @@ It contains:
 
 On an Apple M3 Max, the hand-authored AIR path validates a
 2048x2048x2048 FP32 matmul and reaches about 2.9 TFLOP/s after `air-opt --O3`.
+The same experiment also validates a fused matmul+ReLU epilogue by applying a
+vector compare/select to the simdgroup accumulator before the matrix store.
 This proves that direct AIR is technically viable for at least one fast compute
-kernel. The AIR contract is still private and version-specific, so this should
-remain an experimental path until we understand metadata stability, compiler
-versioning, and runtime ABI requirements across Xcode/macOS releases.
+kernel with a simple fused epilogue. The AIR contract is still private and
+version-specific, so this should remain an experimental path until we understand
+metadata stability, compiler versioning, and runtime ABI requirements across
+Xcode/macOS releases.
 
 ## Implementation Phases
 

@@ -71,3 +71,33 @@ kernel void matmul_simdgroup_8x8(
 
   simdgroup_store(acc, c + row * params.n + col, ulong(params.n));
 }
+
+kernel void matmul_relu_simdgroup_8x8(
+    const device float* a [[buffer(0)]], const device float* b [[buffer(1)]],
+    device float* c [[buffer(2)]], constant MatmulParams& params [[buffer(3)]],
+    uint3 group_id [[threadgroup_position_in_grid]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kSimdTile = 8;
+  constexpr uint kSimdgroupsX = 4;
+  constexpr uint kSimdgroupsY = 2;
+
+  const uint local_tile_x = simdgroup_id % kSimdgroupsX;
+  const uint local_tile_y = simdgroup_id / kSimdgroupsX;
+  const uint row = (group_id.y * kSimdgroupsY + local_tile_y) * kSimdTile;
+  const uint col = (group_id.x * kSimdgroupsX + local_tile_x) * kSimdTile;
+
+  simdgroup_float8x8 zero = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc = zero;
+
+  for (uint base = 0; base < params.k; base += kSimdTile) {
+    simdgroup_float8x8 tile_a;
+    simdgroup_float8x8 tile_b;
+    simdgroup_load(tile_a, a + row * params.k + base, ulong(params.k));
+    simdgroup_load(tile_b, b + base * params.n + col, ulong(params.n));
+    simdgroup_multiply_accumulate(acc, tile_a, tile_b, acc);
+  }
+
+  acc.thread_elements() =
+      __builtin_elementwise_max(acc.thread_elements(), zero.thread_elements());
+  simdgroup_store(acc, c + row * params.n + col, ulong(params.n));
+}

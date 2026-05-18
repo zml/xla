@@ -35,5 +35,9 @@ export CLANG_MODULE_CACHE_PATH="$OUT/module-cache"
   512 512 512 20 3
 "$OUT/matmul_air_runner" "$OUT/matmul_air.metallib" matmul_simdgroup_8x8 \
   2048 2048 2048 50 5
+"$OUT/matmul_air_runner" "$OUT/matmul_air.metallib" matmul_relu_simdgroup_8x8 \
+  2048 2048 2048 50 5
 "$OUT/matmul_air_runner" "$OUT/matmul_air_direct.metallib" matmul_simdgroup_8x8 \
   2048 2048 2048 50 5
+"$OUT/matmul_air_runner" "$OUT/matmul_air_direct.metallib" \
+  matmul_relu_simdgroup_8x8 2048 2048 2048 50 5
