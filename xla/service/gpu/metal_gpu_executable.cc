@@ -305,6 +305,8 @@ class ElementwiseAirEmitter {
     switch (instr->opcode()) {
       case HloOpcode::kCall:
         return EmitCall(instr, body);
+      case HloOpcode::kConcatenate:
+        return EmitConcatenate(instr, body);
       case HloOpcode::kTranspose:
         return EmitTranspose(instr, body);
       case HloOpcode::kCompare:
@@ -421,6 +423,67 @@ class ElementwiseAirEmitter {
           "rank-2 f32 transposes with permutation {1,0}.");
     }
     return EmitLoadFromLinearIndex(operand, "%idx", body);
+  }
+
+  absl::StatusOr<std::string> EmitConcatenate(const HloInstruction* instr,
+                                              std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape()) ||
+        instr->shape().dimensions().size() != 1 ||
+        instr->dimensions().size() != 1 || instr->dimensions()[0] != 0 ||
+        instr->operand_count() == 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise concatenate currently supports only "
+          "rank-1 f32 concatenates along dimension 0.");
+    }
+
+    const HloInstruction* parameter = nullptr;
+    int64_t base_start = 0;
+    int64_t output_offset = 0;
+    for (const HloInstruction* operand : instr->operands()) {
+      if (!IsF32Array(operand->shape()) ||
+          operand->shape().dimensions().size() != 1) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise concatenate operands must be rank-1 "
+            "f32 arrays.");
+      }
+      const HloInstruction* operand_parameter = operand;
+      int64_t operand_start = 0;
+      if (operand->opcode() == HloOpcode::kSlice) {
+        if (operand->slice_strides().size() != 1 ||
+            operand->slice_strides(0) != 1 ||
+            operand->operand(0)->opcode() != HloOpcode::kParameter) {
+          return absl::UnimplementedError(
+              "Metal direct AIR elementwise concatenate currently supports "
+              "only contiguous slices of parameters.");
+        }
+        operand_parameter = operand->operand(0);
+        operand_start = operand->slice_starts(0);
+      }
+      if (operand_parameter->opcode() != HloOpcode::kParameter) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise concatenate currently supports only "
+            "parameter or slice operands.");
+      }
+      if (parameter == nullptr) {
+        parameter = operand_parameter;
+        base_start = operand_start;
+      }
+      if (operand_parameter != parameter ||
+          operand_start != base_start + output_offset) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise concatenate currently supports only "
+            "contiguous views of one parameter.");
+      }
+      output_offset += ShapeUtil::ElementsIn(operand->shape());
+    }
+
+    std::string source_index = "%idx";
+    if (base_start != 0) {
+      source_index = NewName("concat_idx");
+      body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
+                                      source_index, base_start));
+    }
+    return EmitLoadFromLinearIndex(parameter, source_index, body);
   }
 
   absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,

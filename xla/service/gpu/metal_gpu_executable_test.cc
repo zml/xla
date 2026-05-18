@@ -650,6 +650,23 @@ TEST(MetalGpuExecutableTest, ElementwiseTransposeSlice) {
   ExpectMatchesTransposeSliceReference(actual, MakeElementwiseLhs());
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseConcatenateSlices) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_concatenate_slices",
+      [](XlaBuilder*, XlaOp input) {
+        ConcatInDim(input.builder(),
+                    {Slice(input, {0}, {128}, {1}),
+                     Slice(input, {128}, {256}, {1})},
+                    0);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesSliceReference(actual, MakeElementwiseLhs(), /*start=*/0,
+                              /*size=*/256);
+}
+
 TEST(MetalGpuExecutableTest, ReductionSum) {
   auto result = ExecuteMetalReduction(HloOpcode::kAdd, 0.0f);
   if (absl::IsFailedPrecondition(result.status())) {
