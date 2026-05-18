@@ -846,6 +846,77 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg0[v2] = v5;"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsNestedDiamondToOuterMerge) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @pad_like(ptr %arg0, ptr %arg1, ptr %arg2, ptr %arg3) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %row = udiv i32 %tid, 3
+  %col = urem i32 %tid, 3
+  %in_outer = icmp sle i32 %row, 2
+  br i1 %in_outer, label %check_inner, label %outer_else
+
+check_inner:
+  %row_ok = icmp sge i32 %row, 1
+  %col_ok = icmp sle i32 %col, 1
+  %in_inner = and i1 %row_ok, %col_ok
+  br i1 %in_inner, label %inner_then, label %inner_else
+
+inner_then:
+  %source_index = add i32 %tid, -2
+  %lhs_gep = getelementptr inbounds [6 x float], ptr %arg1, i32 0, i32 %source_index
+  %lhs = load float, ptr %lhs_gep, align 4
+  %rhs_gep = getelementptr inbounds [6 x float], ptr %arg2, i32 0, i32 %source_index
+  %rhs = load float, ptr %rhs_gep, align 4
+  %base_gep = getelementptr inbounds [6 x float], ptr %arg0, i32 0, i32 %source_index
+  %base = load float, ptr %base_gep, align 4
+  %product = fmul float %lhs, %rhs
+  %sum = fadd float %base, %product
+  br label %inner_merge
+
+inner_else:
+  br label %inner_merge
+
+inner_merge:
+  %inner_value = phi float [ 0.000000e+00, %inner_else ], [ %sum, %inner_then ]
+  br label %outer_then_exit
+
+outer_then_exit:
+  br label %outer_merge
+
+outer_else:
+  br label %outer_merge
+
+outer_merge:
+  %value = phi float [ 1.000000e+00, %outer_else ], [ %inner_value, %outer_then_exit ]
+  br label %store
+
+store:
+  %out_gep = getelementptr inbounds [18 x float], ptr %arg3, i32 0, i32 %tid
+  store float %value, ptr %out_gep, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @pad_like, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("} else {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("float(1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg3[v0] = "), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsAtomicFloatAdd) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

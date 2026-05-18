@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/metal_msl_emitter.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -820,10 +821,101 @@ class FunctionEmitter {
         continue;
       }
 
+      if (const llvm::BasicBlock* continuation =
+              FindCommonStructuredContinuation(true_block, false_block,
+                                               stop_block)) {
+        absl::StrAppend(output, Indent(indent), "if (", condition, ") {\n");
+        absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
+        RETURN_IF_ERROR(EmitStructuredBlock(true_block, continuation, output,
+                                            indent + 1, &true_visited));
+        absl::StrAppend(output, Indent(indent), "} else {\n");
+        absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
+        RETURN_IF_ERROR(EmitStructuredBlock(false_block, continuation, output,
+                                            indent + 1, &false_visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        visited->insert(true_visited.begin(), true_visited.end());
+        visited->insert(false_visited.begin(), false_visited.end());
+        block = continuation;
+        continue;
+      }
+
       return Unsupported(function_, "control flow shape", *terminator);
     }
 
     return absl::OkStatus();
+  }
+
+  absl::flat_hash_map<const llvm::BasicBlock*, int> ReachableBlockDistances(
+      const llvm::BasicBlock* start) const {
+    absl::flat_hash_map<const llvm::BasicBlock*, int> distances;
+    if (start == nullptr) return distances;
+
+    std::vector<const llvm::BasicBlock*> worklist = {start};
+    distances.insert_or_assign(start, 0);
+    for (size_t i = 0; i < worklist.size(); ++i) {
+      const llvm::BasicBlock* block = worklist[i];
+      int next_distance = distances.at(block) + 1;
+      const llvm::Instruction* terminator = block->getTerminator();
+      if (llvm::isa<llvm::ReturnInst>(terminator)) continue;
+
+      auto add_successor = [&](const llvm::BasicBlock* successor) {
+        if (successor == nullptr || distances.contains(successor)) return;
+        distances.insert_or_assign(successor, next_distance);
+        worklist.push_back(successor);
+      };
+
+      if (const auto* branch =
+              llvm::dyn_cast<llvm::UncondBrInst>(terminator)) {
+        add_successor(branch->getSuccessor(0));
+        continue;
+      }
+      if (const auto* branch = llvm::dyn_cast<llvm::CondBrInst>(terminator)) {
+        add_successor(branch->getSuccessor(0));
+        add_successor(branch->getSuccessor(1));
+      }
+    }
+    return distances;
+  }
+
+  const llvm::BasicBlock* FindCommonStructuredContinuation(
+      const llvm::BasicBlock* true_block, const llvm::BasicBlock* false_block,
+      const llvm::BasicBlock* stop_block) const {
+    absl::flat_hash_map<const llvm::BasicBlock*, int> true_distances =
+        ReachableBlockDistances(true_block);
+    absl::flat_hash_map<const llvm::BasicBlock*, int> false_distances =
+        ReachableBlockDistances(false_block);
+
+    const llvm::BasicBlock* best = nullptr;
+    int best_score = 0;
+    for (const llvm::BasicBlock& candidate_ref : function_) {
+      const llvm::BasicBlock* candidate = &candidate_ref;
+      if (candidate == true_block || candidate == false_block ||
+          candidate == stop_block) {
+        continue;
+      }
+      auto true_it = true_distances.find(candidate);
+      auto false_it = false_distances.find(candidate);
+      if (true_it == true_distances.end() ||
+          false_it == false_distances.end()) {
+        continue;
+      }
+      if (!CanEmitStructuredBlockToStop(true_block, candidate) ||
+          !CanEmitStructuredBlockToStop(false_block, candidate)) {
+        continue;
+      }
+      if (stop_block != nullptr &&
+          !CanEmitStructuredBlockToStop(candidate, stop_block)) {
+        continue;
+      }
+
+      int score = std::max(true_it->second, false_it->second) * 1000 +
+                  true_it->second + false_it->second;
+      if (best == nullptr || score < best_score) {
+        best = candidate;
+        best_score = score;
+      }
+    }
+    return best;
   }
 
   bool CanEmitStructuredBlockToStop(const llvm::BasicBlock* block,
