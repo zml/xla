@@ -694,6 +694,10 @@ class FunctionEmitter {
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction)) {
       return BinaryExpr(*binary);
     }
+    if (instruction.getOpcode() == llvm::Instruction::FNeg) {
+      TF_ASSIGN_OR_RETURN(std::string operand, Expr(instruction.getOperand(0)));
+      return absl::StrCat("(-", operand, ")");
+    }
     if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(&instruction)) {
       return ICmpExpr(*icmp);
     }
@@ -911,6 +915,7 @@ class FunctionEmitter {
     if (name == "__nv_cosf") return UnaryMathCall("cos", call);
     if (name == "__nv_expf") return UnaryMathCall("exp", call);
     if (name == "__nv_logf") return UnaryMathCall("log", call);
+    if (name == "__nv_fmaf") return TernaryMathCall("fma", call);
 
     return Unsupported(function_, "call", call);
   }
@@ -995,6 +1000,15 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(call.getArgOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(call.getArgOperand(1)));
     return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
+  }
+
+  absl::StatusOr<std::string> TernaryMathCall(absl::string_view msl_name,
+                                              const llvm::CallInst& call) {
+    if (call.arg_size() != 3) return Unsupported(function_, "math call", call);
+    TF_ASSIGN_OR_RETURN(std::string arg0, Expr(call.getArgOperand(0)));
+    TF_ASSIGN_OR_RETURN(std::string arg1, Expr(call.getArgOperand(1)));
+    TF_ASSIGN_OR_RETURN(std::string arg2, Expr(call.getArgOperand(2)));
+    return absl::StrCat(msl_name, "(", arg0, ", ", arg1, ", ", arg2, ")");
   }
 
   absl::StatusOr<std::string> VoidCallStatement(const llvm::CallInst& call) {
