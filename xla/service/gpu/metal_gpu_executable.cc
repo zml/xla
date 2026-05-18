@@ -283,7 +283,7 @@ class ElementwiseAirEmitter {
       return EmitValue(instr->operand(0), force_scalar, body);
     }
     if (instr->opcode() == HloOpcode::kSlice) {
-      return EmitSlice(instr, body);
+      return EmitSlice(instr, force_scalar, body);
     }
 
     if (instr->IsConstant()) {
@@ -311,6 +311,8 @@ class ElementwiseAirEmitter {
         return EmitCall(instr, body);
       case HloOpcode::kConcatenate:
         return EmitConcatenate(instr, body);
+      case HloOpcode::kIota:
+        return EmitIota(instr, body);
       case HloOpcode::kTranspose:
         return EmitTranspose(instr, body);
       case HloOpcode::kCompare:
@@ -491,6 +493,7 @@ class ElementwiseAirEmitter {
   }
 
   absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,
+                                        bool force_scalar,
                                         std::vector<std::string>* body) {
     if (!IsF32Array(instr->shape()) ||
         !IsF32Array(instr->operand(0)->shape()) ||
@@ -501,11 +504,13 @@ class ElementwiseAirEmitter {
           "Metal direct AIR elementwise slice currently supports only rank-1 "
           "f32 slices.");
     }
-    if (ShapeUtil::ElementsIn(instr->shape()) !=
-        ShapeUtil::ElementsIn(result_shape_)) {
+    const int64_t slice_elements = ShapeUtil::ElementsIn(instr->shape());
+    if ((!force_scalar &&
+         slice_elements != ShapeUtil::ElementsIn(result_shape_)) ||
+        (force_scalar && slice_elements != 1)) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise slice must have the same element count "
-          "as the final result.");
+          "as the final result, unless used as a scalar operand.");
     }
 
     const HloInstruction* operand = instr->operand(0);
@@ -522,7 +527,7 @@ class ElementwiseAirEmitter {
         InputIndexForParameter(operand->parameter_number());
     const int64_t start = instr->slice_starts(0);
     const int64_t stride = instr->slice_strides(0);
-    std::string source_index = "%idx";
+    std::string source_index = force_scalar ? "0" : "%idx";
     if (stride != 1) {
       std::string scaled = NewName("slice_scaled");
       body->push_back(absl::StrFormat("  %s = mul i64 %%idx, %d", scaled,
@@ -536,6 +541,21 @@ class ElementwiseAirEmitter {
       source_index = shifted;
     }
     return EmitLoad(input_index, source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitIota(const HloInstruction* instr,
+                                       std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        instr->shape().dimensions().size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise iota currently supports only rank-1 "
+          "f32 iota results over dimension 0.");
+    }
+    std::string value = NewName("iota");
+    body->push_back(
+        absl::StrFormat("  %s = uitofp i64 %%idx to float", value));
+    return value;
   }
 
   int InputIndexForParameter(int64_t parameter_number) {

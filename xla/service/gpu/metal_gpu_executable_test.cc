@@ -205,6 +205,17 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseWhereCall() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalIota() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_iota");
+  Add(Iota(&builder, F32, 16), Broadcast(ConstantR0<float>(&builder, 1.0f),
+                                        {16}));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+  std::vector<GlobalData*> arguments;
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
                                               float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -688,6 +699,36 @@ TEST(MetalGpuExecutableTest, ElementwiseConcatenateSlices) {
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesSliceReference(actual, MakeElementwiseLhs(), /*start=*/0,
                               /*size=*/256);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScalarSliceBroadcast) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_scalar_slice_broadcast",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp scalar = Reshape(Slice(input, {0}, {1}, {1}), {});
+        Add(Broadcast(scalar, {kElementCount}),
+            Broadcast(ConstantR0<float>(builder, 1.0f), {kElementCount}));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t) { return input.Get<float>({0}) + 1.0f; });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseIota) {
+  auto result = ExecuteMetalIota();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {16})));
+  for (int64_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), static_cast<float>(i + 1));
+  }
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {
