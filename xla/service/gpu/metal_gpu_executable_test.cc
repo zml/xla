@@ -360,6 +360,113 @@ absl::StatusOr<Literal> ExecuteMetalTopKValuesRank1() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalTopKIndicesRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_topk_indices_rank1");
+  Shape shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  GetTupleElement(TopK(input, 3, /*largest=*/true), 1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalSortDescendingExpression() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaBuilder comparator_builder("metal_desc_sort_comparator");
+  XlaOp lhs = Parameter(&comparator_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&comparator_builder, 1, scalar_shape, "rhs");
+  Lt(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation comparator, comparator_builder.Build());
+
+  XlaBuilder builder("metal_sort_descending_expression");
+  Shape shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Neg(Sort({Neg(input)}, comparator, 0, /*is_stable=*/true));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalClamp() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_clamp");
+  Shape shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Clamp(Broadcast(ConstantR0<float>(&builder, -0.5f), {kElementCount}), input,
+        Broadcast(ConstantR0<float>(&builder, 0.75f), {kElementCount}));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReverseRank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_reverse_rank2");
+  Shape shape = ShapeUtil::MakeShape(F32, {3, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Rev(input, {0, 1});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(3, 4);
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      values(row, col) = static_cast<float>(row * 4 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalDynamicSliceDynamicStart() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dynamic_slice_dynamic_start");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp row_start = Parameter(&builder, 1, scalar_shape, "row_start");
+  DynamicSlice(input, {row_start, ConstantR0<int32_t>(&builder, 2)}, {2, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      values(row, col) = static_cast<float>(row * 5 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  Literal row_start_literal = LiteralUtil::CreateR0<int32_t>(1);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> row_start_data,
+                      client->TransferToServer(row_start_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), row_start_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1314,6 +1421,81 @@ TEST(MetalGpuExecutableTest, ElementwiseTopKValuesRank1) {
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3})));
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKIndicesRank1) {
+  auto result = ExecuteMetalTopKIndicesRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<int32_t> expected = {3, 6, 7};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {3})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<int32_t>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSortDescendingExpression) {
+  auto result = ExecuteMetalSortDescendingExpression();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {4.0f,  3.0f,  2.0f,  1.5f,
+                                 0.25f, 0.25f, -1.0f, -2.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseClamp) {
+  auto result = ExecuteMetalClamp();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
+    return std::min(std::max(input.Get<float>({i}), -0.5f), 0.75f);
+  });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReverseRank2) {
+  auto result = ExecuteMetalReverseRank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}),
+                static_cast<float>((2 - row) * 4 + (3 - col)))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceDynamicStart) {
+  auto result = ExecuteMetalDynamicSliceDynamicStart();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}),
+                static_cast<float>((row + 1) * 5 + (col + 2)))
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 

@@ -411,10 +411,14 @@ class ElementwiseAirEmitter {
     switch (instr->opcode()) {
       case HloOpcode::kCall:
         return EmitCall(instr, force_scalar, body);
+      case HloOpcode::kClamp:
+        return EmitClamp(instr, body);
       case HloOpcode::kConcatenate:
         return EmitConcatenate(instr, body);
       case HloOpcode::kConvert:
         return EmitConvert(instr, body);
+      case HloOpcode::kDynamicSlice:
+        return EmitDynamicSlice(instr, body);
       case HloOpcode::kGather:
         return EmitGather(instr, body);
       case HloOpcode::kGetTupleElement:
@@ -431,6 +435,8 @@ class ElementwiseAirEmitter {
         return EmitCompare(instr, body);
       case HloOpcode::kReduce:
         return EmitReduce(instr, body);
+      case HloOpcode::kReverse:
+        return EmitReverse(instr, body);
       case HloOpcode::kSelect:
         return EmitSelect(instr, body);
       case HloOpcode::kSort:
@@ -564,6 +570,35 @@ class ElementwiseAirEmitter {
                           EmitSliceSourceIndex(instr, index, body));
       return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
     }
+    if (instr->opcode() == HloOpcode::kDynamicSlice) {
+      TF_ASSIGN_OR_RETURN(std::string source_index,
+                          EmitDynamicSliceSourceIndex(instr, index, body));
+      return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+    }
+    if (instr->opcode() == HloOpcode::kReverse) {
+      TF_ASSIGN_OR_RETURN(std::string source_index,
+                          EmitReverseSourceIndex(instr, index, body));
+      return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+    }
+    if (instr->opcode() == HloOpcode::kNegate) {
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          EmitLoadFromLinearIndex(instr->operand(0), index,
+                                                  body));
+      std::string negated = NewName("linear_neg");
+      if (instr->shape().element_type() == S32) {
+        body->push_back(
+            absl::StrFormat("  %s = sub i32 0, %s", negated, value));
+        return negated;
+      }
+      if (instr->shape().element_type() == F32) {
+        body->push_back(
+            absl::StrFormat("  %s = fneg fast float %s", negated, value));
+        return negated;
+      }
+      return absl::UnimplementedError(
+          "Metal direct AIR linear load negate currently supports only f32 "
+          "and s32 arrays.");
+    }
     if (instr->opcode() == HloOpcode::kParameter) {
       if (const HloInstruction* override = CallParameterOverride(instr)) {
         return EmitLoadFromLinearIndex(override, index, body);
@@ -653,6 +688,132 @@ class ElementwiseAirEmitter {
                                     operand_minor));
     body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
                                     source_row_offset, source_col));
+    return source_index;
+  }
+
+  bool HasReverseDimension(const HloInstruction* instr, int64_t dimension) {
+    return absl::c_linear_search(instr->dimensions(), dimension);
+  }
+
+  absl::StatusOr<std::string> EmitReverseSourceIndex(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
+        instr->shape().element_type() != operand->shape().element_type() ||
+        !ShapeUtil::Equal(instr->shape(), operand->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reverse currently supports only f32/s32/pred "
+          "arrays with matching operand and result shapes.");
+    }
+    const int64_t rank = instr->shape().dimensions().size();
+    if (rank != 1 && rank != 2) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reverse currently supports only rank-1 and "
+          "rank-2 arrays.");
+    }
+
+    if (rank == 1) {
+      if (!HasReverseDimension(instr, 0)) {
+        return std::string(index);
+      }
+      std::string reversed = NewName("reverse_index");
+      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", reversed,
+                                      instr->shape().dimensions(0) - 1,
+                                      index));
+      return reversed;
+    }
+
+    const int64_t rows = instr->shape().dimensions(0);
+    const int64_t cols = instr->shape().dimensions(1);
+    std::string row = NewName("reverse_row");
+    std::string col = NewName("reverse_col");
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %s, %d", row, index, cols));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %s, %d", col, index, cols));
+    std::string source_row = row;
+    std::string source_col = col;
+    if (HasReverseDimension(instr, 0)) {
+      source_row = NewName("reverse_source_row");
+      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", source_row,
+                                      rows - 1, row));
+    }
+    if (HasReverseDimension(instr, 1)) {
+      source_col = NewName("reverse_source_col");
+      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", source_col,
+                                      cols - 1, col));
+    }
+    std::string row_offset = NewName("reverse_row_offset");
+    std::string source_index = NewName("reverse_index");
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                    source_row, cols));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                    row_offset, source_col));
+    return source_index;
+  }
+
+  absl::StatusOr<std::string> EmitDynamicSliceSourceIndex(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    if (!IsF32Array(instr->shape()) || !IsF32Array(operand->shape()) ||
+        instr->shape().dimensions().size() != operand->shape().dimensions().size() ||
+        instr->operand_count() != instr->shape().dimensions().size() + 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dynamic-slice currently supports only f32 arrays "
+          "with one start index per dimension.");
+    }
+    const int64_t rank = instr->shape().dimensions().size();
+    if (rank != 1 && rank != 2) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dynamic-slice currently supports only rank-1 and "
+          "rank-2 arrays.");
+    }
+
+    std::vector<std::string> starts;
+    starts.reserve(rank);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      const HloInstruction* start = instr->operand(dim + 1);
+      if (!IsScalarLikeS32(start->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR dynamic-slice requires scalar s32 start "
+            "indices.");
+      }
+      TF_ASSIGN_OR_RETURN(std::string raw,
+                          EmitValue(start, /*force_scalar=*/true, body));
+      const int64_t max_start =
+          operand->shape().dimensions(dim) - instr->shape().dimensions(dim);
+      starts.push_back(EmitClampedStartIndex(raw, max_start, body));
+    }
+
+    if (rank == 1) {
+      std::string source_index = NewName("dynamic_slice_index");
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      index, starts[0]));
+      return source_index;
+    }
+
+    const int64_t result_minor = instr->shape().dimensions(1);
+    const int64_t operand_minor = operand->shape().dimensions(1);
+    std::string row = NewName("dynamic_slice_row");
+    std::string col = NewName("dynamic_slice_col");
+    std::string source_row = NewName("dynamic_slice_source_row");
+    std::string source_col = NewName("dynamic_slice_source_col");
+    std::string row_offset = NewName("dynamic_slice_row_offset");
+    std::string source_index = NewName("dynamic_slice_index");
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %s, %d", row, index, result_minor));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %s, %d", col, index, result_minor));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_row, row,
+                                    starts[0]));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_col, col,
+                                    starts[1]));
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                    source_row, operand_minor));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                    row_offset, source_col));
     return source_index;
   }
 
@@ -797,19 +958,18 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(bool descending, SortDescending(instr));
     return EmitRank1F32OrderStatistic(instr->operand(0),
                                       ShapeUtil::ElementsIn(instr->shape()),
-                                      descending, body);
+                                      descending, body,
+                                      /*return_index=*/false);
   }
 
   absl::StatusOr<std::string> EmitGetTupleElement(
       const HloInstruction* instr, std::vector<std::string>* body) {
-    if (instr->tuple_index() != 0 ||
-        instr->operand(0)->opcode() != HloOpcode::kTopK ||
-        !IsF32Array(instr->shape()) ||
+    if (instr->operand(0)->opcode() != HloOpcode::kTopK ||
         instr->shape().dimensions().size() != 1 ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
           "Metal direct AIR get-tuple-element currently supports only the "
-          "values output of rank-1 f32 topk.");
+          "values or indices output of rank-1 f32 topk.");
     }
 
     const auto* topk = Cast<HloTopKInstruction>(instr->operand(0));
@@ -821,13 +981,25 @@ class ElementwiseAirEmitter {
           "inputs with a rank-1 f32 values result.");
     }
 
+    if (instr->tuple_index() == 1 && IsS32Array(instr->shape())) {
+      return EmitRank1F32OrderStatistic(
+          input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
+          /*return_index=*/true);
+    }
+    if (instr->tuple_index() != 0 || !IsF32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR topk get-tuple-element supports only f32 values "
+          "or s32 indices.");
+    }
+
     return EmitRank1F32OrderStatistic(
-        input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body);
+        input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
+        /*return_index=*/false);
   }
 
   absl::StatusOr<std::string> EmitRank1F32OrderStatistic(
       const HloInstruction* input, int64_t input_elements, bool descending,
-      std::vector<std::string>* body) {
+      std::vector<std::string>* body, bool return_index) {
     if (input_elements <= 0) {
       return absl::UnimplementedError(
           "Metal direct AIR rank-1 ordering does not support empty inputs.");
@@ -858,6 +1030,9 @@ class ElementwiseAirEmitter {
     const std::string has_output_rank = NewName("order_has_output_rank");
     const std::string selected_next = NewName("order_selected_next");
     const std::string j_next = NewName("order_j_next");
+    const absl::string_view selected_type = return_index ? "i32" : "float";
+    const absl::string_view selected_init =
+        return_index ? "0" : "0x0000000000000000";
 
     body->push_back(absl::StrFormat("  br label %%%s", outer));
     body->push_back(absl::StrFormat("%s:", outer));
@@ -865,8 +1040,8 @@ class ElementwiseAirEmitter {
         "  %s = phi i32 [ 0, %%body ], [ %s, %%%s ]", j, j_next,
         after_inner));
     body->push_back(absl::StrFormat(
-        "  %s = phi float [ 0x0000000000000000, %%body ], [ %s, %%%s ]",
-        selected, selected_next, after_inner));
+        "  %s = phi %s [ %s, %%body ], [ %s, %%%s ]", selected,
+        selected_type, selected_init, selected_next, after_inner));
     body->push_back(absl::StrFormat("  %s = icmp ult i32 %s, %d", j_in_range,
                                     j, input_elements));
     body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
@@ -916,9 +1091,15 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("%s:", after_inner));
     body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %%idx32",
                                     has_output_rank, rank));
-    body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, float %s, float %s", selected_next,
-        has_output_rank, candidate_value, selected));
+    if (return_index) {
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i32 %s, i32 %s", selected_next,
+          has_output_rank, j, selected));
+    } else {
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, float %s, float %s", selected_next,
+          has_output_rank, candidate_value, selected));
+    }
     body->push_back(absl::StrFormat("  %s = add i32 %s, 1", j_next, j));
     body->push_back(absl::StrFormat("  br label %%%s", outer));
 
@@ -941,6 +1122,32 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(
         std::string source_index,
         EmitSliceSourceIndex(instr, force_scalar ? "0" : "%idx", body));
+    return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitDynamicSlice(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (ShapeUtil::ElementsIn(instr->shape()) !=
+        ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dynamic-slice result must have the same element "
+          "count as the final result.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source_index,
+                        EmitDynamicSliceSourceIndex(instr, "%idx", body));
+    return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitReverse(const HloInstruction* instr,
+                                          std::vector<std::string>* body) {
+    if (ShapeUtil::ElementsIn(instr->shape()) !=
+        ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reverse result must have the same element count "
+          "as the final result.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source_index,
+                        EmitReverseSourceIndex(instr, "%idx", body));
     return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
   }
 
@@ -1159,6 +1366,30 @@ class ElementwiseAirEmitter {
       }
     }
     return nullptr;
+  }
+
+  absl::StatusOr<std::string> EmitClamp(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+        instr->operand_count() != 3) {
+      return absl::UnimplementedError(
+          "Metal direct AIR clamp currently supports only f32 and s32 arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string min,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string max,
+                        EmitValue(instr->operand(2), IsScalarOperand(instr, 2),
+                                  body));
+    if (instr->shape().element_type() == S32) {
+      std::string lower_bounded = EmitIntCompareSelect("sgt", value, min, body);
+      return EmitIntCompareSelect("slt", lower_bounded, max, body);
+    }
+    std::string lower_bounded = EmitCompareSelect("ogt", value, min, body);
+    return EmitCompareSelect("olt", lower_bounded, max, body);
   }
 
   absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
@@ -2285,6 +2516,32 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat(
         "  %s = select i1 %s, i32 %s, i32 %s", value, cmp, lhs, rhs));
     return value;
+  }
+
+  std::string EmitClampedStartIndex(absl::string_view raw_start,
+                                    int64_t max_start,
+                                    std::vector<std::string>* body) {
+    if (max_start <= 0) {
+      return "0";
+    }
+    std::string below_zero = NewName("start_below_zero");
+    std::string above_end = NewName("start_above_end");
+    std::string low_clamped = NewName("start_low_clamped");
+    std::string clamped = NewName("start_clamped");
+    std::string clamped_i64 = NewName("start_i64");
+    body->push_back(absl::StrFormat("  %s = icmp slt i32 %s, 0", below_zero,
+                                    raw_start));
+    body->push_back(absl::StrFormat("  %s = icmp sgt i32 %s, %d", above_end,
+                                    raw_start, max_start));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 0, i32 %s", low_clamped, below_zero,
+        raw_start));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %d, i32 %s", clamped, above_end, max_start,
+        low_clamped));
+    body->push_back(
+        absl::StrFormat("  %s = sext i32 %s to i64", clamped_i64, clamped));
+    return clamped_i64;
   }
 
   std::string NewName(absl::string_view prefix) {
