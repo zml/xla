@@ -133,6 +133,7 @@ absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernelFromMsl(
   kernel->set_library(library);
   kernel->set_function(function);
   kernel->set_pipeline(pipeline);
+  kernel->set_uses_argument_buffer(arity > 31);
   return kernel;
 }
 

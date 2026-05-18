@@ -59,6 +59,7 @@ absl::StatusOr<void*> CompileLibrary(void* device, absl::string_view source);
 absl::StatusOr<void*> NewFunction(void* library, absl::string_view name);
 absl::StatusOr<void*> NewComputePipeline(void* device, void* function);
 absl::StatusOr<void*> Launch(void* command_queue, void* pipeline,
+                             void* function, bool use_argument_buffer,
                              absl::Span<const MetalKernelArgument> arguments,
                              const ThreadDim& thread_dims,
                              const BlockDim& block_dims,

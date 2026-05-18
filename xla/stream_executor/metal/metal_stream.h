@@ -62,6 +62,12 @@ class MetalStream : public StreamCommon {
 
   Stream::PlatformSpecificHandle platform_specific_handle() const override;
 
+  absl::Status LaunchMetalKernel(
+      const ThreadDim& thread_dims, const BlockDim& block_dims,
+      const std::optional<ClusterDim>& cluster_dims, void* pipeline,
+      void* function, bool use_argument_buffer, absl::string_view name,
+      void** args, int64_t shmem_bytes, bool use_pdl);
+
  private:
   absl::Status LaunchKernel(const ThreadDim& thread_dims,
                             const BlockDim& block_dims,

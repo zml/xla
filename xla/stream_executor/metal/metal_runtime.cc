@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "absl/status/status.h"
@@ -208,6 +209,7 @@ absl::StatusOr<void*> NewComputePipeline(void* device, void* function) {
 }
 
 absl::StatusOr<void*> Launch(void* command_queue, void* pipeline,
+                             void* function, bool use_argument_buffer,
                              absl::Span<const MetalKernelArgument> arguments,
                              const ThreadDim& thread_dims,
                              const BlockDim& block_dims,
@@ -229,14 +231,53 @@ absl::StatusOr<void*> Launch(void* command_queue, void* pipeline,
     return absl::InternalError("Failed to create Metal compute encoder.");
   }
   [encoder setComputePipelineState:Obj<id<MTLComputePipelineState>>(pipeline)];
-  for (NSUInteger i = 0; i < arguments.size(); ++i) {
-    const MetalKernelArgument& arg = arguments[i];
-    if (arg.buffer != nullptr) {
-      [encoder setBuffer:Obj<id<MTLBuffer>>(arg.buffer)
-                  offset:arg.offset
-                 atIndex:i];
-    } else {
-      [encoder setBytes:arg.bytes length:arg.bytes_size atIndex:i];
+  if (use_argument_buffer) {
+    if (function == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal argument-buffer launch requires a function object.");
+    }
+    id<MTLArgumentEncoder> argument_encoder =
+        [Obj<id<MTLFunction>>(function) newArgumentEncoderWithBufferIndex:0];
+    if (argument_encoder == nil) {
+      return absl::InternalError("Failed to create Metal argument encoder.");
+    }
+    id<MTLBuffer> argument_buffer = [[Obj<id<MTLCommandQueue>>(command_queue)
+        device] newBufferWithLength:[argument_encoder encodedLength]
+                            options:MTLResourceStorageModeShared];
+    if (argument_buffer == nil) {
+      return absl::ResourceExhaustedError(
+          "Failed to allocate Metal argument buffer.");
+    }
+    [argument_encoder setArgumentBuffer:argument_buffer offset:0];
+    for (NSUInteger i = 0; i < arguments.size(); ++i) {
+      const MetalKernelArgument& arg = arguments[i];
+      if (arg.buffer != nullptr) {
+        [argument_encoder setBuffer:Obj<id<MTLBuffer>>(arg.buffer)
+                              offset:arg.offset
+                             atIndex:i];
+        [encoder useResource:Obj<id<MTLBuffer>>(arg.buffer)
+                       usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+      } else {
+        void* dst = [argument_encoder constantDataAtIndex:i];
+        if (dst == nullptr) {
+          return absl::InternalError(
+              absl::StrCat("Metal argument buffer has no constant slot ", i,
+                           "."));
+        }
+        std::memcpy(dst, arg.bytes, arg.bytes_size);
+      }
+    }
+    [encoder setBuffer:argument_buffer offset:0 atIndex:0];
+  } else {
+    for (NSUInteger i = 0; i < arguments.size(); ++i) {
+      const MetalKernelArgument& arg = arguments[i];
+      if (arg.buffer != nullptr) {
+        [encoder setBuffer:Obj<id<MTLBuffer>>(arg.buffer)
+                    offset:arg.offset
+                   atIndex:i];
+      } else {
+        [encoder setBytes:arg.bytes length:arg.bytes_size atIndex:i];
+      }
     }
   }
 

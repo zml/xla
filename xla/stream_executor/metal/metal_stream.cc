@@ -147,6 +147,17 @@ absl::Status MetalStream::LaunchKernel(
     const ThreadDim& thread_dims, const BlockDim& block_dims,
     const std::optional<ClusterDim>& cluster_dims, void* function,
     absl::string_view name, void** args, int64_t shmem_bytes, bool use_pdl) {
+  return LaunchMetalKernel(thread_dims, block_dims, cluster_dims,
+                           /*pipeline=*/function, /*function=*/nullptr,
+                           /*use_argument_buffer=*/false, name, args,
+                           shmem_bytes, use_pdl);
+}
+
+absl::Status MetalStream::LaunchMetalKernel(
+    const ThreadDim& thread_dims, const BlockDim& block_dims,
+    const std::optional<ClusterDim>& cluster_dims, void* pipeline,
+    void* function, bool use_argument_buffer, absl::string_view name,
+    void** args, int64_t shmem_bytes, bool use_pdl) {
   if (cluster_dims.has_value()) {
     return absl::UnimplementedError("Metal cluster launches are not supported.");
   }
@@ -177,8 +188,9 @@ absl::Status MetalStream::LaunchKernel(
 
   TF_ASSIGN_OR_RETURN(
       void* command_buffer,
-      metal::Launch(executor_->command_queue(), function, arguments,
-                    thread_dims, block_dims, shmem_bytes));
+      metal::Launch(executor_->command_queue(), pipeline, function,
+                    use_argument_buffer, arguments, thread_dims, block_dims,
+                    shmem_bytes));
   SetLastCommandBuffer(command_buffer);
   return absl::OkStatus();
 }

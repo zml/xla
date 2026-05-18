@@ -42,6 +42,9 @@ class MetalKernel : public Kernel {
   void set_pipeline(void* pipeline) { pipeline_ = pipeline; }
 
   void* pipeline() const { return pipeline_; }
+  void set_uses_argument_buffer(bool uses_argument_buffer) {
+    uses_argument_buffer_ = uses_argument_buffer;
+  }
 
   absl::StatusOr<int32_t> GetMaxOccupiedBlocksPerCore(
       ThreadDim threads, size_t dynamic_shared_memory_bytes) const override;
@@ -56,6 +59,7 @@ class MetalKernel : public Kernel {
   void* function_ = nullptr;
   void* pipeline_ = nullptr;
   unsigned arity_ = 0;
+  bool uses_argument_buffer_ = false;
 };
 
 }  // namespace stream_executor::metal

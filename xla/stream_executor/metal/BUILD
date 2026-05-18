@@ -68,6 +68,7 @@ cc_library(
     hdrs = ["metal_kernel.h"],
     deps = [
         ":metal_runtime",
+        ":metal_stream",
         "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:kernel",
         "//xla/stream_executor:kernel_spec",

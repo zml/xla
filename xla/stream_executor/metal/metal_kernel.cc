@@ -27,6 +27,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/metal/metal_runtime.h"
+#include "xla/stream_executor/metal/metal_stream.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/statusor.h"
@@ -83,10 +84,14 @@ absl::Status MetalKernel::Launch(
     size_t kernel_args_size = kernel_arg_addresses.size();
     std::array<void*, 2> config = {kernel_arg_addresses.data(),
                                    &kernel_args_size};
-    return stream->LaunchKernel(
-        thread_dims, block_dims, cluster_dims, pipeline_, name(),
-        reinterpret_cast<void**>(config.data()), packed.number_of_shared_bytes(),
-        use_pdl());
+    auto* metal_stream = dynamic_cast<MetalStream*>(stream);
+    if (metal_stream == nullptr) {
+      return absl::InvalidArgumentError("Expected a MetalStream.");
+    }
+    return metal_stream->LaunchMetalKernel(
+        thread_dims, block_dims, cluster_dims, pipeline_, function_,
+        uses_argument_buffer_, name(), reinterpret_cast<void**>(config.data()),
+        packed.number_of_shared_bytes(), use_pdl());
   };
 
   if (auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {

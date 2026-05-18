@@ -212,6 +212,45 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg2[v0] ="), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsArgumentBufferForLargeArityKernels) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @many_args(ptr %arg0, ptr %arg1, ptr %arg2, ptr %arg3, ptr %arg4, ptr %arg5, ptr %arg6, ptr %arg7, ptr %arg8, ptr %arg9, ptr %arg10, ptr %arg11, ptr %arg12, ptr %arg13, ptr %arg14, ptr %arg15, ptr %arg16, ptr %arg17, ptr %arg18, ptr %arg19, ptr %arg20, ptr %arg21, ptr %arg22, ptr %arg23, ptr %arg24, ptr %arg25, ptr %arg26, ptr %arg27, ptr %arg28, ptr %arg29, ptr %arg30, ptr %arg31) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x float], ptr %arg31, i32 0, i32 %tid
+  %value = load float, ptr %in, align 4
+  %out = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %tid
+  store float %value, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @many_args, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("struct many_args_args"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("device float* arg31 [[id(31)]]"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("kernel void many_args(device many_args_args& args "
+                     "[[buffer(0)]]"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("device float* arg31 = args.arg31;"), std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("[[buffer(31)]]"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsInlineComplexAggregateValue) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -534,7 +573,7 @@ declare float @__nv_log1pf(float)
   EXPECT_NE(msl.find("rint(v2)"), std::string::npos) << msl;
   EXPECT_NE(msl.find("pow(v3, float(2))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("copysign(v4, v1)"), std::string::npos) << msl;
-  EXPECT_NE(msl.find("log1p(v5)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("log((1.0f + v5))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
 }
 

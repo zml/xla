@@ -50,6 +50,8 @@ namespace xla {
 namespace gpu {
 namespace {
 
+constexpr size_t kMaxDirectMetalBufferArguments = 31;
+
 std::string PrintLlvm(const llvm::Value& value) {
   std::string result;
   llvm::raw_string_ostream os(result);
@@ -340,10 +342,15 @@ class FunctionEmitter {
 
     InferPointerElementTypes();
     AssignNames();
+    TF_ASSIGN_OR_RETURN(std::string kernel_name, KernelName());
 
     std::string output;
-    RETURN_IF_ERROR(EmitSignature(&output));
+    if (UseArgumentBuffer()) {
+      RETURN_IF_ERROR(EmitArgumentBufferStruct(&output, kernel_name));
+    }
+    RETURN_IF_ERROR(EmitSignature(&output, kernel_name));
     absl::StrAppend(&output, " {\n");
+    RETURN_IF_ERROR(EmitArgumentAliases(&output));
     RETURN_IF_ERROR(EmitDeclarations(&output));
     RETURN_IF_ERROR(EmitBody(&output));
     absl::StrAppend(&output, "}\n");
@@ -491,7 +498,11 @@ class FunctionEmitter {
     return MslIdentifier(value->getName().str(), "unnamed");
   }
 
-  absl::Status EmitSignature(std::string* output) {
+  bool UseArgumentBuffer() const {
+    return function_.arg_size() > kMaxDirectMetalBufferArguments;
+  }
+
+  absl::StatusOr<std::string> KernelName() const {
     std::string kernel_name =
         MslIdentifier(function_.getName().str(), "xla_metal_kernel");
     if (kernel_name != function_.getName().str()) {
@@ -499,23 +510,55 @@ class FunctionEmitter {
           "Metal kernel name '", function_.getName().str(),
           "' is not a valid MSL identifier after XLA sanitization."));
     }
+    return kernel_name;
+  }
 
-    absl::StrAppend(output, "kernel void ", kernel_name, "(");
-    std::vector<std::string> params;
+  absl::Status EmitArgumentBufferStruct(std::string* output,
+                                        absl::string_view kernel_name) {
+    absl::StrAppend(output, "struct ", kernel_name, "_args {\n");
     int arg_index = 0;
     for (const llvm::Argument& arg : function_.args()) {
       std::string name = Name(&arg);
       if (arg.getType()->isPointerTy()) {
         llvm::Type* element_type = PointerElementType(&arg);
         TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(element_type));
-        params.push_back(absl::StrFormat("device %s* %s [[buffer(%d)]]",
-                                         msl_type, name, arg_index));
+        absl::StrAppend(output, "  device ", msl_type, "* ", name, " [[id(",
+                        arg_index, ")]];\n");
       } else {
         TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(arg.getType()));
-        params.push_back(absl::StrFormat("constant %s& %s [[buffer(%d)]]",
-                                         msl_type, name, arg_index));
+        absl::StrAppend(output, "  constant ", msl_type, "& ", name,
+                        " [[id(", arg_index, ")]];\n");
       }
       ++arg_index;
+    }
+    absl::StrAppend(output, "};\n\n");
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitSignature(std::string* output,
+                             absl::string_view kernel_name) {
+
+    absl::StrAppend(output, "kernel void ", kernel_name, "(");
+    std::vector<std::string> params;
+    if (UseArgumentBuffer()) {
+      params.push_back(
+          absl::StrFormat("device %s_args& args [[buffer(0)]]", kernel_name));
+    } else {
+      int arg_index = 0;
+      for (const llvm::Argument& arg : function_.args()) {
+        std::string name = Name(&arg);
+        if (arg.getType()->isPointerTy()) {
+          llvm::Type* element_type = PointerElementType(&arg);
+          TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(element_type));
+          params.push_back(absl::StrFormat("device %s* %s [[buffer(%d)]]",
+                                           msl_type, name, arg_index));
+        } else {
+          TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(arg.getType()));
+          params.push_back(absl::StrFormat("constant %s& %s [[buffer(%d)]]",
+                                           msl_type, name, arg_index));
+        }
+        ++arg_index;
+      }
     }
     params.push_back("uint3 metal_tid [[thread_position_in_threadgroup]]");
     params.push_back("uint3 metal_bid [[threadgroup_position_in_grid]]");
@@ -523,6 +566,25 @@ class FunctionEmitter {
     params.push_back("uint3 metal_nbid [[threadgroups_per_grid]]");
     params.push_back("uint3 metal_gid [[thread_position_in_grid]]");
     absl::StrAppend(output, absl::StrJoin(params, ", "), ")");
+    return absl::OkStatus();
+  }
+
+  absl::Status EmitArgumentAliases(std::string* output) {
+    if (!UseArgumentBuffer()) return absl::OkStatus();
+
+    for (const llvm::Argument& arg : function_.args()) {
+      std::string name = Name(&arg);
+      if (arg.getType()->isPointerTy()) {
+        llvm::Type* element_type = PointerElementType(&arg);
+        TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(element_type));
+        absl::StrAppend(output, "  device ", msl_type, "* ", name,
+                        " = args.", name, ";\n");
+      } else {
+        TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(arg.getType()));
+        absl::StrAppend(output, "  ", msl_type, " ", name, " = args.", name,
+                        ";\n");
+      }
+    }
     return absl::OkStatus();
   }
 
@@ -1437,7 +1499,7 @@ class FunctionEmitter {
     if (name == "__nv_cosf") return UnaryMathCall("cos", call);
     if (name == "__nv_expf") return UnaryMathCall("exp", call);
     if (name == "__nv_logf") return UnaryMathCall("log", call);
-    if (name == "__nv_log1pf") return UnaryMathCall("log1p", call);
+    if (name == "__nv_log1pf") return Log1pCall(call);
     if (name == "__nv_floorf") return UnaryMathCall("floor", call);
     if (name == "__nv_ceilf") return UnaryMathCall("ceil", call);
     if (name == "__nv_roundf") return UnaryMathCall("round", call);
@@ -1716,6 +1778,12 @@ class FunctionEmitter {
     if (call.arg_size() != 1) return Unsupported(function_, "math call", call);
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(call.getArgOperand(0)));
     return absl::StrCat(msl_name, "(", operand, ")");
+  }
+
+  absl::StatusOr<std::string> Log1pCall(const llvm::CallInst& call) {
+    if (call.arg_size() != 1) return Unsupported(function_, "math call", call);
+    TF_ASSIGN_OR_RETURN(std::string operand, Expr(call.getArgOperand(0)));
+    return absl::StrCat("log((1.0f + ", operand, "))");
   }
 
   absl::StatusOr<std::string> BinaryMathCall(absl::string_view msl_name,
