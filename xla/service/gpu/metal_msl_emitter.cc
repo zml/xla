@@ -405,6 +405,7 @@ class FunctionEmitter {
     std::string base;
     std::string index;
     llvm::Type* element_type;
+    std::string address_space;
   };
 
   struct StoredInlineValue {
@@ -753,6 +754,45 @@ class FunctionEmitter {
                         ");\n");
         block = exit_block;
         continue;
+      }
+
+      if (const auto* branch =
+              llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+          branch != nullptr) {
+        const llvm::BasicBlock* true_block = branch->getSuccessor(0);
+        const llvm::BasicBlock* false_block = branch->getSuccessor(1);
+        if (CanEmitStructuredBlockToStop(true_block, block)) {
+          absl::StrAppend(output, Indent(indent), "while (true) {\n");
+          RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent + 1));
+          TF_ASSIGN_OR_RETURN(std::string condition,
+                              Expr(branch->getCondition()));
+          absl::StrAppend(output, Indent(indent + 1), "if (!(", condition,
+                          ")) {\n", Indent(indent + 2), "break;\n",
+                          Indent(indent + 1), "}\n");
+          RETURN_IF_ERROR(EmitStructuredBlock(true_block, block, output,
+                                              indent + 1, visited));
+          absl::StrAppend(output, Indent(indent), "}\n");
+          RETURN_IF_ERROR(EmitPhiAssignments(*false_block, block, output,
+                                             indent));
+          block = false_block;
+          continue;
+        }
+        if (CanEmitStructuredBlockToStop(false_block, block)) {
+          absl::StrAppend(output, Indent(indent), "while (true) {\n");
+          RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent + 1));
+          TF_ASSIGN_OR_RETURN(std::string condition,
+                              Expr(branch->getCondition()));
+          absl::StrAppend(output, Indent(indent + 1), "if (", condition,
+                          ") {\n", Indent(indent + 2), "break;\n",
+                          Indent(indent + 1), "}\n");
+          RETURN_IF_ERROR(EmitStructuredBlock(false_block, block, output,
+                                              indent + 1, visited));
+          absl::StrAppend(output, Indent(indent), "}\n");
+          RETURN_IF_ERROR(EmitPhiAssignments(*true_block, block, output,
+                                             indent));
+          block = true_block;
+          continue;
+        }
       }
 
       RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent));
@@ -1145,9 +1185,10 @@ class FunctionEmitter {
                         pointer.index, "] = ", value, ";\n");
       } else {
         TF_ASSIGN_OR_RETURN(std::string value_msl_type, MslType(value_type));
-        absl::StrAppend(output, Indent(indent), "*reinterpret_cast<device ",
-                        value_msl_type, "*>(&", pointer.base, "[",
-                        pointer.index, "]) = ", value, ";\n");
+        absl::StrAppend(output, Indent(indent), "*reinterpret_cast<",
+                        pointer.address_space, " ", value_msl_type, "*>(&",
+                        pointer.base, "[", pointer.index, "]) = ", value,
+                        ";\n");
       }
       return absl::OkStatus();
     }
@@ -1288,8 +1329,9 @@ class FunctionEmitter {
       if (load->getType() != pointer.element_type) {
         TF_ASSIGN_OR_RETURN(std::string load_msl_type,
                             MslType(load->getType()));
-        return absl::StrCat("(*reinterpret_cast<device ", load_msl_type,
-                            "*>(&", pointer.base, "[", pointer.index, "]))");
+        return absl::StrCat("(*reinterpret_cast<", pointer.address_space, " ",
+                            load_msl_type, "*>(&", pointer.base, "[",
+                            pointer.index, "]))");
       }
       return absl::StrCat(pointer.base, "[", pointer.index, "]");
     }
@@ -1330,9 +1372,71 @@ class FunctionEmitter {
             llvm::dyn_cast<llvm::ExtractElementInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(std::string vector, Expr(extract->getVectorOperand()));
       TF_ASSIGN_OR_RETURN(std::string index, Expr(extract->getIndexOperand()));
+      if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(
+              extract->getVectorOperand()->getType());
+          vector_type != nullptr && WideVectorTypeName(vector_type).has_value()) {
+        return absl::StrCat(vector, ".elements[", index, "]");
+      }
       return absl::StrCat(vector, "[", index, "]");
     }
+    if (auto* insert =
+            llvm::dyn_cast<llvm::InsertElementInst>(&instruction)) {
+      return InsertElementExpr(*insert);
+    }
     return Unsupported(function_, "instruction", instruction);
+  }
+
+  absl::StatusOr<std::string> VectorElementExpr(const llvm::Value* vector,
+                                                int index) {
+    auto* vector_type = llvm::cast<llvm::FixedVectorType>(vector->getType());
+    llvm::Type* element_type = vector_type->getElementType();
+    if (llvm::isa<llvm::UndefValue>(vector) ||
+        llvm::isa<llvm::PoisonValue>(vector) ||
+        llvm::isa<llvm::ConstantAggregateZero>(vector)) {
+      return ZeroInitializer(element_type);
+    }
+    if (auto* constant_data =
+            llvm::dyn_cast<llvm::ConstantDataVector>(vector)) {
+      return Expr(constant_data->getElementAsConstant(index));
+    }
+    TF_ASSIGN_OR_RETURN(std::string expression, Expr(vector));
+    if (WideVectorTypeName(vector_type).has_value()) {
+      return absl::StrCat(expression, ".elements[", index, "]");
+    }
+    return absl::StrCat(expression, "[", index, "]");
+  }
+
+  absl::StatusOr<std::string> InsertElementExpr(
+      const llvm::InsertElementInst& insert) {
+    auto* vector_type =
+        llvm::dyn_cast<llvm::FixedVectorType>(insert.getType());
+    if (vector_type == nullptr || vector_type->getNumElements() > 4) {
+      return Unsupported(function_, "vector insertion", insert);
+    }
+    auto* index = llvm::dyn_cast<llvm::ConstantInt>(insert.getOperand(2));
+    if (index == nullptr) {
+      return Unsupported(function_, "dynamic vector insertion", insert);
+    }
+    uint64_t inserted_index = index->getZExtValue();
+    if (inserted_index >= vector_type->getNumElements()) {
+      return Unsupported(function_, "out-of-bounds vector insertion", insert);
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(insert.getType()));
+    TF_ASSIGN_OR_RETURN(std::string inserted_value,
+                        Expr(insert.getOperand(1)));
+    std::vector<std::string> elements;
+    elements.reserve(vector_type->getNumElements());
+    for (int i = 0; i < vector_type->getNumElements(); ++i) {
+      if (i == inserted_index) {
+        elements.push_back(inserted_value);
+      } else {
+        TF_ASSIGN_OR_RETURN(std::string element,
+                            VectorElementExpr(insert.getOperand(0), i));
+        elements.push_back(std::move(element));
+      }
+    }
+    return absl::StrCat(type, "(", absl::StrJoin(elements, ", "), ")");
   }
 
   absl::StatusOr<std::string> BinaryExpr(const llvm::BinaryOperator& binary) {
@@ -2243,7 +2347,8 @@ class FunctionEmitter {
       first_index = false;
     }
 
-    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type,
+                   base.address_space};
   }
 
   absl::StatusOr<std::string> InlineNestedLoadExpr(
@@ -2336,7 +2441,8 @@ class FunctionEmitter {
       first_index = false;
     }
 
-    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type,
+                   base.address_space};
   }
 
   absl::StatusOr<std::string> InlineSimpleBinaryCall(
@@ -2745,7 +2851,8 @@ class FunctionEmitter {
       first_index = false;
     }
 
-    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type,
+                   base.address_space};
   }
 
   absl::StatusOr<std::string> InlineInstructionExpr(
@@ -2892,7 +2999,8 @@ class FunctionEmitter {
 
   absl::StatusOr<PtrExpr> PointerExprFor(const llvm::Value* value) {
     if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
-      return PtrExpr{Name(argument), "0", PointerElementType(argument)};
+      return PtrExpr{Name(argument), "0", PointerElementType(argument),
+                     "device"};
     }
 
     if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
@@ -2901,11 +3009,11 @@ class FunctionEmitter {
       }
       TF_ASSIGN_OR_RETURN(ArrayInfo array,
                           FlattenedArrayInfo(global->getValueType()));
-      return PtrExpr{Name(global), "0", array.element_type};
+      return PtrExpr{Name(global), "0", array.element_type, "threadgroup"};
     }
 
     if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
-      return PtrExpr{Name(alloca), "0", alloca->getAllocatedType()};
+      return PtrExpr{Name(alloca), "0", alloca->getAllocatedType(), "thread"};
     }
 
     if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
@@ -2968,7 +3076,8 @@ class FunctionEmitter {
       first_index = false;
     }
 
-    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type,
+                   base.address_space};
   }
 
   const llvm::Function& function_;
