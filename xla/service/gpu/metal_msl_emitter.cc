@@ -509,8 +509,10 @@ class FunctionEmitter {
     }
 
     if (body_block == nullptr || exit_block == nullptr) {
-      return Unsupported(function_, "control flow shape",
-                         *entry.getTerminator());
+      TF_ASSIGN_OR_RETURN(bool emitted,
+                          TryEmitIfElseDiamond(*branch, output));
+      if (emitted) return absl::OkStatus();
+      return Unsupported(function_, "control flow shape", *entry.getTerminator());
     }
 
     RETURN_IF_ERROR(EmitBlockStatements(entry, output, 1));
@@ -519,6 +521,74 @@ class FunctionEmitter {
     absl::StrAppend(output, "  if (", condition, ") {\n");
     RETURN_IF_ERROR(EmitBlockStatements(*body_block, output, 2));
     absl::StrAppend(output, "  }\n");
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<bool> TryEmitIfElseDiamond(const llvm::CondBrInst& branch,
+                                            std::string* output) {
+    const llvm::BasicBlock& entry = function_.getEntryBlock();
+    const llvm::BasicBlock* true_block = branch.getSuccessor(0);
+    const llvm::BasicBlock* false_block = branch.getSuccessor(1);
+
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*true_block);
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*false_block);
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return false;
+    }
+
+    const llvm::BasicBlock* merge_block = true_successor;
+    const llvm::BasicBlock* continuation_block = nullptr;
+    const llvm::Instruction* merge_terminator = merge_block->getTerminator();
+    if (llvm::isa<llvm::ReturnInst>(merge_terminator)) {
+      continuation_block = merge_block;
+    } else {
+      continuation_block = UnconditionalBranchSuccessor(*merge_block);
+      if (continuation_block == nullptr ||
+          !llvm::isa<llvm::ReturnInst>(continuation_block->getTerminator())) {
+        return false;
+      }
+    }
+
+    RETURN_IF_ERROR(EmitBlockStatements(entry, output, 1));
+    TF_ASSIGN_OR_RETURN(std::string condition, Expr(branch.getCondition()));
+    absl::StrAppend(output, "  if (", condition, ") {\n");
+    RETURN_IF_ERROR(EmitBlockStatements(*true_block, output, 2));
+    RETURN_IF_ERROR(EmitPhiAssignments(*merge_block, true_block, output, 2));
+    absl::StrAppend(output, "  } else {\n");
+    RETURN_IF_ERROR(EmitBlockStatements(*false_block, output, 2));
+    RETURN_IF_ERROR(EmitPhiAssignments(*merge_block, false_block, output, 2));
+    absl::StrAppend(output, "  }\n");
+
+    RETURN_IF_ERROR(EmitBlockStatements(*merge_block, output, 1));
+    if (continuation_block != merge_block) {
+      RETURN_IF_ERROR(EmitBlockStatements(*continuation_block, output, 1));
+    }
+    return true;
+  }
+
+  const llvm::BasicBlock* UnconditionalBranchSuccessor(
+      const llvm::BasicBlock& block) const {
+    const auto* branch = llvm::dyn_cast<llvm::UncondBrInst>(block.getTerminator());
+    if (branch == nullptr) return nullptr;
+    return branch->getSuccessor(0);
+  }
+
+  absl::Status EmitPhiAssignments(const llvm::BasicBlock& block,
+                                  const llvm::BasicBlock* incoming_block,
+                                  std::string* output, int indent) {
+    for (const llvm::Instruction& instruction : block) {
+      const auto* phi = llvm::dyn_cast<llvm::PHINode>(&instruction);
+      if (phi == nullptr) break;
+      const llvm::Value* incoming = phi->getIncomingValueForBlock(incoming_block);
+      if (incoming == nullptr) {
+        return absl::InvalidArgumentError(
+            "Metal MSL emission could not find phi incoming value.");
+      }
+      TF_ASSIGN_OR_RETURN(std::string value, Expr(incoming));
+      absl::StrAppend(output, Indent(indent), Name(phi), " = ", value, ";\n");
+    }
     return absl::OkStatus();
   }
 
@@ -541,6 +611,7 @@ class FunctionEmitter {
   absl::Status EmitBlockStatements(const llvm::BasicBlock& block,
                                    std::string* output, int indent) {
     for (const llvm::Instruction& instruction : block) {
+      if (llvm::isa<llvm::PHINode>(&instruction)) continue;
       if (instruction.isTerminator()) continue;
       RETURN_IF_ERROR(EmitInstruction(instruction, output, indent));
     }
@@ -595,8 +666,7 @@ class FunctionEmitter {
 
   absl::StatusOr<std::string> Expr(const llvm::Value* value) {
     if (auto* constant_int = llvm::dyn_cast<llvm::ConstantInt>(value)) {
-      return IntegerLiteral(constant_int->getValue(),
-                            constant_int->getType()->isIntegerTy(1));
+      return IntegerLiteral(constant_int->getValue(), /*is_signed=*/true);
     }
     if (auto* constant_fp = llvm::dyn_cast<llvm::ConstantFP>(value)) {
       const llvm::APFloat& as_apfloat = constant_fp->getValueAPF();

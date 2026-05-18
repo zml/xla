@@ -356,6 +356,57 @@ declare float @__nv_fmaf(float, float, float)
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsIfElseDiamondWithPhi) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @pad(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %ge_lower = icmp sge i32 %tid, 1
+  %le_upper = icmp sle i32 %tid, 4
+  %in_bounds = and i1 %ge_lower, %le_upper
+  br i1 %in_bounds, label %then, label %else
+
+then:
+  %input_index = add i32 %tid, -1
+  %input_gep = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %input_index
+  %input_value = load float, ptr %input_gep, align 4
+  br label %merge
+
+else:
+  %pad_gep = getelementptr inbounds [1 x float], ptr %arg1, i32 0, i32 0
+  %pad_value = load float, ptr %pad_gep, align 4
+  br label %merge
+
+merge:
+  %value = phi float [ %input_value, %then ], [ %pad_value, %else ]
+  br label %exit
+
+exit:
+  %out_gep = getelementptr inbounds [7 x float], ptr %arg2, i32 0, i32 %tid
+  store float %value, ptr %out_gep, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @pad, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("} else {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("v4 = (v0 + -1);"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[v0] = v7;"), std::string::npos) << msl;
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla
