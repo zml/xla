@@ -224,6 +224,37 @@ absl::StatusOr<Literal> ExecuteMetalIota() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalS32Iota() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_s32_iota");
+  Add(Iota(&builder, S32, 16), Broadcast(ConstantR0<int32_t>(&builder, 1),
+                                        {16}));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+  std::vector<GlobalData*> arguments;
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalS32Add() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_s32_add");
+  Shape shape = ShapeUtil::MakeShape(S32, {kElementCount});
+  XlaOp lhs = Parameter(&builder, 0, shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = MakeElementwiseS32();
+  Literal rhs_literal = MakeElementwiseS32();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConvert(PrimitiveType input_type,
                                             PrimitiveType output_type) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -764,6 +795,30 @@ TEST(MetalGpuExecutableTest, ElementwiseIota) {
   for (int64_t i = 0; i < 16; ++i) {
     EXPECT_EQ(actual.Get<float>({i}), static_cast<float>(i + 1));
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32Iota) {
+  auto result = ExecuteMetalS32Iota();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {16})));
+  for (int64_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(actual.Get<int32_t>({i}), static_cast<int32_t>(i + 1));
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32Add) {
+  auto result = ExecuteMetalS32Add();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(
+      actual, [&](int64_t i) { return input.Get<int32_t>({i}) * 2; });
 }
 
 TEST(MetalGpuExecutableTest, ConvertF32ToS32) {

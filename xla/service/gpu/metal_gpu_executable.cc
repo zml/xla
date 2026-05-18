@@ -134,6 +134,49 @@ bool IsScalarLikeF32(const Shape& shape) {
   return shape.element_type() == F32 && ShapeUtil::IsEffectiveScalar(shape);
 }
 
+bool IsScalarLikeS32(const Shape& shape) {
+  return shape.element_type() == S32 && ShapeUtil::IsEffectiveScalar(shape);
+}
+
+bool IsScalarLikeSupported(const Shape& shape) {
+  return (shape.element_type() == F32 || shape.element_type() == S32) &&
+         ShapeUtil::IsEffectiveScalar(shape);
+}
+
+bool IsSupportedElementwiseArray(const Shape& shape) {
+  return IsF32Array(shape) || IsPredArray(shape) || IsS32Array(shape);
+}
+
+const char* ElementIrType(PrimitiveType type) {
+  switch (type) {
+    case F32:
+      return "float";
+    case S32:
+      return "i32";
+    case PRED:
+      return "i8";
+    default:
+      return "float";
+  }
+}
+
+const char* ElementAirTypeName(PrimitiveType type) {
+  switch (type) {
+    case F32:
+      return "float";
+    case S32:
+      return "int";
+    case PRED:
+      return "bool";
+    default:
+      return "float";
+  }
+}
+
+int ElementTypeSize(PrimitiveType type) {
+  return type == PRED ? 1 : 4;
+}
+
 std::string FloatLiteral(float value) {
   double double_value = static_cast<double>(value);
   uint64_t bits = 0;
@@ -272,9 +315,10 @@ class ElementwiseAirEmitter {
       : result_shape_(std::move(result_shape)) {}
 
   absl::StatusOr<std::string> Emit(const HloInstruction* root) {
-    if (!IsF32Array(root->shape()) && !IsPredArray(root->shape())) {
+    if (!IsSupportedElementwiseArray(root->shape())) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise supports only f32 and pred arrays.");
+          "Metal direct AIR elementwise supports only f32, s32, and pred "
+          "arrays.");
     }
     std::vector<std::string> body;
     TF_ASSIGN_OR_RETURN(std::string value,
@@ -293,9 +337,9 @@ class ElementwiseAirEmitter {
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
     if (instr->opcode() == HloOpcode::kBroadcast) {
-      if (!IsScalarLikeF32(instr->operand(0)->shape())) {
+      if (!IsScalarLikeSupported(instr->operand(0)->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR elementwise currently supports only scalar "
+            "Metal direct AIR elementwise currently supports only f32/s32 scalar "
             "broadcasts.");
       }
       return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
@@ -309,10 +353,13 @@ class ElementwiseAirEmitter {
     }
 
     if (instr->IsConstant()) {
-      if (!IsScalarLikeF32(instr->shape())) {
+      if (!IsScalarLikeSupported(instr->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR elementwise currently supports only scalar "
+            "Metal direct AIR elementwise currently supports only f32/s32 scalar "
             "constants.");
+      }
+      if (instr->shape().element_type() == S32) {
+        return absl::StrCat(instr->literal().Get<int32_t>({}));
       }
       return FloatLiteral(instr->literal().Get<float>({}));
     }
@@ -324,8 +371,10 @@ class ElementwiseAirEmitter {
           "shape unless they are scalar-broadcast operands.");
       }
       const int64_t parameter_number = instr->parameter_number();
-      const int input_index = InputIndexForParameter(parameter_number);
-      return EmitLoad(input_index, force_scalar ? "0" : "%idx", body);
+      const int input_index =
+          InputIndexForParameter(parameter_number, instr->shape().element_type());
+      return EmitLoad(input_index, instr->shape().element_type(),
+                      force_scalar ? "0" : "%idx", body);
     }
 
     switch (instr->opcode()) {
@@ -430,8 +479,10 @@ class ElementwiseAirEmitter {
       return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
     }
     if (instr->opcode() == HloOpcode::kParameter) {
-      const int input_index = InputIndexForParameter(instr->parameter_number());
-      return EmitLoad(input_index, index, body);
+      const int input_index =
+          InputIndexForParameter(instr->parameter_number(),
+                                 instr->shape().element_type());
+      return EmitLoad(input_index, instr->shape().element_type(), index, body);
     }
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR linear load does not support HLO opcode %s.",
@@ -545,8 +596,8 @@ class ElementwiseAirEmitter {
           "Metal direct AIR elementwise slice currently supports only "
           "parameter operands.");
     }
-    const int input_index =
-        InputIndexForParameter(operand->parameter_number());
+    const int input_index = InputIndexForParameter(
+        operand->parameter_number(), operand->shape().element_type());
     const int64_t start = instr->slice_starts(0);
     const int64_t stride = instr->slice_strides(0);
     std::string source_index = force_scalar ? "0" : "%idx";
@@ -562,17 +613,21 @@ class ElementwiseAirEmitter {
                                       source_index, start));
       source_index = shifted;
     }
-    return EmitLoad(input_index, source_index, body);
+    return EmitLoad(input_index, operand->shape().element_type(), source_index,
+                    body);
   }
 
   absl::StatusOr<std::string> EmitIota(const HloInstruction* instr,
                                        std::vector<std::string>* body) {
-    if (!IsF32Array(instr->shape()) ||
+    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
         !ShapeUtil::Equal(instr->shape(), result_shape_) ||
         instr->shape().dimensions().size() != 1) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise iota currently supports only rank-1 "
-          "f32 iota results over dimension 0.");
+          "f32/s32 iota results over dimension 0.");
+    }
+    if (instr->shape().element_type() == S32) {
+      return "%idx32";
     }
     std::string value = NewName("iota");
     body->push_back(
@@ -580,7 +635,7 @@ class ElementwiseAirEmitter {
     return value;
   }
 
-  int InputIndexForParameter(int64_t parameter_number) {
+  int InputIndexForParameter(int64_t parameter_number, PrimitiveType type) {
     auto it = parameter_to_input_index_.find(parameter_number);
     if (it != parameter_to_input_index_.end()) {
       return it->second;
@@ -588,6 +643,7 @@ class ElementwiseAirEmitter {
     const int input_index = parameter_numbers_.size();
     parameter_to_input_index_[parameter_number] = input_index;
     parameter_numbers_.push_back(parameter_number);
+    parameter_types_.push_back(type);
     return input_index;
   }
 
@@ -708,6 +764,24 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string rhs,
                         EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
                                   body));
+    if (instr->shape().element_type() == S32) {
+      switch (instr->opcode()) {
+        case HloOpcode::kAdd:
+          return EmitOp("add i32", lhs, rhs, body);
+        case HloOpcode::kSubtract:
+          return EmitOp("sub i32", lhs, rhs, body);
+        case HloOpcode::kMultiply:
+          return EmitOp("mul i32", lhs, rhs, body);
+        case HloOpcode::kDivide:
+          return EmitOp("sdiv i32", lhs, rhs, body);
+        case HloOpcode::kMaximum:
+          return EmitIntCompareSelect("sgt", lhs, rhs, body);
+        case HloOpcode::kMinimum:
+          return EmitIntCompareSelect("slt", lhs, rhs, body);
+        default:
+          return absl::InternalError("Unexpected s32 binary HLO opcode.");
+      }
+    }
     switch (instr->opcode()) {
       case HloOpcode::kAdd:
         return EmitOp("fadd fast float", lhs, rhs, body);
@@ -799,23 +873,25 @@ class ElementwiseAirEmitter {
   }
 
   bool IsScalarOperand(const HloInstruction* instr, int operand_index) const {
-    return IsScalarLikeF32(instr->operand(operand_index)->shape());
+    return IsScalarLikeSupported(instr->operand(operand_index)->shape());
   }
 
   bool HasResultDimensions(const Shape& shape) const {
     return shape.IsArray() && shape.dimensions() == result_shape_.dimensions();
   }
 
-  std::string EmitLoad(int input_index, absl::string_view index,
-                       std::vector<std::string>* body) {
+  std::string EmitLoad(int input_index, PrimitiveType type,
+                       absl::string_view index, std::vector<std::string>* body) {
+    const char* ir_type = ElementIrType(type);
     std::string ptr = NewName("ptr");
     std::string value = NewName("value");
     body->push_back(absl::StrFormat(
-        "  %s = getelementptr inbounds float, float addrspace(1)* %%arg%d, "
+        "  %s = getelementptr inbounds %s, %s addrspace(1)* %%arg%d, "
         "i64 %s",
-        ptr, input_index, index));
+        ptr, ir_type, ir_type, input_index, index));
     body->push_back(absl::StrFormat(
-        "  %s = load float, float addrspace(1)* %s, align 4", value, ptr));
+        "  %s = load %s, %s addrspace(1)* %s, align %d", value, ir_type,
+        ir_type, ptr, ElementTypeSize(type)));
     return value;
   }
 
@@ -838,32 +914,50 @@ class ElementwiseAirEmitter {
     return value;
   }
 
+  std::string EmitIntCompareSelect(absl::string_view predicate,
+                                   absl::string_view lhs, absl::string_view rhs,
+                                   std::vector<std::string>* body) {
+    std::string cmp = NewName("cmp");
+    std::string value = NewName("select");
+    body->push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 %s", value, cmp, lhs, rhs));
+    return value;
+  }
+
   std::string NewName(absl::string_view prefix) {
     return absl::StrFormat("%%%s%d", prefix, next_value_id_++);
   }
 
   std::string BuildModule() const {
-    const bool result_is_pred = result_shape_.element_type() == PRED;
+    const PrimitiveType result_type = result_shape_.element_type();
+    const bool result_is_pred = result_type == PRED;
     std::vector<std::string> args;
     for (int i = 0; i < parameter_numbers_.size(); ++i) {
+      const char* ir_type = ElementIrType(parameter_types_[i]);
       args.push_back(absl::StrFormat(
-          "    float addrspace(1)* nocapture noundef readonly "
+          "    %s addrspace(1)* nocapture noundef readonly "
           "\"air-buffer-no-alias\" %%arg%d",
-          i));
+          ir_type, i));
     }
     args.push_back(absl::StrFormat(
         "    %s addrspace(1)* nocapture noundef writeonly "
         "\"air-buffer-no-alias\" %%out",
-        result_is_pred ? "i8" : "float"));
+        ElementIrType(result_type)));
     args.push_back(
         "    %struct.ElementwiseParams addrspace(2)* nocapture noundef "
         "readonly align 4 dereferenceable(16) \"air-buffer-no-alias\" %params");
     args.push_back("    <3 x i32> noundef %gid");
 
-    std::vector<std::string> signature_types(parameter_numbers_.size(),
-                                             "float addrspace(1)*");
-    signature_types.push_back(result_is_pred ? "i8 addrspace(1)*"
-                                             : "float addrspace(1)*");
+    std::vector<std::string> signature_types;
+    signature_types.reserve(parameter_numbers_.size() + 3);
+    for (PrimitiveType parameter_type : parameter_types_) {
+      signature_types.push_back(
+          absl::StrCat(ElementIrType(parameter_type), " addrspace(1)*"));
+    }
+    signature_types.push_back(
+        absl::StrCat(ElementIrType(result_type), " addrspace(1)*"));
     signature_types.push_back("%struct.ElementwiseParams addrspace(2)*");
     signature_types.push_back("<3 x i32>");
 
@@ -884,6 +978,10 @@ class ElementwiseAirEmitter {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
   %%out_i8 = zext i1 %s to i8
   store i8 %%out_i8, i8 addrspace(1)* %%out_ptr, align 1)",
+                                     result_value_);
+    } else if (result_type == S32) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i32, i32 addrspace(1)* %%out, i64 %%idx
+  store i32 %s, i32 addrspace(1)* %%out_ptr, align 4)",
                                      result_value_);
     } else {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds float, float addrspace(1)* %%out, i64 %%idx
@@ -952,14 +1050,17 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
                                          absl::StrJoin(metadata_args, ", "));
 
     for (int i = 0; i < parameter_numbers_.size(); ++i) {
+      const PrimitiveType parameter_type = parameter_types_[i];
       absl::StrAppendFormat(
           &module,
           "!%d = !{i32 %d, !\"air.buffer\", !\"air.location_index\", i32 %d, "
           "i32 1, !\"air.read\", !\"air.address_space\", i32 1, "
-          "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 "
-          "4, !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", "
+          "!\"air.arg_type_size\", i32 %d, !\"air.arg_type_align_size\", i32 "
+          "%d, !\"air.arg_type_name\", !\"%s\", !\"air.arg_name\", "
           "!\"arg%d\"}\n",
-          3 + i, i, i, i);
+          3 + i, i, i, ElementTypeSize(parameter_type),
+          ElementTypeSize(parameter_type), ElementAirTypeName(parameter_type),
+          i);
     }
     absl::StrAppendFormat(
         &module,
@@ -968,8 +1069,8 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
         "!\"air.arg_type_size\", i32 %d, !\"air.arg_type_align_size\", i32 %d, "
         "!\"air.arg_type_name\", !\"%s\", !\"air.arg_name\", !\"out\"}\n",
         output_metadata, static_cast<int>(parameter_numbers_.size()),
-        static_cast<int>(parameter_numbers_.size()), result_is_pred ? 1 : 4,
-        result_is_pred ? 1 : 4, result_is_pred ? "bool" : "float");
+        static_cast<int>(parameter_numbers_.size()), ElementTypeSize(result_type),
+        ElementTypeSize(result_type), ElementAirTypeName(result_type));
     absl::StrAppendFormat(
         &module,
         "!%d = !{i32 %d, !\"air.buffer\", !\"air.buffer_size\", i32 16, "
@@ -1015,6 +1116,7 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   Shape result_shape_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
+  std::vector<PrimitiveType> parameter_types_;
   std::vector<std::string> expression_body_;
   std::string result_value_;
   int next_value_id_ = 0;
