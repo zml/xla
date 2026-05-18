@@ -2044,6 +2044,52 @@ TEST(MetalGpuExecutableTest, ReductionS32SumMaximum) {
   ExpectScalarS32(max_actual, expected_max);
 }
 
+TEST(MetalGpuExecutableTest, ReductionS32ProductCallInput) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder remainder_builder("metal_s32_remainder");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {kElementCount});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp callee_input = Parameter(&remainder_builder, 0, input_shape, "input");
+  XlaOp divisor = Parameter(&remainder_builder, 1, scalar_shape, "divisor");
+  Rem(callee_input, Broadcast(divisor, {kElementCount}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation remainder,
+                          remainder_builder.Build());
+
+  XlaBuilder reducer_builder("metal_s32_product_reducer");
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Mul(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_s32_product_call_input");
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp rem = Call(&builder, remainder, {input, ConstantR0<int32_t>(&builder, 5)});
+  XlaOp shifted =
+      Add(rem, Broadcast(ConstantR0<int32_t>(&builder, 1), {kElementCount}));
+  Reduce(shifted, ConstantR0<int32_t>(&builder, 1), reducer, {0});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseS32();
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  int32_t expected = 1;
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected *= (input_literal.Get<int32_t>({i}) % 5) + 1;
+  }
+  ExpectScalarS32(actual, expected);
+}
+
 TEST(MetalGpuExecutableTest, ReductionMean) {
   auto client_result = GetMetalClient();
   if (absl::IsFailedPrecondition(client_result.status())) {

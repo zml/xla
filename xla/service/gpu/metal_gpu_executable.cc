@@ -2547,6 +2547,16 @@ class ReductionInputAirEmitter {
 
   absl::StatusOr<std::string> Emit(const HloInstruction* instr,
                                    absl::string_view index) {
+    if (instr->opcode() == HloOpcode::kCall) {
+      CallParameterScope scope;
+      scope.computation = instr->to_apply();
+      for (int64_t i = 0; i < instr->operand_count(); ++i) {
+        scope.arguments[i] = instr->operand(i);
+      }
+      call_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+      return Emit(instr->to_apply()->root_instruction(), index);
+    }
     if (instr->opcode() == HloOpcode::kBitcast ||
         instr->opcode() == HloOpcode::kReshape) {
       if (ShapeUtil::ElementsIn(instr->shape()) !=
@@ -2596,6 +2606,11 @@ class ReductionInputAirEmitter {
       return constant;
     }
     if (instr->opcode() == HloOpcode::kParameter) {
+      if (const HloInstruction* override = CallParameterOverride(instr)) {
+        return Emit(override,
+                    ShapeUtil::IsEffectiveScalar(override->shape()) ? "0"
+                                                                    : index);
+      }
       if (instr->shape().element_type() != config_->element_type ||
           !instr->shape().IsArray()) {
         return absl::UnimplementedError(
@@ -2628,6 +2643,11 @@ class ReductionInputAirEmitter {
   const std::vector<std::string>& body() const { return body_; }
 
  private:
+  struct CallParameterScope {
+    const HloComputation* computation = nullptr;
+    absl::flat_hash_map<int64_t, const HloInstruction*> arguments;
+  };
+
   absl::StatusOr<std::string> EmitF32Expression(const HloInstruction* instr,
                                                 absl::string_view index) {
     switch (instr->opcode()) {
@@ -2666,6 +2686,9 @@ class ReductionInputAirEmitter {
 
   absl::StatusOr<std::string> EmitPredExpression(const HloInstruction* instr,
                                                  absl::string_view index) {
+    if (instr->opcode() == HloOpcode::kCompare) {
+      return EmitCompareExpression(instr, index);
+    }
     switch (instr->opcode()) {
       case HloOpcode::kAnd:
       case HloOpcode::kOr:
@@ -2697,10 +2720,22 @@ class ReductionInputAirEmitter {
 
   absl::StatusOr<std::string> EmitS32Expression(const HloInstruction* instr,
                                                 absl::string_view index) {
+    if (instr->opcode() == HloOpcode::kSelect) {
+      TF_ASSIGN_OR_RETURN(std::string pred, Emit(instr->operand(0), index));
+      TF_ASSIGN_OR_RETURN(std::string on_true, Emit(instr->operand(1), index));
+      TF_ASSIGN_OR_RETURN(std::string on_false, Emit(instr->operand(2), index));
+      std::string value = NewName("reduce_select");
+      body_.push_back(absl::StrFormat(
+          "  %s = select i1 %s, i32 %s, i32 %s", value, pred, on_true,
+          on_false));
+      return value;
+    }
     switch (instr->opcode()) {
       case HloOpcode::kAdd:
       case HloOpcode::kSubtract:
       case HloOpcode::kMultiply:
+      case HloOpcode::kDivide:
+      case HloOpcode::kRemainder:
       case HloOpcode::kMaximum:
       case HloOpcode::kMinimum:
         break;
@@ -2719,6 +2754,10 @@ class ReductionInputAirEmitter {
         return EmitOp("sub i32", lhs, rhs);
       case HloOpcode::kMultiply:
         return EmitOp("mul i32", lhs, rhs);
+      case HloOpcode::kDivide:
+        return EmitOp("sdiv i32", lhs, rhs);
+      case HloOpcode::kRemainder:
+        return EmitOp("srem i32", lhs, rhs);
       case HloOpcode::kMaximum:
         return EmitIntCompareSelect("sgt", lhs, rhs);
       case HloOpcode::kMinimum:
@@ -2745,6 +2784,85 @@ class ReductionInputAirEmitter {
       return pred;
     }
     return loaded;
+  }
+
+  absl::StatusOr<std::string> EmitCompareExpression(
+      const HloInstruction* instr, absl::string_view index) {
+    TF_ASSIGN_OR_RETURN(std::string lhs, Emit(instr->operand(0), index));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Emit(instr->operand(1), index));
+    const PrimitiveType operand_type = instr->operand(0)->shape().element_type();
+    std::string cmp = NewName("reduce_cmp");
+    if (operand_type == S32) {
+      const char* predicate = nullptr;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        case ComparisonDirection::kLt:
+          predicate = "slt";
+          break;
+        case ComparisonDirection::kLe:
+          predicate = "sle";
+          break;
+        case ComparisonDirection::kGt:
+          predicate = "sgt";
+          break;
+        case ComparisonDirection::kGe:
+          predicate = "sge";
+          break;
+      }
+      body_.push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+      return cmp;
+    }
+    if (operand_type == PRED) {
+      const char* predicate = nullptr;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        default:
+          return absl::UnimplementedError(
+              "Metal direct AIR reduction pred compare supports only EQ/NE.");
+      }
+      body_.push_back(absl::StrFormat("  %s = icmp %s i1 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+      return cmp;
+    }
+    if (operand_type == F32) {
+      const char* predicate = nullptr;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "oeq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "one";
+          break;
+        case ComparisonDirection::kLt:
+          predicate = "olt";
+          break;
+        case ComparisonDirection::kLe:
+          predicate = "ole";
+          break;
+        case ComparisonDirection::kGt:
+          predicate = "ogt";
+          break;
+        case ComparisonDirection::kGe:
+          predicate = "oge";
+          break;
+      }
+      body_.push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                      predicate, lhs, rhs));
+      return cmp;
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction compare supports only f32/s32/pred.");
   }
 
   std::string EmitOp(absl::string_view op, absl::string_view lhs,
@@ -2781,7 +2899,26 @@ class ReductionInputAirEmitter {
     return absl::StrFormat("%%%s%d", prefix, next_value_id_++);
   }
 
+  const HloInstruction* CallParameterOverride(
+      const HloInstruction* parameter) const {
+    if (parameter->opcode() != HloOpcode::kParameter) {
+      return nullptr;
+    }
+    for (auto it = call_parameter_scopes_.rbegin();
+         it != call_parameter_scopes_.rend(); ++it) {
+      if (parameter->parent() != it->computation) {
+        continue;
+      }
+      auto found = it->arguments.find(parameter->parameter_number());
+      if (found != it->arguments.end()) {
+        return found->second;
+      }
+    }
+    return nullptr;
+  }
+
   MetalReductionConfig* config_;
+  std::vector<CallParameterScope> call_parameter_scopes_;
   std::vector<std::string> body_;
   int next_value_id_ = 0;
 };
