@@ -35,11 +35,13 @@ struct MetalMatmulConfig {
   int64_t n = 0;
   int64_t k = 0;
   bool relu = false;
+  bool use_simdgroup = false;
 };
 
 absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module);
 
-absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib();
+absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib(
+    const MetalMatmulConfig& config);
 
 absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
     std::shared_ptr<HloModule> module);

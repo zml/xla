@@ -576,6 +576,102 @@ TEST(MetalGpuExecutableTest, DotRelu) {
   ExpectMatchesReference(actual, MakeLhs(), MakeRhs(), /*relu=*/true);
 }
 
+TEST(MetalGpuExecutableTest, SmallDotUsesScalarAirFallback) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_small_dot");
+  Shape lhs_shape = ShapeUtil::MakeShape(F32, {8});
+  Shape rhs_shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  Dot(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = LiteralUtil::CreateR1<float>(
+      {-1.0f, -0.75f, -0.5f, -0.25f, 0.0f, 0.25f, 0.5f, 0.75f});
+  Literal rhs_literal = LiteralUtil::CreateR1<float>(
+      {0.5f, -1.0f, 1.5f, -2.0f, 2.5f, -3.0f, 3.5f, -4.0f});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> lhs_data,
+                          client->TransferToServer(lhs_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> rhs_data,
+                          client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected = 0.0f;
+  for (int64_t i = 0; i < 8; ++i) {
+    expected += lhs_literal.Get<float>({i}) * rhs_literal.Get<float>({i});
+  }
+  ExpectScalarNear(actual, expected, 1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, SmallMatmulUsesScalarAirFallback) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  constexpr int64_t kSmallM = 4;
+  constexpr int64_t kSmallK = 6;
+  constexpr int64_t kSmallN = 3;
+  XlaBuilder builder("metal_small_matmul");
+  Shape lhs_shape = ShapeUtil::MakeShape(F32, {kSmallM, kSmallK});
+  Shape rhs_shape = ShapeUtil::MakeShape(F32, {kSmallK, kSmallN});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  XlaOp dot = Dot(lhs, rhs);
+  Max(dot, Broadcast(ConstantR0<float>(&builder, 0.0f), {kSmallM, kSmallN}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array2D<float> lhs_values(kSmallM, kSmallK);
+  for (int64_t row = 0; row < kSmallM; ++row) {
+    for (int64_t col = 0; col < kSmallK; ++col) {
+      lhs_values(row, col) =
+          static_cast<float>(((row * kSmallK + col) % 11) - 5) / 7.0f;
+    }
+  }
+  Array2D<float> rhs_values(kSmallK, kSmallN);
+  for (int64_t row = 0; row < kSmallK; ++row) {
+    for (int64_t col = 0; col < kSmallN; ++col) {
+      rhs_values(row, col) =
+          static_cast<float>(((row * kSmallN + col) % 7) - 3) / 9.0f;
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR2FromArray2D(rhs_values);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> lhs_data,
+                          client->TransferToServer(lhs_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> rhs_data,
+                          client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {kSmallM, kSmallN})));
+  for (int64_t row = 0; row < kSmallM; ++row) {
+    for (int64_t col = 0; col < kSmallN; ++col) {
+      float expected = 0.0f;
+      for (int64_t kk = 0; kk < kSmallK; ++kk) {
+        expected += lhs_values(row, kk) * rhs_values(kk, col);
+      }
+      expected = std::max(expected, 0.0f);
+      EXPECT_NEAR(actual.Get<float>({row, col}), expected, 1.0e-5f)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseAdd) {
   auto result = ExecuteMetalElementwiseBinary(
       "metal_elementwise_add",

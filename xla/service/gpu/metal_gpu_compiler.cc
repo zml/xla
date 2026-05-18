@@ -56,7 +56,7 @@ absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
   absl::StatusOr<MetalMatmulConfig> matmul_config = MatchMetalMatmul(*module);
   if (matmul_config.ok()) {
     TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
-                        CompileMetalMatmulAirToMetallib());
+                        CompileMetalMatmulAirToMetallib(*matmul_config));
     auto shared_module = std::shared_ptr<HloModule>(std::move(module));
     return std::make_unique<MetalMatmulExecutable>(
         std::move(shared_module), *matmul_config, std::move(metallib));

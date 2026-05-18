@@ -126,6 +126,10 @@ bool IsF32Rank2Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.dimensions().size() == 2;
 }
 
+bool IsF32Rank1Array(const Shape& shape) {
+  return shape.element_type() == F32 && shape.dimensions().size() == 1;
+}
+
 bool IsF32Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.IsArray();
 }
@@ -2158,29 +2162,51 @@ absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module) {
 
   const HloInstruction* lhs = dot->operand(0);
   const HloInstruction* rhs = dot->operand(1);
-  if (!IsF32Rank2Array(lhs->shape()) || !IsF32Rank2Array(rhs->shape()) ||
-      !IsF32Rank2Array(dot->shape())) {
-    return absl::UnimplementedError(
-        "Metal direct AIR matmul supports only rank-2 f32 arrays.");
-  }
-
   const DotDimensionNumbers& dims = dot->dot_dimension_numbers();
   if (dims.lhs_batch_dimensions_size() != 0 ||
       dims.rhs_batch_dimensions_size() != 0 ||
       dims.lhs_contracting_dimensions_size() != 1 ||
-      dims.rhs_contracting_dimensions_size() != 1 ||
-      dims.lhs_contracting_dimensions(0) != 1 ||
+      dims.rhs_contracting_dimensions_size() != 1) {
+    return absl::UnimplementedError(
+        "Metal direct AIR matmul supports only non-batched f32 dots with one "
+        "contracting dimension.");
+  }
+
+  MetalMatmulConfig config;
+  config.relu = relu;
+  if (IsF32Rank1Array(lhs->shape()) && IsF32Rank1Array(rhs->shape()) &&
+      IsScalarLikeF32(dot->shape())) {
+    if (dims.lhs_contracting_dimensions(0) != 0 ||
+        dims.rhs_contracting_dimensions(0) != 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR vector dot supports only lhs[0] x rhs[0].");
+    }
+    config.m = 1;
+    config.n = 1;
+    config.k = lhs->shape().dimensions(0);
+    if (rhs->shape().dimensions(0) != config.k) {
+      return absl::InvalidArgumentError(
+          "Metal direct AIR vector dot dimensions are inconsistent.");
+    }
+    return config;
+  }
+
+  if (!IsF32Rank2Array(lhs->shape()) || !IsF32Rank2Array(rhs->shape()) ||
+      !IsF32Rank2Array(dot->shape())) {
+    return absl::UnimplementedError(
+        "Metal direct AIR matmul supports only rank-1 f32 dot and rank-2 f32 "
+        "matmul.");
+  }
+  if (dims.lhs_contracting_dimensions(0) != 1 ||
       dims.rhs_contracting_dimensions(0) != 0) {
     return absl::UnimplementedError(
         "Metal direct AIR matmul supports only non-batched row-major "
         "contracting dimensions lhs[1] x rhs[0].");
   }
 
-  MetalMatmulConfig config;
   config.m = lhs->shape().dimensions(0);
   config.k = lhs->shape().dimensions(1);
   config.n = rhs->shape().dimensions(1);
-  config.relu = relu;
 
   if (rhs->shape().dimensions(0) != config.k ||
       dot->shape().dimensions(0) != config.m ||
@@ -2189,16 +2215,131 @@ absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module) {
         "Metal direct AIR matmul shape dimensions are inconsistent.");
   }
 
-  if (config.m % 16 != 0 || config.n % 32 != 0 || config.k % 8 != 0) {
-    return absl::UnimplementedError(
-        "Metal direct AIR simdgroup matmul currently requires M multiple of "
-        "16, N multiple of 32, and K multiple of 8.");
-  }
-
+  config.use_simdgroup =
+      config.m % 16 == 0 && config.n % 32 == 0 && config.k % 8 == 0;
   return config;
 }
 
-absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
+std::string BuildGenericMatmulAir(bool relu) {
+  const char* kernel_name = relu ? "matmul_relu_scalar" : "matmul_scalar";
+  std::string relu_epilogue;
+  const char* result_value = "%acc";
+  if (relu) {
+    relu_epilogue = R"(  %relu_cmp = fcmp fast ogt float %acc, 0.000000e+00
+  %relu_acc = select i1 %relu_cmp, float %acc, float 0.000000e+00
+)";
+    result_value = "%relu_acc";
+  }
+
+  return absl::StrCat(R"(
+source_filename = "xla/service/gpu/metal_matmul_scalar_air"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024-n8:16:32"
+target triple = "air64_v27-apple-macosx15.0.0"
+
+%struct.MatmulParams = type { i32, i32, i32, i32 }
+
+define void @)",
+                      kernel_name, R"((
+    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %a,
+    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %b,
+    float addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %c,
+    %struct.MatmulParams addrspace(2)* nocapture noundef readonly align 4 dereferenceable(16) "air-buffer-no-alias" %params,
+    <3 x i32> noundef %gid) local_unnamed_addr #0 {
+entry:
+  %idx32 = extractelement <3 x i32> %gid, i64 0
+  %m_ptr = getelementptr inbounds %struct.MatmulParams, %struct.MatmulParams addrspace(2)* %params, i64 0, i32 0
+  %m = load i32, i32 addrspace(2)* %m_ptr, align 4
+  %n_ptr = getelementptr inbounds %struct.MatmulParams, %struct.MatmulParams addrspace(2)* %params, i64 0, i32 1
+  %n = load i32, i32 addrspace(2)* %n_ptr, align 4
+  %k_ptr = getelementptr inbounds %struct.MatmulParams, %struct.MatmulParams addrspace(2)* %params, i64 0, i32 2
+  %k = load i32, i32 addrspace(2)* %k_ptr, align 4
+  %total = mul i32 %m, %n
+  %in_bounds = icmp ult i32 %idx32, %total
+  br i1 %in_bounds, label %body, label %exit
+
+body:
+  %row = udiv i32 %idx32, %n
+  %col = urem i32 %idx32, %n
+  br label %loop
+
+loop:
+  %kk = phi i32 [ 0, %body ], [ %next, %loop_body ]
+  %acc = phi float [ 0.000000e+00, %body ], [ %acc_next, %loop_body ]
+  %more_k = icmp ult i32 %kk, %k
+  br i1 %more_k, label %loop_body, label %store
+
+loop_body:
+  %a_row_offset = mul i32 %row, %k
+  %a_index32 = add i32 %a_row_offset, %kk
+  %a_index = zext i32 %a_index32 to i64
+  %a_ptr = getelementptr inbounds float, float addrspace(1)* %a, i64 %a_index
+  %a_value = load float, float addrspace(1)* %a_ptr, align 4
+  %b_row_offset = mul i32 %kk, %n
+  %b_index32 = add i32 %b_row_offset, %col
+  %b_index = zext i32 %b_index32 to i64
+  %b_ptr = getelementptr inbounds float, float addrspace(1)* %b, i64 %b_index
+  %b_value = load float, float addrspace(1)* %b_ptr, align 4
+  %prod = fmul fast float %a_value, %b_value
+  %acc_next = fadd fast float %acc, %prod
+  %next = add i32 %kk, 1
+  br label %loop
+
+store:
+)",
+                      relu_epilogue, R"(  %idx = zext i32 %idx32 to i64
+  %c_ptr = getelementptr inbounds float, float addrspace(1)* %c, i64 %idx
+  store float )",
+                      result_value, R"(, float addrspace(1)* %c_ptr, align 4
+  br label %exit
+
+exit:
+  ret void
+}
+
+attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-pointer"="all" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
+!air.compile_options = !{!18, !19, !20}
+!llvm.ident = !{!21}
+!air.version = !{!22}
+!air.language_version = !{!23}
+!air.source_file_name = !{!24}
+
+!0 = !{void (float addrspace(1)*, float addrspace(1)*, float addrspace(1)*, %struct.MatmulParams addrspace(2)*, <3 x i32>)* @)",
+                      kernel_name, R"(, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !8}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"c"}
+!6 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !7, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"MatmulParams", !"air.arg_name", !"params"}
+!7 = !{i32 0, i32 4, i32 0, !"uint", !"m", i32 4, i32 4, i32 0, !"uint", !"n", i32 8, i32 4, i32 0, !"uint", !"k", i32 12, i32 4, i32 0, !"uint", !"reserved"}
+!8 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+!10 = !{i32 1, !"wchar_size", i32 4}
+!11 = !{i32 7, !"air.max_device_buffers", i32 31}
+!12 = !{i32 7, !"air.max_constant_buffers", i32 31}
+!13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+!14 = !{i32 7, !"air.max_textures", i32 128}
+!15 = !{i32 7, !"air.max_read_write_textures", i32 8}
+!16 = !{i32 7, !"air.max_samplers", i32 16}
+!17 = !{i32 7, !"frame-pointer", i32 2}
+!18 = !{!"air.compile.denorms_disable"}
+!19 = !{!"air.compile.fast_math_enable"}
+!20 = !{!"air.compile.framebuffer_fetch_enable"}
+!21 = !{!"xla direct AIR generic matmul"}
+!22 = !{i32 2, i32 7, i32 0}
+!23 = !{!"Metal", i32 3, i32 2, i32 0}
+!24 = !{!"xla/service/gpu/metal_matmul_scalar_air"}
+)");
+}
+
+absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib(
+    const MetalMatmulConfig& config) {
+  if (!config.use_simdgroup) {
+    return CompileMetalAirToMetallib(BuildGenericMatmulAir(config.relu),
+                                     "metal_matmul_scalar_air");
+  }
   return CompileMetalAirToMetallib(get_matmul_air_direct(),
                                    "metal_matmul_air");
 }
@@ -3170,8 +3311,11 @@ MetalMatmulExecutable::MetalMatmulExecutable(std::shared_ptr<HloModule> module,
                         .entry_computation()
                         ->root_instruction()
                         ->shape()),
-      kernel_name_(config.relu ? "matmul_relu_simdgroup_8x8"
-                               : "matmul_simdgroup_8x8"),
+      kernel_name_(config.use_simdgroup
+                       ? (config.relu ? "matmul_relu_simdgroup_8x8"
+                                      : "matmul_simdgroup_8x8")
+                       : (config.relu ? "matmul_relu_scalar"
+                                      : "matmul_scalar")),
       metallib_(std::move(metallib)) {}
 
 Shape MetalMatmulExecutable::result_shape() const { return result_shape_; }
@@ -3231,9 +3375,14 @@ absl::StatusOr<ExecutionOutput> MetalMatmulExecutable::ExecuteAsyncOnStream(
   kernel_args.add_argument(params_address);
 
   se::ThreadDim threads(/*x=*/256, /*y=*/1, /*z=*/1);
-  se::BlockDim blocks(/*x=*/static_cast<uint64_t>((config_.n + 31) / 32),
-                      /*y=*/static_cast<uint64_t>((config_.m + 15) / 16),
-                      /*z=*/1);
+  se::BlockDim blocks(
+      /*x=*/config_.use_simdgroup
+          ? static_cast<uint64_t>((config_.n + 31) / 32)
+          : static_cast<uint64_t>((config_.m * config_.n + 255) / 256),
+      /*y=*/config_.use_simdgroup
+          ? static_cast<uint64_t>((config_.m + 15) / 16)
+          : 1,
+      /*z=*/1);
   TF_RETURN_IF_ERROR(kernel->Launch(threads, blocks, stream, kernel_args));
   TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
 
