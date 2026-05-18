@@ -23,8 +23,10 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/gpu/gpu_compiler.h"
 #include "xla/service/gpu/metal_msl_emitter.h"
+#include "xla/service/triangular_solve_expander.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/semantic_version.h"
@@ -50,7 +52,11 @@ absl::Status MetalGpuCompiler::OptimizeHloConvolutionCanonicalization(
     se::dnn::VersionInfo dnn_version,
     const se::SemanticVersion& toolkit_version,
     CompilationStats* compilation_stats) {
-  return absl::OkStatus();
+  HloPassPipeline pre_pipeline("metal triangular solve expansion",
+                               compilation_stats);
+  pre_pipeline.AddPass<TriangularSolveExpander>();
+  return pre_pipeline.Run(hlo_module, {HloInstruction::kMainExecutionThread})
+      .status();
 }
 
 void MetalGpuCompiler::AddPaddingForGpublasGemms(

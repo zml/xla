@@ -3740,6 +3740,8 @@ cc_library(
         ":gpu_compiler",
         ":metal_msl_emitter",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass_pipeline",
+        "//xla/service:triangular_solve_expander",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream_executor_h",

@@ -355,7 +355,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
   GpuExecutable::ConstantInfo info;
   info.symbol_name.assign(global_name);
   info.allocation_index = slice.index();
-  if (!should_emit_initializer) {
+  // Metal does not materialize LLVM/PTX globals at runtime, so preserve even
+  // small constants that are emitted with initializers in the LLVM module.
+  if (!should_emit_initializer || platform_name() == "METAL") {
     info.content = content;
   }
 
