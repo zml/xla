@@ -93,14 +93,19 @@ enum class ReductionKind {
   kMultiply,
   kMaximum,
   kMinimum,
+  kAnd,
+  kOr,
 };
 
 struct MetalReductionConfig {
-  int64_t parameter_number = 0;
+  const HloInstruction* input = nullptr;
+  PrimitiveType element_type = F32;
+  int64_t parameter_number = -1;
   int64_t num_elements = 0;
   int64_t input_start = 0;
   int64_t input_stride = 1;
   float init_value = 0.0f;
+  bool init_pred = false;
   float output_scale = 1.0f;
   ReductionKind kind = ReductionKind::kAdd;
 };
@@ -2122,6 +2127,219 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
                                    "metal_matmul_air");
 }
 
+const char* ReductionValueIrType(PrimitiveType type) {
+  return type == PRED ? "i1" : "float";
+}
+
+std::string ReductionScalarConstant(const HloInstruction* instr) {
+  switch (instr->shape().element_type()) {
+    case F32:
+      return FloatLiteral(instr->literal().Get<float>({}));
+    case PRED:
+      return instr->literal().Get<bool>({}) ? "true" : "false";
+    default:
+      return "";
+  }
+}
+
+class ReductionInputAirEmitter {
+ public:
+  explicit ReductionInputAirEmitter(MetalReductionConfig* config)
+      : config_(config) {}
+
+  absl::StatusOr<std::string> Emit(const HloInstruction* instr,
+                                   absl::string_view index) {
+    if (instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape) {
+      if (ShapeUtil::ElementsIn(instr->shape()) !=
+          ShapeUtil::ElementsIn(instr->operand(0)->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduction reshape must preserve element count.");
+      }
+      return Emit(instr->operand(0), index);
+    }
+    if (instr->opcode() == HloOpcode::kSlice) {
+      if (instr->shape().dimensions().size() != 1 ||
+          instr->operand(0)->shape().dimensions().size() != 1 ||
+          instr->slice_strides().size() != 1 ||
+          instr->shape().element_type() != config_->element_type) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduction slices must be rank-1 and preserve "
+            "the reduced element type.");
+      }
+      std::string source_index = std::string(index);
+      const int64_t stride = instr->slice_strides(0);
+      const int64_t start = instr->slice_starts(0);
+      if (stride != 1) {
+        std::string scaled = NewName("reduce_slice_scaled");
+        body_.push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        source_index, stride));
+        source_index = scaled;
+      }
+      if (start != 0) {
+        std::string shifted = NewName("reduce_slice_index");
+        body_.push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        source_index, start));
+        source_index = shifted;
+      }
+      return Emit(instr->operand(0), source_index);
+    }
+    if (instr->opcode() == HloOpcode::kBroadcast &&
+        ShapeUtil::IsEffectiveScalar(instr->operand(0)->shape())) {
+      return Emit(instr->operand(0), "0");
+    }
+    if (instr->IsConstant() && ShapeUtil::IsEffectiveScalar(instr->shape())) {
+      std::string constant = ReductionScalarConstant(instr);
+      if (constant.empty()) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduction supports only f32/pred scalar "
+            "constants.");
+      }
+      return constant;
+    }
+    if (instr->opcode() == HloOpcode::kParameter) {
+      if (instr->shape().element_type() != config_->element_type ||
+          instr->shape().dimensions().size() != 1) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduction parameters must be rank-1 and match "
+            "the reduced element type.");
+      }
+      if (config_->parameter_number == -1) {
+        config_->parameter_number = instr->parameter_number();
+      } else if (config_->parameter_number != instr->parameter_number()) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduction currently supports one input "
+            "parameter.");
+      }
+      return EmitLoad(index);
+    }
+    if (instr->shape().element_type() == F32) {
+      return EmitF32Expression(instr, index);
+    }
+    if (instr->shape().element_type() == PRED) {
+      return EmitPredExpression(instr, index);
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR reduction input does not support HLO opcode %s.",
+        HloOpcodeString(instr->opcode())));
+  }
+
+  const std::vector<std::string>& body() const { return body_; }
+
+ private:
+  absl::StatusOr<std::string> EmitF32Expression(const HloInstruction* instr,
+                                                absl::string_view index) {
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+      case HloOpcode::kSubtract:
+      case HloOpcode::kMultiply:
+      case HloOpcode::kDivide:
+      case HloOpcode::kMaximum:
+      case HloOpcode::kMinimum:
+        break;
+      default:
+        return absl::UnimplementedError(absl::StrFormat(
+            "Metal direct AIR reduction f32 input does not support HLO opcode "
+            "%s.",
+            HloOpcodeString(instr->opcode())));
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs, Emit(instr->operand(0), index));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Emit(instr->operand(1), index));
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+        return EmitOp("fadd fast float", lhs, rhs);
+      case HloOpcode::kSubtract:
+        return EmitOp("fsub fast float", lhs, rhs);
+      case HloOpcode::kMultiply:
+        return EmitOp("fmul fast float", lhs, rhs);
+      case HloOpcode::kDivide:
+        return EmitOp("fdiv fast float", lhs, rhs);
+      case HloOpcode::kMaximum:
+        return EmitCompareSelect("ogt", lhs, rhs);
+      case HloOpcode::kMinimum:
+        return EmitCompareSelect("olt", lhs, rhs);
+      default:
+        return absl::InternalError("Unexpected f32 reduction input opcode.");
+    }
+  }
+
+  absl::StatusOr<std::string> EmitPredExpression(const HloInstruction* instr,
+                                                 absl::string_view index) {
+    switch (instr->opcode()) {
+      case HloOpcode::kAnd:
+      case HloOpcode::kOr:
+      case HloOpcode::kXor:
+        break;
+      case HloOpcode::kNot: {
+        TF_ASSIGN_OR_RETURN(std::string value, Emit(instr->operand(0), index));
+        return EmitOp("xor i1", value, "true");
+      }
+      default:
+        return absl::UnimplementedError(absl::StrFormat(
+            "Metal direct AIR reduction pred input does not support HLO opcode "
+            "%s.",
+            HloOpcodeString(instr->opcode())));
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs, Emit(instr->operand(0), index));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Emit(instr->operand(1), index));
+    switch (instr->opcode()) {
+      case HloOpcode::kAnd:
+        return EmitOp("and i1", lhs, rhs);
+      case HloOpcode::kOr:
+        return EmitOp("or i1", lhs, rhs);
+      case HloOpcode::kXor:
+        return EmitOp("xor i1", lhs, rhs);
+      default:
+        return absl::InternalError("Unexpected pred reduction input opcode.");
+    }
+  }
+
+  absl::StatusOr<std::string> EmitLoad(absl::string_view index) {
+    const char* memory_type = ElementIrType(config_->element_type);
+    std::string ptr = NewName("reduce_ptr");
+    std::string loaded = NewName("reduce_loaded");
+    body_.push_back(absl::StrFormat(
+        "  %s = getelementptr inbounds %s, %s addrspace(1)* %%arg0, i64 %s",
+        ptr, memory_type, memory_type, index));
+    body_.push_back(absl::StrFormat(
+        "  %s = load %s, %s addrspace(1)* %s, align %d", loaded, memory_type,
+        memory_type, ptr, ElementTypeSize(config_->element_type)));
+    if (config_->element_type == PRED) {
+      std::string pred = NewName("reduce_pred");
+      body_.push_back(
+          absl::StrFormat("  %s = icmp ne i8 %s, 0", pred, loaded));
+      return pred;
+    }
+    return loaded;
+  }
+
+  std::string EmitOp(absl::string_view op, absl::string_view lhs,
+                     absl::string_view rhs) {
+    std::string name = NewName("reduce_op");
+    body_.push_back(absl::StrFormat("  %s = %s %s, %s", name, op, lhs, rhs));
+    return name;
+  }
+
+  std::string EmitCompareSelect(absl::string_view predicate,
+                                absl::string_view lhs, absl::string_view rhs) {
+    std::string cmp = NewName("reduce_cmp");
+    std::string value = NewName("reduce_select");
+    body_.push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    body_.push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", value, cmp, lhs, rhs));
+    return value;
+  }
+
+  std::string NewName(absl::string_view prefix) {
+    return absl::StrFormat("%%%s%d", prefix, next_value_id_++);
+  }
+
+  MetalReductionConfig* config_;
+  std::vector<std::string> body_;
+  int next_value_id_ = 0;
+};
+
 absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     const HloModule& module) {
   const HloInstruction* root = module.entry_computation()->root_instruction();
@@ -2149,43 +2367,25 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     return absl::UnimplementedError(
         "Metal direct AIR reduction supports only reduce roots.");
   }
-  if (!IsScalarLikeF32(root->shape()) || reduce->operand_count() != 2 ||
-      reduce->dimensions().size() != 1 || reduce->dimensions()[0] != 0) {
+  if (reduce->operand_count() != 2 || reduce->dimensions().size() != 1 ||
+      reduce->dimensions()[0] != 0) {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports only single f32 array "
-        "to f32 scalar reductions over dimension 0.");
+        "Metal direct AIR reduction currently supports single-output rank-1 "
+        "reductions over dimension 0.");
   }
 
   const HloInstruction* input = reduce->operand(0);
   const HloInstruction* init = reduce->operand(1);
-  if (!IsF32Array(input->shape()) || input->shape().dimensions().size() != 1 ||
-      !init->IsConstant() ||
-      !IsScalarLikeF32(init->shape())) {
+  const PrimitiveType element_type = input->shape().element_type();
+  if ((element_type != F32 && element_type != PRED) ||
+      !ShapeUtil::IsEffectiveScalar(root->shape()) ||
+      root->shape().element_type() != element_type ||
+      input->shape().dimensions().size() != 1 || !init->IsConstant() ||
+      !ShapeUtil::IsEffectiveScalar(init->shape()) ||
+      init->shape().element_type() != element_type) {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports only rank-1 f32 inputs "
-        "and scalar f32 constant init values.");
-  }
-
-  int64_t input_start = 0;
-  int64_t input_stride = 1;
-  const HloInstruction* parameter = input;
-  if (input->opcode() == HloOpcode::kSlice) {
-    if (input->slice_strides().size() != 1 ||
-        input->operand(0)->opcode() != HloOpcode::kParameter ||
-        !IsF32Array(input->operand(0)->shape()) ||
-        input->operand(0)->shape().dimensions().size() != 1) {
-      return absl::UnimplementedError(
-          "Metal direct AIR reduction currently supports only rank-1 f32 "
-          "slices of parameters.");
-    }
-    input_start = input->slice_starts(0);
-    input_stride = input->slice_strides(0);
-    parameter = input->operand(0);
-  }
-  if (parameter->opcode() != HloOpcode::kParameter) {
-    return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports only parameter or slice "
-        "inputs.");
+        "Metal direct AIR reduction currently supports rank-1 f32/pred inputs "
+        "and matching scalar constant init values.");
   }
 
   const HloInstruction* reducer = reduce->to_apply()->root_instruction();
@@ -2203,24 +2403,48 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     case HloOpcode::kMinimum:
       kind = ReductionKind::kMinimum;
       break;
+    case HloOpcode::kAnd:
+      kind = ReductionKind::kAnd;
+      break;
+    case HloOpcode::kOr:
+      kind = ReductionKind::kOr;
+      break;
     default:
       return absl::UnimplementedError(absl::StrFormat(
           "Metal direct AIR reduction does not support reducer opcode %s.",
           HloOpcodeString(reducer->opcode())));
   }
+  if (element_type == PRED &&
+      kind != ReductionKind::kAnd && kind != ReductionKind::kOr) {
+    return absl::UnimplementedError(
+        "Metal direct AIR pred reductions currently support only and/or.");
+  }
+  if (element_type == F32 &&
+      (kind == ReductionKind::kAnd || kind == ReductionKind::kOr)) {
+    return absl::UnimplementedError(
+        "Metal direct AIR f32 reductions do not support logical reducers.");
+  }
 
   MetalReductionConfig config;
-  config.parameter_number = parameter->parameter_number();
+  config.input = input;
+  config.element_type = element_type;
   config.num_elements = ShapeUtil::ElementsIn(input->shape());
-  config.input_start = input_start;
-  config.input_stride = input_stride;
-  config.init_value = init->literal().Get<float>({});
+  config.init_value =
+      element_type == F32 ? init->literal().Get<float>({}) : 0.0f;
+  config.init_pred =
+      element_type == PRED ? init->literal().Get<bool>({}) : false;
   config.output_scale = output_scale;
   config.kind = kind;
+  ReductionInputAirEmitter validator(&config);
+  TF_ASSIGN_OR_RETURN(std::string unused, validator.Emit(input, "%i64"));
+  if (config.parameter_number < 0) {
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction requires a parameter-backed input.");
+  }
   return config;
 }
 
-std::string ReductionUpdate(ReductionKind kind) {
+std::string ReductionUpdate(ReductionKind kind, PrimitiveType) {
   switch (kind) {
     case ReductionKind::kAdd:
       return "  %new_acc = fadd fast float %acc, %value\n";
@@ -2234,11 +2458,50 @@ std::string ReductionUpdate(ReductionKind kind) {
       return R"(  %cmp = fcmp fast olt float %value, %acc
   %new_acc = select i1 %cmp, float %value, float %acc
 )";
+    case ReductionKind::kAnd:
+      return "  %new_acc = and i1 %acc, %value\n";
+    case ReductionKind::kOr:
+      return "  %new_acc = or i1 %acc, %value\n";
   }
   return "";
 }
 
-std::string BuildReductionAir(const MetalReductionConfig& config) {
+std::string ReductionInitValue(const MetalReductionConfig& config) {
+  if (config.element_type == PRED) {
+    return config.init_pred ? "true" : "false";
+  }
+  return FloatLiteral(config.init_value);
+}
+
+std::string ReductionStore(const MetalReductionConfig& config) {
+  if (config.element_type == PRED) {
+    return R"(  %out_i8 = zext i1 %acc to i8
+  store i8 %out_i8, i8 addrspace(1)* %out, align 1)";
+  }
+  return absl::StrFormat(R"(  %%scaled_acc = fmul fast float %%acc, %s
+  store float %%scaled_acc, float addrspace(1)* %%out, align 4)",
+                         FloatLiteral(config.output_scale));
+}
+
+std::string ReductionValueAssign(PrimitiveType element_type,
+                                 absl::string_view value) {
+  if (element_type == PRED) {
+    return absl::StrFormat("  %%value = and i1 %s, true", value);
+  }
+  return absl::StrFormat(
+      "  %%value = fadd fast float %s, 0x0000000000000000", value);
+}
+
+absl::StatusOr<std::string> BuildReductionAir(MetalReductionConfig config) {
+  ReductionInputAirEmitter input_emitter(&config);
+  TF_ASSIGN_OR_RETURN(std::string value,
+                      input_emitter.Emit(config.input, "%i64"));
+  const std::string input_body = absl::StrJoin(input_emitter.body(), "\n");
+  const char* memory_type = ElementIrType(config.element_type);
+  const char* value_type = ReductionValueIrType(config.element_type);
+  const char* air_type = ElementAirTypeName(config.element_type);
+  const char* kernel_name =
+      config.element_type == PRED ? "reduce_pred" : "reduce_f32";
   return absl::StrFormat(R"(
 source_filename = "xla/service/gpu/metal_reduction_air"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024-n8:16:32"
@@ -2246,9 +2509,9 @@ target triple = "air64_v27-apple-macosx15.0.0"
 
 %%struct.ReductionParams = type { i32, i32, i32, i32 }
 
-define void @reduce_f32(
-    float addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %%arg0,
-    float addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %%out,
+define void @%s(
+    %s addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %%arg0,
+    %s addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %%out,
     %%struct.ReductionParams addrspace(2)* nocapture noundef readonly align 4 dereferenceable(16) "air-buffer-no-alias" %%params,
     <3 x i32> noundef %%gid) local_unnamed_addr #0 {
 entry:
@@ -2263,22 +2526,19 @@ body:
 
 loop:
   %%i = phi i32 [ 0, %%body ], [ %%next, %%loop_body ]
-  %%acc = phi float [ %s, %%body ], [ %%new_acc, %%loop_body ]
+  %%acc = phi %s [ %s, %%body ], [ %%new_acc, %%loop_body ]
   %%in_bounds = icmp ult i32 %%i, %%n
   br i1 %%in_bounds, label %%loop_body, label %%done
 
 loop_body:
   %%i64 = zext i32 %%i to i64
-  %%scaled_i = mul i64 %%i64, %d
-  %%source_i = add i64 %%scaled_i, %d
-  %%ptr = getelementptr inbounds float, float addrspace(1)* %%arg0, i64 %%source_i
-  %%value = load float, float addrspace(1)* %%ptr, align 4
+%s
+%s
 %s  %%next = add i32 %%i, 1
   br label %%loop
 
 done:
-  %%scaled_acc = fmul fast float %%acc, %s
-  store float %%scaled_acc, float addrspace(1)* %%out, align 4
+%s
   br label %%exit
 
 exit:
@@ -2295,11 +2555,11 @@ attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-poin
 !air.language_version = !{!23}
 !air.source_file_name = !{!24}
 
-!0 = !{void (float addrspace(1)*, float addrspace(1)*, %%struct.ReductionParams addrspace(2)*, <3 x i32>)* @reduce_f32, !1, !2}
+!0 = !{void (%s addrspace(1)*, %s addrspace(1)*, %%struct.ReductionParams addrspace(2)*, <3 x i32>)* @%s, !1, !2}
 !1 = !{}
 !2 = !{!3, !4, !5, !7}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"arg0"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 %d, !"air.arg_type_align_size", i32 %d, !"air.arg_type_name", !"%s", !"air.arg_name", !"arg0"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 %d, !"air.arg_type_align_size", i32 %d, !"air.arg_type_name", !"%s", !"air.arg_name", !"out"}
 !5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"ReductionParams", !"air.arg_name", !"params"}
 !6 = !{i32 0, i32 4, i32 0, !"uint", !"num_elements", i32 4, i32 4, i32 0, !"uint", !"reserved0", i32 8, i32 4, i32 0, !"uint", !"reserved1", i32 12, i32 4, i32 0, !"uint", !"reserved2"}
 !7 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
@@ -2319,10 +2579,15 @@ attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-poin
 !23 = !{!"Metal", i32 3, i32 2, i32 0}
 !24 = !{!"xla/service/gpu/metal_reduction_air"}
 )",
-                         FloatLiteral(config.init_value),
-                         config.input_stride, config.input_start,
-                         ReductionUpdate(config.kind),
-                         FloatLiteral(config.output_scale));
+                         kernel_name, memory_type, memory_type, value_type,
+                         ReductionInitValue(config), input_body,
+                         ReductionValueAssign(config.element_type, value),
+                         ReductionUpdate(config.kind, config.element_type),
+                         ReductionStore(config), memory_type, memory_type,
+                         kernel_name, ElementTypeSize(config.element_type),
+                         ElementTypeSize(config.element_type), air_type,
+                         ElementTypeSize(config.element_type),
+                         ElementTypeSize(config.element_type), air_type);
 }
 
 class MetalReductionExecutable final : public Executable {
@@ -2381,8 +2646,10 @@ class MetalReductionExecutable final : public Executable {
       return absl::InvalidArgumentError("Metal reduction input buffer is null.");
     }
 
+    const char* kernel_name =
+        config_.element_type == PRED ? "reduce_pred" : "reduce_f32";
     auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
-        std::vector<uint8_t>(metallib_.begin(), metallib_.end()), "reduce_f32",
+        std::vector<uint8_t>(metallib_.begin(), metallib_.end()), kernel_name,
         /*arity=*/3);
     TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
                         executor->LoadKernel(spec));
@@ -2415,9 +2682,9 @@ absl::StatusOr<std::unique_ptr<Executable>> BuildMetalReductionExecutable(
     std::shared_ptr<HloModule> module) {
   TF_ASSIGN_OR_RETURN(MetalReductionConfig config,
                       MatchMetalReduction(*module));
+  TF_ASSIGN_OR_RETURN(std::string air, BuildReductionAir(config));
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
-                      CompileMetalAirToMetallib(BuildReductionAir(config),
-                                                "metal_reduction_air"));
+                      CompileMetalAirToMetallib(air, "metal_reduction_air"));
   return std::make_unique<MetalReductionExecutable>(
       std::move(module), config, std::move(metallib));
 }

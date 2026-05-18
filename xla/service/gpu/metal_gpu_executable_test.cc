@@ -546,6 +546,12 @@ void ExpectScalarNear(const Literal& actual, float expected,
   EXPECT_NEAR(actual.Get<float>({}), expected, tolerance);
 }
 
+void ExpectScalarPred(const Literal& actual, bool expected) {
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {})));
+  EXPECT_EQ(actual.Get<bool>({}), expected);
+}
+
 TEST(MetalGpuExecutableTest, Dot) {
   auto result = ExecuteMetalMatmul(/*relu=*/false);
   if (absl::IsFailedPrecondition(result.status())) {
@@ -1473,6 +1479,94 @@ TEST(MetalGpuExecutableTest, ReductionProduct) {
     expected *= input.Get<float>({i});
   }
   ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionProductElementwiseInput) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_product_expr_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Mul(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_product_expr_reduction");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp sliced = Slice(input, {0}, {8}, {1});
+  XlaOp shifted = Add(sliced, Broadcast(ConstantR0<float>(&builder, 2.0f), {8}));
+  Reduce(shifted, ConstantR0<float>(&builder, 1.0f), reducer, {0});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected = 1.0f;
+  for (int64_t i = 0; i < 8; ++i) {
+    expected *= input_literal.Get<float>({i}) + 2.0f;
+  }
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionPredAllAny) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  auto build_reducer = [](HloOpcode opcode) -> absl::StatusOr<XlaComputation> {
+    XlaBuilder reducer_builder("metal_pred_reducer");
+    Shape scalar_shape = ShapeUtil::MakeShape(PRED, {});
+    XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+    XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+    if (opcode == HloOpcode::kAnd) {
+      And(lhs, rhs);
+    } else {
+      Or(lhs, rhs);
+    }
+    return reducer_builder.Build();
+  };
+
+  auto execute = [&](HloOpcode opcode,
+                     bool init_value) -> absl::StatusOr<Literal> {
+    TF_ASSIGN_OR_RETURN(XlaComputation reducer, build_reducer(opcode));
+    XlaBuilder builder("metal_pred_reduction");
+    Shape input_shape = ShapeUtil::MakeShape(PRED, {kElementCount});
+    XlaOp input = Parameter(&builder, 0, input_shape, "input");
+    Reduce(input, ConstantR0<bool>(&builder, init_value), reducer, {0});
+    TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+    Literal input_literal = MakeElementwisePred();
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                        client->TransferToServer(input_literal));
+    std::vector<GlobalData*> arguments = {input_data.get()};
+    return client->ExecuteAndTransfer(computation, arguments);
+  };
+
+  auto all_result = execute(HloOpcode::kAnd, true);
+  if (absl::IsFailedPrecondition(all_result.status())) {
+    GTEST_SKIP() << all_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal all_actual, std::move(all_result));
+  ExpectScalarPred(all_actual, false);
+
+  auto any_result = execute(HloOpcode::kOr, false);
+  if (absl::IsFailedPrecondition(any_result.status())) {
+    GTEST_SKIP() << any_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal any_actual, std::move(any_result));
+  ExpectScalarPred(any_actual, true);
 }
 
 TEST(MetalGpuExecutableTest, ReductionMean) {
