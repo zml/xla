@@ -584,6 +584,117 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineBfloat16ToFloatConversion) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  %ret = alloca i8, align 1
+  call void @compare(ptr %arg0, ptr %ret)
+  %value = load i8, ptr %ret, align 1
+  store i8 %value, ptr %arg1, align 1
+  ret void
+}
+
+define internal void @compare(ptr %lhs, ptr %out) {
+entry:
+  %value = load bfloat, ptr %lhs, align 2
+  %as_f32 = fpext bfloat %value to float
+  %positive = fcmp ogt float %as_f32, 0.000000e+00
+  %as_i8 = zext i1 %positive to i8
+  store i8 %as_i8, ptr %out, align 1
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("xla_metal_bf16_to_f32(arg0[0])"), std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("static_cast<float>(arg0[0])"), std::string::npos)
+      << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsInlineBfloat16ConstantLoad) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+@bf16_nan = constant [64 x i8] c"\C0\7F\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00", align 256
+
+define void @caller(ptr %arg0) {
+entry:
+  call void @write_constant(ptr %arg0)
+  ret void
+}
+
+define internal void @write_constant(ptr %out) {
+entry:
+  %value = load bfloat, ptr @bf16_nan, align 2
+  store bfloat %value, ptr %out, align 2
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("static_cast<ushort>(32704u)"), std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("write_constant("), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsInlineFloat16ConstantLoad) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+@f16_nan = constant [64 x i8] c"\00~\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00", align 256
+
+define void @caller(ptr %arg0) {
+entry:
+  call void @write_constant(ptr %arg0)
+  ret void
+}
+
+define internal void @write_constant(ptr %out) {
+entry:
+  %value = load half, ptr @f16_nan, align 2
+  store half %value, ptr %out, align 2
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("as_type<half>(static_cast<ushort>(32256u))"),
+            std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("write_constant("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsBfloat16ComparisonsAsFloat) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

@@ -1789,6 +1789,11 @@ class FunctionEmitter {
       return PointerToIntegerExpr(cast);
     }
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(cast.getOperand(0)));
+    return CastExprWithOperand(cast, operand);
+  }
+
+  absl::StatusOr<std::string> CastExprWithOperand(const llvm::CastInst& cast,
+                                                  absl::string_view operand) {
     TF_ASSIGN_OR_RETURN(std::string type, MslType(cast.getType()));
     if (cast.getOpcode() == llvm::Instruction::FPTrunc &&
         cast.getType()->isBFloatTy() &&
@@ -2215,11 +2220,7 @@ class FunctionEmitter {
     if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value)) {
       TF_ASSIGN_OR_RETURN(std::string operand,
                           InlineSimpleValue(cast->getOperand(0), call));
-      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
-      if (cast->getOpcode() == llvm::Instruction::BitCast) {
-        return absl::StrCat("as_type<", type, ">(", operand, ")");
-      }
-      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+      return CastExprWithOperand(*cast, operand);
     }
     if (auto* nested_call = llvm::dyn_cast<llvm::CallInst>(value)) {
       return InlineSimpleCall(*nested_call, call);
@@ -2539,11 +2540,7 @@ class FunctionEmitter {
           std::string operand,
           InlineNestedSimpleValue(cast->getOperand(0), nested_call,
                                   outer_call));
-      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
-      if (cast->getOpcode() == llvm::Instruction::BitCast) {
-        return absl::StrCat("as_type<", type, ">(", operand, ")");
-      }
-      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+      return CastExprWithOperand(*cast, operand);
     }
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) {
       return InlineNestedLoadExpr(*load, nested_call, outer_call);
@@ -2811,11 +2808,7 @@ class FunctionEmitter {
                           InlineDoubleNestedSimpleValue(
                               cast->getOperand(0), call, nested_call,
                               outer_call));
-      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
-      if (cast->getOpcode() == llvm::Instruction::BitCast) {
-        return absl::StrCat("as_type<", type, ">(", operand, ")");
-      }
-      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+      return CastExprWithOperand(*cast, operand);
     }
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) {
       return InlineDoubleNestedLoadExpr(*load, call, nested_call, outer_call);
@@ -3596,11 +3589,7 @@ class FunctionEmitter {
       TF_ASSIGN_OR_RETURN(
           std::string operand,
           InlineValueExpr(cast->getOperand(0), call, values, memory));
-      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
-      if (cast->getOpcode() == llvm::Instruction::BitCast) {
-        return absl::StrCat("as_type<", type, ">(", operand, ")");
-      }
-      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+      return CastExprWithOperand(*cast, operand);
     }
     return Unsupported(function_, "inline instruction", instruction);
   }
@@ -3678,6 +3667,14 @@ class FunctionEmitter {
       if (bits == 0) return "float(0)";
       return absl::StrCat("as_type<float>(", static_cast<uint32_t>(bits),
                           "u)");
+    }
+    if (load_type->isBFloatTy()) {
+      return absl::StrCat("static_cast<ushort>(", static_cast<uint16_t>(bits),
+                          "u)");
+    }
+    if (load_type->isHalfTy()) {
+      return absl::StrCat("as_type<half>(static_cast<ushort>(",
+                          static_cast<uint16_t>(bits), "u))");
     }
     if (load_type->isIntegerTy()) {
       return IntegerLiteral(llvm::APInt(load_type->getIntegerBitWidth(), bits),
