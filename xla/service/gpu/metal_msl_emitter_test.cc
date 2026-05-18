@@ -994,6 +994,48 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("compare_index("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineUnaryMathHelperCall) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call float @floor_index(i32 %tid)
+  %out = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %tid
+  store float %value, ptr %out, align 4
+  ret void
+}
+
+define internal float @floor_index(i32 %index) {
+entry:
+  %as_float = sitofp i32 %index to float
+  %shifted = fadd float %as_float, 5.000000e-01
+  %floored = call float @__nv_floorf(float %shifted)
+  ret float %floored
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare float @__nv_floorf(float)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("floor((static_cast<float>(v0) + float(0.5)))"),
+            std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("floor_index("), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("__nv_floorf"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLibdeviceAndMinMaxCalls) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

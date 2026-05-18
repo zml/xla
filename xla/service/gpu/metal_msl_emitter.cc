@@ -2267,11 +2267,35 @@ class FunctionEmitter {
     if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
       return InlineSimpleBinaryCall("min", nested_call, outer_call);
     }
+    if (name.starts_with("llvm.fabs.")) {
+      return InlineSimpleUnaryCall("fabs", nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.sqrt.")) {
+      return InlineSimpleUnaryCall("sqrt", nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.floor.")) {
+      return InlineSimpleUnaryCall("floor", nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.ceil.")) {
+      return InlineSimpleUnaryCall("ceil", nested_call, outer_call);
+    }
     if (name.starts_with("llvm.umax.")) {
       return InlineSimpleUnsignedBinaryCall("max", nested_call, outer_call);
     }
     if (name.starts_with("llvm.umin.")) {
       return InlineSimpleUnsignedBinaryCall("min", nested_call, outer_call);
+    }
+    if (name == "__nv_fabsf") {
+      return InlineSimpleUnaryCall("fabs", nested_call, outer_call);
+    }
+    if (name == "__nv_sqrtf") {
+      return InlineSimpleUnaryCall("sqrt", nested_call, outer_call);
+    }
+    if (name == "__nv_floorf") {
+      return InlineSimpleUnaryCall("floor", nested_call, outer_call);
+    }
+    if (name == "__nv_ceilf") {
+      return InlineSimpleUnaryCall("ceil", nested_call, outer_call);
     }
     return Unsupported(function_, "inline call", nested_call);
   }
@@ -2480,6 +2504,18 @@ class FunctionEmitter {
     if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
       return InlineNestedBinaryCall("min", call, nested_call, outer_call);
     }
+    if (name.starts_with("llvm.fabs.")) {
+      return InlineNestedUnaryCall("fabs", call, nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.sqrt.")) {
+      return InlineNestedUnaryCall("sqrt", call, nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.floor.")) {
+      return InlineNestedUnaryCall("floor", call, nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.ceil.")) {
+      return InlineNestedUnaryCall("ceil", call, nested_call, outer_call);
+    }
     if (name.starts_with("llvm.umax.")) {
       return InlineNestedUnsignedBinaryCall("max", call, nested_call,
                                             outer_call);
@@ -2487,6 +2523,18 @@ class FunctionEmitter {
     if (name.starts_with("llvm.umin.")) {
       return InlineNestedUnsignedBinaryCall("min", call, nested_call,
                                             outer_call);
+    }
+    if (name == "__nv_fabsf") {
+      return InlineNestedUnaryCall("fabs", call, nested_call, outer_call);
+    }
+    if (name == "__nv_sqrtf") {
+      return InlineNestedUnaryCall("sqrt", call, nested_call, outer_call);
+    }
+    if (name == "__nv_floorf") {
+      return InlineNestedUnaryCall("floor", call, nested_call, outer_call);
+    }
+    if (name == "__nv_ceilf") {
+      return InlineNestedUnaryCall("ceil", call, nested_call, outer_call);
     }
     return Unsupported(function_, "nested inline call", call);
   }
@@ -2525,6 +2573,19 @@ class FunctionEmitter {
         InlineNestedSimpleValue(call.getArgOperand(1), nested_call,
                                 outer_call));
     return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
+  }
+
+  absl::StatusOr<std::string> InlineNestedUnaryCall(
+      absl::string_view msl_name, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (call.arg_size() != 1) {
+      return Unsupported(function_, "nested inline unary call", call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string operand,
+        InlineNestedSimpleValue(call.getArgOperand(0), nested_call,
+                                outer_call));
+    return absl::StrCat(msl_name, "(", operand, ")");
   }
 
   absl::StatusOr<std::string> InlineNestedUnsignedBinaryCall(
@@ -2804,6 +2865,18 @@ class FunctionEmitter {
         std::string rhs,
         InlineSimpleValue(nested_call.getArgOperand(1), outer_call));
     return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
+  }
+
+  absl::StatusOr<std::string> InlineSimpleUnaryCall(
+      absl::string_view msl_name, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (nested_call.arg_size() != 1) {
+      return Unsupported(function_, "inline unary call", nested_call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string operand,
+        InlineSimpleValue(nested_call.getArgOperand(0), outer_call));
+    return absl::StrCat(msl_name, "(", operand, ")");
   }
 
   absl::StatusOr<std::string> InlineSimpleUnsignedBinaryCall(
