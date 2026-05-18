@@ -212,6 +212,50 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg2[v0] ="), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineComplexAggregateValue) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @complex_wrap(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [2 x { float, float }], ptr %arg0, i32 0, i32 %tid
+  %value = load { float, float }, ptr %in, align 4
+  %real = extractvalue { float, float } %value, 0
+  %imag = extractvalue { float, float } %value, 1
+  %wrapped = call { { float, float } } @wrap_complex(float %real, float %imag)
+  %complex = extractvalue { { float, float } } %wrapped, 0
+  %out = getelementptr inbounds [2 x { float, float }], ptr %arg1, i32 0, i32 %tid
+  store { float, float } %complex, ptr %out, align 4
+  ret void
+}
+
+define internal { { float, float } } @wrap_complex(float %real, float %imag) {
+entry:
+  %with_real = insertvalue { float, float } poison, float %real, 0
+  %complex = insertvalue { float, float } %with_real, float %imag, 1
+  %wrapped = insertvalue { { float, float } } poison, { float, float } %complex, 0
+  ret { { float, float } } %wrapped
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @complex_wrap, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float2("), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg1[v0] ="), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("wrap_complex("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsEmptyLibraryForModulesWithoutKernels) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -373,6 +417,45 @@ declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32)
   EXPECT_NE(msl.find("float(0) +"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineFunctionArgumentLoad) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call float @read_value(ptr %arg0, i32 %tid)
+  %out = getelementptr inbounds [4 x float], ptr %arg1, i32 0, i32 %tid
+  store float %value, ptr %out, align 4
+  ret void
+}
+
+define internal float @read_value(ptr %base, i32 %index) {
+entry:
+  %in = getelementptr inbounds [4 x float], ptr %base, i32 0, i32 %index
+  %value = load float, ptr %in, align 4, !invariant.load !1
+  ret float %value
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("arg0[v0]"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg1[v0] ="), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("read_value("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLibdeviceAndMinMaxCalls) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -422,8 +505,9 @@ entry:
   %rounded = call float @__nv_rintf(float %floored)
   %powered = call float @__nv_powf(float %rounded, float 2.000000e+00)
   %signed = call float @__nv_copysignf(float %powered, float %value)
+  %logged = call float @__nv_log1pf(float %signed)
   %unordered = fcmp uno float %value, %value
-  %selected = select i1 %unordered, float 0.000000e+00, float %signed
+  %selected = select i1 %unordered, float 0.000000e+00, float %logged
   %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
   store float %selected, ptr %out, align 4
   ret void
@@ -434,6 +518,7 @@ declare float @__nv_floorf(float)
 declare float @__nv_rintf(float)
 declare float @__nv_powf(float, float)
 declare float @__nv_copysignf(float, float)
+declare float @__nv_log1pf(float)
 
 !nvvm.annotations = !{!0}
 !0 = !{ptr @math, !"kernel", i32 1}
@@ -449,6 +534,7 @@ declare float @__nv_copysignf(float, float)
   EXPECT_NE(msl.find("rint(v2)"), std::string::npos) << msl;
   EXPECT_NE(msl.find("pow(v3, float(2))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("copysign(v4, v1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("log1p(v5)"), std::string::npos) << msl;
   EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
 }
 

@@ -382,9 +382,41 @@ class FunctionEmitter {
                        llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
           RecordPointerElementType(store->getPointerOperand(),
                                    store->getValueOperand()->getType());
+        } else if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          RecordInlinePointerElementTypes(*call);
         }
       }
     }
+  }
+
+  void RecordInlinePointerElementTypes(const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) return;
+
+    for (const llvm::BasicBlock& block : *callee) {
+      for (const llvm::Instruction& instruction : block) {
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          RecordInlinePointerElementType(call, load->getPointerOperand(),
+                                         load->getType());
+        } else if (auto* store =
+                       llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+          RecordInlinePointerElementType(
+              call, store->getPointerOperand(),
+              store->getValueOperand()->getType());
+        }
+      }
+    }
+  }
+
+  void RecordInlinePointerElementType(const llvm::CallInst& call,
+                                      const llvm::Value* pointer,
+                                      llvm::Type* element_type) {
+    const llvm::Value* root = PointerRoot(pointer);
+    if (root == nullptr) return;
+    auto* argument = llvm::dyn_cast<llvm::Argument>(root);
+    if (argument == nullptr) return;
+    RecordPointerElementType(call.getArgOperand(argument->getArgNo()),
+                             element_type);
   }
 
   void RecordPointerElementType(const llvm::Value* pointer,
@@ -1405,6 +1437,7 @@ class FunctionEmitter {
     if (name == "__nv_cosf") return UnaryMathCall("cos", call);
     if (name == "__nv_expf") return UnaryMathCall("exp", call);
     if (name == "__nv_logf") return UnaryMathCall("log", call);
+    if (name == "__nv_log1pf") return UnaryMathCall("log1p", call);
     if (name == "__nv_floorf") return UnaryMathCall("floor", call);
     if (name == "__nv_ceilf") return UnaryMathCall("ceil", call);
     if (name == "__nv_roundf") return UnaryMathCall("round", call);
@@ -1544,6 +1577,15 @@ class FunctionEmitter {
       return absl::StrCat("(", condition, " ? ", true_value, " : ",
                           false_value, ")");
     }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
+      return InlineComplexInsertValueExpr(*insert, call);
+    }
+    if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(value)) {
+      return InlineExtractValueExpr(*extract, call);
+    }
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+      return InlineSimpleLoadExpr(*load, call);
+    }
     if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value)) {
       TF_ASSIGN_OR_RETURN(std::string operand,
                           InlineSimpleValue(cast->getOperand(0), call));
@@ -1557,6 +1599,87 @@ class FunctionEmitter {
       return InlineSimpleCall(*nested_call, call);
     }
     return Unsupported(function_, "inline value", *value);
+  }
+
+  absl::StatusOr<std::string> InlineComplexInsertValueExpr(
+      const llvm::InsertValueInst& insert, const llvm::CallInst& call) {
+    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+      return Unsupported(function_, "inline aggregate insertion", insert);
+    }
+
+    unsigned field = *insert.idx_begin();
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+
+    std::string components[2] = {"0.0f", "0.0f"};
+    const llvm::Value* aggregate = insert.getAggregateOperand();
+    if (!llvm::isa<llvm::UndefValue>(aggregate) &&
+        !llvm::isa<llvm::PoisonValue>(aggregate)) {
+      TF_ASSIGN_OR_RETURN(components[0],
+                          InlineComplexComponentExpr(aggregate, call, 0));
+      TF_ASSIGN_OR_RETURN(components[1],
+                          InlineComplexComponentExpr(aggregate, call, 1));
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string inserted,
+        InlineSimpleValue(insert.getInsertedValueOperand(), call));
+    components[field] = std::move(inserted);
+    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+  }
+
+  absl::StatusOr<std::string> InlineComplexComponentExpr(
+      const llvm::Value* value, const llvm::CallInst& call, unsigned field) {
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+    if (llvm::isa<llvm::UndefValue>(value) ||
+        llvm::isa<llvm::PoisonValue>(value)) {
+      return "0.0f";
+    }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
+      if (insert->getNumIndices() != 1) {
+        return Unsupported(function_, "inline aggregate insertion", *insert);
+      }
+      if (*insert->idx_begin() == field) {
+        return InlineSimpleValue(insert->getInsertedValueOperand(), call);
+      }
+      return InlineComplexComponentExpr(insert->getAggregateOperand(), call,
+                                        field);
+    }
+    TF_ASSIGN_OR_RETURN(std::string expression, InlineSimpleValue(value, call));
+    return absl::StrCat(expression, field == 0 ? ".x" : ".y");
+  }
+
+  absl::StatusOr<std::string> InlineExtractValueExpr(
+      const llvm::ExtractValueInst& extract, const llvm::CallInst& call) {
+    if (extract.getNumIndices() != 1) {
+      return Unsupported(function_, "inline nested aggregate extraction",
+                         extract);
+    }
+    const llvm::Value* aggregate = extract.getAggregateOperand();
+    unsigned field = *extract.idx_begin();
+    if (IsComplexFloatStruct(aggregate->getType())) {
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          InlineSimpleValue(aggregate, call));
+      if (field == 0) return absl::StrCat(value, ".x");
+      if (field == 1) return absl::StrCat(value, ".y");
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+    if (auto* nested_call = llvm::dyn_cast<llvm::CallInst>(aggregate)) {
+      return AggregateElementValue(nested_call, &call, field);
+    }
+    return AggregateElementValue(aggregate, &call, field);
+  }
+
+  absl::StatusOr<std::string> InlineSimpleLoadExpr(
+      const llvm::LoadInst& load, const llvm::CallInst& call) {
+    const absl::flat_hash_map<const llvm::Value*, StoredInlineValue> values;
+    const absl::flat_hash_map<const llvm::Value*, StoredInlineValue> memory;
+    return InlineLoadExpr(load, call, values, memory);
   }
 
   absl::StatusOr<std::string> InlineSimpleCall(
@@ -1877,7 +2000,88 @@ class FunctionEmitter {
       return InlineConstantGlobalLoadExpr(*global, load.getType());
     }
 
-    return Unsupported(function_, "inline load source", load);
+    TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                        InlinePointerExprFor(load.getPointerOperand(), call));
+    std::string expression =
+        absl::StrCat(pointer.base, "[", pointer.index, "]");
+    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+  }
+
+  absl::StatusOr<PtrExpr> InlinePointerExprFor(
+      const llvm::Value* value, const llvm::CallInst& call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return PointerExprFor(call.getArgOperand(argument->getArgNo()));
+    }
+
+    if (llvm::isa<llvm::GlobalVariable>(value) ||
+        llvm::isa<llvm::AllocaInst>(value)) {
+      return PointerExprFor(value);
+    }
+
+    if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+      switch (op->getOpcode()) {
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::AddrSpaceCast:
+          return InlinePointerExprFor(op->getOperand(0), call);
+        case llvm::Instruction::GetElementPtr:
+          return InlineGepExpr(*llvm::cast<llvm::GEPOperator>(op), call);
+        default:
+          break;
+      }
+    }
+
+    return Unsupported(function_, "inline pointer expression", *value);
+  }
+
+  absl::StatusOr<PtrExpr> InlineGepExpr(const llvm::GEPOperator& gep,
+                                        const llvm::CallInst& call) {
+    TF_ASSIGN_OR_RETURN(PtrExpr base,
+                        InlinePointerExprFor(gep.getPointerOperand(), call));
+    llvm::Type* current_type = gep.getSourceElementType();
+    std::string offset = "0";
+    bool first_index = true;
+
+    for (const llvm::Use& use : gep.indices()) {
+      const llvm::Value* index = use.get();
+
+      if (!IsZeroConstant(index)) {
+        if (auto* struct_type = llvm::dyn_cast<llvm::StructType>(current_type);
+            struct_type != nullptr && !first_index) {
+          auto* constant_index = llvm::dyn_cast<llvm::ConstantInt>(index);
+          if (constant_index == nullptr) {
+            return absl::UnimplementedError(
+                "Metal MSL emission requires constant struct GEP indices.");
+          }
+          uint64_t field = constant_index->getZExtValue();
+          int64_t field_offset = 0;
+          for (uint64_t i = 0; i < field; ++i) {
+            TF_ASSIGN_OR_RETURN(
+                int64_t count,
+                FlattenedElementCount(data_layout_,
+                                      struct_type->getElementType(i),
+                                      base.element_type));
+            field_offset += count;
+          }
+          offset = AddIndex(offset, absl::StrCat(field_offset));
+        } else {
+          TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
+                              TypeScaledByGepIndex(current_type, first_index));
+          TF_ASSIGN_OR_RETURN(
+              int64_t scale,
+              FlattenedElementCount(data_layout_, scaled_type,
+                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(std::string index_expr,
+                              InlineSimpleValue(index, call));
+          offset = AddIndex(offset, ScaleIndex(index_expr, scale));
+        }
+      }
+
+      TF_ASSIGN_OR_RETURN(current_type,
+                          TypeAfterGepIndex(current_type, index, first_index));
+      first_index = false;
+    }
+
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
   }
 
   absl::StatusOr<std::string> InlineInstructionExpr(
