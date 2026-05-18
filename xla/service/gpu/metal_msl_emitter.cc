@@ -138,6 +138,7 @@ absl::StatusOr<std::string> MslScalarType(llvm::Type* type,
   if (type->isIntegerTy(16)) return unsigned_integer ? "ushort" : "short";
   if (type->isIntegerTy(32)) return unsigned_integer ? "uint" : "int";
   if (type->isIntegerTy(64)) return unsigned_integer ? "ulong" : "long";
+  if (type->isBFloatTy()) return "ushort";
   if (type->isHalfTy()) return "half";
   if (type->isFloatTy()) return "float";
   if (type->isDoubleTy()) return "double";
@@ -166,6 +167,7 @@ absl::StatusOr<std::string> MslType(llvm::Type* type,
 absl::StatusOr<std::string> ZeroInitializer(llvm::Type* type) {
   if (type->isIntegerTy(1)) return "false";
   if (type->isIntegerTy()) return "0";
+  if (type->isBFloatTy()) return "0";
   if (type->isHalfTy()) return "half(0.0)";
   if (type->isFloatTy()) return "0.0f";
   if (type->isDoubleTy()) return "0.0";
@@ -946,6 +948,10 @@ class FunctionEmitter {
       if (as_apfloat.isInfinity() || as_apfloat.isNaN()) {
         std::string sign = as_apfloat.isNegative() ? "-" : "";
         std::string literal = as_apfloat.isInfinity() ? "INFINITY" : "NAN";
+        if (value->getType()->isBFloatTy()) {
+          return absl::StrCat("xla_metal_f32_to_bf16(float(", sign, literal,
+                              "))");
+        }
         if (value->getType()->isHalfTy()) {
           return absl::StrCat("half(", sign, literal, ")");
         }
@@ -955,6 +961,10 @@ class FunctionEmitter {
         return absl::StrCat("double(", sign, literal, ")");
       }
       double as_double = as_apfloat.convertToDouble();
+      if (value->getType()->isBFloatTy()) {
+        return absl::StrFormat("xla_metal_f32_to_bf16(float(%.9g))",
+                               as_double);
+      }
       if (value->getType()->isHalfTy()) {
         return absl::StrFormat("half(%.9g)", as_double);
       }
@@ -1240,6 +1250,16 @@ class FunctionEmitter {
   absl::StatusOr<std::string> CastExpr(const llvm::CastInst& cast) {
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(cast.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string type, MslType(cast.getType()));
+    if (cast.getOpcode() == llvm::Instruction::FPTrunc &&
+        cast.getType()->isBFloatTy() &&
+        cast.getOperand(0)->getType()->isFloatTy()) {
+      return absl::StrCat("xla_metal_f32_to_bf16(", operand, ")");
+    }
+    if (cast.getOpcode() == llvm::Instruction::FPExt &&
+        cast.getOperand(0)->getType()->isBFloatTy() &&
+        cast.getType()->isFloatTy()) {
+      return absl::StrCat("xla_metal_bf16_to_f32(", operand, ")");
+    }
     switch (cast.getOpcode()) {
       case llvm::Instruction::Trunc:
       case llvm::Instruction::ZExt:
@@ -2032,6 +2052,16 @@ absl::StatusOr<std::string> EmitMslFromLlvmModule(const llvm::Module& module) {
   return absl::StrCat("#include <metal_stdlib>\n",
                       "#include <metal_math>\n",
                       "using namespace metal;\n\n",
+                      "inline ushort xla_metal_f32_to_bf16(float value) {\n"
+                      "  uint bits = as_type<uint>(value);\n"
+                      "  uint rounding_bias = 0x7fffu + ((bits >> 16) & 1u);\n"
+                      "  return static_cast<ushort>((bits + rounding_bias) >> "
+                      "16);\n"
+                      "}\n\n"
+                      "inline float xla_metal_bf16_to_f32(ushort value) {\n"
+                      "  return as_type<float>(static_cast<uint>(value) << "
+                      "16);\n"
+                      "}\n\n",
                       absl::StrJoin(kernels, "\n"));
 }
 
