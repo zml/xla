@@ -1745,6 +1745,119 @@ TEST(MetalGpuExecutableTest, ReductionPredAllAny) {
   ExpectScalarPred(any_actual, true);
 }
 
+TEST(MetalGpuExecutableTest, ReductionF32Rank2ToRank1) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_rank2_sum_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  Array2D<float> values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      values(row, col) = static_cast<float>(((row * 5 + col) % 11) - 5) / 3.0f;
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+
+  auto execute = [&](int64_t dimension) -> absl::StatusOr<Literal> {
+    XlaBuilder builder("metal_rank2_sum");
+    Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+    XlaOp input = Parameter(&builder, 0, input_shape, "input");
+    Reduce(input, ConstantR0<float>(&builder, 0.0f), reducer, {dimension});
+    TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                        client->TransferToServer(input_literal));
+    std::vector<GlobalData*> arguments = {input_data.get()};
+    return client->ExecuteAndTransfer(computation, arguments);
+  };
+
+  auto axis0_result = execute(0);
+  if (absl::IsFailedPrecondition(axis0_result.status())) {
+    GTEST_SKIP() << axis0_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal axis0_actual, std::move(axis0_result));
+  ASSERT_TRUE(ShapeUtil::Compatible(axis0_actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {5})));
+  for (int64_t col = 0; col < 5; ++col) {
+    float expected = 0.0f;
+    for (int64_t row = 0; row < 4; ++row) {
+      expected += values(row, col);
+    }
+    EXPECT_NEAR(axis0_actual.Get<float>({col}), expected, 1.0e-6f)
+        << "at col " << col;
+  }
+
+  auto axis1_result = execute(1);
+  if (absl::IsFailedPrecondition(axis1_result.status())) {
+    GTEST_SKIP() << axis1_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal axis1_actual, std::move(axis1_result));
+  ASSERT_TRUE(ShapeUtil::Compatible(axis1_actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {4})));
+  for (int64_t row = 0; row < 4; ++row) {
+    float expected = 0.0f;
+    for (int64_t col = 0; col < 5; ++col) {
+      expected += values(row, col);
+    }
+    EXPECT_NEAR(axis1_actual.Get<float>({row}), expected, 1.0e-6f)
+        << "at row " << row;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ReductionPredRank2AllAxis1) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_rank2_pred_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(PRED, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  And(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_rank2_all");
+  Shape input_shape = ShapeUtil::MakeShape(PRED, {4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<bool>(&builder, true), reducer, {1});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      Literal::CreateFromShape(ShapeUtil::MakeShape(PRED, {4, 5}));
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      input_literal.Set<bool>({row, col}, row != 2 && col != 3);
+    }
+  }
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {4})));
+  for (int64_t row = 0; row < 4; ++row) {
+    bool expected = true;
+    for (int64_t col = 0; col < 5; ++col) {
+      expected = expected && input_literal.Get<bool>({row, col});
+    }
+    EXPECT_EQ(actual.Get<bool>({row}), expected) << "at row " << row;
+  }
+}
+
 TEST(MetalGpuExecutableTest, ReductionS32SumMaximum) {
   auto client_result = GetMetalClient();
   if (absl::IsFailedPrecondition(client_result.status())) {
