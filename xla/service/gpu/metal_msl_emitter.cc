@@ -3585,6 +3585,12 @@ class FunctionEmitter {
       return absl::StrCat("(", condition, " ? ", true_value, " : ",
                           false_value, ")");
     }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(&instruction)) {
+      return InlineComplexInsertValueExpr(*insert, call, values, memory);
+    }
+    if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(&instruction)) {
+      return InlineExtractValueExpr(*extract, call, values, memory);
+    }
     if (auto* cast = llvm::dyn_cast<llvm::CastInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(
           std::string operand,
@@ -3592,6 +3598,90 @@ class FunctionEmitter {
       return CastExprWithOperand(*cast, operand);
     }
     return Unsupported(function_, "inline instruction", instruction);
+  }
+
+  absl::StatusOr<std::string> InlineComplexInsertValueExpr(
+      const llvm::InsertValueInst& insert, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
+    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+      return Unsupported(function_, "inline aggregate insertion", insert);
+    }
+
+    unsigned field = *insert.idx_begin();
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+
+    std::string components[2] = {"0.0f", "0.0f"};
+    const llvm::Value* aggregate = insert.getAggregateOperand();
+    if (!llvm::isa<llvm::UndefValue>(aggregate) &&
+        !llvm::isa<llvm::PoisonValue>(aggregate)) {
+      TF_ASSIGN_OR_RETURN(
+          components[0],
+          InlineComplexComponentExpr(aggregate, call, values, memory, 0));
+      TF_ASSIGN_OR_RETURN(
+          components[1],
+          InlineComplexComponentExpr(aggregate, call, values, memory, 1));
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string inserted,
+        InlineValueExpr(insert.getInsertedValueOperand(), call, values,
+                        memory));
+    components[field] = std::move(inserted);
+    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+  }
+
+  absl::StatusOr<std::string> InlineComplexComponentExpr(
+      const llvm::Value* value, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory,
+      unsigned field) {
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+    if (llvm::isa<llvm::UndefValue>(value) ||
+        llvm::isa<llvm::PoisonValue>(value)) {
+      return "0.0f";
+    }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
+      if (insert->getNumIndices() != 1) {
+        return Unsupported(function_, "inline aggregate insertion", *insert);
+      }
+      if (*insert->idx_begin() == field) {
+        return InlineValueExpr(insert->getInsertedValueOperand(), call, values,
+                               memory);
+      }
+      return InlineComplexComponentExpr(insert->getAggregateOperand(), call,
+                                        values, memory, field);
+    }
+    TF_ASSIGN_OR_RETURN(std::string expression,
+                        InlineValueExpr(value, call, values, memory));
+    return absl::StrCat(expression, field == 0 ? ".x" : ".y");
+  }
+
+  absl::StatusOr<std::string> InlineExtractValueExpr(
+      const llvm::ExtractValueInst& extract, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
+    if (extract.getNumIndices() != 1) {
+      return Unsupported(function_, "inline nested aggregate extraction",
+                         extract);
+    }
+
+    const llvm::Value* aggregate = extract.getAggregateOperand();
+    unsigned field = *extract.idx_begin();
+    if (IsComplexFloatStruct(aggregate->getType())) {
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          InlineValueExpr(aggregate, call, values, memory));
+      if (field == 0) return absl::StrCat(value, ".x");
+      if (field == 1) return absl::StrCat(value, ".y");
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+    return Unsupported(function_, "inline aggregate extraction", extract);
   }
 
   absl::StatusOr<std::string> InlineValueExpr(

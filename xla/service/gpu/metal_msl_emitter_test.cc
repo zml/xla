@@ -2046,6 +2046,42 @@ entry:
   EXPECT_EQ(msl.find("compare("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, InlinesVoidHelperComplexExtractValue) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  call void @sum_complex(ptr %arg0, ptr %arg1)
+  ret void
+}
+
+define internal void @sum_complex(ptr %input, ptr %out) {
+entry:
+  %value = load { float, float }, ptr %input, align 4
+  %real = extractvalue { float, float } %value, 0
+  %imag = extractvalue { float, float } %value, 1
+  %sum = fadd float %real, %imag
+  store float %sum, ptr %out, align 4
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("arg0[0].x"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg0[0].y"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("sum_complex("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsTupleReducerArgmax) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
