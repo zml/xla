@@ -228,6 +228,29 @@ void ExpectMatchesElementwiseReference(const Literal& actual,
   }
 }
 
+void ExpectMatchesSliceReference(const Literal& actual, const Literal& input,
+                                 int64_t start, int64_t size) {
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {size})));
+  for (int64_t i = 0; i < size; ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), input.Get<float>({start + i}))
+        << "at " << i;
+  }
+}
+
+void ExpectMatchesReshapeSliceReference(const Literal& actual,
+                                        const Literal& input) {
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {16, 16})));
+  for (int64_t row = 0; row < 16; ++row) {
+    for (int64_t col = 0; col < 16; ++col) {
+      const int64_t index = row * 16 + col;
+      EXPECT_EQ(actual.Get<float>({row, col}), input.Get<float>({index}))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, Dot) {
   auto result = ExecuteMetalMatmul(/*relu=*/false);
   if (absl::IsFailedPrecondition(result.status())) {
@@ -527,6 +550,31 @@ TEST(MetalGpuExecutableTest, ElementwiseWhereCall) {
     const float value = input.Get<float>({i});
     return value > 0.0f ? value : -value;
   });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSlice) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_slice",
+      [](XlaBuilder*, XlaOp input) { Slice(input, {3}, {200}, {1}); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesSliceReference(actual, MakeElementwiseLhs(), /*start=*/3,
+                              /*size=*/197);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReshapeSlice) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_reshape_slice",
+      [](XlaBuilder*, XlaOp input) {
+        Reshape(Slice(input, {0}, {256}, {1}), {16, 16});
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesReshapeSliceReference(actual, MakeElementwiseLhs());
 }
 
 }  // namespace

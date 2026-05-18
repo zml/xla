@@ -252,6 +252,9 @@ class ElementwiseAirEmitter {
         instr->opcode() == HloOpcode::kReshape) {
       return EmitValue(instr->operand(0), force_scalar, body);
     }
+    if (instr->opcode() == HloOpcode::kSlice) {
+      return EmitSlice(instr, body);
+    }
 
     if (instr->IsConstant()) {
       if (!IsScalarLikeF32(instr->shape())) {
@@ -269,16 +272,8 @@ class ElementwiseAirEmitter {
             "shape unless they are scalar-broadcast operands.");
       }
       const int64_t parameter_number = instr->parameter_number();
-      int input_index = 0;
-      auto it = parameter_to_input_index_.find(parameter_number);
-      if (it == parameter_to_input_index_.end()) {
-        input_index = parameter_numbers_.size();
-        parameter_to_input_index_[parameter_number] = input_index;
-        parameter_numbers_.push_back(parameter_number);
-      } else {
-        input_index = it->second;
-      }
-      return EmitLoad(input_index, force_scalar, body);
+      const int input_index = InputIndexForParameter(parameter_number);
+      return EmitLoad(input_index, force_scalar ? "0" : "%idx", body);
     }
 
     switch (instr->opcode()) {
@@ -334,6 +329,65 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise does not support HLO opcode %s.",
             HloOpcodeString(instr->opcode())));
     }
+  }
+
+  absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape()) ||
+        !IsF32Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions().size() != 1 ||
+        instr->operand(0)->shape().dimensions().size() != 1 ||
+        instr->slice_strides().size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise slice currently supports only rank-1 "
+          "f32 slices.");
+    }
+    if (ShapeUtil::ElementsIn(instr->shape()) !=
+        ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise slice must have the same element count "
+          "as the final result.");
+    }
+
+    const HloInstruction* operand = instr->operand(0);
+    while (operand->opcode() == HloOpcode::kBitcast ||
+           operand->opcode() == HloOpcode::kReshape) {
+      operand = operand->operand(0);
+    }
+    if (operand->opcode() != HloOpcode::kParameter) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise slice currently supports only "
+          "parameter operands.");
+    }
+    const int input_index =
+        InputIndexForParameter(operand->parameter_number());
+    const int64_t start = instr->slice_starts(0);
+    const int64_t stride = instr->slice_strides(0);
+    std::string source_index = "%idx";
+    if (stride != 1) {
+      std::string scaled = NewName("slice_scaled");
+      body->push_back(absl::StrFormat("  %s = mul i64 %%idx, %d", scaled,
+                                      stride));
+      source_index = scaled;
+    }
+    if (start != 0) {
+      std::string shifted = NewName("slice_idx");
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                      source_index, start));
+      source_index = shifted;
+    }
+    return EmitLoad(input_index, source_index, body);
+  }
+
+  int InputIndexForParameter(int64_t parameter_number) {
+    auto it = parameter_to_input_index_.find(parameter_number);
+    if (it != parameter_to_input_index_.end()) {
+      return it->second;
+    }
+    const int input_index = parameter_numbers_.size();
+    parameter_to_input_index_[parameter_number] = input_index;
+    parameter_numbers_.push_back(parameter_number);
+    return input_index;
   }
 
   absl::StatusOr<const HloInstruction*> ResolveCallParameter(
@@ -547,14 +601,14 @@ class ElementwiseAirEmitter {
     return IsScalarLikeF32(instr->operand(operand_index)->shape());
   }
 
-  std::string EmitLoad(int input_index, bool force_scalar,
+  std::string EmitLoad(int input_index, absl::string_view index,
                        std::vector<std::string>* body) {
     std::string ptr = NewName("ptr");
     std::string value = NewName("value");
     body->push_back(absl::StrFormat(
         "  %s = getelementptr inbounds float, float addrspace(1)* %%arg%d, "
         "i64 %s",
-        ptr, input_index, force_scalar ? "0" : "%idx"));
+        ptr, input_index, index));
     body->push_back(absl::StrFormat(
         "  %s = load float, float addrspace(1)* %s, align 4", value, ptr));
     return value;
