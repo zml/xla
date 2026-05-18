@@ -334,6 +334,11 @@ class ElementwiseAirEmitter {
   }
 
  private:
+  struct CallParameterScope {
+    const HloComputation* computation = nullptr;
+    absl::flat_hash_map<int64_t, const HloInstruction*> arguments;
+  };
+
   absl::StatusOr<std::string> EmitValue(const HloInstruction* instr,
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
@@ -366,6 +371,9 @@ class ElementwiseAirEmitter {
     }
 
     if (instr->opcode() == HloOpcode::kParameter) {
+      if (const HloInstruction* override = CallParameterOverride(instr)) {
+        return EmitValue(override, force_scalar, body);
+      }
       if (!force_scalar && !HasResultDimensions(instr->shape())) {
         return absl::UnimplementedError(
           "Metal direct AIR elementwise parameters must have the result "
@@ -380,13 +388,15 @@ class ElementwiseAirEmitter {
 
     switch (instr->opcode()) {
       case HloOpcode::kCall:
-        return EmitCall(instr, body);
+        return EmitCall(instr, force_scalar, body);
       case HloOpcode::kConcatenate:
         return EmitConcatenate(instr, body);
       case HloOpcode::kConvert:
         return EmitConvert(instr, body);
       case HloOpcode::kIota:
         return EmitIota(instr, body);
+      case HloOpcode::kPad:
+        return EmitPad(instr, force_scalar, body);
       case HloOpcode::kTranspose:
         return EmitTranspose(instr, body);
       case HloOpcode::kCompare:
@@ -486,6 +496,9 @@ class ElementwiseAirEmitter {
       return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
     }
     if (instr->opcode() == HloOpcode::kParameter) {
+      if (const HloInstruction* override = CallParameterOverride(instr)) {
+        return EmitLoadFromLinearIndex(override, index, body);
+      }
       const int input_index =
           InputIndexForParameter(instr->parameter_number(),
                                  instr->shape().element_type());
@@ -654,50 +667,38 @@ class ElementwiseAirEmitter {
     return input_index;
   }
 
-  absl::StatusOr<const HloInstruction*> ResolveCallParameter(
-      const HloInstruction* call, const HloInstruction* callee_operand) {
-    if (callee_operand->opcode() != HloOpcode::kParameter) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise call inlining currently supports only "
-          "callee roots whose operands are parameters.");
-    }
-    const int64_t parameter_number = callee_operand->parameter_number();
-    if (parameter_number < 0 || parameter_number >= call->operand_count()) {
+  absl::StatusOr<std::string> EmitCall(const HloInstruction* instr,
+                                       bool force_scalar,
+                                       std::vector<std::string>* body) {
+    const HloComputation* callee = instr->to_apply();
+    if (callee->num_parameters() != instr->operand_count()) {
       return absl::InvalidArgumentError(
-          "Metal direct AIR elementwise call parameter is out of bounds.");
+          "Metal direct AIR elementwise call operand count does not match "
+          "callee parameter count.");
     }
-    return call->operand(parameter_number);
+    CallParameterScope scope;
+    scope.computation = callee;
+    for (int64_t i = 0; i < instr->operand_count(); ++i) {
+      scope.arguments[i] = instr->operand(i);
+    }
+    call_parameter_scopes_.push_back(std::move(scope));
+    absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+    return EmitValue(callee->root_instruction(), force_scalar, body);
   }
 
-  absl::StatusOr<std::string> EmitCall(const HloInstruction* instr,
-                                       std::vector<std::string>* body) {
-    const HloInstruction* root = instr->to_apply()->root_instruction();
-    if (root->opcode() != HloOpcode::kSelect) {
-      return absl::UnimplementedError(absl::StrFormat(
-          "Metal direct AIR elementwise supports only calls that inline to "
-          "select, got callee root opcode %s.",
-          HloOpcodeString(root->opcode())));
+  const HloInstruction* CallParameterOverride(
+      const HloInstruction* instr) const {
+    for (auto it = call_parameter_scopes_.rbegin();
+         it != call_parameter_scopes_.rend(); ++it) {
+      if (instr->parent() != it->computation) {
+        continue;
+      }
+      auto argument = it->arguments.find(instr->parameter_number());
+      if (argument != it->arguments.end()) {
+        return argument->second;
+      }
     }
-    TF_ASSIGN_OR_RETURN(const HloInstruction* pred_instr,
-                        ResolveCallParameter(instr, root->operand(0)));
-    TF_ASSIGN_OR_RETURN(const HloInstruction* on_true_instr,
-                        ResolveCallParameter(instr, root->operand(1)));
-    TF_ASSIGN_OR_RETURN(const HloInstruction* on_false_instr,
-                        ResolveCallParameter(instr, root->operand(2)));
-
-    TF_ASSIGN_OR_RETURN(std::string pred,
-                        EmitValue(pred_instr, /*force_scalar=*/false, body));
-    TF_ASSIGN_OR_RETURN(
-        std::string on_true,
-        EmitValue(on_true_instr, IsScalarLikeF32(on_true_instr->shape()), body));
-    TF_ASSIGN_OR_RETURN(std::string on_false,
-                        EmitValue(on_false_instr,
-                                  IsScalarLikeF32(on_false_instr->shape()),
-                                  body));
-    std::string value = NewName("select");
-    body->push_back(absl::StrFormat("  %s = select i1 %s, float %s, float %s",
-                                    value, pred, on_true, on_false));
-    return value;
+    return nullptr;
   }
 
   absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
@@ -836,6 +837,74 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("  %s = select i1 %s, float %s, float %s",
                                     value, pred, on_true, on_false));
     return value;
+  }
+
+  absl::StatusOr<std::string> EmitPad(const HloInstruction* instr,
+                                      bool force_scalar,
+                                      std::vector<std::string>* body) {
+    if (force_scalar || (!IsF32Array(instr->shape()) &&
+                         !IsS32Array(instr->shape())) ||
+        instr->shape().dimensions().size() != 1 ||
+        instr->operand(0)->shape().dimensions().size() != 1 ||
+        instr->shape().element_type() !=
+            instr->operand(0)->shape().element_type() ||
+        instr->padding_config().dimensions_size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise pad currently supports only rank-1 "
+          "f32/s32 array results.");
+    }
+    const auto& dimension = instr->padding_config().dimensions(0);
+    const int64_t low_padding = dimension.edge_padding_low();
+    const int64_t high_padding = dimension.edge_padding_high();
+    const int64_t interior_padding = dimension.interior_padding();
+    const int64_t input_elements =
+        ShapeUtil::ElementsIn(instr->operand(0)->shape());
+    if (low_padding < 0 || high_padding < 0 || interior_padding != 0 ||
+        input_elements <= 0 ||
+        input_elements + low_padding + high_padding !=
+            ShapeUtil::ElementsIn(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise pad currently supports only "
+          "non-negative edge padding without interior padding.");
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string pad_value,
+                        EmitValue(instr->operand(1), /*force_scalar=*/true,
+                                  body));
+    std::string after_low = NewName("pad_after_low");
+    std::string before_end = NewName("pad_before_end");
+    std::string in_input = NewName("pad_in_input");
+    body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %d",
+                                    after_low, low_padding));
+    body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %d",
+                                    before_end,
+                                    low_padding + input_elements));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_input,
+                                    after_low, before_end));
+
+    std::string source_index = "%idx";
+    if (low_padding != 0) {
+      source_index = NewName("pad_source");
+      body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
+                                      source_index, low_padding));
+    }
+    std::string low_clamped = NewName("pad_low_clamped");
+    std::string safe_index = NewName("pad_safe_index");
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i64 %s, i64 0", low_clamped, after_low,
+        source_index));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i64 %s, i64 %d", safe_index, before_end,
+        low_clamped, input_elements - 1));
+    TF_ASSIGN_OR_RETURN(std::string input_value,
+                        EmitLoadFromLinearIndex(instr->operand(0), safe_index,
+                                                body));
+    const char* ir_type = ElementIrType(instr->shape().element_type());
+    std::string selected = NewName("pad_select");
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, %s %s, %s %s", selected, in_input, ir_type,
+        input_value, ir_type, pad_value));
+    return selected;
   }
 
   absl::StatusOr<std::string> EmitBinary(const HloInstruction* instr,
@@ -1251,6 +1320,7 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   }
 
   Shape result_shape_;
+  std::vector<CallParameterScope> call_parameter_scopes_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
   std::vector<PrimitiveType> parameter_types_;

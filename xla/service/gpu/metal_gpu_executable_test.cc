@@ -213,6 +213,39 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseWhereCall() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalPadCall() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape input_shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+
+  PaddingConfig padding;
+  PaddingConfig::PaddingConfigDimension* dimension =
+      padding.add_dimensions();
+  dimension->set_edge_padding_low(2);
+  dimension->set_edge_padding_high(3);
+  dimension->set_interior_padding(0);
+
+  XlaBuilder pad_builder("_pad");
+  XlaOp callee_input = Parameter(&pad_builder, 0, input_shape, "input");
+  XlaOp callee_padding =
+      Parameter(&pad_builder, 1, scalar_shape, "padding");
+  Pad(callee_input, callee_padding, padding);
+  TF_ASSIGN_OR_RETURN(XlaComputation pad, pad_builder.Build());
+
+  XlaBuilder builder("metal_elementwise_pad_call");
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp padding_value = ConstantR0<float>(&builder, 1.5f);
+  Call(&builder, pad, {input, padding_value});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -361,6 +394,23 @@ void ExpectMatchesSliceReference(const Literal& actual, const Literal& input,
   for (int64_t i = 0; i < size; ++i) {
     EXPECT_EQ(actual.Get<float>({i}), input.Get<float>({start + i}))
         << "at " << i;
+  }
+}
+
+void ExpectMatchesPadReference(const Literal& actual, const Literal& input,
+                               int64_t low_padding, int64_t high_padding,
+                               float pad_value) {
+  const int64_t input_elements = ShapeUtil::ElementsIn(input.shape());
+  const int64_t output_elements =
+      input_elements + low_padding + high_padding;
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {output_elements})));
+  for (int64_t i = 0; i < output_elements; ++i) {
+    const bool in_input =
+        i >= low_padding && i < low_padding + input_elements;
+    const float expected =
+        in_input ? input.Get<float>({i - low_padding}) : pad_value;
+    EXPECT_EQ(actual.Get<float>({i}), expected) << "at " << i;
   }
 }
 
@@ -775,6 +825,16 @@ TEST(MetalGpuExecutableTest, ElementwiseWhereCall) {
     const float value = input.Get<float>({i});
     return value > 0.0f ? value : -value;
   });
+}
+
+TEST(MetalGpuExecutableTest, ElementwisePadCall) {
+  auto result = ExecuteMetalPadCall();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesPadReference(actual, MakeElementwiseLhs(), /*low_padding=*/2,
+                            /*high_padding=*/3, /*pad_value=*/1.5f);
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {
