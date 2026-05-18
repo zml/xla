@@ -541,6 +541,79 @@ bool IsZeroConstant(const llvm::Value* value) {
   return constant != nullptr && constant->isZero();
 }
 
+std::optional<bool> KnownICmpValue(llvm::CmpInst::Predicate predicate,
+                                   const llvm::Value* lhs,
+                                   const llvm::Value* rhs) {
+  auto* lhs_constant = llvm::dyn_cast<llvm::ConstantInt>(lhs);
+  auto* rhs_constant = llvm::dyn_cast<llvm::ConstantInt>(rhs);
+  if (lhs_constant != nullptr && rhs_constant != nullptr) {
+    const llvm::APInt& lhs_value = lhs_constant->getValue();
+    const llvm::APInt& rhs_value = rhs_constant->getValue();
+    switch (predicate) {
+      case llvm::CmpInst::ICMP_EQ:
+        return lhs_value == rhs_value;
+      case llvm::CmpInst::ICMP_NE:
+        return lhs_value != rhs_value;
+      case llvm::CmpInst::ICMP_UGT:
+        return lhs_value.ugt(rhs_value);
+      case llvm::CmpInst::ICMP_UGE:
+        return lhs_value.uge(rhs_value);
+      case llvm::CmpInst::ICMP_ULT:
+        return lhs_value.ult(rhs_value);
+      case llvm::CmpInst::ICMP_ULE:
+        return lhs_value.ule(rhs_value);
+      case llvm::CmpInst::ICMP_SGT:
+        return lhs_value.sgt(rhs_value);
+      case llvm::CmpInst::ICMP_SGE:
+        return lhs_value.sge(rhs_value);
+      case llvm::CmpInst::ICMP_SLT:
+        return lhs_value.slt(rhs_value);
+      case llvm::CmpInst::ICMP_SLE:
+        return lhs_value.sle(rhs_value);
+      default:
+        return std::nullopt;
+    }
+  }
+
+  if (rhs_constant != nullptr) {
+    const llvm::APInt& rhs_value = rhs_constant->getValue();
+    if (rhs_value.isZero()) {
+      if (predicate == llvm::CmpInst::ICMP_UGE) return true;
+      if (predicate == llvm::CmpInst::ICMP_ULT) return false;
+    }
+    if (rhs_value.isAllOnes()) {
+      if (predicate == llvm::CmpInst::ICMP_ULE) return true;
+      if (predicate == llvm::CmpInst::ICMP_UGT) return false;
+    }
+  }
+
+  if (lhs_constant != nullptr) {
+    const llvm::APInt& lhs_value = lhs_constant->getValue();
+    if (lhs_value.isZero()) {
+      if (predicate == llvm::CmpInst::ICMP_ULE) return true;
+      if (predicate == llvm::CmpInst::ICMP_UGT) return false;
+    }
+    if (lhs_value.isAllOnes()) {
+      if (predicate == llvm::CmpInst::ICMP_UGE) return true;
+      if (predicate == llvm::CmpInst::ICMP_ULT) return false;
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::optional<bool> KnownBooleanValue(const llvm::Value* value) {
+  if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+      constant != nullptr && constant->getType()->isIntegerTy(1)) {
+    return !constant->isZero();
+  }
+  if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(value)) {
+    return KnownICmpValue(icmp->getPredicate(), icmp->getOperand(0),
+                          icmp->getOperand(1));
+  }
+  return std::nullopt;
+}
+
 std::string AddIndex(std::string lhs, std::string rhs) {
   if (lhs == "0") return rhs;
   if (rhs == "0") return lhs;
@@ -1033,6 +1106,21 @@ class FunctionEmitter {
                         ");\n");
         block = exit_block;
         continue;
+      }
+
+      if (const auto* branch =
+              llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+          branch != nullptr) {
+        if (std::optional<bool> known =
+                KnownBooleanValue(branch->getCondition())) {
+          RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent));
+          const llvm::BasicBlock* successor =
+              branch->getSuccessor(*known ? 0 : 1);
+          RETURN_IF_ERROR(EmitPhiAssignments(*successor, block, output,
+                                             indent));
+          block = successor;
+          continue;
+        }
       }
 
       if (const auto* branch =

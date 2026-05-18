@@ -2360,6 +2360,49 @@ entry:
       << msl;
 }
 
+TEST(MetalMslEmitterTest, FoldsTrivialUnsignedBranch) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @fold_branch(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %wide = zext i32 %tid to i64
+  %always = icmp uge i64 %wide, 0
+  br i1 %always, label %taken, label %dead
+
+taken:
+  store i32 1, ptr %arg0, align 4
+  br label %done
+
+dead:
+  store i32 2, ptr %arg1, align 4
+  br label %done
+
+done:
+  store i32 3, ptr %arg2, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @fold_branch, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("arg0[0] = 1;"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[0] = 3;"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("arg1[0] = 2;"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("else"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, InlinesVoidHelperComplexExtractValue) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
