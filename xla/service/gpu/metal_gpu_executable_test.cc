@@ -467,6 +467,87 @@ absl::StatusOr<Literal> ExecuteMetalDynamicSliceDynamicStart() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalScatter(bool add) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaBuilder reducer_builder(add ? "metal_scatter_add_reducer"
+                                 : "metal_scatter_set_reducer");
+  XlaOp current = Parameter(&reducer_builder, 0, scalar_shape, "current");
+  XlaOp update = Parameter(&reducer_builder, 1, scalar_shape, "update");
+  if (add) {
+    Add(current, update);
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder(add ? "metal_scatter_add" : "metal_scatter_set");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {8});
+  Shape update_shape = ShapeUtil::MakeShape(F32, {3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp updates = Parameter(&builder, 1, update_shape, "updates");
+  Array2D<int32_t> index_values(3, 1);
+  index_values(0, 0) = 1;
+  index_values(1, 0) = 3;
+  index_values(2, 0) = 6;
+  XlaOp indices = ConstantR2FromArray2D<int32_t>(&builder, index_values);
+  ScatterDimensionNumbers dnums;
+  dnums.add_inserted_window_dims(0);
+  dnums.add_scatter_dims_to_operand_dims(0);
+  dnums.set_index_vector_dim(1);
+  Scatter(input, indices, updates, reducer, dnums,
+          /*indices_are_sorted=*/true, /*unique_indices=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      LiteralUtil::CreateR1<float>({0.0f, 1.0f, 2.0f, 3.0f,
+                                    4.0f, 5.0f, 6.0f, 7.0f});
+  Literal update_literal = LiteralUtil::CreateR1<float>({-1.0f, -2.0f, -3.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> update_data,
+                      client->TransferToServer(update_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), update_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
+                                                 float init_value) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_window_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  switch (opcode) {
+    case HloOpcode::kAdd:
+      Add(lhs, rhs);
+      break;
+    case HloOpcode::kMaximum:
+      Max(lhs, rhs);
+      break;
+    default:
+      return absl::InvalidArgumentError("Unexpected reduce-window opcode.");
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_window");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {16});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  ReduceWindow(input, ConstantR0<float>(&builder, init_value), reducer, {3},
+               {1}, Padding::kValid);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<float> values(16);
+  for (int64_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<float>(i) * 0.25f - 2.0f;
+  }
+  Literal input_literal = LiteralUtil::CreateR1<float>(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1496,6 +1577,68 @@ TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceDynamicStart) {
                 static_cast<float>((row + 1) * 5 + (col + 2)))
           << "at (" << row << ", " << col << ")";
     }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScatterSet) {
+  auto result = ExecuteMetalScatter(/*add=*/false);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {0.0f, -1.0f, 2.0f, -2.0f,
+                                 4.0f, 5.0f,  -3.0f, 7.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScatterAdd) {
+  auto result = ExecuteMetalScatter(/*add=*/true);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {0.0f, 0.0f, 2.0f, 1.0f,
+                                 4.0f, 5.0f, 3.0f, 7.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceWindowSum) {
+  auto result = ExecuteMetalReduceWindow(HloOpcode::kAdd, 0.0f);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {14})));
+  for (int64_t i = 0; i < 14; ++i) {
+    const float x0 = static_cast<float>(i) * 0.25f - 2.0f;
+    const float x1 = static_cast<float>(i + 1) * 0.25f - 2.0f;
+    const float x2 = static_cast<float>(i + 2) * 0.25f - 2.0f;
+    EXPECT_EQ(actual.Get<float>({i}), x0 + x1 + x2) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceWindowMax) {
+  auto result = ExecuteMetalReduceWindow(
+      HloOpcode::kMaximum, -std::numeric_limits<float>::infinity());
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {14})));
+  for (int64_t i = 0; i < 14; ++i) {
+    EXPECT_EQ(actual.Get<float>({i}),
+              static_cast<float>(i + 2) * 0.25f - 2.0f)
+        << "at " << i;
   }
 }
 

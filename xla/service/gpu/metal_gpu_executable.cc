@@ -435,8 +435,12 @@ class ElementwiseAirEmitter {
         return EmitCompare(instr, body);
       case HloOpcode::kReduce:
         return EmitReduce(instr, body);
+      case HloOpcode::kReduceWindow:
+        return EmitReduceWindow(instr, body);
       case HloOpcode::kReverse:
         return EmitReverse(instr, body);
+      case HloOpcode::kScatter:
+        return EmitScatter(instr, body);
       case HloOpcode::kSelect:
         return EmitSelect(instr, body);
       case HloOpcode::kSort:
@@ -1322,6 +1326,132 @@ class ElementwiseAirEmitter {
     return result;
   }
 
+  absl::StatusOr<std::string> EmitScatter(const HloInstruction* instr,
+                                          std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    const HloInstruction* indices = instr->operand(1);
+    const HloInstruction* updates = instr->operand(2);
+    const ScatterDimensionNumbers& dnums = instr->scatter_dimension_numbers();
+    if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
+        !IsF32Array(updates->shape()) ||
+        instr->shape().dimensions().size() != 1 ||
+        input->shape().dimensions().size() != 1 ||
+        updates->shape().dimensions().size() != 1 ||
+        indices->shape().element_type() != S32 ||
+        indices->shape().dimensions().size() != 2 ||
+        indices->shape().dimensions(1) != 1 ||
+        !ShapeUtil::Equal(instr->shape(), input->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        dnums.update_window_dims_size() != 0 ||
+        dnums.inserted_window_dims_size() != 1 ||
+        dnums.inserted_window_dims(0) != 0 ||
+        dnums.scatter_dims_to_operand_dims_size() != 1 ||
+        dnums.scatter_dims_to_operand_dims(0) != 0 ||
+        dnums.index_vector_dim() != 1 ||
+        ShapeUtil::ElementsIn(updates->shape()) !=
+            indices->shape().dimensions(0)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scatter currently supports only rank-1 f32 "
+          "scatter set/add with static scalar indices.");
+    }
+
+    const HloInstruction* reducer = instr->to_apply()->root_instruction();
+    const bool scatter_add = reducer->opcode() == HloOpcode::kAdd;
+    const bool scatter_set =
+        reducer->opcode() == HloOpcode::kParameter &&
+        reducer->parameter_number() == 1;
+    if (!scatter_add && !scatter_set) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scatter currently supports only set and add "
+          "update computations.");
+    }
+
+    TF_ASSIGN_OR_RETURN(std::vector<int64_t> static_indices,
+                        EvaluateS32Array(indices));
+    const int64_t input_elements = ShapeUtil::ElementsIn(input->shape());
+    for (int64_t index : static_indices) {
+      if (index < 0 || index >= input_elements) {
+        return absl::UnimplementedError(
+            "Metal direct AIR scatter currently requires static in-bounds "
+            "indices.");
+      }
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string selected,
+                        EmitLoadFromLinearIndex(input, "%idx", body));
+    for (int64_t update_index = 0; update_index < static_indices.size();
+         ++update_index) {
+      TF_ASSIGN_OR_RETURN(
+          std::string update_value,
+          EmitLoadFromLinearIndex(updates, absl::StrCat(update_index), body));
+      std::string replacement = update_value;
+      if (scatter_add) {
+        replacement = EmitOp("fadd fast float", selected, update_value, body);
+      }
+      std::string is_index = NewName("scatter_is_index");
+      std::string next = NewName("scatter_select");
+      body->push_back(absl::StrFormat("  %s = icmp eq i64 %%idx, %d",
+                                      is_index, static_indices[update_index]));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, float %s, float %s", next, is_index,
+          replacement, selected));
+      selected = next;
+    }
+    return selected;
+  }
+
+  absl::StatusOr<std::string> EmitReduceWindow(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
+        instr->operand_count() != 2 ||
+        instr->shape().dimensions().size() != 1 ||
+        input->shape().dimensions().size() != 1 ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_) ||
+        instr->window().dimensions().size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reduce-window currently supports only rank-1 f32 "
+          "results.");
+    }
+    const WindowDimension& dim = instr->window().dimensions(0);
+    if (dim.stride() != 1 || dim.padding_low() != 0 ||
+        dim.padding_high() != 0 || dim.base_dilation() != 1 ||
+        dim.window_dilation() != 1 || dim.window_reversal()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reduce-window currently supports only unpadded "
+          "stride-1 non-dilated windows.");
+    }
+
+    const HloOpcode reducer_opcode = instr->to_apply()->root_instruction()->opcode();
+    if (reducer_opcode != HloOpcode::kAdd &&
+        reducer_opcode != HloOpcode::kMaximum &&
+        reducer_opcode != HloOpcode::kMinimum &&
+        reducer_opcode != HloOpcode::kMultiply) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reduce-window currently supports add, multiply, "
+          "maximum, and minimum reducers.");
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string accumulator,
+                        EmitValue(instr->operand(1), /*force_scalar=*/true,
+                                  body));
+    for (int64_t offset = 0; offset < dim.size(); ++offset) {
+      std::string source_index = "%idx";
+      if (offset != 0) {
+        source_index = NewName("reduce_window_index");
+        body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
+                                        source_index, offset));
+      }
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          EmitLoadFromLinearIndex(input, source_index, body));
+      TF_ASSIGN_OR_RETURN(accumulator,
+                          EmitF32ReducerOp(reducer_opcode, accumulator, value,
+                                           body));
+    }
+    return accumulator;
+  }
+
   int InputIndexForParameter(int64_t parameter_number, PrimitiveType type) {
     auto it = parameter_to_input_index_.find(parameter_number);
     if (it != parameter_to_input_index_.end()) {
@@ -2165,6 +2295,23 @@ class ElementwiseAirEmitter {
         return EmitCompareSelect("olt", lhs, rhs, body);
       default:
         return absl::InternalError("Unexpected binary HLO opcode.");
+    }
+  }
+
+  absl::StatusOr<std::string> EmitF32ReducerOp(
+      HloOpcode opcode, absl::string_view lhs, absl::string_view rhs,
+      std::vector<std::string>* body) {
+    switch (opcode) {
+      case HloOpcode::kAdd:
+        return EmitOp("fadd fast float", lhs, rhs, body);
+      case HloOpcode::kMultiply:
+        return EmitOp("fmul fast float", lhs, rhs, body);
+      case HloOpcode::kMaximum:
+        return EmitCompareSelect("ogt", lhs, rhs, body);
+      case HloOpcode::kMinimum:
+        return EmitCompareSelect("olt", lhs, rhs, body);
+      default:
+        return absl::InternalError("Unexpected f32 reducer HLO opcode.");
     }
   }
 
