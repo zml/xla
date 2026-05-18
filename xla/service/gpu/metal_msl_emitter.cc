@@ -84,6 +84,17 @@ std::string PrintLlvmType(const llvm::Type& type) {
 
 std::string Indent(int depth) { return std::string(depth * 2, ' '); }
 
+std::string WideVectorStructDefinitions() {
+  std::string output;
+  for (int elements = 5; elements <= 16; ++elements) {
+    absl::StrAppend(&output, "struct xla_metal_vec", elements,
+                    "_char { char elements[", elements, "]; };\n");
+    absl::StrAppend(&output, "struct xla_metal_vec", elements,
+                    "_uchar { uchar elements[", elements, "]; };\n");
+  }
+  return output;
+}
+
 bool IsPointerType(const llvm::Value& value) {
   return value.getType()->isPointerTy();
 }
@@ -176,10 +187,23 @@ absl::StatusOr<std::string> MslScalarType(llvm::Type* type,
                    PrintLlvmType(*type)));
 }
 
+std::optional<std::string> WideVectorTypeName(
+    llvm::FixedVectorType* vector_type, bool unsigned_integer = false) {
+  int elements = vector_type->getNumElements();
+  if (elements <= 4 || elements > 16) return std::nullopt;
+  if (!vector_type->getElementType()->isIntegerTy(8)) return std::nullopt;
+  return absl::StrCat("xla_metal_vec", elements, "_",
+                      unsigned_integer ? "uchar" : "char");
+}
+
 absl::StatusOr<std::string> MslType(llvm::Type* type,
                                     bool unsigned_integer = false) {
   if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type)) {
     int elements = vector_type->getNumElements();
+    if (std::optional<std::string> wide_type =
+            WideVectorTypeName(vector_type, unsigned_integer)) {
+      return *wide_type;
+    }
     if (elements < 2 || elements > 4) {
       return absl::UnimplementedError(absl::StrCat(
           "Metal MSL emission supports vector widths 2, 3, and 4, got ",
@@ -203,6 +227,9 @@ absl::StatusOr<std::string> ZeroInitializer(llvm::Type* type) {
   if (type->isDoubleTy()) return "0.0";
   if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type)) {
     TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(type));
+    if (WideVectorTypeName(vector_type).has_value()) {
+      return absl::StrCat(msl_type, "{}");
+    }
     TF_ASSIGN_OR_RETURN(std::string zero,
                         ZeroInitializer(vector_type->getElementType()));
     std::vector<std::string> values(vector_type->getNumElements(), zero);
@@ -2966,6 +2993,8 @@ absl::StatusOr<std::string> EmitMslFromLlvmModule(const llvm::Module& module) {
   return absl::StrCat("#include <metal_stdlib>\n",
                       "#include <metal_math>\n",
                       "using namespace metal;\n\n",
+                      WideVectorStructDefinitions(),
+                      "\n",
                       "inline ushort xla_metal_f32_to_bf16(float value) {\n"
                       "  uint bits = as_type<uint>(value);\n"
                       "  uint rounding_bias = 0x7fffu + ((bits >> 16) & 1u);\n"

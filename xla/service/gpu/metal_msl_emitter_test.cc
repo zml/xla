@@ -163,6 +163,45 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsWideByteVectorCopy) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @copy(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %offset = mul i32 %tid, 8
+  %in = getelementptr inbounds [64 x i8], ptr %arg0, i32 0, i32 %offset
+  %vector = load <8 x i8>, ptr %in, align 1
+  %out = getelementptr inbounds [64 x i8], ptr %arg1, i32 0, i32 %offset
+  store <8 x i8> %vector, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @copy, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("struct xla_metal_vec8_char"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("*reinterpret_cast<device xla_metal_vec8_char*>(&arg0"
+                     "[v1])"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("*reinterpret_cast<device xla_metal_vec8_char*>(&arg1"
+                     "[v1])"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsComplexFloatStructAsFloat2) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
