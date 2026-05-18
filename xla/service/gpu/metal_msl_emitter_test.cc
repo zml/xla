@@ -407,6 +407,62 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg2[v0] = v7;"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsNestedGuardChain) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @scatter(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %has_update = icmp ult i32 %tid, 2
+  br i1 %has_update, label %load_index, label %exit
+
+load_index:
+  %index_gep = getelementptr inbounds [2 x i32], ptr %arg1, i32 0, i32 %tid
+  %index = load i32, ptr %index_gep, align 4
+  %index_in_bounds = icmp ule i32 %index, 7
+  br i1 %index_in_bounds, label %check_update, label %join_index
+
+check_update:
+  %update_in_bounds = icmp sle i32 %tid, 1
+  br i1 %update_in_bounds, label %store_update, label %join_update
+
+store_update:
+  %update_gep = getelementptr inbounds [2 x float], ptr %arg2, i32 0, i32 %tid
+  %update = load float, ptr %update_gep, align 4
+  %out_gep = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %index
+  store atomic float %update, ptr %out_gep unordered, align 4
+  br label %join_update
+
+join_update:
+  br label %join_index
+
+join_index:
+  br label %exit
+
+exit:
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @scatter, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("if (v1) {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("if (v3) {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("if (v4) {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg0[v2] = v5;"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsTupleReducerArgmax) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

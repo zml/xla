@@ -557,10 +557,84 @@ class FunctionEmitter {
         continue;
       }
 
+      if (CanEmitStructuredBlockToStop(true_block, false_block)) {
+        absl::StrAppend(output, Indent(indent), "if (", condition, ") {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(true_block, false_block, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        block = false_block;
+        continue;
+      }
+
+      if (CanEmitStructuredBlockToStop(false_block, true_block)) {
+        absl::StrAppend(output, Indent(indent), "if (!(", condition, ")) {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(false_block, true_block, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        block = true_block;
+        continue;
+      }
+
       return Unsupported(function_, "control flow shape", *terminator);
     }
 
     return absl::OkStatus();
+  }
+
+  bool CanEmitStructuredBlockToStop(const llvm::BasicBlock* block,
+                                    const llvm::BasicBlock* stop_block) const {
+    absl::flat_hash_set<const llvm::BasicBlock*> visited;
+    return CanEmitStructuredBlockToStop(block, stop_block, &visited);
+  }
+
+  bool CanEmitStructuredBlockToStop(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* stop_block,
+      absl::flat_hash_set<const llvm::BasicBlock*>* visited) const {
+    if (block == stop_block) return true;
+    if (block == nullptr || !visited->insert(block).second) return false;
+
+    const llvm::Instruction* terminator = block->getTerminator();
+    if (llvm::isa<llvm::ReturnInst>(terminator)) return false;
+
+    if (const auto* branch = llvm::dyn_cast<llvm::UncondBrInst>(terminator)) {
+      return CanEmitStructuredBlockToStop(branch->getSuccessor(0), stop_block,
+                                          visited);
+    }
+
+    const auto* branch = llvm::dyn_cast<llvm::CondBrInst>(terminator);
+    if (branch == nullptr) return false;
+
+    const llvm::BasicBlock* true_block = branch->getSuccessor(0);
+    const llvm::BasicBlock* false_block = branch->getSuccessor(1);
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*true_block);
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*false_block);
+
+    if (true_successor != nullptr && true_successor == false_successor) {
+      absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
+      absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
+      absl::flat_hash_set<const llvm::BasicBlock*> merge_visited = *visited;
+      return CanEmitStructuredBlockToStop(true_block, true_successor,
+                                          &true_visited) &&
+             CanEmitStructuredBlockToStop(false_block, false_successor,
+                                          &false_visited) &&
+             CanEmitStructuredBlockToStop(true_successor, stop_block,
+                                          &merge_visited);
+    }
+
+    absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
+    absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
+    if (CanEmitStructuredBlockToStop(true_block, false_block, &true_visited) &&
+        CanEmitStructuredBlockToStop(false_block, stop_block, &false_visited)) {
+      return true;
+    }
+
+    true_visited = *visited;
+    false_visited = *visited;
+    return CanEmitStructuredBlockToStop(false_block, true_block,
+                                        &false_visited) &&
+           CanEmitStructuredBlockToStop(true_block, stop_block, &true_visited);
   }
 
   absl::StatusOr<bool> TryEmitIfElseDiamond(const llvm::CondBrInst& branch,
