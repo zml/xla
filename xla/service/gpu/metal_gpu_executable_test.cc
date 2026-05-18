@@ -40,6 +40,8 @@ constexpr int64_t kM = 16;
 constexpr int64_t kN = 32;
 constexpr int64_t kK = 8;
 constexpr int64_t kElementCount = 257;
+constexpr int64_t kGatherInputSize = 16;
+constexpr int64_t kGatherOutputSize = 4;
 
 absl::StatusOr<LocalClient*> GetMetalClient() {
   TF_ASSIGN_OR_RETURN(se::Platform * platform,
@@ -96,6 +98,14 @@ Literal MakeElementwiseS32() {
     values[i] = static_cast<int32_t>((i % 31) - 15);
   }
   return LiteralUtil::CreateR1<int32_t>(values);
+}
+
+Literal MakeGatherInput() {
+  std::vector<float> values(kGatherInputSize);
+  for (int64_t i = 0; i < kGatherInputSize; ++i) {
+    values[i] = static_cast<float>(i) * 0.25f - 2.0f;
+  }
+  return LiteralUtil::CreateR1<float>(values);
 }
 
 float Reference(const Literal& lhs, const Literal& rhs, int64_t row,
@@ -240,6 +250,41 @@ absl::StatusOr<Literal> ExecuteMetalPadCall() {
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
 
   Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalGatherSelect() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_elementwise_gather_select");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {kGatherInputSize});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+
+  Array2D<int32_t> indices(kGatherOutputSize, 1);
+  indices(0, 0) = 0;
+  indices(1, 0) = 2;
+  indices(2, 0) = 4;
+  indices(3, 0) = 8;
+  XlaOp start_indices = ConstantR2FromArray2D<int32_t>(&builder, indices);
+
+  GatherDimensionNumbers dnums;
+  dnums.add_collapsed_slice_dims(0);
+  dnums.add_start_index_map(0);
+  dnums.set_index_vector_dim(1);
+  XlaOp gather = Gather(input, start_indices, dnums, {1},
+                        /*indices_are_sorted=*/true);
+  XlaOp pred =
+      Broadcast(ConstantR0<bool>(&builder, true), {kGatherOutputSize});
+  XlaOp fallback = Broadcast(
+      ConstantR0<float>(&builder, std::numeric_limits<float>::quiet_NaN()),
+      {kGatherOutputSize});
+  Select(pred, gather, fallback);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeGatherInput();
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   std::vector<GlobalData*> arguments = {input_data.get()};
@@ -411,6 +456,16 @@ void ExpectMatchesPadReference(const Literal& actual, const Literal& input,
     const float expected =
         in_input ? input.Get<float>({i - low_padding}) : pad_value;
     EXPECT_EQ(actual.Get<float>({i}), expected) << "at " << i;
+  }
+}
+
+void ExpectMatchesGatherReference(const Literal& actual, const Literal& input) {
+  constexpr int64_t kIndices[kGatherOutputSize] = {0, 2, 4, 8};
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {kGatherOutputSize})));
+  for (int64_t i = 0; i < kGatherOutputSize; ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), input.Get<float>({kIndices[i]}))
+        << "at " << i;
   }
 }
 
@@ -835,6 +890,15 @@ TEST(MetalGpuExecutableTest, ElementwisePadCall) {
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesPadReference(actual, MakeElementwiseLhs(), /*low_padding=*/2,
                             /*high_padding=*/3, /*pad_value=*/1.5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherSelect) {
+  auto result = ExecuteMetalGatherSelect();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesGatherReference(actual, MakeGatherInput());
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {

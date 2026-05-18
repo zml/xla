@@ -26,6 +26,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
@@ -393,6 +394,8 @@ class ElementwiseAirEmitter {
         return EmitConcatenate(instr, body);
       case HloOpcode::kConvert:
         return EmitConvert(instr, body);
+      case HloOpcode::kGather:
+        return EmitGather(instr, body);
       case HloOpcode::kIota:
         return EmitIota(instr, body);
       case HloOpcode::kPad:
@@ -401,6 +404,8 @@ class ElementwiseAirEmitter {
         return EmitTranspose(instr, body);
       case HloOpcode::kCompare:
         return EmitCompare(instr, body);
+      case HloOpcode::kReduce:
+        return EmitReduce(instr, body);
       case HloOpcode::kSelect:
         return EmitSelect(instr, body);
       case HloOpcode::kAdd:
@@ -410,6 +415,8 @@ class ElementwiseAirEmitter {
       case HloOpcode::kMaximum:
       case HloOpcode::kMinimum:
         return EmitBinary(instr, body);
+      case HloOpcode::kAnd:
+        return EmitLogicalBinary(instr, body);
       case HloOpcode::kAtan2:
         return EmitAtan2(instr, body);
       case HloOpcode::kPower:
@@ -704,10 +711,13 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
                                           std::vector<std::string>* body) {
     Shape pred_shape = ShapeUtil::MakeShape(PRED, result_shape_.dimensions());
-    if (!ShapeUtil::Compatible(instr->shape(), pred_shape)) {
+    if (!ShapeUtil::Compatible(instr->shape(), pred_shape) &&
+        (!instr->shape().IsArray() ||
+         ShapeUtil::ElementsIn(instr->shape()) !=
+             ShapeUtil::ElementsIn(result_shape_))) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise compare currently supports only "
-          "predicates matching the result shape.");
+          "predicates matching the result element count.");
     }
     TF_ASSIGN_OR_RETURN(std::string lhs,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
@@ -817,12 +827,38 @@ class ElementwiseAirEmitter {
         primitive_util::LowercasePrimitiveTypeName(dst_type)));
   }
 
+  absl::StatusOr<std::string> EmitReduce(const HloInstruction* instr,
+                                         std::vector<std::string>* body) {
+    if (!IsPredArray(instr->shape()) || instr->operand_count() != 2 ||
+        !IsPredArray(instr->operand(0)->shape()) ||
+        instr->dimensions().size() != 1 || instr->dimensions()[0] != 1 ||
+        instr->operand(0)->shape().dimensions().size() != 2 ||
+        instr->operand(0)->shape().dimensions(1) != 1 ||
+        instr->to_apply()->root_instruction()->opcode() != HloOpcode::kAnd ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reduce currently supports only pred rank-2 "
+          "degenerate reduce-and to the result element count.");
+    }
+    return EmitValue(instr->operand(0), /*force_scalar=*/false, body);
+  }
+
   absl::StatusOr<std::string> EmitSelect(const HloInstruction* instr,
                                          std::vector<std::string>* body) {
+    if (instr->operand(1)->opcode() == HloOpcode::kGather) {
+      auto pred_values = EvaluatePredArray(instr->operand(0));
+      if (pred_values.ok() &&
+          absl::c_all_of(*pred_values, [](bool value) { return value; })) {
+        return EmitGather(instr->operand(1), body);
+      }
+    }
     if (!IsF32Array(instr->shape())) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise select currently supports only f32 "
-          "array results.");
+      if (!IsS32Array(instr->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise select currently supports only "
+            "f32/s32 array results.");
+      }
     }
     TF_ASSIGN_OR_RETURN(std::string pred,
                         EmitValue(instr->operand(0), /*force_scalar=*/false,
@@ -834,8 +870,10 @@ class ElementwiseAirEmitter {
                         EmitValue(instr->operand(2), IsScalarOperand(instr, 2),
                                   body));
     std::string value = NewName("select");
-    body->push_back(absl::StrFormat("  %s = select i1 %s, float %s, float %s",
-                                    value, pred, on_true, on_false));
+    const char* ir_type = ElementIrType(instr->shape().element_type());
+    body->push_back(absl::StrFormat("  %s = select i1 %s, %s %s, %s %s",
+                                    value, pred, ir_type, on_true, ir_type,
+                                    on_false));
     return value;
   }
 
@@ -905,6 +943,333 @@ class ElementwiseAirEmitter {
         "  %s = select i1 %s, %s %s, %s %s", selected, in_input, ir_type,
         input_value, ir_type, pad_value));
     return selected;
+  }
+
+  absl::StatusOr<std::string> EmitLogicalBinary(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsPredArray(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR logical binary ops currently support only pred "
+          "arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    std::string value = NewName("logical");
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", value, lhs, rhs));
+    return value;
+  }
+
+  absl::StatusOr<std::string> EmitGather(const HloInstruction* instr,
+                                         std::vector<std::string>* body) {
+    const GatherDimensionNumbers& dnums = instr->gather_dimension_numbers();
+    if (!IsF32Array(instr->shape()) || !IsF32Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions().size() != 1 ||
+        instr->operand(0)->shape().dimensions().size() != 1 ||
+        instr->operand(1)->shape().dimensions().size() != 2 ||
+        instr->operand(1)->shape().dimensions(1) != 1 ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            instr->operand(1)->shape().dimensions(0) ||
+        dnums.offset_dims_size() != 0 ||
+        dnums.collapsed_slice_dims_size() != 1 ||
+        dnums.collapsed_slice_dims(0) != 0 ||
+        dnums.start_index_map_size() != 1 || dnums.start_index_map(0) != 0 ||
+        dnums.index_vector_dim() != 1 ||
+        instr->gather_slice_sizes().size() != 1 ||
+        instr->gather_slice_sizes()[0] != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR gather currently supports only rank-1 f32 gathers "
+          "with scalar start indices.");
+    }
+
+    const int64_t input_elements =
+        ShapeUtil::ElementsIn(instr->operand(0)->shape());
+    auto indices_or = EvaluateS32Array(instr->operand(1));
+    if (indices_or.ok()) {
+      const std::vector<int64_t>& indices = *indices_or;
+      if (indices.empty() ||
+          indices.size() != ShapeUtil::ElementsIn(instr->shape())) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR gather index count does not match output size.");
+      }
+      for (int64_t index : indices) {
+        if (index < 0 || index >= input_elements) {
+          return absl::UnimplementedError(
+              "Metal direct AIR gather currently requires static in-bounds "
+              "indices.");
+        }
+      }
+
+      std::string source_index = absl::StrCat(indices[0]);
+      for (int64_t i = 1; i < indices.size(); ++i) {
+        std::string is_lane = NewName("gather_lane");
+        std::string selected = NewName("gather_index");
+        body->push_back(
+            absl::StrFormat("  %s = icmp eq i64 %%idx, %d", is_lane, i));
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, i64 %d, i64 %s", selected, is_lane,
+            indices[i], source_index));
+        source_index = selected;
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string raw_index,
+                        EmitValue(instr->operand(1), /*force_scalar=*/false,
+                                  body));
+    std::string below_zero = NewName("gather_below_zero");
+    std::string above_end = NewName("gather_above_end");
+    std::string low_clamped = NewName("gather_low_clamped");
+    std::string clamped = NewName("gather_clamped");
+    std::string source_index = NewName("gather_source_index");
+    body->push_back(absl::StrFormat("  %s = icmp slt i32 %s, 0", below_zero,
+                                    raw_index));
+    body->push_back(absl::StrFormat("  %s = icmp sge i32 %s, %d", above_end,
+                                    raw_index, input_elements));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 0, i32 %s", low_clamped, below_zero,
+        raw_index));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %d, i32 %s", clamped, above_end,
+        input_elements - 1, low_clamped));
+    body->push_back(absl::StrFormat("  %s = sext i32 %s to i64",
+                                    source_index, clamped));
+    return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+  }
+
+  absl::StatusOr<std::vector<int64_t>> EvaluateS32Array(
+      const HloInstruction* instr) {
+    if (instr->opcode() == HloOpcode::kParameter) {
+      if (const HloInstruction* override = CallParameterOverride(instr)) {
+        return EvaluateS32Array(override);
+      }
+    }
+    if (instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape) {
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> values,
+                          EvaluateS32Array(instr->operand(0)));
+      if (values.size() != ShapeUtil::ElementsIn(instr->shape())) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant s32 reshape changes element count.");
+      }
+      return values;
+    }
+    if (instr->opcode() == HloOpcode::kBroadcast &&
+        instr->operand(0)->IsConstant() &&
+        IsScalarLikeS32(instr->operand(0)->shape())) {
+      return std::vector<int64_t>(
+          ShapeUtil::ElementsIn(instr->shape()),
+          instr->operand(0)->literal().Get<int32_t>({}));
+    }
+    if (instr->IsConstant() && instr->shape().element_type() == S32) {
+      std::vector<int64_t> values;
+      values.reserve(ShapeUtil::ElementsIn(instr->shape()));
+      if (ShapeUtil::IsEffectiveScalar(instr->shape())) {
+        values.push_back(instr->literal().Get<int32_t>({}));
+        return values;
+      }
+      if (instr->shape().dimensions().size() == 1) {
+        for (int64_t i = 0; i < instr->shape().dimensions(0); ++i) {
+          values.push_back(instr->literal().Get<int32_t>({i}));
+        }
+        return values;
+      }
+      if (instr->shape().dimensions().size() == 2) {
+        for (int64_t row = 0; row < instr->shape().dimensions(0); ++row) {
+          for (int64_t col = 0; col < instr->shape().dimensions(1); ++col) {
+            values.push_back(instr->literal().Get<int32_t>({row, col}));
+          }
+        }
+        return values;
+      }
+    }
+    if (instr->opcode() == HloOpcode::kCall) {
+      const HloComputation* callee = instr->to_apply();
+      if (callee->num_parameters() != instr->operand_count()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant call operand count mismatch.");
+      }
+      CallParameterScope scope;
+      scope.computation = callee;
+      for (int64_t i = 0; i < instr->operand_count(); ++i) {
+        scope.arguments[i] = instr->operand(i);
+      }
+      call_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+      return EvaluateS32Array(callee->root_instruction());
+    }
+    if (instr->opcode() == HloOpcode::kAdd ||
+        instr->opcode() == HloOpcode::kSubtract) {
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> lhs,
+                          EvaluateS32Array(instr->operand(0)));
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> rhs,
+                          EvaluateS32Array(instr->operand(1)));
+      if (lhs.size() != rhs.size()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant s32 binary size mismatch.");
+      }
+      for (int64_t i = 0; i < lhs.size(); ++i) {
+        lhs[i] = instr->opcode() == HloOpcode::kAdd ? lhs[i] + rhs[i]
+                                                    : lhs[i] - rhs[i];
+      }
+      return lhs;
+    }
+    if (instr->opcode() == HloOpcode::kSelect) {
+      TF_ASSIGN_OR_RETURN(std::vector<bool> pred,
+                          EvaluatePredArray(instr->operand(0)));
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> on_true,
+                          EvaluateS32Array(instr->operand(1)));
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> on_false,
+                          EvaluateS32Array(instr->operand(2)));
+      if (pred.size() != on_true.size() || pred.size() != on_false.size()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant s32 select size mismatch.");
+      }
+      for (int64_t i = 0; i < pred.size(); ++i) {
+        on_true[i] = pred[i] ? on_true[i] : on_false[i];
+      }
+      return on_true;
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR cannot statically evaluate s32 HLO opcode %s.",
+        HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::vector<bool>> EvaluatePredArray(
+      const HloInstruction* instr) {
+    if (instr->opcode() == HloOpcode::kParameter) {
+      if (const HloInstruction* override = CallParameterOverride(instr)) {
+        return EvaluatePredArray(override);
+      }
+    }
+    if (instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape) {
+      TF_ASSIGN_OR_RETURN(std::vector<bool> values,
+                          EvaluatePredArray(instr->operand(0)));
+      if (values.size() != ShapeUtil::ElementsIn(instr->shape())) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant pred reshape changes element count.");
+      }
+      return values;
+    }
+    if (instr->opcode() == HloOpcode::kBroadcast &&
+        instr->operand(0)->IsConstant() &&
+        instr->operand(0)->shape().element_type() == PRED) {
+      return std::vector<bool>(
+          ShapeUtil::ElementsIn(instr->shape()),
+          instr->operand(0)->literal().Get<bool>({}));
+    }
+    if (instr->IsConstant() && instr->shape().element_type() == PRED) {
+      std::vector<bool> values;
+      values.reserve(ShapeUtil::ElementsIn(instr->shape()));
+      if (ShapeUtil::IsEffectiveScalar(instr->shape())) {
+        values.push_back(instr->literal().Get<bool>({}));
+        return values;
+      }
+      if (instr->shape().dimensions().size() == 1) {
+        for (int64_t i = 0; i < instr->shape().dimensions(0); ++i) {
+          values.push_back(instr->literal().Get<bool>({i}));
+        }
+        return values;
+      }
+      if (instr->shape().dimensions().size() == 2) {
+        for (int64_t row = 0; row < instr->shape().dimensions(0); ++row) {
+          for (int64_t col = 0; col < instr->shape().dimensions(1); ++col) {
+            values.push_back(instr->literal().Get<bool>({row, col}));
+          }
+        }
+        return values;
+      }
+    }
+    if (instr->opcode() == HloOpcode::kCall) {
+      const HloComputation* callee = instr->to_apply();
+      if (callee->num_parameters() != instr->operand_count()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant call operand count mismatch.");
+      }
+      CallParameterScope scope;
+      scope.computation = callee;
+      for (int64_t i = 0; i < instr->operand_count(); ++i) {
+        scope.arguments[i] = instr->operand(i);
+      }
+      call_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+      return EvaluatePredArray(callee->root_instruction());
+    }
+    if (instr->opcode() == HloOpcode::kCompare) {
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> lhs,
+                          EvaluateS32Array(instr->operand(0)));
+      TF_ASSIGN_OR_RETURN(std::vector<int64_t> rhs,
+                          EvaluateS32Array(instr->operand(1)));
+      if (lhs.size() != rhs.size()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant compare size mismatch.");
+      }
+      std::vector<bool> values(lhs.size());
+      for (int64_t i = 0; i < lhs.size(); ++i) {
+        switch (instr->comparison_direction()) {
+          case ComparisonDirection::kEq:
+            values[i] = lhs[i] == rhs[i];
+            break;
+          case ComparisonDirection::kNe:
+            values[i] = lhs[i] != rhs[i];
+            break;
+          case ComparisonDirection::kGe:
+            values[i] = lhs[i] >= rhs[i];
+            break;
+          case ComparisonDirection::kGt:
+            values[i] = lhs[i] > rhs[i];
+            break;
+          case ComparisonDirection::kLe:
+            values[i] = lhs[i] <= rhs[i];
+            break;
+          case ComparisonDirection::kLt:
+            values[i] = lhs[i] < rhs[i];
+            break;
+        }
+      }
+      return values;
+    }
+    if (instr->opcode() == HloOpcode::kAnd) {
+      TF_ASSIGN_OR_RETURN(std::vector<bool> lhs,
+                          EvaluatePredArray(instr->operand(0)));
+      TF_ASSIGN_OR_RETURN(std::vector<bool> rhs,
+                          EvaluatePredArray(instr->operand(1)));
+      if (lhs.size() != rhs.size()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR constant pred binary size mismatch.");
+      }
+      for (int64_t i = 0; i < lhs.size(); ++i) {
+        lhs[i] = lhs[i] && rhs[i];
+      }
+      return lhs;
+    }
+    if (instr->opcode() == HloOpcode::kReduce &&
+        instr->operand_count() == 2 &&
+        instr->dimensions().size() == 1 && instr->dimensions()[0] == 1 &&
+        instr->operand(0)->shape().dimensions().size() == 2 &&
+        instr->to_apply()->root_instruction()->opcode() == HloOpcode::kAnd &&
+        instr->operand(1)->IsConstant() &&
+        instr->operand(1)->shape().element_type() == PRED) {
+      TF_ASSIGN_OR_RETURN(std::vector<bool> input,
+                          EvaluatePredArray(instr->operand(0)));
+      const int64_t rows = instr->operand(0)->shape().dimensions(0);
+      const int64_t cols = instr->operand(0)->shape().dimensions(1);
+      std::vector<bool> values(rows,
+                               instr->operand(1)->literal().Get<bool>({}));
+      for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < cols; ++col) {
+          values[row] = values[row] && input[row * cols + col];
+        }
+      }
+      return values;
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR cannot statically evaluate pred HLO opcode %s.",
+        HloOpcodeString(instr->opcode())));
   }
 
   absl::StatusOr<std::string> EmitBinary(const HloInstruction* instr,
