@@ -104,6 +104,10 @@ bool IsF32Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.IsArray();
 }
 
+bool IsPredArray(const Shape& shape) {
+  return shape.element_type() == PRED && shape.IsArray();
+}
+
 bool IsScalarLikeF32(const Shape& shape) {
   return shape.element_type() == F32 && ShapeUtil::IsEffectiveScalar(shape);
 }
@@ -246,9 +250,9 @@ class ElementwiseAirEmitter {
       : result_shape_(std::move(result_shape)) {}
 
   absl::StatusOr<std::string> Emit(const HloInstruction* root) {
-    if (!IsF32Array(root->shape())) {
+    if (!IsF32Array(root->shape()) && !IsPredArray(root->shape())) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise supports only f32 arrays.");
+          "Metal direct AIR elementwise supports only f32 and pred arrays.");
     }
     std::vector<std::string> body;
     TF_ASSIGN_OR_RETURN(std::string value,
@@ -292,10 +296,10 @@ class ElementwiseAirEmitter {
     }
 
     if (instr->opcode() == HloOpcode::kParameter) {
-      if (!force_scalar && !ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      if (!force_scalar && !HasResultDimensions(instr->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR elementwise parameters must have the result "
-            "shape unless they are scalar-broadcast operands.");
+          "Metal direct AIR elementwise parameters must have the result "
+          "shape unless they are scalar-broadcast operands.");
       }
       const int64_t parameter_number = instr->parameter_number();
       const int input_index = InputIndexForParameter(parameter_number);
@@ -756,6 +760,10 @@ class ElementwiseAirEmitter {
     return IsScalarLikeF32(instr->operand(operand_index)->shape());
   }
 
+  bool HasResultDimensions(const Shape& shape) const {
+    return shape.IsArray() && shape.dimensions() == result_shape_.dimensions();
+  }
+
   std::string EmitLoad(int input_index, absl::string_view index,
                        std::vector<std::string>* body) {
     std::string ptr = NewName("ptr");
@@ -793,6 +801,7 @@ class ElementwiseAirEmitter {
   }
 
   std::string BuildModule() const {
+    const bool result_is_pred = result_shape_.element_type() == PRED;
     std::vector<std::string> args;
     for (int i = 0; i < parameter_numbers_.size(); ++i) {
       args.push_back(absl::StrFormat(
@@ -800,9 +809,10 @@ class ElementwiseAirEmitter {
           "\"air-buffer-no-alias\" %%arg%d",
           i));
     }
-    args.push_back(
-        "    float addrspace(1)* nocapture noundef writeonly "
-        "\"air-buffer-no-alias\" %out");
+    args.push_back(absl::StrFormat(
+        "    %s addrspace(1)* nocapture noundef writeonly "
+        "\"air-buffer-no-alias\" %%out",
+        result_is_pred ? "i8" : "float"));
     args.push_back(
         "    %struct.ElementwiseParams addrspace(2)* nocapture noundef "
         "readonly align 4 dereferenceable(16) \"air-buffer-no-alias\" %params");
@@ -810,7 +820,8 @@ class ElementwiseAirEmitter {
 
     std::vector<std::string> signature_types(parameter_numbers_.size(),
                                              "float addrspace(1)*");
-    signature_types.push_back("float addrspace(1)*");
+    signature_types.push_back(result_is_pred ? "i8 addrspace(1)*"
+                                             : "float addrspace(1)*");
     signature_types.push_back("%struct.ElementwiseParams addrspace(2)*");
     signature_types.push_back("<3 x i32>");
 
@@ -825,6 +836,18 @@ class ElementwiseAirEmitter {
     metadata_args.push_back(absl::StrFormat("!%d", output_metadata));
     metadata_args.push_back(absl::StrFormat("!%d", params_metadata));
     metadata_args.push_back(absl::StrFormat("!%d", gid_metadata));
+
+    std::string store_result;
+    if (result_is_pred) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
+  %%out_i8 = zext i1 %s to i8
+  store i8 %%out_i8, i8 addrspace(1)* %%out_ptr, align 1)",
+                                     result_value_);
+    } else {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds float, float addrspace(1)* %%out, i64 %%idx
+  store float %s, float addrspace(1)* %%out_ptr, align 4)",
+                                     result_value_);
+    }
 
     std::string module = absl::StrFormat(R"(
 source_filename = "xla/service/gpu/metal_elementwise_air"
@@ -858,8 +881,7 @@ entry:
 body:
   %%idx = zext i32 %%idx32 to i64
 %s
-  %%out_ptr = getelementptr inbounds float, float addrspace(1)* %%out, i64 %%idx
-  store float %s, float addrspace(1)* %%out_ptr, align 4
+%s
   br label %%exit
 
 exit:
@@ -883,7 +905,7 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
 )",
                                          absl::StrJoin(args, ",\n"),
                                          absl::StrJoin(expression_body_, "\n"),
-                                         result_value_,
+                                         store_result,
                                          absl::StrJoin(signature_types, ", "),
                                          absl::StrJoin(metadata_args, ", "));
 
@@ -901,10 +923,11 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
         &module,
         "!%d = !{i32 %d, !\"air.buffer\", !\"air.location_index\", i32 %d, "
         "i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, "
-        "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, "
-        "!\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"out\"}\n",
+        "!\"air.arg_type_size\", i32 %d, !\"air.arg_type_align_size\", i32 %d, "
+        "!\"air.arg_type_name\", !\"%s\", !\"air.arg_name\", !\"out\"}\n",
         output_metadata, static_cast<int>(parameter_numbers_.size()),
-        static_cast<int>(parameter_numbers_.size()));
+        static_cast<int>(parameter_numbers_.size()), result_is_pred ? 1 : 4,
+        result_is_pred ? 1 : 4, result_is_pred ? "bool" : "float");
     absl::StrAppendFormat(
         &module,
         "!%d = !{i32 %d, !\"air.buffer\", !\"air.buffer_size\", i32 16, "

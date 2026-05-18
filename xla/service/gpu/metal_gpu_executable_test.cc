@@ -268,6 +268,15 @@ void ExpectMatchesElementwiseReference(const Literal& actual,
   }
 }
 
+template <typename ReferenceFn>
+void ExpectMatchesPredReference(const Literal& actual, ReferenceFn reference) {
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(PRED, {kElementCount})));
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    EXPECT_EQ(actual.Get<bool>({i}), reference(i)) << "at " << i;
+  }
+}
+
 void ExpectMatchesSliceReference(const Literal& actual, const Literal& input,
                                  int64_t start, int64_t size) {
   ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
@@ -597,6 +606,20 @@ TEST(MetalGpuExecutableTest, ElementwiseSelectCompare) {
     const float value = input.Get<float>({i});
     return value > 0.0f ? value : -value;
   });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseCompareRoot) {
+  auto result = ExecuteMetalElementwiseBinary(
+      "metal_elementwise_compare_root",
+      [](XlaBuilder*, XlaOp lhs, XlaOp rhs) { Gt(lhs, rhs); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal lhs = MakeElementwiseLhs();
+  Literal rhs = MakeElementwiseRhs();
+  ExpectMatchesPredReference(
+      actual, [&](int64_t i) { return lhs.Get<float>({i}) > rhs.Get<float>({i}); });
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseWhereCall) {
