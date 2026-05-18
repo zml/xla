@@ -291,6 +291,19 @@ void ExpectMatchesReshapeSliceReference(const Literal& actual,
   }
 }
 
+void ExpectMatchesTransposeSliceReference(const Literal& actual,
+                                          const Literal& input) {
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {16, 16})));
+  for (int64_t row = 0; row < 16; ++row) {
+    for (int64_t col = 0; col < 16; ++col) {
+      const int64_t index = col * 16 + row;
+      EXPECT_EQ(actual.Get<float>({row, col}), input.Get<float>({index}))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 void ExpectScalarNear(const Literal& actual, float expected,
                       float tolerance = 1.0e-6f) {
   ASSERT_TRUE(
@@ -622,6 +635,19 @@ TEST(MetalGpuExecutableTest, ElementwiseReshapeSlice) {
   }
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesReshapeSliceReference(actual, MakeElementwiseLhs());
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTransposeSlice) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_transpose_slice",
+      [](XlaBuilder*, XlaOp input) {
+        Transpose(Reshape(Slice(input, {0}, {256}, {1}), {16, 16}), {1, 0});
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesTransposeSliceReference(actual, MakeElementwiseLhs());
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {

@@ -305,6 +305,8 @@ class ElementwiseAirEmitter {
     switch (instr->opcode()) {
       case HloOpcode::kCall:
         return EmitCall(instr, body);
+      case HloOpcode::kTranspose:
+        return EmitTranspose(instr, body);
       case HloOpcode::kCompare:
         return EmitCompare(instr, body);
       case HloOpcode::kSelect:
@@ -355,6 +357,70 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise does not support HLO opcode %s.",
             HloOpcodeString(instr->opcode())));
     }
+  }
+
+  absl::StatusOr<std::string> EmitLoadFromLinearIndex(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    if (instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape) {
+      if (ShapeUtil::ElementsIn(instr->shape()) !=
+          ShapeUtil::ElementsIn(instr->operand(0)->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load reshape must preserve element "
+            "count.");
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+    }
+    if (instr->opcode() == HloOpcode::kSlice) {
+      if (!IsF32Array(instr->shape()) ||
+          !IsF32Array(instr->operand(0)->shape()) ||
+          instr->shape().dimensions().size() != 1 ||
+          instr->operand(0)->shape().dimensions().size() != 1 ||
+          instr->slice_strides().size() != 1) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load slice currently supports only "
+            "rank-1 f32 slices.");
+      }
+      std::string source_index = std::string(index);
+      const int64_t stride = instr->slice_strides(0);
+      const int64_t start = instr->slice_starts(0);
+      if (stride != 1) {
+        std::string scaled = NewName("linear_slice_scaled");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        source_index, stride));
+        source_index = scaled;
+      }
+      if (start != 0) {
+        std::string shifted = NewName("linear_slice_idx");
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        source_index, start));
+        source_index = shifted;
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+    }
+    if (instr->opcode() == HloOpcode::kParameter) {
+      const int input_index = InputIndexForParameter(instr->parameter_number());
+      return EmitLoad(input_index, index, body);
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR linear load does not support HLO opcode %s.",
+        HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitTranspose(const HloInstruction* instr,
+                                            std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    if (!IsF32Array(instr->shape()) || !IsF32Array(operand->shape()) ||
+        instr->shape().dimensions().size() != 2 ||
+        operand->shape().dimensions().size() != 2 ||
+        instr->dimensions().size() != 2 || instr->dimensions()[0] != 1 ||
+        instr->dimensions()[1] != 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise transpose currently supports only "
+          "rank-2 f32 transposes with permutation {1,0}.");
+    }
+    return EmitLoadFromLinearIndex(operand, "%idx", body);
   }
 
   absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,
