@@ -354,6 +354,37 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("float2(float(1), float(0))"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsComplexDoubleConstantStruct) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @complex128_constant(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %out = getelementptr inbounds [2 x { double, double }], ptr %arg0, i32 0, i32 %tid
+  store { double, double } { double 1.000000e+00, double 0.000000e+00 }, ptr %out, align 8
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @complex128_constant, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("device double2* arg0 [[buffer(0)]]"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("double2(1, 0)"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsArgumentBufferForLargeArityKernels) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

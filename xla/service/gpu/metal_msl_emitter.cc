@@ -103,15 +103,25 @@ bool IsAggregateType(llvm::Type* type) {
   return type->isStructTy() || type->isArrayTy();
 }
 
-bool IsComplexFloatStruct(llvm::Type* type) {
+llvm::Type* ComplexStructElementType(llvm::Type* type) {
   auto* struct_type = llvm::dyn_cast<llvm::StructType>(type);
-  return struct_type != nullptr && struct_type->getNumElements() == 2 &&
-         struct_type->getElementType(0)->isFloatTy() &&
-         struct_type->getElementType(1)->isFloatTy();
+  if (struct_type == nullptr || struct_type->getNumElements() != 2) {
+    return nullptr;
+  }
+  llvm::Type* element_type = struct_type->getElementType(0);
+  if (struct_type->getElementType(1) != element_type) return nullptr;
+  if (!element_type->isFloatTy() && !element_type->isDoubleTy()) {
+    return nullptr;
+  }
+  return element_type;
+}
+
+bool IsComplexStruct(llvm::Type* type) {
+  return ComplexStructElementType(type) != nullptr;
 }
 
 bool IsNonMaterializedAggregateType(llvm::Type* type) {
-  return IsAggregateType(type) && !IsComplexFloatStruct(type);
+  return IsAggregateType(type) && !IsComplexStruct(type);
 }
 
 absl::Status Unsupported(const llvm::Function& function, absl::string_view what,
@@ -214,7 +224,11 @@ absl::StatusOr<std::string> MslType(llvm::Type* type,
                                       unsigned_integer));
     return absl::StrCat(element_type, elements);
   }
-  if (IsComplexFloatStruct(type)) return "float2";
+  if (llvm::Type* element_type = ComplexStructElementType(type)) {
+    TF_ASSIGN_OR_RETURN(std::string element_msl_type,
+                        MslScalarType(element_type, unsigned_integer));
+    return absl::StrCat(element_msl_type, "2");
+  }
   return MslScalarType(type, unsigned_integer);
 }
 
@@ -235,7 +249,11 @@ absl::StatusOr<std::string> ZeroInitializer(llvm::Type* type) {
     std::vector<std::string> values(vector_type->getNumElements(), zero);
     return absl::StrCat(msl_type, "(", absl::StrJoin(values, ", "), ")");
   }
-  if (IsComplexFloatStruct(type)) return "float2(0.0f, 0.0f)";
+  if (llvm::Type* element_type = ComplexStructElementType(type)) {
+    TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(type));
+    TF_ASSIGN_OR_RETURN(std::string zero, ZeroInitializer(element_type));
+    return absl::StrCat(msl_type, "(", zero, ", ", zero, ")");
+  }
   return absl::UnimplementedError(
       absl::StrCat("Unsupported zero initializer type for MSL: ",
                    PrintLlvmType(*type)));
@@ -1308,12 +1326,13 @@ class FunctionEmitter {
       return absl::StrFormat("%.17g", as_double);
     }
     if (auto* constant_struct = llvm::dyn_cast<llvm::ConstantStruct>(value);
-        constant_struct != nullptr && IsComplexFloatStruct(value->getType())) {
+        constant_struct != nullptr && IsComplexStruct(value->getType())) {
       TF_ASSIGN_OR_RETURN(std::string real,
                           Expr(constant_struct->getOperand(0)));
       TF_ASSIGN_OR_RETURN(std::string imag,
                           Expr(constant_struct->getOperand(1)));
-      return absl::StrCat("float2(", real, ", ", imag, ")");
+      TF_ASSIGN_OR_RETURN(std::string type, MslType(value->getType()));
+      return absl::StrCat(type, "(", real, ", ", imag, ")");
     }
     if (llvm::isa<llvm::ConstantAggregateZero>(value) ||
         llvm::isa<llvm::UndefValue>(value) ||
@@ -1537,7 +1556,7 @@ class FunctionEmitter {
     }
     const llvm::Value* aggregate = extract.getAggregateOperand();
     unsigned field = *extract.idx_begin();
-    if (IsComplexFloatStruct(aggregate->getType())) {
+    if (IsComplexStruct(aggregate->getType())) {
       TF_ASSIGN_OR_RETURN(std::string value, Expr(aggregate));
       if (field == 0) return absl::StrCat(value, ".x");
       if (field == 1) return absl::StrCat(value, ".y");
@@ -1558,7 +1577,7 @@ class FunctionEmitter {
 
   absl::StatusOr<std::string> InsertValueExpr(
       const llvm::InsertValueInst& insert) {
-    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+    if (!IsComplexStruct(insert.getType()) || insert.getNumIndices() != 1) {
       return Unsupported(function_, "aggregate insertion", insert);
     }
 
@@ -1568,7 +1587,12 @@ class FunctionEmitter {
           absl::StrCat("complex field ", field, " is out of range."));
     }
 
-    std::string components[2] = {"0.0f", "0.0f"};
+    llvm::Type* element_type = ComplexStructElementType(insert.getType());
+    if (element_type == nullptr) {
+      return Unsupported(function_, "aggregate insertion", insert);
+    }
+    TF_ASSIGN_OR_RETURN(std::string zero, ZeroInitializer(element_type));
+    std::string components[2] = {zero, zero};
     const llvm::Value* aggregate = insert.getAggregateOperand();
     if (!llvm::isa<llvm::UndefValue>(aggregate) &&
         !llvm::isa<llvm::PoisonValue>(aggregate)) {
@@ -1578,7 +1602,8 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string inserted,
                         Expr(insert.getInsertedValueOperand()));
     components[field] = std::move(inserted);
-    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(insert.getType()));
+    return absl::StrCat(type, "(", components[0], ", ", components[1], ")");
   }
 
   absl::StatusOr<std::string> ComplexComponentExpr(const llvm::Value* value,
@@ -1589,7 +1614,11 @@ class FunctionEmitter {
     }
     if (llvm::isa<llvm::UndefValue>(value) ||
         llvm::isa<llvm::PoisonValue>(value)) {
-      return "0.0f";
+      llvm::Type* element_type = ComplexStructElementType(value->getType());
+      if (element_type == nullptr) {
+        return Unsupported(function_, "aggregate initializer", *value);
+      }
+      return ZeroInitializer(element_type);
     }
     if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
       if (insert->getNumIndices() != 1) {
@@ -2230,7 +2259,7 @@ class FunctionEmitter {
 
   absl::StatusOr<std::string> InlineComplexInsertValueExpr(
       const llvm::InsertValueInst& insert, const llvm::CallInst& call) {
-    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+    if (!IsComplexStruct(insert.getType()) || insert.getNumIndices() != 1) {
       return Unsupported(function_, "inline aggregate insertion", insert);
     }
 
@@ -2240,7 +2269,12 @@ class FunctionEmitter {
           absl::StrCat("complex field ", field, " is out of range."));
     }
 
-    std::string components[2] = {"0.0f", "0.0f"};
+    llvm::Type* element_type = ComplexStructElementType(insert.getType());
+    if (element_type == nullptr) {
+      return Unsupported(function_, "inline aggregate insertion", insert);
+    }
+    TF_ASSIGN_OR_RETURN(std::string zero, ZeroInitializer(element_type));
+    std::string components[2] = {zero, zero};
     const llvm::Value* aggregate = insert.getAggregateOperand();
     if (!llvm::isa<llvm::UndefValue>(aggregate) &&
         !llvm::isa<llvm::PoisonValue>(aggregate)) {
@@ -2253,7 +2287,8 @@ class FunctionEmitter {
         std::string inserted,
         InlineSimpleValue(insert.getInsertedValueOperand(), call));
     components[field] = std::move(inserted);
-    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(insert.getType()));
+    return absl::StrCat(type, "(", components[0], ", ", components[1], ")");
   }
 
   absl::StatusOr<std::string> InlineComplexComponentExpr(
@@ -2264,7 +2299,11 @@ class FunctionEmitter {
     }
     if (llvm::isa<llvm::UndefValue>(value) ||
         llvm::isa<llvm::PoisonValue>(value)) {
-      return "0.0f";
+      llvm::Type* element_type = ComplexStructElementType(value->getType());
+      if (element_type == nullptr) {
+        return Unsupported(function_, "inline aggregate initializer", *value);
+      }
+      return ZeroInitializer(element_type);
     }
     if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
       if (insert->getNumIndices() != 1) {
@@ -2288,7 +2327,7 @@ class FunctionEmitter {
     }
     const llvm::Value* aggregate = extract.getAggregateOperand();
     unsigned field = *extract.idx_begin();
-    if (IsComplexFloatStruct(aggregate->getType())) {
+    if (IsComplexStruct(aggregate->getType())) {
       TF_ASSIGN_OR_RETURN(std::string value,
                           InlineSimpleValue(aggregate, call));
       if (field == 0) return absl::StrCat(value, ".x");
@@ -3604,7 +3643,7 @@ class FunctionEmitter {
       const llvm::InsertValueInst& insert, const llvm::CallInst& call,
       const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
       const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
-    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+    if (!IsComplexStruct(insert.getType()) || insert.getNumIndices() != 1) {
       return Unsupported(function_, "inline aggregate insertion", insert);
     }
 
@@ -3614,7 +3653,12 @@ class FunctionEmitter {
           absl::StrCat("complex field ", field, " is out of range."));
     }
 
-    std::string components[2] = {"0.0f", "0.0f"};
+    llvm::Type* element_type = ComplexStructElementType(insert.getType());
+    if (element_type == nullptr) {
+      return Unsupported(function_, "inline aggregate insertion", insert);
+    }
+    TF_ASSIGN_OR_RETURN(std::string zero, ZeroInitializer(element_type));
+    std::string components[2] = {zero, zero};
     const llvm::Value* aggregate = insert.getAggregateOperand();
     if (!llvm::isa<llvm::UndefValue>(aggregate) &&
         !llvm::isa<llvm::PoisonValue>(aggregate)) {
@@ -3630,7 +3674,8 @@ class FunctionEmitter {
         InlineValueExpr(insert.getInsertedValueOperand(), call, values,
                         memory));
     components[field] = std::move(inserted);
-    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(insert.getType()));
+    return absl::StrCat(type, "(", components[0], ", ", components[1], ")");
   }
 
   absl::StatusOr<std::string> InlineComplexComponentExpr(
@@ -3644,7 +3689,11 @@ class FunctionEmitter {
     }
     if (llvm::isa<llvm::UndefValue>(value) ||
         llvm::isa<llvm::PoisonValue>(value)) {
-      return "0.0f";
+      llvm::Type* element_type = ComplexStructElementType(value->getType());
+      if (element_type == nullptr) {
+        return Unsupported(function_, "inline aggregate initializer", *value);
+      }
+      return ZeroInitializer(element_type);
     }
     if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
       if (insert->getNumIndices() != 1) {
@@ -3673,7 +3722,7 @@ class FunctionEmitter {
 
     const llvm::Value* aggregate = extract.getAggregateOperand();
     unsigned field = *extract.idx_begin();
-    if (IsComplexFloatStruct(aggregate->getType())) {
+    if (IsComplexStruct(aggregate->getType())) {
       TF_ASSIGN_OR_RETURN(std::string value,
                           InlineValueExpr(aggregate, call, values, memory));
       if (field == 0) return absl::StrCat(value, ".x");
