@@ -1344,14 +1344,7 @@ class FunctionEmitter {
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                           PointerExprFor(load->getPointerOperand()));
-      if (load->getType() != pointer.element_type) {
-        TF_ASSIGN_OR_RETURN(std::string load_msl_type,
-                            MslType(load->getType()));
-        return absl::StrCat("(*reinterpret_cast<", pointer.address_space, " ",
-                            load_msl_type, "*>(&", pointer.base, "[",
-                            pointer.index, "]))");
-      }
-      return absl::StrCat(pointer.base, "[", pointer.index, "]");
+      return LoadFromPointer(pointer, load->getType());
     }
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction)) {
       return BinaryExpr(*binary);
@@ -1836,15 +1829,76 @@ class FunctionEmitter {
     if (callee == nullptr || callee->isDeclaration()) {
       return Unsupported(function_, "inline call", call);
     }
-    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+    if (callee->arg_size() != call.arg_size()) {
       return Unsupported(function_, "inline function shape", call);
     }
+    if (callee->size() != 1) return InlineIfElsePhiFunctionCall(call);
     const llvm::BasicBlock& block = callee->getEntryBlock();
     const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
     if (ret == nullptr || ret->getReturnValue() == nullptr) {
       return Unsupported(function_, "inline function return", call);
     }
     return InlineSimpleValue(ret->getReturnValue(), call);
+  }
+
+  absl::StatusOr<std::string> InlineIfElsePhiFunctionCall(
+      const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "inline call", call);
+    }
+    const llvm::BasicBlock& entry = callee->getEntryBlock();
+    const auto* branch =
+        llvm::dyn_cast<llvm::CondBrInst>(entry.getTerminator());
+    if (branch == nullptr) {
+      return Unsupported(function_, "inline function shape", call);
+    }
+
+    const llvm::BasicBlock* true_block = branch->getSuccessor(0);
+    const llvm::BasicBlock* false_block = branch->getSuccessor(1);
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*true_block);
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*false_block);
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return Unsupported(function_, "inline function shape", call);
+    }
+
+    const llvm::BasicBlock* merge_block = true_successor;
+    const llvm::ReturnInst* ret =
+        llvm::dyn_cast<llvm::ReturnInst>(merge_block->getTerminator());
+    if (ret == nullptr) {
+      const llvm::BasicBlock* return_block =
+          UnconditionalBranchSuccessor(*merge_block);
+      if (return_block == nullptr) {
+        return Unsupported(function_, "inline function shape", call);
+      }
+      ret = llvm::dyn_cast<llvm::ReturnInst>(return_block->getTerminator());
+    }
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "inline function return", call);
+    }
+
+    const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret->getReturnValue());
+    if (phi == nullptr || phi->getParent() != merge_block) {
+      return Unsupported(function_, "inline function return", call);
+    }
+    int true_index = phi->getBasicBlockIndex(true_block);
+    int false_index = phi->getBasicBlockIndex(false_block);
+    if (true_index < 0 || false_index < 0) {
+      return Unsupported(function_, "inline function return", call);
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string condition,
+                        InlineSimpleValue(branch->getCondition(), call));
+    TF_ASSIGN_OR_RETURN(
+        std::string true_value,
+        InlineSimpleValue(phi->getIncomingValue(true_index), call));
+    TF_ASSIGN_OR_RETURN(
+        std::string false_value,
+        InlineSimpleValue(phi->getIncomingValue(false_index), call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
   }
 
   absl::StatusOr<std::string> InlineSimpleAggregateElement(
@@ -2085,9 +2139,12 @@ class FunctionEmitter {
     if (callee == nullptr || callee->isDeclaration()) {
       return Unsupported(function_, "nested inline call", nested_call);
     }
-    if (callee->arg_size() != nested_call.arg_size() || callee->size() != 1) {
+    if (callee->arg_size() != nested_call.arg_size()) {
       return Unsupported(function_, "nested inline function shape",
                          nested_call);
+    }
+    if (callee->size() != 1) {
+      return InlineNestedIfElsePhiFunctionCall(nested_call, outer_call);
     }
     const llvm::BasicBlock& block = callee->getEntryBlock();
     const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
@@ -2097,6 +2154,76 @@ class FunctionEmitter {
     }
     return InlineNestedSimpleValue(ret->getReturnValue(), nested_call,
                                    outer_call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedIfElsePhiFunctionCall(
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    const llvm::Function* callee = nested_call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "nested inline call", nested_call);
+    }
+    const llvm::BasicBlock& entry = callee->getEntryBlock();
+    const auto* branch =
+        llvm::dyn_cast<llvm::CondBrInst>(entry.getTerminator());
+    if (branch == nullptr) {
+      return Unsupported(function_, "nested inline function shape",
+                         nested_call);
+    }
+
+    const llvm::BasicBlock* true_block = branch->getSuccessor(0);
+    const llvm::BasicBlock* false_block = branch->getSuccessor(1);
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*true_block);
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*false_block);
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return Unsupported(function_, "nested inline function shape",
+                         nested_call);
+    }
+
+    const llvm::BasicBlock* merge_block = true_successor;
+    const llvm::ReturnInst* ret =
+        llvm::dyn_cast<llvm::ReturnInst>(merge_block->getTerminator());
+    if (ret == nullptr) {
+      const llvm::BasicBlock* return_block =
+          UnconditionalBranchSuccessor(*merge_block);
+      if (return_block == nullptr) {
+        return Unsupported(function_, "nested inline function shape",
+                           nested_call);
+      }
+      ret = llvm::dyn_cast<llvm::ReturnInst>(return_block->getTerminator());
+    }
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "nested inline function return",
+                         nested_call);
+    }
+
+    const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret->getReturnValue());
+    if (phi == nullptr || phi->getParent() != merge_block) {
+      return Unsupported(function_, "nested inline function return",
+                         nested_call);
+    }
+    int true_index = phi->getBasicBlockIndex(true_block);
+    int false_index = phi->getBasicBlockIndex(false_block);
+    if (true_index < 0 || false_index < 0) {
+      return Unsupported(function_, "nested inline function return",
+                         nested_call);
+    }
+
+    TF_ASSIGN_OR_RETURN(
+        std::string condition,
+        InlineNestedSimpleValue(branch->getCondition(), nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string true_value,
+        InlineNestedSimpleValue(phi->getIncomingValue(true_index), nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string false_value,
+        InlineNestedSimpleValue(phi->getIncomingValue(false_index), nested_call,
+                                outer_call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
   }
 
   absl::StatusOr<std::string> InlineNestedSimpleValue(
@@ -2321,9 +2448,7 @@ class FunctionEmitter {
         PtrExpr pointer,
         InlineDoubleNestedPointerExprFor(load.getPointerOperand(), call,
                                          nested_call, outer_call));
-    std::string expression =
-        absl::StrCat(pointer.base, "[", pointer.index, "]");
-    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+    return LoadFromPointer(pointer, load.getType());
   }
 
   absl::StatusOr<PtrExpr> InlineDoubleNestedPointerExprFor(
@@ -2416,9 +2541,7 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                         InlineNestedPointerExprFor(load.getPointerOperand(),
                                                    nested_call, outer_call));
-    std::string expression =
-        absl::StrCat(pointer.base, "[", pointer.index, "]");
-    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+    return LoadFromPointer(pointer, load.getType());
   }
 
   absl::StatusOr<PtrExpr> InlineNestedPointerExprFor(
@@ -2819,10 +2942,7 @@ class FunctionEmitter {
       TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                           PointerExprFor(call.getArgOperand(
                               argument->getArgNo())));
-      std::string expression =
-          absl::StrCat(pointer.base, "[", pointer.index, "]");
-      return ConvertStoredValue(expression, pointer.element_type,
-                                load.getType());
+      return LoadFromPointer(pointer, load.getType());
     }
 
     if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(root)) {
@@ -2831,9 +2951,7 @@ class FunctionEmitter {
 
     TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                         InlinePointerExprFor(load.getPointerOperand(), call));
-    std::string expression =
-        absl::StrCat(pointer.base, "[", pointer.index, "]");
-    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+    return LoadFromPointer(pointer, load.getType());
   }
 
   absl::StatusOr<PtrExpr> InlinePointerExprFor(
@@ -3012,6 +3130,16 @@ class FunctionEmitter {
       return absl::StrCat("as_type<", to_msl_type, ">(", expression, ")");
     }
     return absl::StrCat("static_cast<", to_msl_type, ">(", expression, ")");
+  }
+
+  absl::StatusOr<std::string> LoadFromPointer(const PtrExpr& pointer,
+                                              llvm::Type* load_type) {
+    std::string expression =
+        absl::StrCat(pointer.base, "[", pointer.index, "]");
+    if (pointer.element_type == load_type) return expression;
+    TF_ASSIGN_OR_RETURN(std::string load_msl_type, MslType(load_type));
+    return absl::StrCat("(*reinterpret_cast<", pointer.address_space, " ",
+                        load_msl_type, "*>(&", expression, "))");
   }
 
   absl::StatusOr<std::string> InlineConstantGlobalLoadExpr(

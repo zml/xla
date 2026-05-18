@@ -637,6 +637,201 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("read_value("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineIfElsePhiFunction) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call i8 @select_byte(ptr %arg0, ptr %arg1, i32 %tid)
+  %out = getelementptr inbounds [4 x i8], ptr %arg2, i32 0, i32 %tid
+  store i8 %value, ptr %out, align 1
+  ret void
+}
+
+define internal i8 @select_byte(ptr %lhs, ptr %rhs, i32 %index) {
+entry:
+  %use_lhs = icmp ult i32 %index, 2
+  br i1 %use_lhs, label %lhs_block, label %rhs_block
+
+lhs_block:
+  %lhs_gep = getelementptr inbounds [4 x i8], ptr %lhs, i32 0, i32 %index
+  %lhs_value = load i8, ptr %lhs_gep, align 1, !invariant.load !1
+  br label %merge
+
+rhs_block:
+  %rhs_gep = getelementptr inbounds [4 x i8], ptr %rhs, i32 0, i32 %index
+  %rhs_value = load i8, ptr %rhs_gep, align 1, !invariant.load !1
+  br label %merge
+
+merge:
+  %selected = phi i8 [ %lhs_value, %lhs_block ], [ %rhs_value, %rhs_block ]
+  br label %return
+
+return:
+  ret i8 %selected
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("? arg0[v0] : arg1[v0])"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[v0] ="), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("select_byte("), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsInlineComplexIfElsePhiFunction) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call { float, float } @select_complex(ptr %arg0, ptr %arg1, i32 %tid)
+  %out = getelementptr inbounds [4 x { float, float }], ptr %arg2, i32 0, i32 %tid
+  store { float, float } %value, ptr %out, align 4
+  ret void
+}
+
+define internal { float, float } @select_complex(ptr %lhs, ptr %rhs, i32 %index) {
+entry:
+  %use_lhs = icmp ult i32 %index, 2
+  br i1 %use_lhs, label %lhs_block, label %rhs_block
+
+lhs_block:
+  %lhs_gep = getelementptr inbounds [4 x { float, float }], ptr %lhs, i32 0, i32 %index
+  %lhs_value = load { float, float }, ptr %lhs_gep, align 4, !invariant.load !1
+  br label %merge
+
+rhs_block:
+  %rhs_gep = getelementptr inbounds [4 x { float, float }], ptr %rhs, i32 0, i32 %index
+  %rhs_value = load { float, float }, ptr %rhs_gep, align 4, !invariant.load !1
+  br label %merge
+
+merge:
+  %selected = phi { float, float } [ %lhs_value, %lhs_block ], [ %rhs_value, %rhs_block ]
+  br label %return
+
+return:
+  ret { float, float } %selected
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float2 v1 ="), std::string::npos) << msl;
+  EXPECT_NE(msl.find("? arg0[v0] : arg1[v0])"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[v0] = v1;"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("select_complex("), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsNestedInlineIfElsePhiFunction) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call { float, float } @shift_select(ptr %arg0, ptr %arg1, i32 %tid, i32 %tid)
+  %out = getelementptr inbounds [4 x { float, float }], ptr %arg2, i32 0, i32 %tid
+  store { float, float } %value, ptr %out, align 4
+  ret void
+}
+
+define internal { float, float } @shift_select(ptr %lhs, ptr %rhs, i32 %plane, i32 %index) {
+entry:
+  %use_shifted = icmp ult i32 %index, 2
+  br i1 %use_shifted, label %shifted, label %unshifted
+
+shifted:
+  %shifted_index = add i32 %index, 1
+  %shifted_value = call { float, float } @select_complex(ptr %lhs, ptr %rhs, i32 %plane, i32 %shifted_index)
+  br label %merge
+
+unshifted:
+  %unshifted_index = sub i32 %index, 1
+  %unshifted_value = call { float, float } @select_complex(ptr %lhs, ptr %rhs, i32 %plane, i32 %unshifted_index)
+  br label %merge
+
+merge:
+  %selected = phi { float, float } [ %shifted_value, %shifted ], [ %unshifted_value, %unshifted ]
+  br label %return
+
+return:
+  ret { float, float } %selected
+}
+
+define internal { float, float } @select_complex(ptr %lhs, ptr %rhs, i32 %plane, i32 %index) {
+entry:
+  %use_lhs = icmp ult i32 %plane, 2
+  br i1 %use_lhs, label %lhs_block, label %rhs_block
+
+lhs_block:
+  %lhs_gep = getelementptr inbounds [8 x { float, float }], ptr %lhs, i32 0, i32 %index
+  %lhs_value = load { float, float }, ptr %lhs_gep, align 4, !invariant.load !1
+  br label %merge
+
+rhs_block:
+  %rhs_gep = getelementptr inbounds [8 x { float, float }], ptr %rhs, i32 0, i32 %index
+  %rhs_value = load { float, float }, ptr %rhs_gep, align 4, !invariant.load !1
+  br label %merge
+
+merge:
+  %selected = phi { float, float } [ %lhs_value, %lhs_block ], [ %rhs_value, %rhs_block ]
+  br label %return
+
+return:
+  ret { float, float } %selected
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float2 v1 ="), std::string::npos) << msl;
+  EXPECT_NE(msl.find("? (*reinterpret_cast<device float2*>(&arg0[((v0 + 1) * 8)]))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("? (*reinterpret_cast<device float2*>(&arg0[((v0 - 1) * 8)]))"),
+            std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("shift_select("), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("select_complex("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsNestedInlineHelperCall) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
