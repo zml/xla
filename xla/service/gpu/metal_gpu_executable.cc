@@ -552,30 +552,8 @@ class ElementwiseAirEmitter {
       return value;
     }
     if (instr->opcode() == HloOpcode::kSlice) {
-      if (!IsF32Array(instr->shape()) ||
-          !IsF32Array(instr->operand(0)->shape()) ||
-          instr->shape().dimensions().size() != 1 ||
-          instr->operand(0)->shape().dimensions().size() != 1 ||
-          instr->slice_strides().size() != 1) {
-        return absl::UnimplementedError(
-            "Metal direct AIR linear load slice currently supports only "
-            "rank-1 f32 slices.");
-      }
-      std::string source_index = std::string(index);
-      const int64_t stride = instr->slice_strides(0);
-      const int64_t start = instr->slice_starts(0);
-      if (stride != 1) {
-        std::string scaled = NewName("linear_slice_scaled");
-        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
-                                        source_index, stride));
-        source_index = scaled;
-      }
-      if (start != 0) {
-        std::string shifted = NewName("linear_slice_idx");
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
-                                        source_index, start));
-        source_index = shifted;
-      }
+      TF_ASSIGN_OR_RETURN(std::string source_index,
+                          EmitSliceSourceIndex(instr, index, body));
       return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
     }
     if (instr->opcode() == HloOpcode::kParameter) {
@@ -590,6 +568,84 @@ class ElementwiseAirEmitter {
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR linear load does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitSliceSourceIndex(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape()) || !IsF32Array(instr->operand(0)->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR slice currently supports only f32 arrays.");
+    }
+    const int64_t rank = instr->shape().dimensions().size();
+    if (rank != instr->operand(0)->shape().dimensions().size() ||
+        rank != instr->slice_strides().size() || (rank != 1 && rank != 2)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR slice currently supports only rank-1 and rank-2 "
+          "f32 slices.");
+    }
+    if (rank == 1) {
+      std::string source_index = std::string(index);
+      const int64_t stride = instr->slice_strides(0);
+      const int64_t start = instr->slice_starts(0);
+      if (stride != 1) {
+        std::string scaled = NewName("slice_scaled");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        source_index, stride));
+        source_index = scaled;
+      }
+      if (start != 0) {
+        std::string shifted = NewName("slice_idx");
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        source_index, start));
+        source_index = shifted;
+      }
+      return source_index;
+    }
+
+    const int64_t result_minor = instr->shape().dimensions(1);
+    const int64_t operand_minor = instr->operand(0)->shape().dimensions(1);
+    std::string row = NewName("slice_row");
+    std::string col = NewName("slice_col");
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %s, %d", row, index, result_minor));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %s, %d", col, index, result_minor));
+
+    std::string source_row = row;
+    if (instr->slice_strides(0) != 1) {
+      source_row = NewName("slice_source_row_scaled");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", source_row,
+                                      row, instr->slice_strides(0)));
+    }
+    if (instr->slice_starts(0) != 0) {
+      std::string shifted = NewName("slice_source_row");
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                      source_row, instr->slice_starts(0)));
+      source_row = shifted;
+    }
+
+    std::string source_col = col;
+    if (instr->slice_strides(1) != 1) {
+      source_col = NewName("slice_source_col_scaled");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", source_col,
+                                      col, instr->slice_strides(1)));
+    }
+    if (instr->slice_starts(1) != 0) {
+      std::string shifted = NewName("slice_source_col");
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                      source_col, instr->slice_starts(1)));
+      source_col = shifted;
+    }
+
+    std::string source_row_offset = NewName("slice_row_offset");
+    std::string source_index = NewName("slice_index");
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                    source_row_offset, source_row,
+                                    operand_minor));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                    source_row_offset, source_col));
+    return source_index;
   }
 
   absl::StatusOr<std::string> EmitTranspose(const HloInstruction* instr,
@@ -671,15 +727,6 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
-    if (!IsF32Array(instr->shape()) ||
-        !IsF32Array(instr->operand(0)->shape()) ||
-        instr->shape().dimensions().size() != 1 ||
-        instr->operand(0)->shape().dimensions().size() != 1 ||
-        instr->slice_strides().size() != 1) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise slice currently supports only rank-1 "
-          "f32 slices.");
-    }
     const int64_t slice_elements = ShapeUtil::ElementsIn(instr->shape());
     if ((!force_scalar &&
          slice_elements != ShapeUtil::ElementsIn(result_shape_)) ||
@@ -689,35 +736,10 @@ class ElementwiseAirEmitter {
           "as the final result, unless used as a scalar operand.");
     }
 
-    const HloInstruction* operand = instr->operand(0);
-    while (operand->opcode() == HloOpcode::kBitcast ||
-           operand->opcode() == HloOpcode::kReshape) {
-      operand = operand->operand(0);
-    }
-    if (operand->opcode() != HloOpcode::kParameter) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise slice currently supports only "
-          "parameter operands.");
-    }
-    const int input_index = InputIndexForParameter(
-        operand->parameter_number(), operand->shape().element_type());
-    const int64_t start = instr->slice_starts(0);
-    const int64_t stride = instr->slice_strides(0);
-    std::string source_index = force_scalar ? "0" : "%idx";
-    if (stride != 1) {
-      std::string scaled = NewName("slice_scaled");
-      body->push_back(absl::StrFormat("  %s = mul i64 %%idx, %d", scaled,
-                                      stride));
-      source_index = scaled;
-    }
-    if (start != 0) {
-      std::string shifted = NewName("slice_idx");
-      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
-                                      source_index, start));
-      source_index = shifted;
-    }
-    return EmitLoad(input_index, operand->shape().element_type(), source_index,
-                    body);
+    TF_ASSIGN_OR_RETURN(
+        std::string source_index,
+        EmitSliceSourceIndex(instr, force_scalar ? "0" : "%idx", body));
+    return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
   }
 
   absl::StatusOr<std::string> EmitIota(const HloInstruction* instr,

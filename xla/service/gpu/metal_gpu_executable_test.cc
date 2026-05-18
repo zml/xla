@@ -1271,6 +1271,45 @@ TEST(MetalGpuExecutableTest, ElementwiseReshapeSlice) {
   ExpectMatchesReshapeSliceReference(actual, MakeElementwiseLhs());
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseRank2Slice) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_rank2_slice");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {5, 6});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp sliced = Slice(input, {1, 2}, {4, 5}, {1, 1});
+  Add(sliced, Broadcast(ConstantR0<float>(&builder, 1.0f), {3, 3}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(5, 6);
+  for (int64_t row = 0; row < 5; ++row) {
+    for (int64_t col = 0; col < 6; ++col) {
+      values(row, col) = static_cast<float>(((row * 6 + col) % 13) - 6) / 4.0f;
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 3})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}), values(row + 1, col + 2) + 1.0f)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseReshapeParameter) {
   auto client_result = GetMetalClient();
   if (absl::IsFailedPrecondition(client_result.status())) {
