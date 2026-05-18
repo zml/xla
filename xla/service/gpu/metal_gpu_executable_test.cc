@@ -821,6 +821,33 @@ TEST(MetalGpuExecutableTest, ElementwiseS32Add) {
       actual, [&](int64_t i) { return input.Get<int32_t>({i}) * 2; });
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseS32CompareRoot) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_s32_compare_root");
+  Shape shape = ShapeUtil::MakeShape(S32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Gt(input, Broadcast(ConstantR0<int32_t>(&builder, 0), {kElementCount}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseS32();
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectMatchesPredReference(actual, [&](int64_t i) {
+    return input_literal.Get<int32_t>({i}) > 0;
+  });
+}
+
 TEST(MetalGpuExecutableTest, ConvertF32ToS32) {
   auto result = ExecuteMetalConvert(F32, S32);
   if (absl::IsFailedPrecondition(result.status())) {

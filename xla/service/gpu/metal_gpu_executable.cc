@@ -707,30 +707,56 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string rhs,
                         EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
                                   body));
-    absl::string_view predicate;
-    switch (instr->comparison_direction()) {
-      case ComparisonDirection::kEq:
-        predicate = "oeq";
-        break;
-      case ComparisonDirection::kNe:
-        predicate = "one";
-        break;
-      case ComparisonDirection::kGe:
-        predicate = "oge";
-        break;
-      case ComparisonDirection::kGt:
-        predicate = "ogt";
-        break;
-      case ComparisonDirection::kLe:
-        predicate = "ole";
-        break;
-      case ComparisonDirection::kLt:
-        predicate = "olt";
-        break;
-    }
     std::string cmp = NewName("cmp");
-    body->push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
-                                    predicate, lhs, rhs));
+    if (instr->operand(0)->shape().element_type() == S32) {
+      absl::string_view predicate;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        case ComparisonDirection::kGe:
+          predicate = "sge";
+          break;
+        case ComparisonDirection::kGt:
+          predicate = "sgt";
+          break;
+        case ComparisonDirection::kLe:
+          predicate = "sle";
+          break;
+        case ComparisonDirection::kLt:
+          predicate = "slt";
+          break;
+      }
+      body->push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+    } else {
+      absl::string_view predicate;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "oeq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "one";
+          break;
+        case ComparisonDirection::kGe:
+          predicate = "oge";
+          break;
+        case ComparisonDirection::kGt:
+          predicate = "ogt";
+          break;
+        case ComparisonDirection::kLe:
+          predicate = "ole";
+          break;
+        case ComparisonDirection::kLt:
+          predicate = "olt";
+          break;
+      }
+      body->push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                      predicate, lhs, rhs));
+    }
     return cmp;
   }
 
