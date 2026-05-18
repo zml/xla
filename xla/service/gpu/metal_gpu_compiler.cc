@@ -72,6 +72,15 @@ absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     return reduction.status();
   }
 
+  absl::StatusOr<std::unique_ptr<Executable>> convert =
+      BuildMetalConvertExecutable(shared_module);
+  if (convert.ok()) {
+    return std::move(*convert);
+  }
+  if (!absl::IsUnimplemented(convert.status())) {
+    return convert.status();
+  }
+
   return BuildMetalElementwiseExecutable(std::move(shared_module));
 }
 

@@ -90,6 +90,14 @@ Literal MakeElementwiseRhs() {
   return LiteralUtil::CreateR1<float>(values);
 }
 
+Literal MakeElementwiseS32() {
+  std::vector<int32_t> values(kElementCount);
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    values[i] = static_cast<int32_t>((i % 31) - 15);
+  }
+  return LiteralUtil::CreateR1<int32_t>(values);
+}
+
 float Reference(const Literal& lhs, const Literal& rhs, int64_t row,
                 int64_t col, bool relu) {
   float acc = 0.0f;
@@ -216,6 +224,24 @@ absl::StatusOr<Literal> ExecuteMetalIota() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConvert(PrimitiveType input_type,
+                                            PrimitiveType output_type) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_convert");
+  Shape input_shape = ShapeUtil::MakeShape(input_type, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  ConvertElementType(input, output_type);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      input_type == F32 ? MakeElementwiseLhs() : MakeElementwiseS32();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
                                               float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -285,6 +311,15 @@ void ExpectMatchesPredReference(const Literal& actual, ReferenceFn reference) {
       actual.shape(), ShapeUtil::MakeShape(PRED, {kElementCount})));
   for (int64_t i = 0; i < kElementCount; ++i) {
     EXPECT_EQ(actual.Get<bool>({i}), reference(i)) << "at " << i;
+  }
+}
+
+template <typename ReferenceFn>
+void ExpectMatchesS32Reference(const Literal& actual, ReferenceFn reference) {
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(S32, {kElementCount})));
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    EXPECT_EQ(actual.Get<int32_t>({i}), reference(i)) << "at " << i;
   }
 }
 
@@ -729,6 +764,30 @@ TEST(MetalGpuExecutableTest, ElementwiseIota) {
   for (int64_t i = 0; i < 16; ++i) {
     EXPECT_EQ(actual.Get<float>({i}), static_cast<float>(i + 1));
   }
+}
+
+TEST(MetalGpuExecutableTest, ConvertF32ToS32) {
+  auto result = ExecuteMetalConvert(F32, S32);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesS32Reference(actual, [&](int64_t i) {
+    return static_cast<int32_t>(input.Get<float>({i}));
+  });
+}
+
+TEST(MetalGpuExecutableTest, ConvertS32ToF32) {
+  auto result = ExecuteMetalConvert(S32, F32);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
+    return static_cast<float>(input.Get<int32_t>({i}));
+  });
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {

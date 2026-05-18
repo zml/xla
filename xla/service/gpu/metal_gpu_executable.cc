@@ -79,6 +79,13 @@ struct ReductionParams {
   uint32_t reserved2;
 };
 
+struct ConvertParams {
+  uint32_t num_elements;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+};
+
 enum class ReductionKind {
   kAdd,
   kMultiply,
@@ -96,6 +103,17 @@ struct MetalReductionConfig {
   ReductionKind kind = ReductionKind::kAdd;
 };
 
+enum class ConvertKind {
+  kF32ToS32,
+  kS32ToF32,
+};
+
+struct MetalConvertConfig {
+  int64_t parameter_number = 0;
+  int64_t num_elements = 0;
+  ConvertKind kind = ConvertKind::kF32ToS32;
+};
+
 bool IsF32Rank2Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.dimensions().size() == 2;
 }
@@ -106,6 +124,10 @@ bool IsF32Array(const Shape& shape) {
 
 bool IsPredArray(const Shape& shape) {
   return shape.element_type() == PRED && shape.IsArray();
+}
+
+bool IsS32Array(const Shape& shape) {
+  return shape.element_type() == S32 && shape.IsArray();
 }
 
 bool IsScalarLikeF32(const Shape& shape) {
@@ -1349,6 +1371,212 @@ absl::StatusOr<std::unique_ptr<Executable>> BuildMetalReductionExecutable(
                       CompileMetalAirToMetallib(BuildReductionAir(config),
                                                 "metal_reduction_air"));
   return std::make_unique<MetalReductionExecutable>(
+      std::move(module), config, std::move(metallib));
+}
+
+absl::StatusOr<MetalConvertConfig> MatchMetalConvert(const HloModule& module) {
+  const HloInstruction* root = module.entry_computation()->root_instruction();
+  if (root->opcode() != HloOpcode::kConvert) {
+    return absl::UnimplementedError(
+        "Metal direct AIR convert supports only convert roots.");
+  }
+  const HloInstruction* input = root->operand(0);
+  if (input->opcode() != HloOpcode::kParameter ||
+      root->shape().dimensions() != input->shape().dimensions()) {
+    return absl::UnimplementedError(
+        "Metal direct AIR convert currently supports only parameter operands "
+        "with unchanged dimensions.");
+  }
+
+  MetalConvertConfig config;
+  config.parameter_number = input->parameter_number();
+  config.num_elements = ShapeUtil::ElementsIn(root->shape());
+  if (IsF32Array(input->shape()) && IsS32Array(root->shape())) {
+    config.kind = ConvertKind::kF32ToS32;
+    return config;
+  }
+  if (IsS32Array(input->shape()) && IsF32Array(root->shape())) {
+    config.kind = ConvertKind::kS32ToF32;
+    return config;
+  }
+  return absl::UnimplementedError(
+      "Metal direct AIR convert currently supports only f32<->s32 arrays.");
+}
+
+std::string BuildConvertAir(const MetalConvertConfig& config) {
+  const bool f32_to_s32 = config.kind == ConvertKind::kF32ToS32;
+  const char* input_ir_type = f32_to_s32 ? "float" : "i32";
+  const char* output_ir_type = f32_to_s32 ? "i32" : "float";
+  const char* input_air_type = f32_to_s32 ? "float" : "int";
+  const char* output_air_type = f32_to_s32 ? "int" : "float";
+  const char* convert_op = f32_to_s32 ? "fptosi float %value to i32"
+                                      : "sitofp i32 %value to float";
+  return absl::StrFormat(R"(
+source_filename = "xla/service/gpu/metal_convert_air"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024-n8:16:32"
+target triple = "air64_v27-apple-macosx15.0.0"
+
+%%struct.ConvertParams = type { i32, i32, i32, i32 }
+
+define void @convert_elementwise(
+    %s addrspace(1)* nocapture noundef readonly "air-buffer-no-alias" %%arg0,
+    %s addrspace(1)* nocapture noundef writeonly "air-buffer-no-alias" %%out,
+    %%struct.ConvertParams addrspace(2)* nocapture noundef readonly align 4 dereferenceable(16) "air-buffer-no-alias" %%params,
+    <3 x i32> noundef %%gid) local_unnamed_addr #0 {
+entry:
+  %%idx32 = extractelement <3 x i32> %%gid, i64 0
+  %%n_ptr = getelementptr inbounds %%struct.ConvertParams, %%struct.ConvertParams addrspace(2)* %%params, i64 0, i32 0
+  %%n = load i32, i32 addrspace(2)* %%n_ptr, align 4
+  %%in_bounds = icmp ult i32 %%idx32, %%n
+  br i1 %%in_bounds, label %%body, label %%exit
+
+body:
+  %%idx = zext i32 %%idx32 to i64
+  %%ptr = getelementptr inbounds %s, %s addrspace(1)* %%arg0, i64 %%idx
+  %%value = load %s, %s addrspace(1)* %%ptr, align 4
+  %%converted = %s
+  %%out_ptr = getelementptr inbounds %s, %s addrspace(1)* %%out, i64 %%idx
+  store %s %%converted, %s addrspace(1)* %%out_ptr, align 4
+  br label %%exit
+
+exit:
+  ret void
+}
+
+attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-pointer"="all" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
+!air.compile_options = !{!18, !19, !20}
+!llvm.ident = !{!21}
+!air.version = !{!22}
+!air.language_version = !{!23}
+!air.source_file_name = !{!24}
+
+!0 = !{void (%s addrspace(1)*, %s addrspace(1)*, %%struct.ConvertParams addrspace(2)*, <3 x i32>)* @convert_elementwise, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"%s", !"air.arg_name", !"arg0"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"%s", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"ConvertParams", !"air.arg_name", !"params"}
+!6 = !{i32 0, i32 4, i32 0, !"uint", !"num_elements", i32 4, i32 4, i32 0, !"uint", !"reserved0", i32 8, i32 4, i32 0, !"uint", !"reserved1", i32 12, i32 4, i32 0, !"uint", !"reserved2"}
+!7 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+!10 = !{i32 1, !"wchar_size", i32 4}
+!11 = !{i32 7, !"air.max_device_buffers", i32 31}
+!12 = !{i32 7, !"air.max_constant_buffers", i32 31}
+!13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+!14 = !{i32 7, !"air.max_textures", i32 128}
+!15 = !{i32 7, !"air.max_read_write_textures", i32 8}
+!16 = !{i32 7, !"air.max_samplers", i32 16}
+!17 = !{i32 7, !"frame-pointer", i32 2}
+!18 = !{!"air.compile.denorms_disable"}
+!19 = !{!"air.compile.fast_math_enable"}
+!20 = !{!"air.compile.framebuffer_fetch_enable"}
+!21 = !{!"xla direct AIR convert"}
+!22 = !{i32 2, i32 7, i32 0}
+!23 = !{!"Metal", i32 3, i32 2, i32 0}
+!24 = !{!"xla/service/gpu/metal_convert_air"}
+)",
+                         input_ir_type, output_ir_type, input_ir_type,
+                         input_ir_type, input_ir_type, input_ir_type,
+                         convert_op, output_ir_type, output_ir_type,
+                         output_ir_type, output_ir_type, input_ir_type,
+                         output_ir_type, input_air_type, output_air_type);
+}
+
+class MetalConvertExecutable final : public Executable {
+ public:
+  MetalConvertExecutable(std::shared_ptr<HloModule> module,
+                         MetalConvertConfig config,
+                         std::vector<uint8_t> metallib)
+      : Executable(std::move(module)),
+        config_(config),
+        result_shape_(this->module()
+                          .entry_computation()
+                          ->root_instruction()
+                          ->shape()),
+        metallib_(std::move(metallib)) {}
+
+  Shape result_shape() const override { return result_shape_; }
+
+  absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
+      const ServiceExecutableRunOptions* run_options,
+      std::vector<ExecutionInput> arguments) override {
+    se::Stream* stream = run_options->stream();
+    if (stream == nullptr) {
+      return absl::InvalidArgumentError("Metal convert requires a stream.");
+    }
+    se::StreamExecutor* executor = stream->parent();
+    se::DeviceAddressAllocator* allocator = run_options->allocator();
+    if (allocator == nullptr) {
+      return absl::InvalidArgumentError("Metal convert requires an allocator.");
+    }
+    if (config_.parameter_number >= arguments.size()) {
+      return absl::InvalidArgumentError(
+          "Metal convert parameter number is out of bounds.");
+    }
+
+    const int device_ordinal = run_options->device_ordinal() != -1
+                                   ? run_options->device_ordinal()
+                                   : executor->device_ordinal();
+    const int64_t output_size = ShapeUtil::ByteSizeOf(result_shape_, 8);
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> output_buffer,
+                        allocator->Allocate(device_ordinal, output_size));
+    se::DeviceAddressBase output = *output_buffer;
+
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> params_buffer,
+                        allocator->Allocate(device_ordinal,
+                                            sizeof(ConvertParams)));
+    se::DeviceAddressBase params_address = *params_buffer;
+    ConvertParams params{static_cast<uint32_t>(config_.num_elements), 0, 0, 0};
+    TF_RETURN_IF_ERROR(
+        stream->Memcpy(&params_address, &params, sizeof(ConvertParams)));
+
+    se::DeviceAddressBase input =
+        arguments[config_.parameter_number].Buffer({}).AsDeviceAddress();
+    if (input.is_null()) {
+      return absl::InvalidArgumentError("Metal convert input buffer is null.");
+    }
+
+    auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+        std::vector<uint8_t>(metallib_.begin(), metallib_.end()),
+        "convert_elementwise", /*arity=*/3);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        executor->LoadKernel(spec));
+
+    se::KernelArgsPackedArray kernel_args(/*num_args=*/3);
+    kernel_args.add_argument(input);
+    kernel_args.add_argument(output);
+    kernel_args.add_argument(params_address);
+
+    se::ThreadDim threads(/*x=*/256, /*y=*/1, /*z=*/1);
+    se::BlockDim blocks(/*x=*/static_cast<uint64_t>((config_.num_elements + 255) /
+                                                    256),
+                        /*y=*/1, /*z=*/1);
+    TF_RETURN_IF_ERROR(kernel->Launch(threads, blocks, stream, kernel_args));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+    ExecutionOutput result(result_shape_, allocator, device_ordinal,
+                           executor->device_ordinal());
+    static_cast<ShapedBuffer*>(result.MutableResult())
+        ->set_buffer(output_buffer.Release(), {});
+    result.Commit();
+    return std::move(result);
+  }
+
+ private:
+  MetalConvertConfig config_;
+  Shape result_shape_;
+  std::vector<uint8_t> metallib_;
+};
+
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalConvertExecutable(
+    std::shared_ptr<HloModule> module) {
+  TF_ASSIGN_OR_RETURN(MetalConvertConfig config, MatchMetalConvert(*module));
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
+                      CompileMetalAirToMetallib(BuildConvertAir(config),
+                                                "metal_convert_air"));
+  return std::make_unique<MetalConvertExecutable>(
       std::move(module), config, std::move(metallib));
 }
 
