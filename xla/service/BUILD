@@ -1595,6 +1595,8 @@ cc_library(
         ":gpu_plugin_without_collectives",
     ] + if_gpu_is_configured([
         "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
+    ]) + if_macos([
+        "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
     ]),
 )
 
@@ -1614,6 +1616,12 @@ cc_library(
         "//xla/stream_executor/rocm:stream_executor_rocm",
     ]) + if_sycl_is_configured([
         "//xla/service/gpu:intel_gpu_compiler",
+    ]) + if_macos([
+        ":service",
+        "//xla/service/gpu:gpu_compiler",
+        "//xla/service/gpu:gpu_transfer_manager",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:all_runtime",
     ]),
 )
 

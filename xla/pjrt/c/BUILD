@@ -579,7 +579,9 @@ cc_library(
     local_defines = (
         if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
             "TENSORFLOW_USE_ROCM=1",
-        ]) + if_sycl_is_configured(["TENSORFLOW_USE_SYCL=1"])
+        ]) + if_sycl_is_configured(["TENSORFLOW_USE_SYCL=1"]) + if_macos([
+            "TENSORFLOW_USE_METAL=1",
+        ])
     ),
     visibility = ["//visibility:public"],
     deps = [
@@ -660,19 +662,25 @@ cc_library(
     alwayslink = 1,
 )
 
-# PJRT GPU plugin. Can be configured to be built for CUDA or ROCM.
+# PJRT GPU plugin. Can be configured to be built for CUDA, ROCM, SYCL, or Metal.
 xla_cc_binary(
     name = "pjrt_c_api_gpu_plugin",
     additional_linker_inputs = [
         ":pjrt_c_api_gpu_version_script.lds",
     ],
-    linkopts = [
-        "-Wl,--version-script,$(location :pjrt_c_api_gpu_version_script.lds)",
-        "-Wl,--no-undefined",
-    ],
+    linkopts = if_macos(
+        [
+            "-Wl,-exported_symbol,_GetPjrtApi",
+            "-Wl,-install_name,@rpath/libpjrt_metal.dylib",
+            "-Wl,-undefined,error",
+        ],
+        [
+            "-Wl,--version-script,$(location :pjrt_c_api_gpu_version_script.lds)",
+            "-Wl,--no-undefined",
+        ],
+    ),
     linkshared = True,
     tags = [
-        "no_mac",  # No GPU on mac.
         "noasan",
         "nomsan",
         "notsan",
@@ -686,6 +694,8 @@ xla_cc_binary(
         "//xla/stream_executor:rocm_platform",
     ]) + if_sycl_is_configured([
         "//xla/stream_executor:sycl_platform",
+    ]) + if_macos([
+        "//xla/stream_executor:metal_platform",
     ]),
 )
 

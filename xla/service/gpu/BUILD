@@ -16,6 +16,7 @@ load("//xla/tests:build_defs.bzl", "xla_test")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
+    "if_macos",
     "internal_visibility",
     "tsl_copts",
 )
@@ -413,6 +414,22 @@ cc_library(
 )
 
 cc_library(
+    name = "ptx_custom_kernel_emitter_metal",
+    srcs = ["custom_kernel_emitter_metal_stub.cc"],
+    hdrs = ["custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "ptx_custom_kernel_emitter",
     hdrs = ["custom_kernel_emitter.h"],
     tags = ["gpu"],
@@ -422,6 +439,8 @@ cc_library(
         ":ptx_custom_kernel_emitter_rocm",
     ]) + if_sycl_is_configured([
         ":ptx_custom_kernel_emitter_sycl",
+    ]) + if_macos([
+        ":ptx_custom_kernel_emitter_metal",
     ]) + [
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/status:statusor",

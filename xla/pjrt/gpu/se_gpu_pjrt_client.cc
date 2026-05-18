@@ -127,7 +127,8 @@ limitations under the License.
 #include "tsl/profiler/lib/nvtx_utils.h"
 #include "tsl/profiler/lib/traceme.h"
 
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
+    defined(TENSORFLOW_USE_METAL)
 #include "xla/debug_options_flags.h"
 #include "xla/pjrt/gpu/gpu_metrics.h"
 #include "xla/pjrt/proto/compile_options.pb.h"
@@ -136,7 +137,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/xla.pb.h"
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
 
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
@@ -1929,25 +1930,29 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
   gpu_executable_run_options->set_gpu_global_device_ids(
       std::move(gpu_device_ids));
 
-  TF_ASSIGN_OR_RETURN(xla::Collectives * collectives,
-                      xla::CollectivesRegistry::Default("gpu"));
-  xla::gpu::GpuCollectives* gpu_collectives =
-      tsl::down_cast<xla::gpu::GpuCollectives*>(collectives);
+#if !TENSORFLOW_USE_METAL
+  {
+    TF_ASSIGN_OR_RETURN(xla::Collectives * collectives,
+                        xla::CollectivesRegistry::Default("gpu"));
+    xla::gpu::GpuCollectives* gpu_collectives =
+        tsl::down_cast<xla::gpu::GpuCollectives*>(collectives);
 
-  if (gpu_collectives == nullptr) {
-    return absl::InternalError("Failed to get GPU collectives");
-  }
+    if (gpu_collectives == nullptr) {
+      return absl::InternalError("Failed to get GPU collectives");
+    }
 
-  size_t num_processes = global_topology.processes().size();
-  if (gpu_collectives->IsImplemented()) {
-    TF_ASSIGN_OR_RETURN(
-        auto clique_id_callback,
-        gpu_collectives->InitializeTopology(
-            {ProcessId(process_id), num_processes, local_device_states.size(),
-             kv_store, device_to_process}));
-    gpu_executable_run_options->set_clique_id_callback(
-        std::move(clique_id_callback));
+    size_t num_processes = global_topology.processes().size();
+    if (gpu_collectives->IsImplemented()) {
+      TF_ASSIGN_OR_RETURN(auto clique_id_callback,
+                          gpu_collectives->InitializeTopology(
+                              {ProcessId(process_id), num_processes,
+                               local_device_states.size(), kv_store,
+                               device_to_process}));
+      gpu_executable_run_options->set_clique_id_callback(
+          std::move(clique_id_callback));
+    }
   }
+#endif  // !TENSORFLOW_USE_METAL
 
   TF_ASSIGN_OR_RETURN(GpuTopologyProto gpu_topology,
                       BuildGpuTopology(global_topology, *gpu_target_config,
@@ -2067,6 +2072,8 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   auto pjrt_platform_name = xla::RocmName();
 #elif TENSORFLOW_USE_SYCL
   auto pjrt_platform_name = xla::OneapiName();
+#elif TENSORFLOW_USE_METAL
+  auto pjrt_platform_name = xla::MetalName();
 #else   // TENSORFLOW_USE_ROCM
   auto pjrt_platform_name = xla::CudaName();
 #endif  // TENSORFLOW_USE_ROCM
@@ -2190,7 +2197,8 @@ std::vector<std::unique_ptr<PjRtStreamExecutorDevice>> BuildLocalDevices(
   return devices;
 }
 
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
+    defined(TENSORFLOW_USE_METAL)
 static absl::Status CheckAlignment(const BufferAllocation& allocation,
                                    se::DeviceAddressBase buffer, int arg_idx) {
   const int64_t expected_alignment = [&] {
@@ -2211,7 +2219,7 @@ static absl::Status CheckAlignment(const BufferAllocation& allocation,
   }
   return absl::OkStatus();
 }
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
 
 absl::StatusOr<PjRtStreamExecutorExecutionOutput>
 StreamExecutorGpuClient::RunAsync(
@@ -2220,7 +2228,8 @@ StreamExecutorGpuClient::RunAsync(
     absl::Span<const PjRtRawBufferRef> results,
     ExecutableRunOptions run_options_inp, bool parameter_is_tupled_arguments,
     absl::Span<const Shape> executable_parameter_shapes) {
-#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
+    defined(TENSORFLOW_USE_METAL)
   std::vector<const Shape*> argument_shapes;
   argument_shapes.reserve(flat_arguments.size());
   for (const Shape& arg_shape : executable_parameter_shapes) {
@@ -2280,6 +2289,7 @@ StreamExecutorGpuClient::RunAsync(
   // Build a map of per-color allocation granularity. Collective memory requires
   // larger alignment than the BFC allocator guarantees (256 bytes).
   absl::flat_hash_map<LogicalBuffer::Color, int64_t> allocate_granularity;
+#if !TENSORFLOW_USE_METAL
   if (auto* collectives =
           gpu::GpuCollectives::Default(executor->GetPlatform()->Name())) {
     const int64_t collective_memory_alignment =
@@ -2289,6 +2299,7 @@ StreamExecutorGpuClient::RunAsync(
     allocate_granularity[static_cast<LogicalBuffer::Color>(
         gpu::MemorySpaceColor::kCollective)] = collective_memory_alignment;
   }
+#endif  // !TENSORFLOW_USE_METAL
 
   std::vector<se::DeviceAddressBase> buffers(allocations.size());
   {
@@ -2459,7 +2470,7 @@ StreamExecutorGpuClient::RunAsync(
   return PjRtStreamExecutorClient::RunAsync(
       exec, device, flat_arguments, results, std::move(run_options_inp),
       parameter_is_tupled_arguments, executable_parameter_shapes);
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_METAL
 }
 
 absl::StatusOr<std::unique_ptr<PjRtRuntimeAbiVersion>>

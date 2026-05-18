@@ -54,6 +54,8 @@ cc_library(
     hdrs = ["se_gpu_pjrt_client.h"],
     defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
+    ]) + if_macos([
+        "TENSORFLOW_USE_METAL=1",
     ]),
     visibility = internal_visibility(["//xla/pjrt/gpu:legacy_gpu_client_users"]),
     deps = [
@@ -191,6 +193,13 @@ cc_library(
         "@tsl//tsl/profiler/lib:nvtx_utils",
         "@tsl//tsl/profiler/lib:traceme",
     ] + if_cuda_or_rocm([
+        # keep sorted
+        "//xla:debug_options_flags",
+        "//xla/service/gpu:gpu_compiler",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:gpu_executable",
+        "//xla/service/gpu:stream_executor_util",
+    ]) + if_macos([
         # keep sorted
         "//xla:debug_options_flags",
         "//xla/service/gpu:gpu_compiler",
