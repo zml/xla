@@ -1784,6 +1784,18 @@ class FunctionEmitter {
         cast.getType()->isFloatTy()) {
       return absl::StrCat("xla_metal_bf16_to_f32(", operand, ")");
     }
+    if ((cast.getOpcode() == llvm::Instruction::SIToFP ||
+         cast.getOpcode() == llvm::Instruction::UIToFP) &&
+        cast.getType()->isBFloatTy()) {
+      return absl::StrCat("xla_metal_f32_to_bf16(static_cast<float>(",
+                          operand, "))");
+    }
+    if ((cast.getOpcode() == llvm::Instruction::FPToSI ||
+         cast.getOpcode() == llvm::Instruction::FPToUI) &&
+        cast.getOperand(0)->getType()->isBFloatTy()) {
+      return absl::StrCat("static_cast<", type, ">(xla_metal_bf16_to_f32(",
+                          operand, "))");
+    }
     switch (cast.getOpcode()) {
       case llvm::Instruction::Trunc:
       case llvm::Instruction::ZExt:
