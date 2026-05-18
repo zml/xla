@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -67,6 +68,10 @@ std::string Indent(int depth) { return std::string(depth * 2, ' '); }
 
 bool IsPointerType(const llvm::Value& value) {
   return value.getType()->isPointerTy();
+}
+
+bool IsAggregateType(llvm::Type* type) {
+  return type->isStructTy() || type->isArrayTy();
 }
 
 absl::Status Unsupported(const llvm::Function& function, absl::string_view what,
@@ -408,6 +413,7 @@ class FunctionEmitter {
       for (const llvm::Instruction& instruction : block) {
         if (instruction.getType()->isVoidTy()) continue;
         if (IsPointerType(instruction)) continue;
+        if (IsAggregateType(instruction.getType())) continue;
         names_[&instruction] = absl::StrCat("v", value_index++);
       }
     }
@@ -466,6 +472,7 @@ class FunctionEmitter {
       for (const llvm::Instruction& instruction : block) {
         if (instruction.getType()->isVoidTy()) continue;
         if (IsPointerType(instruction)) continue;
+        if (IsAggregateType(instruction.getType())) continue;
         TF_ASSIGN_OR_RETURN(std::string type, MslType(instruction.getType()));
         TF_ASSIGN_OR_RETURN(std::string zero,
                             ZeroInitializer(instruction.getType()));
@@ -478,49 +485,81 @@ class FunctionEmitter {
 
   absl::Status EmitBody(std::string* output) {
     if (function_.empty()) return absl::OkStatus();
-    if (function_.size() == 1) {
-      return EmitBlockStatements(function_.getEntryBlock(), output, 1);
+    absl::flat_hash_set<const llvm::BasicBlock*> visited;
+    return EmitStructuredBlock(&function_.getEntryBlock(), /*stop_block=*/nullptr,
+                               output, /*indent=*/1, &visited);
+  }
+
+  absl::Status EmitStructuredBlock(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* stop_block,
+      std::string* output, int indent,
+      absl::flat_hash_set<const llvm::BasicBlock*>* visited) {
+    while (block != nullptr && block != stop_block) {
+      if (!visited->insert(block).second) {
+        return Unsupported(function_, "cyclic or reused control flow",
+                           *block->getTerminator());
+      }
+
+      RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent));
+
+      const llvm::Instruction* terminator = block->getTerminator();
+      if (llvm::isa<llvm::ReturnInst>(terminator)) return absl::OkStatus();
+
+      if (const auto* branch = llvm::dyn_cast<llvm::UncondBrInst>(terminator)) {
+        const llvm::BasicBlock* successor = branch->getSuccessor(0);
+        RETURN_IF_ERROR(
+            EmitPhiAssignments(*successor, block, output, indent));
+        block = successor;
+        continue;
+      }
+
+      const auto* branch = llvm::dyn_cast<llvm::CondBrInst>(terminator);
+      if (branch == nullptr) {
+        return Unsupported(function_, "terminator", *terminator);
+      }
+
+      const llvm::BasicBlock* true_block = branch->getSuccessor(0);
+      const llvm::BasicBlock* false_block = branch->getSuccessor(1);
+      const llvm::BasicBlock* true_successor =
+          UnconditionalBranchSuccessor(*true_block);
+      const llvm::BasicBlock* false_successor =
+          UnconditionalBranchSuccessor(*false_block);
+
+      TF_ASSIGN_OR_RETURN(std::string condition, Expr(branch->getCondition()));
+
+      if (true_successor != nullptr && true_successor == false_successor) {
+        absl::StrAppend(output, Indent(indent), "if (", condition, ") {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(true_block, true_successor, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "} else {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(false_block, false_successor, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        block = true_successor;
+        continue;
+      }
+
+      if (true_successor == false_block) {
+        absl::StrAppend(output, Indent(indent), "if (", condition, ") {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(true_block, false_block, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        block = false_block;
+        continue;
+      }
+
+      if (false_successor == true_block) {
+        absl::StrAppend(output, Indent(indent), "if (!(", condition, ")) {\n");
+        RETURN_IF_ERROR(EmitStructuredBlock(false_block, true_block, output,
+                                            indent + 1, visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        block = true_block;
+        continue;
+      }
+
+      return Unsupported(function_, "control flow shape", *terminator);
     }
 
-    const llvm::BasicBlock& entry = function_.getEntryBlock();
-    const auto* branch =
-        llvm::dyn_cast<llvm::CondBrInst>(entry.getTerminator());
-    if (branch == nullptr) {
-      return Unsupported(function_, "multi-block control flow",
-                         *entry.getTerminator());
-    }
-
-    const llvm::BasicBlock* true_block = branch->getSuccessor(0);
-    const llvm::BasicBlock* false_block = branch->getSuccessor(1);
-
-    const llvm::BasicBlock* body_block = nullptr;
-    const llvm::BasicBlock* exit_block = nullptr;
-    bool invert_condition = false;
-
-    if (IsReturnOnlyBlock(*false_block) &&
-        IsBodyBlock(*true_block, false_block)) {
-      body_block = true_block;
-      exit_block = false_block;
-    } else if (IsReturnOnlyBlock(*true_block) &&
-               IsBodyBlock(*false_block, true_block)) {
-      body_block = false_block;
-      exit_block = true_block;
-      invert_condition = true;
-    }
-
-    if (body_block == nullptr || exit_block == nullptr) {
-      TF_ASSIGN_OR_RETURN(bool emitted,
-                          TryEmitIfElseDiamond(*branch, output));
-      if (emitted) return absl::OkStatus();
-      return Unsupported(function_, "control flow shape", *entry.getTerminator());
-    }
-
-    RETURN_IF_ERROR(EmitBlockStatements(entry, output, 1));
-    TF_ASSIGN_OR_RETURN(std::string condition, Expr(branch->getCondition()));
-    if (invert_condition) condition = absl::StrCat("!(", condition, ")");
-    absl::StrAppend(output, "  if (", condition, ") {\n");
-    RETURN_IF_ERROR(EmitBlockStatements(*body_block, output, 2));
-    absl::StrAppend(output, "  }\n");
     return absl::OkStatus();
   }
 
@@ -653,6 +692,8 @@ class FunctionEmitter {
         return absl::OkStatus();
       }
     }
+
+    if (IsAggregateType(instruction.getType())) return absl::OkStatus();
 
     if (instruction.getType()->isVoidTy()) {
       return Unsupported(function_, "void instruction", instruction);
@@ -788,6 +829,9 @@ class FunctionEmitter {
     if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
       return CallExpr(*call);
     }
+    if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(&instruction)) {
+      return ExtractValueExpr(*extract);
+    }
     if (auto* extract =
             llvm::dyn_cast<llvm::ExtractElementInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(std::string vector, Expr(extract->getVectorOperand()));
@@ -801,6 +845,19 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(binary.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(binary.getOperand(1)));
     return BinaryExprWithOperands(binary, lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> ExtractValueExpr(
+      const llvm::ExtractValueInst& extract) {
+    if (extract.getNumIndices() != 1) {
+      return Unsupported(function_, "nested aggregate extraction", extract);
+    }
+    const llvm::Value* aggregate = extract.getAggregateOperand();
+    unsigned field = *extract.idx_begin();
+    if (auto* call = llvm::dyn_cast<llvm::CallInst>(aggregate)) {
+      return InlineSimpleAggregateElement(*call, field);
+    }
+    return AggregateElementValue(aggregate, /*outer_call=*/nullptr, field);
   }
 
   absl::StatusOr<std::string> BinaryExprWithOperands(
@@ -851,10 +908,18 @@ class FunctionEmitter {
   absl::StatusOr<std::string> CastForUnsignedCompare(
       const llvm::Value* value, bool unsigned_compare) {
     TF_ASSIGN_OR_RETURN(std::string expression, Expr(value));
-    if (!unsigned_compare || !value->getType()->isIntegerTy()) return expression;
-    TF_ASSIGN_OR_RETURN(std::string type,
-                        MslType(value->getType(), /*unsigned_integer=*/true));
-    return absl::StrCat("static_cast<", type, ">(", expression, ")");
+    return CastForUnsignedCompare(value->getType(), expression,
+                                  unsigned_compare);
+  }
+
+  absl::StatusOr<std::string> CastForUnsignedCompare(
+      llvm::Type* type, absl::string_view expression, bool unsigned_compare) {
+    if (!unsigned_compare || !type->isIntegerTy()) {
+      return std::string(expression);
+    }
+    TF_ASSIGN_OR_RETURN(std::string msl_type,
+                        MslType(type, /*unsigned_integer=*/true));
+    return absl::StrCat("static_cast<", msl_type, ">(", expression, ")");
   }
 
   absl::StatusOr<std::string> ICmpExpr(const llvm::ICmpInst& icmp) {
@@ -865,6 +930,12 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string rhs,
                         CastForUnsignedCompare(icmp.getOperand(1),
                                                unsigned_compare));
+    return ICmpExprWithOperands(icmp, lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> ICmpExprWithOperands(
+      const llvm::ICmpInst& icmp, absl::string_view lhs,
+      absl::string_view rhs) {
     switch (icmp.getPredicate()) {
       case llvm::CmpInst::ICMP_EQ:
         return absl::StrCat("(", lhs, " == ", rhs, ")");
@@ -890,6 +961,12 @@ class FunctionEmitter {
   absl::StatusOr<std::string> FCmpExpr(const llvm::FCmpInst& fcmp) {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(fcmp.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(fcmp.getOperand(1)));
+    return FCmpExprWithOperands(fcmp, lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> FCmpExprWithOperands(
+      const llvm::FCmpInst& fcmp, absl::string_view lhs,
+      absl::string_view rhs) {
     switch (fcmp.getPredicate()) {
       case llvm::CmpInst::FCMP_OEQ:
       case llvm::CmpInst::FCMP_UEQ:
@@ -959,7 +1036,8 @@ class FunctionEmitter {
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.x") return "metal_nbid.x";
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.y") return "metal_nbid.y";
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.z") return "metal_nbid.z";
-    if (name == "llvm.nvvm.shfl.sync.down.f32") {
+    if (name == "llvm.nvvm.shfl.sync.down.f32" ||
+        name == "llvm.nvvm.shfl.sync.down.i32") {
       if (call.arg_size() != 4) {
         return Unsupported(function_, "shuffle-down call", call);
       }
@@ -1007,6 +1085,61 @@ class FunctionEmitter {
     return InlineSimpleValue(ret->getReturnValue(), call);
   }
 
+  absl::StatusOr<std::string> InlineSimpleAggregateElement(
+      const llvm::CallInst& call, unsigned field) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "inline aggregate call", call);
+    }
+    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+      return Unsupported(function_, "inline aggregate function shape", call);
+    }
+    const llvm::BasicBlock& block = callee->getEntryBlock();
+    const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "inline aggregate return", call);
+    }
+    return AggregateElementValue(ret->getReturnValue(), &call, field);
+  }
+
+  absl::StatusOr<std::string> AggregateElementValue(
+      const llvm::Value* value, const llvm::CallInst* outer_call,
+      unsigned field) {
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
+      if (insert->getNumIndices() != 1) {
+        return Unsupported(function_, "nested aggregate insertion", *insert);
+      }
+      if (*insert->idx_begin() == field) {
+        if (outer_call == nullptr) {
+          return Expr(insert->getInsertedValueOperand());
+        }
+        return InlineSimpleValue(insert->getInsertedValueOperand(), *outer_call);
+      }
+      return AggregateElementValue(insert->getAggregateOperand(), outer_call,
+                                   field);
+    }
+
+    if (auto* constant = llvm::dyn_cast<llvm::ConstantStruct>(value)) {
+      if (field >= constant->getNumOperands()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("Aggregate field ", field, " is out of range."));
+      }
+      return Expr(constant->getOperand(field));
+    }
+
+    if (llvm::isa<llvm::ConstantAggregateZero>(value) ||
+        llvm::isa<llvm::UndefValue>(value) ||
+        llvm::isa<llvm::PoisonValue>(value)) {
+      auto* struct_type = llvm::dyn_cast<llvm::StructType>(value->getType());
+      if (struct_type == nullptr || field >= struct_type->getNumElements()) {
+        return Unsupported(function_, "aggregate initializer", *value);
+      }
+      return ZeroInitializer(struct_type->getElementType(field));
+    }
+
+    return Unsupported(function_, "aggregate value", *value);
+  }
+
   absl::StatusOr<std::string> InlineSimpleValue(
       const llvm::Value* value, const llvm::CallInst& call) {
     if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
@@ -1021,6 +1154,53 @@ class FunctionEmitter {
       TF_ASSIGN_OR_RETURN(std::string rhs,
                           InlineSimpleValue(binary->getOperand(1), call));
       return BinaryExprWithOperands(*binary, lhs, rhs);
+    }
+    if (auto* instruction = llvm::dyn_cast<llvm::Instruction>(value);
+        instruction != nullptr &&
+        instruction->getOpcode() == llvm::Instruction::FNeg) {
+      TF_ASSIGN_OR_RETURN(std::string operand,
+                          InlineSimpleValue(instruction->getOperand(0), call));
+      return absl::StrCat("(-", operand, ")");
+    }
+    if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(value)) {
+      bool unsigned_compare = icmp->isUnsigned();
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineSimpleValue(icmp->getOperand(0), call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineSimpleValue(icmp->getOperand(1), call));
+      TF_ASSIGN_OR_RETURN(lhs,
+                          CastForUnsignedCompare(icmp->getOperand(0)->getType(),
+                                                 lhs, unsigned_compare));
+      TF_ASSIGN_OR_RETURN(rhs,
+                          CastForUnsignedCompare(icmp->getOperand(1)->getType(),
+                                                 rhs, unsigned_compare));
+      return ICmpExprWithOperands(*icmp, lhs, rhs);
+    }
+    if (auto* fcmp = llvm::dyn_cast<llvm::FCmpInst>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineSimpleValue(fcmp->getOperand(0), call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineSimpleValue(fcmp->getOperand(1), call));
+      return FCmpExprWithOperands(*fcmp, lhs, rhs);
+    }
+    if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string condition,
+                          InlineSimpleValue(select->getCondition(), call));
+      TF_ASSIGN_OR_RETURN(std::string true_value,
+                          InlineSimpleValue(select->getTrueValue(), call));
+      TF_ASSIGN_OR_RETURN(std::string false_value,
+                          InlineSimpleValue(select->getFalseValue(), call));
+      return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                          false_value, ")");
+    }
+    if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string operand,
+                          InlineSimpleValue(cast->getOperand(0), call));
+      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
+      if (cast->getOpcode() == llvm::Instruction::BitCast) {
+        return absl::StrCat("as_type<", type, ">(", operand, ")");
+      }
+      return absl::StrCat("static_cast<", type, ">(", operand, ")");
     }
     if (auto* nested_call = llvm::dyn_cast<llvm::CallInst>(value)) {
       return InlineSimpleCall(*nested_call, call);

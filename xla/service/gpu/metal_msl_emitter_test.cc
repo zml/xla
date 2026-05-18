@@ -407,6 +407,90 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg2[v0] = v7;"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsTupleReducerArgmax) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @argmax(ptr %arg0, ptr %arg1, ptr %arg2, ptr %arg3) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in_bounds = icmp sle i32 %tid, 7
+  br i1 %in_bounds, label %load, label %empty
+
+load:
+  %value_gep = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %tid
+  %value = load float, ptr %value_gep, align 4
+  %index_gep = getelementptr inbounds [8 x i32], ptr %arg1, i32 0, i32 %tid
+  %index = load i32, ptr %index_gep, align 4
+  %pair = call { float, i32 } @argmax_region(float 0xFFF0000000000000, i32 0, float %value, i32 %index)
+  %pair_value = extractvalue { float, i32 } %pair, 0
+  %pair_index = extractvalue { float, i32 } %pair, 1
+  br label %merge
+
+empty:
+  br label %merge
+
+merge:
+  %value_phi = phi float [ %pair_value, %load ], [ 0xFFF0000000000000, %empty ]
+  %index_phi = phi i32 [ %pair_index, %load ], [ 0, %empty ]
+  %peer_value = call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %value_phi, i32 1, i32 31)
+  %peer_index = call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 %index_phi, i32 1, i32 31)
+  %reduced = call { float, i32 } @argmax_region(float %value_phi, i32 %index_phi, float %peer_value, i32 %peer_index)
+  %out_value = extractvalue { float, i32 } %reduced, 0
+  %out_index = extractvalue { float, i32 } %reduced, 1
+  %is_first = icmp eq i32 %tid, 0
+  br i1 %is_first, label %store, label %exit
+
+store:
+  %out_value_gep = getelementptr inbounds [1 x float], ptr %arg2, i32 0, i32 0
+  store float %out_value, ptr %out_value_gep, align 4
+  %out_index_gep = getelementptr inbounds [1 x i32], ptr %arg3, i32 0, i32 0
+  store i32 %out_index, ptr %out_index_gep, align 4
+  br label %exit
+
+exit:
+  ret void
+}
+
+define internal { float, i32 } @argmax_region(float %lhs_value, i32 %lhs_index, float %rhs_value, i32 %rhs_index) {
+entry:
+  %lhs_greater = fcmp ogt float %lhs_value, %rhs_value
+  %lhs_nan = fcmp une float %lhs_value, %lhs_value
+  %take_lhs_value = or i1 %lhs_greater, %lhs_nan
+  %value = select i1 %take_lhs_value, float %lhs_value, float %rhs_value
+  %values_equal = fcmp oeq float %lhs_value, %rhs_value
+  %lhs_index_lower = icmp slt i32 %lhs_index, %rhs_index
+  %take_lhs_tie = and i1 %values_equal, %lhs_index_lower
+  %take_lhs_index = or i1 %take_lhs_value, %take_lhs_tie
+  %index = select i1 %take_lhs_index, i32 %lhs_index, i32 %rhs_index
+  %with_value = insertvalue { float, i32 } poison, float %value, 0
+  %with_index = insertvalue { float, i32 } %with_value, i32 %index, 1
+  ret { float, i32 } %with_index
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32)
+declare i32 @llvm.nvvm.shfl.sync.down.i32(i32, i32, i32, i32)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @argmax, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("} else {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("simd_shuffle_down(v6, 1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("simd_shuffle_down(v7, 1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[0] = v10;"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg3[0] = v11;"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("{ float, i32 }"), std::string::npos) << msl;
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla
