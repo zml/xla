@@ -164,7 +164,7 @@ absl::Status CheckFloatsAndLog(
   const se::ThreadDim thread_dim(1024);
   const se::BlockDim block_dim =
       GetBlockDimForBuffer<T>(stream, buffer, tmp_ptr.ElementCount());
-  const size_t num_blocks = block_dim.x * block_dim.y * block_dim.z;
+  const uint64_t num_blocks = block_dim.x * block_dim.y * block_dim.z;
 
   TF_RETURN_IF_ERROR(map_kernel.Launch(thread_dim, block_dim, stream, buffer,
                                        buffer.ElementCount(), tmp_ptr,

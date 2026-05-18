@@ -5,7 +5,7 @@ load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/pjrt/gpu:package_groups.bzl", "xla_gpu_internal_packages")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/tsl:tsl.bzl", "if_google", "internal_visibility")
+load("//xla/tsl:tsl.bzl", "if_google", "if_macos", "internal_visibility")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 # Integrate with PJRT rather than the GPU client directly.
@@ -598,6 +598,26 @@ cc_library(
 )
 
 cc_library(
+    name = "se_gpu_pjrt_compiler_metal_registration",
+    srcs = ["se_gpu_pjrt_compiler_metal_registration.cc"],
+    compatible_with = [],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt:stream_executor_platform_id_mapping",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log:check",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "se_gpu_pjrt_compiler",
     hdrs = ["se_gpu_pjrt_compiler.h"],
     # TODO(b/382070262): Migrate users off this target - They should go though the PjRt ABI compatibility layer.
@@ -626,6 +646,8 @@ cc_library(
         ":se_gpu_pjrt_compiler_rocm_registration",
     ]) + if_sycl([
         ":se_gpu_pjrt_compiler_sycl_registration",
+    ]) + if_macos([
+        ":se_gpu_pjrt_compiler_metal_registration",
     ]),
 )
 

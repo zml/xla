@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -74,6 +75,8 @@ std::string CanonicalPlatformName(absl::string_view platform_name) {
     return "rocm";
 #elif TENSORFLOW_USE_SYCL
     return "sycl";
+#elif TENSORFLOW_USE_METAL
+    return "metal";
 #else
     return "cuda";
 #endif
@@ -170,6 +173,7 @@ absl::StatusOr<se::Platform::Id> PlatformUtil::GetPlatformIdFromCanonicalName(
       se::cuda::kCudaPlatformId,
       se::rocm::kROCmPlatformId,
       se::sycl::kSyclPlatformId,
+      se::metal::kMetalPlatformId,
   };
 
   for (se::Platform::Id id : kKnownPlatforms) {

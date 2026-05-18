@@ -182,4 +182,5 @@ cc_embed_data(
     ],
     # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
     embedopts = ["--namespace=xla::gpu"],
+    linkstatic = True,
 )

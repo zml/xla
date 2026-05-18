@@ -15,7 +15,7 @@ load(
 load("//xla/service:xla_compile.bzl", "xla_aot_compile_cpu", "xla_aot_compile_gpu", "xla_aot_compile_gpu_runtime_autotuning")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_is_configured", "if_gpu_is_configured")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "internal_visibility", "tsl_copts")
+load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "if_macos", "internal_visibility", "tsl_copts")
 load("//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable")
 load("//xla/tsl/mkl:build_defs.bzl", "if_onednn")
 load(
@@ -1192,6 +1192,8 @@ cc_library(
     hdrs = ["platform_util.h"],
     local_defines = if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
+    ]) + if_macos([
+        "TENSORFLOW_USE_METAL=1",
     ]),
     deps = [
         ":compiler",
@@ -1206,6 +1208,7 @@ cc_library(
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env",
@@ -3386,6 +3389,7 @@ cc_library(
         "//xla/stream_executor:platform_id",
         "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:errors",

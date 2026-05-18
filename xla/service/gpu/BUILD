@@ -1426,6 +1426,7 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "@com_google_absl//absl/base:core_headers",
@@ -3681,6 +3682,48 @@ cc_library(
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/sycl:sycl_platform_id",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+cc_library(
+    name = "metal_gpu_compiler",
+    srcs = [
+        "metal_gpu_compiler_registration.cc",
+    ],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_gpu_compiler_impl",
+        "//xla/service:compiler",
+        "//xla/stream_executor/metal:metal_platform_id",
+    ],
+    alwayslink = True,  # Contains compiler registration
+)
+
+cc_library(
+    name = "metal_gpu_compiler_impl",
+    srcs = [
+        "metal_gpu_compiler.cc",
+    ],
+    hdrs = [
+        "metal_gpu_compiler.h",
+    ],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":gpu_compiler",
+        "//xla/hlo/ir:hlo",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:ir_headers",
     ],
