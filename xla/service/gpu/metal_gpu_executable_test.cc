@@ -443,6 +443,53 @@ TEST(MetalGpuExecutableTest, ElementwiseMultiply) {
       actual, [&](int64_t i) { return lhs.Get<float>({i}) * rhs.Get<float>({i}); });
 }
 
+TEST(MetalGpuExecutableTest, ElementwisePower) {
+  auto result = ExecuteMetalElementwiseBinary(
+      "metal_elementwise_power", [](XlaBuilder* builder, XlaOp lhs, XlaOp rhs) {
+        XlaOp base =
+            Add(lhs, Broadcast(ConstantR0<float>(builder, 3.0f),
+                               {kElementCount}));
+        XlaOp exponent =
+            Add(Mul(rhs, Broadcast(ConstantR0<float>(builder, 0.25f),
+                                   {kElementCount})),
+                Broadcast(ConstantR0<float>(builder, 1.25f),
+                          {kElementCount}));
+        Pow(base, exponent);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal lhs = MakeElementwiseLhs();
+  Literal rhs = MakeElementwiseRhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) {
+        const float base = lhs.Get<float>({i}) + 3.0f;
+        const float exponent = rhs.Get<float>({i}) * 0.25f + 1.25f;
+        return std::pow(base, exponent);
+      },
+      2.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseAtan2) {
+  auto result = ExecuteMetalElementwiseBinary(
+      "metal_elementwise_atan2",
+      [](XlaBuilder*, XlaOp lhs, XlaOp rhs) { Atan2(lhs, rhs); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal lhs = MakeElementwiseLhs();
+  Literal rhs = MakeElementwiseRhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) {
+        return std::atan2(lhs.Get<float>({i}), rhs.Get<float>({i}));
+      },
+      1.0e-5f);
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseScalarMaximum) {
   auto result = ExecuteMetalElementwiseScalarMaximum();
   if (absl::IsFailedPrecondition(result.status())) {

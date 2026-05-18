@@ -400,6 +400,10 @@ class ElementwiseAirEmitter {
       case HloOpcode::kMaximum:
       case HloOpcode::kMinimum:
         return EmitBinary(instr, body);
+      case HloOpcode::kAtan2:
+        return EmitAtan2(instr, body);
+      case HloOpcode::kPower:
+        return EmitIntrinsicBinary(instr, "air.fast_pow.f32", body);
       case HloOpcode::kNegate:
         return EmitUnary(instr, "fneg fast float", body);
       case HloOpcode::kAbs:
@@ -940,6 +944,59 @@ class ElementwiseAirEmitter {
     return name;
   }
 
+  absl::StatusOr<std::string> EmitIntrinsicBinary(
+      const HloInstruction* instr, absl::string_view intrinsic,
+      std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR intrinsic binary ops currently support only f32 "
+          "array results.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    std::string name = NewName("intrinsic");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @%s(float %s, float %s)", name, intrinsic, lhs,
+        rhs));
+    return name;
+  }
+
+  absl::StatusOr<std::string> EmitAtan2(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR atan2 currently supports only f32 array results.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    std::string value = NewName("atan2");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_atan2.f32(float %s, float %s)",
+        value, lhs, rhs));
+    std::string lhs_zero = NewName("atan2_lhs_zero");
+    std::string rhs_zero = NewName("atan2_rhs_zero");
+    std::string both_zero = NewName("atan2_both_zero");
+    std::string selected = NewName("atan2_select");
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast oeq float %s, 0x0000000000000000", lhs_zero, lhs));
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast oeq float %s, 0x0000000000000000", rhs_zero, rhs));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", both_zero,
+                                    lhs_zero, rhs_zero));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float 0x0000000000000000, float %s", selected,
+        both_zero, value));
+    return selected;
+  }
+
   absl::StatusOr<std::string> EmitAbs(const HloInstruction* instr,
                                       std::vector<std::string>* body) {
     TF_ASSIGN_OR_RETURN(std::string value,
@@ -1075,10 +1132,12 @@ target triple = "air64_v27-apple-macosx15.0.0"
 %%struct.ElementwiseParams = type { i32, i32, i32, i32 }
 
 declare float @air.fast_cos.f32(float) local_unnamed_addr #1
+declare float @air.fast_atan2.f32(float, float) local_unnamed_addr #1
 declare float @air.fast_ceil.f32(float) local_unnamed_addr #1
 declare float @air.fast_exp.f32(float) local_unnamed_addr #1
 declare float @air.fast_floor.f32(float) local_unnamed_addr #1
 declare float @air.fast_log.f32(float) local_unnamed_addr #1
+declare float @air.fast_pow.f32(float, float) local_unnamed_addr #1
 declare float @air.fast_rint.f32(float) local_unnamed_addr #1
 declare float @air.fast_round.f32(float) local_unnamed_addr #1
 declare float @air.fast_rsqrt.f32(float) local_unnamed_addr #1
