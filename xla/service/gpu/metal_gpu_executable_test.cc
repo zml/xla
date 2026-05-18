@@ -552,6 +552,12 @@ void ExpectScalarPred(const Literal& actual, bool expected) {
   EXPECT_EQ(actual.Get<bool>({}), expected);
 }
 
+void ExpectScalarS32(const Literal& actual, int32_t expected) {
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {})));
+  EXPECT_EQ(actual.Get<int32_t>({}), expected);
+}
+
 TEST(MetalGpuExecutableTest, Dot) {
   auto result = ExecuteMetalMatmul(/*relu=*/false);
   if (absl::IsFailedPrecondition(result.status())) {
@@ -1567,6 +1573,65 @@ TEST(MetalGpuExecutableTest, ReductionPredAllAny) {
   }
   TF_ASSERT_OK_AND_ASSIGN(Literal any_actual, std::move(any_result));
   ExpectScalarPred(any_actual, true);
+}
+
+TEST(MetalGpuExecutableTest, ReductionS32SumMaximum) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  auto build_reducer = [](HloOpcode opcode) -> absl::StatusOr<XlaComputation> {
+    XlaBuilder reducer_builder("metal_s32_reducer");
+    Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+    XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+    XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+    if (opcode == HloOpcode::kAdd) {
+      Add(lhs, rhs);
+    } else {
+      Max(lhs, rhs);
+    }
+    return reducer_builder.Build();
+  };
+
+  auto execute = [&](HloOpcode opcode,
+                     int32_t init_value) -> absl::StatusOr<Literal> {
+    TF_ASSIGN_OR_RETURN(XlaComputation reducer, build_reducer(opcode));
+    XlaBuilder builder("metal_s32_reduction");
+    Shape input_shape = ShapeUtil::MakeShape(S32, {kElementCount});
+    XlaOp input = Parameter(&builder, 0, input_shape, "input");
+    Reduce(input, ConstantR0<int32_t>(&builder, init_value), reducer, {0});
+    TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+    Literal input_literal = MakeElementwiseS32();
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                        client->TransferToServer(input_literal));
+    std::vector<GlobalData*> arguments = {input_data.get()};
+    return client->ExecuteAndTransfer(computation, arguments);
+  };
+
+  auto sum_result = execute(HloOpcode::kAdd, 0);
+  if (absl::IsFailedPrecondition(sum_result.status())) {
+    GTEST_SKIP() << sum_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal sum_actual, std::move(sum_result));
+  Literal input = MakeElementwiseS32();
+  int32_t expected_sum = 0;
+  int32_t expected_max = std::numeric_limits<int32_t>::min();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    const int32_t value = input.Get<int32_t>({i});
+    expected_sum += value;
+    expected_max = std::max(expected_max, value);
+  }
+  ExpectScalarS32(sum_actual, expected_sum);
+
+  auto max_result =
+      execute(HloOpcode::kMaximum, std::numeric_limits<int32_t>::min());
+  if (absl::IsFailedPrecondition(max_result.status())) {
+    GTEST_SKIP() << max_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal max_actual, std::move(max_result));
+  ExpectScalarS32(max_actual, expected_max);
 }
 
 TEST(MetalGpuExecutableTest, ReductionMean) {

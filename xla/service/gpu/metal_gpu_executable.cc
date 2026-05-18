@@ -105,6 +105,7 @@ struct MetalReductionConfig {
   int64_t input_start = 0;
   int64_t input_stride = 1;
   float init_value = 0.0f;
+  int32_t init_s32 = 0;
   bool init_pred = false;
   float output_scale = 1.0f;
   ReductionKind kind = ReductionKind::kAdd;
@@ -2135,7 +2136,14 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
 }
 
 const char* ReductionValueIrType(PrimitiveType type) {
-  return type == PRED ? "i1" : "float";
+  switch (type) {
+    case PRED:
+      return "i1";
+    case S32:
+      return "i32";
+    default:
+      return "float";
+  }
 }
 
 std::string ReductionScalarConstant(const HloInstruction* instr) {
@@ -2144,6 +2152,8 @@ std::string ReductionScalarConstant(const HloInstruction* instr) {
       return FloatLiteral(instr->literal().Get<float>({}));
     case PRED:
       return instr->literal().Get<bool>({}) ? "true" : "false";
+    case S32:
+      return absl::StrCat(instr->literal().Get<int32_t>({}));
     default:
       return "";
   }
@@ -2223,6 +2233,9 @@ class ReductionInputAirEmitter {
     if (instr->shape().element_type() == F32) {
       return EmitF32Expression(instr, index);
     }
+    if (instr->shape().element_type() == S32) {
+      return EmitS32Expression(instr, index);
+    }
     if (instr->shape().element_type() == PRED) {
       return EmitPredExpression(instr, index);
     }
@@ -2301,6 +2314,39 @@ class ReductionInputAirEmitter {
     }
   }
 
+  absl::StatusOr<std::string> EmitS32Expression(const HloInstruction* instr,
+                                                absl::string_view index) {
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+      case HloOpcode::kSubtract:
+      case HloOpcode::kMultiply:
+      case HloOpcode::kMaximum:
+      case HloOpcode::kMinimum:
+        break;
+      default:
+        return absl::UnimplementedError(absl::StrFormat(
+            "Metal direct AIR reduction s32 input does not support HLO opcode "
+            "%s.",
+            HloOpcodeString(instr->opcode())));
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs, Emit(instr->operand(0), index));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Emit(instr->operand(1), index));
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+        return EmitOp("add i32", lhs, rhs);
+      case HloOpcode::kSubtract:
+        return EmitOp("sub i32", lhs, rhs);
+      case HloOpcode::kMultiply:
+        return EmitOp("mul i32", lhs, rhs);
+      case HloOpcode::kMaximum:
+        return EmitIntCompareSelect("sgt", lhs, rhs);
+      case HloOpcode::kMinimum:
+        return EmitIntCompareSelect("slt", lhs, rhs);
+      default:
+        return absl::InternalError("Unexpected s32 reduction input opcode.");
+    }
+  }
+
   absl::StatusOr<std::string> EmitLoad(absl::string_view index) {
     const char* memory_type = ElementIrType(config_->element_type);
     std::string ptr = NewName("reduce_ptr");
@@ -2335,6 +2381,18 @@ class ReductionInputAirEmitter {
                                     predicate, lhs, rhs));
     body_.push_back(absl::StrFormat(
         "  %s = select i1 %s, float %s, float %s", value, cmp, lhs, rhs));
+    return value;
+  }
+
+  std::string EmitIntCompareSelect(absl::string_view predicate,
+                                   absl::string_view lhs,
+                                   absl::string_view rhs) {
+    std::string cmp = NewName("reduce_cmp");
+    std::string value = NewName("reduce_select");
+    body_.push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    body_.push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 %s", value, cmp, lhs, rhs));
     return value;
   }
 
@@ -2384,15 +2442,15 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   const HloInstruction* input = reduce->operand(0);
   const HloInstruction* init = reduce->operand(1);
   const PrimitiveType element_type = input->shape().element_type();
-  if ((element_type != F32 && element_type != PRED) ||
+  if ((element_type != F32 && element_type != PRED && element_type != S32) ||
       !ShapeUtil::IsEffectiveScalar(root->shape()) ||
       root->shape().element_type() != element_type ||
       input->shape().dimensions().size() != 1 || !init->IsConstant() ||
       !ShapeUtil::IsEffectiveScalar(init->shape()) ||
       init->shape().element_type() != element_type) {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports rank-1 f32/pred inputs "
-        "and matching scalar constant init values.");
+        "Metal direct AIR reduction currently supports rank-1 f32/s32/pred "
+        "inputs and matching scalar constant init values.");
   }
 
   const HloInstruction* reducer = reduce->to_apply()->root_instruction();
@@ -2431,6 +2489,11 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     return absl::UnimplementedError(
         "Metal direct AIR f32 reductions do not support logical reducers.");
   }
+  if (element_type == S32 &&
+      (kind == ReductionKind::kAnd || kind == ReductionKind::kOr)) {
+    return absl::UnimplementedError(
+        "Metal direct AIR s32 reductions do not support logical reducers.");
+  }
 
   MetalReductionConfig config;
   config.input = input;
@@ -2438,6 +2501,8 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   config.num_elements = ShapeUtil::ElementsIn(input->shape());
   config.init_value =
       element_type == F32 ? init->literal().Get<float>({}) : 0.0f;
+  config.init_s32 =
+      element_type == S32 ? init->literal().Get<int32_t>({}) : 0;
   config.init_pred =
       element_type == PRED ? init->literal().Get<bool>({}) : false;
   config.output_scale = output_scale;
@@ -2451,17 +2516,33 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   return config;
 }
 
-std::string ReductionUpdate(ReductionKind kind, PrimitiveType) {
+std::string ReductionUpdate(ReductionKind kind, PrimitiveType element_type) {
   switch (kind) {
     case ReductionKind::kAdd:
+      if (element_type == S32) {
+        return "  %new_acc = add i32 %acc, %value\n";
+      }
       return "  %new_acc = fadd fast float %acc, %value\n";
     case ReductionKind::kMultiply:
+      if (element_type == S32) {
+        return "  %new_acc = mul i32 %acc, %value\n";
+      }
       return "  %new_acc = fmul fast float %acc, %value\n";
     case ReductionKind::kMaximum:
+      if (element_type == S32) {
+        return R"(  %cmp = icmp sgt i32 %value, %acc
+  %new_acc = select i1 %cmp, i32 %value, i32 %acc
+)";
+      }
       return R"(  %cmp = fcmp fast ogt float %value, %acc
   %new_acc = select i1 %cmp, float %value, float %acc
 )";
     case ReductionKind::kMinimum:
+      if (element_type == S32) {
+        return R"(  %cmp = icmp slt i32 %value, %acc
+  %new_acc = select i1 %cmp, i32 %value, i32 %acc
+)";
+      }
       return R"(  %cmp = fcmp fast olt float %value, %acc
   %new_acc = select i1 %cmp, float %value, float %acc
 )";
@@ -2477,6 +2558,9 @@ std::string ReductionInitValue(const MetalReductionConfig& config) {
   if (config.element_type == PRED) {
     return config.init_pred ? "true" : "false";
   }
+  if (config.element_type == S32) {
+    return absl::StrCat(config.init_s32);
+  }
   return FloatLiteral(config.init_value);
 }
 
@@ -2484,6 +2568,9 @@ std::string ReductionStore(const MetalReductionConfig& config) {
   if (config.element_type == PRED) {
     return R"(  %out_i8 = zext i1 %acc to i8
   store i8 %out_i8, i8 addrspace(1)* %out, align 1)";
+  }
+  if (config.element_type == S32) {
+    return "  store i32 %acc, i32 addrspace(1)* %out, align 4";
   }
   return absl::StrFormat(R"(  %%scaled_acc = fmul fast float %%acc, %s
   store float %%scaled_acc, float addrspace(1)* %%out, align 4)",
@@ -2494,6 +2581,9 @@ std::string ReductionValueAssign(PrimitiveType element_type,
                                  absl::string_view value) {
   if (element_type == PRED) {
     return absl::StrFormat("  %%value = and i1 %s, true", value);
+  }
+  if (element_type == S32) {
+    return absl::StrFormat("  %%value = add i32 %s, 0", value);
   }
   return absl::StrFormat(
       "  %%value = fadd fast float %s, 0x0000000000000000", value);
