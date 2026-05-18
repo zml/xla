@@ -545,14 +545,14 @@ cc_library(
 
 # PJRT CPU plugin.
 xla_cc_binary(
-    name = "pjrt_c_api_cpu_plugin.so",
+    name = "pjrt_c_api_cpu_plugin",
     additional_linker_inputs = [
         ":pjrt_c_api_cpu_version_script.lds",
     ],
     linkopts = if_macos(
         [
             "-Wl,-exported_symbol,_GetPjrtApi",
-            "-Wl,-install_name,@rpath/pjrt_c_api_cpu_plugin.dylib",
+            "-Wl,-install_name,@rpath/libpjrt_cpu.dylib",
             "-Wl,-undefined,error",
         ],
         [
@@ -662,7 +662,7 @@ cc_library(
 
 # PJRT GPU plugin. Can be configured to be built for CUDA or ROCM.
 xla_cc_binary(
-    name = "pjrt_c_api_gpu_plugin.so",
+    name = "pjrt_c_api_gpu_plugin",
     additional_linker_inputs = [
         ":pjrt_c_api_gpu_version_script.lds",
     ],

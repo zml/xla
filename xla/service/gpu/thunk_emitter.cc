@@ -2486,10 +2486,20 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncDone(
         auto async_events =
             GetInstructionToHostExecuteAsyncEvents().at(custom_call);
 
+        absl::InlinedVector<HostExecuteStartThunk::SliceAndShape, 4>
+            result_slices;
+        for (auto& indexed : ShapeUtil::GetLeafShapes(wrapped->shape())) {
+          TF_ASSIGN_OR_RETURN(
+              auto slice,
+              ir_emitter_context_->buffer_assignment().GetUniqueSlice(
+                  wrapped, indexed.index));
+          result_slices.push_back({slice, indexed.shape});
+        }
+
         thunks.push_back(std::make_unique<HostExecuteDoneThunk>(
             Thunk::ThunkInfo::WithProfileAnnotation(
                 instr, ir_emitter_context_->GetNextThunkId()),
-            async_events));
+            std::move(result_slices), async_events));
         return thunks;
       }
       auto it = hlo_async_executions_.find(wrapped);
