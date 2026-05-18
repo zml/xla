@@ -3739,8 +3739,10 @@ cc_library(
     deps = [
         ":gpu_compiler",
         ":metal_msl_emitter",
+        "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass_pipeline",
+        "//xla/hlo/transforms/expanders:op_expander_pass",
         "//xla/service:triangular_solve_expander",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",
