@@ -74,6 +74,17 @@ bool IsAggregateType(llvm::Type* type) {
   return type->isStructTy() || type->isArrayTy();
 }
 
+bool IsComplexFloatStruct(llvm::Type* type) {
+  auto* struct_type = llvm::dyn_cast<llvm::StructType>(type);
+  return struct_type != nullptr && struct_type->getNumElements() == 2 &&
+         struct_type->getElementType(0)->isFloatTy() &&
+         struct_type->getElementType(1)->isFloatTy();
+}
+
+bool IsNonMaterializedAggregateType(llvm::Type* type) {
+  return IsAggregateType(type) && !IsComplexFloatStruct(type);
+}
+
 absl::Status Unsupported(const llvm::Function& function, absl::string_view what,
                          const llvm::Value& value) {
   return absl::UnimplementedError(absl::StrCat(
@@ -161,6 +172,7 @@ absl::StatusOr<std::string> MslType(llvm::Type* type,
                                       unsigned_integer));
     return absl::StrCat(element_type, elements);
   }
+  if (IsComplexFloatStruct(type)) return "float2";
   return MslScalarType(type, unsigned_integer);
 }
 
@@ -178,6 +190,7 @@ absl::StatusOr<std::string> ZeroInitializer(llvm::Type* type) {
     std::vector<std::string> values(vector_type->getNumElements(), zero);
     return absl::StrCat(msl_type, "(", absl::StrJoin(values, ", "), ")");
   }
+  if (IsComplexFloatStruct(type)) return "float2(0.0f, 0.0f)";
   return absl::UnimplementedError(
       absl::StrCat("Unsupported zero initializer type for MSL: ",
                    PrintLlvmType(*type)));
@@ -434,7 +447,7 @@ class FunctionEmitter {
           continue;
         }
         if (IsPointerType(instruction)) continue;
-        if (IsAggregateType(instruction.getType())) continue;
+        if (IsNonMaterializedAggregateType(instruction.getType())) continue;
         names_[&instruction] = absl::StrCat("v", value_index++);
       }
     }
@@ -505,7 +518,7 @@ class FunctionEmitter {
         }
         if (instruction.getType()->isVoidTy()) continue;
         if (IsPointerType(instruction)) continue;
-        if (IsAggregateType(instruction.getType())) continue;
+        if (IsNonMaterializedAggregateType(instruction.getType())) continue;
         TF_ASSIGN_OR_RETURN(std::string type, MslType(instruction.getType()));
         TF_ASSIGN_OR_RETURN(std::string zero,
                             ZeroInitializer(instruction.getType()));
@@ -927,7 +940,9 @@ class FunctionEmitter {
       }
     }
 
-    if (IsAggregateType(instruction.getType())) return absl::OkStatus();
+    if (IsNonMaterializedAggregateType(instruction.getType())) {
+      return absl::OkStatus();
+    }
 
     if (instruction.getType()->isVoidTy()) {
       return Unsupported(function_, "void instruction", instruction);
@@ -1071,6 +1086,9 @@ class FunctionEmitter {
     if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
       return CallExpr(*call);
     }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(&instruction)) {
+      return InsertValueExpr(*insert);
+    }
     if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(&instruction)) {
       return ExtractValueExpr(*extract);
     }
@@ -1096,6 +1114,13 @@ class FunctionEmitter {
     }
     const llvm::Value* aggregate = extract.getAggregateOperand();
     unsigned field = *extract.idx_begin();
+    if (IsComplexFloatStruct(aggregate->getType())) {
+      TF_ASSIGN_OR_RETURN(std::string value, Expr(aggregate));
+      if (field == 0) return absl::StrCat(value, ".x");
+      if (field == 1) return absl::StrCat(value, ".y");
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
     if (auto* cmpxchg = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(aggregate)) {
       if (field == 0) return CmpXchgOldName(*cmpxchg);
       if (field == 1) return CmpXchgSuccessName(*cmpxchg);
@@ -1106,6 +1131,54 @@ class FunctionEmitter {
       return InlineSimpleAggregateElement(*call, field);
     }
     return AggregateElementValue(aggregate, /*outer_call=*/nullptr, field);
+  }
+
+  absl::StatusOr<std::string> InsertValueExpr(
+      const llvm::InsertValueInst& insert) {
+    if (!IsComplexFloatStruct(insert.getType()) || insert.getNumIndices() != 1) {
+      return Unsupported(function_, "aggregate insertion", insert);
+    }
+
+    unsigned field = *insert.idx_begin();
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+
+    std::string components[2] = {"0.0f", "0.0f"};
+    const llvm::Value* aggregate = insert.getAggregateOperand();
+    if (!llvm::isa<llvm::UndefValue>(aggregate) &&
+        !llvm::isa<llvm::PoisonValue>(aggregate)) {
+      TF_ASSIGN_OR_RETURN(components[0], ComplexComponentExpr(aggregate, 0));
+      TF_ASSIGN_OR_RETURN(components[1], ComplexComponentExpr(aggregate, 1));
+    }
+    TF_ASSIGN_OR_RETURN(std::string inserted,
+                        Expr(insert.getInsertedValueOperand()));
+    components[field] = std::move(inserted);
+    return absl::StrCat("float2(", components[0], ", ", components[1], ")");
+  }
+
+  absl::StatusOr<std::string> ComplexComponentExpr(const llvm::Value* value,
+                                                   unsigned field) {
+    if (field > 1) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("complex field ", field, " is out of range."));
+    }
+    if (llvm::isa<llvm::UndefValue>(value) ||
+        llvm::isa<llvm::PoisonValue>(value)) {
+      return "0.0f";
+    }
+    if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value)) {
+      if (insert->getNumIndices() != 1) {
+        return Unsupported(function_, "aggregate insertion", *insert);
+      }
+      if (*insert->idx_begin() == field) {
+        return Expr(insert->getInsertedValueOperand());
+      }
+      return ComplexComponentExpr(insert->getAggregateOperand(), field);
+    }
+    TF_ASSIGN_OR_RETURN(std::string expression, Expr(value));
+    return absl::StrCat(expression, field == 0 ? ".x" : ".y");
   }
 
   absl::StatusOr<std::string> BinaryExprWithOperands(

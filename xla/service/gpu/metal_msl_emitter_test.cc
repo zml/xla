@@ -163,6 +163,55 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsComplexFloatStructAsFloat2) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @complex_add(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %lhs_gep = getelementptr inbounds [2 x { float, float }], ptr %arg0, i32 0, i32 %tid
+  %lhs = load { float, float }, ptr %lhs_gep, align 4
+  %rhs_gep = getelementptr inbounds [2 x { float, float }], ptr %arg1, i32 0, i32 %tid
+  %rhs = load { float, float }, ptr %rhs_gep, align 4
+  %lhs_real = extractvalue { float, float } %lhs, 0
+  %rhs_real = extractvalue { float, float } %rhs, 0
+  %real = fadd float %lhs_real, %rhs_real
+  %lhs_imag = extractvalue { float, float } %lhs, 1
+  %rhs_imag = extractvalue { float, float } %rhs, 1
+  %imag = fadd float %lhs_imag, %rhs_imag
+  %with_real = insertvalue { float, float } poison, float %real, 0
+  %complex = insertvalue { float, float } %with_real, float %imag, 1
+  %out = getelementptr inbounds [2 x { float, float }], ptr %arg2, i32 0, i32 %tid
+  store { float, float } %complex, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @complex_add, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("device float2* arg0 [[buffer(0)]]"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("device float2* arg1 [[buffer(1)]]"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("device float2* arg2 [[buffer(2)]]"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find(".x"), std::string::npos) << msl;
+  EXPECT_NE(msl.find(".y"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("float2("), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg2[v0] ="), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsEmptyLibraryForModulesWithoutKernels) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
