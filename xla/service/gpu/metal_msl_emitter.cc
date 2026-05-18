@@ -719,6 +719,40 @@ class FunctionEmitter {
     return ArrayInfo{type, 1};
   }
 
+  absl::StatusOr<PtrExpr> BytePointerExpr(const PtrExpr& pointer) {
+    std::optional<int64_t> element_size =
+        FixedTypeSize(data_layout_, pointer.element_type);
+    if (!element_size.has_value()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Cannot express MSL pointer ", pointer.base,
+          " as a byte pointer because element type ",
+          PrintLlvmType(*pointer.element_type), " has no fixed size."));
+    }
+    return PtrExpr{
+        absl::StrCat("reinterpret_cast<", pointer.address_space, " char*>(",
+                     pointer.base, ")"),
+        ScaleIndex(pointer.index, *element_size),
+        llvm::Type::getInt8Ty(function_.getContext()), pointer.address_space};
+  }
+
+  absl::StatusOr<int64_t> ScaleForGepIndex(llvm::Type* scaled_type,
+                                           PtrExpr* base) {
+    absl::StatusOr<int64_t> scale =
+        FlattenedElementCount(data_layout_, scaled_type, base->element_type);
+    if (scale.ok()) return *scale;
+
+    std::optional<int64_t> scaled_size =
+        FixedTypeSize(data_layout_, scaled_type);
+    std::optional<int64_t> base_size =
+        FixedTypeSize(data_layout_, base->element_type);
+    if (scaled_size.has_value() && base_size.has_value() &&
+        *scaled_size < *base_size) {
+      TF_ASSIGN_OR_RETURN(*base, BytePointerExpr(*base));
+      return *scaled_size;
+    }
+    return scale.status();
+  }
+
   absl::Status EmitBody(std::string* output) {
     if (function_.empty()) return absl::OkStatus();
     absl::flat_hash_set<const llvm::BasicBlock*> visited;
@@ -1717,6 +1751,9 @@ class FunctionEmitter {
   }
 
   absl::StatusOr<std::string> CastExpr(const llvm::CastInst& cast) {
+    if (cast.getOpcode() == llvm::Instruction::PtrToInt) {
+      return PointerToIntegerExpr(cast);
+    }
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(cast.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string type, MslType(cast.getType()));
     if (cast.getOpcode() == llvm::Instruction::FPTrunc &&
@@ -1745,6 +1782,19 @@ class FunctionEmitter {
       default:
         return Unsupported(function_, "cast", cast);
     }
+  }
+
+  absl::StatusOr<std::string> PointerToIntegerExpr(
+      const llvm::CastInst& cast) {
+    TF_ASSIGN_OR_RETURN(PtrExpr pointer, PointerExprFor(cast.getOperand(0)));
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(cast.getType()));
+    std::optional<int64_t> element_size =
+        FixedTypeSize(data_layout_, pointer.element_type);
+    if (!element_size.has_value()) {
+      return Unsupported(function_, "pointer-to-integer", cast);
+    }
+    return absl::StrCat("static_cast<", type, ">(",
+                        ScaleIndex(pointer.index, *element_size), ")");
   }
 
   absl::StatusOr<std::string> CallExpr(const llvm::CallInst& call) {
@@ -1860,49 +1910,100 @@ class FunctionEmitter {
       return Unsupported(function_, "inline function shape", call);
     }
 
-    const llvm::BasicBlock* true_block = branch->getSuccessor(0);
-    const llvm::BasicBlock* false_block = branch->getSuccessor(1);
-    const llvm::BasicBlock* true_successor =
-        UnconditionalBranchSuccessor(*true_block);
-    const llvm::BasicBlock* false_successor =
-        UnconditionalBranchSuccessor(*false_block);
-    if (true_successor == nullptr || true_successor != false_successor) {
-      return Unsupported(function_, "inline function shape", call);
-    }
+    TF_ASSIGN_OR_RETURN(const llvm::PHINode* phi, ReturnPhi(*callee, call));
+    const llvm::BasicBlock* merge_block = phi->getParent();
 
-    const llvm::BasicBlock* merge_block = true_successor;
-    const llvm::ReturnInst* ret =
-        llvm::dyn_cast<llvm::ReturnInst>(merge_block->getTerminator());
-    if (ret == nullptr) {
-      const llvm::BasicBlock* return_block =
-          UnconditionalBranchSuccessor(*merge_block);
-      if (return_block == nullptr) {
-        return Unsupported(function_, "inline function shape", call);
+    TF_ASSIGN_OR_RETURN(std::string condition,
+                        InlineSimpleValue(branch->getCondition(), call));
+    TF_ASSIGN_OR_RETURN(
+        std::string true_value,
+        InlinePhiIncomingForPath(branch->getSuccessor(0), merge_block, *phi,
+                                 call));
+    TF_ASSIGN_OR_RETURN(
+        std::string false_value,
+        InlinePhiIncomingForPath(branch->getSuccessor(1), merge_block, *phi,
+                                 call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
+  }
+
+  absl::StatusOr<const llvm::PHINode*> ReturnPhi(
+      const llvm::Function& callee, const llvm::CallInst& call) {
+    const llvm::ReturnInst* ret = nullptr;
+    for (const llvm::BasicBlock& block : callee) {
+      if (const auto* block_ret =
+              llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
+        if (ret != nullptr) {
+          return Unsupported(function_, "inline function return", call);
+        }
+        ret = block_ret;
       }
-      ret = llvm::dyn_cast<llvm::ReturnInst>(return_block->getTerminator());
     }
     if (ret == nullptr || ret->getReturnValue() == nullptr) {
       return Unsupported(function_, "inline function return", call);
     }
-
     const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret->getReturnValue());
-    if (phi == nullptr || phi->getParent() != merge_block) {
+    if (phi == nullptr) {
       return Unsupported(function_, "inline function return", call);
     }
-    int true_index = phi->getBasicBlockIndex(true_block);
-    int false_index = phi->getBasicBlockIndex(false_block);
-    if (true_index < 0 || false_index < 0) {
-      return Unsupported(function_, "inline function return", call);
+    return phi;
+  }
+
+  absl::StatusOr<const llvm::Value*> PhiIncomingValueOnLinearPath(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* merge_block,
+      const llvm::PHINode& phi, const llvm::CallInst& call) {
+    while (block != nullptr && block != merge_block) {
+      int index = phi.getBasicBlockIndex(block);
+      if (index >= 0) return phi.getIncomingValue(index);
+      const auto* branch =
+          llvm::dyn_cast<llvm::UncondBrInst>(block->getTerminator());
+      if (branch == nullptr) break;
+      block = branch->getSuccessor(0);
+    }
+    return Unsupported(function_, "inline function return", call);
+  }
+
+  absl::StatusOr<std::string> InlinePhiIncomingForPath(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* merge_block,
+      const llvm::PHINode& phi, const llvm::CallInst& call) {
+    if (absl::StatusOr<const llvm::Value*> incoming =
+            PhiIncomingValueOnLinearPath(block, merge_block, phi, call);
+        incoming.ok()) {
+      return InlineSimpleValue(*incoming, call);
+    }
+
+    const auto* branch =
+        llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+    if (branch == nullptr) {
+      return Unsupported(function_, "inline function shape", call);
+    }
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(0));
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(1));
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return Unsupported(function_, "inline function shape", call);
+    }
+
+    const llvm::BasicBlock* local_merge = true_successor;
+    TF_ASSIGN_OR_RETURN(
+        const llvm::Value* incoming,
+        PhiIncomingValueOnLinearPath(local_merge, merge_block, phi, call));
+    const auto* local_phi = llvm::dyn_cast<llvm::PHINode>(incoming);
+    if (local_phi == nullptr || local_phi->getParent() != local_merge) {
+      return InlineSimpleValue(incoming, call);
     }
 
     TF_ASSIGN_OR_RETURN(std::string condition,
                         InlineSimpleValue(branch->getCondition(), call));
     TF_ASSIGN_OR_RETURN(
         std::string true_value,
-        InlineSimpleValue(phi->getIncomingValue(true_index), call));
+        InlinePhiIncomingForPath(branch->getSuccessor(0), local_merge,
+                                 *local_phi, call));
     TF_ASSIGN_OR_RETURN(
         std::string false_value,
-        InlineSimpleValue(phi->getIncomingValue(false_index), call));
+        InlinePhiIncomingForPath(branch->getSuccessor(1), local_merge,
+                                 *local_phi, call));
     return absl::StrCat("(", condition, " ? ", true_value, " : ",
                         false_value, ")");
   }
@@ -2551,10 +2652,8 @@ class FunctionEmitter {
         } else {
           TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
                               TypeScaledByGepIndex(current_type, first_index));
-          TF_ASSIGN_OR_RETURN(
-              int64_t scale,
-              FlattenedElementCount(data_layout_, scaled_type,
-                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(int64_t scale,
+                              ScaleForGepIndex(scaled_type, &base));
           TF_ASSIGN_OR_RETURN(std::string index_expr,
                               InlineDoubleNestedSimpleValue(index, call,
                                                             nested_call,
@@ -2644,10 +2743,8 @@ class FunctionEmitter {
         } else {
           TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
                               TypeScaledByGepIndex(current_type, first_index));
-          TF_ASSIGN_OR_RETURN(
-              int64_t scale,
-              FlattenedElementCount(data_layout_, scaled_type,
-                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(int64_t scale,
+                              ScaleForGepIndex(scaled_type, &base));
           TF_ASSIGN_OR_RETURN(std::string index_expr,
                               InlineNestedSimpleValue(index, nested_call,
                                                       outer_call));
@@ -3084,10 +3181,8 @@ class FunctionEmitter {
         } else {
           TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
                               TypeScaledByGepIndex(current_type, first_index));
-          TF_ASSIGN_OR_RETURN(
-              int64_t scale,
-              FlattenedElementCount(data_layout_, scaled_type,
-                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(int64_t scale,
+                              ScaleForGepIndex(scaled_type, &base));
           TF_ASSIGN_OR_RETURN(std::string index_expr,
                               InlineSimpleValue(index, call));
           offset = AddIndex(offset, ScaleIndex(index_expr, scale));
@@ -3320,10 +3415,8 @@ class FunctionEmitter {
         } else {
           TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
                               TypeScaledByGepIndex(current_type, first_index));
-          TF_ASSIGN_OR_RETURN(
-              int64_t scale,
-              FlattenedElementCount(data_layout_, scaled_type,
-                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(int64_t scale,
+                              ScaleForGepIndex(scaled_type, &base));
           TF_ASSIGN_OR_RETURN(std::string index_expr, Expr(index));
           offset = AddIndex(offset, ScaleIndex(index_expr, scale));
         }

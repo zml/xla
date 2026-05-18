@@ -692,6 +692,78 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("select_byte("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineNestedPhiSelector) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1, ptr %arg2, ptr %arg3) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call i32 @select3(ptr %arg0, ptr %arg1, ptr %arg2, i32 %tid, i32 %tid)
+  %out = getelementptr inbounds [4 x i32], ptr %arg3, i32 0, i32 %tid
+  store i32 %value, ptr %out, align 4
+  ret void
+}
+
+define internal i32 @select3(ptr %a, ptr %b, ptr %c, i32 %index, i32 %which) {
+entry:
+  %is_first = icmp ult i32 %which, 1
+  br i1 %is_first, label %first, label %rest
+
+first:
+  %first_gep = getelementptr inbounds [4 x i32], ptr %a, i32 0, i32 %index
+  %first_value = load i32, ptr %first_gep, align 4, !invariant.load !1
+  br label %outer_merge
+
+rest:
+  %is_second = icmp ult i32 %which, 2
+  br i1 %is_second, label %second, label %third
+
+second:
+  %second_gep = getelementptr inbounds [4 x i32], ptr %b, i32 0, i32 %index
+  %second_value = load i32, ptr %second_gep, align 4, !invariant.load !1
+  br label %inner_merge
+
+third:
+  %third_gep = getelementptr inbounds [4 x i32], ptr %c, i32 0, i32 %index
+  %third_value = load i32, ptr %third_gep, align 4, !invariant.load !1
+  br label %inner_merge
+
+inner_merge:
+  %inner_value = phi i32 [ %second_value, %second ], [ %third_value, %third ]
+  br label %pass
+
+pass:
+  br label %outer_merge
+
+outer_merge:
+  %selected = phi i32 [ %first_value, %first ], [ %inner_value, %pass ]
+  br label %return
+
+return:
+  ret i32 %selected
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("? arg0[v0] :"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("? arg1[v0] : arg2[v0]"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg3[v0] ="), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("select3("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsInlineComplexIfElsePhiFunction) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -962,6 +1034,49 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("as_type<int>(static_cast<uint>(v1) >> 1)"),
             std::string::npos)
       << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsPointerToIntegerAsByteOffset) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @offset(ptr align 256 %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %ptr = getelementptr inbounds [8 x half], ptr %arg0, i32 0, i32 %tid
+  %addr = ptrtoint ptr %ptr to i64
+  %low = and i64 %addr, 3
+  %truncated = trunc i64 %low to i32
+  %negative_low = sub i64 0, %low
+  %byte_ptr = getelementptr inbounds i8, ptr %ptr, i64 %negative_low
+  %word = load i32, ptr %byte_ptr, align 4
+  %combined = add i32 %truncated, %word
+  %out = getelementptr inbounds [8 x i32], ptr %arg1, i32 0, i32 %tid
+  store i32 %combined, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @offset, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("static_cast<long>((v0 * 2))"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("reinterpret_cast<device char*>(arg0)"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("reinterpret_cast<device int*>"), std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("ptrtoint"), std::string::npos) << msl;
 }
 
 TEST(MetalMslEmitterTest, EmitsMoreMathCallsAndUnorderedCompare) {
