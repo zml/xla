@@ -1303,3 +1303,12 @@ alias(
         "gpu",
     ],
 )
+
+alias(
+    name = "metal_platform",
+    actual = "//xla/stream_executor/metal:all_runtime",
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+)
