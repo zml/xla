@@ -1560,19 +1560,26 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitF32Remainder(
       absl::string_view lhs, absl::string_view rhs,
       std::vector<std::string>* body) {
-    std::string quotient = NewName("rem_quotient");
-    std::string truncated = NewName("rem_truncated");
-    std::string product = NewName("rem_product");
+    std::string raw = NewName("rem_raw");
+    std::string same = NewName("rem_same");
+    std::string rhs_zero = NewName("rem_rhs_zero");
+    std::string rhs_nonzero = NewName("rem_rhs_nonzero");
+    std::string force_zero = NewName("rem_force_zero");
     std::string result = NewName("rem_result");
-    body->push_back(
-        absl::StrFormat("  %s = fdiv float %s, %s", quotient, lhs, rhs));
     body->push_back(absl::StrFormat(
-        "  %s = call float @air.fast_trunc.f32(float %s)", truncated,
-        quotient));
-    body->push_back(absl::StrFormat("  %s = fmul float %s, %s", product,
-                                    truncated, rhs));
-    body->push_back(absl::StrFormat("  %s = fsub float %s, %s", result, lhs,
-                                    product));
+        "  %s = call fast float @air.fast_fmod.f32(float %s, float %s)", raw,
+        lhs, rhs));
+    body->push_back(
+        absl::StrFormat("  %s = fcmp oeq float %s, %s", same, lhs, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp oeq float %s, 0x0000000000000000", rhs_zero, rhs));
+    body->push_back(
+        absl::StrFormat("  %s = xor i1 %s, true", rhs_nonzero, rhs_zero));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", force_zero,
+                                    same, rhs_nonzero));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float 0x0000000000000000, float %s", result,
+        force_zero, raw));
     return result;
   }
 
@@ -1946,6 +1953,7 @@ declare float @air.fast_ceil.f32(float) local_unnamed_addr #1
 declare float @air.fast_cosh.f32(float) local_unnamed_addr #1
 declare float @air.fast_exp.f32(float) local_unnamed_addr #1
 declare float @air.fast_floor.f32(float) local_unnamed_addr #1
+declare float @air.fast_fmod.f32(float, float) local_unnamed_addr #1
 declare float @air.fast_log.f32(float) local_unnamed_addr #1
 declare float @air.fast_pow.f32(float, float) local_unnamed_addr #1
 declare float @air.fast_rint.f32(float) local_unnamed_addr #1
@@ -1956,7 +1964,6 @@ declare float @air.fast_sinh.f32(float) local_unnamed_addr #1
 declare float @air.fast_sqrt.f32(float) local_unnamed_addr #1
 declare float @air.fast_tan.f32(float) local_unnamed_addr #1
 declare float @air.fast_tanh.f32(float) local_unnamed_addr #1
-declare float @air.fast_trunc.f32(float) local_unnamed_addr #1
 declare float @air.sign.f32(float) local_unnamed_addr #1
 
 define void @elementwise_f32(
