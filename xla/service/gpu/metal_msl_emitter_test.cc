@@ -2309,6 +2309,57 @@ entry:
   EXPECT_EQ(msl.find("compare("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsReusableVoidHelperFunction) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  %ret0 = alloca i8, align 1
+  %ret1 = alloca i8, align 1
+  %unused0 = alloca i32, align 4
+  %unused1 = alloca i32, align 4
+  call void @compare(ptr %arg0, ptr %unused0, ptr %ret0)
+  call void @compare(ptr %arg0, ptr %unused1, ptr %ret1)
+  %value0 = load i8, ptr %ret0, align 1
+  %value1 = load i8, ptr %ret1, align 1
+  %merged = or i8 %value0, %value1
+  store i8 %merged, ptr %arg1, align 1
+  ret void
+}
+
+define internal void @compare(ptr %lhs, ptr %unused, ptr %out) {
+entry:
+  %value = load float, ptr %lhs, align 4
+  %positive = fcmp ogt float %value, 0.000000e+00
+  %as_i8 = zext i1 %positive to i8
+  store i8 %as_i8, ptr %out, align 1
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("inline void compare(device float* arg0, thread int* "
+                     "arg1, thread char* arg2)"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("compare(&(arg0[0]), &(local2[0]), &(local0[0]));"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("compare(&(arg0[0]), &(local3[0]), &(local1[0]));"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, InlinesVoidHelperComplexExtractValue) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

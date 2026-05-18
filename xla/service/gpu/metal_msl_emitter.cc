@@ -68,6 +68,11 @@ struct BlockStopKey {
   }
 };
 
+struct HelperFunctionInfo {
+  std::vector<std::string> pointer_address_spaces;
+  std::vector<llvm::Type*> pointer_element_types;
+};
+
 std::string PrintLlvm(const llvm::Value& value) {
   std::string result;
   llvm::raw_string_ostream os(result);
@@ -167,6 +172,163 @@ bool IsKernelFunction(const llvm::Function& function) {
   }
 
   return function.getLinkage() == llvm::GlobalValue::ExternalLinkage;
+}
+
+std::optional<std::string> StaticPointerAddressSpaceForCallOperand(
+    const llvm::Value* value) {
+  while (value != nullptr) {
+    if (llvm::isa<llvm::AllocaInst>(value)) return "thread";
+    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
+      if (global->getAddressSpace() == 3) return "threadgroup";
+      return "device";
+    }
+    if (llvm::isa<llvm::Argument>(value)) return "device";
+
+    if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+      switch (op->getOpcode()) {
+        case llvm::Instruction::GetElementPtr:
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::AddrSpaceCast:
+          value = op->getOperand(0);
+          continue;
+        default:
+          return std::nullopt;
+      }
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+llvm::Type* StaticPointerElementTypeForCallOperand(const llvm::Value* value) {
+  while (value != nullptr) {
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+      return alloca->getAllocatedType();
+    }
+    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
+      llvm::Type* type = global->getValueType();
+      while (auto* array_type = llvm::dyn_cast<llvm::ArrayType>(type)) {
+        type = array_type->getElementType();
+      }
+      return type;
+    }
+    if (llvm::isa<llvm::Argument>(value)) return nullptr;
+
+    if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+      switch (op->getOpcode()) {
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::AddrSpaceCast:
+          value = op->getOperand(0);
+          continue;
+        case llvm::Instruction::GetElementPtr: {
+          auto* gep = llvm::cast<llvm::GEPOperator>(op);
+          llvm::Type* current_type = gep->getSourceElementType();
+          bool first_index = true;
+          for (const llvm::Use& use : gep->indices()) {
+            if (!first_index) {
+              if (auto* array_type =
+                      llvm::dyn_cast<llvm::ArrayType>(current_type)) {
+                current_type = array_type->getElementType();
+              } else if (auto* vector_type =
+                             llvm::dyn_cast<llvm::FixedVectorType>(
+                                 current_type)) {
+                current_type = vector_type->getElementType();
+              } else if (auto* struct_type =
+                             llvm::dyn_cast<llvm::StructType>(current_type)) {
+                auto* index = llvm::dyn_cast<llvm::ConstantInt>(use.get());
+                if (index == nullptr ||
+                    index->getZExtValue() >= struct_type->getNumElements()) {
+                  return nullptr;
+                }
+                current_type =
+                    struct_type->getElementType(index->getZExtValue());
+              }
+            }
+            first_index = false;
+          }
+          return current_type;
+        }
+        default:
+          return nullptr;
+      }
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+bool HasMetalBuiltinDependency(const llvm::Function& function) {
+  for (const llvm::BasicBlock& block : function) {
+    for (const llvm::Instruction& instruction : block) {
+      const auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call == nullptr) continue;
+      const llvm::Function* callee = call->getCalledFunction();
+      if (callee == nullptr || !callee->isDeclaration()) continue;
+      llvm::StringRef name = callee->getName();
+      if (name.starts_with("llvm.nvvm.read.ptx.sreg.") ||
+          name == "llvm.nvvm.barrier.cta.sync.aligned.all" ||
+          name == "llvm.cuda.syncthreads") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::optional<HelperFunctionInfo> AnalyzeReusableVoidHelper(
+    const llvm::Function& function) {
+  if (function.isDeclaration() || IsKernelFunction(function) ||
+      !function.getReturnType()->isVoidTy() ||
+      HasMetalBuiltinDependency(function)) {
+    return std::nullopt;
+  }
+
+  HelperFunctionInfo info;
+  info.pointer_address_spaces.resize(function.arg_size());
+  info.pointer_element_types.resize(function.arg_size());
+  int call_count = 0;
+
+  for (const llvm::User* user : function.users()) {
+    const auto* call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function) {
+      return std::nullopt;
+    }
+    ++call_count;
+
+    auto arg_it = function.arg_begin();
+    for (int i = 0; arg_it != function.arg_end(); ++arg_it, ++i) {
+      if (!arg_it->getType()->isPointerTy()) continue;
+      std::optional<std::string> address_space =
+          StaticPointerAddressSpaceForCallOperand(call->getArgOperand(i));
+      if (!address_space.has_value()) return std::nullopt;
+      std::string& existing = info.pointer_address_spaces[i];
+      if (existing.empty()) {
+        existing = *address_space;
+      } else if (existing != *address_space) {
+        return std::nullopt;
+      }
+
+      llvm::Type* element_type =
+          StaticPointerElementTypeForCallOperand(call->getArgOperand(i));
+      if (element_type != nullptr) {
+        llvm::Type*& existing_type = info.pointer_element_types[i];
+        if (existing_type == nullptr) {
+          existing_type = element_type;
+        } else if (existing_type != element_type) {
+          return std::nullopt;
+        }
+      }
+    }
+  }
+
+  if (call_count <= 1) return std::nullopt;
+  for (const llvm::Argument& arg : function.args()) {
+    if (arg.getType()->isPointerTy() &&
+        info.pointer_address_spaces[arg.getArgNo()].empty()) {
+      info.pointer_address_spaces[arg.getArgNo()] = "device";
+    }
+  }
+  return info;
 }
 
 absl::StatusOr<std::string> IntegerLiteral(const llvm::APInt& value,
@@ -393,26 +555,37 @@ std::string ScaleIndex(std::string index, int64_t scale) {
 
 class FunctionEmitter {
  public:
-  explicit FunctionEmitter(const llvm::Function& function)
+  explicit FunctionEmitter(
+      const llvm::Function& function,
+      const absl::flat_hash_map<const llvm::Function*, HelperFunctionInfo>&
+          helper_functions,
+      bool is_kernel, const HelperFunctionInfo* helper_info = nullptr)
       : function_(function),
-        data_layout_(function.getParent()->getDataLayout()) {}
+        data_layout_(function.getParent()->getDataLayout()),
+        helper_functions_(helper_functions),
+        helper_info_(helper_info),
+        is_kernel_(is_kernel) {}
 
   absl::StatusOr<std::string> Emit() {
     if (!function_.getReturnType()->isVoidTy()) {
       return absl::UnimplementedError(absl::StrCat(
-          "Metal kernel '", function_.getName().str(),
+          "Metal function '", function_.getName().str(),
           "' must return void, got ", PrintLlvmType(*function_.getReturnType())));
     }
 
     InferPointerElementTypes();
     AssignNames();
-    TF_ASSIGN_OR_RETURN(std::string kernel_name, KernelName());
+    TF_ASSIGN_OR_RETURN(std::string function_name, FunctionName());
 
     std::string output;
-    if (UseArgumentBuffer()) {
-      RETURN_IF_ERROR(EmitArgumentBufferStruct(&output, kernel_name));
+    if (is_kernel_ && UseArgumentBuffer()) {
+      RETURN_IF_ERROR(EmitArgumentBufferStruct(&output, function_name));
     }
-    RETURN_IF_ERROR(EmitSignature(&output, kernel_name));
+    if (is_kernel_) {
+      RETURN_IF_ERROR(EmitKernelSignature(&output, function_name));
+    } else {
+      RETURN_IF_ERROR(EmitHelperSignature(&output, function_name));
+    }
     absl::StrAppend(&output, " {\n");
     RETURN_IF_ERROR(EmitArgumentAliases(&output));
     RETURN_IF_ERROR(EmitDeclarations(&output));
@@ -565,18 +738,19 @@ class FunctionEmitter {
   }
 
   bool UseArgumentBuffer() const {
-    return function_.arg_size() > kMaxDirectMetalBufferArguments;
+    return is_kernel_ && function_.arg_size() > kMaxDirectMetalBufferArguments;
   }
 
-  absl::StatusOr<std::string> KernelName() const {
-    std::string kernel_name =
-        MslIdentifier(function_.getName().str(), "xla_metal_kernel");
-    if (kernel_name != function_.getName().str()) {
+  absl::StatusOr<std::string> FunctionName() const {
+    std::string function_name = MslIdentifier(
+        function_.getName().str(),
+        is_kernel_ ? "xla_metal_kernel" : "xla_metal_helper");
+    if (is_kernel_ && function_name != function_.getName().str()) {
       return absl::UnimplementedError(absl::StrCat(
           "Metal kernel name '", function_.getName().str(),
           "' is not a valid MSL identifier after XLA sanitization."));
     }
-    return kernel_name;
+    return function_name;
   }
 
   absl::Status EmitArgumentBufferStruct(std::string* output,
@@ -601,8 +775,8 @@ class FunctionEmitter {
     return absl::OkStatus();
   }
 
-  absl::Status EmitSignature(std::string* output,
-                             absl::string_view kernel_name) {
+  absl::Status EmitKernelSignature(std::string* output,
+                                   absl::string_view kernel_name) {
 
     absl::StrAppend(output, "kernel void ", kernel_name, "(");
     std::vector<std::string> params;
@@ -635,6 +809,27 @@ class FunctionEmitter {
     return absl::OkStatus();
   }
 
+  absl::Status EmitHelperSignature(std::string* output,
+                                   absl::string_view function_name) {
+    absl::StrAppend(output, "inline void ", function_name, "(");
+    std::vector<std::string> params;
+    for (const llvm::Argument& arg : function_.args()) {
+      std::string name = Name(&arg);
+      if (arg.getType()->isPointerTy()) {
+        llvm::Type* element_type = PointerElementType(&arg);
+        TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(element_type));
+        params.push_back(absl::StrFormat("%s %s* %s",
+                                         ArgumentAddressSpace(arg), msl_type,
+                                         name));
+      } else {
+        TF_ASSIGN_OR_RETURN(std::string msl_type, MslType(arg.getType()));
+        params.push_back(absl::StrFormat("%s %s", msl_type, name));
+      }
+    }
+    absl::StrAppend(output, absl::StrJoin(params, ", "), ")");
+    return absl::OkStatus();
+  }
+
   absl::Status EmitArgumentAliases(std::string* output) {
     if (!UseArgumentBuffer()) return absl::OkStatus();
 
@@ -658,7 +853,26 @@ class FunctionEmitter {
     const llvm::Value* root = PointerRoot(pointer);
     auto it = pointer_element_types_.find(root);
     if (it != pointer_element_types_.end()) return it->second;
+    if (helper_info_ != nullptr) {
+      if (auto* argument = llvm::dyn_cast_or_null<llvm::Argument>(root);
+          argument != nullptr &&
+          argument->getArgNo() < helper_info_->pointer_element_types.size() &&
+          helper_info_->pointer_element_types[argument->getArgNo()] !=
+              nullptr) {
+        return helper_info_->pointer_element_types[argument->getArgNo()];
+      }
+    }
     return llvm::Type::getInt8Ty(function_.getContext());
+  }
+
+  std::string ArgumentAddressSpace(const llvm::Argument& arg) const {
+    if (helper_info_ != nullptr && arg.getType()->isPointerTy() &&
+        arg.getArgNo() < helper_info_->pointer_address_spaces.size()) {
+      const std::string& address_space =
+          helper_info_->pointer_address_spaces[arg.getArgNo()];
+      if (!address_space.empty()) return address_space;
+    }
+    return "device";
   }
 
   struct ArrayInfo {
@@ -667,7 +881,9 @@ class FunctionEmitter {
   };
 
   absl::Status EmitDeclarations(std::string* output) {
-    RETURN_IF_ERROR(EmitThreadgroupGlobals(output));
+    if (is_kernel_) {
+      RETURN_IF_ERROR(EmitThreadgroupGlobals(output));
+    }
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
         if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction)) {
@@ -1413,6 +1629,12 @@ class FunctionEmitter {
   absl::StatusOr<std::string> InstructionExpr(
       const llvm::Instruction& instruction) {
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+      if (auto* global =
+              llvm::dyn_cast_or_null<llvm::GlobalVariable>(
+                  PointerRoot(load->getPointerOperand()));
+          global != nullptr && global->getAddressSpace() != 3) {
+        return InlineConstantGlobalLoadExpr(*global, load->getType());
+      }
       TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                           PointerExprFor(load->getPointerOperand()));
       return LoadFromPointer(pointer, load->getType());
@@ -3492,9 +3714,46 @@ class FunctionEmitter {
       const llvm::CallInst& call) {
     const llvm::Function* callee = call.getCalledFunction();
     if (callee != nullptr && !callee->isDeclaration()) {
+      if (helper_functions_.contains(callee)) {
+        return HelperVoidCallStatement(call);
+      }
       return InlineVoidFunctionCall(call);
     }
     return VoidCallStatement(call);
+  }
+
+  absl::StatusOr<std::string> HelperVoidCallStatement(
+      const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || !helper_functions_.contains(callee)) {
+      return Unsupported(function_, "helper call", call);
+    }
+    TF_ASSIGN_OR_RETURN(std::string callee_name, HelperFunctionName(*callee));
+
+    std::vector<std::string> args;
+    args.reserve(call.arg_size());
+    for (int i = 0; i < call.arg_size(); ++i) {
+      const llvm::Value* operand = call.getArgOperand(i);
+      if (operand->getType()->isPointerTy()) {
+        TF_ASSIGN_OR_RETURN(PtrExpr pointer, PointerExprFor(operand));
+        args.push_back(
+            absl::StrCat("&(", pointer.base, "[", pointer.index, "])"));
+      } else {
+        TF_ASSIGN_OR_RETURN(std::string value, Expr(operand));
+        args.push_back(std::move(value));
+      }
+    }
+    return absl::StrCat(callee_name, "(", absl::StrJoin(args, ", "), ");");
+  }
+
+  absl::StatusOr<std::string> HelperFunctionName(
+      const llvm::Function& function) const {
+    std::string name = MslIdentifier(function.getName().str(),
+                                     "xla_metal_helper");
+    if (name.empty()) {
+      return absl::InvalidArgumentError("Metal helper name cannot be empty.");
+    }
+    return name;
   }
 
   absl::StatusOr<std::string> VoidCallStatement(const llvm::CallInst& call) {
@@ -3567,8 +3826,9 @@ class FunctionEmitter {
       if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
         TF_ASSIGN_OR_RETURN(std::string expression,
                             InlineLoadExpr(*load, call, values, memory));
-        values.insert_or_assign(
-            load, StoredInlineValue{std::move(expression), load->getType()});
+        values.insert_or_assign(load,
+                                StoredInlineValue{std::move(expression),
+                                                  load->getType()});
         continue;
       }
 
@@ -4081,7 +4341,7 @@ class FunctionEmitter {
   absl::StatusOr<PtrExpr> PointerExprFor(const llvm::Value* value) {
     if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
       return PtrExpr{Name(argument), "0", PointerElementType(argument),
-                     "device"};
+                     ArgumentAddressSpace(*argument)};
     }
 
     if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
@@ -4161,6 +4421,10 @@ class FunctionEmitter {
 
   const llvm::Function& function_;
   const llvm::DataLayout& data_layout_;
+  const absl::flat_hash_map<const llvm::Function*, HelperFunctionInfo>&
+      helper_functions_;
+  const HelperFunctionInfo* helper_info_;
+  bool is_kernel_;
   absl::flat_hash_map<const llvm::Value*, llvm::Type*> pointer_element_types_;
   absl::flat_hash_map<const llvm::Value*, std::string> names_;
   absl::flat_hash_map<const llvm::Value*, std::string> cmpxchg_old_names_;
@@ -4170,10 +4434,29 @@ class FunctionEmitter {
 }  // namespace
 
 absl::StatusOr<std::string> EmitMslFromLlvmModule(const llvm::Module& module) {
+  absl::flat_hash_map<const llvm::Function*, HelperFunctionInfo>
+      helper_functions;
+  for (const llvm::Function& function : module.functions()) {
+    if (std::optional<HelperFunctionInfo> helper_info =
+            AnalyzeReusableVoidHelper(function)) {
+      helper_functions.emplace(&function, std::move(*helper_info));
+    }
+  }
+
+  std::vector<std::string> helpers;
+  for (const llvm::Function& function : module.functions()) {
+    auto helper_it = helper_functions.find(&function);
+    if (helper_it == helper_functions.end()) continue;
+    FunctionEmitter emitter(function, helper_functions, /*is_kernel=*/false,
+                            &helper_it->second);
+    TF_ASSIGN_OR_RETURN(std::string helper, emitter.Emit());
+    helpers.push_back(std::move(helper));
+  }
+
   std::vector<std::string> kernels;
   for (const llvm::Function& function : module.functions()) {
     if (!IsKernelFunction(function)) continue;
-    FunctionEmitter emitter(function);
+    FunctionEmitter emitter(function, helper_functions, /*is_kernel=*/true);
     TF_ASSIGN_OR_RETURN(std::string kernel, emitter.Emit());
     kernels.push_back(std::move(kernel));
   }
@@ -4193,6 +4476,8 @@ absl::StatusOr<std::string> EmitMslFromLlvmModule(const llvm::Module& module) {
                       "  return as_type<float>(static_cast<uint>(value) << "
                       "16);\n"
                       "}\n\n",
+                      absl::StrJoin(helpers, "\n"),
+                      helpers.empty() ? "" : "\n",
                       absl::StrJoin(kernels, "\n"));
 }
 
