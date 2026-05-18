@@ -66,6 +66,8 @@ class MetalGpuCompiler : public GpuCompiler {
   std::vector<std::string> GetLLVMCommandLineOptions(
       const DebugOptions& debug_options) const override;
 
+  bool RequiresDnnSupport() const override { return false; }
+
  private:
   MetalGpuCompiler(const MetalGpuCompiler&) = delete;
   MetalGpuCompiler& operator=(const MetalGpuCompiler&) = delete;

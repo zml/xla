@@ -97,6 +97,54 @@ declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
   EXPECT_NE(msl.find("arg2[v4] = v8;"), std::string::npos);
 }
 
+TEST(MetalMslEmitterTest, EmitsArrayElementGepWithoutDoubleScaling) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @iota(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = sitofp i32 %tid to float
+  %gep = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %tid
+  store float %value, ptr %gep, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @iota, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("arg0[v0] = v1;"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("arg0[(v0 * 8)]"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsEmptyLibraryForModulesWithoutKernels) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+@constant = private unnamed_addr constant [4 x i8] c"test"
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("#include <metal_stdlib>"), std::string::npos);
+  EXPECT_EQ(msl.find("kernel void"), std::string::npos) << msl;
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

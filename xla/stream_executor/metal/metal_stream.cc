@@ -76,8 +76,7 @@ absl::Status MetalStream::RecordEvent(Event* event) {
   if (metal_event == nullptr) {
     return absl::InvalidArgumentError("Expected a MetalEvent.");
   }
-  metal_event->SetCommandBuffer(last_command_buffer_);
-  last_command_buffer_ = nullptr;
+  metal_event->SetCommandBuffer(RetainObject(last_command_buffer_));
   return absl::OkStatus();
 }
 

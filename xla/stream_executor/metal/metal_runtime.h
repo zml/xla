@@ -50,6 +50,7 @@ absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal);
 absl::StatusOr<void*> RetainDevice(int ordinal);
 absl::StatusOr<void*> NewCommandQueue(void* device);
 
+void* RetainObject(void* object);
 void ReleaseObject(void* object);
 
 absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
@@ -63,6 +64,7 @@ absl::StatusOr<void*> Launch(void* command_queue, void* pipeline,
                              const BlockDim& block_dims,
                              int64_t shmem_bytes);
 absl::Status WaitUntilCompleted(void* command_buffer);
+absl::Status SynchronizeCommandQueue(void* command_queue);
 Event::Status PollCommandBufferStatus(void* command_buffer);
 
 }  // namespace stream_executor::metal

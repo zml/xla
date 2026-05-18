@@ -206,6 +206,7 @@ cc_library(
         "//xla/service/gpu:gpu_constants",
         "//xla/service/gpu:gpu_executable",
         "//xla/service/gpu:stream_executor_util",
+        "//xla/stream_executor/metal:metal_platform_id",
     ]) + if_cuda([
         # keep sorted
         "//xla/stream_executor/cuda:cuda_device_address_vmm_allocator",

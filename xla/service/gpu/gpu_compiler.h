@@ -232,6 +232,8 @@ class GpuCompiler : public LLVMCompiler {
     return absl::OkStatus();
   }
 
+  virtual bool RequiresDnnSupport() const { return true; }
+
  private:
   struct CompileResultWithMetadata {
     BackendCompileResult backend_result;

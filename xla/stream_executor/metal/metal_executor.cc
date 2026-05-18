@@ -233,7 +233,9 @@ absl::Status MetalExecutor::SynchronousMemcpy(
   return absl::OkStatus();
 }
 
-bool MetalExecutor::SynchronizeAllActivity() { return true; }
+bool MetalExecutor::SynchronizeAllActivity() {
+  return SynchronizeCommandQueue(command_queue_).ok();
+}
 
 absl::StatusOr<std::unique_ptr<Stream>> MetalExecutor::CreateStream(
     std::optional<std::variant<StreamPriority, int>> priority) {

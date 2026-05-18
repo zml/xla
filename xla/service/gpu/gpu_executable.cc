@@ -116,6 +116,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/module_spec.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -513,6 +514,8 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == stream_executor::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == stream_executor::metal::kMetalPlatformId) {
+    // The Metal backend validates MSL compatibility at library/pipeline load.
   } else {
     return Internal("Unknown platform");
   }

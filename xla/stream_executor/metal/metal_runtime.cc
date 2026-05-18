@@ -118,6 +118,13 @@ absl::StatusOr<void*> NewCommandQueue(void* device) {
   return RetainObj(queue);
 }
 
+void* RetainObject(void* object) {
+  if (object != nullptr) {
+    CFRetain(object);
+  }
+  return object;
+}
+
 void ReleaseObject(void* object) {
   if (object != nullptr) {
     CFRelease(object);
@@ -133,9 +140,10 @@ absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
     *contents = nullptr;
     return nullptr;
   }
-  id<MTLBuffer> buffer =
-      [Obj<id<MTLDevice>>(device) newBufferWithLength:size
-                                              options:MTLResourceStorageModeShared];
+  MTLResourceOptions options = MTLResourceStorageModeShared;
+  id<MTLBuffer> buffer = [Obj<id<MTLDevice>>(device)
+      newBufferWithLength:size
+                  options:options];
   if (buffer == nil) {
     return absl::ResourceExhaustedError(
         absl::StrCat("Failed to allocate Metal shared buffer of ", size,
@@ -251,6 +259,23 @@ absl::Status WaitUntilCompleted(void* command_buffer) {
     return absl::InternalError(
         absl::StrCat("Metal command buffer failed: ",
                      ErrorMessage([buffer error])));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status SynchronizeCommandQueue(void* command_queue) {
+  id<MTLCommandBuffer> command_buffer =
+      [Obj<id<MTLCommandQueue>>(command_queue) commandBuffer];
+  if (command_buffer == nil) {
+    return absl::InternalError(
+        "Failed to create Metal synchronization command buffer.");
+  }
+  [command_buffer commit];
+  [command_buffer waitUntilCompleted];
+  if ([command_buffer status] == MTLCommandBufferStatusError) {
+    return absl::InternalError(
+        absl::StrCat("Metal command queue synchronization failed: ",
+                     ErrorMessage([command_buffer error])));
   }
   return absl::OkStatus();
 }

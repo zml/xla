@@ -147,6 +147,8 @@ limitations under the License.
 #include "xla/stream_executor/gpu/gpu_cudamallocasync_allocator.h"
 #elif TENSORFLOW_USE_ROCM
 #include "rocm/rocm_config.h"
+#elif TENSORFLOW_USE_METAL
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #endif
 
 #include "xla/service/gpu/gpu_executable_run_options.h"
@@ -1658,6 +1660,9 @@ GetStreamExecutorGpuDeviceAllocator(
   }
 
   // Add any additional allocators for alternate memory spaces.
+#if TENSORFLOW_USE_METAL
+  if (platform->id() != stream_executor::metal::kMetalPlatformId) {
+#endif  // TENSORFLOW_USE_METAL
   for (const auto& ordinal_and_device : addressable_devices) {
     TF_ASSIGN_OR_RETURN(
         auto collective_bfc_allocator,
@@ -1670,6 +1675,9 @@ GetStreamExecutorGpuDeviceAllocator(
          ordinal_and_device.second->compute_stream(),
          /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kCollective});
   }
+#if TENSORFLOW_USE_METAL
+  }
+#endif  // TENSORFLOW_USE_METAL
 
   for (const auto& ordinal_and_device : addressable_devices) {
     TF_ASSIGN_OR_RETURN(

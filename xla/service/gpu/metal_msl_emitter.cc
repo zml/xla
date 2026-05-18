@@ -256,6 +256,25 @@ absl::StatusOr<llvm::Type*> TypeAfterGepIndex(llvm::Type* current_type,
                    PrintLlvmType(*current_type)));
 }
 
+absl::StatusOr<llvm::Type*> TypeScaledByGepIndex(llvm::Type* current_type,
+                                                 bool first_index) {
+  if (first_index) return current_type;
+
+  if (auto* array_type = llvm::dyn_cast<llvm::ArrayType>(current_type)) {
+    return array_type->getElementType();
+  }
+  if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(current_type)) {
+    return vector_type->getElementType();
+  }
+  if (llvm::isa<llvm::StructType>(current_type)) {
+    return absl::InvalidArgumentError(
+        "Struct GEP indices are lowered through field offsets.");
+  }
+  return absl::UnimplementedError(
+      absl::StrCat("Cannot index into LLVM type: ",
+                   PrintLlvmType(*current_type)));
+}
+
 bool IsZeroConstant(const llvm::Value* value) {
   auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
   return constant != nullptr && constant->isZero();
@@ -882,9 +901,11 @@ class FunctionEmitter {
           }
           offset = AddIndex(offset, absl::StrCat(field_offset));
         } else {
+          TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
+                              TypeScaledByGepIndex(current_type, first_index));
           TF_ASSIGN_OR_RETURN(
               int64_t scale,
-              FlattenedElementCount(data_layout_, current_type,
+              FlattenedElementCount(data_layout_, scaled_type,
                                     base.element_type));
           TF_ASSIGN_OR_RETURN(std::string index_expr, Expr(index));
           offset = AddIndex(offset, ScaleIndex(index_expr, scale));
@@ -914,11 +935,6 @@ absl::StatusOr<std::string> EmitMslFromLlvmModule(const llvm::Module& module) {
     FunctionEmitter emitter(function);
     TF_ASSIGN_OR_RETURN(std::string kernel, emitter.Emit());
     kernels.push_back(std::move(kernel));
-  }
-
-  if (kernels.empty()) {
-    return absl::InvalidArgumentError(
-        "LLVM module does not contain any GPU kernel functions to emit as MSL.");
   }
 
   return absl::StrCat("#include <metal_stdlib>\n",

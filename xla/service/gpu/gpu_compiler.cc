@@ -2758,9 +2758,13 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
   BinaryMap dnn_compiled_graphs;
   if (stream_exec) {
     se::dnn::DnnSupport* dnn_support = stream_exec->AsDnn();
-    TF_RET_CHECK(dnn_support != nullptr);
-    RETURN_IF_ERROR(RunCudnnCompilerPasses(module.get(), *dnn_support,
-                                           &dnn_compiled_graphs));
+    if (dnn_support == nullptr) {
+      TF_RET_CHECK(!RequiresDnnSupport())
+          << "DNN support is required by this GPU compiler.";
+    } else {
+      RETURN_IF_ERROR(RunCudnnCompilerPasses(module.get(), *dnn_support,
+                                             &dnn_compiled_graphs));
+    }
   }
 
   const DebugOptions& debug_opts = module->config().debug_options();
