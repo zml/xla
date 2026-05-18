@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/literal.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/service/dump.h"
 #include "xla/service/gpu/gpu_compiler.h"
 #include "xla/service/gpu/metal_msl_emitter.h"
 #include "xla/service/triangular_solve_expander.h"
@@ -282,6 +283,12 @@ MetalGpuCompiler::CompileTargetBinary(
     bool relocatable, const HloModule* debug_module,
     std::optional<int> shard_number) {
   TF_ASSIGN_OR_RETURN(std::string msl, EmitMslFromLlvmModule(*llvm_module));
+  if (debug_module != nullptr && DumpingEnabledForHloModule(*debug_module)) {
+    std::string suffix = shard_number.has_value()
+                             ? std::to_string(*shard_number) + ".msl"
+                             : "msl";
+    DumpToFileInDirOrStdout(*debug_module, "", suffix, msl);
+  }
   std::vector<uint8_t> binary(msl.begin(), msl.end());
   return BackendCompileResult{/*asm_text=*/std::move(msl),
                               /*binary=*/std::move(binary)};
