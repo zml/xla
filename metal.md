@@ -53,6 +53,11 @@ Current implementation status:
 - The initial compiler bridge emits MSL from the LLVM GPU IR that XLA already
   produces for simple straight-line kernels and the common single bounds-check
   block shape used by elementwise fusions.
+- Library-backed GEMM rewrites are disabled for Metal so dots stay on the
+  generic loop/fusion path and lower to generated MSL kernels.
+- FFT HLOs are expanded in the Metal compiler to direct DFT dot kernels before
+  thunk emission. This is a correctness-first path and is not intended to be
+  the long-term high-performance FFT implementation.
 - The longer-term direct structured MLIR-to-MSL emitter is still the right path
   for complete coverage; the LLVM-IR bridge is a bring-up step that keeps the
   payload direct MSL and avoids MPS, SPIR-V, PTX assembly, or vendor libraries.
@@ -106,7 +111,7 @@ The first backend version should fail clearly for:
 
 - Collectives and collective memory.
 - NCCL/NVSHMEM-equivalent behavior.
-- MPS, BLAS, DNN, FFT, and vendor library custom calls.
+- MPS, BLAS, DNN, and vendor library custom calls.
 - Triton codegen.
 - Command buffers.
 - Peer access.
@@ -162,6 +167,7 @@ Finally add XLA end-to-end tests:
 - copy/transpose,
 - reduction,
 - small dot through generic loop lowering.
+- direct FFT expansion coverage for FFT/IFFT/RFFT/IRFFT.
 
 ## Implementation Phases
 
