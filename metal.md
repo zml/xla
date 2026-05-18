@@ -169,6 +169,32 @@ Finally add XLA end-to-end tests:
 - small dot through generic loop lowering.
 - direct FFT expansion coverage for FFT/IFFT/RFFT/IRFFT.
 
+## Direct AIR Feasibility Spike
+
+Apple's Metal toolchain can assemble textual AIR LLVM IR directly:
+
+```sh
+air-as matmul_air_direct.ll -o matmul_air_direct.air
+air-opt --O3 matmul_air_direct.air -o matmul_air_direct.opt.air
+metallib matmul_air_direct.opt.air -o matmul_air_direct.metallib
+```
+
+A repo-local experiment lives in `xla/service/gpu/metal_air_experiment`.
+It contains:
+
+- an MSL reference kernel that emits textual AIR with `metal -S -emit-llvm`,
+- a hand-authored textual AIR FP32 matmul kernel using simdgroup matrix
+  intrinsics,
+- a small Objective-C++ runner that loads the metallib, validates the result,
+  and reports Metal GPU timestamps.
+
+On an Apple M3 Max, the hand-authored AIR path validates a
+2048x2048x2048 FP32 matmul and reaches about 2.9 TFLOP/s after `air-opt --O3`.
+This proves that direct AIR is technically viable for at least one fast compute
+kernel. The AIR contract is still private and version-specific, so this should
+remain an experimental path until we understand metadata stability, compiler
+versioning, and runtime ABI requirements across Xcode/macOS releases.
+
 ## Implementation Phases
 
 1. Land this design document.
