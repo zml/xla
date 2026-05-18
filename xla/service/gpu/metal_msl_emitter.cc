@@ -1037,6 +1037,16 @@ class FunctionEmitter {
           CanEmitStructuredBlockToStop(true_block, stop_block, memo, active));
     }
 
+    if (CanEmitStructuredBlockToStop(true_block, block, memo, active) &&
+        CanEmitStructuredBlockToStop(false_block, stop_block, memo, active)) {
+      return finish(true);
+    }
+
+    if (CanEmitStructuredBlockToStop(false_block, block, memo, active) &&
+        CanEmitStructuredBlockToStop(true_block, stop_block, memo, active)) {
+      return finish(true);
+    }
+
     if (true_successor != nullptr && true_successor == false_successor) {
       return finish(CanEmitStructuredBlockToStop(true_block, true_successor,
                                                  memo, active) &&

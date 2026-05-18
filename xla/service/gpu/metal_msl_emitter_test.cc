@@ -1198,6 +1198,62 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg1[0] = v2;"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsGuardedHeaderBodyExitLoop) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @guarded_sum(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %active = icmp slt i32 %tid, 4
+  br i1 %active, label %preheader, label %done
+
+preheader:
+  br label %header
+
+header:
+  %i = phi i32 [ 0, %preheader ], [ %next_i, %body ]
+  %acc = phi i32 [ 0, %preheader ], [ %next_acc, %body ]
+  %keep_going = icmp slt i32 %i, 4
+  br i1 %keep_going, label %body, label %exit
+
+body:
+  %in_index = add i32 %tid, %i
+  %in = getelementptr inbounds [8 x i32], ptr %arg0, i32 0, i32 %in_index
+  %value = load i32, ptr %in, align 4
+  %next_acc = add i32 %acc, %value
+  %next_i = add i32 %i, 1
+  br label %header
+
+exit:
+  %out = getelementptr inbounds [4 x i32], ptr %arg1, i32 0, i32 %tid
+  store i32 %acc, ptr %out, align 4
+  br label %done
+
+done:
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @guarded_sum, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("if (v1) {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("while (true) {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("v2 = v8;"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("v3 = v7;"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg1[v0] = v3;"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLocalStackSlot) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
