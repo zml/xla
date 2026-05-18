@@ -1747,7 +1747,12 @@ class FunctionEmitter {
   absl::StatusOr<std::string> InlineSimpleCall(
       const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
     const llvm::Function* callee = nested_call.getCalledFunction();
-    if (callee == nullptr) return Unsupported(function_, "inline call", nested_call);
+    if (callee == nullptr) {
+      return Unsupported(function_, "inline call", nested_call);
+    }
+    if (!callee->isDeclaration()) {
+      return InlineNestedSimpleFunctionCall(nested_call, outer_call);
+    }
     llvm::StringRef name = callee->getName();
     if (name.starts_with("llvm.maximum.") || name.starts_with("llvm.smax.")) {
       return InlineSimpleBinaryCall("max", nested_call, outer_call);
@@ -1756,6 +1761,429 @@ class FunctionEmitter {
       return InlineSimpleBinaryCall("min", nested_call, outer_call);
     }
     return Unsupported(function_, "inline call", nested_call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedSimpleFunctionCall(
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    const llvm::Function* callee = nested_call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "nested inline call", nested_call);
+    }
+    if (callee->arg_size() != nested_call.arg_size() || callee->size() != 1) {
+      return Unsupported(function_, "nested inline function shape",
+                         nested_call);
+    }
+    const llvm::BasicBlock& block = callee->getEntryBlock();
+    const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "nested inline function return",
+                         nested_call);
+    }
+    return InlineNestedSimpleValue(ret->getReturnValue(), nested_call,
+                                   outer_call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedSimpleValue(
+      const llvm::Value* value, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return InlineSimpleValue(nested_call.getArgOperand(argument->getArgNo()),
+                               outer_call);
+    }
+    if (llvm::isa<llvm::Constant>(value)) return Expr(value);
+    if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineNestedSimpleValue(binary->getOperand(0), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineNestedSimpleValue(binary->getOperand(1), nested_call,
+                                  outer_call));
+      return BinaryExprWithOperands(*binary, lhs, rhs);
+    }
+    if (auto* instruction = llvm::dyn_cast<llvm::Instruction>(value);
+        instruction != nullptr &&
+        instruction->getOpcode() == llvm::Instruction::FNeg) {
+      TF_ASSIGN_OR_RETURN(
+          std::string operand,
+          InlineNestedSimpleValue(instruction->getOperand(0), nested_call,
+                                  outer_call));
+      return absl::StrCat("(-", operand, ")");
+    }
+    if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(value)) {
+      bool unsigned_compare = icmp->isUnsigned();
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineNestedSimpleValue(icmp->getOperand(0), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineNestedSimpleValue(icmp->getOperand(1), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(lhs,
+                          CastForUnsignedCompare(icmp->getOperand(0)->getType(),
+                                                 lhs, unsigned_compare));
+      TF_ASSIGN_OR_RETURN(rhs,
+                          CastForUnsignedCompare(icmp->getOperand(1)->getType(),
+                                                 rhs, unsigned_compare));
+      return ICmpExprWithOperands(*icmp, lhs, rhs);
+    }
+    if (auto* fcmp = llvm::dyn_cast<llvm::FCmpInst>(value)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineNestedSimpleValue(fcmp->getOperand(0), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineNestedSimpleValue(fcmp->getOperand(1), nested_call,
+                                  outer_call));
+      return FCmpExprWithOperands(*fcmp, lhs, rhs);
+    }
+    if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string condition,
+          InlineNestedSimpleValue(select->getCondition(), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(
+          std::string true_value,
+          InlineNestedSimpleValue(select->getTrueValue(), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(
+          std::string false_value,
+          InlineNestedSimpleValue(select->getFalseValue(), nested_call,
+                                  outer_call));
+      return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                          false_value, ")");
+    }
+    if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string operand,
+          InlineNestedSimpleValue(cast->getOperand(0), nested_call,
+                                  outer_call));
+      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
+      if (cast->getOpcode() == llvm::Instruction::BitCast) {
+        return absl::StrCat("as_type<", type, ">(", operand, ")");
+      }
+      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+    }
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+      return InlineNestedLoadExpr(*load, nested_call, outer_call);
+    }
+    if (auto* call = llvm::dyn_cast<llvm::CallInst>(value)) {
+      return InlineNestedSimpleCall(*call, nested_call, outer_call);
+    }
+    return Unsupported(function_, "nested inline value", *value);
+  }
+
+  absl::StatusOr<std::string> InlineNestedSimpleCall(
+      const llvm::CallInst& call, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr) {
+      return Unsupported(function_, "nested inline call", call);
+    }
+    if (!callee->isDeclaration()) {
+      return InlineNestedSimpleFunctionCallThrough(call, nested_call,
+                                                   outer_call);
+    }
+    llvm::StringRef name = callee->getName();
+    if (name.starts_with("llvm.maximum.") || name.starts_with("llvm.smax.")) {
+      return InlineNestedBinaryCall("max", call, nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
+      return InlineNestedBinaryCall("min", call, nested_call, outer_call);
+    }
+    return Unsupported(function_, "nested inline call", call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedSimpleFunctionCallThrough(
+      const llvm::CallInst& call, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "nested inline call", call);
+    }
+    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+      return Unsupported(function_, "nested inline function shape", call);
+    }
+    const llvm::BasicBlock& block = callee->getEntryBlock();
+    const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "nested inline function return", call);
+    }
+    return InlineDoubleNestedSimpleValue(ret->getReturnValue(), call,
+                                         nested_call, outer_call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedBinaryCall(
+      absl::string_view msl_name, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (call.arg_size() != 2) {
+      return Unsupported(function_, "nested inline binary call", call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string lhs,
+        InlineNestedSimpleValue(call.getArgOperand(0), nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string rhs,
+        InlineNestedSimpleValue(call.getArgOperand(1), nested_call,
+                                outer_call));
+    return absl::StrCat(msl_name, "(", lhs, ", ", rhs, ")");
+  }
+
+  absl::StatusOr<std::string> InlineDoubleNestedSimpleValue(
+      const llvm::Value* value, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return InlineNestedSimpleValue(call.getArgOperand(argument->getArgNo()),
+                                     nested_call, outer_call);
+    }
+    if (llvm::isa<llvm::Constant>(value)) return Expr(value);
+    if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineDoubleNestedSimpleValue(
+                              binary->getOperand(0), call, nested_call,
+                              outer_call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineDoubleNestedSimpleValue(
+                              binary->getOperand(1), call, nested_call,
+                              outer_call));
+      return BinaryExprWithOperands(*binary, lhs, rhs);
+    }
+    if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(value)) {
+      bool unsigned_compare = icmp->isUnsigned();
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineDoubleNestedSimpleValue(
+                              icmp->getOperand(0), call, nested_call,
+                              outer_call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineDoubleNestedSimpleValue(
+                              icmp->getOperand(1), call, nested_call,
+                              outer_call));
+      TF_ASSIGN_OR_RETURN(lhs,
+                          CastForUnsignedCompare(icmp->getOperand(0)->getType(),
+                                                 lhs, unsigned_compare));
+      TF_ASSIGN_OR_RETURN(rhs,
+                          CastForUnsignedCompare(icmp->getOperand(1)->getType(),
+                                                 rhs, unsigned_compare));
+      return ICmpExprWithOperands(*icmp, lhs, rhs);
+    }
+    if (auto* fcmp = llvm::dyn_cast<llvm::FCmpInst>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineDoubleNestedSimpleValue(
+                              fcmp->getOperand(0), call, nested_call,
+                              outer_call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineDoubleNestedSimpleValue(
+                              fcmp->getOperand(1), call, nested_call,
+                              outer_call));
+      return FCmpExprWithOperands(*fcmp, lhs, rhs);
+    }
+    if (auto* cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string operand,
+                          InlineDoubleNestedSimpleValue(
+                              cast->getOperand(0), call, nested_call,
+                              outer_call));
+      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
+      if (cast->getOpcode() == llvm::Instruction::BitCast) {
+        return absl::StrCat("as_type<", type, ">(", operand, ")");
+      }
+      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+    }
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+      return InlineDoubleNestedLoadExpr(*load, call, nested_call, outer_call);
+    }
+    return Unsupported(function_, "double nested inline value", *value);
+  }
+
+  absl::StatusOr<std::string> InlineDoubleNestedLoadExpr(
+      const llvm::LoadInst& load, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(
+        PtrExpr pointer,
+        InlineDoubleNestedPointerExprFor(load.getPointerOperand(), call,
+                                         nested_call, outer_call));
+    std::string expression =
+        absl::StrCat(pointer.base, "[", pointer.index, "]");
+    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+  }
+
+  absl::StatusOr<PtrExpr> InlineDoubleNestedPointerExprFor(
+      const llvm::Value* value, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return InlineNestedPointerExprFor(call.getArgOperand(argument->getArgNo()),
+                                        nested_call, outer_call);
+    }
+    if (llvm::isa<llvm::GlobalVariable>(value) ||
+        llvm::isa<llvm::AllocaInst>(value)) {
+      return PointerExprFor(value);
+    }
+    if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+      switch (op->getOpcode()) {
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::AddrSpaceCast:
+          return InlineDoubleNestedPointerExprFor(op->getOperand(0), call,
+                                                  nested_call, outer_call);
+        case llvm::Instruction::GetElementPtr:
+          return InlineDoubleNestedGepExpr(*llvm::cast<llvm::GEPOperator>(op),
+                                           call, nested_call, outer_call);
+        default:
+          break;
+      }
+    }
+    return InlineNestedPointerExprFor(value, nested_call, outer_call);
+  }
+
+  absl::StatusOr<PtrExpr> InlineDoubleNestedGepExpr(
+      const llvm::GEPOperator& gep, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(PtrExpr base,
+                        InlineDoubleNestedPointerExprFor(
+                            gep.getPointerOperand(), call, nested_call,
+                            outer_call));
+    llvm::Type* current_type = gep.getSourceElementType();
+    std::string offset = "0";
+    bool first_index = true;
+
+    for (const llvm::Use& use : gep.indices()) {
+      const llvm::Value* index = use.get();
+
+      if (!IsZeroConstant(index)) {
+        if (auto* struct_type = llvm::dyn_cast<llvm::StructType>(current_type);
+            struct_type != nullptr && !first_index) {
+          auto* constant_index = llvm::dyn_cast<llvm::ConstantInt>(index);
+          if (constant_index == nullptr) {
+            return absl::UnimplementedError(
+                "Metal MSL emission requires constant struct GEP indices.");
+          }
+          uint64_t field = constant_index->getZExtValue();
+          int64_t field_offset = 0;
+          for (uint64_t i = 0; i < field; ++i) {
+            TF_ASSIGN_OR_RETURN(
+                int64_t count,
+                FlattenedElementCount(data_layout_,
+                                      struct_type->getElementType(i),
+                                      base.element_type));
+            field_offset += count;
+          }
+          offset = AddIndex(offset, absl::StrCat(field_offset));
+        } else {
+          TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
+                              TypeScaledByGepIndex(current_type, first_index));
+          TF_ASSIGN_OR_RETURN(
+              int64_t scale,
+              FlattenedElementCount(data_layout_, scaled_type,
+                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(std::string index_expr,
+                              InlineDoubleNestedSimpleValue(index, call,
+                                                            nested_call,
+                                                            outer_call));
+          offset = AddIndex(offset, ScaleIndex(index_expr, scale));
+        }
+      }
+
+      TF_ASSIGN_OR_RETURN(current_type,
+                          TypeAfterGepIndex(current_type, index, first_index));
+      first_index = false;
+    }
+
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
+  }
+
+  absl::StatusOr<std::string> InlineNestedLoadExpr(
+      const llvm::LoadInst& load, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                        InlineNestedPointerExprFor(load.getPointerOperand(),
+                                                   nested_call, outer_call));
+    std::string expression =
+        absl::StrCat(pointer.base, "[", pointer.index, "]");
+    return ConvertStoredValue(expression, pointer.element_type, load.getType());
+  }
+
+  absl::StatusOr<PtrExpr> InlineNestedPointerExprFor(
+      const llvm::Value* value, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return InlinePointerExprFor(nested_call.getArgOperand(argument->getArgNo()),
+                                  outer_call);
+    }
+    if (llvm::isa<llvm::GlobalVariable>(value) ||
+        llvm::isa<llvm::AllocaInst>(value)) {
+      return PointerExprFor(value);
+    }
+    if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+      switch (op->getOpcode()) {
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::AddrSpaceCast:
+          return InlineNestedPointerExprFor(op->getOperand(0), nested_call,
+                                            outer_call);
+        case llvm::Instruction::GetElementPtr:
+          return InlineNestedGepExpr(*llvm::cast<llvm::GEPOperator>(op),
+                                     nested_call, outer_call);
+        default:
+          break;
+      }
+    }
+    return InlinePointerExprFor(value, outer_call);
+  }
+
+  absl::StatusOr<PtrExpr> InlineNestedGepExpr(
+      const llvm::GEPOperator& gep, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(
+        PtrExpr base,
+        InlineNestedPointerExprFor(gep.getPointerOperand(), nested_call,
+                                   outer_call));
+    llvm::Type* current_type = gep.getSourceElementType();
+    std::string offset = "0";
+    bool first_index = true;
+
+    for (const llvm::Use& use : gep.indices()) {
+      const llvm::Value* index = use.get();
+
+      if (!IsZeroConstant(index)) {
+        if (auto* struct_type = llvm::dyn_cast<llvm::StructType>(current_type);
+            struct_type != nullptr && !first_index) {
+          auto* constant_index = llvm::dyn_cast<llvm::ConstantInt>(index);
+          if (constant_index == nullptr) {
+            return absl::UnimplementedError(
+                "Metal MSL emission requires constant struct GEP indices.");
+          }
+          uint64_t field = constant_index->getZExtValue();
+          int64_t field_offset = 0;
+          for (uint64_t i = 0; i < field; ++i) {
+            TF_ASSIGN_OR_RETURN(
+                int64_t count,
+                FlattenedElementCount(data_layout_,
+                                      struct_type->getElementType(i),
+                                      base.element_type));
+            field_offset += count;
+          }
+          offset = AddIndex(offset, absl::StrCat(field_offset));
+        } else {
+          TF_ASSIGN_OR_RETURN(llvm::Type* scaled_type,
+                              TypeScaledByGepIndex(current_type, first_index));
+          TF_ASSIGN_OR_RETURN(
+              int64_t scale,
+              FlattenedElementCount(data_layout_, scaled_type,
+                                    base.element_type));
+          TF_ASSIGN_OR_RETURN(std::string index_expr,
+                              InlineNestedSimpleValue(index, nested_call,
+                                                      outer_call));
+          offset = AddIndex(offset, ScaleIndex(index_expr, scale));
+        }
+      }
+
+      TF_ASSIGN_OR_RETURN(current_type,
+                          TypeAfterGepIndex(current_type, index, first_index));
+      first_index = false;
+    }
+
+    return PtrExpr{base.base, AddIndex(base.index, offset), base.element_type};
   }
 
   absl::StatusOr<std::string> InlineSimpleBinaryCall(

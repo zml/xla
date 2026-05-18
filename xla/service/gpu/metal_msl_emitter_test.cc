@@ -495,6 +495,63 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("read_value("), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsNestedInlineHelperCall) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value = call float @select_value(ptr %arg0, ptr %arg1, i32 %tid)
+  %out = getelementptr inbounds [4 x float], ptr %arg2, i32 0, i32 %tid
+  store float %value, ptr %out, align 4
+  ret void
+}
+
+define internal float @select_value(ptr %lhs, ptr %rhs, i32 %index) {
+entry:
+  %flag = call i8 @compare_index(ptr %lhs, ptr %rhs, i32 %index)
+  %lhs_gep = getelementptr inbounds [4 x float], ptr %lhs, i32 0, i32 %index
+  %lhs_value = load float, ptr %lhs_gep, align 4, !invariant.load !1
+  %rhs_gep = getelementptr inbounds [4 x float], ptr %rhs, i32 0, i32 %index
+  %rhs_value = load float, ptr %rhs_gep, align 4, !invariant.load !1
+  %condition = trunc i8 %flag to i1
+  %selected = select i1 %condition, float %lhs_value, float %rhs_value
+  ret float %selected
+}
+
+define internal i8 @compare_index(ptr %lhs, ptr %rhs, i32 %index) {
+entry:
+  %lhs_gep = getelementptr inbounds [4 x float], ptr %lhs, i32 0, i32 %index
+  %lhs_value = load float, ptr %lhs_gep, align 4, !invariant.load !1
+  %rhs_gep = getelementptr inbounds [4 x float], ptr %rhs, i32 0, i32 %index
+  %rhs_value = load float, ptr %rhs_gep, align 4, !invariant.load !1
+  %greater = fcmp ogt float %lhs_value, %rhs_value
+  %result = zext i1 %greater to i8
+  ret i8 %result
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("arg0[v0]"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg1[v0]"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("?"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("select_value("), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("compare_index("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLibdeviceAndMinMaxCalls) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
