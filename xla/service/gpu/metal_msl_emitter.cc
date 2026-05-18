@@ -275,6 +275,19 @@ absl::StatusOr<llvm::Type*> TypeScaledByGepIndex(llvm::Type* current_type,
                    PrintLlvmType(*current_type)));
 }
 
+template <typename GepT>
+absl::StatusOr<llvm::Type*> GepResultElementType(const GepT& gep) {
+  llvm::Type* current_type = gep.getSourceElementType();
+  bool first_index = true;
+  for (const llvm::Use& use : gep.indices()) {
+    TF_ASSIGN_OR_RETURN(
+        current_type,
+        TypeAfterGepIndex(current_type, use.get(), first_index));
+    first_index = false;
+  }
+  return current_type;
+}
+
 bool IsZeroConstant(const llvm::Value* value) {
   auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
   return constant != nullptr && constant->isZero();
@@ -327,6 +340,17 @@ class FunctionEmitter {
   void InferPointerElementTypes() {
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
+        if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&instruction)) {
+          if (auto element_type = GepResultElementType(*gep);
+              element_type.ok()) {
+            RecordPointerElementType(gep, *element_type);
+          }
+        }
+      }
+    }
+
+    for (const llvm::BasicBlock& block : function_) {
+      for (const llvm::Instruction& instruction : block) {
         if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
           RecordPointerElementType(load->getPointerOperand(), load->getType());
         } else if (auto* store =
@@ -344,8 +368,12 @@ class FunctionEmitter {
     if (root == nullptr) return;
     auto [it, inserted] = pointer_element_types_.try_emplace(root, element_type);
     if (!inserted && it->second != element_type) {
-      // Keep the first type. The emitter will still reject unsupported GEPs
-      // where the chosen root element type cannot represent later accesses.
+      if (auto* vector_type =
+              llvm::dyn_cast<llvm::FixedVectorType>(it->second);
+          vector_type != nullptr &&
+          vector_type->getElementType() == element_type) {
+        it->second = element_type;
+      }
       return;
     }
   }
@@ -534,8 +562,16 @@ class FunctionEmitter {
       TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                           PointerExprFor(store->getPointerOperand()));
       TF_ASSIGN_OR_RETURN(std::string value, Expr(store->getValueOperand()));
-      absl::StrAppend(output, Indent(indent), pointer.base, "[", pointer.index,
-                      "] = ", value, ";\n");
+      llvm::Type* value_type = store->getValueOperand()->getType();
+      if (value_type == pointer.element_type) {
+        absl::StrAppend(output, Indent(indent), pointer.base, "[",
+                        pointer.index, "] = ", value, ";\n");
+      } else {
+        TF_ASSIGN_OR_RETURN(std::string value_msl_type, MslType(value_type));
+        absl::StrAppend(output, Indent(indent), "*reinterpret_cast<device ",
+                        value_msl_type, "*>(&", pointer.base, "[",
+                        pointer.index, "]) = ", value, ";\n");
+      }
       return absl::OkStatus();
     }
 
@@ -568,7 +604,7 @@ class FunctionEmitter {
         return absl::StrFormat("half(%.9g)", as_double);
       }
       if (value->getType()->isFloatTy()) {
-        return absl::StrFormat("%.9gf", as_double);
+        return absl::StrFormat("float(%.9g)", as_double);
       }
       return absl::StrFormat("%.17g", as_double);
     }
@@ -635,6 +671,12 @@ class FunctionEmitter {
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(PtrExpr pointer,
                           PointerExprFor(load->getPointerOperand()));
+      if (load->getType() != pointer.element_type) {
+        TF_ASSIGN_OR_RETURN(std::string load_msl_type,
+                            MslType(load->getType()));
+        return absl::StrCat("(*reinterpret_cast<device ", load_msl_type,
+                            "*>(&", pointer.base, "[", pointer.index, "]))");
+      }
       return absl::StrCat(pointer.base, "[", pointer.index, "]");
     }
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction)) {

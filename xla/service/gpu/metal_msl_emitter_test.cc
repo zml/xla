@@ -127,6 +127,42 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("arg0[(v0 * 8)]"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsVectorLoadFromScalarBuffer) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @dot(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %offset = mul i32 %tid, 2
+  %gep = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %offset
+  %vector = load <2 x float>, ptr %gep, align 4
+  %element = extractelement <2 x float> %vector, i64 1
+  %out = getelementptr inbounds [4 x float], ptr %arg1, i32 0, i32 %tid
+  store float %element, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @dot, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("device float* arg0 [[buffer(0)]]"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("*reinterpret_cast<device float2*>(&arg0[v1])"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsEmptyLibraryForModulesWithoutKernels) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -143,6 +179,35 @@ target triple = "nvptx64-nvidia-cuda"
 
   EXPECT_NE(msl.find("#include <metal_stdlib>"), std::string::npos);
   EXPECT_EQ(msl.find("kernel void"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsValidFloatConstantLiteral) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @constant(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %gep = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 %tid
+  store float 0.000000e+00, ptr %gep, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @constant, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float(0)"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("0f"), std::string::npos) << msl;
 }
 
 }  // namespace
