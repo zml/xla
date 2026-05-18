@@ -19,6 +19,7 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -80,6 +81,7 @@ struct ReductionParams {
 
 enum class ReductionKind {
   kAdd,
+  kMultiply,
   kMaximum,
   kMinimum,
 };
@@ -87,7 +89,10 @@ enum class ReductionKind {
 struct MetalReductionConfig {
   int64_t parameter_number = 0;
   int64_t num_elements = 0;
+  int64_t input_start = 0;
+  int64_t input_stride = 1;
   float init_value = 0.0f;
+  float output_scale = 1.0f;
   ReductionKind kind = ReductionKind::kAdd;
 };
 
@@ -104,10 +109,11 @@ bool IsScalarLikeF32(const Shape& shape) {
 }
 
 std::string FloatLiteral(float value) {
-  if (!std::isfinite(value)) {
-    return value > 0 ? "0x7FF0000000000000" : "0xFFF0000000000000";
-  }
-  return absl::StrFormat("%.9e", value);
+  double double_value = static_cast<double>(value);
+  uint64_t bits = 0;
+  std::memcpy(&bits, &double_value, sizeof(bits));
+  return absl::StrFormat("0x%016llX",
+                         static_cast<unsigned long long>(bits));
 }
 
 bool IsZeroValue(const HloInstruction* instruction) {
@@ -877,32 +883,77 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
 absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     const HloModule& module) {
   const HloInstruction* root = module.entry_computation()->root_instruction();
-  if (root->opcode() != HloOpcode::kReduce) {
+  float output_scale = 1.0f;
+  const HloInstruction* reduce = root;
+  if (root->opcode() == HloOpcode::kDivide ||
+      root->opcode() == HloOpcode::kMultiply) {
+    const HloInstruction* lhs = root->operand(0);
+    const HloInstruction* rhs = root->operand(1);
+    if (lhs->opcode() == HloOpcode::kReduce && rhs->IsConstant() &&
+        IsScalarLikeF32(rhs->shape())) {
+      reduce = lhs;
+      const float rhs_value = rhs->literal().Get<float>({});
+      output_scale =
+          root->opcode() == HloOpcode::kDivide ? 1.0f / rhs_value : rhs_value;
+    } else if (root->opcode() == HloOpcode::kMultiply &&
+               rhs->opcode() == HloOpcode::kReduce && lhs->IsConstant() &&
+               IsScalarLikeF32(lhs->shape())) {
+      reduce = rhs;
+      output_scale = lhs->literal().Get<float>({});
+    }
+  }
+
+  if (reduce->opcode() != HloOpcode::kReduce) {
     return absl::UnimplementedError(
         "Metal direct AIR reduction supports only reduce roots.");
   }
-  if (!IsScalarLikeF32(root->shape()) || root->operand_count() != 2 ||
-      root->dimensions().size() != 1 || root->dimensions()[0] != 0) {
+  if (!IsScalarLikeF32(root->shape()) || reduce->operand_count() != 2 ||
+      reduce->dimensions().size() != 1 || reduce->dimensions()[0] != 0) {
     return absl::UnimplementedError(
         "Metal direct AIR reduction currently supports only single f32 array "
         "to f32 scalar reductions over dimension 0.");
   }
 
-  const HloInstruction* input = root->operand(0);
-  const HloInstruction* init = root->operand(1);
-  if (input->opcode() != HloOpcode::kParameter || !IsF32Array(input->shape()) ||
-      input->shape().dimensions().size() != 1 || !init->IsConstant() ||
+  const HloInstruction* input = reduce->operand(0);
+  const HloInstruction* init = reduce->operand(1);
+  if (!IsF32Array(input->shape()) || input->shape().dimensions().size() != 1 ||
+      !init->IsConstant() ||
       !IsScalarLikeF32(init->shape())) {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports only rank-1 f32 "
-        "parameter inputs and scalar f32 constant init values.");
+        "Metal direct AIR reduction currently supports only rank-1 f32 inputs "
+        "and scalar f32 constant init values.");
   }
 
-  const HloInstruction* reducer = root->to_apply()->root_instruction();
+  int64_t input_start = 0;
+  int64_t input_stride = 1;
+  const HloInstruction* parameter = input;
+  if (input->opcode() == HloOpcode::kSlice) {
+    if (input->slice_strides().size() != 1 ||
+        input->operand(0)->opcode() != HloOpcode::kParameter ||
+        !IsF32Array(input->operand(0)->shape()) ||
+        input->operand(0)->shape().dimensions().size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR reduction currently supports only rank-1 f32 "
+          "slices of parameters.");
+    }
+    input_start = input->slice_starts(0);
+    input_stride = input->slice_strides(0);
+    parameter = input->operand(0);
+  }
+  if (parameter->opcode() != HloOpcode::kParameter) {
+    return absl::UnimplementedError(
+        "Metal direct AIR reduction currently supports only parameter or slice "
+        "inputs.");
+  }
+
+  const HloInstruction* reducer = reduce->to_apply()->root_instruction();
   ReductionKind kind;
   switch (reducer->opcode()) {
     case HloOpcode::kAdd:
       kind = ReductionKind::kAdd;
+      break;
+    case HloOpcode::kMultiply:
+      kind = ReductionKind::kMultiply;
       break;
     case HloOpcode::kMaximum:
       kind = ReductionKind::kMaximum;
@@ -917,9 +968,12 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   }
 
   MetalReductionConfig config;
-  config.parameter_number = input->parameter_number();
+  config.parameter_number = parameter->parameter_number();
   config.num_elements = ShapeUtil::ElementsIn(input->shape());
+  config.input_start = input_start;
+  config.input_stride = input_stride;
   config.init_value = init->literal().Get<float>({});
+  config.output_scale = output_scale;
   config.kind = kind;
   return config;
 }
@@ -928,6 +982,8 @@ std::string ReductionUpdate(ReductionKind kind) {
   switch (kind) {
     case ReductionKind::kAdd:
       return "  %new_acc = fadd fast float %acc, %value\n";
+    case ReductionKind::kMultiply:
+      return "  %new_acc = fmul fast float %acc, %value\n";
     case ReductionKind::kMaximum:
       return R"(  %cmp = fcmp fast ogt float %value, %acc
   %new_acc = select i1 %cmp, float %value, float %acc
@@ -937,6 +993,7 @@ std::string ReductionUpdate(ReductionKind kind) {
   %new_acc = select i1 %cmp, float %value, float %acc
 )";
   }
+  return "";
 }
 
 std::string BuildReductionAir(const MetalReductionConfig& config) {
@@ -970,13 +1027,16 @@ loop:
 
 loop_body:
   %%i64 = zext i32 %%i to i64
-  %%ptr = getelementptr inbounds float, float addrspace(1)* %%arg0, i64 %%i64
+  %%scaled_i = mul i64 %%i64, %d
+  %%source_i = add i64 %%scaled_i, %d
+  %%ptr = getelementptr inbounds float, float addrspace(1)* %%arg0, i64 %%source_i
   %%value = load float, float addrspace(1)* %%ptr, align 4
 %s  %%next = add i32 %%i, 1
   br label %%loop
 
 done:
-  store float %%acc, float addrspace(1)* %%out, align 4
+  %%scaled_acc = fmul fast float %%acc, %s
+  store float %%scaled_acc, float addrspace(1)* %%out, align 4
   br label %%exit
 
 exit:
@@ -1018,7 +1078,9 @@ attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-poin
 !24 = !{!"xla/service/gpu/metal_reduction_air"}
 )",
                          FloatLiteral(config.init_value),
-                         ReductionUpdate(config.kind));
+                         config.input_stride, config.input_start,
+                         ReductionUpdate(config.kind),
+                         FloatLiteral(config.output_scale));
 }
 
 class MetalReductionExecutable final : public Executable {

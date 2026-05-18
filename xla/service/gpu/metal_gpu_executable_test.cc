@@ -217,6 +217,9 @@ absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
     case HloOpcode::kAdd:
       Add(lhs, rhs);
       break;
+    case HloOpcode::kMultiply:
+      Mul(lhs, rhs);
+      break;
     case HloOpcode::kMaximum:
       Max(lhs, rhs);
       break;
@@ -662,6 +665,58 @@ TEST(MetalGpuExecutableTest, ReductionMinimum) {
   for (int64_t i = 0; i < kElementCount; ++i) {
     expected = std::min(expected, input.Get<float>({i}));
   }
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionProduct) {
+  auto result = ExecuteMetalReduction(HloOpcode::kMultiply, 1.0f);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  float expected = 1.0f;
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected *= input.Get<float>({i});
+  }
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionMean) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_mean_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduction_mean");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp sum = Reduce(input, ConstantR0<float>(&builder, 0.0f), reducer, {0});
+  Div(sum, ConstantR0<float>(&builder, static_cast<float>(kElementCount)));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected = 0.0f;
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    expected += input_literal.Get<float>({i});
+  }
+  expected /= static_cast<float>(kElementCount);
   ExpectScalarNear(actual, expected);
 }
 
