@@ -497,6 +497,127 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("memory_order_relaxed"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsLocalStackSlot) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @local_buffer(ptr %arg0) {
+entry:
+  %slot = alloca i8, align 1
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %is_first = icmp eq i32 %tid, 0
+  call void @llvm.assume(i1 %is_first)
+  %value = zext i1 %is_first to i8
+  store i8 %value, ptr %slot, align 1
+  %loaded = load i8, ptr %slot, align 1
+  %out = getelementptr inbounds [1 x i8], ptr %arg0, i32 0, i32 0
+  store i8 %loaded, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare void @llvm.assume(i1)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @local_buffer, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("char local0[1] = {0};"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("local0[0] = v2;"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("v3 = local0[0];"), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("llvm.assume"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsThreadgroupGlobal) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+@tile = private addrspace(3) global [64 x float] undef, align 4
+
+define void @shared_tile(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [64 x float], ptr addrspace(3) @tile, i32 0, i32 %tid
+  store float 1.000000e+00, ptr addrspace(3) %in, align 4
+  %loaded = load float, ptr addrspace(3) %in, align 4
+  %out = getelementptr inbounds [64 x float], ptr %arg0, i32 0, i32 %tid
+  store float %loaded, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @shared_tile, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("threadgroup float tile[64];"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("tile[v0] = float(1);"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("v1 = tile[v0];"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, InlinesVoidHelperWithOutputBuffer) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+@nan_bits = constant [4 x i8] c"\00\00\C0\7F", align 4
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  %ret = alloca i8, align 1
+  call void @compare(ptr %arg0, ptr %ret)
+  %value = load i8, ptr %ret, align 1
+  store i8 %value, ptr %arg1, align 1
+  ret void
+}
+
+define internal void @compare(ptr %lhs, ptr %out) {
+entry:
+  %slot = alloca float, align 4
+  %value = load float, ptr %lhs, align 4
+  %nan = load float, ptr @nan_bits, align 4
+  %sum = fadd float %value, %nan
+  store float %sum, ptr %slot, align 4
+  %bits = load i32, ptr %slot, align 4
+  %is_negative = icmp slt i32 %bits, 0
+  %out_value = zext i1 %is_negative to i8
+  store i8 %out_value, ptr %out, align 1
+  ret void
+}
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("as_type<float>(2143289344u)"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("as_type<int>("), std::string::npos) << msl;
+  EXPECT_NE(msl.find("local0[0] = static_cast<char>"), std::string::npos)
+      << msl;
+  EXPECT_EQ(msl.find("compare("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsTupleReducerArgmax) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

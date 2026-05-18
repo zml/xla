@@ -38,6 +38,7 @@ limitations under the License.
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_allocator.h"
@@ -97,8 +98,25 @@ absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernel(
   if (!msl.has_value()) {
     return absl::InvalidArgumentError("Metal kernel payload is empty.");
   }
-  return LoadKernelFromMsl(msl->cubin_bytes, spec.kernel_name(),
-                           spec.arity());
+  TF_ASSIGN_OR_RETURN(auto kernel, LoadKernelFromMsl(msl->cubin_bytes,
+                                                     spec.kernel_name(),
+                                                     spec.arity()));
+  if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
+          spec.kernel_args_packing())) {
+    kernel->set_args_packing(
+        std::get<KernelLoaderSpec::KernelArgsPackingFunc>(
+            spec.kernel_args_packing()));
+  } else {
+    const auto& packing_spec =
+        std::get<KernelArgsPackingSpec>(spec.kernel_args_packing());
+    kernel->set_args_packing(
+        [packing_spec](const Kernel& kernel, const KernelArgs& args) {
+          const auto& mem_args = Cast<KernelArgsDeviceAddressArray>(&args);
+          return packing_spec.BuildArguments(mem_args->device_addr_args(),
+                                             args.number_of_shared_bytes());
+        });
+  }
+  return kernel;
 }
 
 absl::StatusOr<std::unique_ptr<Kernel>> MetalExecutor::LoadKernelFromMsl(

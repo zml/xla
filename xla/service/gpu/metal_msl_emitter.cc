@@ -342,6 +342,11 @@ class FunctionEmitter {
     llvm::Type* element_type;
   };
 
+  struct StoredInlineValue {
+    std::string expression;
+    llvm::Type* type;
+  };
+
   void InferPointerElementTypes() {
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
@@ -409,9 +414,14 @@ class FunctionEmitter {
     }
 
     int value_index = 0;
+    int local_index = 0;
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
         if (instruction.getType()->isVoidTy()) continue;
+        if (llvm::isa<llvm::AllocaInst>(&instruction)) {
+          names_[&instruction] = absl::StrCat("local", local_index++);
+          continue;
+        }
         if (IsPointerType(instruction)) continue;
         if (IsAggregateType(instruction.getType())) continue;
         names_[&instruction] = absl::StrCat("v", value_index++);
@@ -467,9 +477,21 @@ class FunctionEmitter {
     return llvm::Type::getInt8Ty(function_.getContext());
   }
 
+  struct ArrayInfo {
+    llvm::Type* element_type;
+    uint64_t element_count;
+  };
+
   absl::Status EmitDeclarations(std::string* output) {
+    RETURN_IF_ERROR(EmitThreadgroupGlobals(output));
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
+        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction)) {
+          TF_ASSIGN_OR_RETURN(std::string declaration,
+                              AllocaDeclaration(*alloca));
+          absl::StrAppend(output, "  ", declaration, "\n");
+          continue;
+        }
         if (instruction.getType()->isVoidTy()) continue;
         if (IsPointerType(instruction)) continue;
         if (IsAggregateType(instruction.getType())) continue;
@@ -481,6 +503,58 @@ class FunctionEmitter {
       }
     }
     return absl::OkStatus();
+  }
+
+  absl::Status EmitThreadgroupGlobals(std::string* output) {
+    for (const llvm::GlobalVariable& global : function_.getParent()->globals()) {
+      if (global.getAddressSpace() != 3) continue;
+      TF_ASSIGN_OR_RETURN(std::string declaration,
+                          ThreadgroupGlobalDeclaration(global));
+      absl::StrAppend(output, "  ", declaration, "\n");
+    }
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<std::string> ThreadgroupGlobalDeclaration(
+      const llvm::GlobalVariable& global) {
+    TF_ASSIGN_OR_RETURN(ArrayInfo array,
+                        FlattenedArrayInfo(global.getValueType()));
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(array.element_type));
+    return absl::StrCat("threadgroup ", type, " ", Name(&global), "[",
+                        array.element_count, "];");
+  }
+
+  absl::StatusOr<std::string> AllocaDeclaration(
+      const llvm::AllocaInst& alloca) {
+    auto* constant_count = llvm::dyn_cast<llvm::ConstantInt>(
+        alloca.getArraySize());
+    if (constant_count == nullptr) {
+      return Unsupported(function_, "dynamic stack allocation", alloca);
+    }
+
+    uint64_t count = constant_count->getZExtValue();
+    if (count == 0) {
+      return absl::InvalidArgumentError(
+          "Metal MSL emission cannot allocate a zero-sized stack slot.");
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string type,
+                        MslType(alloca.getAllocatedType()));
+    TF_ASSIGN_OR_RETURN(std::string zero,
+                        ZeroInitializer(alloca.getAllocatedType()));
+    std::vector<std::string> values(count, zero);
+    return absl::StrCat(type, " ", Name(&alloca), "[", count, "] = {",
+                        absl::StrJoin(values, ", "), "};");
+  }
+
+  absl::StatusOr<ArrayInfo> FlattenedArrayInfo(llvm::Type* type) {
+    if (auto* array_type = llvm::dyn_cast<llvm::ArrayType>(type)) {
+      TF_ASSIGN_OR_RETURN(ArrayInfo nested,
+                          FlattenedArrayInfo(array_type->getElementType()));
+      return ArrayInfo{nested.element_type,
+                       nested.element_count * array_type->getNumElements()};
+    }
+    return ArrayInfo{type, 1};
   }
 
   absl::Status EmitBody(std::string* output) {
@@ -733,6 +807,9 @@ class FunctionEmitter {
 
   absl::Status EmitInstruction(const llvm::Instruction& instruction,
                                std::string* output, int indent) {
+    if (llvm::isa<llvm::AllocaInst>(&instruction)) {
+      return absl::OkStatus();
+    }
     if (llvm::isa<llvm::GetElementPtrInst>(&instruction) &&
         IsPointerType(instruction)) {
       return absl::OkStatus();
@@ -767,8 +844,11 @@ class FunctionEmitter {
 
     if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
       if (call->getType()->isVoidTy()) {
-        TF_ASSIGN_OR_RETURN(std::string statement, VoidCallStatement(*call));
-        absl::StrAppend(output, Indent(indent), statement, "\n");
+        TF_ASSIGN_OR_RETURN(std::string statement,
+                            VoidCallStatementOrInline(*call));
+        if (!statement.empty()) {
+          absl::StrAppend(output, Indent(indent), statement, "\n");
+        }
         return absl::OkStatus();
       }
     }
@@ -1412,6 +1492,15 @@ class FunctionEmitter {
     }
   }
 
+  absl::StatusOr<std::string> VoidCallStatementOrInline(
+      const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee != nullptr && !callee->isDeclaration()) {
+      return InlineVoidFunctionCall(call);
+    }
+    return VoidCallStatement(call);
+  }
+
   absl::StatusOr<std::string> VoidCallStatement(const llvm::CallInst& call) {
     const llvm::Function* callee = call.getCalledFunction();
     if (callee == nullptr) return Unsupported(function_, "indirect call", call);
@@ -1420,12 +1509,307 @@ class FunctionEmitter {
         name == "llvm.cuda.syncthreads") {
       return "threadgroup_barrier(mem_flags::mem_threadgroup);";
     }
+    if (name == "llvm.assume") return "";
     return Unsupported(function_, "void call", call);
+  }
+
+  absl::StatusOr<std::string> InlineVoidFunctionCall(
+      const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "inline void call", call);
+    }
+    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+      return Unsupported(function_, "inline void function shape", call);
+    }
+
+    absl::flat_hash_map<const llvm::Value*, StoredInlineValue> values;
+    absl::flat_hash_map<const llvm::Value*, StoredInlineValue> memory;
+    std::optional<std::string> output_store;
+
+    const llvm::BasicBlock& block = callee->getEntryBlock();
+    for (const llvm::Instruction& instruction : block) {
+      if (llvm::isa<llvm::ReturnInst>(&instruction)) break;
+
+      if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction)) {
+        TF_ASSIGN_OR_RETURN(std::string zero,
+                            ZeroInitializer(alloca->getAllocatedType()));
+        memory.insert_or_assign(
+            alloca, StoredInlineValue{zero, alloca->getAllocatedType()});
+        continue;
+      }
+
+      if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+        TF_ASSIGN_OR_RETURN(
+            std::string value,
+            InlineValueExpr(store->getValueOperand(), call, values, memory));
+        const llvm::Value* root = InlinePointerRoot(store->getPointerOperand());
+        if (root == nullptr) {
+          return Unsupported(function_, "inline store pointer", *store);
+        }
+        StoredInlineValue stored{value, store->getValueOperand()->getType()};
+        if (llvm::isa<llvm::AllocaInst>(root)) {
+          memory.insert_or_assign(root, std::move(stored));
+          continue;
+        }
+        if (auto* argument = llvm::dyn_cast<llvm::Argument>(root)) {
+          TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                              PointerExprFor(call.getArgOperand(
+                                  argument->getArgNo())));
+          TF_ASSIGN_OR_RETURN(
+              std::string converted,
+              ConvertStoredValue(stored.expression, stored.type,
+                                 pointer.element_type));
+          output_store =
+              absl::StrCat(pointer.base, "[", pointer.index, "] = ",
+                           converted, ";");
+          continue;
+        }
+        return Unsupported(function_, "inline store destination", *store);
+      }
+
+      if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        TF_ASSIGN_OR_RETURN(std::string expression,
+                            InlineLoadExpr(*load, call, values, memory));
+        values.insert_or_assign(
+            load, StoredInlineValue{std::move(expression), load->getType()});
+        continue;
+      }
+
+      if (instruction.getType()->isVoidTy()) {
+        return Unsupported(function_, "inline void instruction", instruction);
+      }
+
+      TF_ASSIGN_OR_RETURN(
+          std::string expression,
+          InlineInstructionExpr(instruction, call, values, memory));
+      values.insert_or_assign(
+          &instruction,
+          StoredInlineValue{std::move(expression), instruction.getType()});
+    }
+
+    if (!output_store.has_value()) {
+      return Unsupported(function_, "inline void function without output store",
+                         call);
+    }
+    return *output_store;
+  }
+
+  const llvm::Value* InlinePointerRoot(const llvm::Value* value) const {
+    while (value != nullptr) {
+      if (llvm::isa<llvm::Argument>(value) ||
+          llvm::isa<llvm::AllocaInst>(value) ||
+          llvm::isa<llvm::GlobalVariable>(value)) {
+        return value;
+      }
+      if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
+        switch (op->getOpcode()) {
+          case llvm::Instruction::BitCast:
+          case llvm::Instruction::AddrSpaceCast:
+            value = op->getOperand(0);
+            continue;
+          default:
+            return value;
+        }
+      }
+      return value;
+    }
+    return nullptr;
+  }
+
+  absl::StatusOr<std::string> InlineLoadExpr(
+      const llvm::LoadInst& load, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
+    const llvm::Value* root = InlinePointerRoot(load.getPointerOperand());
+    if (root == nullptr) {
+      return Unsupported(function_, "inline load pointer", load);
+    }
+
+    if (llvm::isa<llvm::AllocaInst>(root)) {
+      auto it = memory.find(root);
+      if (it == memory.end()) {
+        return Unsupported(function_, "inline uninitialized stack load", load);
+      }
+      return ConvertStoredValue(it->second.expression, it->second.type,
+                                load.getType());
+    }
+
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(root)) {
+      TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                          PointerExprFor(call.getArgOperand(
+                              argument->getArgNo())));
+      std::string expression =
+          absl::StrCat(pointer.base, "[", pointer.index, "]");
+      return ConvertStoredValue(expression, pointer.element_type,
+                                load.getType());
+    }
+
+    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(root)) {
+      return InlineConstantGlobalLoadExpr(*global, load.getType());
+    }
+
+    return Unsupported(function_, "inline load source", load);
+  }
+
+  absl::StatusOr<std::string> InlineInstructionExpr(
+      const llvm::Instruction& instruction, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
+    if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineValueExpr(binary->getOperand(0), call, values, memory));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineValueExpr(binary->getOperand(1), call, values, memory));
+      return BinaryExprWithOperands(*binary, lhs, rhs);
+    }
+    if (instruction.getOpcode() == llvm::Instruction::FNeg) {
+      TF_ASSIGN_OR_RETURN(
+          std::string operand,
+          InlineValueExpr(instruction.getOperand(0), call, values, memory));
+      return absl::StrCat("(-", operand, ")");
+    }
+    if (auto* icmp = llvm::dyn_cast<llvm::ICmpInst>(&instruction)) {
+      bool unsigned_compare = icmp->isUnsigned();
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineValueExpr(icmp->getOperand(0), call, values, memory));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineValueExpr(icmp->getOperand(1), call, values, memory));
+      TF_ASSIGN_OR_RETURN(lhs,
+                          CastForUnsignedCompare(icmp->getOperand(0)->getType(),
+                                                 lhs, unsigned_compare));
+      TF_ASSIGN_OR_RETURN(rhs,
+                          CastForUnsignedCompare(icmp->getOperand(1)->getType(),
+                                                 rhs, unsigned_compare));
+      return ICmpExprWithOperands(*icmp, lhs, rhs);
+    }
+    if (auto* fcmp = llvm::dyn_cast<llvm::FCmpInst>(&instruction)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          InlineValueExpr(fcmp->getOperand(0), call, values, memory));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          InlineValueExpr(fcmp->getOperand(1), call, values, memory));
+      return FCmpExprWithOperands(*fcmp, lhs, rhs);
+    }
+    if (auto* select = llvm::dyn_cast<llvm::SelectInst>(&instruction)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string condition,
+          InlineValueExpr(select->getCondition(), call, values, memory));
+      TF_ASSIGN_OR_RETURN(
+          std::string true_value,
+          InlineValueExpr(select->getTrueValue(), call, values, memory));
+      TF_ASSIGN_OR_RETURN(
+          std::string false_value,
+          InlineValueExpr(select->getFalseValue(), call, values, memory));
+      return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                          false_value, ")");
+    }
+    if (auto* cast = llvm::dyn_cast<llvm::CastInst>(&instruction)) {
+      TF_ASSIGN_OR_RETURN(
+          std::string operand,
+          InlineValueExpr(cast->getOperand(0), call, values, memory));
+      TF_ASSIGN_OR_RETURN(std::string type, MslType(cast->getType()));
+      if (cast->getOpcode() == llvm::Instruction::BitCast) {
+        return absl::StrCat("as_type<", type, ">(", operand, ")");
+      }
+      return absl::StrCat("static_cast<", type, ">(", operand, ")");
+    }
+    return Unsupported(function_, "inline instruction", instruction);
+  }
+
+  absl::StatusOr<std::string> InlineValueExpr(
+      const llvm::Value* value, const llvm::CallInst& call,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& values,
+      const absl::flat_hash_map<const llvm::Value*, StoredInlineValue>& memory) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return Expr(call.getArgOperand(argument->getArgNo()));
+    }
+    if (llvm::isa<llvm::Constant>(value)) return Expr(value);
+    if (auto* instruction = llvm::dyn_cast<llvm::Instruction>(value)) {
+      auto it = values.find(instruction);
+      if (it != values.end()) return it->second.expression;
+    }
+    return Unsupported(function_, "inline value expression", *value);
+  }
+
+  absl::StatusOr<std::string> ConvertStoredValue(absl::string_view expression,
+                                                 llvm::Type* from_type,
+                                                 llvm::Type* to_type) {
+    if (from_type == to_type) return std::string(expression);
+    TF_ASSIGN_OR_RETURN(std::string to_msl_type, MslType(to_type));
+
+    std::optional<int64_t> from_size = FixedTypeSize(data_layout_, from_type);
+    std::optional<int64_t> to_size = FixedTypeSize(data_layout_, to_type);
+    if (from_size.has_value() && to_size.has_value() &&
+        *from_size == *to_size) {
+      return absl::StrCat("as_type<", to_msl_type, ">(", expression, ")");
+    }
+    return absl::StrCat("static_cast<", to_msl_type, ">(", expression, ")");
+  }
+
+  absl::StatusOr<std::string> InlineConstantGlobalLoadExpr(
+      const llvm::GlobalVariable& global, llvm::Type* load_type) {
+    if (!global.isConstant() || !global.hasInitializer()) {
+      return Unsupported(function_, "inline global load", global);
+    }
+
+    const llvm::Constant* initializer = global.getInitializer();
+    if (llvm::isa<llvm::ConstantAggregateZero>(initializer)) {
+      return ZeroInitializer(load_type);
+    }
+
+    auto* data = llvm::dyn_cast<llvm::ConstantDataSequential>(initializer);
+    if (data == nullptr) {
+      return Unsupported(function_, "inline global initializer", global);
+    }
+
+    std::optional<int64_t> load_size = FixedTypeSize(data_layout_, load_type);
+    if (!load_size.has_value() || *load_size <= 0 ||
+        data->getRawDataValues().size() < *load_size) {
+      return Unsupported(function_, "inline global load type", global);
+    }
+
+    uint64_t bits = 0;
+    llvm::StringRef raw = data->getRawDataValues();
+    for (int64_t i = 0; i < *load_size; ++i) {
+      bits |= static_cast<uint64_t>(static_cast<unsigned char>(raw[i]))
+              << (i * 8);
+    }
+
+    if (load_type->isFloatTy()) {
+      if (bits == 0) return "float(0)";
+      return absl::StrCat("as_type<float>(", static_cast<uint32_t>(bits),
+                          "u)");
+    }
+    if (load_type->isIntegerTy()) {
+      return IntegerLiteral(llvm::APInt(load_type->getIntegerBitWidth(), bits),
+                            /*is_signed=*/true);
+    }
+
+    return Unsupported(function_, "inline global load type", global);
   }
 
   absl::StatusOr<PtrExpr> PointerExprFor(const llvm::Value* value) {
     if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
       return PtrExpr{Name(argument), "0", PointerElementType(argument)};
+    }
+
+    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
+      if (global->getAddressSpace() != 3) {
+        return Unsupported(function_, "global pointer expression", *global);
+      }
+      TF_ASSIGN_OR_RETURN(ArrayInfo array,
+                          FlattenedArrayInfo(global->getValueType()));
+      return PtrExpr{Name(global), "0", array.element_type};
+    }
+
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+      return PtrExpr{Name(alloca), "0", alloca->getAllocatedType()};
     }
 
     if (auto* op = llvm::dyn_cast<llvm::Operator>(value)) {
