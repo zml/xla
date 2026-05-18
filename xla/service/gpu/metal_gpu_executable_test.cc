@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -312,6 +313,47 @@ absl::StatusOr<Literal> ExecuteMetalGatherSelect() {
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
 
   Literal input_literal = MakeGatherInput();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalSortRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaBuilder comparator_builder("metal_sort_comparator");
+  XlaOp lhs = Parameter(&comparator_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&comparator_builder, 1, scalar_shape, "rhs");
+  Lt(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation comparator, comparator_builder.Build());
+
+  XlaBuilder builder("metal_sort_rank1");
+  Shape shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Sort({input}, comparator, 0, /*is_stable=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalTopKValuesRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_topk_values_rank1");
+  Shape shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  GetTupleElement(TopK(input, 3, /*largest=*/true), 0);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   std::vector<GlobalData*> arguments = {input_data.get()};
@@ -1244,6 +1286,35 @@ TEST(MetalGpuExecutableTest, ElementwiseGatherSelect) {
   }
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesGatherReference(actual, MakeGatherInput());
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSortRank1) {
+  auto result = ExecuteMetalSortRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {-2.0f, -1.0f, 0.25f, 0.25f,
+                                 1.5f,  2.0f,  3.0f,  4.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKValuesRank1) {
+  auto result = ExecuteMetalTopKValuesRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {4.0f, 3.0f, 2.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {
