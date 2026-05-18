@@ -463,6 +463,40 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("arg0[v2] = v5;"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsAtomicFloatAdd) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @scatter_add(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %value_gep = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
+  %value = load float, ptr %value_gep, align 4
+  %out_gep = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %tid
+  %old = atomicrmw fadd ptr %out_gep, float %value monotonic, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @scatter_add, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("atomic_fetch_add_explicit"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("reinterpret_cast<device atomic_float*>(&arg0[v0])"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("memory_order_relaxed"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsTupleReducerArgmax) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

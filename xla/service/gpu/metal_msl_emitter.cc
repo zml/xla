@@ -759,6 +759,12 @@ class FunctionEmitter {
       return absl::OkStatus();
     }
 
+    if (auto* atomic = llvm::dyn_cast<llvm::AtomicRMWInst>(&instruction)) {
+      TF_ASSIGN_OR_RETURN(std::string statement, AtomicRmwStatement(*atomic));
+      absl::StrAppend(output, Indent(indent), statement, "\n");
+      return absl::OkStatus();
+    }
+
     if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
       if (call->getType()->isVoidTy()) {
         TF_ASSIGN_OR_RETURN(std::string statement, VoidCallStatement(*call));
@@ -1333,6 +1339,77 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string arg1, Expr(call.getArgOperand(1)));
     TF_ASSIGN_OR_RETURN(std::string arg2, Expr(call.getArgOperand(2)));
     return absl::StrCat(msl_name, "(", arg0, ", ", arg1, ", ", arg2, ")");
+  }
+
+  absl::StatusOr<std::string> AtomicRmwStatement(
+      const llvm::AtomicRMWInst& atomic) {
+    TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                        PointerExprFor(atomic.getPointerOperand()));
+    TF_ASSIGN_OR_RETURN(std::string value, Expr(atomic.getValOperand()));
+    TF_ASSIGN_OR_RETURN(std::string expression,
+                        AtomicRmwExpr(atomic, pointer, value));
+    if (atomic.use_empty()) return absl::StrCat(expression, ";");
+    return absl::StrCat(Name(&atomic), " = ", expression, ";");
+  }
+
+  absl::StatusOr<std::string> AtomicRmwExpr(const llvm::AtomicRMWInst& atomic,
+                                            const PtrExpr& pointer,
+                                            absl::string_view value) {
+    TF_ASSIGN_OR_RETURN(std::string atomic_type,
+                        MslAtomicType(atomic.getValOperand()->getType(),
+                                      AtomicOpUsesUnsignedType(atomic)));
+    TF_ASSIGN_OR_RETURN(std::string function, AtomicRmwFunction(atomic));
+    return absl::StrCat(function, "(reinterpret_cast<device ", atomic_type,
+                        "*>(&", pointer.base, "[", pointer.index, "]), ",
+                        value, ", memory_order_relaxed)");
+  }
+
+  bool AtomicOpUsesUnsignedType(const llvm::AtomicRMWInst& atomic) const {
+    switch (atomic.getOperation()) {
+      case llvm::AtomicRMWInst::UMax:
+      case llvm::AtomicRMWInst::UMin:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  absl::StatusOr<std::string> MslAtomicType(llvm::Type* type,
+                                            bool unsigned_integer) {
+    if (type->isFloatTy()) return "atomic_float";
+    if (type->isIntegerTy(32)) {
+      return unsigned_integer ? "atomic_uint" : "atomic_int";
+    }
+    return absl::UnimplementedError(
+        absl::StrCat("Unsupported LLVM atomic type for MSL: ",
+                     PrintLlvmType(*type)));
+  }
+
+  absl::StatusOr<std::string> AtomicRmwFunction(
+      const llvm::AtomicRMWInst& atomic) {
+    switch (atomic.getOperation()) {
+      case llvm::AtomicRMWInst::Add:
+      case llvm::AtomicRMWInst::FAdd:
+        return "atomic_fetch_add_explicit";
+      case llvm::AtomicRMWInst::Sub:
+        return "atomic_fetch_sub_explicit";
+      case llvm::AtomicRMWInst::And:
+        return "atomic_fetch_and_explicit";
+      case llvm::AtomicRMWInst::Or:
+        return "atomic_fetch_or_explicit";
+      case llvm::AtomicRMWInst::Xor:
+        return "atomic_fetch_xor_explicit";
+      case llvm::AtomicRMWInst::Max:
+      case llvm::AtomicRMWInst::UMax:
+        return "atomic_fetch_max_explicit";
+      case llvm::AtomicRMWInst::Min:
+      case llvm::AtomicRMWInst::UMin:
+        return "atomic_fetch_min_explicit";
+      case llvm::AtomicRMWInst::Xchg:
+        return "atomic_exchange_explicit";
+      default:
+        return Unsupported(function_, "atomic read-modify-write", atomic);
+    }
   }
 
   absl::StatusOr<std::string> VoidCallStatement(const llvm::CallInst& call) {
