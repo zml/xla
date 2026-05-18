@@ -352,9 +352,7 @@ class ElementwiseAirEmitter {
                                         std::vector<std::string>* body) {
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (!IsScalarLikeSupported(instr->operand(0)->shape())) {
-        return absl::UnimplementedError(
-            "Metal direct AIR elementwise currently supports only f32/s32 scalar "
-            "broadcasts.");
+        return EmitBroadcast(instr, body);
       }
       return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
     }
@@ -516,6 +514,34 @@ class ElementwiseAirEmitter {
             "count.");
       }
       return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+    }
+    if (instr->opcode() == HloOpcode::kBroadcast) {
+      if (ShapeUtil::ElementsIn(instr->shape()) !=
+          ShapeUtil::ElementsIn(instr->operand(0)->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load broadcast currently supports only "
+            "broadcasts that preserve element count.");
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+    }
+    if (instr->opcode() == HloOpcode::kIota) {
+      if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+          instr->shape().dimensions().size() != 1 ||
+          instr->dimensions().size() != 1 || instr->dimensions(0) != 0) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load iota currently supports only rank-1 "
+            "f32/s32 iotas over dimension 0.");
+      }
+      if (instr->shape().element_type() == S32) {
+        std::string value = NewName("linear_iota_s32");
+        body->push_back(
+            absl::StrFormat("  %s = trunc i64 %s to i32", value, index));
+        return value;
+      }
+      std::string value = NewName("linear_iota");
+      body->push_back(
+          absl::StrFormat("  %s = uitofp i64 %s to float", value, index));
+      return value;
     }
     if (instr->opcode() == HloOpcode::kSlice) {
       if (!IsF32Array(instr->shape()) ||
@@ -702,6 +728,45 @@ class ElementwiseAirEmitter {
     body->push_back(
         absl::StrFormat("  %s = uitofp i64 %%idx to float", value));
     return value;
+  }
+
+  absl::StatusOr<std::string> EmitBroadcast(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    if (!instr->shape().IsArray() || !operand->shape().IsArray() ||
+        instr->shape().dimensions().size() != 2 ||
+        operand->shape().dimensions().size() != 1 ||
+        instr->dimensions().size() != 1 ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise broadcast currently supports only "
+          "rank-1 operands broadcast into rank-2 results.");
+    }
+    std::string source_index;
+    const int64_t major = instr->shape().dimensions(0);
+    const int64_t minor = instr->shape().dimensions(1);
+    if (instr->dimensions()[0] == 0) {
+      source_index = NewName("broadcast_major");
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", source_index, minor));
+      if (operand->shape().dimensions(0) != major) {
+        return absl::UnimplementedError(
+            "Metal direct AIR broadcast operand dimension mismatch.");
+      }
+    } else if (instr->dimensions()[0] == 1) {
+      source_index = NewName("broadcast_minor");
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", source_index, minor));
+      if (operand->shape().dimensions(0) != minor) {
+        return absl::UnimplementedError(
+            "Metal direct AIR broadcast operand dimension mismatch.");
+      }
+    } else {
+      return absl::UnimplementedError(
+          "Metal direct AIR broadcast dimension out of range.");
+    }
+    return EmitLoadFromLinearIndex(operand, source_index, body);
   }
 
   int InputIndexForParameter(int64_t parameter_number, PrimitiveType type) {
