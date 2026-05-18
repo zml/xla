@@ -13,6 +13,7 @@ load(
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test", "xla_internal")
 load("//xla/tests:build_defs.bzl", "xla_test")
+load("//xla/util:build_defs.bzl", "embed_files")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
@@ -3711,6 +3712,12 @@ cc_library(
     ],
 )
 
+embed_files(
+    name = "embed_metal_air_kernels",
+    srcs = ["metal_air_experiment/matmul_air_direct.ll"],
+    cpp_namespace = "xla::gpu",
+)
+
 cc_library(
     name = "metal_gpu_compiler",
     srcs = [
@@ -3732,25 +3739,63 @@ cc_library(
     name = "metal_gpu_compiler_impl",
     srcs = [
         "metal_gpu_compiler.cc",
+        "metal_gpu_executable.cc",
     ],
     hdrs = [
         "metal_gpu_compiler.h",
+        "metal_gpu_executable.h",
     ],
     tags = [
         "gpu",
         "metal-only",
     ],
     deps = [
+        ":embed_metal_air_kernels",
         "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/service:compiler",
         "//xla/service:executable",
         "//xla/service:hlo_cost_analysis",
         "//xla/service:hlo_module_config",
+        "//xla/service:service_executable_run_options",
+        "//xla/service:shaped_buffer",
+        "//xla:status_macros",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:subprocess",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_gpu_executable_test",
+    srcs = ["metal_gpu_executable_test.cc"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_gpu_compiler",
+        ":gpu_transfer_manager",
+        "//xla/client:client_library",
+        "//xla/hlo/builder:xla_builder",
+        "//xla:literal",
+        "//xla:literal_comparison",
+        "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla/service:platform_util",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor/metal:metal_platform",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

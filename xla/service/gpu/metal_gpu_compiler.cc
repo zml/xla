@@ -23,7 +23,9 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/metal_gpu_executable.h"
 #include "xla/shape_util.h"
+#include "xla/status_macros.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
 
 namespace xla {
@@ -51,14 +53,30 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
 absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
-  return DirectAirNotWired();
+  TF_ASSIGN_OR_RETURN(MetalMatmulConfig config, MatchMetalMatmul(*module));
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
+                      CompileMetalMatmulAirToMetallib());
+  auto shared_module = std::shared_ptr<HloModule>(std::move(module));
+  return std::make_unique<MetalMatmulExecutable>(
+      std::move(shared_module), config, std::move(metallib));
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<Executable>>>
 MetalGpuCompiler::Compile(std::unique_ptr<HloModule> hlo_module,
                           std::vector<se::StreamExecutor*> stream_exec,
                           const CompileOptions& options) {
-  return DirectAirNotWired();
+  if (stream_exec.empty()) {
+    return absl::InvalidArgumentError(
+        "Metal compilation requires at least one StreamExecutor.");
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
+                      RunHloPasses(std::move(hlo_module), stream_exec[0],
+                                   options));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Executable> executable,
+                      RunBackend(std::move(module), stream_exec[0], options));
+  std::vector<std::unique_ptr<Executable>> executables;
+  executables.push_back(std::move(executable));
+  return executables;
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
