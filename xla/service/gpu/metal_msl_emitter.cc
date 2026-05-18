@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -51,6 +52,20 @@ namespace gpu {
 namespace {
 
 constexpr size_t kMaxDirectMetalBufferArguments = 31;
+
+struct BlockStopKey {
+  const llvm::BasicBlock* block;
+  const llvm::BasicBlock* stop;
+
+  template <typename H>
+  friend H AbslHashValue(H h, const BlockStopKey& key) {
+    return H::combine(std::move(h), key.block, key.stop);
+  }
+
+  bool operator==(const BlockStopKey& other) const {
+    return block == other.block && stop == other.stop;
+  }
+};
 
 std::string PrintLlvm(const llvm::Value& value) {
   std::string result;
@@ -813,26 +828,39 @@ class FunctionEmitter {
 
   bool CanEmitStructuredBlockToStop(const llvm::BasicBlock* block,
                                     const llvm::BasicBlock* stop_block) const {
-    absl::flat_hash_set<const llvm::BasicBlock*> visited;
-    return CanEmitStructuredBlockToStop(block, stop_block, &visited);
+    absl::flat_hash_map<BlockStopKey, bool> memo;
+    absl::flat_hash_set<BlockStopKey> active;
+    return CanEmitStructuredBlockToStop(block, stop_block, &memo, &active);
   }
 
   bool CanEmitStructuredBlockToStop(
       const llvm::BasicBlock* block, const llvm::BasicBlock* stop_block,
-      absl::flat_hash_set<const llvm::BasicBlock*>* visited) const {
+      absl::flat_hash_map<BlockStopKey, bool>* memo,
+      absl::flat_hash_set<BlockStopKey>* active) const {
     if (block == stop_block) return true;
-    if (block == nullptr || !visited->insert(block).second) return false;
+    if (block == nullptr) return false;
+
+    BlockStopKey key{block, stop_block};
+    if (auto it = memo->find(key); it != memo->end()) {
+      return it->second;
+    }
+    if (!active->insert(key).second) return false;
+    auto finish = [&](bool result) {
+      active->erase(key);
+      memo->insert_or_assign(key, result);
+      return result;
+    };
 
     const llvm::Instruction* terminator = block->getTerminator();
-    if (llvm::isa<llvm::ReturnInst>(terminator)) return false;
+    if (llvm::isa<llvm::ReturnInst>(terminator)) return finish(false);
 
     if (const auto* branch = llvm::dyn_cast<llvm::UncondBrInst>(terminator)) {
-      return CanEmitStructuredBlockToStop(branch->getSuccessor(0), stop_block,
-                                          visited);
+      return finish(CanEmitStructuredBlockToStop(
+          branch->getSuccessor(0), stop_block, memo, active));
     }
 
     const auto* branch = llvm::dyn_cast<llvm::CondBrInst>(terminator);
-    if (branch == nullptr) return false;
+    if (branch == nullptr) return finish(false);
 
     const llvm::BasicBlock* true_block = branch->getSuccessor(0);
     const llvm::BasicBlock* false_block = branch->getSuccessor(1);
@@ -842,49 +870,42 @@ class FunctionEmitter {
         UnconditionalBranchSuccessor(*false_block);
 
     if (true_block == block) {
-      return CanEmitStructuredBlockToStop(false_block, stop_block, visited);
+      return finish(
+          CanEmitStructuredBlockToStop(false_block, stop_block, memo, active));
     }
     if (false_block == block) {
-      return CanEmitStructuredBlockToStop(true_block, stop_block, visited);
+      return finish(
+          CanEmitStructuredBlockToStop(true_block, stop_block, memo, active));
     }
 
     if (true_successor != nullptr && true_successor == false_successor) {
-      absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
-      absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
-      absl::flat_hash_set<const llvm::BasicBlock*> merge_visited = *visited;
-      return CanEmitStructuredBlockToStop(true_block, true_successor,
-                                          &true_visited) &&
-             CanEmitStructuredBlockToStop(false_block, false_successor,
-                                          &false_visited) &&
-             CanEmitStructuredBlockToStop(true_successor, stop_block,
-                                          &merge_visited);
+      return finish(CanEmitStructuredBlockToStop(true_block, true_successor,
+                                                 memo, active) &&
+                    CanEmitStructuredBlockToStop(false_block, false_successor,
+                                                 memo, active) &&
+                    CanEmitStructuredBlockToStop(true_successor, stop_block,
+                                                 memo, active));
     }
 
-    absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
-    absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
-    if (CanEmitStructuredBlockToStop(true_block, false_block, &true_visited) &&
-        CanEmitStructuredBlockToStop(false_block, stop_block, &false_visited)) {
-      return true;
+    if (CanEmitStructuredBlockToStop(true_block, false_block, memo, active) &&
+        CanEmitStructuredBlockToStop(false_block, stop_block, memo, active)) {
+      return finish(true);
     }
 
-    true_visited = *visited;
-    false_visited = *visited;
     if (CanEmitStructuredBlockToStop(false_block, true_block,
-                                     &false_visited) &&
-        CanEmitStructuredBlockToStop(true_block, stop_block, &true_visited)) {
-      return true;
+                                     memo, active) &&
+        CanEmitStructuredBlockToStop(true_block, stop_block, memo, active)) {
+      return finish(true);
     }
 
     if (stop_block != nullptr) {
-      true_visited = *visited;
-      false_visited = *visited;
-      return CanEmitStructuredBlockToStop(true_block, stop_block,
-                                          &true_visited) &&
-             CanEmitStructuredBlockToStop(false_block, stop_block,
-                                          &false_visited);
+      return finish(CanEmitStructuredBlockToStop(true_block, stop_block, memo,
+                                                 active) &&
+                    CanEmitStructuredBlockToStop(false_block, stop_block, memo,
+                                                 active));
     }
 
-    return false;
+    return finish(false);
   }
 
   absl::StatusOr<bool> TryEmitIfElseDiamond(const llvm::CondBrInst& branch,
