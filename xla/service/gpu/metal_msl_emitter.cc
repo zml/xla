@@ -413,12 +413,6 @@ class FunctionEmitter {
     llvm::Type* type;
   };
 
-  struct PhiBranch {
-    const llvm::CondBrInst* branch;
-    const llvm::Value* true_value;
-    const llvm::Value* false_value;
-  };
-
   void InferPointerElementTypes() {
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
@@ -2076,7 +2070,7 @@ class FunctionEmitter {
                         false_value, ")");
   }
 
-  absl::StatusOr<PhiBranch> LinearPhiBranch(
+  absl::StatusOr<std::string> InlineSimplePhiValue(
       const llvm::PHINode& phi, const llvm::CallInst& call) {
     const llvm::BasicBlock* merge_block = phi.getParent();
     const llvm::Function* function = merge_block->getParent();
@@ -2084,32 +2078,18 @@ class FunctionEmitter {
       const auto* branch =
           llvm::dyn_cast<llvm::CondBrInst>(block.getTerminator());
       if (branch == nullptr) continue;
-
-      absl::StatusOr<const llvm::Value*> true_value =
-          PhiIncomingValueOnLinearPath(branch->getSuccessor(0), merge_block,
-                                       phi, call);
+      absl::StatusOr<std::string> true_value = InlinePhiIncomingForPath(
+          branch->getSuccessor(0), merge_block, phi, call);
       if (!true_value.ok()) continue;
-      absl::StatusOr<const llvm::Value*> false_value =
-          PhiIncomingValueOnLinearPath(branch->getSuccessor(1), merge_block,
-                                       phi, call);
+      absl::StatusOr<std::string> false_value = InlinePhiIncomingForPath(
+          branch->getSuccessor(1), merge_block, phi, call);
       if (!false_value.ok()) continue;
-      return PhiBranch{branch, *true_value, *false_value};
+      TF_ASSIGN_OR_RETURN(std::string condition,
+                          InlineSimpleValue(branch->getCondition(), call));
+      return absl::StrCat("(", condition, " ? ", *true_value, " : ",
+                          *false_value, ")");
     }
-    return Unsupported(function_, "linear inline phi", phi);
-  }
-
-  absl::StatusOr<std::string> InlineSimplePhiValue(
-      const llvm::PHINode& phi, const llvm::CallInst& call) {
-    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, call));
-    TF_ASSIGN_OR_RETURN(std::string condition,
-                        InlineSimpleValue(phi_branch.branch->getCondition(),
-                                          call));
-    TF_ASSIGN_OR_RETURN(std::string true_value,
-                        InlineSimpleValue(phi_branch.true_value, call));
-    TF_ASSIGN_OR_RETURN(std::string false_value,
-                        InlineSimpleValue(phi_branch.false_value, call));
-    return absl::StrCat("(", condition, " ? ", true_value, " : ",
-                        false_value, ")");
+    return Unsupported(function_, "inline phi", phi);
   }
 
   absl::StatusOr<std::string> InlineSimpleAggregateElement(
@@ -2654,19 +2634,76 @@ class FunctionEmitter {
   absl::StatusOr<std::string> InlineNestedPhiValue(
       const llvm::PHINode& phi, const llvm::CallInst& nested_call,
       const llvm::CallInst& outer_call) {
-    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, nested_call));
+    const llvm::BasicBlock* merge_block = phi.getParent();
+    const llvm::Function* function = merge_block->getParent();
+    for (const llvm::BasicBlock& block : *function) {
+      const auto* branch =
+          llvm::dyn_cast<llvm::CondBrInst>(block.getTerminator());
+      if (branch == nullptr) continue;
+      absl::StatusOr<std::string> true_value =
+          InlineNestedPhiIncomingForPath(branch->getSuccessor(0), merge_block,
+                                        phi, nested_call, outer_call);
+      if (!true_value.ok()) continue;
+      absl::StatusOr<std::string> false_value =
+          InlineNestedPhiIncomingForPath(branch->getSuccessor(1), merge_block,
+                                        phi, nested_call, outer_call);
+      if (!false_value.ok()) continue;
+      TF_ASSIGN_OR_RETURN(
+          std::string condition,
+          InlineNestedSimpleValue(branch->getCondition(), nested_call,
+                                  outer_call));
+      return absl::StrCat("(", condition, " ? ", *true_value, " : ",
+                          *false_value, ")");
+    }
+    return Unsupported(function_, "nested inline phi", phi);
+  }
+
+  absl::StatusOr<std::string> InlineNestedPhiIncomingForPath(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* merge_block,
+      const llvm::PHINode& phi, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (absl::StatusOr<const llvm::Value*> incoming =
+            PhiIncomingValueOnLinearPath(block, merge_block, phi, nested_call);
+        incoming.ok()) {
+      return InlineNestedSimpleValue(*incoming, nested_call, outer_call);
+    }
+
+    const auto* branch =
+        llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+    if (branch == nullptr) {
+      return Unsupported(function_, "nested inline function shape",
+                         nested_call);
+    }
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(0));
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(1));
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return Unsupported(function_, "nested inline function shape",
+                         nested_call);
+    }
+
+    const llvm::BasicBlock* local_merge = true_successor;
+    TF_ASSIGN_OR_RETURN(const llvm::Value* incoming,
+                        PhiIncomingValueOnLinearPath(
+                            local_merge, merge_block, phi, nested_call));
+    const auto* local_phi = llvm::dyn_cast<llvm::PHINode>(incoming);
+    if (local_phi == nullptr || local_phi->getParent() != local_merge) {
+      return InlineNestedSimpleValue(incoming, nested_call, outer_call);
+    }
+
     TF_ASSIGN_OR_RETURN(
         std::string condition,
-        InlineNestedSimpleValue(phi_branch.branch->getCondition(), nested_call,
+        InlineNestedSimpleValue(branch->getCondition(), nested_call,
                                 outer_call));
     TF_ASSIGN_OR_RETURN(
         std::string true_value,
-        InlineNestedSimpleValue(phi_branch.true_value, nested_call,
-                                outer_call));
+        InlineNestedPhiIncomingForPath(branch->getSuccessor(0), local_merge,
+                                      *local_phi, nested_call, outer_call));
     TF_ASSIGN_OR_RETURN(
         std::string false_value,
-        InlineNestedSimpleValue(phi_branch.false_value, nested_call,
-                                outer_call));
+        InlineNestedPhiIncomingForPath(branch->getSuccessor(1), local_merge,
+                                      *local_phi, nested_call, outer_call));
     return absl::StrCat("(", condition, " ? ", true_value, " : ",
                         false_value, ")");
   }
@@ -2789,19 +2826,80 @@ class FunctionEmitter {
   absl::StatusOr<std::string> InlineDoubleNestedPhiValue(
       const llvm::PHINode& phi, const llvm::CallInst& call,
       const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
-    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, call));
-    TF_ASSIGN_OR_RETURN(std::string condition,
-                        InlineDoubleNestedSimpleValue(
-                            phi_branch.branch->getCondition(), call,
-                            nested_call, outer_call));
-    TF_ASSIGN_OR_RETURN(std::string true_value,
-                        InlineDoubleNestedSimpleValue(
-                            phi_branch.true_value, call, nested_call,
-                            outer_call));
-    TF_ASSIGN_OR_RETURN(std::string false_value,
-                        InlineDoubleNestedSimpleValue(
-                            phi_branch.false_value, call, nested_call,
-                            outer_call));
+    const llvm::BasicBlock* merge_block = phi.getParent();
+    const llvm::Function* function = merge_block->getParent();
+    for (const llvm::BasicBlock& block : *function) {
+      const auto* branch =
+          llvm::dyn_cast<llvm::CondBrInst>(block.getTerminator());
+      if (branch == nullptr) continue;
+      absl::StatusOr<std::string> true_value =
+          InlineDoubleNestedPhiIncomingForPath(
+              branch->getSuccessor(0), merge_block, phi, call, nested_call,
+              outer_call);
+      if (!true_value.ok()) continue;
+      absl::StatusOr<std::string> false_value =
+          InlineDoubleNestedPhiIncomingForPath(
+              branch->getSuccessor(1), merge_block, phi, call, nested_call,
+              outer_call);
+      if (!false_value.ok()) continue;
+      TF_ASSIGN_OR_RETURN(
+          std::string condition,
+          InlineDoubleNestedSimpleValue(branch->getCondition(), call,
+                                        nested_call, outer_call));
+      return absl::StrCat("(", condition, " ? ", *true_value, " : ",
+                          *false_value, ")");
+    }
+    return Unsupported(function_, "double nested inline phi", phi);
+  }
+
+  absl::StatusOr<std::string> InlineDoubleNestedPhiIncomingForPath(
+      const llvm::BasicBlock* block, const llvm::BasicBlock* merge_block,
+      const llvm::PHINode& phi, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (absl::StatusOr<const llvm::Value*> incoming =
+            PhiIncomingValueOnLinearPath(block, merge_block, phi, call);
+        incoming.ok()) {
+      return InlineDoubleNestedSimpleValue(*incoming, call, nested_call,
+                                           outer_call);
+    }
+
+    const auto* branch =
+        llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+    if (branch == nullptr) {
+      return Unsupported(function_, "nested inline function shape", call);
+    }
+    const llvm::BasicBlock* true_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(0));
+    const llvm::BasicBlock* false_successor =
+        UnconditionalBranchSuccessor(*branch->getSuccessor(1));
+    if (true_successor == nullptr || true_successor != false_successor) {
+      return Unsupported(function_, "nested inline function shape", call);
+    }
+
+    const llvm::BasicBlock* local_merge = true_successor;
+    TF_ASSIGN_OR_RETURN(const llvm::Value* incoming,
+                        PhiIncomingValueOnLinearPath(local_merge, merge_block,
+                                                     phi, call));
+    const auto* local_phi = llvm::dyn_cast<llvm::PHINode>(incoming);
+    if (local_phi == nullptr || local_phi->getParent() != local_merge) {
+      return InlineDoubleNestedSimpleValue(incoming, call, nested_call,
+                                           outer_call);
+    }
+
+    TF_ASSIGN_OR_RETURN(
+        std::string condition,
+        InlineDoubleNestedSimpleValue(branch->getCondition(), call,
+                                      nested_call, outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string true_value,
+        InlineDoubleNestedPhiIncomingForPath(
+            branch->getSuccessor(0), local_merge, *local_phi, call,
+            nested_call, outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string false_value,
+        InlineDoubleNestedPhiIncomingForPath(
+            branch->getSuccessor(1), local_merge, *local_phi, call,
+            nested_call, outer_call));
     return absl::StrCat("(", condition, " ? ", true_value, " : ",
                         false_value, ")");
   }
