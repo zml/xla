@@ -1310,6 +1310,59 @@ TEST(MetalGpuExecutableTest, ElementwiseRank2Slice) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSlice) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_dynamic_update_slice");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+  Shape update_shape = ShapeUtil::MakeShape(F32, {2, 2});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp update = Parameter(&builder, 1, update_shape, "update");
+  DynamicUpdateSlice(input, update,
+                     {ConstantR0<int32_t>(&builder, 1),
+                      ConstantR0<int32_t>(&builder, 2)});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array2D<float> input_values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      input_values(row, col) = static_cast<float>(row * 5 + col);
+    }
+  }
+  Array2D<float> update_values(2, 2);
+  update_values(0, 0) = -1.0f;
+  update_values(0, 1) = -2.0f;
+  update_values(1, 0) = -3.0f;
+  update_values(1, 1) = -4.0f;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(input_values);
+  Literal update_literal = LiteralUtil::CreateR2FromArray2D(update_values);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> update_data,
+                          client->TransferToServer(update_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), update_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), input_shape));
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      float expected = input_values(row, col);
+      if (row >= 1 && row < 3 && col >= 2 && col < 4) {
+        expected = update_values(row - 1, col - 2);
+      }
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseReshapeParameter) {
   auto client_result = GetMetalClient();
   if (absl::IsFailedPrecondition(client_result.status())) {

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/metal_gpu_executable.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -415,6 +416,8 @@ class ElementwiseAirEmitter {
         return EmitConvert(instr, body);
       case HloOpcode::kGather:
         return EmitGather(instr, body);
+      case HloOpcode::kDynamicUpdateSlice:
+        return EmitDynamicUpdateSlice(instr, body);
       case HloOpcode::kIota:
         return EmitIota(instr, body);
       case HloOpcode::kPad:
@@ -826,6 +829,120 @@ class ElementwiseAirEmitter {
           "Metal direct AIR broadcast dimension out of range.");
     }
     return EmitLoadFromLinearIndex(operand, source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitDynamicUpdateSlice(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    const HloInstruction* update = instr->operand(1);
+    if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
+        !IsF32Array(update->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), input->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dynamic-update-slice currently supports only f32 "
+          "array updates with result shape matching the input shape.");
+    }
+    const int64_t rank = instr->shape().dimensions().size();
+    if (rank != update->shape().dimensions().size() ||
+        instr->operand_count() != rank + 2 || (rank != 1 && rank != 2)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dynamic-update-slice currently supports only "
+          "rank-1 and rank-2 updates.");
+    }
+
+    std::vector<int64_t> starts;
+    starts.reserve(rank);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      const HloInstruction* start = instr->operand(dim + 2);
+      if (!start->IsConstant() || !IsScalarLikeS32(start->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR dynamic-update-slice currently requires static "
+            "s32 start indices.");
+      }
+      int64_t value = start->literal().Get<int32_t>({});
+      const int64_t max_start =
+          instr->shape().dimensions(dim) - update->shape().dimensions(dim);
+      value = std::max<int64_t>(0, std::min<int64_t>(value, max_start));
+      starts.push_back(value);
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string input_value,
+                        EmitLoadFromLinearIndex(input, "%idx", body));
+    std::string in_update;
+    std::string update_index;
+    if (rank == 1) {
+      std::string ge_start = NewName("dus_ge_start");
+      std::string lt_end = NewName("dus_lt_end");
+      in_update = NewName("dus_in_update");
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %d",
+                                      ge_start, starts[0]));
+      body->push_back(absl::StrFormat(
+          "  %s = icmp ult i64 %%idx, %d", lt_end,
+          starts[0] + update->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_update,
+                                      ge_start, lt_end));
+      update_index = NewName("dus_update_index");
+      body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
+                                      update_index, starts[0]));
+    } else {
+      const int64_t result_minor = instr->shape().dimensions(1);
+      const int64_t update_minor = update->shape().dimensions(1);
+      std::string row = NewName("dus_row");
+      std::string col = NewName("dus_col");
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", row, result_minor));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", col, result_minor));
+      std::string row_ge_start = NewName("dus_row_ge_start");
+      std::string row_lt_end = NewName("dus_row_lt_end");
+      std::string col_ge_start = NewName("dus_col_ge_start");
+      std::string col_lt_end = NewName("dus_col_lt_end");
+      std::string row_in = NewName("dus_row_in");
+      std::string col_in = NewName("dus_col_in");
+      in_update = NewName("dus_in_update");
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                      row_ge_start, row, starts[0]));
+      body->push_back(absl::StrFormat(
+          "  %s = icmp ult i64 %s, %d", row_lt_end, row,
+          starts[0] + update->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                      col_ge_start, col, starts[1]));
+      body->push_back(absl::StrFormat(
+          "  %s = icmp ult i64 %s, %d", col_lt_end, col,
+          starts[1] + update->shape().dimensions(1)));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", row_in,
+                                      row_ge_start, row_lt_end));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", col_in,
+                                      col_ge_start, col_lt_end));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_update,
+                                      row_in, col_in));
+      std::string local_row = NewName("dus_local_row");
+      std::string local_col = NewName("dus_local_col");
+      std::string row_offset = NewName("dus_row_offset");
+      update_index = NewName("dus_update_index");
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", local_row, row,
+                                      starts[0]));
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", local_col, col,
+                                      starts[1]));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      local_row, update_minor));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", update_index,
+                                      row_offset, local_col));
+    }
+
+    std::string safe_update_index = NewName("dus_safe_update_index");
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i64 %s, i64 0", safe_update_index, in_update,
+        update_index));
+    TF_ASSIGN_OR_RETURN(
+        std::string update_value,
+        EmitLoadFromLinearIndex(update, safe_update_index, body));
+    std::string result = NewName("dus_select");
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", result, in_update,
+        update_value, input_value));
+    return result;
   }
 
   int InputIndexForParameter(int64_t parameter_number, PrimitiveType type) {
