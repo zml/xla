@@ -1428,6 +1428,9 @@ cc_library(
     name = "gpu_transfer_manager",
     srcs = ["gpu_transfer_manager.cc"],
     hdrs = ["gpu_transfer_manager.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         ":io_feed_manager",
         ":target_constants",
@@ -1445,7 +1448,6 @@ cc_library(
         "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
@@ -1463,7 +1465,9 @@ cc_library(
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:numbers",
         "@tsl//tsl/platform:statusor",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
     alwayslink = True,  # Contains per-platform transfer manager registration
 )
 

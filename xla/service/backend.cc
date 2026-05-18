@@ -36,7 +36,9 @@ limitations under the License.
 #include "xla/service/platform_util.h"
 #include "xla/service/stream_pool.h"
 #include "xla/service/transfer_manager.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
+#endif
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/host/host_platform_id.h"
@@ -247,8 +249,12 @@ Backend::Backend(se::Platform* platform, std::unique_ptr<Compiler> compiler,
       transfer_manager_(transfer_manager),
       computation_placer_(computation_placer),
       stream_executors_(stream_executors.begin(), stream_executors.end()) {
-  if (platform->id() == se::cuda::kCudaPlatformId ||
-      platform->id() == se::rocm::kROCmPlatformId) {
+  bool use_bfc_gpu_allocator =
+#if !TENSORFLOW_USE_METAL
+      platform->id() == se::cuda::kCudaPlatformId ||
+#endif
+      platform->id() == se::rocm::kROCmPlatformId;
+  if (use_bfc_gpu_allocator) {
     std::tie(allocator_streams_, memory_allocator_) =
         CreateGpuAllocators(platform, stream_executors_);
   } else {

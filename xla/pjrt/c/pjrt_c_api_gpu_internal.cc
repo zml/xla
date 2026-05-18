@@ -67,8 +67,10 @@ limitations under the License.
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_pjrt_client.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/python/custom_call_batch_partitioner.h"
 #include "xla/python/custom_partition_callback.h"
+#endif
 #include "xla/service/compiler.h"
 #include "xla/service/cpu/executable.pb.h"
 #include "xla/service/custom_call_target_registry.h"
@@ -470,6 +472,7 @@ PJRT_Profiler_Extension profiler_extension{
     /*profiler_api=*/&profiler_api,
 };
 
+#if !TENSORFLOW_USE_METAL
 PJRT_Error* PJRT_Register_Custom_Partitioner(
     PJRT_Register_Custom_Partitioner_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -501,6 +504,7 @@ PJRT_Custom_Partitioner_Extension custom_partitioner{
     /*register_custom_partitioner=*/PJRT_Register_Custom_Partitioner,
     /*register_batch_partitionable=*/PJRT_Register_Batch_Partitionable,
 };
+#endif
 
 PJRT_Error* PJRT_Get_Stream_For_External_Ready_Events(
     PJRT_Get_Stream_For_External_Ready_Events_Args* args) {
@@ -531,7 +535,11 @@ PJRT_Stream_Extension stream{
     PJRT_Extension_Base{
         /*struct_size=*/PJRT_Stream_Extension_STRUCT_SIZE,
         /*type=*/PJRT_Extension_Type::PJRT_Extension_Type_Stream,
+#if TENSORFLOW_USE_METAL
+        /*next=*/&profiler_extension.base,
+#else
         /*next=*/&custom_partitioner.base,
+#endif
     },
     /*get_stream=*/PJRT_Get_Stream_For_External_Ready_Events,
     /*wait_stream=*/PJRT_Wait_Until_Buffer_Ready_On_Stream,

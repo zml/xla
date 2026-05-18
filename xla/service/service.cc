@@ -72,7 +72,6 @@ limitations under the License.
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/profiler/lib/scoped_annotation.h"
 
 namespace xla {
 namespace {
@@ -628,11 +627,6 @@ absl::StatusOr<std::unique_ptr<Executable>> Service::BuildExecutable(
   VLOG(1) << StrFormat(
       "BuildExecutable on service %p with serialized module proto: %s", this,
       module_proto.name());
-
-  tsl::profiler::ScopedAnnotation annotation{[&] {
-    // module's unique_id is not available yet
-    return absl::StrFormat("XlaCompile:#module=%s#", module_proto.name());
-  }};
 
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<HloModule> module,

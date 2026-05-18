@@ -66,7 +66,6 @@ limitations under the License.
 #include "xla/util.h"
 #include "tsl/platform/path.h"
 #include "tsl/platform/platform.h"
-#include "tsl/profiler/lib/scoped_annotation.h"
 
 // BuildData isn't available in OSS.
 #if !TSL_IS_IN_OSS
@@ -340,10 +339,6 @@ static std::vector<std::string> DumpHloModuleImpl(
     const HloModule& module, const BufferAssignment* buffer_assn,
     string_view prefix, string_view suffix, const DumpOptions& opts,
     const DebugOptions& debug_options) {
-  tsl::profiler::ScopedAnnotation annotation([&] {
-    return absl::StrFormat("XlaDumpHloModule:#module=%s,program_id=%d#",
-                           module.name(), module.unique_id());
-  });
   std::string filename = FilenameFor(module, prefix, suffix);
 
   std::vector<std::optional<std::string>> file_paths;

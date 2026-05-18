@@ -575,7 +575,6 @@ cc_library(
         "@tsl//tsl/platform:path",
         "@tsl//tsl/platform:protobuf",
         "@tsl//tsl/platform:regexp",
-        "@tsl//tsl/profiler/lib:scoped_annotation",
     ] + if_google([
         "@com_google_absl//absl/base:builddata",
     ]),
@@ -1205,8 +1204,6 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:platform_manager",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_compute_capability",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
         "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
@@ -1218,7 +1215,10 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
 )
 
 xla_cc_test(
@@ -1240,6 +1240,9 @@ cc_library(
     name = "backend",
     srcs = ["backend.cc"],
     hdrs = ["backend.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         ":compiler",
         ":computation_placer",
@@ -1254,7 +1257,6 @@ cc_library(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_address_allocator",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
         "//xla/stream_executor/integrations:device_mem_allocator",
         "//xla/stream_executor/integrations:tf_allocator_adapter",
@@ -1275,7 +1277,9 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@eigen_archive//:eigen3",
         "@tsl//tsl/platform:platform_port",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
 )
 
 cc_library(
@@ -1332,7 +1336,6 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:logging",
-        "@tsl//tsl/profiler/lib:scoped_annotation",
     ],
     alwayslink = 1,
 )
@@ -3396,6 +3399,9 @@ cc_library(
     name = "computation_placer",
     srcs = ["computation_placer.cc"],
     hdrs = ["computation_placer.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         "//xla:array2d",
         "//xla:literal",
@@ -3406,7 +3412,6 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla/runtime:device_id",
         "//xla/stream_executor:platform_id",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
         "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
@@ -3427,7 +3432,9 @@ cc_library(
         "@tsl//tsl/platform:errors",
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:status",
-    ] + if_libtpu([":tpu_computation_placer"]),
+    ] + if_libtpu([":tpu_computation_placer"]) + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
     alwayslink = True,  # Contains per-platform computation placer registration
 )
 

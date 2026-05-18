@@ -621,8 +621,6 @@ cc_library(
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_allocator_config",
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_client_options",
         "//xla/pjrt/plugin/xla_gpu:xla_gpu_pjrt_client",
-        "//xla/python:custom_call_batch_partitioner",
-        "//xla/python:custom_partition_callback",
         "//xla/service:compiler",
         "//xla/service:custom_call_target_registry",
         "//xla/service:gpu_topology",
@@ -646,6 +644,8 @@ cc_library(
     deps = [
         "//xla/pjrt/extensions/cross_host_transfers:pjrt_c_api_cross_host_transfer_extension",
         "//xla/pjrt/gpu:se_gpu_pjrt_compiler",  # buildcleaner: keep to register GPU AOT compiler
+        "//xla/python:custom_call_batch_partitioner",
+        "//xla/python:custom_partition_callback",
         "//xla/python:debug_callback_partitioner",  # To register "DebugCallbackCustomCallPartitioner" custom partitioning handler.
         "//xla/python:inspect_sharding",  # To register "InspectSharding" custom partitioning handler.
     ] + if_cuda_is_configured([
