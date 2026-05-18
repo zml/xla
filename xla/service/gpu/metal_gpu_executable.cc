@@ -674,8 +674,7 @@ class ElementwiseAirEmitter {
           "rank-1 f32 concatenates along dimension 0.");
     }
 
-    const HloInstruction* parameter = nullptr;
-    int64_t base_start = 0;
+    std::string selected;
     int64_t output_offset = 0;
     for (const HloInstruction* operand : instr->operands()) {
       if (!IsF32Array(operand->shape()) ||
@@ -684,44 +683,74 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise concatenate operands must be rank-1 "
             "f32 arrays.");
       }
-      const HloInstruction* operand_parameter = operand;
-      int64_t operand_start = 0;
-      if (operand->opcode() == HloOpcode::kSlice) {
-        if (operand->slice_strides().size() != 1 ||
-            operand->slice_strides(0) != 1 ||
-            operand->operand(0)->opcode() != HloOpcode::kParameter) {
-          return absl::UnimplementedError(
-              "Metal direct AIR elementwise concatenate currently supports "
-              "only contiguous slices of parameters.");
-        }
-        operand_parameter = operand->operand(0);
-        operand_start = operand->slice_starts(0);
-      }
-      if (operand_parameter->opcode() != HloOpcode::kParameter) {
+      const int64_t operand_elements = ShapeUtil::ElementsIn(operand->shape());
+      if (operand_elements == 0) {
         return absl::UnimplementedError(
-            "Metal direct AIR elementwise concatenate currently supports only "
-            "parameter or slice operands.");
+            "Metal direct AIR elementwise concatenate does not support empty "
+            "operands.");
       }
-      if (parameter == nullptr) {
-        parameter = operand_parameter;
-        base_start = operand_start;
+
+      std::string in_range;
+      const int64_t operand_end = output_offset + operand_elements;
+      if (output_offset == 0 &&
+          operand_end == ShapeUtil::ElementsIn(instr->shape())) {
+        in_range = "true";
+      } else if (output_offset == 0) {
+        in_range = NewName("concat_in_range");
+        body->push_back(
+            absl::StrFormat("  %s = icmp ult i64 %%idx, %d", in_range,
+                            operand_end));
+      } else if (operand_end == ShapeUtil::ElementsIn(instr->shape())) {
+        in_range = NewName("concat_in_range");
+        body->push_back(
+            absl::StrFormat("  %s = icmp uge i64 %%idx, %d", in_range,
+                            output_offset));
+      } else {
+        std::string ge_start = NewName("concat_ge_start");
+        std::string lt_end = NewName("concat_lt_end");
+        in_range = NewName("concat_in_range");
+        body->push_back(
+            absl::StrFormat("  %s = icmp uge i64 %%idx, %d", ge_start,
+                            output_offset));
+        body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %d",
+                                        lt_end, operand_end));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
+                                        ge_start, lt_end));
       }
-      if (operand_parameter != parameter ||
-          operand_start != base_start + output_offset) {
-        return absl::UnimplementedError(
-            "Metal direct AIR elementwise concatenate currently supports only "
-            "contiguous views of one parameter.");
+
+      std::string local_index = "%idx";
+      if (output_offset != 0) {
+        local_index = NewName("concat_local_index");
+        body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
+                                        local_index, output_offset));
       }
-      output_offset += ShapeUtil::ElementsIn(operand->shape());
+      std::string safe_index = local_index;
+      if (in_range != "true") {
+        safe_index = NewName("concat_safe_index");
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, i64 %s, i64 0", safe_index, in_range,
+            local_index));
+      }
+
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          EmitLoadFromLinearIndex(operand, safe_index, body));
+      if (selected.empty()) {
+        selected = value;
+      } else {
+        std::string next = NewName("concat_select");
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, float %s, float %s", next, in_range, value,
+            selected));
+        selected = next;
+      }
+      output_offset = operand_end;
     }
 
-    std::string source_index = "%idx";
-    if (base_start != 0) {
-      source_index = NewName("concat_idx");
-      body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
-                                      source_index, base_start));
+    if (output_offset != ShapeUtil::ElementsIn(instr->shape())) {
+      return absl::InvalidArgumentError(
+          "Metal direct AIR concatenate operand sizes do not match result.");
     }
-    return EmitLoadFromLinearIndex(parameter, source_index, body);
+    return selected;
   }
 
   absl::StatusOr<std::string> EmitSlice(const HloInstruction* instr,

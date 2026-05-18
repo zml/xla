@@ -1414,6 +1414,41 @@ TEST(MetalGpuExecutableTest, ElementwiseConcatenateSlices) {
                               /*size=*/256);
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseConcatenateTwoParameters) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_concatenate_two_parameters");
+  Shape shape = ShapeUtil::MakeShape(F32, {4});
+  XlaOp lhs = Parameter(&builder, 0, shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, shape, "rhs");
+  ConcatInDim(&builder, {lhs, rhs}, 0);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = LiteralUtil::CreateR1<float>({1.0f, 2.0f, 3.0f, 4.0f});
+  Literal rhs_literal =
+      LiteralUtil::CreateR1<float>({-1.0f, -2.0f, -3.0f, -4.0f});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> lhs_data,
+                          client->TransferToServer(lhs_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> rhs_data,
+                          client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
+  for (int64_t i = 0; i < 4; ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), lhs_literal.Get<float>({i}));
+    EXPECT_EQ(actual.Get<float>({i + 4}), rhs_literal.Get<float>({i}));
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseScalarSliceBroadcast) {
   auto result = ExecuteMetalElementwiseUnary(
       "metal_elementwise_scalar_slice_broadcast",
