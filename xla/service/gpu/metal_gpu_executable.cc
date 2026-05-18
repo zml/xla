@@ -293,14 +293,36 @@ class ElementwiseAirEmitter {
         return EmitUnary(instr, "fneg fast float", body);
       case HloOpcode::kAbs:
         return EmitAbs(instr, body);
+      case HloOpcode::kCos:
+        return EmitIntrinsicUnary(instr, "air.fast_cos.f32", body);
       case HloOpcode::kExp:
         return EmitIntrinsicUnary(instr, "air.fast_exp.f32", body);
+      case HloOpcode::kExpm1:
+        return EmitExpm1(instr, body);
+      case HloOpcode::kLog:
+        return EmitIntrinsicUnary(instr, "air.fast_log.f32", body);
+      case HloOpcode::kLog1p:
+        return EmitLog1p(instr, body);
+      case HloOpcode::kLogistic:
+        return EmitLogistic(instr, body);
       case HloOpcode::kSin:
         return EmitIntrinsicUnary(instr, "air.fast_sin.f32", body);
       case HloOpcode::kSqrt:
         return EmitIntrinsicUnary(instr, "air.fast_sqrt.f32", body);
       case HloOpcode::kTanh:
         return EmitIntrinsicUnary(instr, "air.fast_tanh.f32", body);
+      case HloOpcode::kRsqrt:
+        return EmitIntrinsicUnary(instr, "air.fast_rsqrt.f32", body);
+      case HloOpcode::kFloor:
+        return EmitIntrinsicUnary(instr, "air.fast_floor.f32", body);
+      case HloOpcode::kCeil:
+        return EmitIntrinsicUnary(instr, "air.fast_ceil.f32", body);
+      case HloOpcode::kRoundNearestEven:
+        return EmitIntrinsicUnary(instr, "air.fast_rint.f32", body);
+      case HloOpcode::kRoundNearestAfz:
+        return EmitIntrinsicUnary(instr, "air.fast_round.f32", body);
+      case HloOpcode::kSign:
+        return EmitIntrinsicUnary(instr, "air.sign.f32", body);
       default:
         return absl::UnimplementedError(absl::StrFormat(
             "Metal direct AIR elementwise does not support HLO opcode %s.",
@@ -343,6 +365,45 @@ class ElementwiseAirEmitter {
     std::string name = NewName("unary");
     body->push_back(absl::StrFormat("  %s = %s %s", name, op, value));
     return name;
+  }
+
+  absl::StatusOr<std::string> EmitLog1p(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string one_plus =
+        EmitOp("fadd fast float", value, "1.000000e+00", body);
+    std::string name = NewName("log1p");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_log.f32(float %s)", name, one_plus));
+    return name;
+  }
+
+  absl::StatusOr<std::string> EmitExpm1(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string exp = NewName("exp");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_exp.f32(float %s)", exp, value));
+    return EmitOp("fsub fast float", exp, "1.000000e+00", body);
+  }
+
+  absl::StatusOr<std::string> EmitLogistic(const HloInstruction* instr,
+                                           std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string neg = NewName("neg");
+    body->push_back(absl::StrFormat("  %s = fneg fast float %s", neg, value));
+    std::string exp = NewName("exp");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_exp.f32(float %s)", exp, neg));
+    std::string denom =
+        EmitOp("fadd fast float", "1.000000e+00", exp, body);
+    return EmitOp("fdiv fast float", "1.000000e+00", denom, body);
   }
 
   absl::StatusOr<std::string> EmitIntrinsicUnary(
@@ -448,10 +509,18 @@ target triple = "air64_v27-apple-macosx15.0.0"
 
 %%struct.ElementwiseParams = type { i32, i32, i32, i32 }
 
+declare float @air.fast_cos.f32(float) local_unnamed_addr #1
+declare float @air.fast_ceil.f32(float) local_unnamed_addr #1
 declare float @air.fast_exp.f32(float) local_unnamed_addr #1
+declare float @air.fast_floor.f32(float) local_unnamed_addr #1
+declare float @air.fast_log.f32(float) local_unnamed_addr #1
+declare float @air.fast_rint.f32(float) local_unnamed_addr #1
+declare float @air.fast_round.f32(float) local_unnamed_addr #1
+declare float @air.fast_rsqrt.f32(float) local_unnamed_addr #1
 declare float @air.fast_sin.f32(float) local_unnamed_addr #1
 declare float @air.fast_sqrt.f32(float) local_unnamed_addr #1
 declare float @air.fast_tanh.f32(float) local_unnamed_addr #1
+declare float @air.sign.f32(float) local_unnamed_addr #1
 
 define void @elementwise_f32(
 %s) local_unnamed_addr #0 {
