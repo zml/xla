@@ -584,6 +584,49 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsBfloat16ComparisonsAsFloat) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @bf16_compare(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %lhs_gep = getelementptr inbounds [4 x bfloat], ptr %arg0, i32 0, i32 %tid
+  %lhs = load bfloat, ptr %lhs_gep, align 2
+  %rhs_gep = getelementptr inbounds [4 x bfloat], ptr %arg1, i32 0, i32 %tid
+  %rhs = load bfloat, ptr %rhs_gep, align 2
+  %greater = fcmp ogt bfloat %lhs, %rhs
+  %as_i8 = zext i1 %greater to i8
+  %out = getelementptr inbounds [4 x i8], ptr %arg2, i32 0, i32 %tid
+  store i8 %as_i8, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @bf16_compare, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("!isnan(xla_metal_bf16_to_f32(v1))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("!isnan(xla_metal_bf16_to_f32(v2))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find(
+                "xla_metal_bf16_to_f32(v1) > xla_metal_bf16_to_f32(v2)"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsInlineReducerAndShuffleDown) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

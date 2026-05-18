@@ -1709,6 +1709,14 @@ class FunctionEmitter {
     }
   }
 
+  absl::StatusOr<std::string> CastForFloatCompare(
+      llvm::Type* type, absl::string_view expression) {
+    if (type->isBFloatTy()) {
+      return absl::StrCat("xla_metal_bf16_to_f32(", expression, ")");
+    }
+    return std::string(expression);
+  }
+
   absl::StatusOr<std::string> FCmpExpr(const llvm::FCmpInst& fcmp) {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(fcmp.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(fcmp.getOperand(1)));
@@ -1718,51 +1726,59 @@ class FunctionEmitter {
   absl::StatusOr<std::string> FCmpExprWithOperands(
       const llvm::FCmpInst& fcmp, absl::string_view lhs,
       absl::string_view rhs) {
+    TF_ASSIGN_OR_RETURN(std::string lhs_expr,
+                        CastForFloatCompare(fcmp.getOperand(0)->getType(),
+                                            lhs));
+    TF_ASSIGN_OR_RETURN(std::string rhs_expr,
+                        CastForFloatCompare(fcmp.getOperand(1)->getType(),
+                                            rhs));
     switch (fcmp.getPredicate()) {
       case llvm::CmpInst::FCMP_OEQ:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " == ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " == ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_UEQ:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " == ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " == ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_ONE:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " != ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " != ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_UNE:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " != ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " != ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_OGT:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " > ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " > ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_UGT:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " > ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " > ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_OGE:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " >= ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " >= ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_UGE:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " >= ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " >= ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_OLT:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " < ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " < ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_ULT:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " < ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " < ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_OLE:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
-                            lhs, " <= ", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            ") && (", lhs_expr, " <= ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_ULE:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
-                            lhs, " <= ", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            ") || (", lhs_expr, " <= ", rhs_expr, "))");
       case llvm::CmpInst::FCMP_FALSE:
         return "false";
       case llvm::CmpInst::FCMP_TRUE:
         return "true";
       case llvm::CmpInst::FCMP_ORD:
-        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, "))");
+        return absl::StrCat("(!isnan(", lhs_expr, ") && !isnan(", rhs_expr,
+                            "))");
       case llvm::CmpInst::FCMP_UNO:
-        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, "))");
+        return absl::StrCat("(isnan(", lhs_expr, ") || isnan(", rhs_expr,
+                            "))");
       default:
         return Unsupported(function_, "floating-point comparison", fcmp);
     }
