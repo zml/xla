@@ -1306,7 +1306,14 @@ class FunctionEmitter {
       }
       case llvm::Instruction::Shl:
         return absl::StrCat("(", lhs, " << ", rhs, ")");
-      case llvm::Instruction::LShr:
+      case llvm::Instruction::LShr: {
+        TF_ASSIGN_OR_RETURN(std::string type, MslType(binary.getType()));
+        TF_ASSIGN_OR_RETURN(
+            std::string unsigned_type,
+            MslType(binary.getType(), /*unsigned_integer=*/true));
+        return absl::StrCat("(as_type<", type, ">(static_cast<",
+                            unsigned_type, ">(", lhs, ") >> ", rhs, "))");
+      }
       case llvm::Instruction::AShr:
         return absl::StrCat("(", lhs, " >> ", rhs, ")");
       case llvm::Instruction::And:

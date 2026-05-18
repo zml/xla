@@ -587,6 +587,39 @@ declare float @__nv_sinf(float)
   EXPECT_NE(msl.find("sin(v2)"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsLogicalRightShiftWithUnsignedType) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @shift(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x i32], ptr %arg0, i32 0, i32 %tid
+  %value = load i32, ptr %in, align 4
+  %shifted = lshr i32 %value, 1
+  %out = getelementptr inbounds [4 x i32], ptr %arg1, i32 0, i32 %tid
+  store i32 %shifted, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @shift, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("as_type<int>(static_cast<uint>(v1) >> 1)"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsMoreMathCallsAndUnorderedCompare) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
