@@ -385,7 +385,10 @@ class ElementwiseAirEmitter {
       if (const HloInstruction* override = CallParameterOverride(instr)) {
         return EmitValue(override, force_scalar, body);
       }
-      if (!force_scalar && !HasResultDimensions(instr->shape())) {
+      if (!force_scalar && !HasResultDimensions(instr->shape()) &&
+          (!instr->shape().IsArray() ||
+           ShapeUtil::ElementsIn(instr->shape()) !=
+               ShapeUtil::ElementsIn(result_shape_))) {
         return absl::UnimplementedError(
           "Metal direct AIR elementwise parameters must have the result "
           "shape unless they are scalar-broadcast operands.");
