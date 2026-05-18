@@ -334,6 +334,23 @@ absl::StatusOr<Literal> ExecuteMetalS32Add() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+template <typename BuildFn>
+absl::StatusOr<Literal> ExecuteMetalS32Unary(const char* name, BuildFn build) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder(name);
+  Shape shape = ShapeUtil::MakeShape(S32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  build(&builder, input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseS32();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConvert(PrimitiveType input_type,
                                             PrimitiveType output_type) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -576,6 +593,30 @@ TEST(MetalGpuExecutableTest, ElementwisePower) {
         return std::pow(base, exponent);
       },
       2.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseRemainder) {
+  auto result = ExecuteMetalElementwiseBinary(
+      "metal_elementwise_remainder",
+      [](XlaBuilder* builder, XlaOp lhs, XlaOp rhs) {
+        XlaOp divisor =
+            Add(Abs(rhs), Broadcast(ConstantR0<float>(builder, 1.0f),
+                                    {kElementCount}));
+        Rem(lhs, divisor);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal lhs = MakeElementwiseLhs();
+  Literal rhs = MakeElementwiseRhs();
+  ExpectMatchesElementwiseReference(
+      actual,
+      [&](int64_t i) {
+        return std::fmod(lhs.Get<float>({i}),
+                         std::abs(rhs.Get<float>({i})) + 1.0f);
+      },
+      1.0e-5f);
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseAtan2) {
@@ -989,6 +1030,25 @@ TEST(MetalGpuExecutableTest, ElementwiseCompareRoot) {
       actual, [&](int64_t i) { return lhs.Get<float>({i}) > rhs.Get<float>({i}); });
 }
 
+TEST(MetalGpuExecutableTest, ElementwisePredicateCompare) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_predicate_compare",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp zero =
+            Broadcast(ConstantR0<float>(builder, 0.0f), {kElementCount});
+        Ne(Gt(input, zero), Lt(input, zero));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesPredReference(actual, [&](int64_t i) {
+    const float value = input.Get<float>({i});
+    return (value > 0.0f) != (value < 0.0f);
+  });
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseConvertCompareToF32) {
   auto result = ExecuteMetalElementwiseUnary(
       "metal_elementwise_convert_compare_to_f32",
@@ -1146,6 +1206,70 @@ TEST(MetalGpuExecutableTest, ElementwiseS32Add) {
   Literal input = MakeElementwiseS32();
   ExpectMatchesS32Reference(
       actual, [&](int64_t i) { return input.Get<int32_t>({i}) * 2; });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32Remainder) {
+  auto result = ExecuteMetalS32Unary(
+      "metal_s32_remainder", [](XlaBuilder* builder, XlaOp input) {
+        Rem(input, Broadcast(ConstantR0<int32_t>(builder, 7), {kElementCount}));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(
+      actual, [&](int64_t i) { return input.Get<int32_t>({i}) % 7; });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32Bitwise) {
+  auto result = ExecuteMetalS32Unary(
+      "metal_s32_bitwise", [](XlaBuilder* builder, XlaOp input) {
+        XlaOp mask = Broadcast(ConstantR0<int32_t>(builder, 7), {kElementCount});
+        XlaOp high =
+            Broadcast(ConstantR0<int32_t>(builder, 16), {kElementCount});
+        XlaOp toggle =
+            Broadcast(ConstantR0<int32_t>(builder, 3), {kElementCount});
+        Xor(Or(And(input, mask), high), toggle);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(actual, [&](int64_t i) {
+    return ((input.Get<int32_t>({i}) & 7) | 16) ^ 3;
+  });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32Shifts) {
+  auto result = ExecuteMetalS32Unary(
+      "metal_s32_shifts", [](XlaBuilder* builder, XlaOp input) {
+        XlaOp amount =
+            And(input,
+                Broadcast(ConstantR0<int32_t>(builder, 3), {kElementCount}));
+        XlaOp positive_lhs =
+            And(input,
+                Broadcast(ConstantR0<int32_t>(builder, 255), {kElementCount}));
+        XlaOp left = ShiftLeft(positive_lhs, amount);
+        XlaOp arithmetic = ShiftRightArithmetic(input, amount);
+        XlaOp logical = ShiftRightLogical(input, amount);
+        Xor(left, Xor(arithmetic, logical));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(actual, [&](int64_t i) {
+    const int32_t value = input.Get<int32_t>({i});
+    const int32_t amount = value & 3;
+    const int32_t left = (value & 255) << amount;
+    const int32_t arithmetic = value >> amount;
+    const int32_t logical =
+        static_cast<int32_t>(static_cast<uint32_t>(value) >> amount);
+    return left ^ (arithmetic ^ logical);
+  });
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseS32CompareRoot) {

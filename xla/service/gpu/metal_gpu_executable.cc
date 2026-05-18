@@ -141,7 +141,8 @@ bool IsScalarLikeS32(const Shape& shape) {
 }
 
 bool IsScalarLikeSupported(const Shape& shape) {
-  return (shape.element_type() == F32 || shape.element_type() == S32) &&
+  return (shape.element_type() == F32 || shape.element_type() == S32 ||
+          shape.element_type() == PRED) &&
          ShapeUtil::IsEffectiveScalar(shape);
 }
 
@@ -368,6 +369,9 @@ class ElementwiseAirEmitter {
       if (instr->shape().element_type() == S32) {
         return absl::StrCat(instr->literal().Get<int32_t>({}));
       }
+      if (instr->shape().element_type() == PRED) {
+        return instr->literal().Get<bool>({}) ? "true" : "false";
+      }
       return FloatLiteral(instr->literal().Get<float>({}));
     }
 
@@ -414,9 +418,16 @@ class ElementwiseAirEmitter {
       case HloOpcode::kDivide:
       case HloOpcode::kMaximum:
       case HloOpcode::kMinimum:
+      case HloOpcode::kRemainder:
         return EmitBinary(instr, body);
       case HloOpcode::kAnd:
+      case HloOpcode::kOr:
+      case HloOpcode::kXor:
         return EmitLogicalBinary(instr, body);
+      case HloOpcode::kShiftLeft:
+      case HloOpcode::kShiftRightArithmetic:
+      case HloOpcode::kShiftRightLogical:
+        return EmitShift(instr, body);
       case HloOpcode::kAtan2:
         return EmitAtan2(instr, body);
       case HloOpcode::kPower:
@@ -727,7 +738,8 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
                                           std::vector<std::string>* body) {
     Shape pred_shape = ShapeUtil::MakeShape(PRED, result_shape_.dimensions());
-    if (!ShapeUtil::Compatible(instr->shape(), pred_shape) &&
+    if (!ShapeUtil::IsEffectiveScalar(instr->shape()) &&
+        !ShapeUtil::Compatible(instr->shape(), pred_shape) &&
         (!instr->shape().IsArray() ||
          ShapeUtil::ElementsIn(instr->shape()) !=
              ShapeUtil::ElementsIn(result_shape_))) {
@@ -742,7 +754,22 @@ class ElementwiseAirEmitter {
                         EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
                                   body));
     std::string cmp = NewName("cmp");
-    if (instr->operand(0)->shape().element_type() == S32) {
+    if (instr->operand(0)->shape().element_type() == PRED) {
+      absl::string_view predicate;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        default:
+          return absl::UnimplementedError(
+              "Metal direct AIR predicate compare supports only EQ and NE.");
+      }
+      body->push_back(absl::StrFormat("  %s = icmp %s i1 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+    } else if (instr->operand(0)->shape().element_type() == S32) {
       absl::string_view predicate;
       switch (instr->comparison_direction()) {
         case ComparisonDirection::kEq:
@@ -963,10 +990,28 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitLogicalBinary(
       const HloInstruction* instr, std::vector<std::string>* body) {
+    if (instr->shape().element_type() == S32) {
+      TF_ASSIGN_OR_RETURN(
+          std::string lhs,
+          EmitValue(instr->operand(0), IsScalarOperand(instr, 0), body));
+      TF_ASSIGN_OR_RETURN(
+          std::string rhs,
+          EmitValue(instr->operand(1), IsScalarOperand(instr, 1), body));
+      switch (instr->opcode()) {
+        case HloOpcode::kAnd:
+          return EmitOp("and i32", lhs, rhs, body);
+        case HloOpcode::kOr:
+          return EmitOp("or i32", lhs, rhs, body);
+        case HloOpcode::kXor:
+          return EmitOp("xor i32", lhs, rhs, body);
+        default:
+          return absl::InternalError("Unexpected s32 logical HLO opcode.");
+      }
+    }
     if (!IsPredArray(instr->shape())) {
       return absl::UnimplementedError(
           "Metal direct AIR logical binary ops currently support only pred "
-          "arrays.");
+          "and s32 arrays.");
     }
     TF_ASSIGN_OR_RETURN(std::string lhs,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
@@ -975,8 +1020,74 @@ class ElementwiseAirEmitter {
                         EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
                                   body));
     std::string value = NewName("logical");
-    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", value, lhs, rhs));
+    switch (instr->opcode()) {
+      case HloOpcode::kAnd:
+        body->push_back(
+            absl::StrFormat("  %s = and i1 %s, %s", value, lhs, rhs));
+        break;
+      case HloOpcode::kOr:
+        body->push_back(
+            absl::StrFormat("  %s = or i1 %s, %s", value, lhs, rhs));
+        break;
+      case HloOpcode::kXor:
+        body->push_back(
+            absl::StrFormat("  %s = xor i1 %s, %s", value, lhs, rhs));
+        break;
+      default:
+        return absl::InternalError("Unexpected pred logical HLO opcode.");
+    }
     return value;
+  }
+
+  absl::StatusOr<std::string> EmitShift(const HloInstruction* instr,
+                                        std::vector<std::string>* body) {
+    if (!IsS32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR shift ops currently support only s32 arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    std::string in_range = NewName("shift_in_range");
+    std::string safe_rhs = NewName("shift_safe_rhs");
+    std::string shifted = NewName("shifted");
+    std::string saturated = "0";
+    body->push_back(
+        absl::StrFormat("  %s = icmp ult i32 %s, 32", in_range, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 0", safe_rhs, in_range, rhs));
+    switch (instr->opcode()) {
+      case HloOpcode::kShiftLeft:
+        body->push_back(
+            absl::StrFormat("  %s = shl i32 %s, %s", shifted, lhs, safe_rhs));
+        break;
+      case HloOpcode::kShiftRightArithmetic: {
+        body->push_back(absl::StrFormat("  %s = ashr i32 %s, %s", shifted,
+                                        lhs, safe_rhs));
+        std::string negative = NewName("shift_negative");
+        std::string sign_bits = NewName("shift_sign_bits");
+        body->push_back(absl::StrFormat("  %s = icmp slt i32 %s, 0",
+                                        negative, lhs));
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, i32 -1, i32 0", sign_bits, negative));
+        saturated = sign_bits;
+        break;
+      }
+      case HloOpcode::kShiftRightLogical:
+        body->push_back(
+            absl::StrFormat("  %s = lshr i32 %s, %s", shifted, lhs, safe_rhs));
+        break;
+      default:
+        return absl::InternalError("Unexpected shift HLO opcode.");
+    }
+    std::string result = NewName("shift_result");
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 %s", result, in_range, shifted,
+        saturated));
+    return result;
   }
 
   absl::StatusOr<std::string> EmitGather(const HloInstruction* instr,
@@ -1306,6 +1417,8 @@ class ElementwiseAirEmitter {
           return EmitOp("mul i32", lhs, rhs, body);
         case HloOpcode::kDivide:
           return EmitOp("sdiv i32", lhs, rhs, body);
+        case HloOpcode::kRemainder:
+          return EmitS32Remainder(lhs, rhs, body);
         case HloOpcode::kMaximum:
           return EmitIntCompareSelect("sgt", lhs, rhs, body);
         case HloOpcode::kMinimum:
@@ -1323,6 +1436,8 @@ class ElementwiseAirEmitter {
         return EmitOp("fmul fast float", lhs, rhs, body);
       case HloOpcode::kDivide:
         return EmitOp("fdiv fast float", lhs, rhs, body);
+      case HloOpcode::kRemainder:
+        return EmitF32Remainder(lhs, rhs, body);
       case HloOpcode::kMaximum:
         return EmitCompareSelect("ogt", lhs, rhs, body);
       case HloOpcode::kMinimum:
@@ -1330,6 +1445,60 @@ class ElementwiseAirEmitter {
       default:
         return absl::InternalError("Unexpected binary HLO opcode.");
     }
+  }
+
+  absl::StatusOr<std::string> EmitS32Remainder(
+      absl::string_view lhs, absl::string_view rhs,
+      std::vector<std::string>* body) {
+    std::string rhs_is_zero = NewName("rem_rhs_is_zero");
+    std::string lhs_is_min = NewName("rem_lhs_is_min");
+    std::string rhs_is_minus_one = NewName("rem_rhs_is_minus_one");
+    std::string overflow = NewName("rem_overflow");
+    std::string unsafe = NewName("rem_unsafe");
+    std::string safe_rhs = NewName("rem_safe_rhs");
+    std::string safe_rem = NewName("rem_safe");
+    std::string overflow_result = NewName("rem_overflow_result");
+    std::string result = NewName("rem_result");
+    body->push_back(
+        absl::StrFormat("  %s = icmp eq i32 %s, 0", rhs_is_zero, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = icmp eq i32 %s, -2147483648", lhs_is_min, lhs));
+    body->push_back(absl::StrFormat(
+        "  %s = icmp eq i32 %s, -1", rhs_is_minus_one, rhs));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", overflow,
+                                    lhs_is_min, rhs_is_minus_one));
+    body->push_back(absl::StrFormat("  %s = or i1 %s, %s", unsafe,
+                                    rhs_is_zero, overflow));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 1, i32 %s", safe_rhs, unsafe, rhs));
+    body->push_back(
+        absl::StrFormat("  %s = srem i32 %s, %s", safe_rem, lhs, safe_rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 0, i32 %s", overflow_result, overflow,
+        safe_rem));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 %s", result, rhs_is_zero, lhs,
+        overflow_result));
+    return result;
+  }
+
+  absl::StatusOr<std::string> EmitF32Remainder(
+      absl::string_view lhs, absl::string_view rhs,
+      std::vector<std::string>* body) {
+    std::string quotient = NewName("rem_quotient");
+    std::string truncated = NewName("rem_truncated");
+    std::string product = NewName("rem_product");
+    std::string result = NewName("rem_result");
+    body->push_back(
+        absl::StrFormat("  %s = fdiv float %s, %s", quotient, lhs, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = call float @air.fast_trunc.f32(float %s)", truncated,
+        quotient));
+    body->push_back(absl::StrFormat("  %s = fmul float %s, %s", product,
+                                    truncated, rhs));
+    body->push_back(absl::StrFormat("  %s = fsub float %s, %s", result, lhs,
+                                    product));
+    return result;
   }
 
   absl::StatusOr<std::string> EmitUnary(const HloInstruction* instr,
@@ -1602,6 +1771,7 @@ declare float @air.fast_sinh.f32(float) local_unnamed_addr #1
 declare float @air.fast_sqrt.f32(float) local_unnamed_addr #1
 declare float @air.fast_tan.f32(float) local_unnamed_addr #1
 declare float @air.fast_tanh.f32(float) local_unnamed_addr #1
+declare float @air.fast_trunc.f32(float) local_unnamed_addr #1
 declare float @air.sign.f32(float) local_unnamed_addr #1
 
 define void @elementwise_f32(
