@@ -16,14 +16,17 @@ limitations under the License.
 #include "xla/service/gpu/metal_gpu_executable.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
@@ -61,8 +64,30 @@ struct MatmulParams {
   uint32_t reserved;
 };
 
+struct ElementwiseParams {
+  uint32_t num_elements;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+};
+
 bool IsF32Rank2Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.dimensions().size() == 2;
+}
+
+bool IsF32Array(const Shape& shape) {
+  return shape.element_type() == F32 && shape.IsArray();
+}
+
+bool IsScalarLikeF32(const Shape& shape) {
+  return shape.element_type() == F32 && ShapeUtil::IsEffectiveScalar(shape);
+}
+
+std::string FloatLiteral(float value) {
+  if (!std::isfinite(value)) {
+    return value > 0 ? "0x7FF0000000000000" : "0xFFF0000000000000";
+  }
+  return absl::StrFormat("%.9e", value);
 }
 
 bool IsZeroValue(const HloInstruction* instruction) {
@@ -148,6 +173,369 @@ absl::StatusOr<std::string> FindMetalTool(const char* env_name,
   return path;
 }
 
+absl::StatusOr<std::vector<uint8_t>> CompileMetalAirToMetallib(
+    absl::string_view source, absl::string_view temp_name) {
+  TF_ASSIGN_OR_RETURN(std::string air_as, FindMetalTool("AIR_AS", "air-as"));
+  TF_ASSIGN_OR_RETURN(std::string air_opt,
+                      FindMetalTool("AIR_OPT", "air-opt"));
+  TF_ASSIGN_OR_RETURN(std::string metallib,
+                      FindMetalTool("METALLIB", "metallib"));
+
+  tsl::Env* env = tsl::Env::Default();
+  std::string base;
+  if (!env->LocalTempFilename(&base)) {
+    return absl::InternalError(
+        absl::StrFormat("Could not create Metal AIR temp filename for %s.",
+                        temp_name));
+  }
+  std::string air_ll_path = absl::StrCat(base, ".ll");
+  std::string air_path = absl::StrCat(base, ".air");
+  std::string opt_air_path = absl::StrCat(base, ".opt.air");
+  std::string metallib_path = absl::StrCat(base, ".metallib");
+  absl::Cleanup cleanup = [&] {
+    env->DeleteFile(air_ll_path).IgnoreError();
+    env->DeleteFile(air_path).IgnoreError();
+    env->DeleteFile(opt_air_path).IgnoreError();
+    env->DeleteFile(metallib_path).IgnoreError();
+  };
+
+  TF_RETURN_IF_ERROR(tsl::WriteStringToFile(env, air_ll_path, source));
+  TF_RETURN_IF_ERROR(
+      RunCommand({air_as, air_ll_path, "-o", air_path}, false).status());
+  TF_RETURN_IF_ERROR(
+      RunCommand({air_opt, "--O3", air_path, "-o", opt_air_path}, false)
+          .status());
+  TF_RETURN_IF_ERROR(
+      RunCommand({metallib, opt_air_path, "-o", metallib_path}, false)
+          .status());
+
+  std::string bytes;
+  TF_RETURN_IF_ERROR(tsl::ReadFileToString(env, metallib_path, &bytes));
+  return std::vector<uint8_t>(bytes.begin(), bytes.end());
+}
+
+class ElementwiseAirEmitter {
+ public:
+  explicit ElementwiseAirEmitter(Shape result_shape)
+      : result_shape_(std::move(result_shape)) {}
+
+  absl::StatusOr<std::string> Emit(const HloInstruction* root) {
+    if (!IsF32Array(root->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise supports only f32 arrays.");
+    }
+    std::vector<std::string> body;
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(root, /*force_scalar=*/false, &body));
+    expression_body_ = std::move(body);
+    result_value_ = std::move(value);
+    return BuildModule();
+  }
+
+  const std::vector<int64_t>& parameter_numbers() const {
+    return parameter_numbers_;
+  }
+
+ private:
+  absl::StatusOr<std::string> EmitValue(const HloInstruction* instr,
+                                        bool force_scalar,
+                                        std::vector<std::string>* body) {
+    if (instr->opcode() == HloOpcode::kBroadcast) {
+      if (!IsScalarLikeF32(instr->operand(0)->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise currently supports only scalar "
+            "broadcasts.");
+      }
+      return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
+    }
+    if (instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape) {
+      return EmitValue(instr->operand(0), force_scalar, body);
+    }
+
+    if (instr->IsConstant()) {
+      if (!IsScalarLikeF32(instr->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise currently supports only scalar "
+            "constants.");
+      }
+      return FloatLiteral(instr->literal().Get<float>({}));
+    }
+
+    if (instr->opcode() == HloOpcode::kParameter) {
+      if (!force_scalar && !ShapeUtil::Equal(instr->shape(), result_shape_)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise parameters must have the result "
+            "shape unless they are scalar-broadcast operands.");
+      }
+      const int64_t parameter_number = instr->parameter_number();
+      int input_index = 0;
+      auto it = parameter_to_input_index_.find(parameter_number);
+      if (it == parameter_to_input_index_.end()) {
+        input_index = parameter_numbers_.size();
+        parameter_to_input_index_[parameter_number] = input_index;
+        parameter_numbers_.push_back(parameter_number);
+      } else {
+        input_index = it->second;
+      }
+      return EmitLoad(input_index, force_scalar, body);
+    }
+
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+      case HloOpcode::kSubtract:
+      case HloOpcode::kMultiply:
+      case HloOpcode::kDivide:
+      case HloOpcode::kMaximum:
+      case HloOpcode::kMinimum:
+        return EmitBinary(instr, body);
+      case HloOpcode::kNegate:
+        return EmitUnary(instr, "fneg fast float", body);
+      case HloOpcode::kAbs:
+        return EmitAbs(instr, body);
+      default:
+        return absl::UnimplementedError(absl::StrFormat(
+            "Metal direct AIR elementwise does not support HLO opcode %s.",
+            HloOpcodeString(instr->opcode())));
+    }
+  }
+
+  absl::StatusOr<std::string> EmitBinary(const HloInstruction* instr,
+                                         std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+        return EmitOp("fadd fast float", lhs, rhs, body);
+      case HloOpcode::kSubtract:
+        return EmitOp("fsub fast float", lhs, rhs, body);
+      case HloOpcode::kMultiply:
+        return EmitOp("fmul fast float", lhs, rhs, body);
+      case HloOpcode::kDivide:
+        return EmitOp("fdiv fast float", lhs, rhs, body);
+      case HloOpcode::kMaximum:
+        return EmitCompareSelect("ogt", lhs, rhs, body);
+      case HloOpcode::kMinimum:
+        return EmitCompareSelect("olt", lhs, rhs, body);
+      default:
+        return absl::InternalError("Unexpected binary HLO opcode.");
+    }
+  }
+
+  absl::StatusOr<std::string> EmitUnary(const HloInstruction* instr,
+                                        absl::string_view op,
+                                        std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string name = NewName("unary");
+    body->push_back(absl::StrFormat("  %s = %s %s", name, op, value));
+    return name;
+  }
+
+  absl::StatusOr<std::string> EmitAbs(const HloInstruction* instr,
+                                      std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string neg = NewName("neg");
+    body->push_back(absl::StrFormat("  %s = fneg fast float %s", neg, value));
+    return EmitCompareSelect("ogt", value, neg, body);
+  }
+
+  bool IsScalarOperand(const HloInstruction* instr, int operand_index) const {
+    return IsScalarLikeF32(instr->operand(operand_index)->shape());
+  }
+
+  std::string EmitLoad(int input_index, bool force_scalar,
+                       std::vector<std::string>* body) {
+    std::string ptr = NewName("ptr");
+    std::string value = NewName("value");
+    body->push_back(absl::StrFormat(
+        "  %s = getelementptr inbounds float, float addrspace(1)* %%arg%d, "
+        "i64 %s",
+        ptr, input_index, force_scalar ? "0" : "%idx"));
+    body->push_back(absl::StrFormat(
+        "  %s = load float, float addrspace(1)* %s, align 4", value, ptr));
+    return value;
+  }
+
+  std::string EmitOp(absl::string_view op, absl::string_view lhs,
+                     absl::string_view rhs, std::vector<std::string>* body) {
+    std::string name = NewName("op");
+    body->push_back(absl::StrFormat("  %s = %s %s, %s", name, op, lhs, rhs));
+    return name;
+  }
+
+  std::string EmitCompareSelect(absl::string_view predicate,
+                                absl::string_view lhs, absl::string_view rhs,
+                                std::vector<std::string>* body) {
+    std::string cmp = NewName("cmp");
+    std::string value = NewName("select");
+    body->push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", value, cmp, lhs, rhs));
+    return value;
+  }
+
+  std::string NewName(absl::string_view prefix) {
+    return absl::StrFormat("%%%s%d", prefix, next_value_id_++);
+  }
+
+  std::string BuildModule() const {
+    std::vector<std::string> args;
+    for (int i = 0; i < parameter_numbers_.size(); ++i) {
+      args.push_back(absl::StrFormat(
+          "    float addrspace(1)* nocapture noundef readonly "
+          "\"air-buffer-no-alias\" %%arg%d",
+          i));
+    }
+    args.push_back(
+        "    float addrspace(1)* nocapture noundef writeonly "
+        "\"air-buffer-no-alias\" %out");
+    args.push_back(
+        "    %struct.ElementwiseParams addrspace(2)* nocapture noundef "
+        "readonly align 4 dereferenceable(16) \"air-buffer-no-alias\" %params");
+    args.push_back("    <3 x i32> noundef %gid");
+
+    std::vector<std::string> signature_types(parameter_numbers_.size(),
+                                             "float addrspace(1)*");
+    signature_types.push_back("float addrspace(1)*");
+    signature_types.push_back("%struct.ElementwiseParams addrspace(2)*");
+    signature_types.push_back("<3 x i32>");
+
+    std::vector<std::string> metadata_args;
+    for (int i = 0; i < parameter_numbers_.size(); ++i) {
+      metadata_args.push_back(absl::StrFormat("!%d", 3 + i));
+    }
+    const int output_metadata = 3 + parameter_numbers_.size();
+    const int params_metadata = output_metadata + 1;
+    const int struct_metadata = params_metadata + 1;
+    const int gid_metadata = struct_metadata + 1;
+    metadata_args.push_back(absl::StrFormat("!%d", output_metadata));
+    metadata_args.push_back(absl::StrFormat("!%d", params_metadata));
+    metadata_args.push_back(absl::StrFormat("!%d", gid_metadata));
+
+    std::string module = absl::StrFormat(R"(
+source_filename = "xla/service/gpu/metal_elementwise_air"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024-n8:16:32"
+target triple = "air64_v27-apple-macosx15.0.0"
+
+%%struct.ElementwiseParams = type { i32, i32, i32, i32 }
+
+define void @elementwise_f32(
+%s) local_unnamed_addr #0 {
+entry:
+  %%idx32 = extractelement <3 x i32> %%gid, i64 0
+  %%n_ptr = getelementptr inbounds %%struct.ElementwiseParams, %%struct.ElementwiseParams addrspace(2)* %%params, i64 0, i32 0
+  %%n = load i32, i32 addrspace(2)* %%n_ptr, align 4
+  %%in_bounds = icmp ult i32 %%idx32, %%n
+  br i1 %%in_bounds, label %%body, label %%exit
+
+body:
+  %%idx = zext i32 %%idx32 to i64
+%s
+  %%out_ptr = getelementptr inbounds float, float addrspace(1)* %%out, i64 %%idx
+  store float %s, float addrspace(1)* %%out_ptr, align 4
+  br label %%exit
+
+exit:
+  ret void
+}
+
+attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-pointer"="all" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
+!air.compile_options = !{!18, !19, !20}
+!llvm.ident = !{!21}
+!air.version = !{!22}
+!air.language_version = !{!23}
+!air.source_file_name = !{!24}
+
+!0 = !{void (%s)* @elementwise_f32, !1, !2}
+!1 = !{}
+!2 = !{%s}
+)",
+                                         absl::StrJoin(args, ",\n"),
+                                         absl::StrJoin(expression_body_, "\n"),
+                                         result_value_,
+                                         absl::StrJoin(signature_types, ", "),
+                                         absl::StrJoin(metadata_args, ", "));
+
+    for (int i = 0; i < parameter_numbers_.size(); ++i) {
+      absl::StrAppendFormat(
+          &module,
+          "!%d = !{i32 %d, !\"air.buffer\", !\"air.location_index\", i32 %d, "
+          "i32 1, !\"air.read\", !\"air.address_space\", i32 1, "
+          "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 "
+          "4, !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", "
+          "!\"arg%d\"}\n",
+          3 + i, i, i, i);
+    }
+    absl::StrAppendFormat(
+        &module,
+        "!%d = !{i32 %d, !\"air.buffer\", !\"air.location_index\", i32 %d, "
+        "i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, "
+        "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, "
+        "!\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"out\"}\n",
+        output_metadata, static_cast<int>(parameter_numbers_.size()),
+        static_cast<int>(parameter_numbers_.size()));
+    absl::StrAppendFormat(
+        &module,
+        "!%d = !{i32 %d, !\"air.buffer\", !\"air.buffer_size\", i32 16, "
+        "!\"air.location_index\", i32 %d, i32 1, !\"air.read\", "
+        "!\"air.address_space\", i32 2, !\"air.struct_type_info\", !%d, "
+        "!\"air.arg_type_size\", i32 16, !\"air.arg_type_align_size\", i32 4, "
+        "!\"air.arg_type_name\", !\"ElementwiseParams\", !\"air.arg_name\", "
+        "!\"params\"}\n",
+        params_metadata, static_cast<int>(parameter_numbers_.size() + 1),
+        static_cast<int>(parameter_numbers_.size() + 1), struct_metadata);
+    absl::StrAppendFormat(
+        &module,
+        "!%d = !{i32 0, i32 4, i32 0, !\"uint\", !\"num_elements\", i32 4, "
+        "i32 4, i32 0, !\"uint\", !\"reserved0\", i32 8, i32 4, i32 0, "
+        "!\"uint\", !\"reserved1\", i32 12, i32 4, i32 0, !\"uint\", "
+        "!\"reserved2\"}\n",
+        struct_metadata);
+    absl::StrAppendFormat(
+        &module,
+        "!%d = !{i32 %d, !\"air.thread_position_in_grid\", "
+        "!\"air.arg_type_name\", !\"uint3\", !\"air.arg_name\", !\"gid\"}\n",
+        gid_metadata, static_cast<int>(parameter_numbers_.size() + 2));
+    absl::StrAppend(&module, R"(
+!10 = !{i32 1, !"wchar_size", i32 4}
+!11 = !{i32 7, !"air.max_device_buffers", i32 31}
+!12 = !{i32 7, !"air.max_constant_buffers", i32 31}
+!13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+!14 = !{i32 7, !"air.max_textures", i32 128}
+!15 = !{i32 7, !"air.max_read_write_textures", i32 8}
+!16 = !{i32 7, !"air.max_samplers", i32 16}
+!17 = !{i32 7, !"frame-pointer", i32 2}
+!18 = !{!"air.compile.denorms_disable"}
+!19 = !{!"air.compile.fast_math_enable"}
+!20 = !{!"air.compile.framebuffer_fetch_enable"}
+!21 = !{!"xla direct AIR elementwise"}
+!22 = !{i32 2, i32 7, i32 0}
+!23 = !{!"Metal", i32 3, i32 2, i32 0}
+!24 = !{!"xla/service/gpu/metal_elementwise_air"}
+)");
+    return module;
+  }
+
+  Shape result_shape_;
+  absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
+  std::vector<int64_t> parameter_numbers_;
+  std::vector<std::string> expression_body_;
+  std::string result_value_;
+  int next_value_id_ = 0;
+};
+
 }  // namespace
 
 absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module) {
@@ -198,42 +586,109 @@ absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module) {
 }
 
 absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib() {
-  TF_ASSIGN_OR_RETURN(std::string air_as, FindMetalTool("AIR_AS", "air-as"));
-  TF_ASSIGN_OR_RETURN(std::string air_opt,
-                      FindMetalTool("AIR_OPT", "air-opt"));
-  TF_ASSIGN_OR_RETURN(std::string metallib,
-                      FindMetalTool("METALLIB", "metallib"));
+  return CompileMetalAirToMetallib(get_matmul_air_direct(),
+                                   "metal_matmul_air");
+}
 
-  tsl::Env* env = tsl::Env::Default();
-  std::string base;
-  if (!env->LocalTempFilename(&base)) {
-    return absl::InternalError("Could not create Metal AIR temp filename.");
+class MetalElementwiseExecutable final : public Executable {
+ public:
+  MetalElementwiseExecutable(std::shared_ptr<HloModule> module,
+                             std::vector<int64_t> parameter_numbers,
+                             std::vector<uint8_t> metallib)
+      : Executable(std::move(module)),
+        parameter_numbers_(std::move(parameter_numbers)),
+        result_shape_(this->module()
+                          .entry_computation()
+                          ->root_instruction()
+                          ->shape()),
+        num_elements_(ShapeUtil::ElementsIn(result_shape_)),
+        metallib_(std::move(metallib)) {}
+
+  Shape result_shape() const override { return result_shape_; }
+
+  absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
+      const ServiceExecutableRunOptions* run_options,
+      std::vector<ExecutionInput> arguments) override {
+    se::Stream* stream = run_options->stream();
+    if (stream == nullptr) {
+      return absl::InvalidArgumentError("Metal elementwise requires a stream.");
+    }
+    se::StreamExecutor* executor = stream->parent();
+    se::DeviceAddressAllocator* allocator = run_options->allocator();
+    if (allocator == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal elementwise requires an allocator.");
+    }
+
+    const int device_ordinal = run_options->device_ordinal() != -1
+                                   ? run_options->device_ordinal()
+                                   : executor->device_ordinal();
+    const int64_t output_size = ShapeUtil::ByteSizeOf(result_shape_, 8);
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> output_buffer,
+                        allocator->Allocate(device_ordinal, output_size));
+    se::DeviceAddressBase output = *output_buffer;
+
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> params_buffer,
+                        allocator->Allocate(device_ordinal,
+                                            sizeof(ElementwiseParams)));
+    se::DeviceAddressBase params_address = *params_buffer;
+    ElementwiseParams params{static_cast<uint32_t>(num_elements_), 0, 0, 0};
+    TF_RETURN_IF_ERROR(
+        stream->Memcpy(&params_address, &params, sizeof(ElementwiseParams)));
+
+    auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+        std::vector<uint8_t>(metallib_.begin(), metallib_.end()),
+        "elementwise_f32", parameter_numbers_.size() + 2);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        executor->LoadKernel(spec));
+
+    se::KernelArgsPackedArray kernel_args(parameter_numbers_.size() + 2);
+    for (int64_t parameter_number : parameter_numbers_) {
+      if (parameter_number >= arguments.size()) {
+        return absl::InvalidArgumentError(
+            "Metal elementwise parameter number is out of bounds.");
+      }
+      se::DeviceAddressBase arg =
+          arguments[parameter_number].Buffer({}).AsDeviceAddress();
+      if (arg.is_null()) {
+        return absl::InvalidArgumentError(
+            "Metal elementwise input buffer is null.");
+      }
+      kernel_args.add_argument(arg);
+    }
+    kernel_args.add_argument(output);
+    kernel_args.add_argument(params_address);
+
+    se::ThreadDim threads(/*x=*/256, /*y=*/1, /*z=*/1);
+    se::BlockDim blocks(/*x=*/static_cast<uint64_t>((num_elements_ + 255) / 256),
+                        /*y=*/1, /*z=*/1);
+    TF_RETURN_IF_ERROR(kernel->Launch(threads, blocks, stream, kernel_args));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+    ExecutionOutput result(result_shape_, allocator, device_ordinal,
+                           executor->device_ordinal());
+    static_cast<ShapedBuffer*>(result.MutableResult())
+        ->set_buffer(output_buffer.Release(), {});
+    result.Commit();
+    return std::move(result);
   }
-  std::string air_ll_path = absl::StrCat(base, ".ll");
-  std::string air_path = absl::StrCat(base, ".air");
-  std::string opt_air_path = absl::StrCat(base, ".opt.air");
-  std::string metallib_path = absl::StrCat(base, ".metallib");
-  absl::Cleanup cleanup = [&] {
-    env->DeleteFile(air_ll_path).IgnoreError();
-    env->DeleteFile(air_path).IgnoreError();
-    env->DeleteFile(opt_air_path).IgnoreError();
-    env->DeleteFile(metallib_path).IgnoreError();
-  };
 
-  TF_RETURN_IF_ERROR(
-      tsl::WriteStringToFile(env, air_ll_path, get_matmul_air_direct()));
-  TF_RETURN_IF_ERROR(
-      RunCommand({air_as, air_ll_path, "-o", air_path}, false).status());
-  TF_RETURN_IF_ERROR(
-      RunCommand({air_opt, "--O3", air_path, "-o", opt_air_path}, false)
-          .status());
-  TF_RETURN_IF_ERROR(
-      RunCommand({metallib, opt_air_path, "-o", metallib_path}, false)
-          .status());
+ private:
+  std::vector<int64_t> parameter_numbers_;
+  Shape result_shape_;
+  int64_t num_elements_;
+  std::vector<uint8_t> metallib_;
+};
 
-  std::string bytes;
-  TF_RETURN_IF_ERROR(tsl::ReadFileToString(env, metallib_path, &bytes));
-  return std::vector<uint8_t>(bytes.begin(), bytes.end());
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
+    std::shared_ptr<HloModule> module) {
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ElementwiseAirEmitter emitter(root->shape());
+  TF_ASSIGN_OR_RETURN(std::string air, emitter.Emit(root));
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
+                      CompileMetalAirToMetallib(air, "metal_elementwise_air"));
+  return std::make_unique<MetalElementwiseExecutable>(
+      std::move(module), emitter.parameter_numbers(), std::move(metallib));
 }
 
 MetalMatmulExecutable::MetalMatmulExecutable(std::shared_ptr<HloModule> module,

@@ -53,12 +53,17 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
 absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
-  TF_ASSIGN_OR_RETURN(MetalMatmulConfig config, MatchMetalMatmul(*module));
-  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
-                      CompileMetalMatmulAirToMetallib());
-  auto shared_module = std::shared_ptr<HloModule>(std::move(module));
-  return std::make_unique<MetalMatmulExecutable>(
-      std::move(shared_module), config, std::move(metallib));
+  absl::StatusOr<MetalMatmulConfig> matmul_config = MatchMetalMatmul(*module);
+  if (matmul_config.ok()) {
+    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
+                        CompileMetalMatmulAirToMetallib());
+    auto shared_module = std::shared_ptr<HloModule>(std::move(module));
+    return std::make_unique<MetalMatmulExecutable>(
+        std::move(shared_module), *matmul_config, std::move(metallib));
+  }
+
+  return BuildMetalElementwiseExecutable(
+      std::shared_ptr<HloModule>(std::move(module)));
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<Executable>>>

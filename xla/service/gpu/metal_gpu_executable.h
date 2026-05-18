@@ -41,6 +41,9 @@ absl::StatusOr<MetalMatmulConfig> MatchMetalMatmul(const HloModule& module);
 
 absl::StatusOr<std::vector<uint8_t>> CompileMetalMatmulAirToMetallib();
 
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
+    std::shared_ptr<HloModule> module);
+
 class MetalMatmulExecutable final : public Executable {
  public:
   MetalMatmulExecutable(std::shared_ptr<HloModule> module,
