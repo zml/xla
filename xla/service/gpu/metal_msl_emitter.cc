@@ -1516,6 +1516,12 @@ class FunctionEmitter {
     if (name.starts_with("llvm.copysign.")) {
       return BinaryMathCall("copysign", call);
     }
+    if (name.starts_with("llvm.ctpop.")) {
+      return IntegerBitCountCall("popcount", call);
+    }
+    if (name.starts_with("llvm.ctlz.")) {
+      return IntegerBitCountCall("clz", call);
+    }
     if (name.starts_with("llvm.maximum.")) return BinaryMathCall("max", call);
     if (name.starts_with("llvm.minimum.")) return BinaryMathCall("min", call);
     if (name.starts_with("llvm.smax.")) return BinaryMathCall("max", call);
@@ -2234,6 +2240,21 @@ class FunctionEmitter {
     if (call.arg_size() != 1) return Unsupported(function_, "math call", call);
     TF_ASSIGN_OR_RETURN(std::string operand, Expr(call.getArgOperand(0)));
     return absl::StrCat(msl_name, "(", operand, ")");
+  }
+
+  absl::StatusOr<std::string> IntegerBitCountCall(
+      absl::string_view msl_name, const llvm::CallInst& call) {
+    if (call.arg_size() < 1) {
+      return Unsupported(function_, "integer bit-count call", call);
+    }
+    TF_ASSIGN_OR_RETURN(std::string operand, Expr(call.getArgOperand(0)));
+    llvm::Type* operand_type = call.getArgOperand(0)->getType();
+    TF_ASSIGN_OR_RETURN(std::string unsigned_operand_type,
+                        MslType(operand_type, /*unsigned_integer=*/true));
+    TF_ASSIGN_OR_RETURN(std::string result_type, MslType(call.getType()));
+    return absl::StrCat("static_cast<", result_type, ">(", msl_name,
+                        "(static_cast<", unsigned_operand_type, ">(", operand,
+                        ")))");
   }
 
   absl::StatusOr<std::string> Log1pCall(const llvm::CallInst& call) {

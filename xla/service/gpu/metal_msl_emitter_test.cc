@@ -667,6 +667,43 @@ declare float @__nv_log1pf(float)
   EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsIntegerBitCountIntrinsics) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @bit_count(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [8 x i32], ptr %arg0, i32 0, i32 %tid
+  %value = load i32, ptr %in, align 4
+  %population = call i32 @llvm.ctpop.i32(i32 %value)
+  %leading = call i32 @llvm.ctlz.i32(i32 %value, i1 false)
+  %sum = add i32 %population, %leading
+  %out = getelementptr inbounds [8 x i32], ptr %arg1, i32 0, i32 %tid
+  store i32 %sum, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.ctpop.i32(i32)
+declare i32 @llvm.ctlz.i32(i32, i1 immarg)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @bit_count, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("popcount(static_cast<uint>("), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("clz(static_cast<uint>("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsNegateAndFma) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
