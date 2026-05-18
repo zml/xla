@@ -178,6 +178,32 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseScalarMaximum() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalElementwiseWhereCall() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  Shape pred_shape = ShapeUtil::MakeShape(PRED, {kElementCount});
+
+  XlaBuilder where_builder("_where");
+  XlaOp pred = Parameter(&where_builder, 0, pred_shape, "pred");
+  XlaOp on_true = Parameter(&where_builder, 1, shape, "on_true");
+  XlaOp on_false = Parameter(&where_builder, 2, shape, "on_false");
+  Select(pred, on_true, on_false);
+  TF_ASSIGN_OR_RETURN(XlaComputation where, where_builder.Build());
+
+  XlaBuilder builder("metal_elementwise_where_call");
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp zero = Broadcast(ConstantR0<float>(&builder, 0.0f), {kElementCount});
+  Call(&builder, where, {Gt(input, zero), input, Neg(input)});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 void ExpectMatchesReference(const Literal& actual, const Literal& lhs,
                             const Literal& rhs, bool relu) {
   ASSERT_TRUE(ShapeUtil::Compatible(
@@ -469,6 +495,38 @@ TEST(MetalGpuExecutableTest, ElementwiseLogistic) {
     const float value = input.Get<float>({i});
     return 1.0f / (1.0f + std::exp(-value));
   }, 1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSelectCompare) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_select_compare",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp zero =
+            Broadcast(ConstantR0<float>(builder, 0.0f), {kElementCount});
+        Select(Gt(input, zero), input, Neg(input));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
+    const float value = input.Get<float>({i});
+    return value > 0.0f ? value : -value;
+  });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseWhereCall) {
+  auto result = ExecuteMetalElementwiseWhereCall();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
+    const float value = input.Get<float>({i});
+    return value > 0.0f ? value : -value;
+  });
 }
 
 }  // namespace

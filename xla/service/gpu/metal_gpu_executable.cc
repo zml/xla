@@ -282,6 +282,12 @@ class ElementwiseAirEmitter {
     }
 
     switch (instr->opcode()) {
+      case HloOpcode::kCall:
+        return EmitCall(instr, body);
+      case HloOpcode::kCompare:
+        return EmitCompare(instr, body);
+      case HloOpcode::kSelect:
+        return EmitSelect(instr, body);
       case HloOpcode::kAdd:
       case HloOpcode::kSubtract:
       case HloOpcode::kMultiply:
@@ -328,6 +334,115 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise does not support HLO opcode %s.",
             HloOpcodeString(instr->opcode())));
     }
+  }
+
+  absl::StatusOr<const HloInstruction*> ResolveCallParameter(
+      const HloInstruction* call, const HloInstruction* callee_operand) {
+    if (callee_operand->opcode() != HloOpcode::kParameter) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise call inlining currently supports only "
+          "callee roots whose operands are parameters.");
+    }
+    const int64_t parameter_number = callee_operand->parameter_number();
+    if (parameter_number < 0 || parameter_number >= call->operand_count()) {
+      return absl::InvalidArgumentError(
+          "Metal direct AIR elementwise call parameter is out of bounds.");
+    }
+    return call->operand(parameter_number);
+  }
+
+  absl::StatusOr<std::string> EmitCall(const HloInstruction* instr,
+                                       std::vector<std::string>* body) {
+    const HloInstruction* root = instr->to_apply()->root_instruction();
+    if (root->opcode() != HloOpcode::kSelect) {
+      return absl::UnimplementedError(absl::StrFormat(
+          "Metal direct AIR elementwise supports only calls that inline to "
+          "select, got callee root opcode %s.",
+          HloOpcodeString(root->opcode())));
+    }
+    TF_ASSIGN_OR_RETURN(const HloInstruction* pred_instr,
+                        ResolveCallParameter(instr, root->operand(0)));
+    TF_ASSIGN_OR_RETURN(const HloInstruction* on_true_instr,
+                        ResolveCallParameter(instr, root->operand(1)));
+    TF_ASSIGN_OR_RETURN(const HloInstruction* on_false_instr,
+                        ResolveCallParameter(instr, root->operand(2)));
+
+    TF_ASSIGN_OR_RETURN(std::string pred,
+                        EmitValue(pred_instr, /*force_scalar=*/false, body));
+    TF_ASSIGN_OR_RETURN(
+        std::string on_true,
+        EmitValue(on_true_instr, IsScalarLikeF32(on_true_instr->shape()), body));
+    TF_ASSIGN_OR_RETURN(std::string on_false,
+                        EmitValue(on_false_instr,
+                                  IsScalarLikeF32(on_false_instr->shape()),
+                                  body));
+    std::string value = NewName("select");
+    body->push_back(absl::StrFormat("  %s = select i1 %s, float %s, float %s",
+                                    value, pred, on_true, on_false));
+    return value;
+  }
+
+  absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
+                                          std::vector<std::string>* body) {
+    Shape pred_shape = ShapeUtil::MakeShape(PRED, result_shape_.dimensions());
+    if (!ShapeUtil::Compatible(instr->shape(), pred_shape)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise compare currently supports only "
+          "predicates matching the result shape.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    absl::string_view predicate;
+    switch (instr->comparison_direction()) {
+      case ComparisonDirection::kEq:
+        predicate = "oeq";
+        break;
+      case ComparisonDirection::kNe:
+        predicate = "one";
+        break;
+      case ComparisonDirection::kGe:
+        predicate = "oge";
+        break;
+      case ComparisonDirection::kGt:
+        predicate = "ogt";
+        break;
+      case ComparisonDirection::kLe:
+        predicate = "ole";
+        break;
+      case ComparisonDirection::kLt:
+        predicate = "olt";
+        break;
+    }
+    std::string cmp = NewName("cmp");
+    body->push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    return cmp;
+  }
+
+  absl::StatusOr<std::string> EmitSelect(const HloInstruction* instr,
+                                         std::vector<std::string>* body) {
+    if (!IsF32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise select currently supports only f32 "
+          "array results.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string pred,
+                        EmitValue(instr->operand(0), /*force_scalar=*/false,
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string on_true,
+                        EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string on_false,
+                        EmitValue(instr->operand(2), IsScalarOperand(instr, 2),
+                                  body));
+    std::string value = NewName("select");
+    body->push_back(absl::StrFormat("  %s = select i1 %s, float %s, float %s",
+                                    value, pred, on_true, on_false));
+    return value;
   }
 
   absl::StatusOr<std::string> EmitBinary(const HloInstruction* instr,
