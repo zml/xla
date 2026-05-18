@@ -101,6 +101,15 @@ Literal MakeElementwiseS32() {
   return LiteralUtil::CreateR1<int32_t>(values);
 }
 
+Literal MakeElementwisePred() {
+  Literal literal =
+      Literal::CreateFromShape(ShapeUtil::MakeShape(PRED, {kElementCount}));
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    literal.Set<bool>({i}, (i % 3) == 0);
+  }
+  return literal;
+}
+
 Literal MakeGatherInput() {
   std::vector<float> values(kGatherInputSize);
   for (int64_t i = 0; i < kGatherInputSize; ++i) {
@@ -176,6 +185,23 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseUnary(const char* name,
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
 
   Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+template <typename BuildFn>
+absl::StatusOr<Literal> ExecuteMetalPredUnary(const char* name, BuildFn build) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder(name);
+  Shape shape = ShapeUtil::MakeShape(PRED, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  build(&builder, input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwisePred();
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   std::vector<GlobalData*> arguments = {input_data.get()};
@@ -1270,6 +1296,61 @@ TEST(MetalGpuExecutableTest, ElementwiseS32Shifts) {
         static_cast<int32_t>(static_cast<uint32_t>(value) >> amount);
     return left ^ (arithmetic ^ logical);
   });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32UnaryOps) {
+  auto result = ExecuteMetalS32Unary(
+      "metal_s32_unary_ops", [](XlaBuilder*, XlaOp input) {
+        XlaOp sign = Sign(input);
+        XlaOp abs = Abs(input);
+        XlaOp neg = Neg(input);
+        Add(sign, Add(abs, neg));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(actual, [&](int64_t i) {
+    const int32_t value = input.Get<int32_t>({i});
+    const int32_t sign = (value > 0) ? 1 : ((value < 0) ? -1 : 0);
+    return sign + std::abs(value) - value;
+  });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32NotPopcount) {
+  auto result = ExecuteMetalS32Unary(
+      "metal_s32_not_popcount", [](XlaBuilder*, XlaOp input) {
+        Add(Not(input), PopulationCount(input));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseS32();
+  ExpectMatchesS32Reference(actual, [&](int64_t i) {
+    const int32_t value = input.Get<int32_t>({i});
+    uint32_t bits = static_cast<uint32_t>(value);
+    int32_t count = 0;
+    while (bits != 0) {
+      count += static_cast<int32_t>(bits & 1u);
+      bits >>= 1;
+    }
+    return ~value + count;
+  });
+}
+
+TEST(MetalGpuExecutableTest, ElementwisePredParameterNot) {
+  auto result = ExecuteMetalPredUnary(
+      "metal_pred_parameter_not",
+      [](XlaBuilder*, XlaOp input) { Not(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwisePred();
+  ExpectMatchesPredReference(
+      actual, [&](int64_t i) { return !input.Get<bool>({i}); });
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseS32CompareRoot) {

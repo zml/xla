@@ -424,16 +424,20 @@ class ElementwiseAirEmitter {
       case HloOpcode::kOr:
       case HloOpcode::kXor:
         return EmitLogicalBinary(instr, body);
+      case HloOpcode::kNot:
+        return EmitNot(instr, body);
       case HloOpcode::kShiftLeft:
       case HloOpcode::kShiftRightArithmetic:
       case HloOpcode::kShiftRightLogical:
         return EmitShift(instr, body);
+      case HloOpcode::kPopulationCount:
+        return EmitPopcount(instr, body);
       case HloOpcode::kAtan2:
         return EmitAtan2(instr, body);
       case HloOpcode::kPower:
         return EmitIntrinsicBinary(instr, "air.fast_pow.f32", body);
       case HloOpcode::kNegate:
-        return EmitUnary(instr, "fneg fast float", body);
+        return EmitNegate(instr, body);
       case HloOpcode::kAbs:
         return EmitAbs(instr, body);
       case HloOpcode::kAcos:
@@ -481,7 +485,7 @@ class ElementwiseAirEmitter {
       case HloOpcode::kRoundNearestAfz:
         return EmitIntrinsicUnary(instr, "air.fast_round.f32", body);
       case HloOpcode::kSign:
-        return EmitIntrinsicUnary(instr, "air.sign.f32", body);
+        return EmitSign(instr, body);
       default:
         return absl::UnimplementedError(absl::StrFormat(
             "Metal direct AIR elementwise does not support HLO opcode %s.",
@@ -1090,6 +1094,70 @@ class ElementwiseAirEmitter {
     return result;
   }
 
+  absl::StatusOr<std::string> EmitNot(const HloInstruction* instr,
+                                      std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    if (instr->shape().element_type() == S32) {
+      return EmitOp("xor i32", value, "-1", body);
+    }
+    if (instr->shape().element_type() == PRED) {
+      return EmitOp("xor i1", value, "true", body);
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR not currently supports only s32 and pred arrays.");
+  }
+
+  absl::StatusOr<std::string> EmitPopcount(const HloInstruction* instr,
+                                           std::vector<std::string>* body) {
+    if (!IsS32Array(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR population count currently supports only s32 "
+          "arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string shifted1 = NewName("pop_shift1");
+    std::string masked1 = NewName("pop_mask1");
+    std::string partial1 = NewName("pop_partial1");
+    std::string masked2_lhs = NewName("pop_mask2_lhs");
+    std::string shifted2 = NewName("pop_shift2");
+    std::string masked2_rhs = NewName("pop_mask2_rhs");
+    std::string partial2 = NewName("pop_partial2");
+    std::string shifted4 = NewName("pop_shift4");
+    std::string partial4 = NewName("pop_partial4");
+    std::string masked4 = NewName("pop_mask4");
+    std::string product = NewName("pop_product");
+    std::string result = NewName("pop_result");
+    body->push_back(
+        absl::StrFormat("  %s = lshr i32 %s, 1", shifted1, value));
+    body->push_back(absl::StrFormat("  %s = and i32 %s, 1431655765",
+                                    masked1, shifted1));
+    body->push_back(absl::StrFormat("  %s = sub i32 %s, %s", partial1,
+                                    value, masked1));
+    body->push_back(absl::StrFormat("  %s = and i32 %s, 858993459",
+                                    masked2_lhs, partial1));
+    body->push_back(
+        absl::StrFormat("  %s = lshr i32 %s, 2", shifted2, partial1));
+    body->push_back(absl::StrFormat("  %s = and i32 %s, 858993459",
+                                    masked2_rhs, shifted2));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, %s", partial2,
+                                    masked2_lhs, masked2_rhs));
+    body->push_back(
+        absl::StrFormat("  %s = lshr i32 %s, 4", shifted4, partial2));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, %s", partial4,
+                                    partial2, shifted4));
+    body->push_back(absl::StrFormat("  %s = and i32 %s, 252645135", masked4,
+                                    partial4));
+    body->push_back(absl::StrFormat("  %s = mul i32 %s, 16843009", product,
+                                    masked4));
+    body->push_back(
+        absl::StrFormat("  %s = lshr i32 %s, 24", result, product));
+    return result;
+  }
+
   absl::StatusOr<std::string> EmitGather(const HloInstruction* instr,
                                          std::vector<std::string>* body) {
     const GatherDimensionNumbers& dnums = instr->gather_dimension_numbers();
@@ -1501,15 +1569,51 @@ class ElementwiseAirEmitter {
     return result;
   }
 
-  absl::StatusOr<std::string> EmitUnary(const HloInstruction* instr,
-                                        absl::string_view op,
-                                        std::vector<std::string>* body) {
+  absl::StatusOr<std::string> EmitNegate(const HloInstruction* instr,
+                                         std::vector<std::string>* body) {
     TF_ASSIGN_OR_RETURN(std::string value,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
                                   body));
     std::string name = NewName("unary");
-    body->push_back(absl::StrFormat("  %s = %s %s", name, op, value));
-    return name;
+    if (instr->shape().element_type() == S32) {
+      body->push_back(absl::StrFormat("  %s = sub i32 0, %s", name, value));
+      return name;
+    }
+    if (instr->shape().element_type() == F32) {
+      body->push_back(absl::StrFormat("  %s = fneg fast float %s", name,
+                                      value));
+      return name;
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR negate currently supports only f32 and s32 arrays.");
+  }
+
+  absl::StatusOr<std::string> EmitSign(const HloInstruction* instr,
+                                       std::vector<std::string>* body) {
+    if (instr->shape().element_type() == F32) {
+      return EmitIntrinsicUnary(instr, "air.sign.f32", body);
+    }
+    if (instr->shape().element_type() != S32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR sign currently supports only f32 and s32 arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string positive = NewName("sign_positive");
+    std::string negative = NewName("sign_negative");
+    std::string nonnegative_result = NewName("sign_nonnegative_result");
+    std::string result = NewName("sign_result");
+    body->push_back(
+        absl::StrFormat("  %s = icmp sgt i32 %s, 0", positive, value));
+    body->push_back(
+        absl::StrFormat("  %s = icmp slt i32 %s, 0", negative, value));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 1, i32 0", nonnegative_result, positive));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 -1, i32 %s", result, negative,
+        nonnegative_result));
+    return result;
   }
 
   absl::StatusOr<std::string> EmitLog1p(const HloInstruction* instr,
@@ -1621,6 +1725,15 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string value,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
                                   body));
+    if (instr->shape().element_type() == S32) {
+      std::string neg = NewName("neg");
+      body->push_back(absl::StrFormat("  %s = sub i32 0, %s", neg, value));
+      return EmitIntCompareSelect("sgt", value, neg, body);
+    }
+    if (instr->shape().element_type() != F32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR abs currently supports only f32 and s32 arrays.");
+    }
     std::string neg = NewName("neg");
     body->push_back(absl::StrFormat("  %s = fneg fast float %s", neg, value));
     return EmitCompareSelect("ogt", value, neg, body);
@@ -1646,6 +1759,12 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat(
         "  %s = load %s, %s addrspace(1)* %s, align %d", value, ir_type,
         ir_type, ptr, ElementTypeSize(type)));
+    if (type == PRED) {
+      std::string pred = NewName("pred");
+      body->push_back(
+          absl::StrFormat("  %s = icmp ne i8 %s, 0", pred, value));
+      return pred;
+    }
     return value;
   }
 
