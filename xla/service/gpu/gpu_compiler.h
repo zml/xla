@@ -232,6 +232,7 @@ class GpuCompiler : public LLVMCompiler {
     return absl::OkStatus();
   }
 
+  virtual bool EnableFusionAutotuning() const { return true; }
   virtual bool RequiresDnnSupport() const { return true; }
 
  private:

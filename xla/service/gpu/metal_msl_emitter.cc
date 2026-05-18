@@ -714,7 +714,12 @@ class FunctionEmitter {
   absl::StatusOr<std::string> BinaryExpr(const llvm::BinaryOperator& binary) {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(binary.getOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(binary.getOperand(1)));
+    return BinaryExprWithOperands(binary, lhs, rhs);
+  }
 
+  absl::StatusOr<std::string> BinaryExprWithOperands(
+      const llvm::BinaryOperator& binary, absl::string_view lhs,
+      absl::string_view rhs) {
     switch (binary.getOpcode()) {
       case llvm::Instruction::Add:
       case llvm::Instruction::FAdd:
@@ -851,6 +856,9 @@ class FunctionEmitter {
   absl::StatusOr<std::string> CallExpr(const llvm::CallInst& call) {
     const llvm::Function* callee = call.getCalledFunction();
     if (callee == nullptr) return Unsupported(function_, "indirect call", call);
+    if (!callee->isDeclaration()) {
+      return InlineSimpleFunctionCall(call);
+    }
     llvm::StringRef name = callee->getName();
 
     if (name == "llvm.nvvm.read.ptx.sreg.tid.x") return "metal_tid.x";
@@ -865,6 +873,14 @@ class FunctionEmitter {
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.x") return "metal_nbid.x";
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.y") return "metal_nbid.y";
     if (name == "llvm.nvvm.read.ptx.sreg.nctaid.z") return "metal_nbid.z";
+    if (name == "llvm.nvvm.shfl.sync.down.f32") {
+      if (call.arg_size() != 4) {
+        return Unsupported(function_, "shuffle-down call", call);
+      }
+      TF_ASSIGN_OR_RETURN(std::string value, Expr(call.getArgOperand(1)));
+      TF_ASSIGN_OR_RETURN(std::string delta, Expr(call.getArgOperand(2)));
+      return absl::StrCat("simd_shuffle_down(", value, ", ", delta, ")");
+    }
 
     if (name.starts_with("llvm.fabs.")) return UnaryMathCall("fabs", call);
     if (name.starts_with("llvm.sqrt.")) return UnaryMathCall("sqrt", call);
@@ -874,6 +890,41 @@ class FunctionEmitter {
     if (name.starts_with("llvm.log.")) return UnaryMathCall("log", call);
 
     return Unsupported(function_, "call", call);
+  }
+
+  absl::StatusOr<std::string> InlineSimpleFunctionCall(
+      const llvm::CallInst& call) {
+    const llvm::Function* callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return Unsupported(function_, "inline call", call);
+    }
+    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+      return Unsupported(function_, "inline function shape", call);
+    }
+    const llvm::BasicBlock& block = callee->getEntryBlock();
+    const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr || ret->getReturnValue() == nullptr) {
+      return Unsupported(function_, "inline function return", call);
+    }
+    return InlineSimpleValue(ret->getReturnValue(), call);
+  }
+
+  absl::StatusOr<std::string> InlineSimpleValue(
+      const llvm::Value* value, const llvm::CallInst& call) {
+    if (auto* argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      return Expr(call.getArgOperand(argument->getArgNo()));
+    }
+    if (llvm::isa<llvm::Constant>(value)) {
+      return Expr(value);
+    }
+    if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          InlineSimpleValue(binary->getOperand(0), call));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          InlineSimpleValue(binary->getOperand(1), call));
+      return BinaryExprWithOperands(*binary, lhs, rhs);
+    }
+    return Unsupported(function_, "inline value", *value);
   }
 
   absl::StatusOr<std::string> UnaryMathCall(absl::string_view msl_name,

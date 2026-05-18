@@ -66,6 +66,7 @@ class MetalGpuCompiler : public GpuCompiler {
   std::vector<std::string> GetLLVMCommandLineOptions(
       const DebugOptions& debug_options) const override;
 
+  bool EnableFusionAutotuning() const override { return false; }
   bool RequiresDnnSupport() const override { return false; }
 
  private:

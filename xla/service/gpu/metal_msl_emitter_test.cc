@@ -210,6 +210,53 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_EQ(msl.find("0f"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineReducerAndShuffleDown) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @reduce(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %gep = getelementptr inbounds [2 x float], ptr %arg0, i32 0, i32 %tid
+  %value = load float, ptr %gep, align 4
+  %sum = call float @scalar_add(float 0.000000e+00, float %value)
+  %peer = call float @llvm.nvvm.shfl.sync.down.f32(i32 -1, float %sum, i32 1, i32 31)
+  %total = call float @scalar_add(float %sum, float %peer)
+  %is_first = icmp eq i32 %tid, 0
+  br i1 %is_first, label %then, label %exit
+
+then:
+  store float %total, ptr %arg1, align 4
+  br label %exit
+
+exit:
+  ret void
+}
+
+define internal float @scalar_add(float %lhs, float %rhs) {
+entry:
+  %sum = fadd float %lhs, %rhs
+  ret float %sum
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare float @llvm.nvvm.shfl.sync.down.f32(i32, float, i32, i32)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @reduce, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("simd_shuffle_down("), std::string::npos) << msl;
+  EXPECT_NE(msl.find("float(0) +"), std::string::npos) << msl;
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla
