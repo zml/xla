@@ -699,6 +699,24 @@ TEST(MetalGpuExecutableTest, ElementwiseCompareRoot) {
       actual, [&](int64_t i) { return lhs.Get<float>({i}) > rhs.Get<float>({i}); });
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseConvertCompareToF32) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_convert_compare_to_f32",
+      [](XlaBuilder* builder, XlaOp input) {
+        XlaOp zero =
+            Broadcast(ConstantR0<float>(builder, 0.0f), {kElementCount});
+        ConvertElementType(Gt(input, zero), F32);
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
+    return input.Get<float>({i}) > 0.0f ? 1.0f : 0.0f;
+  });
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseWhereCall) {
   auto result = ExecuteMetalElementwiseWhereCall();
   if (absl::IsFailedPrecondition(result.status())) {

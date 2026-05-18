@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/embed_metal_air_kernels.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_buffer.h"
@@ -382,6 +383,8 @@ class ElementwiseAirEmitter {
         return EmitCall(instr, body);
       case HloOpcode::kConcatenate:
         return EmitConcatenate(instr, body);
+      case HloOpcode::kConvert:
+        return EmitConvert(instr, body);
       case HloOpcode::kIota:
         return EmitIota(instr, body);
       case HloOpcode::kTranspose:
@@ -758,6 +761,55 @@ class ElementwiseAirEmitter {
                                       predicate, lhs, rhs));
     }
     return cmp;
+  }
+
+  absl::StatusOr<std::string> EmitConvert(const HloInstruction* instr,
+                                          std::vector<std::string>* body) {
+    const PrimitiveType src_type = instr->operand(0)->shape().element_type();
+    const PrimitiveType dst_type = instr->shape().element_type();
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), /*force_scalar=*/false,
+                                  body));
+    if (src_type == dst_type) {
+      return value;
+    }
+
+    std::string converted = NewName("convert");
+    if (src_type == PRED && dst_type == F32) {
+      body->push_back(absl::StrFormat("  %s = uitofp i1 %s to float",
+                                      converted, value));
+      return converted;
+    }
+    if (src_type == PRED && dst_type == S32) {
+      body->push_back(
+          absl::StrFormat("  %s = zext i1 %s to i32", converted, value));
+      return converted;
+    }
+    if (src_type == F32 && dst_type == S32) {
+      body->push_back(absl::StrFormat("  %s = fptosi float %s to i32",
+                                      converted, value));
+      return converted;
+    }
+    if (src_type == S32 && dst_type == F32) {
+      body->push_back(absl::StrFormat("  %s = sitofp i32 %s to float",
+                                      converted, value));
+      return converted;
+    }
+    if (src_type == S32 && dst_type == PRED) {
+      body->push_back(
+          absl::StrFormat("  %s = icmp ne i32 %s, 0", converted, value));
+      return converted;
+    }
+    if (src_type == F32 && dst_type == PRED) {
+      body->push_back(absl::StrFormat(
+          "  %s = fcmp fast one float %s, 0x0000000000000000", converted,
+          value));
+      return converted;
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR elementwise convert does not support %s to %s.",
+        primitive_util::LowercasePrimitiveTypeName(src_type),
+        primitive_util::LowercasePrimitiveTypeName(dst_type)));
   }
 
   absl::StatusOr<std::string> EmitSelect(const HloInstruction* instr,
