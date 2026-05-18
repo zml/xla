@@ -314,7 +314,8 @@ absl::StatusOr<ExecutionOutput> MetalMatmulExecutable::ExecuteAsyncOnStream(
 
   ExecutionOutput result(result_shape_, allocator, device_ordinal,
                          executor->device_ordinal());
-  result.MutableResult()->set_buffer(std::move(output_buffer), {});
+  static_cast<ShapedBuffer*>(result.MutableResult())
+      ->set_buffer(output_buffer.Release(), {});
   result.Commit();
   return std::move(result);
 }

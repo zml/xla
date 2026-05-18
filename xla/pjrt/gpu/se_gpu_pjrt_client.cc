@@ -1648,6 +1648,13 @@ GetStreamExecutorGpuDeviceAllocator(
         addressable_devices) {
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
+  bool preallocate = allocator_config.preallocate;
+#if TENSORFLOW_USE_METAL
+  if (platform->id() == stream_executor::metal::kMetalPlatformId &&
+      effective_kind == GpuAllocatorConfig::Kind::kDefault) {
+    preallocate = false;
+  }
+#endif  // TENSORFLOW_USE_METAL
   if (GetDebugOptionsFromFlags().xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
       effective_kind != GpuAllocatorConfig::Kind::kVmm) {
@@ -1662,7 +1669,7 @@ GetStreamExecutorGpuDeviceAllocator(
             auto async_allocator,
             CreateCudaAsyncAllocator(
                 *(ordinal_and_device.second), allocator_config.memory_fraction,
-                allocator_config.preallocate, false, false, true));
+                preallocate, false, false, true));
         allocators.push_back(
             {std::move(async_allocator),
              ordinal_and_device.second->compute_stream(),
@@ -1679,7 +1686,7 @@ GetStreamExecutorGpuDeviceAllocator(
             auto bfc_allocator,
             CreateBFCAllocator(ordinal_and_device.second->executor(),
                                allocator_config.memory_fraction,
-                               allocator_config.preallocate,
+                               preallocate,
                                allocator_config.gpu_system_memory_size,
                                allocator_config.sub_allocator_alloc_visitors,
                                allocator_config.sub_allocator_free_visitors));
