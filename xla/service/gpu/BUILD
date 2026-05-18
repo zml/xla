@@ -3737,14 +3737,58 @@ cc_library(
     ],
     deps = [
         ":gpu_compiler",
+        ":metal_msl_emitter",
         "//xla/hlo/ir:hlo",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+cc_library(
+    name = "metal_msl_emitter",
+    srcs = [
+        "metal_msl_emitter.cc",
+    ],
+    hdrs = [
+        "metal_msl_emitter.h",
+    ],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_msl_emitter_test",
+    srcs = ["metal_msl_emitter_test.cc"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_msl_emitter",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
     ],
 )
 

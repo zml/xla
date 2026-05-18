@@ -24,10 +24,12 @@ limitations under the License.
 #include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/metal_msl_emitter.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace gpu {
@@ -73,9 +75,10 @@ MetalGpuCompiler::CompileTargetBinary(
     const stream_executor::DeviceDescription& device_description,
     bool relocatable, const HloModule* debug_module,
     std::optional<int> shard_number) {
-  return absl::UnimplementedError(
-      "XLA:GPU Metal requires a direct MLIR-to-MSL emitter. The backend is "
-      "registered, but direct MSL code generation is not implemented yet.");
+  TF_ASSIGN_OR_RETURN(std::string msl, EmitMslFromLlvmModule(*llvm_module));
+  std::vector<uint8_t> binary(msl.begin(), msl.end());
+  return BackendCompileResult{/*asm_text=*/std::move(msl),
+                              /*binary=*/std::move(binary)};
 }
 
 std::vector<std::string> MetalGpuCompiler::GetLLVMCommandLineOptions(
