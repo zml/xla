@@ -2006,8 +2006,12 @@ class FunctionEmitter {
     }
     if (name.starts_with("llvm.maximum.")) return BinaryMathCall("max", call);
     if (name.starts_with("llvm.minimum.")) return BinaryMathCall("min", call);
-    if (name.starts_with("llvm.smax.")) return BinaryMathCall("max", call);
-    if (name.starts_with("llvm.smin.")) return BinaryMathCall("min", call);
+    if (name.starts_with("llvm.smax.")) {
+      return SignedIntegerBinaryCall("max", call);
+    }
+    if (name.starts_with("llvm.smin.")) {
+      return SignedIntegerBinaryCall("min", call);
+    }
     if (name.starts_with("llvm.umax.")) {
       return UnsignedIntegerBinaryCall("max", call);
     }
@@ -2436,11 +2440,19 @@ class FunctionEmitter {
       return InlineNestedSimpleFunctionCall(nested_call, outer_call);
     }
     llvm::StringRef name = callee->getName();
-    if (name.starts_with("llvm.maximum.") || name.starts_with("llvm.smax.")) {
+    if (name.starts_with("llvm.maximum.")) {
       return InlineSimpleBinaryCall("max", nested_call, outer_call);
     }
-    if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
+    if (name.starts_with("llvm.minimum.")) {
       return InlineSimpleBinaryCall("min", nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.smax.")) {
+      return InlineSimpleSignedIntegerBinaryCall("max", nested_call,
+                                                 outer_call);
+    }
+    if (name.starts_with("llvm.smin.")) {
+      return InlineSimpleSignedIntegerBinaryCall("min", nested_call,
+                                                 outer_call);
     }
     if (name.starts_with("llvm.fabs.")) {
       return InlineSimpleUnaryCall("fabs", nested_call, outer_call);
@@ -2680,11 +2692,19 @@ class FunctionEmitter {
                                                    outer_call);
     }
     llvm::StringRef name = callee->getName();
-    if (name.starts_with("llvm.maximum.") || name.starts_with("llvm.smax.")) {
+    if (name.starts_with("llvm.maximum.")) {
       return InlineNestedBinaryCall("max", call, nested_call, outer_call);
     }
-    if (name.starts_with("llvm.minimum.") || name.starts_with("llvm.smin.")) {
+    if (name.starts_with("llvm.minimum.")) {
       return InlineNestedBinaryCall("min", call, nested_call, outer_call);
+    }
+    if (name.starts_with("llvm.smax.")) {
+      return InlineNestedSignedIntegerBinaryCall("max", call, nested_call,
+                                                 outer_call);
+    }
+    if (name.starts_with("llvm.smin.")) {
+      return InlineNestedSignedIntegerBinaryCall("min", call, nested_call,
+                                                 outer_call);
     }
     if (name.starts_with("llvm.fabs.")) {
       return InlineNestedUnaryCall("fabs", call, nested_call, outer_call);
@@ -2867,6 +2887,23 @@ class FunctionEmitter {
         InlineNestedSimpleValue(call.getArgOperand(1), nested_call,
                                 outer_call));
     return UnsignedIntegerBinaryExpr(msl_name, call.getType(), lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> InlineNestedSignedIntegerBinaryCall(
+      absl::string_view msl_name, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    if (call.arg_size() != 2) {
+      return Unsupported(function_, "nested inline binary call", call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string lhs,
+        InlineNestedSimpleValue(call.getArgOperand(0), nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string rhs,
+        InlineNestedSimpleValue(call.getArgOperand(1), nested_call,
+                                outer_call));
+    return SignedIntegerBinaryExpr(msl_name, call.getType(), lhs, rhs);
   }
 
   absl::StatusOr<std::string> InlineDoubleNestedSimpleValue(
@@ -3238,6 +3275,21 @@ class FunctionEmitter {
     return UnsignedIntegerBinaryExpr(msl_name, nested_call.getType(), lhs, rhs);
   }
 
+  absl::StatusOr<std::string> InlineSimpleSignedIntegerBinaryCall(
+      absl::string_view msl_name, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    if (nested_call.arg_size() != 2) {
+      return Unsupported(function_, "inline binary call", nested_call);
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string lhs,
+        InlineSimpleValue(nested_call.getArgOperand(0), outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string rhs,
+        InlineSimpleValue(nested_call.getArgOperand(1), outer_call));
+    return SignedIntegerBinaryExpr(msl_name, nested_call.getType(), lhs, rhs);
+  }
+
   absl::StatusOr<std::string> UnaryMathCall(absl::string_view msl_name,
                                             const llvm::CallInst& call) {
     if (call.arg_size() != 1) return Unsupported(function_, "math call", call);
@@ -3280,6 +3332,23 @@ class FunctionEmitter {
     TF_ASSIGN_OR_RETURN(std::string lhs, Expr(call.getArgOperand(0)));
     TF_ASSIGN_OR_RETURN(std::string rhs, Expr(call.getArgOperand(1)));
     return UnsignedIntegerBinaryExpr(msl_name, call.getType(), lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> SignedIntegerBinaryCall(
+      absl::string_view msl_name, const llvm::CallInst& call) {
+    if (call.arg_size() != 2) return Unsupported(function_, "math call", call);
+    TF_ASSIGN_OR_RETURN(std::string lhs, Expr(call.getArgOperand(0)));
+    TF_ASSIGN_OR_RETURN(std::string rhs, Expr(call.getArgOperand(1)));
+    return SignedIntegerBinaryExpr(msl_name, call.getType(), lhs, rhs);
+  }
+
+  absl::StatusOr<std::string> SignedIntegerBinaryExpr(
+      absl::string_view msl_name, llvm::Type* result_type,
+      absl::string_view lhs, absl::string_view rhs) {
+    TF_ASSIGN_OR_RETURN(std::string signed_type, MslType(result_type));
+    return absl::StrCat("static_cast<", signed_type, ">(", msl_name,
+                        "(static_cast<", signed_type, ">(", lhs,
+                        "), static_cast<", signed_type, ">(", rhs, ")))");
   }
 
   absl::StatusOr<std::string> UnsignedIntegerBinaryExpr(

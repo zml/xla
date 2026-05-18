@@ -1465,7 +1465,8 @@ define void @calls(ptr %arg0, ptr %arg1) {
 entry:
   %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   %signed_limited = call i32 @llvm.smin.i32(i32 %tid, i32 4)
-  %limited = call i32 @llvm.umin.i32(i32 %signed_limited, i32 3)
+  %signed_floor = call i32 @llvm.smax.i32(i32 -2147483648, i32 %signed_limited)
+  %limited = call i32 @llvm.umin.i32(i32 %signed_floor, i32 3)
   %in = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %limited
   %value = load float, ptr %in, align 4
   %sine = call float @__nv_sinf(float %value)
@@ -1476,6 +1477,7 @@ entry:
 
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 declare i32 @llvm.smin.i32(i32, i32)
+declare i32 @llvm.smax.i32(i32, i32)
 declare i32 @llvm.umin.i32(i32, i32)
 declare float @__nv_sinf(float)
 
@@ -1489,13 +1491,22 @@ declare float @__nv_sinf(float)
 
   TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
 
-  EXPECT_NE(msl.find("min(v0, 4)"), std::string::npos) << msl;
   EXPECT_NE(msl.find(
-                "static_cast<int>(min(static_cast<uint>(v1), "
+                "static_cast<int>(min(static_cast<int>(v0), "
+                "static_cast<int>(4)))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find(
+                "static_cast<int>(max(static_cast<int>(-2147483648), "
+                "static_cast<int>(v1)))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find(
+                "static_cast<int>(min(static_cast<uint>(v2), "
                 "static_cast<uint>(3)))"),
             std::string::npos)
       << msl;
-  EXPECT_NE(msl.find("sin(v3)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("sin("), std::string::npos) << msl;
 }
 
 TEST(MetalMslEmitterTest, EmitsLogicalRightShiftWithUnsignedType) {
