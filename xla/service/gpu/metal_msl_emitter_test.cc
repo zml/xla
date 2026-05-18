@@ -615,6 +615,156 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsSubByteIntegerSignExtension) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @i4_to_i8(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x i8], ptr %arg0, i32 0, i32 %tid
+  %packed = load i8, ptr %in, align 1
+  %nibble = trunc i8 %packed to i4
+  %extended = sext i4 %nibble to i8
+  %out = getelementptr inbounds [4 x i8], ptr %arg1, i32 0, i32 %tid
+  store i8 %extended, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @i4_to_i8, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("static_cast<uchar>(v1) & 15u"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("^ 8u"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsSubByteIntegerZeroExtension) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @u4_to_u8(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x i8], ptr %arg0, i32 0, i32 %tid
+  %packed = load i8, ptr %in, align 1
+  %nibble = trunc i8 %packed to i4
+  %extended = zext i4 %nibble to i8
+  %out = getelementptr inbounds [4 x i8], ptr %arg1, i32 0, i32 %tid
+  store i8 %extended, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @u4_to_u8, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("static_cast<uchar>(v1) & 15u"), std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("v3 = static_cast<char>((static_cast<uchar>(v2) & 15u));"),
+            std::string::npos)
+      << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsPackedSubByteIntegerVectorStore) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @i8_to_i4x2(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in_offset = shl i32 %tid, 1
+  %in = getelementptr inbounds [6 x i8], ptr %arg0, i32 0, i32 %in_offset
+  %pair = load <2 x i8>, ptr %in, align 1
+  %lo_i8 = extractelement <2 x i8> %pair, i32 0
+  %lo_i4 = trunc i8 %lo_i8 to i4
+  %hi_i8 = extractelement <2 x i8> %pair, i32 1
+  %hi_i4 = trunc i8 %hi_i8 to i4
+  %lo_vec = insertelement <2 x i4> poison, i4 %lo_i4, i32 0
+  %packed = insertelement <2 x i4> %lo_vec, i4 %hi_i4, i32 1
+  %out_offset = lshr i32 %in_offset, 1
+  %out = getelementptr inbounds [3 x i8], ptr %arg1, i32 0, i32 %out_offset
+  store <2 x i4> %packed, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @i8_to_i4x2, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_EQ(msl.find("reinterpret_cast<device char2*>(&arg1"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("] = static_cast<char>(("), std::string::npos) << msl;
+  EXPECT_NE(msl.find(" & 15u) << 4"), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsPackedSubByteIntegerVectorLoad) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @i4x2_to_i8(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [3 x i8], ptr %arg0, i32 0, i32 %tid
+  %packed = load <2 x i4>, ptr %in, align 1
+  %lo_i4 = extractelement <2 x i4> %packed, i32 0
+  %lo_i8 = sext i4 %lo_i4 to i8
+  %out = getelementptr inbounds [6 x i8], ptr %arg1, i32 0, i32 %tid
+  store i8 %lo_i8, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @i4x2_to_i8, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("char2(static_cast<char>((static_cast<uchar>(arg0[v0]) & "
+                     "15u))"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("(static_cast<uchar>(arg0[v0]) >> 4) & 15u"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsInlineBfloat16ToFloatConversion) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -1376,7 +1526,45 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
   TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
 
-  EXPECT_NE(msl.find("as_type<int>(static_cast<uint>(v1) >> 1)"),
+  EXPECT_NE(msl.find(
+                "as_type<int>(static_cast<uint>(static_cast<uint>(v1) >> 1))"),
+            std::string::npos)
+      << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsByteLogicalRightShiftWithNarrowResult) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @shift_i8(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x i8], ptr %arg0, i32 0, i32 %tid
+  %value = load i8, ptr %in, align 1
+  %amount32 = and i32 %tid, 7
+  %amount = trunc i32 %amount32 to i8
+  %shifted = lshr i8 %value, %amount
+  %out = getelementptr inbounds [4 x i8], ptr %arg1, i32 0, i32 %tid
+  store i8 %shifted, ptr %out, align 1
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @shift_i8, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find(
+                "as_type<char>(static_cast<uchar>(static_cast<uchar>(v1) >> "
+                "v3))"),
             std::string::npos)
       << msl;
 }

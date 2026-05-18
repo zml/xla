@@ -184,6 +184,9 @@ absl::StatusOr<std::string> ZeroInitializer(llvm::Type* type);
 absl::StatusOr<std::string> MslScalarType(llvm::Type* type,
                                           bool unsigned_integer = false) {
   if (type->isIntegerTy(1)) return "bool";
+  if (type->isIntegerTy() && type->getIntegerBitWidth() < 8) {
+    return unsigned_integer ? "uchar" : "char";
+  }
   if (type->isIntegerTy(8)) return unsigned_integer ? "uchar" : "char";
   if (type->isIntegerTy(16)) return unsigned_integer ? "ushort" : "short";
   if (type->isIntegerTy(32)) return unsigned_integer ? "uint" : "int";
@@ -490,6 +493,7 @@ class FunctionEmitter {
 
   void RecordPointerElementType(const llvm::Value* pointer,
                                 llvm::Type* element_type) {
+    element_type = PointerStorageElementType(element_type);
     const llvm::Value* root = PointerRoot(pointer);
     if (root == nullptr) return;
     auto [it, inserted] = pointer_element_types_.try_emplace(root, element_type);
@@ -755,6 +759,13 @@ class FunctionEmitter {
 
   absl::StatusOr<int64_t> ScaleForGepIndex(llvm::Type* scaled_type,
                                            PtrExpr* base) {
+    if (base->element_type->isIntegerTy(8)) {
+      if (std::optional<int64_t> packed_bytes =
+              PackedSubByteVectorByteSize(scaled_type)) {
+        return *packed_bytes;
+      }
+    }
+
     absl::StatusOr<int64_t> scale =
         FlattenedElementCount(data_layout_, scaled_type, base->element_type);
     if (scale.ok()) return *scale;
@@ -1242,6 +1253,13 @@ class FunctionEmitter {
                           PointerExprFor(store->getPointerOperand()));
       TF_ASSIGN_OR_RETURN(std::string value, Expr(store->getValueOperand()));
       llvm::Type* value_type = store->getValueOperand()->getType();
+      TF_ASSIGN_OR_RETURN(std::optional<std::string> packed_store,
+                          PackedSubByteVectorStoreStatements(
+                              pointer, value_type, value, indent));
+      if (packed_store.has_value()) {
+        absl::StrAppend(output, *packed_store);
+        return absl::OkStatus();
+      }
       if (value_type == pointer.element_type) {
         absl::StrAppend(output, Indent(indent), pointer.base, "[",
                         pointer.index, "] = ", value, ";\n");
@@ -1670,7 +1688,8 @@ class FunctionEmitter {
             std::string unsigned_type,
             MslType(binary.getType(), /*unsigned_integer=*/true));
         return absl::StrCat("(as_type<", type, ">(static_cast<",
-                            unsigned_type, ">(", lhs, ") >> ", rhs, "))");
+                            unsigned_type, ">(static_cast<", unsigned_type,
+                            ">(", lhs, ") >> ", rhs, ")))");
       }
       case llvm::Instruction::AShr:
         return absl::StrCat("(", lhs, " >> ", rhs, ")");
@@ -1824,6 +1843,23 @@ class FunctionEmitter {
   absl::StatusOr<std::string> CastExprWithOperand(const llvm::CastInst& cast,
                                                   absl::string_view operand) {
     TF_ASSIGN_OR_RETURN(std::string type, MslType(cast.getType()));
+    if (cast.getOpcode() == llvm::Instruction::Trunc &&
+        IsSubByteInteger(cast.getType())) {
+      return absl::StrCat("static_cast<", type, ">(",
+                          MaskedSubByteInteger(operand, cast.getType()), ")");
+    }
+    if (cast.getOpcode() == llvm::Instruction::ZExt &&
+        IsSubByteInteger(cast.getOperand(0)->getType())) {
+      return absl::StrCat("static_cast<", type, ">(",
+                          MaskedSubByteInteger(
+                              operand, cast.getOperand(0)->getType()),
+                          ")");
+    }
+    if (cast.getOpcode() == llvm::Instruction::SExt &&
+        IsSubByteInteger(cast.getOperand(0)->getType())) {
+      return SignExtendSubByteInteger(operand, cast.getOperand(0)->getType(),
+                                      type);
+    }
     if (cast.getOpcode() == llvm::Instruction::FPTrunc &&
         cast.getType()->isBFloatTy() &&
         cast.getOperand(0)->getType()->isFloatTy()) {
@@ -1862,6 +1898,48 @@ class FunctionEmitter {
       default:
         return Unsupported(function_, "cast", cast);
     }
+  }
+
+  bool IsSubByteInteger(llvm::Type* type) const {
+    return type->isIntegerTy() && type->getIntegerBitWidth() > 1 &&
+           type->getIntegerBitWidth() < 8;
+  }
+
+  std::optional<int64_t> PackedSubByteVectorByteSize(llvm::Type* type) const {
+    auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type);
+    if (vector_type == nullptr) return std::nullopt;
+    llvm::Type* element_type = vector_type->getElementType();
+    if (!IsSubByteInteger(element_type)) return std::nullopt;
+
+    int width = element_type->getIntegerBitWidth();
+    if (8 % width != 0) return std::nullopt;
+
+    int64_t bits = static_cast<int64_t>(width) * vector_type->getNumElements();
+    return (bits + 7) / 8;
+  }
+
+  llvm::Type* PointerStorageElementType(llvm::Type* element_type) const {
+    if (PackedSubByteVectorByteSize(element_type).has_value()) {
+      return llvm::Type::getInt8Ty(function_.getContext());
+    }
+    return element_type;
+  }
+
+  std::string MaskedSubByteInteger(absl::string_view value,
+                                   llvm::Type* type) const {
+    int width = type->getIntegerBitWidth();
+    uint64_t mask = (uint64_t{1} << width) - 1;
+    return absl::StrCat("(static_cast<uchar>(", value, ") & ", mask, "u)");
+  }
+
+  std::string SignExtendSubByteInteger(absl::string_view value,
+                                       llvm::Type* type,
+                                       absl::string_view result_type) const {
+    int width = type->getIntegerBitWidth();
+    uint64_t sign_bit = uint64_t{1} << (width - 1);
+    std::string masked = MaskedSubByteInteger(value, type);
+    return absl::StrCat("static_cast<", result_type, ">(static_cast<int>((",
+                        masked, " ^ ", sign_bit, "u)) - ", sign_bit, ")");
   }
 
   absl::StatusOr<std::string> PointerToIntegerExpr(
@@ -3765,12 +3843,111 @@ class FunctionEmitter {
 
   absl::StatusOr<std::string> LoadFromPointer(const PtrExpr& pointer,
                                               llvm::Type* load_type) {
+    TF_ASSIGN_OR_RETURN(std::optional<std::string> packed_load,
+                        PackedSubByteVectorLoadExpr(pointer, load_type));
+    if (packed_load.has_value()) return *packed_load;
+
     std::string expression =
         absl::StrCat(pointer.base, "[", pointer.index, "]");
     if (pointer.element_type == load_type) return expression;
     TF_ASSIGN_OR_RETURN(std::string load_msl_type, MslType(load_type));
     return absl::StrCat("(*reinterpret_cast<", pointer.address_space, " ",
                         load_msl_type, "*>(&", expression, "))");
+  }
+
+  std::string VectorLaneExpr(absl::string_view vector,
+                             llvm::FixedVectorType* vector_type,
+                             int lane) const {
+    if (WideVectorTypeName(vector_type).has_value()) {
+      return absl::StrCat(vector, ".elements[", lane, "]");
+    }
+    return absl::StrCat(vector, "[", lane, "]");
+  }
+
+  absl::StatusOr<std::optional<std::string>>
+  PackedSubByteVectorStoreStatements(const PtrExpr& pointer,
+                                     llvm::Type* value_type,
+                                     absl::string_view value, int indent) {
+    auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(value_type);
+    if (vector_type == nullptr ||
+        !PackedSubByteVectorByteSize(value_type).has_value()) {
+      return std::nullopt;
+    }
+    if (!pointer.element_type->isIntegerTy(8)) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Metal MSL emission cannot store packed sub-byte vector ",
+          PrintLlvmType(*value_type), " through pointer element type ",
+          PrintLlvmType(*pointer.element_type)));
+    }
+
+    llvm::Type* element_type = vector_type->getElementType();
+    int element_width = element_type->getIntegerBitWidth();
+    int lanes_per_byte = 8 / element_width;
+    int lanes = vector_type->getNumElements();
+    int bytes = (lanes + lanes_per_byte - 1) / lanes_per_byte;
+
+    std::string output;
+    for (int byte = 0; byte < bytes; ++byte) {
+      std::vector<std::string> terms;
+      for (int lane_in_byte = 0; lane_in_byte < lanes_per_byte;
+           ++lane_in_byte) {
+        int lane = byte * lanes_per_byte + lane_in_byte;
+        if (lane >= lanes) break;
+
+        std::string masked = MaskedSubByteInteger(
+            VectorLaneExpr(value, vector_type, lane), element_type);
+        int shift = lane_in_byte * element_width;
+        if (shift == 0) {
+          terms.push_back(std::move(masked));
+        } else {
+          terms.push_back(absl::StrCat("(", masked, " << ", shift, ")"));
+        }
+      }
+      absl::StrAppend(&output, Indent(indent), pointer.base, "[",
+                      AddIndex(pointer.index, absl::StrCat(byte)),
+                      "] = static_cast<char>((", absl::StrJoin(terms, " | "),
+                      "));\n");
+    }
+    return output;
+  }
+
+  absl::StatusOr<std::optional<std::string>> PackedSubByteVectorLoadExpr(
+      const PtrExpr& pointer, llvm::Type* load_type) {
+    auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(load_type);
+    if (vector_type == nullptr ||
+        !PackedSubByteVectorByteSize(load_type).has_value()) {
+      return std::nullopt;
+    }
+    if (!pointer.element_type->isIntegerTy(8)) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Metal MSL emission cannot load packed sub-byte vector ",
+          PrintLlvmType(*load_type), " through pointer element type ",
+          PrintLlvmType(*pointer.element_type)));
+    }
+
+    llvm::Type* element_type = vector_type->getElementType();
+    int element_width = element_type->getIntegerBitWidth();
+    int lanes_per_byte = 8 / element_width;
+
+    TF_ASSIGN_OR_RETURN(std::string vector_msl_type, MslType(load_type));
+    std::vector<std::string> lanes;
+    lanes.reserve(vector_type->getNumElements());
+    for (int lane = 0; lane < vector_type->getNumElements(); ++lane) {
+      int byte = lane / lanes_per_byte;
+      int shift = (lane % lanes_per_byte) * element_width;
+      std::string byte_expr = absl::StrCat(
+          "static_cast<uchar>(", pointer.base, "[",
+          AddIndex(pointer.index, absl::StrCat(byte)), "])");
+      std::string shifted = shift == 0
+                                ? byte_expr
+                                : absl::StrCat("(", byte_expr, " >> ", shift,
+                                               ")");
+      lanes.push_back(absl::StrCat(
+          "static_cast<char>((", shifted, " & ",
+          (uint64_t{1} << element_width) - 1, "u))"));
+    }
+    return absl::StrCat(vector_msl_type, "(", absl::StrJoin(lanes, ", "),
+                        ")");
   }
 
   absl::StatusOr<std::string> InlineConstantGlobalLoadExpr(
