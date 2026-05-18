@@ -1051,6 +1051,11 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
       uint64_t allocation_size = allocations[info.allocation_index]->size();
       uint64_t content_size = info.content.span().size();
       uint64_t size = content_size == 0 ? allocation_size : content_size;
+      if (size == 0) {
+        InsertOrDie(globals.get(), info.allocation_index,
+                    se::DeviceAddressBase(nullptr, 0));
+        continue;
+      }
       se::DeviceAddressBase global = executor->Allocate(size, /*memory_space=*/0);
       if (global.opaque() == nullptr) {
         return absl::InternalError(absl::StrCat(
