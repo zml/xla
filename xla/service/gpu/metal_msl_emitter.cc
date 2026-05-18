@@ -415,11 +415,20 @@ class FunctionEmitter {
 
     int value_index = 0;
     int local_index = 0;
+    int cmpxchg_index = 0;
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
         if (instruction.getType()->isVoidTy()) continue;
         if (llvm::isa<llvm::AllocaInst>(&instruction)) {
           names_[&instruction] = absl::StrCat("local", local_index++);
+          continue;
+        }
+        if (llvm::isa<llvm::AtomicCmpXchgInst>(&instruction)) {
+          cmpxchg_old_names_[&instruction] =
+              absl::StrCat("cmpxchg_old", cmpxchg_index);
+          cmpxchg_success_names_[&instruction] =
+              absl::StrCat("cmpxchg_success", cmpxchg_index);
+          ++cmpxchg_index;
           continue;
         }
         if (IsPointerType(instruction)) continue;
@@ -574,6 +583,26 @@ class FunctionEmitter {
                            *block->getTerminator());
       }
 
+      if (const auto* branch =
+              llvm::dyn_cast<llvm::CondBrInst>(block->getTerminator());
+          branch != nullptr &&
+          (branch->getSuccessor(0) == block ||
+           branch->getSuccessor(1) == block)) {
+        const bool continue_on_true = branch->getSuccessor(0) == block;
+        const llvm::BasicBlock* exit_block =
+            continue_on_true ? branch->getSuccessor(1)
+                             : branch->getSuccessor(0);
+        absl::StrAppend(output, Indent(indent), "do {\n");
+        RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent + 1));
+        RETURN_IF_ERROR(EmitPhiAssignments(*block, block, output, indent + 1));
+        TF_ASSIGN_OR_RETURN(std::string condition, Expr(branch->getCondition()));
+        if (!continue_on_true) condition = absl::StrCat("!(", condition, ")");
+        absl::StrAppend(output, Indent(indent), "} while (", condition,
+                        ");\n");
+        block = exit_block;
+        continue;
+      }
+
       RETURN_IF_ERROR(EmitBlockStatements(*block, output, indent));
 
       const llvm::Instruction* terminator = block->getTerminator();
@@ -649,6 +678,24 @@ class FunctionEmitter {
         continue;
       }
 
+      if (stop_block != nullptr &&
+          CanEmitStructuredBlockToStop(true_block, stop_block) &&
+          CanEmitStructuredBlockToStop(false_block, stop_block)) {
+        absl::StrAppend(output, Indent(indent), "if (", condition, ") {\n");
+        absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
+        RETURN_IF_ERROR(EmitStructuredBlock(true_block, stop_block, output,
+                                            indent + 1, &true_visited));
+        absl::StrAppend(output, Indent(indent), "} else {\n");
+        absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
+        RETURN_IF_ERROR(EmitStructuredBlock(false_block, stop_block, output,
+                                            indent + 1, &false_visited));
+        absl::StrAppend(output, Indent(indent), "}\n");
+        visited->insert(true_visited.begin(), true_visited.end());
+        visited->insert(false_visited.begin(), false_visited.end());
+        block = stop_block;
+        continue;
+      }
+
       return Unsupported(function_, "control flow shape", *terminator);
     }
 
@@ -685,6 +732,13 @@ class FunctionEmitter {
     const llvm::BasicBlock* false_successor =
         UnconditionalBranchSuccessor(*false_block);
 
+    if (true_block == block) {
+      return CanEmitStructuredBlockToStop(false_block, stop_block, visited);
+    }
+    if (false_block == block) {
+      return CanEmitStructuredBlockToStop(true_block, stop_block, visited);
+    }
+
     if (true_successor != nullptr && true_successor == false_successor) {
       absl::flat_hash_set<const llvm::BasicBlock*> true_visited = *visited;
       absl::flat_hash_set<const llvm::BasicBlock*> false_visited = *visited;
@@ -706,9 +760,22 @@ class FunctionEmitter {
 
     true_visited = *visited;
     false_visited = *visited;
-    return CanEmitStructuredBlockToStop(false_block, true_block,
-                                        &false_visited) &&
-           CanEmitStructuredBlockToStop(true_block, stop_block, &true_visited);
+    if (CanEmitStructuredBlockToStop(false_block, true_block,
+                                     &false_visited) &&
+        CanEmitStructuredBlockToStop(true_block, stop_block, &true_visited)) {
+      return true;
+    }
+
+    if (stop_block != nullptr) {
+      true_visited = *visited;
+      false_visited = *visited;
+      return CanEmitStructuredBlockToStop(true_block, stop_block,
+                                          &true_visited) &&
+             CanEmitStructuredBlockToStop(false_block, stop_block,
+                                          &false_visited);
+    }
+
+    return false;
   }
 
   absl::StatusOr<bool> TryEmitIfElseDiamond(const llvm::CondBrInst& branch,
@@ -839,6 +906,11 @@ class FunctionEmitter {
     if (auto* atomic = llvm::dyn_cast<llvm::AtomicRMWInst>(&instruction)) {
       TF_ASSIGN_OR_RETURN(std::string statement, AtomicRmwStatement(*atomic));
       absl::StrAppend(output, Indent(indent), statement, "\n");
+      return absl::OkStatus();
+    }
+
+    if (auto* cmpxchg = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&instruction)) {
+      RETURN_IF_ERROR(EmitAtomicCmpXchg(*cmpxchg, output, indent));
       return absl::OkStatus();
     }
 
@@ -1014,6 +1086,12 @@ class FunctionEmitter {
     }
     const llvm::Value* aggregate = extract.getAggregateOperand();
     unsigned field = *extract.idx_begin();
+    if (auto* cmpxchg = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(aggregate)) {
+      if (field == 0) return CmpXchgOldName(*cmpxchg);
+      if (field == 1) return CmpXchgSuccessName(*cmpxchg);
+      return absl::InvalidArgumentError(
+          absl::StrCat("cmpxchg field ", field, " is out of range."));
+    }
     if (auto* call = llvm::dyn_cast<llvm::CallInst>(aggregate)) {
       return InlineSimpleAggregateElement(*call, field);
     }
@@ -1464,6 +1542,43 @@ class FunctionEmitter {
                         value, ", memory_order_relaxed)");
   }
 
+  absl::Status EmitAtomicCmpXchg(const llvm::AtomicCmpXchgInst& cmpxchg,
+                                 std::string* output, int indent) {
+    TF_ASSIGN_OR_RETURN(PtrExpr pointer,
+                        PointerExprFor(cmpxchg.getPointerOperand()));
+    TF_ASSIGN_OR_RETURN(std::string compare, Expr(cmpxchg.getCompareOperand()));
+    TF_ASSIGN_OR_RETURN(std::string new_value, Expr(cmpxchg.getNewValOperand()));
+    llvm::Type* value_type = cmpxchg.getCompareOperand()->getType();
+    TF_ASSIGN_OR_RETURN(std::string value_msl_type, MslType(value_type));
+    TF_ASSIGN_OR_RETURN(std::string atomic_type,
+                        MslAtomicType(value_type, /*unsigned_integer=*/false));
+    std::string old_name = CmpXchgOldName(cmpxchg);
+    std::string success_name = CmpXchgSuccessName(cmpxchg);
+
+    absl::StrAppend(output, Indent(indent), value_msl_type, " ", old_name,
+                    " = ", compare, ";\n");
+    absl::StrAppend(
+        output, Indent(indent), "bool ", success_name,
+        " = atomic_compare_exchange_weak_explicit(reinterpret_cast<device ",
+        atomic_type, "*>(&", pointer.base, "[", pointer.index, "]), &",
+        old_name, ", ", new_value,
+        ", memory_order_relaxed, memory_order_relaxed);\n");
+    return absl::OkStatus();
+  }
+
+  std::string CmpXchgOldName(const llvm::AtomicCmpXchgInst& cmpxchg) const {
+    auto it = cmpxchg_old_names_.find(&cmpxchg);
+    if (it != cmpxchg_old_names_.end()) return it->second;
+    return absl::StrCat(Name(&cmpxchg), "_old");
+  }
+
+  std::string CmpXchgSuccessName(
+      const llvm::AtomicCmpXchgInst& cmpxchg) const {
+    auto it = cmpxchg_success_names_.find(&cmpxchg);
+    if (it != cmpxchg_success_names_.end()) return it->second;
+    return absl::StrCat(Name(&cmpxchg), "_success");
+  }
+
   bool AtomicOpUsesUnsignedType(const llvm::AtomicRMWInst& atomic) const {
     switch (atomic.getOperation()) {
       case llvm::AtomicRMWInst::UMax:
@@ -1899,6 +2014,8 @@ class FunctionEmitter {
   const llvm::DataLayout& data_layout_;
   absl::flat_hash_map<const llvm::Value*, llvm::Type*> pointer_element_types_;
   absl::flat_hash_map<const llvm::Value*, std::string> names_;
+  absl::flat_hash_map<const llvm::Value*, std::string> cmpxchg_old_names_;
+  absl::flat_hash_map<const llvm::Value*, std::string> cmpxchg_success_names_;
 };
 
 }  // namespace

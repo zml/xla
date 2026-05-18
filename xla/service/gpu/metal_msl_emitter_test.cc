@@ -541,6 +541,59 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find("memory_order_relaxed"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsCompareExchangeLoop) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @scatter_min(ptr %arg0, ptr %arg1, ptr %arg2) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %index_gep = getelementptr inbounds [3 x i32], ptr %arg1, i32 0, i32 %tid
+  %index = load i32, ptr %index_gep, align 4
+  %update_gep = getelementptr inbounds [3 x float], ptr %arg2, i32 0, i32 %tid
+  %update = load float, ptr %update_gep, align 4
+  %out = getelementptr inbounds [6 x float], ptr %arg0, i32 0, i32 %index
+  %old = load i32, ptr %out, align 4
+  br label %loop
+
+loop:
+  %current = phi i32 [ %old, %entry ], [ %actual, %loop ]
+  %current_float = bitcast i32 %current to float
+  %next_float = call float @llvm.minimum.f32(float %current_float, float %update)
+  %next = bitcast float %next_float to i32
+  %cas = cmpxchg ptr %out, i32 %current, i32 %next monotonic monotonic, align 4
+  %actual = extractvalue { i32, i1 } %cas, 0
+  %success = extractvalue { i32, i1 } %cas, 1
+  %retry = xor i1 %success, true
+  br i1 %retry, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare float @llvm.minimum.f32(float, float)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @scatter_min, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("do {"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("atomic_compare_exchange_weak_explicit"),
+            std::string::npos)
+      << msl;
+  EXPECT_NE(msl.find("cmpxchg_old0"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("cmpxchg_success0"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("} while (v"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLocalStackSlot) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
