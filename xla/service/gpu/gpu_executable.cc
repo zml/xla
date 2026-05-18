@@ -487,6 +487,12 @@ GpuExecutable::~GpuExecutable() {
   thunk_executor_.reset();
   {
     absl::MutexLock lock(&module_handle_mutex_);
+    for (auto& [executor, allocations] : module_constant_allocations_) {
+      for (se::DeviceAddressBase& allocation : allocations) {
+        executor->Deallocate(&allocation);
+      }
+    }
+    module_constant_allocations_.clear();
     module_handles_.clear();
   }
 
@@ -1023,6 +1029,49 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
   auto it = module_globals_.find(executor);
   if (it != module_globals_.end()) {
     return it->second.get();
+  }
+
+  if (executor->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
+    std::vector<se::DeviceAddressBase>& owned_allocations =
+        module_constant_allocations_[executor];
+    int submitted_mem_copies = 0;
+
+    for (const ConstantInfo& info : constants_) {
+      if (info.allocation_index == -1) continue;
+      absl::Span<const BufferAllocation* const> allocations = GetAllocations();
+      if (info.allocation_index < 0 ||
+          info.allocation_index >= allocations.size()) {
+        return absl::InternalError(absl::StrCat(
+            "Metal constant global ", info.symbol_name,
+            " has invalid allocation index ", info.allocation_index));
+      }
+
+      uint64_t allocation_size = allocations[info.allocation_index]->size();
+      uint64_t content_size = info.content.span().size();
+      uint64_t size = content_size == 0 ? allocation_size : content_size;
+      se::DeviceAddressBase global = executor->Allocate(size, /*memory_space=*/0);
+      if (global.opaque() == nullptr) {
+        return absl::InternalError(absl::StrCat(
+            "Failed to allocate Metal constant global ", info.symbol_name));
+      }
+      owned_allocations.push_back(global);
+      if (content_size == 0) {
+        RETURN_IF_ERROR(stream->MemZero(&global, size));
+      } else {
+        RETURN_IF_ERROR(
+            stream->Memcpy(&global, info.content.span().data(), content_size));
+      }
+      submitted_mem_copies = true;
+      InsertOrDie(globals.get(), info.allocation_index, global);
+    }
+
+    if (submitted_mem_copies) {
+      CHECK_OK(stream->BlockHostUntilDone());
+    }
+    return module_globals_.emplace(executor, std::move(globals))
+        .first->second.get();
   }
 
   se::MultiModuleLoaderSpec module_spec;
