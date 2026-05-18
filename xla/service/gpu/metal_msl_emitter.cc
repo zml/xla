@@ -413,6 +413,12 @@ class FunctionEmitter {
     llvm::Type* type;
   };
 
+  struct PhiBranch {
+    const llvm::CondBrInst* branch;
+    const llvm::Value* true_value;
+    const llvm::Value* false_value;
+  };
+
   void InferPointerElementTypes() {
     for (const llvm::BasicBlock& block : function_) {
       for (const llvm::Instruction& instruction : block) {
@@ -1934,7 +1940,16 @@ class FunctionEmitter {
     if (callee->arg_size() != call.arg_size()) {
       return Unsupported(function_, "inline function shape", call);
     }
-    if (callee->size() != 1) return InlineIfElsePhiFunctionCall(call);
+    if (callee->size() != 1) {
+      if (absl::StatusOr<std::string> expression =
+              InlineIfElsePhiFunctionCall(call);
+          expression.ok()) {
+        return *expression;
+      }
+      TF_ASSIGN_OR_RETURN(const llvm::ReturnInst* ret,
+                          SingleReturnInst(*callee, call));
+      return InlineSimpleValue(ret->getReturnValue(), call);
+    }
     const llvm::BasicBlock& block = callee->getEntryBlock();
     const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
     if (ret == nullptr || ret->getReturnValue() == nullptr) {
@@ -1975,6 +1990,17 @@ class FunctionEmitter {
 
   absl::StatusOr<const llvm::PHINode*> ReturnPhi(
       const llvm::Function& callee, const llvm::CallInst& call) {
+    TF_ASSIGN_OR_RETURN(const llvm::ReturnInst* ret,
+                        SingleReturnInst(callee, call));
+    const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret->getReturnValue());
+    if (phi == nullptr) {
+      return Unsupported(function_, "inline function return", call);
+    }
+    return phi;
+  }
+
+  absl::StatusOr<const llvm::ReturnInst*> SingleReturnInst(
+      const llvm::Function& callee, const llvm::CallInst& call) {
     const llvm::ReturnInst* ret = nullptr;
     for (const llvm::BasicBlock& block : callee) {
       if (const auto* block_ret =
@@ -1988,11 +2014,7 @@ class FunctionEmitter {
     if (ret == nullptr || ret->getReturnValue() == nullptr) {
       return Unsupported(function_, "inline function return", call);
     }
-    const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret->getReturnValue());
-    if (phi == nullptr) {
-      return Unsupported(function_, "inline function return", call);
-    }
-    return phi;
+    return ret;
   }
 
   absl::StatusOr<const llvm::Value*> PhiIncomingValueOnLinearPath(
@@ -2050,6 +2072,42 @@ class FunctionEmitter {
         std::string false_value,
         InlinePhiIncomingForPath(branch->getSuccessor(1), local_merge,
                                  *local_phi, call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
+  }
+
+  absl::StatusOr<PhiBranch> LinearPhiBranch(
+      const llvm::PHINode& phi, const llvm::CallInst& call) {
+    const llvm::BasicBlock* merge_block = phi.getParent();
+    const llvm::Function* function = merge_block->getParent();
+    for (const llvm::BasicBlock& block : *function) {
+      const auto* branch =
+          llvm::dyn_cast<llvm::CondBrInst>(block.getTerminator());
+      if (branch == nullptr) continue;
+
+      absl::StatusOr<const llvm::Value*> true_value =
+          PhiIncomingValueOnLinearPath(branch->getSuccessor(0), merge_block,
+                                       phi, call);
+      if (!true_value.ok()) continue;
+      absl::StatusOr<const llvm::Value*> false_value =
+          PhiIncomingValueOnLinearPath(branch->getSuccessor(1), merge_block,
+                                       phi, call);
+      if (!false_value.ok()) continue;
+      return PhiBranch{branch, *true_value, *false_value};
+    }
+    return Unsupported(function_, "linear inline phi", phi);
+  }
+
+  absl::StatusOr<std::string> InlineSimplePhiValue(
+      const llvm::PHINode& phi, const llvm::CallInst& call) {
+    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, call));
+    TF_ASSIGN_OR_RETURN(std::string condition,
+                        InlineSimpleValue(phi_branch.branch->getCondition(),
+                                          call));
+    TF_ASSIGN_OR_RETURN(std::string true_value,
+                        InlineSimpleValue(phi_branch.true_value, call));
+    TF_ASSIGN_OR_RETURN(std::string false_value,
+                        InlineSimpleValue(phi_branch.false_value, call));
     return absl::StrCat("(", condition, " ? ", true_value, " : ",
                         false_value, ")");
   }
@@ -2116,6 +2174,9 @@ class FunctionEmitter {
     }
     if (llvm::isa<llvm::Constant>(value)) {
       return Expr(value);
+    }
+    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+      return InlineSimplePhiValue(*phi, call);
     }
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
       TF_ASSIGN_OR_RETURN(std::string lhs,
@@ -2327,7 +2388,15 @@ class FunctionEmitter {
                          nested_call);
     }
     if (callee->size() != 1) {
-      return InlineNestedIfElsePhiFunctionCall(nested_call, outer_call);
+      if (absl::StatusOr<std::string> expression =
+              InlineNestedIfElsePhiFunctionCall(nested_call, outer_call);
+          expression.ok()) {
+        return *expression;
+      }
+      TF_ASSIGN_OR_RETURN(const llvm::ReturnInst* ret,
+                          SingleReturnInst(*callee, nested_call));
+      return InlineNestedSimpleValue(ret->getReturnValue(), nested_call,
+                                     outer_call);
     }
     const llvm::BasicBlock& block = callee->getEntryBlock();
     const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
@@ -2417,6 +2486,9 @@ class FunctionEmitter {
                                outer_call);
     }
     if (llvm::isa<llvm::Constant>(value)) return Expr(value);
+    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+      return InlineNestedPhiValue(*phi, nested_call, outer_call);
+    }
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
       TF_ASSIGN_OR_RETURN(
           std::string lhs,
@@ -2562,16 +2634,41 @@ class FunctionEmitter {
     if (callee == nullptr || callee->isDeclaration()) {
       return Unsupported(function_, "nested inline call", call);
     }
-    if (callee->arg_size() != call.arg_size() || callee->size() != 1) {
+    if (callee->arg_size() != call.arg_size()) {
       return Unsupported(function_, "nested inline function shape", call);
     }
-    const llvm::BasicBlock& block = callee->getEntryBlock();
-    const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
-    if (ret == nullptr || ret->getReturnValue() == nullptr) {
-      return Unsupported(function_, "nested inline function return", call);
+    const llvm::ReturnInst* ret = nullptr;
+    if (callee->size() == 1) {
+      const llvm::BasicBlock& block = callee->getEntryBlock();
+      ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+      if (ret == nullptr || ret->getReturnValue() == nullptr) {
+        return Unsupported(function_, "nested inline function return", call);
+      }
+    } else {
+      TF_ASSIGN_OR_RETURN(ret, SingleReturnInst(*callee, call));
     }
     return InlineDoubleNestedSimpleValue(ret->getReturnValue(), call,
                                          nested_call, outer_call);
+  }
+
+  absl::StatusOr<std::string> InlineNestedPhiValue(
+      const llvm::PHINode& phi, const llvm::CallInst& nested_call,
+      const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, nested_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string condition,
+        InlineNestedSimpleValue(phi_branch.branch->getCondition(), nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string true_value,
+        InlineNestedSimpleValue(phi_branch.true_value, nested_call,
+                                outer_call));
+    TF_ASSIGN_OR_RETURN(
+        std::string false_value,
+        InlineNestedSimpleValue(phi_branch.false_value, nested_call,
+                                outer_call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
   }
 
   absl::StatusOr<std::string> InlineNestedBinaryCall(
@@ -2629,6 +2726,9 @@ class FunctionEmitter {
                                      nested_call, outer_call);
     }
     if (llvm::isa<llvm::Constant>(value)) return Expr(value);
+    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+      return InlineDoubleNestedPhiValue(*phi, call, nested_call, outer_call);
+    }
     if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
       TF_ASSIGN_OR_RETURN(std::string lhs,
                           InlineDoubleNestedSimpleValue(
@@ -2684,6 +2784,26 @@ class FunctionEmitter {
       return InlineDoubleNestedLoadExpr(*load, call, nested_call, outer_call);
     }
     return Unsupported(function_, "double nested inline value", *value);
+  }
+
+  absl::StatusOr<std::string> InlineDoubleNestedPhiValue(
+      const llvm::PHINode& phi, const llvm::CallInst& call,
+      const llvm::CallInst& nested_call, const llvm::CallInst& outer_call) {
+    TF_ASSIGN_OR_RETURN(PhiBranch phi_branch, LinearPhiBranch(phi, call));
+    TF_ASSIGN_OR_RETURN(std::string condition,
+                        InlineDoubleNestedSimpleValue(
+                            phi_branch.branch->getCondition(), call,
+                            nested_call, outer_call));
+    TF_ASSIGN_OR_RETURN(std::string true_value,
+                        InlineDoubleNestedSimpleValue(
+                            phi_branch.true_value, call, nested_call,
+                            outer_call));
+    TF_ASSIGN_OR_RETURN(std::string false_value,
+                        InlineDoubleNestedSimpleValue(
+                            phi_branch.false_value, call, nested_call,
+                            outer_call));
+    return absl::StrCat("(", condition, " ? ", true_value, " : ",
+                        false_value, ")");
   }
 
   absl::StatusOr<std::string> InlineDoubleNestedLoadExpr(

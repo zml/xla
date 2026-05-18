@@ -1079,6 +1079,91 @@ declare float @__nv_floorf(float)
   EXPECT_EQ(msl.find("__nv_floorf"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsInlineGuardedPhiChainHelperCall) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @caller(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %direct = call i32 @guarded_sum(ptr %arg0, i32 %tid)
+  %nested = call i32 @wrap_sum(ptr %arg0, i32 %tid)
+  %total = add i32 %direct, %nested
+  %out = getelementptr inbounds [4 x i32], ptr %arg1, i32 0, i32 %tid
+  store i32 %total, ptr %out, align 4
+  ret void
+}
+
+define internal i32 @wrap_sum(ptr %data, i32 %index) {
+entry:
+  %sum = call i32 @guarded_sum(ptr %data, i32 %index)
+  %doubled = add i32 %sum, %sum
+  ret i32 %doubled
+}
+
+define internal i32 @guarded_sum(ptr %data, i32 %index) {
+entry:
+  %has_prev = icmp sge i32 %index, 1
+  br i1 %has_prev, label %prev, label %no_prev
+
+prev:
+  %prev_index = add i32 %index, -1
+  %prev_gep = getelementptr inbounds [4 x i32], ptr %data, i32 0, i32 %prev_index
+  %prev_value = load i32, ptr %prev_gep, align 4, !invariant.load !1
+  br label %merge_prev
+
+no_prev:
+  br label %merge_prev
+
+merge_prev:
+  %acc0 = phi i32 [ 0, %no_prev ], [ %prev_value, %prev ]
+  br label %check_next
+
+check_next:
+  %next_index = add i32 %index, 1
+  %has_next = icmp slt i32 %next_index, 4
+  br i1 %has_next, label %next, label %no_next
+
+next:
+  %next_gep = getelementptr inbounds [4 x i32], ptr %data, i32 0, i32 %next_index
+  %next_value = load i32, ptr %next_gep, align 4, !invariant.load !1
+  %acc1_value = add i32 %acc0, %next_value
+  br label %merge_next
+
+no_next:
+  br label %merge_next
+
+merge_next:
+  %acc1 = phi i32 [ %acc0, %no_next ], [ %acc1_value, %next ]
+  br label %return
+
+return:
+  %current_gep = getelementptr inbounds [4 x i32], ptr %data, i32 0, i32 %index
+  %current = load i32, ptr %current_gep, align 4, !invariant.load !1
+  %result = add i32 %acc1, %current
+  ret i32 %result
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @caller, !"kernel", i32 1}
+!1 = !{}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("?"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("arg1[v0] ="), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("guarded_sum("), std::string::npos) << msl;
+  EXPECT_EQ(msl.find("wrap_sum("), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsLibdeviceAndMinMaxCalls) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
