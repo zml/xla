@@ -144,6 +144,24 @@ absl::StatusOr<Literal> ExecuteMetalElementwiseBinary(const char* name,
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+template <typename BuildFn>
+absl::StatusOr<Literal> ExecuteMetalElementwiseUnary(const char* name,
+                                                     BuildFn build) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder(name);
+  Shape shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  build(&builder, input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalElementwiseScalarMaximum() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -175,11 +193,12 @@ void ExpectMatchesReference(const Literal& actual, const Literal& lhs,
 
 template <typename ReferenceFn>
 void ExpectMatchesElementwiseReference(const Literal& actual,
-                                       ReferenceFn reference) {
+                                       ReferenceFn reference,
+                                       float tolerance = 1.0e-6f) {
   ASSERT_TRUE(ShapeUtil::Compatible(
       actual.shape(), ShapeUtil::MakeShape(F32, {kElementCount})));
   for (int64_t i = 0; i < kElementCount; ++i) {
-    EXPECT_NEAR(actual.Get<float>({i}), reference(i), 1.0e-6) << "at " << i;
+    EXPECT_NEAR(actual.Get<float>({i}), reference(i), tolerance) << "at " << i;
   }
 }
 
@@ -238,6 +257,66 @@ TEST(MetalGpuExecutableTest, ElementwiseScalarMaximum) {
   Literal lhs = MakeElementwiseLhs();
   ExpectMatchesElementwiseReference(
       actual, [&](int64_t i) { return std::max(lhs.Get<float>({i}), 1.0f); });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseExp) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_exp",
+      [](XlaBuilder*, XlaOp input) { Exp(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::exp(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSin) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_sin",
+      [](XlaBuilder*, XlaOp input) { Sin(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::sin(input.Get<float>({i})); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSqrt) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_sqrt",
+      [](XlaBuilder* builder, XlaOp input) {
+        Sqrt(Add(input,
+                 Broadcast(ConstantR0<float>(builder, 3.0f),
+                           {kElementCount})));
+      });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::sqrt(input.Get<float>({i}) + 3.0f); },
+      1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTanh) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_tanh",
+      [](XlaBuilder*, XlaOp input) { Tanh(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::tanh(input.Get<float>({i})); },
+      1.0e-5f);
 }
 
 }  // namespace

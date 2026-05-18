@@ -293,6 +293,14 @@ class ElementwiseAirEmitter {
         return EmitUnary(instr, "fneg fast float", body);
       case HloOpcode::kAbs:
         return EmitAbs(instr, body);
+      case HloOpcode::kExp:
+        return EmitIntrinsicUnary(instr, "air.fast_exp.f32", body);
+      case HloOpcode::kSin:
+        return EmitIntrinsicUnary(instr, "air.fast_sin.f32", body);
+      case HloOpcode::kSqrt:
+        return EmitIntrinsicUnary(instr, "air.fast_sqrt.f32", body);
+      case HloOpcode::kTanh:
+        return EmitIntrinsicUnary(instr, "air.fast_tanh.f32", body);
       default:
         return absl::UnimplementedError(absl::StrFormat(
             "Metal direct AIR elementwise does not support HLO opcode %s.",
@@ -334,6 +342,18 @@ class ElementwiseAirEmitter {
                                   body));
     std::string name = NewName("unary");
     body->push_back(absl::StrFormat("  %s = %s %s", name, op, value));
+    return name;
+  }
+
+  absl::StatusOr<std::string> EmitIntrinsicUnary(
+      const HloInstruction* instr, absl::string_view intrinsic,
+      std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string name = NewName("intrinsic");
+    body->push_back(absl::StrFormat("  %s = call fast float @%s(float %s)",
+                                    name, intrinsic, value));
     return name;
   }
 
@@ -428,6 +448,11 @@ target triple = "air64_v27-apple-macosx15.0.0"
 
 %%struct.ElementwiseParams = type { i32, i32, i32, i32 }
 
+declare float @air.fast_exp.f32(float) local_unnamed_addr #1
+declare float @air.fast_sin.f32(float) local_unnamed_addr #1
+declare float @air.fast_sqrt.f32(float) local_unnamed_addr #1
+declare float @air.fast_tanh.f32(float) local_unnamed_addr #1
+
 define void @elementwise_f32(
 %s) local_unnamed_addr #0 {
 entry:
@@ -449,6 +474,7 @@ exit:
 }
 
 attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-pointer"="all" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
 
 !air.kernel = !{!0}
 !llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
