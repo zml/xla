@@ -67,6 +67,7 @@ class MetalGpuCompiler : public GpuCompiler {
       const DebugOptions& debug_options) const override;
 
   bool EnableFusionAutotuning() const override { return false; }
+  bool EnableGemmCustomCalls() const override { return false; }
   bool RequiresDnnSupport() const override { return false; }
 
  private:

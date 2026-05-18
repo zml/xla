@@ -233,6 +233,7 @@ class GpuCompiler : public LLVMCompiler {
   }
 
   virtual bool EnableFusionAutotuning() const { return true; }
+  virtual bool EnableGemmCustomCalls() const { return true; }
   virtual bool RequiresDnnSupport() const { return true; }
 
  private:
