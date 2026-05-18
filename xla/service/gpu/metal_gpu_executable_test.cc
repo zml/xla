@@ -1008,6 +1008,19 @@ TEST(MetalGpuExecutableTest, ElementwiseSign) {
   });
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseErf) {
+  auto result = ExecuteMetalElementwiseUnary(
+      "metal_elementwise_erf", [](XlaBuilder*, XlaOp input) { Erf(input); });
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return std::erf(input.Get<float>({i})); },
+      1.5e-5f);
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseLogistic) {
   auto result = ExecuteMetalElementwiseUnary(
       "metal_elementwise_logistic",

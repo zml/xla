@@ -486,6 +486,8 @@ class ElementwiseAirEmitter {
         return EmitIntrinsicUnary(instr, "air.fast_round.f32", body);
       case HloOpcode::kSign:
         return EmitSign(instr, body);
+      case HloOpcode::kErf:
+        return EmitErf(instr, body);
       default:
         return absl::UnimplementedError(absl::StrFormat(
             "Metal direct AIR elementwise does not support HLO opcode %s.",
@@ -1613,6 +1615,65 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat(
         "  %s = select i1 %s, i32 -1, i32 %s", result, negative,
         nonnegative_result));
+    return result;
+  }
+
+  absl::StatusOr<std::string> EmitErf(const HloInstruction* instr,
+                                      std::vector<std::string>* body) {
+    if (instr->shape().element_type() != F32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR erf currently supports only f32 arrays.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string negative = NewName("erf_negative");
+    std::string negated = NewName("erf_negated");
+    std::string abs_value = NewName("erf_abs");
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast olt float %s, 0x0000000000000000", negative, value));
+    body->push_back(
+        absl::StrFormat("  %s = fneg fast float %s", negated, value));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", abs_value, negative,
+        negated, value));
+
+    std::string scaled = EmitOp("fmul fast float", FloatLiteral(0.3275911f),
+                                abs_value, body);
+    std::string denom =
+        EmitOp("fadd fast float", "1.000000e+00", scaled, body);
+    std::string t = EmitOp("fdiv fast float", "1.000000e+00", denom, body);
+
+    std::string poly = EmitOp("fmul fast float", FloatLiteral(1.061405429f), t,
+                              body);
+    poly = EmitOp("fadd fast float", poly, FloatLiteral(-1.453152027f), body);
+    poly = EmitOp("fmul fast float", poly, t, body);
+    poly = EmitOp("fadd fast float", poly, FloatLiteral(1.421413741f), body);
+    poly = EmitOp("fmul fast float", poly, t, body);
+    poly = EmitOp("fadd fast float", poly, FloatLiteral(-0.284496736f), body);
+    poly = EmitOp("fmul fast float", poly, t, body);
+    poly = EmitOp("fadd fast float", poly, FloatLiteral(0.254829592f), body);
+    poly = EmitOp("fmul fast float", poly, t, body);
+
+    std::string squared =
+        EmitOp("fmul fast float", abs_value, abs_value, body);
+    std::string neg_squared = NewName("erf_neg_squared");
+    body->push_back(absl::StrFormat("  %s = fneg fast float %s", neg_squared,
+                                    squared));
+    std::string exp = NewName("erf_exp");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_exp.f32(float %s)", exp,
+        neg_squared));
+    std::string tail = EmitOp("fmul fast float", poly, exp, body);
+    std::string positive_result =
+        EmitOp("fsub fast float", "1.000000e+00", tail, body);
+    std::string negative_result = NewName("erf_negative_result");
+    std::string result = NewName("erf_result");
+    body->push_back(absl::StrFormat("  %s = fneg fast float %s",
+                                    negative_result, positive_result));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", result, negative,
+        negative_result, positive_result));
     return result;
   }
 
