@@ -1263,6 +1263,14 @@ class FunctionEmitter {
       }
       return absl::StrFormat("%.17g", as_double);
     }
+    if (auto* constant_struct = llvm::dyn_cast<llvm::ConstantStruct>(value);
+        constant_struct != nullptr && IsComplexFloatStruct(value->getType())) {
+      TF_ASSIGN_OR_RETURN(std::string real,
+                          Expr(constant_struct->getOperand(0)));
+      TF_ASSIGN_OR_RETURN(std::string imag,
+                          Expr(constant_struct->getOperand(1)));
+      return absl::StrCat("float2(", real, ", ", imag, ")");
+    }
     if (llvm::isa<llvm::ConstantAggregateZero>(value) ||
         llvm::isa<llvm::UndefValue>(value) ||
         llvm::isa<llvm::PoisonValue>(value)) {
@@ -1383,6 +1391,10 @@ class FunctionEmitter {
             llvm::dyn_cast<llvm::InsertElementInst>(&instruction)) {
       return InsertElementExpr(*insert);
     }
+    if (auto* shuffle =
+            llvm::dyn_cast<llvm::ShuffleVectorInst>(&instruction)) {
+      return ShuffleVectorExpr(*shuffle);
+    }
     return Unsupported(function_, "instruction", instruction);
   }
 
@@ -1435,6 +1447,42 @@ class FunctionEmitter {
                             VectorElementExpr(insert.getOperand(0), i));
         elements.push_back(std::move(element));
       }
+    }
+    return absl::StrCat(type, "(", absl::StrJoin(elements, ", "), ")");
+  }
+
+  absl::StatusOr<std::string> ShuffleVectorExpr(
+      const llvm::ShuffleVectorInst& shuffle) {
+    auto* result_type =
+        llvm::dyn_cast<llvm::FixedVectorType>(shuffle.getType());
+    auto* lhs_type = llvm::dyn_cast<llvm::FixedVectorType>(
+        shuffle.getOperand(0)->getType());
+    if (result_type == nullptr || lhs_type == nullptr ||
+        result_type->getNumElements() > 4) {
+      return Unsupported(function_, "vector shuffle", shuffle);
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string type, MslType(shuffle.getType()));
+    std::vector<int> mask = shuffle.getShuffleMask();
+    std::vector<std::string> elements;
+    elements.reserve(mask.size());
+    for (int lane : mask) {
+      if (lane < 0) {
+        TF_ASSIGN_OR_RETURN(
+            std::string zero,
+            ZeroInitializer(result_type->getElementType()));
+        elements.push_back(std::move(zero));
+        continue;
+      }
+      const llvm::Value* source = shuffle.getOperand(0);
+      int source_lane = lane;
+      if (lane >= lhs_type->getNumElements()) {
+        source = shuffle.getOperand(1);
+        source_lane = lane - lhs_type->getNumElements();
+      }
+      TF_ASSIGN_OR_RETURN(std::string element,
+                          VectorElementExpr(source, source_lane));
+      elements.push_back(std::move(element));
     }
     return absl::StrCat(type, "(", absl::StrJoin(elements, ", "), ")");
   }
@@ -1764,6 +1812,7 @@ class FunctionEmitter {
     if (name == "__nv_powf") return BinaryMathCall("pow", call);
     if (name == "__nv_atan2f") return BinaryMathCall("atan2", call);
     if (name == "__nv_copysignf") return BinaryMathCall("copysign", call);
+    if (name == "__nv_fmodf") return BinaryMathCall("fmod", call);
     if (name == "__nv_erff") return UnaryMathCall("erf", call);
     if (name == "__nv_tanhf") return UnaryMathCall("tanh", call);
     if (name == "__nv_fmaf") return TernaryMathCall("fma", call);

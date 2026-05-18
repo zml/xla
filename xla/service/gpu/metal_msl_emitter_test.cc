@@ -242,6 +242,41 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
       << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsVectorShuffleSplat) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @splat(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [4 x float], ptr %arg0, i32 0, i32 0
+  %value = load float, ptr %in, align 4
+  %vec0 = insertelement <4 x float> poison, float %value, i32 0
+  %splat = shufflevector <4 x float> %vec0, <4 x float> poison, <4 x i32> zeroinitializer
+  %element = extractelement <4 x float> %splat, i32 2
+  %out = getelementptr inbounds [4 x float], ptr %arg1, i32 0, i32 %tid
+  store float %element, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @splat, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float4(v2[0], v2[0], v2[0], v2[0])"),
+            std::string::npos)
+      << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsComplexFloatStructAsFloat2) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
@@ -289,6 +324,34 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   EXPECT_NE(msl.find(".y"), std::string::npos) << msl;
   EXPECT_NE(msl.find("float2("), std::string::npos) << msl;
   EXPECT_NE(msl.find("arg2[v0] ="), std::string::npos) << msl;
+}
+
+TEST(MetalMslEmitterTest, EmitsComplexFloatConstantStruct) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @complex_constant(ptr %arg0) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %out = getelementptr inbounds [2 x { float, float }], ptr %arg0, i32 0, i32 %tid
+  store { float, float } { float 1.000000e+00, float 0.000000e+00 }, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @complex_constant, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("float2(float(1), float(0))"), std::string::npos) << msl;
 }
 
 TEST(MetalMslEmitterTest, EmitsArgumentBufferForLargeArityKernels) {
@@ -714,8 +777,9 @@ entry:
   %powered = call float @__nv_powf(float %rounded, float 2.000000e+00)
   %signed = call float @__nv_copysignf(float %powered, float %value)
   %logged = call float @__nv_log1pf(float %signed)
+  %modded = call float @__nv_fmodf(float %logged, float 2.000000e+00)
   %unordered = fcmp uno float %value, %value
-  %selected = select i1 %unordered, float 0.000000e+00, float %logged
+  %selected = select i1 %unordered, float 0.000000e+00, float %modded
   %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
   store float %selected, ptr %out, align 4
   ret void
@@ -727,6 +791,7 @@ declare float @__nv_rintf(float)
 declare float @__nv_powf(float, float)
 declare float @__nv_copysignf(float, float)
 declare float @__nv_log1pf(float)
+declare float @__nv_fmodf(float, float)
 
 !nvvm.annotations = !{!0}
 !0 = !{ptr @math, !"kernel", i32 1}
@@ -743,6 +808,7 @@ declare float @__nv_log1pf(float)
   EXPECT_NE(msl.find("pow(v3, float(2))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("copysign(v4, v1)"), std::string::npos) << msl;
   EXPECT_NE(msl.find("log((1.0f + v5))"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("fmod(v6, float(2))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
 }
 
