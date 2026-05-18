@@ -1855,6 +1855,15 @@ class FunctionEmitter {
                               operand, cast.getOperand(0)->getType()),
                           ")");
     }
+    if (cast.getOpcode() == llvm::Instruction::ZExt &&
+        cast.getOperand(0)->getType()->isIntOrIntVectorTy() &&
+        cast.getType()->isIntOrIntVectorTy()) {
+      TF_ASSIGN_OR_RETURN(
+          std::string unsigned_operand_type,
+          MslType(cast.getOperand(0)->getType(), /*unsigned_integer=*/true));
+      return absl::StrCat("static_cast<", type, ">(static_cast<",
+                          unsigned_operand_type, ">(", operand, "))");
+    }
     if (cast.getOpcode() == llvm::Instruction::SExt &&
         IsSubByteInteger(cast.getOperand(0)->getType())) {
       return SignExtendSubByteInteger(operand, cast.getOperand(0)->getType(),
