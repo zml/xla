@@ -1096,7 +1096,9 @@ entry:
   %logged = call float @__nv_log1pf(float %signed)
   %modded = call float @__nv_fmodf(float %logged, float 2.000000e+00)
   %unordered = fcmp uno float %value, %value
-  %selected = select i1 %unordered, float 0.000000e+00, float %modded
+  %unordered_ne = fcmp une float %value, %value
+  %fallback = select i1 %unordered_ne, float 1.000000e+00, float %modded
+  %selected = select i1 %unordered, float 0.000000e+00, float %fallback
   %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
   store float %selected, ptr %out, align 4
   ret void
@@ -1127,6 +1129,9 @@ declare float @__nv_fmodf(float, float)
   EXPECT_NE(msl.find("log((1.0f + v5))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("fmod(v6, float(2))"), std::string::npos) << msl;
   EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("(isnan(v1) || isnan(v1) || (v1 != v1))"),
+            std::string::npos)
+      << msl;
 }
 
 TEST(MetalMslEmitterTest, EmitsIntegerBitCountIntrinsics) {

@@ -1720,23 +1720,41 @@ class FunctionEmitter {
       absl::string_view rhs) {
     switch (fcmp.getPredicate()) {
       case llvm::CmpInst::FCMP_OEQ:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " == ", rhs, "))");
       case llvm::CmpInst::FCMP_UEQ:
-        return absl::StrCat("(", lhs, " == ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " == ", rhs, "))");
       case llvm::CmpInst::FCMP_ONE:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " != ", rhs, "))");
       case llvm::CmpInst::FCMP_UNE:
-        return absl::StrCat("(", lhs, " != ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " != ", rhs, "))");
       case llvm::CmpInst::FCMP_OGT:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " > ", rhs, "))");
       case llvm::CmpInst::FCMP_UGT:
-        return absl::StrCat("(", lhs, " > ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " > ", rhs, "))");
       case llvm::CmpInst::FCMP_OGE:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " >= ", rhs, "))");
       case llvm::CmpInst::FCMP_UGE:
-        return absl::StrCat("(", lhs, " >= ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " >= ", rhs, "))");
       case llvm::CmpInst::FCMP_OLT:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " < ", rhs, "))");
       case llvm::CmpInst::FCMP_ULT:
-        return absl::StrCat("(", lhs, " < ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " < ", rhs, "))");
       case llvm::CmpInst::FCMP_OLE:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, ") && (",
+                            lhs, " <= ", rhs, "))");
       case llvm::CmpInst::FCMP_ULE:
-        return absl::StrCat("(", lhs, " <= ", rhs, ")");
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, ") || (",
+                            lhs, " <= ", rhs, "))");
       case llvm::CmpInst::FCMP_FALSE:
         return "false";
       case llvm::CmpInst::FCMP_TRUE:
