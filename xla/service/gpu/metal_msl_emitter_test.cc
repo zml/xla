@@ -321,6 +321,50 @@ declare float @__nv_sinf(float)
   EXPECT_NE(msl.find("sin(v2)"), std::string::npos) << msl;
 }
 
+TEST(MetalMslEmitterTest, EmitsMoreMathCallsAndUnorderedCompare) {
+  constexpr absl::string_view kLlvmIr = R"(
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+target triple = "nvptx64-nvidia-cuda"
+
+define void @math(ptr %arg0, ptr %arg1) {
+entry:
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %in = getelementptr inbounds [8 x float], ptr %arg0, i32 0, i32 %tid
+  %value = load float, ptr %in, align 4
+  %floored = call float @__nv_floorf(float %value)
+  %rounded = call float @__nv_rintf(float %floored)
+  %powered = call float @__nv_powf(float %rounded, float 2.000000e+00)
+  %signed = call float @__nv_copysignf(float %powered, float %value)
+  %unordered = fcmp uno float %value, %value
+  %selected = select i1 %unordered, float 0.000000e+00, float %signed
+  %out = getelementptr inbounds [8 x float], ptr %arg1, i32 0, i32 %tid
+  store float %selected, ptr %out, align 4
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare float @__nv_floorf(float)
+declare float @__nv_rintf(float)
+declare float @__nv_powf(float, float)
+declare float @__nv_copysignf(float, float)
+
+!nvvm.annotations = !{!0}
+!0 = !{ptr @math, !"kernel", i32 1}
+)";
+
+  llvm::LLVMContext context;
+  std::unique_ptr<llvm::Module> module = ParseModule(kLlvmIr, context);
+  ASSERT_NE(module, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string msl, EmitMslFromLlvmModule(*module));
+
+  EXPECT_NE(msl.find("floor(v1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("rint(v2)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("pow(v3, float(2))"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("copysign(v4, v1)"), std::string::npos) << msl;
+  EXPECT_NE(msl.find("(isnan(v1) || isnan(v1))"), std::string::npos) << msl;
+}
+
 TEST(MetalMslEmitterTest, EmitsNegateAndFma) {
   constexpr absl::string_view kLlvmIr = R"(
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"

@@ -1150,6 +1150,10 @@ class FunctionEmitter {
         return "false";
       case llvm::CmpInst::FCMP_TRUE:
         return "true";
+      case llvm::CmpInst::FCMP_ORD:
+        return absl::StrCat("(!isnan(", lhs, ") && !isnan(", rhs, "))");
+      case llvm::CmpInst::FCMP_UNO:
+        return absl::StrCat("(isnan(", lhs, ") || isnan(", rhs, "))");
       default:
         return Unsupported(function_, "floating-point comparison", fcmp);
     }
@@ -1212,6 +1216,13 @@ class FunctionEmitter {
     if (name.starts_with("llvm.cos.")) return UnaryMathCall("cos", call);
     if (name.starts_with("llvm.exp.")) return UnaryMathCall("exp", call);
     if (name.starts_with("llvm.log.")) return UnaryMathCall("log", call);
+    if (name.starts_with("llvm.floor.")) return UnaryMathCall("floor", call);
+    if (name.starts_with("llvm.ceil.")) return UnaryMathCall("ceil", call);
+    if (name.starts_with("llvm.round.")) return UnaryMathCall("round", call);
+    if (name.starts_with("llvm.pow.")) return BinaryMathCall("pow", call);
+    if (name.starts_with("llvm.copysign.")) {
+      return BinaryMathCall("copysign", call);
+    }
     if (name.starts_with("llvm.maximum.")) return BinaryMathCall("max", call);
     if (name.starts_with("llvm.minimum.")) return BinaryMathCall("min", call);
     if (name.starts_with("llvm.smax.")) return BinaryMathCall("max", call);
@@ -1223,6 +1234,15 @@ class FunctionEmitter {
     if (name == "__nv_cosf") return UnaryMathCall("cos", call);
     if (name == "__nv_expf") return UnaryMathCall("exp", call);
     if (name == "__nv_logf") return UnaryMathCall("log", call);
+    if (name == "__nv_floorf") return UnaryMathCall("floor", call);
+    if (name == "__nv_ceilf") return UnaryMathCall("ceil", call);
+    if (name == "__nv_roundf") return UnaryMathCall("round", call);
+    if (name == "__nv_rintf") return UnaryMathCall("rint", call);
+    if (name == "__nv_powf") return BinaryMathCall("pow", call);
+    if (name == "__nv_atan2f") return BinaryMathCall("atan2", call);
+    if (name == "__nv_copysignf") return BinaryMathCall("copysign", call);
+    if (name == "__nv_erff") return UnaryMathCall("erf", call);
+    if (name == "__nv_tanhf") return UnaryMathCall("tanh", call);
     if (name == "__nv_fmaf") return TernaryMathCall("fma", call);
 
     return Unsupported(function_, "call", call);
