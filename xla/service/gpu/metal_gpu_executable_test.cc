@@ -564,6 +564,30 @@ absl::StatusOr<Literal> ExecuteMetalSortRank1() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalSortU16Rank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(U16, {});
+  XlaBuilder comparator_builder("metal_sort_u16_comparator");
+  XlaOp lhs = Parameter(&comparator_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&comparator_builder, 1, scalar_shape, "rhs");
+  Lt(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation comparator, comparator_builder.Build());
+
+  XlaBuilder builder("metal_sort_u16_rank1");
+  Shape shape = ShapeUtil::MakeShape(U16, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Sort({input}, comparator, 0, /*is_stable=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<uint16_t>(
+      {9, 1, 65535, 3, 1, 42, 0, 17});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalSortRank2() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2317,6 +2341,20 @@ TEST(MetalGpuExecutableTest, ElementwiseSortRank1) {
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSortU16Rank1) {
+  auto result = ExecuteMetalSortU16Rank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<uint16_t> expected = {0, 1, 1, 3, 9, 17, 42, 65535};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U16, {8})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<uint16_t>({i}), expected[i]) << "at " << i;
   }
 }
 

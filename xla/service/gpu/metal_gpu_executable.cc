@@ -149,6 +149,10 @@ bool IsS32Array(const Shape& shape) {
   return shape.element_type() == S32 && shape.IsArray();
 }
 
+bool IsU16Array(const Shape& shape) {
+  return shape.element_type() == U16 && shape.IsArray();
+}
+
 bool IsC64Array(const Shape& shape) {
   return shape.element_type() == C64 && shape.IsArray();
 }
@@ -168,7 +172,12 @@ bool IsScalarLikeSupported(const Shape& shape) {
 }
 
 bool IsSupportedElementwiseArray(const Shape& shape) {
-  return IsF32Array(shape) || IsPredArray(shape) || IsS32Array(shape);
+  return IsF32Array(shape) || IsPredArray(shape) || IsS32Array(shape) ||
+         IsU16Array(shape);
+}
+
+bool IsOrderStatisticArray(const Shape& shape) {
+  return IsF32Array(shape) || IsS32Array(shape) || IsU16Array(shape);
 }
 
 const char* ElementIrType(PrimitiveType type) {
@@ -177,6 +186,8 @@ const char* ElementIrType(PrimitiveType type) {
       return "float";
     case S32:
       return "i32";
+    case U16:
+      return "i16";
     case PRED:
       return "i8";
     case C64:
@@ -196,6 +207,8 @@ const char* ElementAirTypeName(PrimitiveType type) {
       return "float";
     case S32:
       return "int";
+    case U16:
+      return "ushort";
     case PRED:
       return "bool";
     case C64:
@@ -208,6 +221,9 @@ const char* ElementAirTypeName(PrimitiveType type) {
 int ElementTypeSize(PrimitiveType type) {
   if (type == PRED) {
     return 1;
+  }
+  if (type == U16) {
+    return 2;
   }
   if (type == C64) {
     return 8;
@@ -2015,8 +2031,9 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitSort(const HloInstruction* instr,
                                        std::vector<std::string>* body) {
-    if (IsF32Array(instr->shape()) && instr->operand_count() == 1 &&
-        IsF32Array(instr->operand(0)->shape()) &&
+    if (IsOrderStatisticArray(instr->shape()) && instr->operand_count() == 1 &&
+        instr->operand(0)->shape().element_type() ==
+            instr->shape().element_type() &&
         instr->shape().dimensions().size() == 2 &&
         instr->operand(0)->shape().dimensions().size() == 2 &&
         instr->dimensions().size() == 1 && instr->dimensions()[0] == 1 &&
@@ -2029,15 +2046,16 @@ class ElementwiseAirEmitter {
           descending, body, /*return_index=*/false);
     }
 
-    if (!IsF32Array(instr->shape()) || instr->operand_count() != 1 ||
-        !IsF32Array(instr->operand(0)->shape()) ||
+    if (!IsOrderStatisticArray(instr->shape()) || instr->operand_count() != 1 ||
+        instr->operand(0)->shape().element_type() !=
+            instr->shape().element_type() ||
         instr->shape().dimensions().size() != 1 ||
         instr->operand(0)->shape().dimensions().size() != 1 ||
         instr->dimensions().size() != 1 || instr->dimensions()[0] != 0 ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
           "Metal direct AIR sort currently supports only single-operand "
-          "rank-1 f32 sorts along dimension 0.");
+          "rank-1/rank-2 f32/s32/u16 sorts along the minor dimension.");
     }
 
     TF_ASSIGN_OR_RETURN(bool descending, SortDescending(instr));
@@ -2419,10 +2437,10 @@ class ElementwiseAirEmitter {
       const HloInstruction* input, int64_t input_elements, bool descending,
       std::vector<std::string>* body, bool return_index) {
     const PrimitiveType value_type = input->shape().element_type();
-    if (value_type != F32 && value_type != S32) {
+    if (value_type != F32 && value_type != S32 && value_type != U16) {
       return absl::UnimplementedError(
-          "Metal direct AIR rank-1 ordering currently supports only f32 and "
-          "s32 inputs.");
+          "Metal direct AIR rank-1 ordering currently supports only f32, s32, "
+          "and u16 inputs.");
     }
     if (input_elements <= 0) {
       return absl::UnimplementedError(
@@ -2457,7 +2475,9 @@ class ElementwiseAirEmitter {
     const absl::string_view selected_type =
         return_index ? "i32" : ElementIrType(value_type);
     const std::string selected_init =
-        (return_index || value_type == S32) ? "0" : "0x0000000000000000";
+        (return_index || value_type == S32 || value_type == U16)
+            ? "0"
+            : "0x0000000000000000";
 
     body->push_back(absl::StrFormat("  br label %%%s", outer));
     body->push_back(absl::StrFormat("%s:", outer));
@@ -2494,12 +2514,15 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("  %s = zext i32 %s to i64", i64, i));
     TF_ASSIGN_OR_RETURN(std::string other_value,
                         EmitLoadFromLinearIndex(input, i64, body));
-    if (value_type == S32) {
+    if (value_type == S32 || value_type == U16) {
+      const char* lt = value_type == S32 ? "slt" : "ult";
+      const char* gt = value_type == S32 ? "sgt" : "ugt";
       body->push_back(absl::StrFormat(
-          "  %s = icmp %s i32 %s, %s", ordered,
-          descending ? "sgt" : "slt", other_value, candidate_value));
-      body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %s", equal,
-                                      other_value, candidate_value));
+          "  %s = icmp %s %s %s, %s", ordered, descending ? gt : lt,
+          ElementIrType(value_type), other_value, candidate_value));
+      body->push_back(absl::StrFormat("  %s = icmp eq %s %s, %s", equal,
+                                      ElementIrType(value_type), other_value,
+                                      candidate_value));
     } else {
       body->push_back(absl::StrFormat(
           "  %s = fcmp fast %s float %s, %s", ordered,
@@ -2546,10 +2569,10 @@ class ElementwiseAirEmitter {
       int64_t output_cols, bool descending, std::vector<std::string>* body,
       bool return_index) {
     const PrimitiveType value_type = input->shape().element_type();
-    if (value_type != F32 && value_type != S32) {
+    if (value_type != F32 && value_type != S32 && value_type != U16) {
       return absl::UnimplementedError(
-          "Metal direct AIR rank-2 ordering currently supports only f32 and "
-          "s32 inputs.");
+          "Metal direct AIR rank-2 ordering currently supports only f32, s32, "
+          "and u16 inputs.");
     }
     if (rows <= 0 || input_cols <= 0 || output_cols <= 0 ||
         output_cols > input_cols) {
@@ -2601,7 +2624,9 @@ class ElementwiseAirEmitter {
     const absl::string_view selected_type =
         return_index ? "i32" : ElementIrType(value_type);
     const std::string selected_init =
-        (return_index || value_type == S32) ? "0" : "0x0000000000000000";
+        (return_index || value_type == S32 || value_type == U16)
+            ? "0"
+            : "0x0000000000000000";
 
     body->push_back(absl::StrFormat("  br label %%%s", outer));
     body->push_back(absl::StrFormat("%s:", outer));
@@ -2642,12 +2667,15 @@ class ElementwiseAirEmitter {
                                     row_offset, i64));
     TF_ASSIGN_OR_RETURN(std::string other_value,
                         EmitLoadFromLinearIndex(input, other_index, body));
-    if (value_type == S32) {
+    if (value_type == S32 || value_type == U16) {
+      const char* lt = value_type == S32 ? "slt" : "ult";
+      const char* gt = value_type == S32 ? "sgt" : "ugt";
       body->push_back(absl::StrFormat(
-          "  %s = icmp %s i32 %s, %s", ordered,
-          descending ? "sgt" : "slt", other_value, candidate_value));
-      body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %s", equal,
-                                      other_value, candidate_value));
+          "  %s = icmp %s %s %s, %s", ordered, descending ? gt : lt,
+          ElementIrType(value_type), other_value, candidate_value));
+      body->push_back(absl::StrFormat("  %s = icmp eq %s %s, %s", equal,
+                                      ElementIrType(value_type), other_value,
+                                      candidate_value));
     } else {
       body->push_back(absl::StrFormat(
           "  %s = fcmp fast %s float %s, %s", ordered,
