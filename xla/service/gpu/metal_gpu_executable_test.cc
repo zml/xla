@@ -486,6 +486,29 @@ absl::StatusOr<Literal> ExecuteMetalRfft() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalComplexTranspose() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_transpose");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {2, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Transpose(input, {1, 0});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      input_literal.Set<complex64>(
+          {row, col}, complex64(static_cast<float>(row * 3 + col),
+                                static_cast<float>(row - col)));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 template <typename BuildFn>
 absl::StatusOr<Literal> ExecuteMetalElementwiseBinary(const char* name,
                                                       BuildFn build) {
@@ -2182,6 +2205,27 @@ TEST(MetalGpuExecutableTest, RfftUsesScalarAirFallback) {
     const complex64 value = actual.Get<complex64>({k});
     EXPECT_NEAR(value.real(), expected_real, 1.0e-4f) << "real at " << k;
     EXPECT_NEAR(value.imag(), expected_imag, 1.0e-4f) << "imag at " << k;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ComplexTranspose) {
+  auto result = ExecuteMetalComplexTranspose();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {3, 2})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      const complex64 expected(static_cast<float>(col * 3 + row),
+                               static_cast<float>(col - row));
+      const complex64 value = actual.Get<complex64>({row, col});
+      EXPECT_EQ(value.real(), expected.real()) << "real at (" << row << ", "
+                                               << col << ")";
+      EXPECT_EQ(value.imag(), expected.imag()) << "imag at (" << row << ", "
+                                               << col << ")";
+    }
   }
 }
 

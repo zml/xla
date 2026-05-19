@@ -729,6 +729,24 @@ class ElementwiseAirEmitter {
     if (instr->opcode() == HloOpcode::kFft) {
       return EmitRfft(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kTranspose &&
+        ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      if (!IsC64Array(instr->shape()) || !IsC64Array(instr->operand(0)->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR complex root transpose supports only c64 arrays.");
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), "%idx", body);
+    }
+    if (instr->opcode() == HloOpcode::kParameter ||
+        instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape ||
+        instr->opcode() == HloOpcode::kTranspose) {
+      if (!IsC64Array(instr->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR complex linear path supports only c64 arrays.");
+      }
+      return EmitLoadFromLinearIndex(instr, "%idx", body);
+    }
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR complex path does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
@@ -1370,8 +1388,11 @@ class ElementwiseAirEmitter {
       const HloInstruction* instr, absl::string_view linear_index,
       std::vector<std::string>* body) {
     const HloInstruction* operand = instr->operand(0);
-    if (!IsSupportedElementwiseArray(instr->shape()) ||
-        !IsSupportedElementwiseArray(operand->shape()) ||
+    auto is_supported_transpose_array = [](const Shape& shape) {
+      return IsSupportedElementwiseArray(shape) || IsC64Array(shape);
+    };
+    if (!is_supported_transpose_array(instr->shape()) ||
+        !is_supported_transpose_array(operand->shape()) ||
         instr->shape().element_type() != operand->shape().element_type() ||
         instr->shape().dimensions().size() !=
             operand->shape().dimensions().size() ||
