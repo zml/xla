@@ -7162,20 +7162,26 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitReduce(const HloInstruction* instr,
                                          std::vector<std::string>* body) {
-    const HloInstruction* reduce_root = instr->to_apply() == nullptr
-                                            ? nullptr
-                                            : instr->to_apply()->root_instruction();
+    const HloInstruction* reduce_root =
+        instr->to_apply() == nullptr ? nullptr
+                                     : instr->to_apply()->root_instruction();
     const PrimitiveType reduce_type = instr->shape().element_type();
-    const bool is_rank3_s32_add =
-        reduce_type == S32 && reduce_root != nullptr &&
-        reduce_root->opcode() == HloOpcode::kAdd;
+    const bool is_rank3_arithmetic =
+        (IsIntegerElementType(reduce_type) ||
+         IsFloatAccumulatorElementType(reduce_type)) &&
+        reduce_root != nullptr &&
+        (reduce_root->opcode() == HloOpcode::kAdd ||
+         reduce_root->opcode() == HloOpcode::kMultiply);
     const bool is_rank3_bitwise =
         (IsIntegerElementType(reduce_type) || reduce_type == PRED) &&
         reduce_root != nullptr &&
         (reduce_root->opcode() == HloOpcode::kAnd ||
          reduce_root->opcode() == HloOpcode::kOr ||
-         reduce_root->opcode() == HloOpcode::kXor);
-    if ((is_rank3_s32_add || is_rank3_bitwise) &&
+         reduce_root->opcode() == HloOpcode::kXor ||
+         (reduce_type == PRED &&
+          (reduce_root->opcode() == HloOpcode::kMinimum ||
+           reduce_root->opcode() == HloOpcode::kMaximum)));
+    if ((is_rank3_arithmetic || is_rank3_bitwise) &&
         instr->operand_count() == 2 &&
         instr->operand(0)->shape().element_type() == reduce_type &&
         instr->operand(0)->shape().IsArray() &&
@@ -7187,26 +7193,46 @@ class ElementwiseAirEmitter {
             ShapeUtil::ElementsIn(result_shape_)) {
       const HloInstruction* input = instr->operand(0);
       const char* reduce_ir_type = ValueIrType(reduce_type);
-      std::string reduce_op_name;
+      const bool float_reduce = IsFloatAccumulatorElementType(reduce_type);
+      std::string reduce_op;
       switch (reduce_root->opcode()) {
         case HloOpcode::kAdd:
-          reduce_op_name = "add";
+          reduce_op = float_reduce ? "fadd fast float"
+                                   : absl::StrCat("add ", reduce_ir_type);
+          break;
+        case HloOpcode::kMultiply:
+          reduce_op = float_reduce ? "fmul fast float"
+                                   : absl::StrCat("mul ", reduce_ir_type);
           break;
         case HloOpcode::kAnd:
-          reduce_op_name = "and";
+          reduce_op = absl::StrCat("and ", reduce_ir_type);
           break;
         case HloOpcode::kOr:
-          reduce_op_name = "or";
+          reduce_op = absl::StrCat("or ", reduce_ir_type);
           break;
         case HloOpcode::kXor:
-          reduce_op_name = "xor";
+          reduce_op = absl::StrCat("xor ", reduce_ir_type);
+          break;
+        case HloOpcode::kMinimum:
+          if (reduce_type != PRED) {
+            return absl::UnimplementedError(
+                "Metal direct AIR rank-3 minimum reduce is supported only for "
+                "pred values here.");
+          }
+          reduce_op = "and i1";
+          break;
+        case HloOpcode::kMaximum:
+          if (reduce_type != PRED) {
+            return absl::UnimplementedError(
+                "Metal direct AIR rank-3 maximum reduce is supported only for "
+                "pred values here.");
+          }
+          reduce_op = "or i1";
           break;
         default:
           return absl::UnimplementedError(
               "Metal direct AIR rank-3 reduce has unsupported reducer.");
       }
-      const std::string reduce_op =
-          absl::StrCat(reduce_op_name, " ", reduce_ir_type);
       const std::string reduce_name_prefix =
           absl::StrCat("reduce_",
                        primitive_util::LowercasePrimitiveTypeName(reduce_type));
@@ -7240,39 +7266,45 @@ class ElementwiseAirEmitter {
                               static_cast<int64_t>(uint64_t{1} << bit_width));
         };
         std::string accumulator;
-        switch (reduce_type) {
-          case S32:
-            accumulator =
-                absl::StrCat(instr->operand(1)->literal().Get<int32_t>({}));
-            break;
-          case S16:
-            accumulator =
-                absl::StrCat(instr->operand(1)->literal().Get<int16_t>({}));
-            break;
-          case S8:
-            accumulator = absl::StrCat(static_cast<int>(
-                instr->operand(1)->literal().Get<int8_t>({})));
-            break;
-          case U32:
-            accumulator = format_unsigned_init(
-                instr->operand(1)->literal().Get<uint32_t>({}));
-            break;
-          case U16:
-            accumulator = format_unsigned_init(
-                instr->operand(1)->literal().Get<uint16_t>({}));
-            break;
-          case U8:
-            accumulator = format_unsigned_init(
-                instr->operand(1)->literal().Get<uint8_t>({}));
-            break;
-          case PRED:
-            accumulator = instr->operand(1)->literal().Get<bool>({})
-                              ? "true"
-                              : "false";
-            break;
-          default:
-            valid_dimensions = false;
-            break;
+        if (IsFloatAccumulatorElementType(reduce_type)) {
+          TF_ASSIGN_OR_RETURN(accumulator,
+                              EmitValue(instr->operand(1),
+                                        /*force_scalar=*/true, body));
+        } else {
+          switch (reduce_type) {
+            case S32:
+              accumulator =
+                  absl::StrCat(instr->operand(1)->literal().Get<int32_t>({}));
+              break;
+            case S16:
+              accumulator =
+                  absl::StrCat(instr->operand(1)->literal().Get<int16_t>({}));
+              break;
+            case S8:
+              accumulator = absl::StrCat(static_cast<int>(
+                  instr->operand(1)->literal().Get<int8_t>({})));
+              break;
+            case U32:
+              accumulator = format_unsigned_init(
+                  instr->operand(1)->literal().Get<uint32_t>({}));
+              break;
+            case U16:
+              accumulator = format_unsigned_init(
+                  instr->operand(1)->literal().Get<uint16_t>({}));
+              break;
+            case U8:
+              accumulator = format_unsigned_init(
+                  instr->operand(1)->literal().Get<uint8_t>({}));
+              break;
+            case PRED:
+              accumulator = instr->operand(1)->literal().Get<bool>({})
+                                ? "true"
+                                : "false";
+              break;
+            default:
+              valid_dimensions = false;
+              break;
+          }
         }
         std::vector<std::string> coords(3);
         if (retained_dims.size() == 1) {

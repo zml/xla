@@ -2903,6 +2903,70 @@ absl::StatusOr<Literal> ExecuteMetalReduceOrPredRank3Dims12() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReduceProdBF16Rank3Scalar() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_prod_bf16_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(BF16, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Mul(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_prod_bf16_rank3_scalar");
+  Shape input_shape = ShapeUtil::MakeShape(BF16, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<bfloat16>(&builder, bfloat16(1.0f)), reducer,
+         {0, 1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<bfloat16>({dim0, dim1, dim2}, bfloat16(1.0f));
+      }
+    }
+  }
+  input_literal.Set<bfloat16>({0, 1, 2}, bfloat16(1.5f));
+  input_literal.Set<bfloat16>({2, 3, 4}, bfloat16(2.0f));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceMaxPredRank3Dim0() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_max_pred_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(PRED, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Max(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_max_pred_rank3_dim0");
+  Shape input_shape = ShapeUtil::MakeShape(PRED, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<bool>(&builder, false), reducer, {0});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<bool>({dim0, dim1, dim2},
+                                dim0 == 1 && dim1 == 2 && dim2 == 3);
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
                                                  float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -5897,6 +5961,33 @@ TEST(MetalGpuExecutableTest, ElementwiseReduceOrPredRank3Dims12) {
   EXPECT_FALSE(actual.Get<bool>({0}));
   EXPECT_TRUE(actual.Get<bool>({1}));
   EXPECT_FALSE(actual.Get<bool>({2}));
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceProdBF16Rank3Scalar) {
+  auto result = ExecuteMetalReduceProdBF16Rank3Scalar();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(BF16, {})));
+  EXPECT_EQ(actual.Get<bfloat16>({}), bfloat16(3.0f));
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceMaxPredRank3Dim0) {
+  auto result = ExecuteMetalReduceMaxPredRank3Dim0();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {4, 5})));
+  for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+    for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+      EXPECT_EQ(actual.Get<bool>({dim1, dim2}), dim1 == 2 && dim2 == 3)
+          << "at (" << dim1 << ", " << dim2 << ")";
+    }
+  }
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseConditional) {
