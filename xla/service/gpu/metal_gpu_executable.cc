@@ -153,8 +153,24 @@ bool IsS32Array(const Shape& shape) {
   return shape.element_type() == S32 && shape.IsArray();
 }
 
+bool IsS16Array(const Shape& shape) {
+  return shape.element_type() == S16 && shape.IsArray();
+}
+
+bool IsS8Array(const Shape& shape) {
+  return shape.element_type() == S8 && shape.IsArray();
+}
+
+bool IsU32Array(const Shape& shape) {
+  return shape.element_type() == U32 && shape.IsArray();
+}
+
 bool IsU16Array(const Shape& shape) {
   return shape.element_type() == U16 && shape.IsArray();
+}
+
+bool IsU8Array(const Shape& shape) {
+  return shape.element_type() == U8 && shape.IsArray();
 }
 
 bool IsBF16Array(const Shape& shape) {
@@ -205,7 +221,9 @@ bool IsScalarLikeSupported(const Shape& shape) {
 
 bool IsSupportedElementwiseArray(const Shape& shape) {
   return IsF32Array(shape) || IsF16Array(shape) || IsPredArray(shape) ||
-         IsS32Array(shape) || IsU16Array(shape) || IsBF16Array(shape);
+         IsS32Array(shape) || IsS16Array(shape) || IsS8Array(shape) ||
+         IsU32Array(shape) || IsU16Array(shape) || IsU8Array(shape) ||
+         IsBF16Array(shape);
 }
 
 bool IsOrderStatisticArray(const Shape& shape) {
@@ -806,13 +824,7 @@ class ElementwiseAirEmitter {
       if (IsScalarLikeSupported(instr->operand(0)->shape())) {
         return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
       }
-      if (ShapeUtil::ElementsIn(instr->shape()) !=
-          ShapeUtil::ElementsIn(instr->operand(0)->shape())) {
-        return absl::UnimplementedError(
-            "Metal direct AIR linear load broadcast currently supports only "
-            "broadcasts that preserve element count.");
-      }
-      return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+      return EmitBroadcastFromLinearIndex(instr, index, body);
     }
     if (instr->opcode() == HloOpcode::kIota) {
       const auto* iota = Cast<HloIotaInstruction>(instr);
@@ -2943,43 +2955,90 @@ class ElementwiseAirEmitter {
     return value;
   }
 
-  absl::StatusOr<std::string> EmitBroadcast(
-      const HloInstruction* instr, std::vector<std::string>* body) {
+  absl::StatusOr<std::string> EmitBroadcastFromLinearIndex(
+      const HloInstruction* instr, absl::string_view linear_index,
+      std::vector<std::string>* body) {
     const HloInstruction* operand = instr->operand(0);
     if (!instr->shape().IsArray() || !operand->shape().IsArray() ||
-        instr->shape().dimensions().size() != 2 ||
-        operand->shape().dimensions().size() != 1 ||
-        instr->dimensions().size() != 1 ||
-        ShapeUtil::ElementsIn(instr->shape()) !=
-            ShapeUtil::ElementsIn(result_shape_)) {
+        instr->dimensions().size() != operand->shape().dimensions().size() ||
+        ShapeUtil::ElementsIn(instr->shape()) == 0) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise broadcast currently supports only "
-          "rank-1 operands broadcast into rank-2 results.");
+          "Metal direct AIR elementwise broadcast requires array operands, "
+          "valid broadcast dimensions, and non-empty result shapes.");
     }
-    std::string source_index;
-    const int64_t major = instr->shape().dimensions(0);
-    const int64_t minor = instr->shape().dimensions(1);
-    if (instr->dimensions()[0] == 0) {
-      source_index = NewName("broadcast_major");
-      body->push_back(
-          absl::StrFormat("  %s = udiv i64 %%idx, %d", source_index, minor));
-      if (operand->shape().dimensions(0) != major) {
+
+    const int64_t result_rank = instr->shape().dimensions().size();
+    const int64_t operand_rank = operand->shape().dimensions().size();
+    if (operand_rank == 0) {
+      return EmitLoadFromLinearIndex(operand, "0", body);
+    }
+
+    std::vector<int64_t> result_strides(result_rank, 1);
+    for (int64_t dim = result_rank - 2; dim >= 0; --dim) {
+      result_strides[dim] =
+          result_strides[dim + 1] * instr->shape().dimensions(dim + 1);
+    }
+    std::vector<int64_t> operand_strides(operand_rank, 1);
+    for (int64_t dim = operand_rank - 2; dim >= 0; --dim) {
+      operand_strides[dim] =
+          operand_strides[dim + 1] * operand->shape().dimensions(dim + 1);
+    }
+
+    std::string source_index = "0";
+    for (int64_t operand_dim = 0; operand_dim < operand_rank; ++operand_dim) {
+      const int64_t result_dim = instr->dimensions()[operand_dim];
+      if (result_dim < 0 || result_dim >= result_rank ||
+          operand->shape().dimensions(operand_dim) !=
+              instr->shape().dimensions(result_dim)) {
         return absl::UnimplementedError(
             "Metal direct AIR broadcast operand dimension mismatch.");
       }
-    } else if (instr->dimensions()[0] == 1) {
-      source_index = NewName("broadcast_minor");
-      body->push_back(
-          absl::StrFormat("  %s = urem i64 %%idx, %d", source_index, minor));
-      if (operand->shape().dimensions(0) != minor) {
-        return absl::UnimplementedError(
-            "Metal direct AIR broadcast operand dimension mismatch.");
+
+      std::string coord = "0";
+      const int64_t result_dim_size = instr->shape().dimensions(result_dim);
+      if (result_dim_size != 1) {
+        coord = std::string(linear_index);
+        if (result_strides[result_dim] != 1) {
+          coord = NewName("broadcast_div");
+          body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                          linear_index,
+                                          result_strides[result_dim]));
+        }
+        if (result_dim_size != 0) {
+          std::string rem = NewName("broadcast_coord");
+          body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                          coord, result_dim_size));
+          coord = rem;
+        }
       }
-    } else {
-      return absl::UnimplementedError(
-          "Metal direct AIR broadcast dimension out of range.");
+
+      std::string term = coord;
+      if (operand_strides[operand_dim] != 1 && coord != "0") {
+        term = NewName("broadcast_term");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term, coord,
+                                        operand_strides[operand_dim]));
+      }
+      if (source_index == "0") {
+        source_index = term;
+      } else if (term != "0") {
+        std::string sum = NewName("broadcast_index");
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", sum,
+                                        source_index, term));
+        source_index = sum;
+      }
     }
     return EmitLoadFromLinearIndex(operand, source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitBroadcast(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (ShapeUtil::ElementsIn(instr->shape()) !=
+        ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR root broadcast must match the result element "
+          "count.");
+    }
+    return EmitBroadcastFromLinearIndex(instr, "%idx", body);
   }
 
   absl::StatusOr<std::string> EmitDynamicUpdateSlice(

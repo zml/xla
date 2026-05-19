@@ -3347,6 +3347,45 @@ TEST(MetalGpuExecutableTest, ElementwiseVectorBroadcast) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseRank2ToRank4Broadcast) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_rank2_to_rank4_broadcast");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {2, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BroadcastInDim(input, {1, 2, 2, 3}, {2, 3});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR2<int32_t>({{1, 2, 3},
+                                                          {4, 5, 6}});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(S32, {1, 2, 2, 3})));
+  for (int64_t b0 = 0; b0 < 1; ++b0) {
+    for (int64_t b1 = 0; b1 < 2; ++b1) {
+      for (int64_t row = 0; row < 2; ++row) {
+        for (int64_t col = 0; col < 3; ++col) {
+          EXPECT_EQ(actual.Get<int32_t>({b0, b1, row, col}),
+                    input_literal.Get<int32_t>({row, col}))
+              << "at (" << b0 << ", " << b1 << ", " << row << ", " << col
+              << ")";
+        }
+      }
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseTransposeSlice) {
   auto result = ExecuteMetalElementwiseUnary(
       "metal_elementwise_transpose_slice",
