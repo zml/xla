@@ -834,6 +834,64 @@ absl::StatusOr<Literal> ExecuteMetalScatter(bool add) {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalScatterRank2(bool add) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaBuilder reducer_builder(add ? "metal_scatter_rank2_add_reducer"
+                                 : "metal_scatter_rank2_set_reducer");
+  XlaOp current = Parameter(&reducer_builder, 0, scalar_shape, "current");
+  XlaOp update = Parameter(&reducer_builder, 1, scalar_shape, "update");
+  if (add) {
+    Add(current, update);
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder(add ? "metal_scatter_rank2_add"
+                         : "metal_scatter_rank2_set");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {3, 4});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {3, 2});
+  Shape update_shape = ShapeUtil::MakeShape(F32, {3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+  XlaOp updates = Parameter(&builder, 2, update_shape, "updates");
+  ScatterDimensionNumbers dnums;
+  dnums.add_inserted_window_dims(0);
+  dnums.add_inserted_window_dims(1);
+  dnums.add_scatter_dims_to_operand_dims(0);
+  dnums.add_scatter_dims_to_operand_dims(1);
+  dnums.set_index_vector_dim(1);
+  Scatter(input, indices, updates, reducer, dnums,
+          /*indices_are_sorted=*/false, /*unique_indices=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> input_values(3, 4);
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      input_values(row, col) = static_cast<float>(row * 4 + col);
+    }
+  }
+  Array2D<int32_t> index_values(3, 2);
+  index_values(0, 0) = 0;
+  index_values(0, 1) = 1;
+  index_values(1, 0) = 2;
+  index_values(1, 1) = 3;
+  index_values(2, 0) = 1;
+  index_values(2, 1) = 2;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(input_values);
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  Literal update_literal = LiteralUtil::CreateR1<float>({-5.0f, 7.0f, 4.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> update_data,
+                      client->TransferToServer(update_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get(),
+                                        update_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
                                                  float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -2238,6 +2296,46 @@ TEST(MetalGpuExecutableTest, ElementwiseScatterAdd) {
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {8})));
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScatterRank2Set) {
+  auto result = ExecuteMetalScatterRank2(/*add=*/false);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {0.0f, -5.0f, 2.0f, 3.0f,
+                                 4.0f, 5.0f,  4.0f, 7.0f,
+                                 8.0f, 9.0f,  10.0f, 7.0f};
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const int64_t index = row * 4 + col;
+      EXPECT_EQ(actual.Get<float>({row, col}), expected[index])
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScatterRank2Add) {
+  auto result = ExecuteMetalScatterRank2(/*add=*/true);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {0.0f, -4.0f, 2.0f, 3.0f,
+                                 4.0f, 5.0f,  10.0f, 7.0f,
+                                 8.0f, 9.0f,  10.0f, 18.0f};
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const int64_t index = row * 4 + col;
+      EXPECT_EQ(actual.Get<float>({row, col}), expected[index])
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 
