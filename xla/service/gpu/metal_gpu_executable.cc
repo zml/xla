@@ -434,6 +434,22 @@ bool IsIntegerElementType(PrimitiveType type) {
   return IsSignedIntegerElementType(type) || IsUnsignedIntegerElementType(type);
 }
 
+bool IsSupportedIotaElementType(PrimitiveType type) {
+  return type == F32 || IsIntegerElementType(type);
+}
+
+bool IsSupportedIotaArray(const Shape& shape) {
+  return shape.IsArray() && IsSupportedIotaElementType(shape.element_type());
+}
+
+bool IsTransparentMetadataCustomCall(const HloInstruction* instr) {
+  return instr->opcode() == HloOpcode::kCustomCall &&
+         instr->operand_count() == 1 &&
+         ShapeUtil::Equal(instr->shape(), instr->operand(0)->shape()) &&
+         instr->IsCustomCall(
+             {"Sharding", "LayoutConstraint", "xla.sdy.FuncResultSharding"});
+}
+
 bool IsSupportedDotElementPair(PrimitiveType input_type,
                                PrimitiveType result_type) {
   if (input_type == result_type) {
@@ -707,6 +723,9 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitValue(const HloInstruction* instr,
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
+    if (IsTransparentMetadataCustomCall(instr)) {
+      return EmitValue(instr->operand(0), force_scalar, body);
+    }
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (!IsScalarLikeSupported(instr->operand(0)->shape())) {
         return EmitBroadcast(instr, body);
@@ -920,6 +939,9 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitComplexValue(
       const HloInstruction* instr, std::vector<std::string>* body) {
+    if (IsTransparentMetadataCustomCall(instr)) {
+      return EmitComplexValue(instr->operand(0), body);
+    }
     if (instr->IsConstant()) {
       return EmitComplexConstant(instr, body);
     }
@@ -2306,6 +2328,9 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitLoadFromLinearIndex(
       const HloInstruction* instr, absl::string_view index,
       std::vector<std::string>* body) {
+    if (IsTransparentMetadataCustomCall(instr)) {
+      return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+    }
     if (instr->IsConstant()) {
       if (!IsScalarLikeSupported(instr->shape())) {
         if (!IsSupportedElementwiseArray(instr->shape())) {
@@ -2468,17 +2493,19 @@ class ElementwiseAirEmitter {
     }
     if (instr->opcode() == HloOpcode::kIota) {
       const auto* iota = Cast<HloIotaInstruction>(instr);
-      if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+      if (!IsSupportedIotaArray(instr->shape()) ||
           instr->shape().dimensions().size() != 1 ||
           iota->iota_dimension() != 0) {
         return absl::UnimplementedError(
             "Metal direct AIR linear load iota currently supports only rank-1 "
-            "f32/s32 iotas over dimension 0.");
+            "f32/integer iotas over dimension 0.");
       }
-      if (instr->shape().element_type() == S32) {
-        std::string value = NewName("linear_iota_s32");
+      const PrimitiveType type = instr->shape().element_type();
+      if (IsIntegerElementType(type)) {
+        std::string value = NewName("linear_iota_int");
         body->push_back(
-            absl::StrFormat("  %s = trunc i64 %s to i32", value, index));
+            absl::StrFormat("  %s = trunc i64 %s to %s", value, index,
+                            ElementIrType(type)));
         return value;
       }
       std::string value = NewName("linear_iota");
@@ -5320,6 +5347,21 @@ class ElementwiseAirEmitter {
     if (instr->operand(0)->opcode() == HloOpcode::kReduce) {
       return EmitArgmaxReduceTupleElement(instr, body);
     }
+    if (instr->operand(0)->opcode() == HloOpcode::kTuple) {
+      const int64_t tuple_index = instr->tuple_index();
+      if (tuple_index < 0 || tuple_index >= instr->operand(0)->operand_count()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR get-tuple-element tuple index is out of range.");
+      }
+      const HloInstruction* element = instr->operand(0)->operand(tuple_index);
+      if (!ShapeUtil::Equal(instr->shape(), element->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR get-tuple-element requires tuple element shape "
+            "to match the result shape.");
+      }
+      return EmitValue(element, ShapeUtil::IsEffectiveScalar(instr->shape()),
+                       body);
+    }
     if (instr->operand(0)->opcode() != HloOpcode::kTopK ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
@@ -6167,11 +6209,11 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitIota(const HloInstruction* instr,
                                        std::vector<std::string>* body) {
-    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+    if (!IsSupportedIotaArray(instr->shape()) ||
         ShapeUtil::ElementsIn(instr->shape()) !=
             ShapeUtil::ElementsIn(result_shape_)) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise iota currently supports only f32/s32 "
+          "Metal direct AIR elementwise iota currently supports only f32/integer "
           "iotas with the final result element count.");
     }
     const int64_t rank = instr->shape().dimensions().size();
@@ -6204,13 +6246,14 @@ class ElementwiseAirEmitter {
             absl::StrFormat("  %s = urem i64 %%idx, %d", source_index, minor));
       }
     }
-    if (instr->shape().element_type() == S32) {
-      if (rank == 1) {
+    const PrimitiveType type = instr->shape().element_type();
+    if (IsIntegerElementType(type)) {
+      if (rank == 1 && (type == S32 || type == U32)) {
         return "%idx32";
       }
-      std::string value = NewName("iota_s32");
-      body->push_back(
-          absl::StrFormat("  %s = trunc i64 %s to i32", value, source_index));
+      std::string value = NewName("iota_int");
+      body->push_back(absl::StrFormat("  %s = trunc i64 %s to %s", value,
+                                      source_index, ElementIrType(type)));
       return value;
     }
     std::string value = NewName("iota");

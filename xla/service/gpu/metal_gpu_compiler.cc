@@ -42,6 +42,15 @@ absl::Status DirectAirNotWired() {
       "Metal direct AIR compilation is not wired into XLA yet.");
 }
 
+bool IsTransparentMetadataCustomCall(const HloInstruction* instruction) {
+  return instruction->opcode() == HloOpcode::kCustomCall &&
+         instruction->operand_count() == 1 &&
+         ShapeUtil::Equal(instruction->shape(),
+                          instruction->operand(0)->shape()) &&
+         instruction->IsCustomCall(
+             {"Sharding", "LayoutConstraint", "xla.sdy.FuncResultSharding"});
+}
+
 bool IsPackedSubbyteArray(const Shape& shape) {
   return shape.IsArray() &&
          (shape.element_type() == S4 || shape.element_type() == U4);
@@ -112,8 +121,9 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
 absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
-  if (module->entry_computation()->root_instruction()->opcode() ==
-      HloOpcode::kCustomCall) {
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  if (root->opcode() == HloOpcode::kCustomCall &&
+      !IsTransparentMetadataCustomCall(root)) {
     auto shared_module = std::shared_ptr<HloModule>(std::move(module));
     return BuildMetalCustomCallExecutable(std::move(shared_module));
   }

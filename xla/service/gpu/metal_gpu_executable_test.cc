@@ -2221,6 +2221,42 @@ absl::StatusOr<Literal> ExecuteMetalTupleScalarSlices() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalFuncResultShardingTupleGetTupleElement() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_func_result_sharding_tuple_gte");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp sharded = CustomCall(&builder, "xla.sdy.FuncResultSharding",
+                             /*operands=*/{input}, shape,
+                             /*opaque=*/"", /*has_side_effect=*/true);
+  GetTupleElement(Tuple(&builder, {sharded}), 0);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR0<float>(3.5f);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalShardingCustomCallIdentity() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_sharding_custom_call_identity");
+  Shape shape = ShapeUtil::MakeShape(U32, {2});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp first = CustomCall(&builder, "Sharding", /*operands=*/{input}, shape);
+  CustomCall(&builder, "Sharding", /*operands=*/{first}, shape);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<uint32_t>({11, 19});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalTopKTupleRank2() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -3388,6 +3424,17 @@ absl::StatusOr<Literal> ExecuteMetalS32Iota() {
 
   XlaBuilder builder("metal_s32_iota");
   Add(Iota(&builder, S32, 16), Broadcast(ConstantR0<int32_t>(&builder, 1),
+                                        {16}));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+  std::vector<GlobalData*> arguments;
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalU32Iota() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_u32_iota");
+  Add(Iota(&builder, U32, 16), Broadcast(ConstantR0<uint32_t>(&builder, 1),
                                         {16}));
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
   std::vector<GlobalData*> arguments;
@@ -5665,6 +5712,29 @@ TEST(MetalGpuExecutableTest, ElementwiseTupleScalarSlices) {
   EXPECT_EQ(second.Get<int32_t>({}), 5);
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseFuncResultShardingTupleGte) {
+  auto result = ExecuteMetalFuncResultShardingTupleGetTupleElement();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {})));
+  EXPECT_EQ(actual.Get<float>({}), 3.5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseShardingCustomCallIdentity) {
+  auto result = ExecuteMetalShardingCustomCallIdentity();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U32, {2})));
+  EXPECT_EQ(actual.Get<uint32_t>({0}), 11);
+  EXPECT_EQ(actual.Get<uint32_t>({1}), 19);
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseTopKTupleRank2) {
   auto result = ExecuteMetalTopKTupleRank2();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -6897,6 +6967,19 @@ TEST(MetalGpuExecutableTest, ElementwiseS32Iota) {
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {16})));
   for (int64_t i = 0; i < 16; ++i) {
     EXPECT_EQ(actual.Get<int32_t>({i}), static_cast<int32_t>(i + 1));
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseU32Iota) {
+  auto result = ExecuteMetalU32Iota();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U32, {16})));
+  for (int64_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(actual.Get<uint32_t>({i}), static_cast<uint32_t>(i + 1));
   }
 }
 
