@@ -364,6 +364,87 @@ absl::StatusOr<Literal> ExecuteMetalConv0DIsDot() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConv0DFeatureGroup() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_0d_feature_group");
+  Shape lhs_shape = ShapeUtil::MakeShape(F32, {3, 4});
+  Shape rhs_shape = ShapeUtil::MakeShape(F32, {4, 2});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  ConvGeneralDilated(lhs, rhs, {}, {}, {}, {}, dnums,
+                     /*feature_group_count=*/2, /*batch_group_count=*/1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> lhs_values(3, 4);
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      lhs_values(row, col) = static_cast<float>(row * 4 + col + 1);
+    }
+  }
+  Array2D<float> rhs_values(4, 2);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      rhs_values(row, col) = static_cast<float>(row * 2 + col - 3) * 0.5f;
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR2FromArray2D(rhs_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv0DU16() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_0d_u16");
+  Shape lhs_shape = ShapeUtil::MakeShape(U16, {2, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(U16, {2, 3});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  ConvGeneralDilated(lhs, rhs, {}, {}, {}, {}, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<uint16_t> lhs_values(2, 3);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      lhs_values(row, col) = static_cast<uint16_t>(row * 3 + col + 1);
+    }
+  }
+  Array2D<uint16_t> rhs_values(2, 3);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      rhs_values(row, col) = static_cast<uint16_t>(row * 3 + col + 2);
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR2FromArray2D(rhs_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConv2D() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -465,6 +546,105 @@ absl::StatusOr<Literal> ExecuteMetalConv2DNchwF16SameLower() {
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
                       client->TransferToServer(kernel_literal));
   std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalComplexConv2DBatchGroupDilation() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_conv_2d_batch_group_dilation");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {2, 3, 4, 1});
+  Shape kernel_shape = ShapeUtil::MakeShape(C64, {2, 2, 1, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.add_input_spatial_dimensions(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.set_input_feature_dimension(3);
+  dnums.add_kernel_spatial_dimensions(0);
+  dnums.add_kernel_spatial_dimensions(1);
+  dnums.set_kernel_input_feature_dimension(2);
+  dnums.set_kernel_output_feature_dimension(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.add_output_spatial_dimensions(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.set_output_feature_dimension(3);
+  std::vector<std::pair<int64_t, int64_t>> padding = {{0, 0}, {1, 0}};
+  ConvGeneralDilated(input, kernel, {1, 1}, padding, {1, 2}, {1, 1}, dnums,
+                     /*feature_group_count=*/1, /*batch_group_count=*/2);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t b = 0; b < 2; ++b) {
+    for (int64_t h = 0; h < 3; ++h) {
+      for (int64_t w = 0; w < 4; ++w) {
+        input_literal.Set<complex64>(
+            {b, h, w, 0},
+            complex64(static_cast<float>(b * 12 + h * 4 + w) * 0.25f,
+                      static_cast<float>(b - h + w) * 0.125f));
+      }
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  for (int64_t kh = 0; kh < 2; ++kh) {
+    for (int64_t kw = 0; kw < 2; ++kw) {
+      for (int64_t oc = 0; oc < 4; ++oc) {
+        kernel_literal.Set<complex64>(
+            {kh, kw, 0, oc},
+            complex64(static_cast<float>(kh * 8 + kw * 4 + oc) * 0.125f,
+                      static_cast<float>(oc - kh - kw) * 0.25f));
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalComplexConv0DBatchGroup() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_conv_0d_batch_group");
+  Shape lhs_shape = ShapeUtil::MakeShape(C64, {4, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(C64, {4, 3});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  ConvGeneralDilated(lhs, rhs, {}, {}, {}, {}, dnums,
+                     /*feature_group_count=*/1, /*batch_group_count=*/2);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      lhs_literal.Set<complex64>(
+          {row, col}, complex64(static_cast<float>(row * 3 + col) * 0.25f,
+                                static_cast<float>(row - col) * 0.5f));
+    }
+  }
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      rhs_literal.Set<complex64>(
+          {row, col}, complex64(static_cast<float>(row * 3 + col - 4) * 0.125f,
+                                static_cast<float>(col - row) * 0.25f));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
@@ -2110,6 +2290,53 @@ TEST(MetalGpuExecutableTest, Conv0DIsDotUsesScalarAirFallback) {
   }
 }
 
+TEST(MetalGpuExecutableTest, Conv0DFeatureGroupUsesScalarAirFallback) {
+  auto result = ExecuteMetalConv0DFeatureGroup();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t out_feature = 0; out_feature < 4; ++out_feature) {
+      const int64_t feature_group = out_feature / 2;
+      float expected = 0.0f;
+      for (int64_t k = 0; k < 2; ++k) {
+        const float lhs =
+            static_cast<float>(row * 4 + feature_group * 2 + k + 1);
+        const float rhs =
+            static_cast<float>(out_feature * 2 + k - 3) * 0.5f;
+        expected += lhs * rhs;
+      }
+      EXPECT_EQ(actual.Get<float>({row, out_feature}), expected)
+          << "at (" << row << ", " << out_feature << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv0DU16UsesScalarAirFallback) {
+  auto result = ExecuteMetalConv0DU16();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U16, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t out_feature = 0; out_feature < 2; ++out_feature) {
+      uint32_t expected = 0;
+      for (int64_t k = 0; k < 3; ++k) {
+        expected += static_cast<uint32_t>(row * 3 + k + 1) *
+                    static_cast<uint32_t>(out_feature * 3 + k + 2);
+      }
+      EXPECT_EQ(actual.Get<uint16_t>({row, out_feature}),
+                static_cast<uint16_t>(expected))
+          << "at (" << row << ", " << out_feature << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, Conv2DUsesScalarAirFallback) {
   auto result = ExecuteMetalConv2D();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2178,6 +2405,89 @@ TEST(MetalGpuExecutableTest, Conv2DNchwF16SameLowerUsesScalarAirFallback) {
               << "at (" << b << ", " << o << ", " << oh << ", " << ow << ")";
         }
       }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ComplexConv2DBatchGroupDilation) {
+  auto result = ExecuteMetalComplexConv2DBatchGroupDilation();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(C64, {1, 2, 7, 4})));
+
+  auto input_value = [](int64_t b, int64_t h, int64_t w) {
+    return complex64(static_cast<float>(b * 12 + h * 4 + w) * 0.25f,
+                     static_cast<float>(b - h + w) * 0.125f);
+  };
+  auto kernel_value = [](int64_t kh, int64_t kw, int64_t oc) {
+    return complex64(static_cast<float>(kh * 8 + kw * 4 + oc) * 0.125f,
+                     static_cast<float>(oc - kh - kw) * 0.25f);
+  };
+
+  for (int64_t oh = 0; oh < 2; ++oh) {
+    for (int64_t ow = 0; ow < 7; ++ow) {
+      for (int64_t oc = 0; oc < 4; ++oc) {
+        complex64 expected(0.0f, 0.0f);
+        const int64_t input_batch = oc < 2 ? 0 : 1;
+        for (int64_t kh = 0; kh < 2; ++kh) {
+          const int64_t ih = oh + kh;
+          if (ih < 0 || ih >= 3) {
+            continue;
+          }
+          for (int64_t kw = 0; kw < 2; ++kw) {
+            const int64_t dilated_iw = ow + kw - 1;
+            if (dilated_iw < 0 || dilated_iw >= 7 ||
+                dilated_iw % 2 != 0) {
+              continue;
+            }
+            const int64_t iw = dilated_iw / 2;
+            expected += input_value(input_batch, ih, iw) *
+                        kernel_value(kh, kw, oc);
+          }
+        }
+        const complex64 value = actual.Get<complex64>({0, oh, ow, oc});
+        EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f)
+            << "real at (" << oh << ", " << ow << ", " << oc << ")";
+        EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f)
+            << "imag at (" << oh << ", " << ow << ", " << oc << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ComplexConv0DBatchGroup) {
+  auto result = ExecuteMetalComplexConv0DBatchGroup();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {2, 4})));
+
+  auto lhs_value = [](int64_t row, int64_t col) {
+    return complex64(static_cast<float>(row * 3 + col) * 0.25f,
+                     static_cast<float>(row - col) * 0.5f);
+  };
+  auto rhs_value = [](int64_t row, int64_t col) {
+    return complex64(static_cast<float>(row * 3 + col - 4) * 0.125f,
+                     static_cast<float>(col - row) * 0.25f);
+  };
+
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t out_feature = 0; out_feature < 4; ++out_feature) {
+      const int64_t input_batch = out_feature < 2 ? row : row + 2;
+      complex64 expected(0.0f, 0.0f);
+      for (int64_t k = 0; k < 3; ++k) {
+        expected += lhs_value(input_batch, k) * rhs_value(out_feature, k);
+      }
+      const complex64 value = actual.Get<complex64>({row, out_feature});
+      EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f)
+          << "real at (" << row << ", " << out_feature << ")";
+      EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f)
+          << "imag at (" << row << ", " << out_feature << ")";
     }
   }
 }
