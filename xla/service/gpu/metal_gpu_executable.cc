@@ -221,6 +221,13 @@ bool IsScalarLikeS32(const Shape& shape) {
   return shape.element_type() == S32 && ShapeUtil::IsEffectiveScalar(shape);
 }
 
+bool IsScalarLikeIndex(const Shape& shape) {
+  return (shape.element_type() == S32 || shape.element_type() == S16 ||
+          shape.element_type() == S8 || shape.element_type() == U32 ||
+          shape.element_type() == U16 || shape.element_type() == U8) &&
+         ShapeUtil::IsEffectiveScalar(shape);
+}
+
 bool IsScalarLikeSupported(const Shape& shape) {
   return (shape.element_type() == F32 || shape.element_type() == F16 ||
           shape.element_type() == BF16 || shape.element_type() == S32 ||
@@ -399,9 +406,27 @@ bool IsSupportedDotElementPair(PrimitiveType input_type,
                                PrimitiveType result_type) {
   if (input_type == result_type) {
     return IsFloatAccumulatorElementType(result_type) ||
-           IsIntegerElementType(result_type) || result_type == PRED;
+           IsIntegerElementType(result_type) || result_type == PRED ||
+           result_type == C64;
   }
-  return result_type == F32 && IsFloatAccumulatorElementType(input_type);
+  if (IsFloatAccumulatorElementType(input_type) && result_type == F32) {
+    return true;
+  }
+  if (IsIntegerElementType(input_type) &&
+      IsFloatAccumulatorElementType(result_type)) {
+    return true;
+  }
+  if (IsSignedIntegerElementType(input_type) &&
+      IsSignedIntegerElementType(result_type) &&
+      ElementBitWidth(input_type) <= ElementBitWidth(result_type)) {
+    return true;
+  }
+  if (IsUnsignedIntegerElementType(input_type) &&
+      IsUnsignedIntegerElementType(result_type) &&
+      ElementBitWidth(input_type) <= ElementBitWidth(result_type)) {
+    return true;
+  }
+  return false;
 }
 
 bool IsSupportedConvolutionElementPair(PrimitiveType input_type,
@@ -561,7 +586,9 @@ class ElementwiseAirEmitter {
  public:
   explicit ElementwiseAirEmitter(Shape result_shape)
       : result_shape_(std::move(result_shape)),
-        num_work_items_(ShapeUtil::ElementsIn(result_shape_)) {}
+        num_work_items_(result_shape_.IsArray()
+                            ? ShapeUtil::ElementsIn(result_shape_)
+                            : 0) {}
 
   absl::StatusOr<std::string> Emit(const HloInstruction* root) {
     if (root->shape().IsArray() && ShapeUtil::ElementsIn(root->shape()) == 0) {
@@ -2379,13 +2406,12 @@ class ElementwiseAirEmitter {
     starts.reserve(rank);
     for (int64_t dim = 0; dim < rank; ++dim) {
       const HloInstruction* start = instr->operand(dim + 1);
-      if (!IsScalarLikeS32(start->shape())) {
+      if (!IsScalarLikeIndex(start->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR dynamic-slice requires scalar s32 start "
+            "Metal direct AIR dynamic-slice requires scalar integer start "
             "indices.");
       }
-      TF_ASSIGN_OR_RETURN(std::string raw,
-                          EmitValue(start, /*force_scalar=*/true, body));
+      TF_ASSIGN_OR_RETURN(std::string raw, EmitStartIndexAsS32(start, body));
       const int64_t max_start =
           operand->shape().dimensions(dim) - instr->shape().dimensions(dim);
       starts.push_back(EmitClampedStartIndex(raw, max_start, body));
@@ -2680,20 +2706,18 @@ class ElementwiseAirEmitter {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
     const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
-    if (dnums.lhs_contracting_dimensions_size() != 1 ||
-        dnums.rhs_contracting_dimensions_size() != 1 ||
+    if (dnums.lhs_contracting_dimensions_size() !=
+            dnums.rhs_contracting_dimensions_size() ||
         dnums.lhs_batch_dimensions_size() !=
             dnums.rhs_batch_dimensions_size()) {
       return absl::UnimplementedError(
-          "Metal direct AIR dot fallback currently supports one contracting "
-          "dimension and matching batch dimensions.");
+          "Metal direct AIR dot fallback currently supports matching "
+          "contracting and batch dimensions.");
     }
 
     const int64_t lhs_rank = lhs->shape().dimensions().size();
     const int64_t rhs_rank = rhs->shape().dimensions().size();
     const int64_t result_rank = instr->shape().dimensions().size();
-    const int64_t lhs_contract = dnums.lhs_contracting_dimensions(0);
-    const int64_t rhs_contract = dnums.rhs_contracting_dimensions(0);
     std::vector<bool> lhs_used(lhs_rank, false);
     std::vector<bool> rhs_used(rhs_rank, false);
     auto mark_dim = [](std::vector<bool>* used, int64_t dim) {
@@ -2704,12 +2728,29 @@ class ElementwiseAirEmitter {
       (*used)[dim] = true;
       return true;
     };
-    if (!mark_dim(&lhs_used, lhs_contract) ||
-        !mark_dim(&rhs_used, rhs_contract) ||
-        lhs->shape().dimensions(lhs_contract) !=
-            rhs->shape().dimensions(rhs_contract)) {
-      return absl::UnimplementedError(
-          "Metal direct AIR dot fallback dimension numbers do not match.");
+
+    std::vector<int64_t> lhs_contracting;
+    std::vector<int64_t> rhs_contracting;
+    std::vector<int64_t> contracting_sizes;
+    lhs_contracting.reserve(dnums.lhs_contracting_dimensions_size());
+    rhs_contracting.reserve(dnums.rhs_contracting_dimensions_size());
+    contracting_sizes.reserve(dnums.lhs_contracting_dimensions_size());
+    int64_t contracting_count = 1;
+    for (int64_t i = 0; i < dnums.lhs_contracting_dimensions_size(); ++i) {
+      const int64_t lhs_contract = dnums.lhs_contracting_dimensions(i);
+      const int64_t rhs_contract = dnums.rhs_contracting_dimensions(i);
+      if (!mark_dim(&lhs_used, lhs_contract) ||
+          !mark_dim(&rhs_used, rhs_contract) ||
+          lhs->shape().dimensions(lhs_contract) !=
+              rhs->shape().dimensions(rhs_contract)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR dot fallback contracting dimensions do not "
+            "match.");
+      }
+      lhs_contracting.push_back(lhs_contract);
+      rhs_contracting.push_back(rhs_contract);
+      contracting_sizes.push_back(lhs->shape().dimensions(lhs_contract));
+      contracting_count *= lhs->shape().dimensions(lhs_contract);
     }
 
     std::vector<int64_t> lhs_batch;
@@ -2816,10 +2857,9 @@ class ElementwiseAirEmitter {
 
     std::vector<std::string> out_coords =
         emit_coords(instr->shape(), "%idx", "dot_generic_out");
-    const int64_t k = lhs->shape().dimensions(lhs_contract);
     const PrimitiveType dot_type = instr->shape().element_type();
     std::string accumulator = DefaultIrValue(dot_type);
-    for (int64_t kk = 0; kk < k; ++kk) {
+    for (int64_t kk = 0; kk < contracting_count; ++kk) {
       std::vector<std::string> lhs_coords(lhs_rank, "0");
       std::vector<std::string> rhs_coords(rhs_rank, "0");
       int64_t result_dim = 0;
@@ -2833,8 +2873,14 @@ class ElementwiseAirEmitter {
       for (int64_t dim : rhs_outer) {
         rhs_coords[dim] = out_coords[result_dim++];
       }
-      lhs_coords[lhs_contract] = absl::StrCat(kk);
-      rhs_coords[rhs_contract] = absl::StrCat(kk);
+      int64_t contracting_linear = kk;
+      for (int64_t i = static_cast<int64_t>(contracting_sizes.size()) - 1;
+           i >= 0; --i) {
+        const int64_t coord = contracting_linear % contracting_sizes[i];
+        contracting_linear /= contracting_sizes[i];
+        lhs_coords[lhs_contracting[i]] = absl::StrCat(coord);
+        rhs_coords[rhs_contracting[i]] = absl::StrCat(coord);
+      }
 
       std::string lhs_index =
           emit_linear_index(lhs->shape(), lhs_coords, "dot_generic_lhs");
@@ -2844,6 +2890,14 @@ class ElementwiseAirEmitter {
                           EmitLoadFromLinearIndex(lhs, lhs_index, body));
       TF_ASSIGN_OR_RETURN(std::string rhs_value,
                           EmitLoadFromLinearIndex(rhs, rhs_index, body));
+      TF_ASSIGN_OR_RETURN(
+          lhs_value,
+          EmitConvertDotOperand(lhs->shape().element_type(), dot_type,
+                                lhs_value, body));
+      TF_ASSIGN_OR_RETURN(
+          rhs_value,
+          EmitConvertDotOperand(rhs->shape().element_type(), dot_type,
+                                rhs_value, body));
       TF_ASSIGN_OR_RETURN(accumulator,
                           EmitDotAccumulatorUpdate(dot_type, accumulator,
                                                    lhs_value, rhs_value, body));
@@ -2916,11 +2970,54 @@ class ElementwiseAirEmitter {
                           EmitLoadFromLinearIndex(lhs, lhs_index, body));
       TF_ASSIGN_OR_RETURN(std::string rhs_value,
                           EmitLoadFromLinearIndex(rhs, rhs_index, body));
+      TF_ASSIGN_OR_RETURN(
+          lhs_value,
+          EmitConvertDotOperand(lhs->shape().element_type(), dot_type,
+                                lhs_value, body));
+      TF_ASSIGN_OR_RETURN(
+          rhs_value,
+          EmitConvertDotOperand(rhs->shape().element_type(), dot_type,
+                                rhs_value, body));
       TF_ASSIGN_OR_RETURN(accumulator,
                           EmitDotAccumulatorUpdate(dot_type, accumulator,
                                                    lhs_value, rhs_value, body));
     }
     return accumulator;
+  }
+
+  absl::StatusOr<std::string> EmitConvertDotOperand(
+      PrimitiveType src_type, PrimitiveType dot_type, absl::string_view value,
+      std::vector<std::string>* body) {
+    if (src_type == dot_type ||
+        (IsFloatAccumulatorElementType(src_type) &&
+         IsFloatAccumulatorElementType(dot_type))) {
+      return std::string(value);
+    }
+    std::string converted = NewName("dot_operand_convert");
+    if (IsIntegerElementType(src_type) &&
+        IsFloatAccumulatorElementType(dot_type)) {
+      body->push_back(absl::StrFormat(
+          "  %s = %s %s %s to float", converted,
+          IsSignedIntegerElementType(src_type) ? "sitofp" : "uitofp",
+          ElementIrType(src_type), value));
+      return converted;
+    }
+    if (IsIntegerElementType(src_type) && IsIntegerElementType(dot_type)) {
+      if (ElementBitWidth(src_type) == ElementBitWidth(dot_type)) {
+        return std::string(value);
+      }
+      if (ElementBitWidth(src_type) < ElementBitWidth(dot_type)) {
+        body->push_back(absl::StrFormat(
+            "  %s = %s %s %s to %s", converted,
+            IsSignedIntegerElementType(src_type) ? "sext" : "zext",
+            ElementIrType(src_type), value, ElementIrType(dot_type)));
+        return converted;
+      }
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR dot operand conversion does not support %s to %s.",
+        primitive_util::LowercasePrimitiveTypeName(src_type),
+        primitive_util::LowercasePrimitiveTypeName(dot_type)));
   }
 
   absl::StatusOr<std::string> EmitDotAccumulatorUpdate(
@@ -2941,6 +3038,51 @@ class ElementwiseAirEmitter {
     if (dot_type == PRED) {
       std::string product = EmitOp("and i1", lhs_value, rhs_value, body);
       return EmitOp("or i1", accumulator, product, body);
+    }
+    if (dot_type == C64) {
+      std::string lhs_real = NewName("dot_lhs_real");
+      std::string lhs_imag = NewName("dot_lhs_imag");
+      std::string rhs_real = NewName("dot_rhs_real");
+      std::string rhs_imag = NewName("dot_rhs_imag");
+      std::string acc_real = NewName("dot_acc_real");
+      std::string acc_imag = NewName("dot_acc_imag");
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 0", lhs_real,
+          lhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 1", lhs_imag,
+          lhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 0", rhs_real,
+          rhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 1", rhs_imag,
+          rhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 0", acc_real,
+          accumulator));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 1", acc_imag,
+          accumulator));
+      std::string rr = EmitOp("fmul fast float", lhs_real, rhs_real, body);
+      std::string ii = EmitOp("fmul fast float", lhs_imag, rhs_imag, body);
+      std::string ri = EmitOp("fmul fast float", lhs_real, rhs_imag, body);
+      std::string ir = EmitOp("fmul fast float", lhs_imag, rhs_real, body);
+      std::string product_real = EmitOp("fsub fast float", rr, ii, body);
+      std::string product_imag = EmitOp("fadd fast float", ri, ir, body);
+      std::string next_real =
+          EmitOp("fadd fast float", acc_real, product_real, body);
+      std::string next_imag =
+          EmitOp("fadd fast float", acc_imag, product_imag, body);
+      std::string real_part = NewName("dot_complex_real");
+      std::string complex_value = NewName("dot_complex");
+      body->push_back(absl::StrFormat(
+          "  %s = insertelement <2 x float> undef, float %s, i32 0",
+          real_part, next_real));
+      body->push_back(absl::StrFormat(
+          "  %s = insertelement <2 x float> %s, float %s, i32 1",
+          complex_value, real_part, next_imag));
+      return complex_value;
     }
     return absl::UnimplementedError(
         "Metal direct AIR dot accumulator does not support this element type.");
@@ -5467,13 +5609,18 @@ class ElementwiseAirEmitter {
       const HloInstruction* instr, std::vector<std::string>* body) {
     const HloInstruction* input = instr->operand(0);
     const HloInstruction* update = instr->operand(1);
-    if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
-        !IsF32Array(update->shape()) ||
+    const PrimitiveType element_type = instr->shape().element_type();
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
+        !IsSupportedElementwiseArray(input->shape()) ||
+        !IsSupportedElementwiseArray(update->shape()) ||
+        input->shape().element_type() != element_type ||
+        update->shape().element_type() != element_type ||
         !ShapeUtil::Equal(instr->shape(), input->shape()) ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
-          "Metal direct AIR dynamic-update-slice currently supports only f32 "
-          "array updates with result shape matching the input shape.");
+          "Metal direct AIR dynamic-update-slice currently supports only "
+          "supported array updates with result shape matching the input "
+          "shape.");
     }
     const int64_t rank = instr->shape().dimensions().size();
     if (rank != update->shape().dimensions().size() ||
@@ -5488,15 +5635,14 @@ class ElementwiseAirEmitter {
     starts.reserve(rank);
     for (int64_t dim = 0; dim < rank; ++dim) {
       const HloInstruction* start = instr->operand(dim + 2);
-      if (!IsScalarLikeS32(start->shape())) {
+      if (!IsScalarLikeIndex(start->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR dynamic-update-slice requires scalar s32 start "
-            "indices.");
+            "Metal direct AIR dynamic-update-slice requires scalar integer "
+            "start indices.");
       }
       const int64_t max_start =
           instr->shape().dimensions(dim) - update->shape().dimensions(dim);
-      TF_ASSIGN_OR_RETURN(std::string raw,
-                          EmitValue(start, /*force_scalar=*/true, body));
+      TF_ASSIGN_OR_RETURN(std::string raw, EmitStartIndexAsS32(start, body));
       starts.push_back(EmitClampedStartIndex(raw, max_start, body));
     }
 
@@ -5647,9 +5793,10 @@ class ElementwiseAirEmitter {
         std::string update_value,
         EmitLoadFromLinearIndex(update, safe_update_index, body));
     std::string result = NewName("dus_select");
+    const char* ir_type = ValueIrType(element_type);
     body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, float %s, float %s", result, in_update,
-        update_value, input_value));
+        "  %s = select i1 %s, %s %s, %s %s", result, in_update, ir_type,
+        update_value, ir_type, input_value));
     return result;
   }
 
@@ -7790,6 +7937,26 @@ class ElementwiseAirEmitter {
     return value;
   }
 
+  absl::StatusOr<std::string> EmitStartIndexAsS32(
+      const HloInstruction* start, std::vector<std::string>* body) {
+    const PrimitiveType type = start->shape().element_type();
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(start, /*force_scalar=*/true, body));
+    if (type == S32 || type == U32) {
+      return value;
+    }
+    if (type == S8 || type == S16 || type == U8 || type == U16) {
+      std::string converted = NewName("start_index_s32");
+      body->push_back(absl::StrFormat(
+          "  %s = %s %s %s to i32", converted,
+          IsSignedIntegerElementType(type) ? "sext" : "zext",
+          ElementIrType(type), value));
+      return converted;
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR start index conversion requires an integer scalar.");
+  }
+
   std::string EmitClampedStartIndex(absl::string_view raw_start,
                                     int64_t max_start,
                                     std::vector<std::string>* body) {
@@ -9633,9 +9800,184 @@ class MetalElementwiseExecutable final : public Executable {
   std::vector<uint8_t> metallib_;
 };
 
+class MetalTupleElementwiseExecutable final : public Executable {
+ public:
+  MetalTupleElementwiseExecutable(
+      std::shared_ptr<HloModule> module,
+      std::vector<std::vector<int64_t>> parameter_numbers,
+      std::vector<int64_t> num_elements,
+      std::vector<std::vector<uint8_t>> metallibs)
+      : Executable(std::move(module)),
+        parameter_numbers_(std::move(parameter_numbers)),
+        result_shape_(this->module().output_shape()),
+        num_elements_(std::move(num_elements)),
+        metallibs_(std::move(metallibs)) {}
+
+  Shape result_shape() const override { return result_shape_; }
+
+  absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
+      const ServiceExecutableRunOptions* run_options,
+      std::vector<ExecutionInput> arguments) override {
+    se::Stream* stream = run_options->stream();
+    if (stream == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal tuple elementwise requires a stream.");
+    }
+    se::StreamExecutor* executor = stream->parent();
+    se::DeviceAddressAllocator* allocator = run_options->allocator();
+    if (allocator == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal tuple elementwise requires an allocator.");
+    }
+    TF_ASSIGN_OR_RETURN(TransferManager * transfer_manager,
+                        TransferManager::GetForPlatform(executor->GetPlatform()));
+
+    const int device_ordinal = run_options->device_ordinal() != -1
+                                   ? run_options->device_ordinal()
+                                   : executor->device_ordinal();
+    const int64_t tuple_element_count =
+        ShapeUtil::TupleElementCount(result_shape_);
+    TF_ASSIGN_OR_RETURN(
+        se::ScopedDeviceAddress<uint8_t> tuple_buffer,
+        allocator->Allocate(device_ordinal,
+                            transfer_manager->GetByteSizeRequirement(
+                                result_shape_)));
+
+    std::vector<se::ScopedDeviceAddress<uint8_t>> element_buffers;
+    std::vector<se::ScopedDeviceAddress<uint8_t>> params_buffers;
+    element_buffers.reserve(tuple_element_count);
+    params_buffers.reserve(tuple_element_count);
+
+    for (int64_t i = 0; i < tuple_element_count; ++i) {
+      const Shape& element_shape = result_shape_.tuple_shapes(i);
+      TF_ASSIGN_OR_RETURN(
+          se::ScopedDeviceAddress<uint8_t> element_buffer,
+          allocator->Allocate(device_ordinal,
+                              transfer_manager->GetByteSizeRequirement(
+                                  element_shape)));
+      se::DeviceAddressBase output = *element_buffer;
+
+      if (num_elements_[i] != 0) {
+        TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> params_buffer,
+                            allocator->Allocate(device_ordinal,
+                                                sizeof(ElementwiseParams)));
+        se::DeviceAddressBase params_address = *params_buffer;
+        ElementwiseParams params{static_cast<uint32_t>(num_elements_[i]), 0, 0,
+                                 0};
+        TF_RETURN_IF_ERROR(stream->Memcpy(&params_address, &params,
+                                          sizeof(ElementwiseParams)));
+        TF_RETURN_IF_ERROR(LaunchElementKernel(executor, stream, i, arguments,
+                                               output, params_address));
+        params_buffers.push_back(std::move(params_buffer));
+      }
+      element_buffers.push_back(std::move(element_buffer));
+    }
+
+    ExecutionOutput result(result_shape_, allocator, device_ordinal,
+                           executor->device_ordinal());
+    ScopedShapedBuffer* shaped_result = result.MutableResult();
+    ShapedBuffer* shaped_buffer = static_cast<ShapedBuffer*>(shaped_result);
+    shaped_buffer->set_buffer(tuple_buffer.Release(), {});
+    for (int64_t i = 0; i < tuple_element_count; ++i) {
+      shaped_buffer->set_buffer(element_buffers[i].Release(), {i});
+    }
+    TF_RETURN_IF_ERROR(
+        transfer_manager->WriteRootTupleIndexTable(stream, *shaped_result));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+    result.Commit();
+    return std::move(result);
+  }
+
+ private:
+  absl::Status LaunchElementKernel(
+      se::StreamExecutor* executor, se::Stream* stream, int64_t tuple_index,
+      const std::vector<ExecutionInput>& arguments, se::DeviceAddressBase output,
+      se::DeviceAddressBase params_address) const {
+    auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+        std::vector<uint8_t>(metallibs_[tuple_index].begin(),
+                             metallibs_[tuple_index].end()),
+        "elementwise_f32", parameter_numbers_[tuple_index].size() + 2);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        executor->LoadKernel(spec));
+
+    se::KernelArgsPackedArray kernel_args(
+        parameter_numbers_[tuple_index].size() + 2);
+    for (int64_t parameter_number : parameter_numbers_[tuple_index]) {
+      if (parameter_number < 0 || parameter_number >= arguments.size()) {
+        return absl::InvalidArgumentError(
+            "Metal tuple elementwise parameter number is out of bounds.");
+      }
+      se::DeviceAddressBase arg =
+          arguments[parameter_number].Buffer({}).AsDeviceAddress();
+      if (arg.is_null()) {
+        return absl::InvalidArgumentError(
+            "Metal tuple elementwise input buffer is null.");
+      }
+      kernel_args.add_argument(arg);
+    }
+    kernel_args.add_argument(output);
+    kernel_args.add_argument(params_address);
+
+    se::ThreadDim threads(/*x=*/256, /*y=*/1, /*z=*/1);
+    se::BlockDim blocks(
+        /*x=*/static_cast<uint64_t>((num_elements_[tuple_index] + 255) / 256),
+        /*y=*/1, /*z=*/1);
+    return kernel->Launch(threads, blocks, stream, kernel_args);
+  }
+
+  std::vector<std::vector<int64_t>> parameter_numbers_;
+  Shape result_shape_;
+  std::vector<int64_t> num_elements_;
+  std::vector<std::vector<uint8_t>> metallibs_;
+};
+
+absl::StatusOr<std::unique_ptr<Executable>>
+BuildMetalTupleElementwiseExecutable(std::shared_ptr<HloModule> module) {
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  if (root->opcode() != HloOpcode::kTuple || !root->shape().IsTuple() ||
+      root->operand_count() != ShapeUtil::TupleElementCount(root->shape())) {
+    return absl::UnimplementedError(
+        "Metal direct AIR tuple elementwise executable requires a tuple root.");
+  }
+
+  std::vector<std::vector<int64_t>> parameter_numbers;
+  std::vector<int64_t> num_elements;
+  std::vector<std::vector<uint8_t>> metallibs;
+  const int64_t tuple_element_count =
+      ShapeUtil::TupleElementCount(root->shape());
+  parameter_numbers.reserve(tuple_element_count);
+  num_elements.reserve(tuple_element_count);
+  metallibs.reserve(tuple_element_count);
+  for (int64_t i = 0; i < tuple_element_count; ++i) {
+    const Shape& element_shape = root->shape().tuple_shapes(i);
+    if (!element_shape.IsArray() ||
+        !ShapeUtil::Compatible(element_shape, root->operand(i)->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR tuple elementwise executable supports only tuple "
+          "operands matching array tuple element shapes.");
+    }
+    ElementwiseAirEmitter emitter(element_shape);
+    TF_ASSIGN_OR_RETURN(std::string air, emitter.Emit(root->operand(i)));
+    TF_ASSIGN_OR_RETURN(
+        std::vector<uint8_t> metallib,
+        CompileMetalAirToMetallib(air, "metal_tuple_elementwise_air"));
+    parameter_numbers.push_back(emitter.parameter_numbers());
+    num_elements.push_back(emitter.num_work_items());
+    metallibs.push_back(std::move(metallib));
+  }
+
+  return std::make_unique<MetalTupleElementwiseExecutable>(
+      std::move(module), std::move(parameter_numbers), std::move(num_elements),
+      std::move(metallibs));
+}
+
 absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
     std::shared_ptr<HloModule> module) {
   HloInstruction* root = module->entry_computation()->root_instruction();
+  if (root->opcode() == HloOpcode::kTuple || root->shape().IsTuple()) {
+    return BuildMetalTupleElementwiseExecutable(std::move(module));
+  }
   ElementwiseAirEmitter emitter(root->shape());
   TF_ASSIGN_OR_RETURN(std::string air, emitter.Emit(root));
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,

@@ -331,6 +331,71 @@ absl::StatusOr<Literal> ExecuteMetalDotF16F32Matrix() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalDotS16S32Vector() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_s16_s32_vector");
+  Shape shape = ShapeUtil::MakeShape(S16, {3});
+  XlaOp lhs = Parameter(&builder, 0, shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, shape, "rhs");
+  Dot(lhs, rhs, /*precision_config=*/nullptr,
+      /*preferred_element_type=*/S32);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = LiteralUtil::CreateR1<int16_t>({-3, 4, 7});
+  Literal rhs_literal = LiteralUtil::CreateR1<int16_t>({5, -2, 6});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalDotU32TwoContractingDims() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_u32_two_contracting_dims");
+  Shape lhs_shape = ShapeUtil::MakeShape(U32, {5, 3, 2});
+  Shape rhs_shape = ShapeUtil::MakeShape(U32, {5, 2, 4});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_contracting_dimensions(0);
+  dnums.add_lhs_contracting_dimensions(2);
+  dnums.add_rhs_contracting_dimensions(0);
+  dnums.add_rhs_contracting_dimensions(1);
+  DotGeneral(lhs, rhs, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t c0 = 0; c0 < 5; ++c0) {
+    for (int64_t row = 0; row < 3; ++row) {
+      for (int64_t c1 = 0; c1 < 2; ++c1) {
+        lhs_literal.Set<uint32_t>(
+            {c0, row, c1},
+            static_cast<uint32_t>((c0 * 6 + row * 2 + c1) % 11 + 1));
+      }
+    }
+  }
+  for (int64_t c0 = 0; c0 < 5; ++c0) {
+    for (int64_t c1 = 0; c1 < 2; ++c1) {
+      for (int64_t col = 0; col < 4; ++col) {
+        rhs_literal.Set<uint32_t>(
+            {c0, c1, col},
+            static_cast<uint32_t>((c0 * 8 + c1 * 4 + col) % 13 + 2));
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalDotBf16NonLeadingBatch() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1726,6 +1791,24 @@ absl::StatusOr<Literal> ExecuteMetalTopKTupleS32Rank1() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalTupleScalarSlices() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_tuple_scalar_slices");
+  Shape shape = ShapeUtil::MakeShape(S32, {2});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp first = Reshape(Slice(input, {0}, {1}, {1}), {});
+  XlaOp second = Reshape(Slice(input, {1}, {2}, {1}), {});
+  Tuple(&builder, {first, second});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<int32_t>({2, 5});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalTopKTupleRank2() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1965,6 +2048,31 @@ absl::StatusOr<Literal> ExecuteMetalS32DynamicSliceDynamicStart() {
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> row_start_data,
                       client->TransferToServer(row_start_literal));
   std::vector<GlobalData*> arguments = {input_data.get(), row_start_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalS32DynamicSliceU8Start() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_s32_dynamic_slice_u8_start");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {200});
+  Shape scalar_shape = ShapeUtil::MakeShape(U8, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp start = Parameter(&builder, 1, scalar_shape, "start");
+  DynamicSlice(input, {start}, {1});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<int32_t> values(200);
+  for (int64_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<int32_t>(i);
+  }
+  Literal input_literal = LiteralUtil::CreateR1<int32_t>(values);
+  Literal start_literal = LiteralUtil::CreateR0<uint8_t>(128);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> start_data,
+                      client->TransferToServer(start_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), start_data.get()};
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
@@ -2993,6 +3101,44 @@ TEST(MetalGpuExecutableTest, DotF16F32MatrixUsesScalarAirFallback) {
         expected += lhs * rhs;
       }
       EXPECT_NEAR(actual.Get<float>({row, col}), expected, 1.0e-5f)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, DotS16S32VectorUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotS16S32Vector();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {})));
+  EXPECT_EQ(actual.Get<int32_t>({}), static_cast<int32_t>(-3 * 5 + 4 * -2 +
+                                                         7 * 6));
+}
+
+TEST(MetalGpuExecutableTest, DotU32TwoContractingDimsUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotU32TwoContractingDims();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      uint32_t expected = 0;
+      for (int64_t c0 = 0; c0 < 5; ++c0) {
+        for (int64_t c1 = 0; c1 < 2; ++c1) {
+          const uint32_t lhs =
+              static_cast<uint32_t>((c0 * 6 + row * 2 + c1) % 11 + 1);
+          const uint32_t rhs =
+              static_cast<uint32_t>((c0 * 8 + c1 * 4 + col) % 13 + 2);
+          expected += lhs * rhs;
+        }
+      }
+      EXPECT_EQ(actual.Get<uint32_t>({row, col}), expected)
           << "at (" << row << ", " << col << ")";
     }
   }
@@ -4420,6 +4566,21 @@ TEST(MetalGpuExecutableTest, ElementwiseTopKTupleS32Rank1) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseTupleScalarSlices) {
+  auto result = ExecuteMetalTupleScalarSlices();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Shape expected_shape = ShapeUtil::MakeTupleShape(
+      {ShapeUtil::MakeShape(S32, {}), ShapeUtil::MakeShape(S32, {})});
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), expected_shape));
+  LiteralSlice first(actual, {0});
+  LiteralSlice second(actual, {1});
+  EXPECT_EQ(first.Get<int32_t>({}), 2);
+  EXPECT_EQ(second.Get<int32_t>({}), 5);
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseTopKTupleRank2) {
   auto result = ExecuteMetalTopKTupleRank2();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -4590,6 +4751,17 @@ TEST(MetalGpuExecutableTest, ElementwiseS32DynamicSliceDynamicStart) {
           << "at (" << row << ", " << col << ")";
     }
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseS32DynamicSliceU8Start) {
+  auto result = ExecuteMetalS32DynamicSliceU8Start();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {1})));
+  EXPECT_EQ(actual.Get<int32_t>({0}), 128);
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceRank3) {
@@ -4928,6 +5100,43 @@ TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSlice) {
           << "at (" << row << ", " << col << ")";
     }
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSliceBf16) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_dynamic_update_slice_bf16");
+  Shape input_shape = ShapeUtil::MakeShape(BF16, {3});
+  Shape update_shape = ShapeUtil::MakeShape(BF16, {1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp update = Parameter(&builder, 1, update_shape, "update");
+  DynamicUpdateSlice(input, update, {ConstantR0<int32_t>(&builder, 1)});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  input_literal.Set<bfloat16>({0}, bfloat16(1.0f));
+  input_literal.Set<bfloat16>({1}, bfloat16(2.0f));
+  input_literal.Set<bfloat16>({2}, bfloat16(3.0f));
+  Literal update_literal = Literal::CreateFromShape(update_shape);
+  update_literal.Set<bfloat16>({0}, bfloat16(-4.0f));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> update_data,
+                          client->TransferToServer(update_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), update_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), input_shape));
+  EXPECT_EQ(actual.Get<bfloat16>({0}), bfloat16(1.0f));
+  EXPECT_EQ(actual.Get<bfloat16>({1}), bfloat16(-4.0f));
+  EXPECT_EQ(actual.Get<bfloat16>({2}), bfloat16(3.0f));
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSliceDynamicStart) {
