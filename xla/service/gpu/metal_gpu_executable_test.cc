@@ -242,6 +242,95 @@ absl::StatusOr<Literal> ExecuteMetalBatchedDotBf16() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalDotS32MatrixVector() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_s32_matrix_vector");
+  Shape lhs_shape = ShapeUtil::MakeShape(S32, {4, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(S32, {3});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  Dot(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<int32_t> lhs_values(4, 3);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      lhs_values(row, col) = static_cast<int32_t>((row * 3 + col) % 7 - 3);
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR1<int32_t>({2, -1, 3});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalDotPredVector() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_pred_vector");
+  Shape shape = ShapeUtil::MakeShape(PRED, {3});
+  XlaOp lhs = Parameter(&builder, 0, shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, shape, "rhs");
+  Dot(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(shape);
+  Literal rhs_literal = Literal::CreateFromShape(shape);
+  const bool lhs_values[3] = {true, false, true};
+  const bool rhs_values[3] = {false, true, true};
+  for (int64_t i = 0; i < 3; ++i) {
+    lhs_literal.Set<bool>({i}, lhs_values[i]);
+    rhs_literal.Set<bool>({i}, rhs_values[i]);
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalDotF16F32Matrix() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_f16_f32_matrix");
+  Shape lhs_shape = ShapeUtil::MakeShape(F16, {2, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(F16, {3, 2});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  Dot(lhs, rhs, /*precision_config=*/nullptr,
+      /*preferred_element_type=*/F32);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      lhs_literal.Set<half>(
+          {row, col},
+          half(static_cast<float>(row * 3 + col - 2) * 0.25f));
+    }
+  }
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      rhs_literal.Set<half>(
+          {row, col},
+          half(static_cast<float>(row * 2 + col + 1) * 0.125f));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalDotBf16NonLeadingBatch() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2849,6 +2938,62 @@ TEST(MetalGpuExecutableTest, BatchedDotBf16UsesScalarAirFallback) {
         EXPECT_EQ(actual.Get<bfloat16>({b, row, col}), bfloat16(expected))
             << "at (" << b << ", " << row << ", " << col << ")";
       }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, DotS32MatrixVectorUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotS32MatrixVector();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {4})));
+  const int32_t rhs_values[3] = {2, -1, 3};
+  for (int64_t row = 0; row < 4; ++row) {
+    int32_t expected = 0;
+    for (int64_t col = 0; col < 3; ++col) {
+      expected += static_cast<int32_t>((row * 3 + col) % 7 - 3) *
+                  rhs_values[col];
+    }
+    EXPECT_EQ(actual.Get<int32_t>({row}), expected) << "at " << row;
+  }
+}
+
+TEST(MetalGpuExecutableTest, DotPredVectorUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotPredVector();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(PRED, {})));
+  EXPECT_TRUE(actual.Get<bool>({}));
+}
+
+TEST(MetalGpuExecutableTest, DotF16F32MatrixUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotF16F32Matrix();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      float expected = 0.0f;
+      for (int64_t k = 0; k < 3; ++k) {
+        const float lhs =
+            static_cast<float>(half(static_cast<float>(row * 3 + k - 2) *
+                                    0.25f));
+        const float rhs =
+            static_cast<float>(half(static_cast<float>(k * 2 + col + 1) *
+                                    0.125f));
+        expected += lhs * rhs;
+      }
+      EXPECT_NEAR(actual.Get<float>({row, col}), expected, 1.0e-5f)
+          << "at (" << row << ", " << col << ")";
     }
   }
 }

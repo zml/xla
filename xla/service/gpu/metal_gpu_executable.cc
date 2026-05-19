@@ -395,6 +395,15 @@ bool IsIntegerElementType(PrimitiveType type) {
   return IsSignedIntegerElementType(type) || IsUnsignedIntegerElementType(type);
 }
 
+bool IsSupportedDotElementPair(PrimitiveType input_type,
+                               PrimitiveType result_type) {
+  if (input_type == result_type) {
+    return IsFloatAccumulatorElementType(result_type) ||
+           IsIntegerElementType(result_type) || result_type == PRED;
+  }
+  return result_type == F32 && IsFloatAccumulatorElementType(input_type);
+}
+
 bool IsSupportedConvolutionElementPair(PrimitiveType input_type,
                                        PrimitiveType result_type) {
   if (!IsScalarConvolutionElementType(input_type) ||
@@ -1835,6 +1844,42 @@ class ElementwiseAirEmitter {
            IsFloatAccumulatorElementType(dst_type))) {
         return value;
       }
+      auto build_complex = [&](absl::string_view real)
+          -> absl::StatusOr<std::string> {
+        std::string real_part = NewName("linear_convert_complex_real");
+        std::string complex_value = NewName("linear_convert_complex");
+        body->push_back(absl::StrFormat(
+            "  %s = insertelement <2 x float> undef, float %s, i32 0",
+            real_part, real));
+        body->push_back(absl::StrFormat(
+            "  %s = insertelement <2 x float> %s, float "
+            "0x0000000000000000, i32 1",
+            complex_value, real_part));
+        return complex_value;
+      };
+      if (dst_type == C64) {
+        if (IsFloatAccumulatorElementType(src_type)) {
+          return build_complex(value);
+        }
+        std::string real = NewName("linear_convert_complex_scalar");
+        if (src_type == PRED) {
+          body->push_back(
+              absl::StrFormat("  %s = uitofp i1 %s to float", real, value));
+          return build_complex(real);
+        }
+        if (IsSignedIntegerElementType(src_type)) {
+          body->push_back(absl::StrFormat("  %s = sitofp %s %s to float",
+                                          real, ElementIrType(src_type),
+                                          value));
+          return build_complex(real);
+        }
+        if (IsUnsignedIntegerElementType(src_type)) {
+          body->push_back(absl::StrFormat("  %s = uitofp %s %s to float",
+                                          real, ElementIrType(src_type),
+                                          value));
+          return build_complex(real);
+        }
+      }
       std::string converted = NewName("linear_convert");
       if (src_type == PRED && IsFloatAccumulatorElementType(dst_type)) {
         body->push_back(absl::StrFormat("  %s = uitofp i1 %s to float",
@@ -1858,6 +1903,22 @@ class ElementwiseAirEmitter {
       if (src_type == PRED && IsIntegerElementType(dst_type)) {
         body->push_back(absl::StrFormat("  %s = zext i1 %s to %s", converted,
                                         value, ElementIrType(dst_type)));
+        return converted;
+      }
+      if (IsIntegerElementType(src_type) && IsIntegerElementType(dst_type)) {
+        if (ElementBitWidth(src_type) == ElementBitWidth(dst_type)) {
+          return value;
+        }
+        if (ElementBitWidth(src_type) < ElementBitWidth(dst_type)) {
+          body->push_back(absl::StrFormat(
+              "  %s = %s %s %s to %s", converted,
+              IsSignedIntegerElementType(src_type) ? "sext" : "zext",
+              ElementIrType(src_type), value, ElementIrType(dst_type)));
+          return converted;
+        }
+        body->push_back(absl::StrFormat("  %s = trunc %s %s to %s", converted,
+                                        ElementIrType(src_type), value,
+                                        ElementIrType(dst_type)));
         return converted;
       }
       if (IsSignedIntegerElementType(src_type) &&
@@ -2512,14 +2573,14 @@ class ElementwiseAirEmitter {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
     const PrimitiveType dot_type = instr->shape().element_type();
-    if ((dot_type != F32 && dot_type != F16 && dot_type != BF16) ||
-        lhs->shape().element_type() != dot_type ||
-        rhs->shape().element_type() != dot_type ||
+    if (!IsSupportedDotElementPair(lhs->shape().element_type(), dot_type) ||
+        !IsSupportedDotElementPair(rhs->shape().element_type(), dot_type) ||
         !lhs->shape().IsArray() || !rhs->shape().IsArray() ||
-        !ShapeUtil::Equal(instr->shape(), result_shape_)) {
+        !HasResultDimensions(instr->shape())) {
       return absl::UnimplementedError(
-          "Metal direct AIR dot fallback currently supports only f32, f16, "
-          "and bf16 arrays matching the final result.");
+          "Metal direct AIR dot fallback currently supports only "
+          "floating-point, integer, and pred arrays with supported result "
+          "types.");
     }
 
     if (instr->shape().dimensions().size() == 2 &&
@@ -2565,7 +2626,7 @@ class ElementwiseAirEmitter {
       body->push_back(
           absl::StrFormat("  %s = udiv i64 %s, %d", batch, row_linear, m));
       return EmitDotAccumulation(lhs, rhs, batch, row, col, batch_count, m, n,
-                                 k, body);
+                                 k, dot_type, body);
     }
 
     if (instr->shape().dimensions().size() == 4 &&
@@ -2607,7 +2668,8 @@ class ElementwiseAirEmitter {
           absl::StrFormat("  %s = udiv i64 %s, %d", batch_linear,
                           row_linear, m));
       return EmitDotAccumulation(lhs, rhs, batch_linear, row, col,
-                                 batch0_count * batch1_count, m, n, k, body);
+                                 batch0_count * batch1_count, m, n, k,
+                                 dot_type, body);
     }
 
     return EmitGenericDot(instr, body);
@@ -2755,7 +2817,8 @@ class ElementwiseAirEmitter {
     std::vector<std::string> out_coords =
         emit_coords(instr->shape(), "%idx", "dot_generic_out");
     const int64_t k = lhs->shape().dimensions(lhs_contract);
-    std::string accumulator = "0x0000000000000000";
+    const PrimitiveType dot_type = instr->shape().element_type();
+    std::string accumulator = DefaultIrValue(dot_type);
     for (int64_t kk = 0; kk < k; ++kk) {
       std::vector<std::string> lhs_coords(lhs_rank, "0");
       std::vector<std::string> rhs_coords(rhs_rank, "0");
@@ -2781,11 +2844,9 @@ class ElementwiseAirEmitter {
                           EmitLoadFromLinearIndex(lhs, lhs_index, body));
       TF_ASSIGN_OR_RETURN(std::string rhs_value,
                           EmitLoadFromLinearIndex(rhs, rhs_index, body));
-      std::string product =
-          EmitOp("fmul fast float", lhs_value, rhs_value, body);
       TF_ASSIGN_OR_RETURN(accumulator,
-                          EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
-                                           product, body));
+                          EmitDotAccumulatorUpdate(dot_type, accumulator,
+                                                   lhs_value, rhs_value, body));
     }
     return accumulator;
   }
@@ -2803,16 +2864,17 @@ class ElementwiseAirEmitter {
     body->push_back(
         absl::StrFormat("  %s = urem i64 %%idx, %d", col, n));
     return EmitDotAccumulation(lhs, rhs, /*batch=*/"0", row, col,
-                               /*batch_count=*/1, m, n, k, body);
+                               /*batch_count=*/1, m, n, k,
+                               dot_shape.element_type(), body);
   }
 
   absl::StatusOr<std::string> EmitDotAccumulation(
       const HloInstruction* lhs, const HloInstruction* rhs,
       absl::string_view batch, absl::string_view row, absl::string_view col,
       int64_t batch_count, int64_t m, int64_t n, int64_t k,
-      std::vector<std::string>* body) {
+      PrimitiveType dot_type, std::vector<std::string>* body) {
     (void)batch_count;
-    std::string accumulator = "0x0000000000000000";
+    std::string accumulator = DefaultIrValue(dot_type);
     for (int64_t kk = 0; kk < k; ++kk) {
       std::string lhs_index;
       std::string rhs_index;
@@ -2854,13 +2916,34 @@ class ElementwiseAirEmitter {
                           EmitLoadFromLinearIndex(lhs, lhs_index, body));
       TF_ASSIGN_OR_RETURN(std::string rhs_value,
                           EmitLoadFromLinearIndex(rhs, rhs_index, body));
-      std::string product =
-          EmitOp("fmul fast float", lhs_value, rhs_value, body);
       TF_ASSIGN_OR_RETURN(accumulator,
-                          EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
-                                           product, body));
+                          EmitDotAccumulatorUpdate(dot_type, accumulator,
+                                                   lhs_value, rhs_value, body));
     }
     return accumulator;
+  }
+
+  absl::StatusOr<std::string> EmitDotAccumulatorUpdate(
+      PrimitiveType dot_type, absl::string_view accumulator,
+      absl::string_view lhs_value, absl::string_view rhs_value,
+      std::vector<std::string>* body) {
+    if (IsFloatAccumulatorElementType(dot_type)) {
+      std::string product =
+          EmitOp("fmul fast float", lhs_value, rhs_value, body);
+      return EmitF32ReducerOp(HloOpcode::kAdd, accumulator, product, body);
+    }
+    if (IsIntegerElementType(dot_type)) {
+      const char* ir_type = ValueIrType(dot_type);
+      std::string product =
+          EmitOp(absl::StrCat("mul ", ir_type), lhs_value, rhs_value, body);
+      return EmitOp(absl::StrCat("add ", ir_type), accumulator, product, body);
+    }
+    if (dot_type == PRED) {
+      std::string product = EmitOp("and i1", lhs_value, rhs_value, body);
+      return EmitOp("or i1", accumulator, product, body);
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR dot accumulator does not support this element type.");
   }
 
   absl::StatusOr<std::string> EmitConvolution(
@@ -6216,6 +6299,10 @@ class ElementwiseAirEmitter {
         EmitValue(instr->operand(0), ShapeUtil::IsEffectiveScalar(instr->shape()),
                   body));
     if (src_type == dst_type) {
+      return value;
+    }
+    if (IsFloatAccumulatorElementType(src_type) &&
+        IsFloatAccumulatorElementType(dst_type)) {
       return value;
     }
 
