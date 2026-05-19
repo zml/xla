@@ -576,6 +576,45 @@ absl::StatusOr<Literal> ExecuteMetalS32DynamicSliceDynamicStart() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConcatenateRank2(int64_t dim) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_concatenate_rank2");
+  Shape lhs_shape =
+      dim == 0 ? ShapeUtil::MakeShape(F32, {2, 3})
+               : ShapeUtil::MakeShape(F32, {3, 2});
+  Shape rhs_shape =
+      dim == 0 ? ShapeUtil::MakeShape(F32, {1, 3})
+               : ShapeUtil::MakeShape(F32, {3, 1});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  ConcatInDim(&builder, {lhs, rhs}, dim);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> lhs_values(lhs_shape.dimensions(0), lhs_shape.dimensions(1));
+  for (int64_t row = 0; row < lhs_shape.dimensions(0); ++row) {
+    for (int64_t col = 0; col < lhs_shape.dimensions(1); ++col) {
+      lhs_values(row, col) = static_cast<float>(row * lhs_shape.dimensions(1) +
+                                                col);
+    }
+  }
+  Array2D<float> rhs_values(rhs_shape.dimensions(0), rhs_shape.dimensions(1));
+  for (int64_t row = 0; row < rhs_shape.dimensions(0); ++row) {
+    for (int64_t col = 0; col < rhs_shape.dimensions(1); ++col) {
+      rhs_values(row, col) =
+          100.0f + static_cast<float>(row * rhs_shape.dimensions(1) + col);
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR2FromArray2D(rhs_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalScatter(bool add) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2224,6 +2263,42 @@ TEST(MetalGpuExecutableTest, ElementwiseConcatenateTwoParameters) {
   for (int64_t i = 0; i < 4; ++i) {
     EXPECT_EQ(actual.Get<float>({i}), lhs_literal.Get<float>({i}));
     EXPECT_EQ(actual.Get<float>({i + 4}), rhs_literal.Get<float>({i}));
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseConcatenateRank2Dim0) {
+  auto result = ExecuteMetalConcatenateRank2(/*dim=*/0);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 3})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      float expected = row < 2 ? static_cast<float>(row * 3 + col)
+                               : 100.0f + static_cast<float>(col);
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseConcatenateRank2Dim1) {
+  auto result = ExecuteMetalConcatenateRank2(/*dim=*/1);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 3})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      float expected = col < 2 ? static_cast<float>(row * 2 + col)
+                               : 100.0f + static_cast<float>(row);
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 
