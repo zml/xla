@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,8 @@ limitations under the License.
 #include "xla/service/executable.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/shape.h"
+#include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/stream_executor.h"
 
 namespace xla {
 namespace gpu {
@@ -72,6 +75,9 @@ class MetalMatmulExecutable final : public Executable {
   Shape result_shape_;
   std::string kernel_name_;
   std::vector<uint8_t> metallib_;
+  std::mutex kernel_mutex_;
+  se::StreamExecutor* kernel_executor_ = nullptr;
+  std::unique_ptr<se::Kernel> kernel_;
 };
 
 }  // namespace gpu

@@ -11556,12 +11556,6 @@ absl::StatusOr<ExecutionOutput> MetalMatmulExecutable::ExecuteAsyncOnStream(
   TF_RETURN_IF_ERROR(
       stream->Memcpy(&params_address, &params, sizeof(MatmulParams)));
 
-  auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
-      std::vector<uint8_t>(metallib_.begin(), metallib_.end()), kernel_name_,
-      /*arity=*/4);
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                      executor->LoadKernel(spec));
-
   se::KernelArgsPackedArray kernel_args(/*num_args=*/4);
   kernel_args.add_argument(lhs);
   kernel_args.add_argument(rhs);
@@ -11577,7 +11571,17 @@ absl::StatusOr<ExecutionOutput> MetalMatmulExecutable::ExecuteAsyncOnStream(
           ? static_cast<uint64_t>((config_.m + 15) / 16)
           : 1,
       /*z=*/1);
-  TF_RETURN_IF_ERROR(kernel->Launch(threads, blocks, stream, kernel_args));
+  {
+    std::lock_guard<std::mutex> lock(kernel_mutex_);
+    if (kernel_ == nullptr || kernel_executor_ != executor) {
+      auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+          std::vector<uint8_t>(metallib_.begin(), metallib_.end()),
+          kernel_name_, /*arity=*/4);
+      TF_ASSIGN_OR_RETURN(kernel_, executor->LoadKernel(spec));
+      kernel_executor_ = executor;
+    }
+    TF_RETURN_IF_ERROR(kernel_->Launch(threads, blocks, stream, kernel_args));
+  }
   TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
 
   ExecutionOutput result(result_shape_, allocator, device_ordinal,
