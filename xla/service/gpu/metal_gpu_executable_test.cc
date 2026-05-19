@@ -1395,6 +1395,44 @@ absl::StatusOr<Literal> ExecuteMetalComplexLogRank1() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalComplexTanhRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_tanh_rank1");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Tanh(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  input_literal.Set<complex64>({0}, complex64(0.25f, 0.5f));
+  input_literal.Set<complex64>({1}, complex64(-0.75f, 0.125f));
+  input_literal.Set<complex64>({2}, complex64(0.5f, -0.375f));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalComplexLogisticRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_logistic_rank1");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Logistic(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  input_literal.Set<complex64>({0}, complex64(0.25f, 0.5f));
+  input_literal.Set<complex64>({1}, complex64(-0.75f, 0.125f));
+  input_literal.Set<complex64>({2}, complex64(0.5f, -0.375f));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 template <typename BuildFn>
 absl::StatusOr<Literal> ExecuteMetalElementwiseBinary(const char* name,
                                                       BuildFn build) {
@@ -4606,6 +4644,45 @@ TEST(MetalGpuExecutableTest, ComplexLogRank1) {
                                complex64(0.5f, 1.5f)};
   for (int64_t i = 0; i < 3; ++i) {
     const complex64 expected = std::log(inputs[i]);
+    const complex64 value = actual.Get<complex64>({i});
+    EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f) << "real at " << i;
+    EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f) << "imag at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ComplexTanhRank1) {
+  auto result = ExecuteMetalComplexTanhRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {3})));
+  const complex64 inputs[3] = {complex64(0.25f, 0.5f),
+                               complex64(-0.75f, 0.125f),
+                               complex64(0.5f, -0.375f)};
+  for (int64_t i = 0; i < 3; ++i) {
+    const complex64 expected = std::tanh(inputs[i]);
+    const complex64 value = actual.Get<complex64>({i});
+    EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f) << "real at " << i;
+    EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f) << "imag at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ComplexLogisticRank1) {
+  auto result = ExecuteMetalComplexLogisticRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {3})));
+  const complex64 inputs[3] = {complex64(0.25f, 0.5f),
+                               complex64(-0.75f, 0.125f),
+                               complex64(0.5f, -0.375f)};
+  for (int64_t i = 0; i < 3; ++i) {
+    const complex64 expected =
+        complex64(1.0f, 0.0f) / (complex64(1.0f, 0.0f) + std::exp(-inputs[i]));
     const complex64 value = actual.Get<complex64>({i});
     EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f) << "real at " << i;
     EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f) << "imag at " << i;

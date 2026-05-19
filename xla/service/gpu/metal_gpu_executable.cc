@@ -920,6 +920,9 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitComplexValue(
       const HloInstruction* instr, std::vector<std::string>* body) {
+    if (instr->IsConstant()) {
+      return EmitComplexConstant(instr, body);
+    }
     if (instr->opcode() == HloOpcode::kCall) {
       const HloComputation* callee = instr->to_apply();
       if (callee->num_parameters() != instr->operand_count()) {
@@ -955,16 +958,34 @@ class ElementwiseAirEmitter {
     if (instr->opcode() == HloOpcode::kGather) {
       return EmitComplexGather(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kAdd ||
+        instr->opcode() == HloOpcode::kSubtract ||
+        instr->opcode() == HloOpcode::kMultiply ||
+        instr->opcode() == HloOpcode::kDivide) {
+      return EmitComplexBinary(instr, body);
+    }
+    if (instr->opcode() == HloOpcode::kNegate) {
+      return EmitComplexNegate(instr, body);
+    }
     if (instr->opcode() == HloOpcode::kComplex) {
       return EmitComplexConstructor(instr, body);
     }
     if (instr->opcode() == HloOpcode::kLog) {
       return EmitComplexLog(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kTanh) {
+      return EmitComplexTanh(instr, body);
+    }
+    if (instr->opcode() == HloOpcode::kLogistic) {
+      return EmitComplexLogistic(instr, body);
+    }
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (!IsC64Array(instr->shape())) {
         return absl::UnimplementedError(
             "Metal direct AIR complex broadcast supports only c64 arrays.");
+      }
+      if (ShapeUtil::IsEffectiveScalar(instr->operand(0)->shape())) {
+        return EmitComplexValue(instr->operand(0), body);
       }
       return EmitLoadFromLinearIndex(instr, "%idx", body);
     }
@@ -991,6 +1012,132 @@ class ElementwiseAirEmitter {
         HloOpcodeString(instr->opcode())));
   }
 
+  std::string BuildComplexValue(absl::string_view real,
+                                absl::string_view imag,
+                                absl::string_view prefix,
+                                std::vector<std::string>* body) {
+    std::string real_part = NewName(absl::StrCat(prefix, "_real"));
+    std::string complex_value = NewName(absl::StrCat(prefix, "_value"));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1",
+        complex_value, real_part, imag));
+    return complex_value;
+  }
+
+  std::pair<std::string, std::string> ExtractComplexValue(
+      absl::string_view value, absl::string_view prefix,
+      std::vector<std::string>* body) {
+    std::string real = NewName(absl::StrCat(prefix, "_real"));
+    std::string imag = NewName(absl::StrCat(prefix, "_imag"));
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 0", real, value));
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 1", imag, value));
+    return {real, imag};
+  }
+
+  absl::StatusOr<std::string> EmitComplexConstant(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) ||
+        !ShapeUtil::IsEffectiveScalar(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex constants currently require scalar c64.");
+    }
+    const complex64 value = instr->literal().Get<complex64>({});
+    return BuildComplexValue(FloatLiteral(value.real()),
+                             FloatLiteral(value.imag()),
+                             "complex_constant", body);
+  }
+
+  absl::StatusOr<std::string> EmitComplexNegate(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 1 ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions() !=
+            instr->operand(0)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex negate requires c64 input and output with "
+          "matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source,
+                        EmitComplexValue(instr->operand(0), body));
+    auto [real, imag] = ExtractComplexValue(source, "complex_neg", body);
+    std::string neg_real = NewName("complex_neg_real_value");
+    std::string neg_imag = NewName("complex_neg_imag_value");
+    body->push_back(
+        absl::StrFormat("  %s = fneg fast float %s", neg_real, real));
+    body->push_back(
+        absl::StrFormat("  %s = fneg fast float %s", neg_imag, imag));
+    return BuildComplexValue(neg_real, neg_imag, "complex_neg", body);
+  }
+
+  absl::StatusOr<std::string> EmitComplexBinary(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 2 ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        !IsC64Array(instr->operand(1)->shape()) ||
+        instr->shape().dimensions() !=
+            instr->operand(0)->shape().dimensions() ||
+        instr->shape().dimensions() !=
+            instr->operand(1)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex binary ops require c64 operands and "
+          "result with matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitComplexValue(instr->operand(0), body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitComplexValue(instr->operand(1), body));
+    auto [lhs_real, lhs_imag] = ExtractComplexValue(lhs, "complex_lhs", body);
+    auto [rhs_real, rhs_imag] = ExtractComplexValue(rhs, "complex_rhs", body);
+    std::string result_real;
+    std::string result_imag;
+    switch (instr->opcode()) {
+      case HloOpcode::kAdd:
+        result_real = EmitOp("fadd fast float", lhs_real, rhs_real, body);
+        result_imag = EmitOp("fadd fast float", lhs_imag, rhs_imag, body);
+        break;
+      case HloOpcode::kSubtract:
+        result_real = EmitOp("fsub fast float", lhs_real, rhs_real, body);
+        result_imag = EmitOp("fsub fast float", lhs_imag, rhs_imag, body);
+        break;
+      case HloOpcode::kMultiply: {
+        std::string rr = EmitOp("fmul fast float", lhs_real, rhs_real, body);
+        std::string ii = EmitOp("fmul fast float", lhs_imag, rhs_imag, body);
+        std::string ri = EmitOp("fmul fast float", lhs_real, rhs_imag, body);
+        std::string ir = EmitOp("fmul fast float", lhs_imag, rhs_real, body);
+        result_real = EmitOp("fsub fast float", rr, ii, body);
+        result_imag = EmitOp("fadd fast float", ri, ir, body);
+        break;
+      }
+      case HloOpcode::kDivide: {
+        std::string rr = EmitOp("fmul fast float", rhs_real, rhs_real, body);
+        std::string ii = EmitOp("fmul fast float", rhs_imag, rhs_imag, body);
+        std::string denom = EmitOp("fadd fast float", rr, ii, body);
+        std::string lr_rr =
+            EmitOp("fmul fast float", lhs_real, rhs_real, body);
+        std::string li_ri =
+            EmitOp("fmul fast float", lhs_imag, rhs_imag, body);
+        std::string li_rr =
+            EmitOp("fmul fast float", lhs_imag, rhs_real, body);
+        std::string lr_ri =
+            EmitOp("fmul fast float", lhs_real, rhs_imag, body);
+        std::string real_num = EmitOp("fadd fast float", lr_rr, li_ri, body);
+        std::string imag_num = EmitOp("fsub fast float", li_rr, lr_ri, body);
+        result_real = EmitOp("fdiv fast float", real_num, denom, body);
+        result_imag = EmitOp("fdiv fast float", imag_num, denom, body);
+        break;
+      }
+      default:
+        return absl::UnimplementedError(
+            "Metal direct AIR complex binary unsupported opcode.");
+    }
+    return BuildComplexValue(result_real, result_imag, "complex_binary", body);
+  }
+
   absl::StatusOr<std::string> EmitComplexConstructor(
       const HloInstruction* instr, std::vector<std::string>* body) {
     if (!IsC64Array(instr->shape()) || instr->operand_count() != 2 ||
@@ -1013,15 +1160,7 @@ class ElementwiseAirEmitter {
                                   ShapeUtil::IsEffectiveScalar(
                                       instr->operand(1)->shape()),
                                   body));
-    std::string real_part = NewName("complex_insert_real");
-    std::string complex_value = NewName("complex_value");
-    body->push_back(absl::StrFormat(
-        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
-        real));
-    body->push_back(absl::StrFormat(
-        "  %s = insertelement <2 x float> %s, float %s, i32 1",
-        complex_value, real_part, imag));
-    return complex_value;
+    return BuildComplexValue(real, imag, "complex", body);
   }
 
   absl::StatusOr<std::string> EmitComplexPart(
@@ -1036,14 +1175,8 @@ class ElementwiseAirEmitter {
           "Metal direct AIR complex part extraction requires real/imag from "
           "c64 to f32 with matching dimensions.");
     }
-    TF_ASSIGN_OR_RETURN(
-        std::string complex_value,
-        EmitLoadFromLinearIndex(
-            instr->operand(0),
-            (force_scalar || ShapeUtil::IsEffectiveScalar(instr->shape()))
-                ? "0"
-                : "%idx",
-            body));
+    TF_ASSIGN_OR_RETURN(std::string complex_value,
+                        EmitComplexValue(instr->operand(0), body));
     std::string value =
         NewName(instr->opcode() == HloOpcode::kReal ? "complex_real"
                                                     : "complex_imag");
@@ -1109,6 +1242,116 @@ class ElementwiseAirEmitter {
         "  %s = insertelement <2 x float> %s, float %s, i32 1",
         complex_value, real_part, selected_angle));
     return complex_value;
+  }
+
+  absl::StatusOr<std::string> EmitComplexTanh(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 1 ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions() !=
+            instr->operand(0)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex tanh requires c64 input and output with "
+          "matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source,
+                        EmitComplexValue(instr->operand(0), body));
+    std::string real = NewName("complex_tanh_real");
+    std::string imag = NewName("complex_tanh_imag");
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 0", real, source));
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 1", imag, source));
+    std::string two_real =
+        EmitOp("fadd fast float", real, real, body);
+    std::string two_imag =
+        EmitOp("fadd fast float", imag, imag, body);
+    std::string sinh_real = NewName("complex_tanh_sinh");
+    std::string cosh_real = NewName("complex_tanh_cosh");
+    std::string sin_imag = NewName("complex_tanh_sin");
+    std::string cos_imag = NewName("complex_tanh_cos");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_sinh.f32(float %s)", sinh_real,
+        two_real));
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_cosh.f32(float %s)", cosh_real,
+        two_real));
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_sin.f32(float %s)", sin_imag,
+        two_imag));
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_cos.f32(float %s)", cos_imag,
+        two_imag));
+    std::string denom = EmitOp("fadd fast float", cosh_real, cos_imag, body);
+    std::string result_real =
+        EmitOp("fdiv fast float", sinh_real, denom, body);
+    std::string result_imag =
+        EmitOp("fdiv fast float", sin_imag, denom, body);
+
+    std::string real_part = NewName("complex_tanh_insert_real");
+    std::string complex_value = NewName("complex_tanh_value");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        result_real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1",
+        complex_value, real_part, result_imag));
+    return complex_value;
+  }
+
+  absl::StatusOr<std::string> EmitComplexLogistic(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 1 ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions() !=
+            instr->operand(0)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex logistic requires c64 input and output "
+          "with matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source,
+                        EmitComplexValue(instr->operand(0), body));
+    auto [real, imag] = ExtractComplexValue(source, "complex_logistic", body);
+    std::string neg_real = NewName("complex_logistic_neg_real");
+    std::string neg_imag = NewName("complex_logistic_neg_imag");
+    body->push_back(
+        absl::StrFormat("  %s = fneg fast float %s", neg_real, real));
+    body->push_back(
+        absl::StrFormat("  %s = fneg fast float %s", neg_imag, imag));
+    std::string exp_real = NewName("complex_logistic_exp_real");
+    std::string cos_imag = NewName("complex_logistic_cos_imag");
+    std::string sin_imag = NewName("complex_logistic_sin_imag");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_exp.f32(float %s)", exp_real,
+        neg_real));
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_cos.f32(float %s)", cos_imag,
+        neg_imag));
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_sin.f32(float %s)", sin_imag,
+        neg_imag));
+    std::string exp_neg_real =
+        EmitOp("fmul fast float", exp_real, cos_imag, body);
+    std::string exp_neg_imag =
+        EmitOp("fmul fast float", exp_real, sin_imag, body);
+    std::string denom_real =
+        EmitOp("fadd fast float", FloatLiteral(1.0f), exp_neg_real, body);
+    std::string denom_imag = exp_neg_imag;
+    std::string denom_real_sq =
+        EmitOp("fmul fast float", denom_real, denom_real, body);
+    std::string denom_imag_sq =
+        EmitOp("fmul fast float", denom_imag, denom_imag, body);
+    std::string denom =
+        EmitOp("fadd fast float", denom_real_sq, denom_imag_sq, body);
+    std::string result_real =
+        EmitOp("fdiv fast float", denom_real, denom, body);
+    std::string neg_denom_imag = NewName("complex_logistic_result_imag_num");
+    body->push_back(absl::StrFormat("  %s = fneg fast float %s",
+                                    neg_denom_imag, denom_imag));
+    std::string result_imag =
+        EmitOp("fdiv fast float", neg_denom_imag, denom, body);
+    return BuildComplexValue(result_real, result_imag, "complex_logistic",
+                             body);
   }
 
   absl::StatusOr<std::string> EmitComplexGather(
