@@ -1123,6 +1123,46 @@ absl::StatusOr<Literal> ExecuteMetalWhileAccumulator() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalWhileVectorAccumulator() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape index_shape = ShapeUtil::MakeShape(S32, {});
+  Shape vector_shape = ShapeUtil::MakeShape(F32, {3});
+  Shape state_shape =
+      ShapeUtil::MakeTupleShape({index_shape, vector_shape, vector_shape});
+
+  XlaBuilder cond_builder("metal_while_vector_cond");
+  XlaOp cond_state = Parameter(&cond_builder, 0, state_shape, "state");
+  Lt(GetTupleElement(cond_state, 0), ConstantR0<int32_t>(&cond_builder, 3));
+  TF_ASSIGN_OR_RETURN(XlaComputation condition, cond_builder.Build());
+
+  XlaBuilder body_builder("metal_while_vector_body");
+  XlaOp body_state = Parameter(&body_builder, 0, state_shape, "state");
+  XlaOp i = GetTupleElement(body_state, 0);
+  XlaOp acc = GetTupleElement(body_state, 1);
+  XlaOp input = GetTupleElement(body_state, 2);
+  XlaOp next_i = Add(i, ConstantR0<int32_t>(&body_builder, 1));
+  Tuple(&body_builder, {next_i, Add(acc, input), input});
+  TF_ASSIGN_OR_RETURN(XlaComputation while_body, body_builder.Build());
+
+  XlaBuilder builder("metal_while_vector_accumulator");
+  XlaOp entry_input = Parameter(&builder, 0, vector_shape, "input");
+  XlaOp zero_vector =
+      Broadcast(ConstantR0<float>(&builder, 0.0f), {3});
+  XlaOp init =
+      Tuple(&builder, {ConstantR0<int32_t>(&builder, 0), zero_vector,
+                       entry_input});
+  XlaOp result = While(condition, while_body, init);
+  GetTupleElement(result, 1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>({1.0f, 2.0f, 3.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2569,6 +2609,20 @@ TEST(MetalGpuExecutableTest, ElementwiseWhileAccumulator) {
     expected += static_cast<float>(i) * 0.25f - 2.0f;
   }
   ExpectScalarNear(actual, expected, 1.0e-5f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseWhileVectorAccumulator) {
+  auto result = ExecuteMetalWhileVectorAccumulator();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  std::vector<float> expected = {3.0f, 6.0f, 9.0f};
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3})));
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
+  }
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {
