@@ -141,6 +141,10 @@ bool IsF32Array(const Shape& shape) {
   return shape.element_type() == F32 && shape.IsArray();
 }
 
+bool IsF16Array(const Shape& shape) {
+  return shape.element_type() == F16 && shape.IsArray();
+}
+
 bool IsPredArray(const Shape& shape) {
   return shape.element_type() == PRED && shape.IsArray();
 }
@@ -176,8 +180,8 @@ bool IsScalarLikeSupported(const Shape& shape) {
 }
 
 bool IsSupportedElementwiseArray(const Shape& shape) {
-  return IsF32Array(shape) || IsPredArray(shape) || IsS32Array(shape) ||
-         IsU16Array(shape) || IsBF16Array(shape);
+  return IsF32Array(shape) || IsF16Array(shape) || IsPredArray(shape) ||
+         IsS32Array(shape) || IsU16Array(shape) || IsBF16Array(shape);
 }
 
 bool IsOrderStatisticArray(const Shape& shape) {
@@ -188,6 +192,8 @@ const char* ElementIrType(PrimitiveType type) {
   switch (type) {
     case F32:
       return "float";
+    case F16:
+      return "half";
     case S32:
       return "i32";
     case U16:
@@ -206,6 +212,9 @@ const char* ValueIrType(PrimitiveType type) {
   if (type == BF16) {
     return "float";
   }
+  if (type == F16) {
+    return "float";
+  }
   return type == PRED ? "i1" : ElementIrType(type);
 }
 
@@ -213,6 +222,8 @@ const char* ElementAirTypeName(PrimitiveType type) {
   switch (type) {
     case F32:
       return "float";
+    case F16:
+      return "half";
     case S32:
       return "int";
     case U16:
@@ -231,7 +242,7 @@ int ElementTypeSize(PrimitiveType type) {
   if (type == PRED) {
     return 1;
   }
-  if (type == U16 || type == BF16) {
+  if (type == U16 || type == BF16 || type == F16) {
     return 2;
   }
   if (type == C64) {
@@ -1272,14 +1283,14 @@ class ElementwiseAirEmitter {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
     const PrimitiveType dot_type = instr->shape().element_type();
-    if ((dot_type != F32 && dot_type != BF16) ||
+    if ((dot_type != F32 && dot_type != F16 && dot_type != BF16) ||
         lhs->shape().element_type() != dot_type ||
         rhs->shape().element_type() != dot_type ||
         !lhs->shape().IsArray() || !rhs->shape().IsArray() ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
-          "Metal direct AIR dot fallback currently supports only f32 and bf16 "
-          "arrays matching the final result.");
+          "Metal direct AIR dot fallback currently supports only f32, f16, "
+          "and bf16 arrays matching the final result.");
     }
 
     if (instr->shape().dimensions().size() == 2 &&
@@ -1292,45 +1303,87 @@ class ElementwiseAirEmitter {
     }
 
     const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
-    if (instr->shape().dimensions().size() != 3 ||
-        lhs->shape().dimensions().size() != 3 ||
-        rhs->shape().dimensions().size() != 3 ||
-        dnums.lhs_batch_dimensions_size() != 1 ||
-        dnums.lhs_batch_dimensions(0) != 0 ||
-        dnums.rhs_batch_dimensions_size() != 1 ||
-        dnums.rhs_batch_dimensions(0) != 0 ||
-        dnums.lhs_contracting_dimensions_size() != 1 ||
-        dnums.lhs_contracting_dimensions(0) != 2 ||
-        dnums.rhs_contracting_dimensions_size() != 1 ||
-        dnums.rhs_contracting_dimensions(0) != 1 ||
-        instr->shape().dimensions(0) != lhs->shape().dimensions(0) ||
-        instr->shape().dimensions(0) != rhs->shape().dimensions(0) ||
-        instr->shape().dimensions(1) != lhs->shape().dimensions(1) ||
-        instr->shape().dimensions(2) != rhs->shape().dimensions(2) ||
-        lhs->shape().dimensions(2) != rhs->shape().dimensions(1)) {
-      return absl::UnimplementedError(
-          "Metal direct AIR dot fallback currently supports only rank-2 "
-          "matmul or rank-3 batched matmul with batch dimension 0.");
+    if (instr->shape().dimensions().size() == 3 &&
+        lhs->shape().dimensions().size() == 3 &&
+        rhs->shape().dimensions().size() == 3 &&
+        dnums.lhs_batch_dimensions_size() == 1 &&
+        dnums.lhs_batch_dimensions(0) == 0 &&
+        dnums.rhs_batch_dimensions_size() == 1 &&
+        dnums.rhs_batch_dimensions(0) == 0 &&
+        dnums.lhs_contracting_dimensions_size() == 1 &&
+        dnums.lhs_contracting_dimensions(0) == 2 &&
+        dnums.rhs_contracting_dimensions_size() == 1 &&
+        dnums.rhs_contracting_dimensions(0) == 1 &&
+        instr->shape().dimensions(0) == lhs->shape().dimensions(0) &&
+        instr->shape().dimensions(0) == rhs->shape().dimensions(0) &&
+        instr->shape().dimensions(1) == lhs->shape().dimensions(1) &&
+        instr->shape().dimensions(2) == rhs->shape().dimensions(2) &&
+        lhs->shape().dimensions(2) == rhs->shape().dimensions(1)) {
+      const int64_t batch_count = instr->shape().dimensions(0);
+      const int64_t m = instr->shape().dimensions(1);
+      const int64_t n = instr->shape().dimensions(2);
+      const int64_t k = lhs->shape().dimensions(2);
+      std::string col = NewName("dot_col");
+      std::string row_linear = NewName("dot_row_linear");
+      std::string row = NewName("dot_row");
+      std::string batch = NewName("dot_batch");
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", col, n));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", row_linear, n));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %s, %d", row, row_linear, m));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %s, %d", batch, row_linear, m));
+      return EmitDotAccumulation(lhs, rhs, batch, row, col, batch_count, m, n,
+                                 k, body);
     }
 
-    const int64_t batch_count = instr->shape().dimensions(0);
-    const int64_t m = instr->shape().dimensions(1);
-    const int64_t n = instr->shape().dimensions(2);
-    const int64_t k = lhs->shape().dimensions(2);
-    std::string col = NewName("dot_col");
-    std::string row_linear = NewName("dot_row_linear");
-    std::string row = NewName("dot_row");
-    std::string batch = NewName("dot_batch");
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %%idx, %d", col, n));
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %%idx, %d", row_linear, n));
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %s, %d", row, row_linear, m));
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %s, %d", batch, row_linear, m));
-    return EmitDotAccumulation(lhs, rhs, batch, row, col, batch_count, m, n, k,
-                               body);
+    if (instr->shape().dimensions().size() == 4 &&
+        lhs->shape().dimensions().size() == 4 &&
+        rhs->shape().dimensions().size() == 4 &&
+        dnums.lhs_batch_dimensions_size() == 2 &&
+        dnums.lhs_batch_dimensions(0) == 0 &&
+        dnums.lhs_batch_dimensions(1) == 1 &&
+        dnums.rhs_batch_dimensions_size() == 2 &&
+        dnums.rhs_batch_dimensions(0) == 0 &&
+        dnums.rhs_batch_dimensions(1) == 1 &&
+        dnums.lhs_contracting_dimensions_size() == 1 &&
+        dnums.lhs_contracting_dimensions(0) == 3 &&
+        dnums.rhs_contracting_dimensions_size() == 1 &&
+        dnums.rhs_contracting_dimensions(0) == 2 &&
+        instr->shape().dimensions(0) == lhs->shape().dimensions(0) &&
+        instr->shape().dimensions(0) == rhs->shape().dimensions(0) &&
+        instr->shape().dimensions(1) == lhs->shape().dimensions(1) &&
+        instr->shape().dimensions(1) == rhs->shape().dimensions(1) &&
+        instr->shape().dimensions(2) == lhs->shape().dimensions(2) &&
+        instr->shape().dimensions(3) == rhs->shape().dimensions(3) &&
+        lhs->shape().dimensions(3) == rhs->shape().dimensions(2)) {
+      const int64_t batch0_count = instr->shape().dimensions(0);
+      const int64_t batch1_count = instr->shape().dimensions(1);
+      const int64_t m = instr->shape().dimensions(2);
+      const int64_t n = instr->shape().dimensions(3);
+      const int64_t k = lhs->shape().dimensions(3);
+      std::string col = NewName("dot4_col");
+      std::string row_linear = NewName("dot4_row_linear");
+      std::string row = NewName("dot4_row");
+      std::string batch_linear = NewName("dot4_batch_linear");
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", col, n));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", row_linear, n));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %s, %d", row, row_linear, m));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %s, %d", batch_linear,
+                          row_linear, m));
+      return EmitDotAccumulation(lhs, rhs, batch_linear, row, col,
+                                 batch0_count * batch1_count, m, n, k, body);
+    }
+
+    return absl::UnimplementedError(
+        "Metal direct AIR dot fallback currently supports only rank-2 matmul "
+        "or rank-3/rank-4 batched matmul with leading batch dimensions.");
   }
 
   absl::StatusOr<std::string> EmitRank2Dot(
@@ -1359,7 +1412,7 @@ class ElementwiseAirEmitter {
     for (int64_t kk = 0; kk < k; ++kk) {
       std::string lhs_index;
       std::string rhs_index;
-      if (lhs->shape().dimensions().size() == 3) {
+      if (lhs->shape().dimensions().size() >= 3) {
         std::string batch_lhs_offset = NewName("dot_lhs_batch_offset");
         std::string row_lhs_offset = NewName("dot_lhs_row_offset");
         std::string lhs_base_index = NewName("dot_lhs_base_index");
@@ -4628,6 +4681,12 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat(
         "  %s = load %s, %s addrspace(1)* %s, align %d", value, ir_type,
         ir_type, ptr, ElementTypeSize(type)));
+    if (type == F16) {
+      std::string converted = NewName("f16_float");
+      body->push_back(absl::StrFormat("  %s = fpext half %s to float",
+                                      converted, value));
+      return converted;
+    }
     if (type == BF16) {
       std::string extended = NewName("bf16_zext");
       std::string shifted = NewName("bf16_shift");
@@ -4794,6 +4853,11 @@ class ElementwiseAirEmitter {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
   %%out_i8 = zext i1 %s to i8
   store i8 %%out_i8, i8 addrspace(1)* %%out_ptr, align 1)",
+                                     result_value_);
+    } else if (result_type == F16) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds half, half addrspace(1)* %%out, i64 %%idx
+  %%out_f16 = fptrunc float %s to half
+  store half %%out_f16, half addrspace(1)* %%out_ptr, align 2)",
                                      result_value_);
     } else if (result_type == BF16) {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i16, i16 addrspace(1)* %%out, i64 %%idx

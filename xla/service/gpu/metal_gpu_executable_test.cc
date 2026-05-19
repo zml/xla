@@ -239,6 +239,48 @@ absl::StatusOr<Literal> ExecuteMetalBatchedDotBf16() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalBatchedDotF16Rank4() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_batched_dot_f16_rank4");
+  Shape lhs_shape = ShapeUtil::MakeShape(F16, {1, 2, 2, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(F16, {1, 2, 3, 1});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_batch_dimensions(0);
+  dnums.add_lhs_batch_dimensions(1);
+  dnums.add_rhs_batch_dimensions(0);
+  dnums.add_rhs_batch_dimensions(1);
+  dnums.add_lhs_contracting_dimensions(3);
+  dnums.add_rhs_contracting_dimensions(2);
+  DotGeneral(lhs, rhs, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t b1 = 0; b1 < 2; ++b1) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t col = 0; col < 3; ++col) {
+        lhs_literal.Set<half>(
+            {0, b1, row, col},
+            half(static_cast<float>(b1 * 6 + row * 3 + col) * 0.125f));
+      }
+    }
+    for (int64_t row = 0; row < 3; ++row) {
+      rhs_literal.Set<half>(
+          {0, b1, row, 0},
+          half(static_cast<float>(b1 * 3 + row) * 0.25f - 0.5f));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConv1D() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1702,6 +1744,30 @@ TEST(MetalGpuExecutableTest, BatchedDotBf16UsesScalarAirFallback) {
         EXPECT_EQ(actual.Get<bfloat16>({b, row, col}), bfloat16(expected))
             << "at (" << b << ", " << row << ", " << col << ")";
       }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, BatchedDotF16Rank4UsesScalarAirFallback) {
+  auto result = ExecuteMetalBatchedDotF16Rank4();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F16, {1, 2, 2, 1})));
+  for (int64_t b1 = 0; b1 < 2; ++b1) {
+    for (int64_t row = 0; row < 2; ++row) {
+      float expected = 0.0f;
+      for (int64_t kk = 0; kk < 3; ++kk) {
+        const float lhs = static_cast<float>(
+            half(static_cast<float>(b1 * 6 + row * 3 + kk) * 0.125f));
+        const float rhs = static_cast<float>(
+            half(static_cast<float>(b1 * 3 + kk) * 0.25f - 0.5f));
+        expected += lhs * rhs;
+      }
+      EXPECT_EQ(actual.Get<half>({0, b1, row, 0}), half(expected))
+          << "at (0, " << b1 << ", " << row << ", 0)";
     }
   }
 }
