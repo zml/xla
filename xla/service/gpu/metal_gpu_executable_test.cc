@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "xla/array2d.h"
 #include "xla/array3d.h"
+#include "xla/array4d.h"
 #include "xla/client/client.h"
 #include "xla/client/client_library.h"
 #include "xla/hlo/builder/lib/math.h"
@@ -226,6 +227,51 @@ absl::StatusOr<Literal> ExecuteMetalConv1D() {
   kernel_values(2, 0, 0) = -1.0f;
   Literal input_literal = LiteralUtil::CreateR3FromArray3D(input_values);
   Literal kernel_literal = LiteralUtil::CreateR3FromArray3D(kernel_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv2D() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_2d");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {1, 4, 4, 1});
+  Shape kernel_shape = ShapeUtil::MakeShape(F32, {2, 2, 1, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.add_input_spatial_dimensions(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.set_input_feature_dimension(3);
+  dnums.add_kernel_spatial_dimensions(0);
+  dnums.add_kernel_spatial_dimensions(1);
+  dnums.set_kernel_input_feature_dimension(2);
+  dnums.set_kernel_output_feature_dimension(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.add_output_spatial_dimensions(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.set_output_feature_dimension(3);
+  ConvWithGeneralDimensions(input, kernel, {1, 1}, Padding::kValid, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array4D<float> input_values(1, 4, 4, 1);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      input_values(0, row, col, 0) = static_cast<float>(row * 4 + col) / 4.0f;
+    }
+  }
+  Array4D<float> kernel_values(2, 2, 1, 1);
+  kernel_values(0, 0, 0, 0) = 1.0f;
+  kernel_values(0, 1, 0, 0) = 1.0f;
+  kernel_values(1, 0, 0, 0) = 1.0f;
+  kernel_values(1, 1, 0, 0) = 1.0f;
+  Literal input_literal = LiteralUtil::CreateR4FromArray4D(input_values);
+  Literal kernel_literal = LiteralUtil::CreateR4FromArray4D(kernel_values);
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
@@ -1247,6 +1293,28 @@ TEST(MetalGpuExecutableTest, Conv1DUsesScalarAirFallback) {
   std::vector<float> expected = {0.0f, 2.0f, 4.0f};
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({0, i, 0}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv2DUsesScalarAirFallback) {
+  auto result = ExecuteMetalConv2D();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {1, 3, 3, 1})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      const float expected =
+          (static_cast<float>(row * 4 + col) +
+           static_cast<float>(row * 4 + col + 1) +
+           static_cast<float>((row + 1) * 4 + col) +
+           static_cast<float>((row + 1) * 4 + col + 1)) /
+          4.0f;
+      EXPECT_EQ(actual.Get<float>({0, row, col, 0}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 
