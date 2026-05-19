@@ -108,6 +108,10 @@ struct MetalReductionConfig {
   int64_t output_elements = 1;
   int64_t input_minor = 0;
   int64_t reduction_dim = 0;
+  int64_t input_dim0 = 0;
+  int64_t input_dim1 = 0;
+  int64_t input_dim2 = 0;
+  int64_t kept_dim = 0;
   int64_t input_start = 0;
   int64_t input_stride = 1;
   float init_value = 0.0f;
@@ -116,6 +120,7 @@ struct MetalReductionConfig {
   float output_scale = 1.0f;
   ReductionKind kind = ReductionKind::kAdd;
   bool rank2_to_rank1 = false;
+  bool rank3_to_rank1 = false;
 };
 
 enum class ConvertKind {
@@ -6129,9 +6134,9 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
     return absl::UnimplementedError(
         "Metal direct AIR reduction supports only reduce roots.");
   }
-  if (reduce->operand_count() != 2 || reduce->dimensions().size() != 1) {
+  if (reduce->operand_count() != 2 || reduce->dimensions().empty()) {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports reductions over one "
+        "Metal direct AIR reduction requires at least one reduction "
         "dimension.");
   }
 
@@ -6149,15 +6154,35 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   }
 
   const int64_t input_rank = input->shape().dimensions().size();
-  const int64_t reduction_dim = reduce->dimensions()[0];
+  auto reduces_all_dimensions = [&] {
+    if (reduce->dimensions().size() != input_rank) {
+      return false;
+    }
+    std::vector<bool> seen(input_rank, false);
+    for (int64_t dim : reduce->dimensions()) {
+      if (dim < 0 || dim >= input_rank || seen[dim]) {
+        return false;
+      }
+      seen[dim] = true;
+    }
+    return true;
+  };
+  const int64_t reduction_dim =
+      reduce->dimensions().size() == 1 ? reduce->dimensions()[0] : 0;
   bool rank2_to_rank1 = false;
+  bool rank3_to_rank1 = false;
   int64_t reduce_count = 0;
   int64_t output_elements = 1;
   int64_t input_minor = 0;
-  if (input_rank == 1 && reduction_dim == 0 &&
-      ShapeUtil::IsEffectiveScalar(root->shape())) {
-    reduce_count = input->shape().dimensions(0);
-  } else if (input_rank == 2 && root->shape().dimensions().size() == 1 &&
+  int64_t input_dim0 = 0;
+  int64_t input_dim1 = 0;
+  int64_t input_dim2 = 0;
+  int64_t kept_dim = 0;
+  if (ShapeUtil::IsEffectiveScalar(root->shape()) &&
+      reduces_all_dimensions()) {
+    reduce_count = ShapeUtil::ElementsIn(input->shape());
+  } else if (reduce->dimensions().size() == 1 && input_rank == 2 &&
+             root->shape().dimensions().size() == 1 &&
              reduction_dim >= 0 && reduction_dim < 2) {
     rank2_to_rank1 = true;
     input_minor = input->shape().dimensions(1);
@@ -6170,10 +6195,43 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
           "inconsistent.");
     }
     output_elements = output_dim;
+  } else if (reduce->dimensions().size() == 2 && input_rank == 3 &&
+             root->shape().dimensions().size() == 1) {
+    std::vector<bool> reduced(input_rank, false);
+    for (int64_t dim : reduce->dimensions()) {
+      if (dim < 0 || dim >= input_rank || reduced[dim]) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR rank-3 reduction dimensions are invalid.");
+      }
+      reduced[dim] = true;
+    }
+    for (int64_t dim = 0; dim < input_rank; ++dim) {
+      if (!reduced[dim]) {
+        kept_dim = dim;
+        break;
+      }
+    }
+    rank3_to_rank1 = true;
+    input_dim0 = input->shape().dimensions(0);
+    input_dim1 = input->shape().dimensions(1);
+    input_dim2 = input->shape().dimensions(2);
+    reduce_count = 1;
+    for (int64_t dim = 0; dim < input_rank; ++dim) {
+      if (reduced[dim]) {
+        reduce_count *= input->shape().dimensions(dim);
+      }
+    }
+    output_elements = input->shape().dimensions(kept_dim);
+    if (root->shape().dimensions(0) != output_elements) {
+      return absl::InvalidArgumentError(
+          "Metal direct AIR rank-3 reduction output dimension is "
+          "inconsistent.");
+    }
   } else {
     return absl::UnimplementedError(
-        "Metal direct AIR reduction currently supports rank-1 to scalar and "
-        "rank-2 to rank-1 reductions.");
+        "Metal direct AIR reduction currently supports full-rank reductions "
+        "to scalar, rank-2 to rank-1 reductions, and rank-3 to rank-1 "
+        "reductions.");
   }
 
   const HloInstruction* reducer = reduce->to_apply()->root_instruction();
@@ -6225,6 +6283,10 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   config.output_elements = output_elements;
   config.input_minor = input_minor;
   config.reduction_dim = reduction_dim;
+  config.input_dim0 = input_dim0;
+  config.input_dim1 = input_dim1;
+  config.input_dim2 = input_dim2;
+  config.kept_dim = kept_dim;
   config.init_value =
       element_type == F32 ? init->literal().Get<float>({}) : 0.0f;
   config.init_s32 =
@@ -6234,6 +6296,7 @@ absl::StatusOr<MetalReductionConfig> MatchMetalReduction(
   config.output_scale = output_scale;
   config.kind = kind;
   config.rank2_to_rank1 = rank2_to_rank1;
+  config.rank3_to_rank1 = rank3_to_rank1;
   ReductionInputAirEmitter validator(&config);
   TF_ASSIGN_OR_RETURN(std::string unused, validator.Emit(input, "%i64"));
   if (config.parameter_number < 0) {
@@ -6321,11 +6384,70 @@ std::string ReductionValueAssign(PrimitiveType element_type,
 }
 
 absl::StatusOr<std::string> BuildReductionAir(MetalReductionConfig config) {
-  if (config.rank2_to_rank1) {
+  if (config.rank2_to_rank1 || config.rank3_to_rank1) {
     ReductionInputAirEmitter input_emitter(&config);
     TF_ASSIGN_OR_RETURN(std::string value,
                         input_emitter.Emit(config.input, "%source_i64"));
     const std::string input_body = absl::StrJoin(input_emitter.body(), "\n");
+    std::string index_setup_body;
+    std::string source_index_body;
+    if (config.rank2_to_rank1) {
+      index_setup_body = R"(  %minor_ptr = getelementptr inbounds %struct.ReductionParams, %struct.ReductionParams addrspace(2)* %params, i64 0, i32 2
+  %minor = load i32, i32 addrspace(2)* %minor_ptr, align 4
+  %dim_ptr = getelementptr inbounds %struct.ReductionParams, %struct.ReductionParams addrspace(2)* %params, i64 0, i32 3
+  %dim = load i32, i32 addrspace(2)* %dim_ptr, align 4
+  %reduce_dim0 = icmp eq i32 %dim, 0
+)";
+      source_index_body = R"(  %dim0_base = mul i32 %i, %minor
+  %dim0_index = add i32 %dim0_base, %idx32
+  %dim1_base = mul i32 %idx32, %minor
+  %dim1_index = add i32 %dim1_base, %i
+  %source32 = select i1 %reduce_dim0, i32 %dim0_index, i32 %dim1_index
+  %source_i64 = zext i32 %source32 to i64
+)";
+    } else if (config.kept_dim == 0) {
+      source_index_body = absl::StrFormat(
+          R"(  %%kept_i64 = zext i32 %%idx32 to i64
+  %%reduce_i64 = zext i32 %%i to i64
+  %%rd0 = udiv i64 %%reduce_i64, %d
+  %%rd1 = urem i64 %%reduce_i64, %d
+  %%kept_offset = mul i64 %%kept_i64, %d
+  %%rd0_offset = mul i64 %%rd0, %d
+  %%partial_source = add i64 %%kept_offset, %%rd0_offset
+  %%source_i64 = add i64 %%partial_source, %%rd1
+)",
+          config.input_dim2, config.input_dim2,
+          config.input_dim1 * config.input_dim2, config.input_dim2);
+    } else if (config.kept_dim == 1) {
+      source_index_body = absl::StrFormat(
+          R"(  %%kept_i64 = zext i32 %%idx32 to i64
+  %%reduce_i64 = zext i32 %%i to i64
+  %%rd0 = udiv i64 %%reduce_i64, %d
+  %%rd1 = urem i64 %%reduce_i64, %d
+  %%rd0_offset = mul i64 %%rd0, %d
+  %%kept_offset = mul i64 %%kept_i64, %d
+  %%partial_source = add i64 %%rd0_offset, %%kept_offset
+  %%source_i64 = add i64 %%partial_source, %%rd1
+)",
+          config.input_dim2, config.input_dim2,
+          config.input_dim1 * config.input_dim2, config.input_dim2);
+    } else if (config.kept_dim == 2) {
+      source_index_body = absl::StrFormat(
+          R"(  %%kept_i64 = zext i32 %%idx32 to i64
+  %%reduce_i64 = zext i32 %%i to i64
+  %%rd0 = udiv i64 %%reduce_i64, %d
+  %%rd1 = urem i64 %%reduce_i64, %d
+  %%rd0_offset = mul i64 %%rd0, %d
+  %%rd1_offset = mul i64 %%rd1, %d
+  %%partial_source = add i64 %%rd0_offset, %%rd1_offset
+  %%source_i64 = add i64 %%partial_source, %%kept_i64
+)",
+          config.input_dim1, config.input_dim1,
+          config.input_dim1 * config.input_dim2, config.input_dim2);
+    } else {
+      return absl::InternalError(
+          "Metal direct AIR rank-3 reduction kept dimension is invalid.");
+    }
     const char* memory_type = ElementIrType(config.element_type);
     const char* value_type = ReductionValueIrType(config.element_type);
     const char* air_type = ElementAirTypeName(config.element_type);
@@ -6353,11 +6475,7 @@ entry:
 body:
   %%reduce_n_ptr = getelementptr inbounds %%struct.ReductionParams, %%struct.ReductionParams addrspace(2)* %%params, i64 0, i32 0
   %%reduce_n = load i32, i32 addrspace(2)* %%reduce_n_ptr, align 4
-  %%minor_ptr = getelementptr inbounds %%struct.ReductionParams, %%struct.ReductionParams addrspace(2)* %%params, i64 0, i32 2
-  %%minor = load i32, i32 addrspace(2)* %%minor_ptr, align 4
-  %%dim_ptr = getelementptr inbounds %%struct.ReductionParams, %%struct.ReductionParams addrspace(2)* %%params, i64 0, i32 3
-  %%dim = load i32, i32 addrspace(2)* %%dim_ptr, align 4
-  %%reduce_dim0 = icmp eq i32 %%dim, 0
+%s
   br label %%loop
 
 loop:
@@ -6367,12 +6485,7 @@ loop:
   br i1 %%more, label %%loop_body, label %%done
 
 loop_body:
-  %%dim0_base = mul i32 %%i, %%minor
-  %%dim0_index = add i32 %%dim0_base, %%idx32
-  %%dim1_base = mul i32 %%idx32, %%minor
-  %%dim1_index = add i32 %%dim1_base, %%i
-  %%source32 = select i1 %%reduce_dim0, i32 %%dim0_index, i32 %%dim1_index
-  %%source_i64 = zext i32 %%source32 to i64
+%s
 %s
 %s
 %s  %%next = add i32 %%i, 1
@@ -6422,8 +6535,10 @@ attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-poin
 !23 = !{!"Metal", i32 3, i32 2, i32 0}
 !24 = !{!"xla/service/gpu/metal_reduction_air"}
 )",
-                           kernel_name, memory_type, memory_type, value_type,
-                           ReductionInitValue(config), input_body,
+                           kernel_name, memory_type, memory_type,
+                           index_setup_body, value_type,
+                           ReductionInitValue(config), source_index_body,
+                           input_body,
                            ReductionValueAssign(config.element_type, value),
                            ReductionUpdate(config.kind, config.element_type),
                            memory_type, memory_type,
@@ -6605,8 +6720,9 @@ class MetalReductionExecutable final : public Executable {
 
     const uint64_t output_elements =
         static_cast<uint64_t>(config_.output_elements);
-    const se::ThreadDim threads(config_.rank2_to_rank1 ? 256 : 1, 1, 1);
-    const se::BlockDim blocks(config_.rank2_to_rank1
+    const bool vector_output = config_.rank2_to_rank1 || config_.rank3_to_rank1;
+    const se::ThreadDim threads(vector_output ? 256 : 1, 1, 1);
+    const se::BlockDim blocks(vector_output
                                   ? (output_elements + 255) / 256
                                   : 1,
                               1, 1);

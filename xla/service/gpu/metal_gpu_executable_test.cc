@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/strings/str_join.h"
 #include "xla/array2d.h"
 #include "xla/array3d.h"
 #include "xla/array4d.h"
@@ -4022,6 +4023,129 @@ TEST(MetalGpuExecutableTest, ReductionF32Rank2ToRank1) {
     }
     EXPECT_NEAR(axis1_actual.Get<float>({row}), expected, 1.0e-6f)
         << "at row " << row;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ReductionF32Rank3ToScalar) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_rank3_sum_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_rank3_sum_to_scalar");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<float>(&builder, 0.0f), reducer, {0, 1, 2});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array3D<float> values(2, 3, 4);
+  float expected = 0.0f;
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        values(i, j, k) = static_cast<float>(i * 12 + j * 4 + k) * 0.25f;
+        expected += values(i, j, k);
+      }
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(values);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectScalarNear(actual, expected);
+}
+
+TEST(MetalGpuExecutableTest, ReductionF32Rank3ToRank1) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder reducer_builder("metal_rank3_to_rank1_sum_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation reducer, reducer_builder.Build());
+
+  Shape input_shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  Array3D<float> values(2, 3, 4);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        values(i, j, k) = static_cast<float>(i * 12 + j * 4 + k) * 0.5f;
+      }
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(values);
+
+  auto execute =
+      [&](std::vector<int64_t> reduction_dims) -> absl::StatusOr<Literal> {
+    XlaBuilder builder("metal_rank3_sum_to_rank1");
+    XlaOp input = Parameter(&builder, 0, input_shape, "input");
+    Reduce(input, ConstantR0<float>(&builder, 0.0f), reducer, reduction_dims);
+    TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                        client->TransferToServer(input_literal));
+    std::vector<GlobalData*> arguments = {input_data.get()};
+    return client->ExecuteAndTransfer(computation, arguments);
+  };
+
+  for (const std::vector<int64_t>& reduction_dims :
+       {std::vector<int64_t>{1, 2}, std::vector<int64_t>{0, 2},
+        std::vector<int64_t>{0, 1}}) {
+    auto result = execute(reduction_dims);
+    if (absl::IsFailedPrecondition(result.status())) {
+      GTEST_SKIP() << result.status();
+    }
+    TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+
+    std::vector<bool> reduced(3, false);
+    for (int64_t dim : reduction_dims) {
+      reduced[dim] = true;
+    }
+    int64_t kept_dim = 0;
+    for (int64_t dim = 0; dim < 3; ++dim) {
+      if (!reduced[dim]) {
+        kept_dim = dim;
+        break;
+      }
+    }
+    const int64_t output_size = input_shape.dimensions(kept_dim);
+    ASSERT_TRUE(ShapeUtil::Compatible(
+        actual.shape(), ShapeUtil::MakeShape(F32, {output_size})));
+
+    for (int64_t out = 0; out < output_size; ++out) {
+      float expected = 0.0f;
+      for (int64_t i = 0; i < 2; ++i) {
+        for (int64_t j = 0; j < 3; ++j) {
+          for (int64_t k = 0; k < 4; ++k) {
+            if ((kept_dim == 0 && i == out) ||
+                (kept_dim == 1 && j == out) ||
+                (kept_dim == 2 && k == out)) {
+              expected += values(i, j, k);
+            }
+          }
+        }
+      }
+      EXPECT_NEAR(actual.Get<float>({out}), expected, 1.0e-6f)
+          << "for reduction dims " << absl::StrJoin(reduction_dims, ",")
+          << " at output index " << out;
+    }
   }
 }
 
