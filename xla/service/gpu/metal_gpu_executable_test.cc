@@ -1474,6 +1474,38 @@ absl::StatusOr<Literal> ExecuteMetalBitcastConvertF32ToU4() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalBitcastConvertU32ToS8() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_bitcast_convert_u32_to_s8");
+  Shape input_shape = ShapeUtil::MakeShape(U32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BitcastConvertType(input, S8);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR0<uint32_t>(0x1234fedc);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalBitcastConvertF32ToBF16() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_bitcast_convert_f32_to_bf16");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BitcastConvertType(input, BF16);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR0<float>(1.0f);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
                                               float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -1632,6 +1664,12 @@ void ExpectScalarPred(const Literal& actual, bool expected) {
 }
 
 uint16_t HalfBits(half value) {
+  uint16_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+uint16_t Bfloat16Bits(bfloat16 value) {
   uint16_t bits;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
@@ -3705,6 +3743,34 @@ TEST(MetalGpuExecutableTest, BitcastConvertF32ToU4) {
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<u4>({i}), expected[i]) << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, BitcastConvertU32ToS8) {
+  auto result = ExecuteMetalBitcastConvertU32ToS8();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S8, {4})));
+  const std::vector<int8_t> expected = {
+      static_cast<int8_t>(0xdc), static_cast<int8_t>(0xfe),
+      static_cast<int8_t>(0x34), static_cast<int8_t>(0x12)};
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<int8_t>({i}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, BitcastConvertF32ToBF16) {
+  auto result = ExecuteMetalBitcastConvertF32ToBF16();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(BF16, {2})));
+  EXPECT_EQ(Bfloat16Bits(actual.Get<bfloat16>({0})), 0x0000);
+  EXPECT_EQ(Bfloat16Bits(actual.Get<bfloat16>({1})), 0x3f80);
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {

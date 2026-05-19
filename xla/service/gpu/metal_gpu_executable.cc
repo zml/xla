@@ -166,6 +166,25 @@ bool IsPackedSubbyteArray(const Shape& shape) {
          (shape.element_type() == S4 || shape.element_type() == U4);
 }
 
+bool IsSupportedBitcastArray(const Shape& shape) {
+  switch (shape.element_type()) {
+    case S4:
+    case U4:
+    case S8:
+    case U8:
+    case S16:
+    case U16:
+    case S32:
+    case U32:
+    case F16:
+    case BF16:
+    case F32:
+      return shape.IsArray();
+    default:
+      return false;
+  }
+}
+
 bool IsC64Array(const Shape& shape) {
   return shape.element_type() == C64 && shape.IsArray();
 }
@@ -205,7 +224,9 @@ const char* ElementIrType(PrimitiveType type) {
     case F16:
       return "half";
     case S32:
+    case U32:
       return "i32";
+    case S16:
     case U16:
     case BF16:
       return "i16";
@@ -242,6 +263,10 @@ const char* ElementAirTypeName(PrimitiveType type) {
       return "half";
     case S32:
       return "int";
+    case U32:
+      return "uint";
+    case S16:
+      return "short";
     case U16:
     case BF16:
       return "ushort";
@@ -261,7 +286,7 @@ int ElementTypeSize(PrimitiveType type) {
   if (type == PRED) {
     return 1;
   }
-  if (type == U16 || type == BF16 || type == F16) {
+  if (type == S16 || type == U16 || type == BF16 || type == F16) {
     return 2;
   }
   if (type == C64) {
@@ -431,7 +456,7 @@ class ElementwiseAirEmitter {
     }
     if (!IsSupportedElementwiseArray(root->shape()) &&
         !(root->opcode() == HloOpcode::kBitcastConvert &&
-          IsPackedSubbyteArray(root->shape()))) {
+          IsSupportedBitcastArray(root->shape()))) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise supports only f32, f16, bf16, s32, "
           "u16, pred, and packed subbyte bitcast-convert arrays.");
@@ -3652,6 +3677,97 @@ class ElementwiseAirEmitter {
       return byte;
     }
 
+    if (dst_bit_width % 8 == 0) {
+      const HloInstruction* operand = instr->operand(0);
+      if (operand->opcode() == HloOpcode::kParameter) {
+        const int input_index =
+            InputIndexForParameter(operand->parameter_number(), src_type);
+        const char* src_ir_type = ElementIrType(src_type);
+        std::string raw_arg = absl::StrFormat("%%arg%d", input_index);
+        if (std::string(src_ir_type) != "i8") {
+          raw_arg = NewName("bitcast_raw_arg");
+          body->push_back(absl::StrFormat(
+              "  %s = bitcast %s addrspace(1)* %%arg%d to i8 addrspace(1)*",
+              raw_arg, src_ir_type, input_index));
+        }
+
+        const int dst_bytes = dst_bit_width / 8;
+        std::string byte_base = "%idx";
+        if (dst_bytes != 1) {
+          byte_base = NewName("bitcast_byte_base");
+          body->push_back(absl::StrFormat("  %s = mul i64 %%idx, %d",
+                                          byte_base, dst_bytes));
+        }
+
+        auto load_byte = [&](absl::string_view byte_index)
+            -> absl::StatusOr<std::string> {
+          std::string ptr = NewName("bitcast_ptr");
+          std::string byte = NewName("bitcast_byte");
+          body->push_back(absl::StrFormat(
+              "  %s = getelementptr inbounds i8, i8 addrspace(1)* %s, i64 %s",
+              ptr, raw_arg, byte_index));
+          body->push_back(absl::StrFormat(
+              "  %s = load i8, i8 addrspace(1)* %s, align 1", byte, ptr));
+          return byte;
+        };
+
+        if (dst_bytes == 1) {
+          return load_byte(byte_base);
+        }
+
+        const char* bits_type = dst_bytes == 2 ? "i16" : "i32";
+        std::string bits;
+        for (int byte_index = 0; byte_index < dst_bytes; ++byte_index) {
+          std::string current_index = byte_base;
+          if (byte_index != 0) {
+            current_index = NewName("bitcast_byte_index");
+            body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                            current_index, byte_base,
+                                            byte_index));
+          }
+          TF_ASSIGN_OR_RETURN(std::string byte, load_byte(current_index));
+          std::string extended = NewName("bitcast_bits_part");
+          body->push_back(absl::StrFormat("  %s = zext i8 %s to %s",
+                                          extended, byte, bits_type));
+          if (byte_index != 0) {
+            std::string shifted = NewName("bitcast_bits_part");
+            body->push_back(absl::StrFormat("  %s = shl %s %s, %d", shifted,
+                                            bits_type, extended,
+                                            byte_index * 8));
+            extended = shifted;
+          }
+          if (bits.empty()) {
+            bits = extended;
+          } else {
+            std::string combined = NewName("bitcast_bits");
+            body->push_back(absl::StrFormat("  %s = or %s %s, %s", combined,
+                                            bits_type, bits, extended));
+            bits = combined;
+          }
+        }
+
+        if (dst_type == F16) {
+          std::string half_value = NewName("bitcast_half");
+          std::string float_value = NewName("bitcast_float");
+          body->push_back(absl::StrFormat("  %s = bitcast i16 %s to half",
+                                          half_value, bits));
+          body->push_back(absl::StrFormat("  %s = fpext half %s to float",
+                                          float_value, half_value));
+          return float_value;
+        }
+        if (dst_type == F32) {
+          std::string float_value = NewName("bitcast_float");
+          body->push_back(absl::StrFormat("  %s = bitcast i32 %s to float",
+                                          float_value, bits));
+          return float_value;
+        }
+        if (dst_type == BF16) {
+          raw_bf16_result_ = true;
+        }
+        return bits;
+      }
+    }
+
     if ((src_type == S4 || src_type == U4) && dst_type == F16) {
       const HloInstruction* operand = instr->operand(0);
       if (operand->opcode() != HloOpcode::kParameter) {
@@ -5046,6 +5162,10 @@ class ElementwiseAirEmitter {
   %%out_f16 = fptrunc float %s to half
   store half %%out_f16, half addrspace(1)* %%out_ptr, align 2)",
                                      result_value_);
+    } else if (raw_bf16_result_) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i16, i16 addrspace(1)* %%out, i64 %%idx
+  store i16 %s, i16 addrspace(1)* %%out_ptr, align 2)",
+                                     result_value_);
     } else if (result_type == BF16) {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i16, i16 addrspace(1)* %%out, i64 %%idx
   %%out_bits = bitcast float %s to i32
@@ -5222,6 +5342,7 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   Shape result_shape_;
   int64_t num_work_items_ = 0;
   bool raw_byte_result_ = false;
+  bool raw_bf16_result_ = false;
   std::vector<CallParameterScope> call_parameter_scopes_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
