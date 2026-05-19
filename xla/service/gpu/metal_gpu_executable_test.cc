@@ -2301,6 +2301,59 @@ absl::StatusOr<Literal> ExecuteMetalScatterRank2(bool add) {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalBatchedWindowScatterS32() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaBuilder reducer_builder("metal_batched_window_scatter_s32_reducer");
+  Parameter(&reducer_builder, 0, scalar_shape, "current");
+  Parameter(&reducer_builder, 1, scalar_shape, "update");
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_batched_window_scatter_s32");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {6, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {6, 1});
+  Shape update_shape = ShapeUtil::MakeShape(S32, {6, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+  XlaOp updates = Parameter(&builder, 2, update_shape, "updates");
+  ScatterDimensionNumbers dnums;
+  dnums.add_update_window_dims(1);
+  dnums.add_scatter_dims_to_operand_dims(1);
+  dnums.add_input_batching_dims(0);
+  dnums.add_scatter_indices_batching_dims(0);
+  dnums.set_index_vector_dim(1);
+  Scatter(input, indices, updates, reducer, dnums,
+          /*indices_are_sorted=*/true, /*unique_indices=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<int32_t> input_values(6, 5);
+  Array2D<int32_t> index_values(6, 1);
+  Array2D<int32_t> update_values(6, 3);
+  const int32_t starts[6] = {0, 1, 2, 2, 1, 0};
+  for (int64_t row = 0; row < 6; ++row) {
+    index_values(row, 0) = starts[row];
+    for (int64_t col = 0; col < 5; ++col) {
+      input_values(row, col) = static_cast<int32_t>(row * 10 + col);
+    }
+    for (int64_t col = 0; col < 3; ++col) {
+      update_values(row, col) = static_cast<int32_t>(100 + row * 10 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(input_values);
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  Literal update_literal = LiteralUtil::CreateR2FromArray2D(update_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> update_data,
+                      client->TransferToServer(update_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get(),
+                                        update_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
                                                  float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -4848,6 +4901,27 @@ TEST(MetalGpuExecutableTest, ElementwiseScatterRank2Add) {
     for (int64_t col = 0; col < 4; ++col) {
       const int64_t index = row * 4 + col;
       EXPECT_EQ(actual.Get<float>({row, col}), expected[index])
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseBatchedWindowScatterS32) {
+  auto result = ExecuteMetalBatchedWindowScatterS32();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {6, 5})));
+  const int32_t starts[6] = {0, 1, 2, 2, 1, 0};
+  for (int64_t row = 0; row < 6; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      int32_t expected = static_cast<int32_t>(row * 10 + col);
+      if (col >= starts[row] && col < starts[row] + 3) {
+        expected = static_cast<int32_t>(100 + row * 10 + col - starts[row]);
+      }
+      EXPECT_EQ(actual.Get<int32_t>({row, col}), expected)
           << "at (" << row << ", " << col << ")";
     }
   }

@@ -1997,6 +1997,27 @@ class ElementwiseAirEmitter {
     if (instr->opcode() == HloOpcode::kConcatenate) {
       return EmitConcatenateLinearIndex(instr, index, body);
     }
+    if (instr->opcode() == HloOpcode::kClamp) {
+      TF_ASSIGN_OR_RETURN(std::string min_value,
+                          EmitLinearOperand(instr->operand(0), index, body));
+      TF_ASSIGN_OR_RETURN(std::string value,
+                          EmitLinearOperand(instr->operand(1), index, body));
+      TF_ASSIGN_OR_RETURN(std::string max_value,
+                          EmitLinearOperand(instr->operand(2), index, body));
+      const PrimitiveType type = instr->shape().element_type();
+      if (type == S32) {
+        std::string lower =
+            EmitIntCompareSelect("sgt", value, min_value, body, type);
+        return EmitIntCompareSelect("slt", lower, max_value, body, type);
+      }
+      if (IsFloatAccumulatorElementType(type)) {
+        std::string lower = EmitCompareSelect("ogt", value, min_value, body);
+        return EmitCompareSelect("olt", lower, max_value, body);
+      }
+      return absl::UnimplementedError(
+          "Metal direct AIR linear load clamp currently supports only f32 "
+          "and s32 arrays.");
+    }
     if (instr->opcode() == HloOpcode::kDynamicSlice) {
       TF_ASSIGN_OR_RETURN(std::string source_index,
                           EmitDynamicSliceSourceIndex(instr, index, body));
@@ -5808,6 +5829,94 @@ class ElementwiseAirEmitter {
     const ScatterDimensionNumbers& dnums = instr->scatter_dimension_numbers();
     const int64_t rank = input->shape().dimensions().size();
     const int64_t update_count = ShapeUtil::ElementsIn(updates->shape());
+    const PrimitiveType element_type = instr->shape().element_type();
+    const HloInstruction* reducer = instr->to_apply()->root_instruction();
+    const bool scatter_add = reducer->opcode() == HloOpcode::kAdd;
+    const bool scatter_set =
+        reducer->opcode() == HloOpcode::kParameter &&
+        reducer->parameter_number() == 1;
+    if (!scatter_add && !scatter_set) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scatter currently supports only set and add "
+          "update computations.");
+    }
+
+    if (scatter_set && IsSupportedElementwiseArray(instr->shape()) &&
+        IsSupportedElementwiseArray(input->shape()) &&
+        IsSupportedElementwiseArray(updates->shape()) &&
+        input->shape().element_type() == element_type &&
+        updates->shape().element_type() == element_type &&
+        rank == 2 && instr->shape().dimensions().size() == 2 &&
+        updates->shape().dimensions().size() == 2 &&
+        indices->shape().element_type() == S32 &&
+        indices->shape().dimensions().size() == 2 &&
+        indices->shape().dimensions(1) == 1 &&
+        ShapeUtil::Equal(instr->shape(), input->shape()) &&
+        ShapeUtil::Equal(instr->shape(), result_shape_) &&
+        updates->shape().dimensions(0) == input->shape().dimensions(0) &&
+        indices->shape().dimensions(0) == input->shape().dimensions(0) &&
+        updates->shape().dimensions(1) <= input->shape().dimensions(1) &&
+        dnums.update_window_dims_size() == 1 &&
+        dnums.update_window_dims(0) == 1 &&
+        dnums.inserted_window_dims_size() == 0 &&
+        dnums.scatter_dims_to_operand_dims_size() == 1 &&
+        dnums.scatter_dims_to_operand_dims(0) == 1 &&
+        dnums.input_batching_dims_size() == 1 &&
+        dnums.input_batching_dims(0) == 0 &&
+        dnums.scatter_indices_batching_dims_size() == 1 &&
+        dnums.scatter_indices_batching_dims(0) == 0 &&
+        dnums.index_vector_dim() == 1) {
+      const int64_t input_cols = input->shape().dimensions(1);
+      const int64_t update_cols = updates->shape().dimensions(1);
+      TF_ASSIGN_OR_RETURN(std::string input_value,
+                          EmitLoadFromLinearIndex(input, "%idx", body));
+      std::string row = NewName("scatter_batch_row");
+      std::string col = NewName("scatter_batch_col");
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", row, input_cols));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", col, input_cols));
+      TF_ASSIGN_OR_RETURN(std::string raw_start,
+                          EmitLoadFromLinearIndex(indices, row, body));
+      std::string start = NewName("scatter_batch_start");
+      body->push_back(absl::StrFormat("  %s = sext i32 %s to i64", start,
+                                      raw_start));
+      std::string ge_start = NewName("scatter_batch_ge_start");
+      std::string end = NewName("scatter_batch_end");
+      std::string lt_end = NewName("scatter_batch_lt_end");
+      std::string in_update = NewName("scatter_batch_in_update");
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %s", ge_start,
+                                      col, start));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", end, start,
+                                      update_cols));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %s", lt_end,
+                                      col, end));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_update,
+                                      ge_start, lt_end));
+      std::string local_col = NewName("scatter_batch_local_col");
+      std::string row_offset = NewName("scatter_batch_row_offset");
+      std::string update_index = NewName("scatter_batch_update_index");
+      std::string safe_update_index = NewName("scatter_batch_safe_update");
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_col, col,
+                                      start));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      row, update_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", update_index,
+                                      row_offset, local_col));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe_update_index, in_update,
+          update_index));
+      TF_ASSIGN_OR_RETURN(
+          std::string update_value,
+          EmitLoadFromLinearIndex(updates, safe_update_index, body));
+      std::string result = NewName("scatter_batch_select");
+      const char* ir_type = ValueIrType(element_type);
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, %s %s, %s %s", result, in_update, ir_type,
+          update_value, ir_type, input_value));
+      return result;
+    }
+
     if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
         !IsF32Array(updates->shape()) ||
         instr->shape().dimensions().size() != rank ||
@@ -5831,20 +5940,9 @@ class ElementwiseAirEmitter {
       if (dnums.inserted_window_dims(dim) != dim ||
           dnums.scatter_dims_to_operand_dims(dim) != dim) {
         return absl::UnimplementedError(
-            "Metal direct AIR scatter currently requires identity scatter "
-            "dimension mappings.");
+          "Metal direct AIR scatter currently requires identity scatter "
+          "dimension mappings.");
       }
-    }
-
-    const HloInstruction* reducer = instr->to_apply()->root_instruction();
-    const bool scatter_add = reducer->opcode() == HloOpcode::kAdd;
-    const bool scatter_set =
-        reducer->opcode() == HloOpcode::kParameter &&
-        reducer->parameter_number() == 1;
-    if (!scatter_add && !scatter_set) {
-      return absl::UnimplementedError(
-          "Metal direct AIR scatter currently supports only set and add "
-          "update computations.");
     }
 
     TF_ASSIGN_OR_RETURN(std::string selected,
