@@ -656,6 +656,66 @@ absl::StatusOr<Literal> ExecuteMetalTopKRank2(bool indices) {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalTopKTupleRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_topk_tuple_rank1");
+  Shape shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  TopK(input, 3, /*largest=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalTopKTupleS32Rank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_topk_tuple_s32_rank1");
+  Shape shape = ShapeUtil::MakeShape(S32, {8});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp topk = TopK(input, 3, /*largest=*/true);
+  Tuple(&builder, {GetTupleElement(topk, 0), GetTupleElement(topk, 1)});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      LiteralUtil::CreateR1<int32_t>({2, -4, 7, 7, 1, 9, -1, 3});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalTopKTupleRank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_topk_tuple_rank2");
+  Shape shape = ShapeUtil::MakeShape(F32, {2, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  TopK(input, 2, /*largest=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(2, 4);
+  values(0, 0) = 1.0f;
+  values(0, 1) = 4.0f;
+  values(0, 2) = 3.0f;
+  values(0, 3) = 4.0f;
+  values(1, 0) = 6.0f;
+  values(1, 1) = 2.0f;
+  values(1, 2) = 5.0f;
+  values(1, 3) = 0.0f;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalArgmaxRank1() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2336,6 +2396,73 @@ TEST(MetalGpuExecutableTest, ElementwiseTopKIndicesRank2) {
     for (int64_t col = 0; col < 2; ++col) {
       EXPECT_EQ(actual.Get<int32_t>({row, col}), expected[row][col])
           << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKTupleRank1) {
+  auto result = ExecuteMetalTopKTupleRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Shape expected_shape = ShapeUtil::MakeTupleShape(
+      {ShapeUtil::MakeShape(F32, {3}), ShapeUtil::MakeShape(S32, {3})});
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), expected_shape));
+
+  LiteralSlice values(actual, {0});
+  LiteralSlice indices(actual, {1});
+  std::vector<float> expected_values = {4.0f, 3.0f, 2.0f};
+  std::vector<int32_t> expected_indices = {3, 6, 7};
+  for (int64_t i = 0; i < expected_values.size(); ++i) {
+    EXPECT_EQ(values.Get<float>({i}), expected_values[i]) << "value at " << i;
+    EXPECT_EQ(indices.Get<int32_t>({i}), expected_indices[i])
+        << "index at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKTupleS32Rank1) {
+  auto result = ExecuteMetalTopKTupleS32Rank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Shape expected_shape = ShapeUtil::MakeTupleShape(
+      {ShapeUtil::MakeShape(S32, {3}), ShapeUtil::MakeShape(S32, {3})});
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), expected_shape));
+
+  LiteralSlice values(actual, {0});
+  LiteralSlice indices(actual, {1});
+  std::vector<int32_t> expected_values = {9, 7, 7};
+  std::vector<int32_t> expected_indices = {5, 2, 3};
+  for (int64_t i = 0; i < expected_values.size(); ++i) {
+    EXPECT_EQ(values.Get<int32_t>({i}), expected_values[i])
+        << "value at " << i;
+    EXPECT_EQ(indices.Get<int32_t>({i}), expected_indices[i])
+        << "index at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKTupleRank2) {
+  auto result = ExecuteMetalTopKTupleRank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Shape expected_shape = ShapeUtil::MakeTupleShape(
+      {ShapeUtil::MakeShape(F32, {2, 2}), ShapeUtil::MakeShape(S32, {2, 2})});
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), expected_shape));
+
+  LiteralSlice values(actual, {0});
+  LiteralSlice indices(actual, {1});
+  float expected_values[2][2] = {{4.0f, 4.0f}, {6.0f, 5.0f}};
+  int32_t expected_indices[2][2] = {{1, 3}, {0, 2}};
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      EXPECT_EQ(values.Get<float>({row, col}), expected_values[row][col])
+          << "value at (" << row << ", " << col << ")";
+      EXPECT_EQ(indices.Get<int32_t>({row, col}), expected_indices[row][col])
+          << "index at (" << row << ", " << col << ")";
     }
   }
 }

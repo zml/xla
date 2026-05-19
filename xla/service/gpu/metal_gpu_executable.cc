@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/service/gpu/embed_metal_air_kernels.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_buffer.h"
+#include "xla/service/transfer_manager.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
@@ -367,6 +368,32 @@ class ElementwiseAirEmitter {
     std::vector<std::string> body;
     TF_ASSIGN_OR_RETURN(std::string value,
                         EmitValue(root, /*force_scalar=*/false, &body));
+    expression_body_ = std::move(body);
+    result_value_ = std::move(value);
+    return BuildModule();
+  }
+
+  absl::StatusOr<std::string> EmitTopKTupleElement(
+      const HloInstruction* topk_instr, int64_t tuple_index) {
+    if (topk_instr->opcode() != HloOpcode::kTopK ||
+        !topk_instr->shape().IsTuple() || tuple_index < 0 ||
+        tuple_index >= ShapeUtil::TupleElementCount(topk_instr->shape()) ||
+        !ShapeUtil::Equal(topk_instr->shape().tuple_shapes(tuple_index),
+                          result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR topk tuple emission requires a topk tuple root "
+          "and a matching tuple element result shape.");
+    }
+    if (!IsSupportedElementwiseArray(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR topk tuple emission supports only f32, s32, and "
+          "pred arrays.");
+    }
+    std::vector<std::string> body;
+    TF_ASSIGN_OR_RETURN(
+        std::string value,
+        EmitTopKElement(Cast<HloTopKInstruction>(topk_instr), tuple_index,
+                        &body));
     expression_body_ = std::move(body);
     result_value_ = std::move(value);
     return BuildModule();
@@ -1996,7 +2023,7 @@ class ElementwiseAirEmitter {
         ShapeUtil::Equal(instr->shape(), instr->operand(0)->shape()) &&
         ShapeUtil::Equal(instr->shape(), result_shape_)) {
       TF_ASSIGN_OR_RETURN(bool descending, SortDescending(instr));
-      return EmitRank2F32OrderStatistic(
+      return EmitRank2OrderStatistic(
           instr->operand(0), instr->shape().dimensions(0),
           instr->shape().dimensions(1), instr->shape().dimensions(1),
           descending, body, /*return_index=*/false);
@@ -2014,10 +2041,10 @@ class ElementwiseAirEmitter {
     }
 
     TF_ASSIGN_OR_RETURN(bool descending, SortDescending(instr));
-    return EmitRank1F32OrderStatistic(instr->operand(0),
-                                      ShapeUtil::ElementsIn(instr->shape()),
-                                      descending, body,
-                                      /*return_index=*/false);
+    return EmitRank1OrderStatistic(instr->operand(0),
+                                   ShapeUtil::ElementsIn(instr->shape()),
+                                   descending, body,
+                                   /*return_index=*/false);
   }
 
   absl::StatusOr<std::string> EmitGetTupleElement(
@@ -2035,47 +2062,57 @@ class ElementwiseAirEmitter {
           "values or indices output of rank-1/rank-2 f32 topk.");
     }
 
-    const auto* topk = Cast<HloTopKInstruction>(instr->operand(0));
+    return EmitTopKElement(Cast<HloTopKInstruction>(instr->operand(0)),
+                           instr->tuple_index(), body);
+  }
+
+  absl::StatusOr<std::string> EmitTopKElement(
+      const HloTopKInstruction* topk, int64_t tuple_index,
+      std::vector<std::string>* body) {
     const HloInstruction* input = topk->operand(0);
-    if (IsF32Array(input->shape()) && input->shape().dimensions().size() == 2 &&
-        instr->shape().dimensions().size() == 2 &&
-        instr->shape().dimensions(0) == input->shape().dimensions(0) &&
-        instr->shape().dimensions(1) == topk->k()) {
-      if (instr->tuple_index() == 1 && IsS32Array(instr->shape())) {
-        return EmitRank2F32OrderStatistic(
+    const bool supported_value_type =
+        IsF32Array(input->shape()) || IsS32Array(input->shape());
+    if (supported_value_type && input->shape().dimensions().size() == 2 &&
+        result_shape_.dimensions().size() == 2 &&
+        result_shape_.dimensions(0) == input->shape().dimensions(0) &&
+        result_shape_.dimensions(1) == topk->k()) {
+      if (tuple_index == 1 && IsS32Array(result_shape_)) {
+        return EmitRank2OrderStatistic(
             input, input->shape().dimensions(0), input->shape().dimensions(1),
             topk->k(), topk->largest(), body, /*return_index=*/true);
       }
-      if (instr->tuple_index() == 0 && IsF32Array(instr->shape())) {
-        return EmitRank2F32OrderStatistic(
+      if (tuple_index == 0 &&
+          result_shape_.element_type() == input->shape().element_type()) {
+        return EmitRank2OrderStatistic(
             input, input->shape().dimensions(0), input->shape().dimensions(1),
             topk->k(), topk->largest(), body, /*return_index=*/false);
       }
       return absl::UnimplementedError(
           "Metal direct AIR rank-2 topk get-tuple-element supports only f32 "
-          "values or s32 indices.");
+          "or s32 values and s32 indices.");
     }
 
-    if (!IsF32Array(input->shape()) || input->shape().dimensions().size() != 1 ||
-        instr->shape().dimensions().size() != 1 ||
-        ShapeUtil::ElementsIn(instr->shape()) != topk->k()) {
+    if (!supported_value_type || input->shape().dimensions().size() != 1 ||
+        result_shape_.dimensions().size() != 1 ||
+        ShapeUtil::ElementsIn(result_shape_) != topk->k()) {
       return absl::UnimplementedError(
-          "Metal direct AIR topk values currently supports only rank-1 f32 "
-          "inputs with a rank-1 f32 values result.");
+          "Metal direct AIR topk values currently supports only rank-1 f32 or "
+          "s32 inputs with a rank-1 values result.");
     }
 
-    if (instr->tuple_index() == 1 && IsS32Array(instr->shape())) {
-      return EmitRank1F32OrderStatistic(
+    if (tuple_index == 1 && IsS32Array(result_shape_)) {
+      return EmitRank1OrderStatistic(
           input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
           /*return_index=*/true);
     }
-    if (instr->tuple_index() != 0 || !IsF32Array(instr->shape())) {
+    if (tuple_index != 0 ||
+        result_shape_.element_type() != input->shape().element_type()) {
       return absl::UnimplementedError(
-          "Metal direct AIR topk get-tuple-element supports only f32 values "
-          "or s32 indices.");
+          "Metal direct AIR topk get-tuple-element supports only f32 or s32 "
+          "values and s32 indices.");
     }
 
-    return EmitRank1F32OrderStatistic(
+    return EmitRank1OrderStatistic(
         input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
         /*return_index=*/false);
   }
@@ -2378,9 +2415,15 @@ class ElementwiseAirEmitter {
         "Metal direct AIR expected an f32 scalar constant.");
   }
 
-  absl::StatusOr<std::string> EmitRank1F32OrderStatistic(
+  absl::StatusOr<std::string> EmitRank1OrderStatistic(
       const HloInstruction* input, int64_t input_elements, bool descending,
       std::vector<std::string>* body, bool return_index) {
+    const PrimitiveType value_type = input->shape().element_type();
+    if (value_type != F32 && value_type != S32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-1 ordering currently supports only f32 and "
+          "s32 inputs.");
+    }
     if (input_elements <= 0) {
       return absl::UnimplementedError(
           "Metal direct AIR rank-1 ordering does not support empty inputs.");
@@ -2411,9 +2454,10 @@ class ElementwiseAirEmitter {
     const std::string has_output_rank = NewName("order_has_output_rank");
     const std::string selected_next = NewName("order_selected_next");
     const std::string j_next = NewName("order_j_next");
-    const absl::string_view selected_type = return_index ? "i32" : "float";
-    const absl::string_view selected_init =
-        return_index ? "0" : "0x0000000000000000";
+    const absl::string_view selected_type =
+        return_index ? "i32" : ElementIrType(value_type);
+    const std::string selected_init =
+        (return_index || value_type == S32) ? "0" : "0x0000000000000000";
 
     body->push_back(absl::StrFormat("  br label %%%s", outer));
     body->push_back(absl::StrFormat("%s:", outer));
@@ -2450,12 +2494,20 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("  %s = zext i32 %s to i64", i64, i));
     TF_ASSIGN_OR_RETURN(std::string other_value,
                         EmitLoadFromLinearIndex(input, i64, body));
-    body->push_back(absl::StrFormat(
-        "  %s = fcmp fast %s float %s, %s", ordered,
-        descending ? "ogt" : "olt", other_value, candidate_value));
-    body->push_back(absl::StrFormat(
-        "  %s = fcmp fast oeq float %s, %s", equal, other_value,
-        candidate_value));
+    if (value_type == S32) {
+      body->push_back(absl::StrFormat(
+          "  %s = icmp %s i32 %s, %s", ordered,
+          descending ? "sgt" : "slt", other_value, candidate_value));
+      body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %s", equal,
+                                      other_value, candidate_value));
+    } else {
+      body->push_back(absl::StrFormat(
+          "  %s = fcmp fast %s float %s, %s", ordered,
+          descending ? "ogt" : "olt", other_value, candidate_value));
+      body->push_back(absl::StrFormat(
+          "  %s = fcmp fast oeq float %s, %s", equal, other_value,
+          candidate_value));
+    }
     body->push_back(
         absl::StrFormat("  %s = icmp ult i32 %s, %s", tie_before, i, j));
     body->push_back(absl::StrFormat("  %s = and i1 %s, %s", stable_tie,
@@ -2478,8 +2530,9 @@ class ElementwiseAirEmitter {
           has_output_rank, j, selected));
     } else {
       body->push_back(absl::StrFormat(
-          "  %s = select i1 %s, float %s, float %s", selected_next,
-          has_output_rank, candidate_value, selected));
+          "  %s = select i1 %s, %s %s, %s %s", selected_next,
+          has_output_rank, selected_type, candidate_value, selected_type,
+          selected));
     }
     body->push_back(absl::StrFormat("  %s = add i32 %s, 1", j_next, j));
     body->push_back(absl::StrFormat("  br label %%%s", outer));
@@ -2488,10 +2541,16 @@ class ElementwiseAirEmitter {
     return selected;
   }
 
-  absl::StatusOr<std::string> EmitRank2F32OrderStatistic(
+  absl::StatusOr<std::string> EmitRank2OrderStatistic(
       const HloInstruction* input, int64_t rows, int64_t input_cols,
       int64_t output_cols, bool descending, std::vector<std::string>* body,
       bool return_index) {
+    const PrimitiveType value_type = input->shape().element_type();
+    if (value_type != F32 && value_type != S32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-2 ordering currently supports only f32 and "
+          "s32 inputs.");
+    }
     if (rows <= 0 || input_cols <= 0 || output_cols <= 0 ||
         output_cols > input_cols) {
       return absl::UnimplementedError(
@@ -2539,9 +2598,10 @@ class ElementwiseAirEmitter {
     const std::string has_output_rank = NewName("order2_has_output_rank");
     const std::string selected_next = NewName("order2_selected_next");
     const std::string j_next = NewName("order2_j_next");
-    const absl::string_view selected_type = return_index ? "i32" : "float";
-    const absl::string_view selected_init =
-        return_index ? "0" : "0x0000000000000000";
+    const absl::string_view selected_type =
+        return_index ? "i32" : ElementIrType(value_type);
+    const std::string selected_init =
+        (return_index || value_type == S32) ? "0" : "0x0000000000000000";
 
     body->push_back(absl::StrFormat("  br label %%%s", outer));
     body->push_back(absl::StrFormat("%s:", outer));
@@ -2582,12 +2642,20 @@ class ElementwiseAirEmitter {
                                     row_offset, i64));
     TF_ASSIGN_OR_RETURN(std::string other_value,
                         EmitLoadFromLinearIndex(input, other_index, body));
-    body->push_back(absl::StrFormat(
-        "  %s = fcmp fast %s float %s, %s", ordered,
-        descending ? "ogt" : "olt", other_value, candidate_value));
-    body->push_back(absl::StrFormat(
-        "  %s = fcmp fast oeq float %s, %s", equal, other_value,
-        candidate_value));
+    if (value_type == S32) {
+      body->push_back(absl::StrFormat(
+          "  %s = icmp %s i32 %s, %s", ordered,
+          descending ? "sgt" : "slt", other_value, candidate_value));
+      body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %s", equal,
+                                      other_value, candidate_value));
+    } else {
+      body->push_back(absl::StrFormat(
+          "  %s = fcmp fast %s float %s, %s", ordered,
+          descending ? "ogt" : "olt", other_value, candidate_value));
+      body->push_back(absl::StrFormat(
+          "  %s = fcmp fast oeq float %s, %s", equal, other_value,
+          candidate_value));
+    }
     body->push_back(
         absl::StrFormat("  %s = icmp ult i32 %s, %s", tie_before, i, j));
     body->push_back(absl::StrFormat("  %s = and i1 %s, %s", stable_tie,
@@ -2610,8 +2678,9 @@ class ElementwiseAirEmitter {
           has_output_rank, j, selected));
     } else {
       body->push_back(absl::StrFormat(
-          "  %s = select i1 %s, float %s, float %s", selected_next,
-          has_output_rank, candidate_value, selected));
+          "  %s = select i1 %s, %s %s, %s %s", selected_next,
+          has_output_rank, selected_type, candidate_value, selected_type,
+          selected));
     }
     body->push_back(absl::StrFormat("  %s = add i32 %s, 1", j_next, j));
     body->push_back(absl::StrFormat("  br label %%%s", outer));
@@ -6284,6 +6353,207 @@ absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
                       CompileMetalAirToMetallib(air, "metal_elementwise_air"));
   return std::make_unique<MetalElementwiseExecutable>(
       std::move(module), emitter.parameter_numbers(), std::move(metallib));
+}
+
+absl::StatusOr<const HloInstruction*> MatchTopKTupleRoot(
+    const HloInstruction* root) {
+  if (root->opcode() == HloOpcode::kTopK) {
+    return root;
+  }
+  if (root->opcode() != HloOpcode::kTuple || root->operand_count() != 2) {
+    return absl::UnimplementedError(
+        "Metal direct AIR topk tuple executable requires a topk root or a "
+        "tuple of topk get-tuple-elements.");
+  }
+
+  const HloInstruction* values = root->operand(0);
+  const HloInstruction* indices = root->operand(1);
+  if (values->opcode() != HloOpcode::kGetTupleElement ||
+      indices->opcode() != HloOpcode::kGetTupleElement ||
+      values->tuple_index() != 0 || indices->tuple_index() != 1 ||
+      values->operand(0) != indices->operand(0) ||
+      values->operand(0)->opcode() != HloOpcode::kTopK) {
+    return absl::UnimplementedError(
+        "Metal direct AIR topk tuple executable requires tuple(gte(topk, 0), "
+        "gte(topk, 1)).");
+  }
+  return values->operand(0);
+}
+
+class MetalTopKTupleExecutable final : public Executable {
+ public:
+  MetalTopKTupleExecutable(std::shared_ptr<HloModule> module,
+                           std::vector<int64_t> values_parameter_numbers,
+                           std::vector<int64_t> indices_parameter_numbers,
+                           std::vector<uint8_t> values_metallib,
+                           std::vector<uint8_t> indices_metallib)
+      : Executable(std::move(module)),
+        values_parameter_numbers_(std::move(values_parameter_numbers)),
+        indices_parameter_numbers_(std::move(indices_parameter_numbers)),
+        result_shape_(this->module()
+                          .entry_computation()
+                          ->root_instruction()
+                          ->shape()),
+        num_elements_(ShapeUtil::ElementsIn(result_shape_.tuple_shapes(0))),
+        values_metallib_(std::move(values_metallib)),
+        indices_metallib_(std::move(indices_metallib)) {}
+
+  Shape result_shape() const override { return result_shape_; }
+
+  absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(
+      const ServiceExecutableRunOptions* run_options,
+      std::vector<ExecutionInput> arguments) override {
+    se::Stream* stream = run_options->stream();
+    if (stream == nullptr) {
+      return absl::InvalidArgumentError("Metal topk tuple requires a stream.");
+    }
+    se::StreamExecutor* executor = stream->parent();
+    se::DeviceAddressAllocator* allocator = run_options->allocator();
+    if (allocator == nullptr) {
+      return absl::InvalidArgumentError(
+          "Metal topk tuple requires an allocator.");
+    }
+    TF_ASSIGN_OR_RETURN(TransferManager * transfer_manager,
+                        TransferManager::GetForPlatform(executor->GetPlatform()));
+
+    const int device_ordinal = run_options->device_ordinal() != -1
+                                   ? run_options->device_ordinal()
+                                   : executor->device_ordinal();
+    const Shape& values_shape = result_shape_.tuple_shapes(0);
+    const Shape& indices_shape = result_shape_.tuple_shapes(1);
+
+    TF_ASSIGN_OR_RETURN(
+        se::ScopedDeviceAddress<uint8_t> tuple_buffer,
+        allocator->Allocate(device_ordinal,
+                            transfer_manager->GetByteSizeRequirement(
+                                result_shape_)));
+    TF_ASSIGN_OR_RETURN(
+        se::ScopedDeviceAddress<uint8_t> values_buffer,
+        allocator->Allocate(device_ordinal,
+                            transfer_manager->GetByteSizeRequirement(
+                                values_shape)));
+    TF_ASSIGN_OR_RETURN(
+        se::ScopedDeviceAddress<uint8_t> indices_buffer,
+        allocator->Allocate(device_ordinal,
+                            transfer_manager->GetByteSizeRequirement(
+                                indices_shape)));
+    se::DeviceAddressBase values_output = *values_buffer;
+    se::DeviceAddressBase indices_output = *indices_buffer;
+
+    TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> params_buffer,
+                        allocator->Allocate(device_ordinal,
+                                            sizeof(ElementwiseParams)));
+    se::DeviceAddressBase params_address = *params_buffer;
+    ElementwiseParams params{static_cast<uint32_t>(num_elements_), 0, 0, 0};
+    TF_RETURN_IF_ERROR(
+        stream->Memcpy(&params_address, &params, sizeof(ElementwiseParams)));
+
+    TF_RETURN_IF_ERROR(LaunchElementwiseKernel(
+        executor, stream, values_metallib_, values_parameter_numbers_,
+        arguments, values_output, params_address, "topk values"));
+    TF_RETURN_IF_ERROR(LaunchElementwiseKernel(
+        executor, stream, indices_metallib_, indices_parameter_numbers_,
+        arguments, indices_output, params_address, "topk indices"));
+
+    ExecutionOutput result(result_shape_, allocator, device_ordinal,
+                           executor->device_ordinal());
+    ScopedShapedBuffer* shaped_result = result.MutableResult();
+    ShapedBuffer* shaped_buffer = static_cast<ShapedBuffer*>(shaped_result);
+    shaped_buffer->set_buffer(tuple_buffer.Release(), {});
+    shaped_buffer->set_buffer(values_buffer.Release(), {0});
+    shaped_buffer->set_buffer(indices_buffer.Release(), {1});
+    TF_RETURN_IF_ERROR(
+        transfer_manager->WriteRootTupleIndexTable(stream, *shaped_result));
+    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+    result.Commit();
+    return std::move(result);
+  }
+
+ private:
+  absl::Status LaunchElementwiseKernel(
+      se::StreamExecutor* executor, se::Stream* stream,
+      const std::vector<uint8_t>& metallib,
+      const std::vector<int64_t>& parameter_numbers,
+      const std::vector<ExecutionInput>& arguments, se::DeviceAddressBase output,
+      se::DeviceAddressBase params_address, absl::string_view name) const {
+    auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+        std::vector<uint8_t>(metallib.begin(), metallib.end()),
+        "elementwise_f32", parameter_numbers.size() + 2);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        executor->LoadKernel(spec));
+
+    se::KernelArgsPackedArray kernel_args(parameter_numbers.size() + 2);
+    for (int64_t parameter_number : parameter_numbers) {
+      if (parameter_number < 0 || parameter_number >= arguments.size()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Metal %s parameter number is out of bounds.", name));
+      }
+      se::DeviceAddressBase arg =
+          arguments[parameter_number].Buffer({}).AsDeviceAddress();
+      if (arg.is_null()) {
+        return absl::InvalidArgumentError(
+            absl::StrFormat("Metal %s input buffer is null.", name));
+      }
+      kernel_args.add_argument(arg);
+    }
+    kernel_args.add_argument(output);
+    kernel_args.add_argument(params_address);
+
+    se::ThreadDim threads(/*x=*/256, /*y=*/1, /*z=*/1);
+    se::BlockDim blocks(
+        /*x=*/static_cast<uint64_t>((num_elements_ + 255) / 256),
+        /*y=*/1, /*z=*/1);
+    return kernel->Launch(threads, blocks, stream, kernel_args);
+  }
+
+  std::vector<int64_t> values_parameter_numbers_;
+  std::vector<int64_t> indices_parameter_numbers_;
+  Shape result_shape_;
+  int64_t num_elements_;
+  std::vector<uint8_t> values_metallib_;
+  std::vector<uint8_t> indices_metallib_;
+};
+
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalTopKTupleExecutable(
+    std::shared_ptr<HloModule> module) {
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  TF_ASSIGN_OR_RETURN(const HloInstruction* topk, MatchTopKTupleRoot(root));
+  if (!root->shape().IsTuple() || !topk->shape().IsTuple() ||
+      ShapeUtil::TupleElementCount(root->shape()) != 2 ||
+      ShapeUtil::TupleElementCount(topk->shape()) != 2 ||
+      !ShapeUtil::Equal(root->shape().tuple_shapes(0),
+                        topk->shape().tuple_shapes(0)) ||
+      !ShapeUtil::Equal(root->shape().tuple_shapes(1),
+                        topk->shape().tuple_shapes(1)) ||
+      (!IsF32Array(root->shape().tuple_shapes(0)) &&
+       !IsS32Array(root->shape().tuple_shapes(0))) ||
+      !IsS32Array(root->shape().tuple_shapes(1)) ||
+      root->shape().tuple_shapes(0).dimensions() !=
+          root->shape().tuple_shapes(1).dimensions()) {
+    return absl::UnimplementedError(
+        "Metal direct AIR topk tuple executable supports only tuple roots "
+        "with f32 or s32 values and s32 indices of the same shape.");
+  }
+
+  ElementwiseAirEmitter values_emitter(root->shape().tuple_shapes(0));
+  TF_ASSIGN_OR_RETURN(std::string values_air,
+                      values_emitter.EmitTopKTupleElement(topk, 0));
+  ElementwiseAirEmitter indices_emitter(root->shape().tuple_shapes(1));
+  TF_ASSIGN_OR_RETURN(std::string indices_air,
+                      indices_emitter.EmitTopKTupleElement(topk, 1));
+
+  TF_ASSIGN_OR_RETURN(
+      std::vector<uint8_t> values_metallib,
+      CompileMetalAirToMetallib(values_air, "metal_topk_values_air"));
+  TF_ASSIGN_OR_RETURN(
+      std::vector<uint8_t> indices_metallib,
+      CompileMetalAirToMetallib(indices_air, "metal_topk_indices_air"));
+
+  return std::make_unique<MetalTopKTupleExecutable>(
+      std::move(module), values_emitter.parameter_numbers(),
+      indices_emitter.parameter_numbers(), std::move(values_metallib),
+      std::move(indices_metallib));
 }
 
 MetalMatmulExecutable::MetalMatmulExecutable(std::shared_ptr<HloModule> module,

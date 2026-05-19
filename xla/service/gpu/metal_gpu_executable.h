@@ -52,6 +52,9 @@ absl::StatusOr<std::unique_ptr<Executable>> BuildMetalReductionExecutable(
 absl::StatusOr<std::unique_ptr<Executable>> BuildMetalConvertExecutable(
     std::shared_ptr<HloModule> module);
 
+absl::StatusOr<std::unique_ptr<Executable>> BuildMetalTopKTupleExecutable(
+    std::shared_ptr<HloModule> module);
+
 class MetalMatmulExecutable final : public Executable {
  public:
   MetalMatmulExecutable(std::shared_ptr<HloModule> module,

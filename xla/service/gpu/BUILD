@@ -3759,6 +3759,7 @@ cc_library(
         "//xla/service:hlo_module_config",
         "//xla/service:service_executable_run_options",
         "//xla/service:shaped_buffer",
+        "//xla/service:transfer_manager",
         "//xla:status_macros",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",

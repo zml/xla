@@ -81,6 +81,15 @@ absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     return convert.status();
   }
 
+  absl::StatusOr<std::unique_ptr<Executable>> topk_tuple =
+      BuildMetalTopKTupleExecutable(shared_module);
+  if (topk_tuple.ok()) {
+    return std::move(*topk_tuple);
+  }
+  if (!absl::IsUnimplemented(topk_tuple.status())) {
+    return topk_tuple.status();
+  }
+
   return BuildMetalElementwiseExecutable(std::move(shared_module));
 }
 
