@@ -549,6 +549,33 @@ absl::StatusOr<Literal> ExecuteMetalDynamicSliceDynamicStart() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalS32DynamicSliceDynamicStart() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_s32_dynamic_slice_dynamic_start");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {4, 5});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp row_start = Parameter(&builder, 1, scalar_shape, "row_start");
+  DynamicSlice(input, {row_start, ConstantR0<int32_t>(&builder, 2)}, {2, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<int32_t> values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      values(row, col) = static_cast<int32_t>(row * 5 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  Literal row_start_literal = LiteralUtil::CreateR0<int32_t>(1);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> row_start_data,
+                      client->TransferToServer(row_start_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), row_start_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalScatter(bool add) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1779,6 +1806,23 @@ TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceDynamicStart) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseS32DynamicSliceDynamicStart) {
+  auto result = ExecuteMetalS32DynamicSliceDynamicStart();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      EXPECT_EQ(actual.Get<int32_t>({row, col}),
+                static_cast<int32_t>((row + 1) * 5 + (col + 2)))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseScatterSet) {
   auto result = ExecuteMetalScatter(/*add=*/false);
   if (absl::IsFailedPrecondition(result.status())) {
@@ -1964,6 +2008,68 @@ TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSlice) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> update_data,
                           client->TransferToServer(update_literal));
   std::vector<GlobalData*> arguments = {input_data.get(), update_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), input_shape));
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      float expected = input_values(row, col);
+      if (row >= 1 && row < 3 && col >= 2 && col < 4) {
+        expected = update_values(row - 1, col - 2);
+      }
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSliceDynamicStart) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_dynamic_update_slice_dynamic_start");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+  Shape update_shape = ShapeUtil::MakeShape(F32, {2, 2});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp update = Parameter(&builder, 1, update_shape, "update");
+  XlaOp row_start = Parameter(&builder, 2, scalar_shape, "row_start");
+  XlaOp col_start = Parameter(&builder, 3, scalar_shape, "col_start");
+  DynamicUpdateSlice(input, update, {row_start, col_start});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array2D<float> input_values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      input_values(row, col) = static_cast<float>(row * 5 + col);
+    }
+  }
+  Array2D<float> update_values(2, 2);
+  update_values(0, 0) = -1.0f;
+  update_values(0, 1) = -2.0f;
+  update_values(1, 0) = -3.0f;
+  update_values(1, 1) = -4.0f;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(input_values);
+  Literal update_literal = LiteralUtil::CreateR2FromArray2D(update_values);
+  Literal row_start_literal = LiteralUtil::CreateR0<int32_t>(1);
+  Literal col_start_literal = LiteralUtil::CreateR0<int32_t>(2);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> update_data,
+                          client->TransferToServer(update_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> row_start_data,
+                          client->TransferToServer(row_start_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> col_start_data,
+                          client->TransferToServer(col_start_literal));
+  std::vector<GlobalData*> arguments = {
+      input_data.get(), update_data.get(), row_start_data.get(),
+      col_start_data.get()};
   auto result = client->ExecuteAndTransfer(computation, arguments);
   if (absl::IsFailedPrecondition(result.status())) {
     GTEST_SKIP() << result.status();

@@ -767,12 +767,15 @@ class ElementwiseAirEmitter {
       const HloInstruction* instr, absl::string_view index,
       std::vector<std::string>* body) {
     const HloInstruction* operand = instr->operand(0);
-    if (!IsF32Array(instr->shape()) || !IsF32Array(operand->shape()) ||
-        instr->shape().dimensions().size() != operand->shape().dimensions().size() ||
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
+        !IsSupportedElementwiseArray(operand->shape()) ||
+        instr->shape().element_type() != operand->shape().element_type() ||
+        instr->shape().dimensions().size() !=
+            operand->shape().dimensions().size() ||
         instr->operand_count() != instr->shape().dimensions().size() + 1) {
       return absl::UnimplementedError(
-          "Metal direct AIR dynamic-slice currently supports only f32 arrays "
-          "with one start index per dimension.");
+          "Metal direct AIR dynamic-slice currently supports only "
+          "f32/s32/pred arrays with one start index per dimension.");
     }
     const int64_t rank = instr->shape().dimensions().size();
     if (rank != 1 && rank != 2) {
@@ -1644,20 +1647,20 @@ class ElementwiseAirEmitter {
           "rank-1 and rank-2 updates.");
     }
 
-    std::vector<int64_t> starts;
+    std::vector<std::string> starts;
     starts.reserve(rank);
     for (int64_t dim = 0; dim < rank; ++dim) {
       const HloInstruction* start = instr->operand(dim + 2);
-      if (!start->IsConstant() || !IsScalarLikeS32(start->shape())) {
+      if (!IsScalarLikeS32(start->shape())) {
         return absl::UnimplementedError(
-            "Metal direct AIR dynamic-update-slice currently requires static "
-            "s32 start indices.");
+            "Metal direct AIR dynamic-update-slice requires scalar s32 start "
+            "indices.");
       }
-      int64_t value = start->literal().Get<int32_t>({});
       const int64_t max_start =
           instr->shape().dimensions(dim) - update->shape().dimensions(dim);
-      value = std::max<int64_t>(0, std::min<int64_t>(value, max_start));
-      starts.push_back(value);
+      TF_ASSIGN_OR_RETURN(std::string raw,
+                          EmitValue(start, /*force_scalar=*/true, body));
+      starts.push_back(EmitClampedStartIndex(raw, max_start, body));
     }
 
     TF_ASSIGN_OR_RETURN(std::string input_value,
@@ -1666,17 +1669,20 @@ class ElementwiseAirEmitter {
     std::string update_index;
     if (rank == 1) {
       std::string ge_start = NewName("dus_ge_start");
+      std::string end = NewName("dus_end");
       std::string lt_end = NewName("dus_lt_end");
       in_update = NewName("dus_in_update");
-      body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %d",
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %s",
                                       ge_start, starts[0]));
-      body->push_back(absl::StrFormat(
-          "  %s = icmp ult i64 %%idx, %d", lt_end,
-          starts[0] + update->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", end,
+                                      starts[0],
+                                      update->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %s",
+                                      lt_end, end));
       body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_update,
                                       ge_start, lt_end));
       update_index = NewName("dus_update_index");
-      body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
+      body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %s",
                                       update_index, starts[0]));
     } else {
       const int64_t result_minor = instr->shape().dimensions(1);
@@ -1688,22 +1694,28 @@ class ElementwiseAirEmitter {
       body->push_back(
           absl::StrFormat("  %s = urem i64 %%idx, %d", col, result_minor));
       std::string row_ge_start = NewName("dus_row_ge_start");
+      std::string row_end = NewName("dus_row_end");
       std::string row_lt_end = NewName("dus_row_lt_end");
       std::string col_ge_start = NewName("dus_col_ge_start");
+      std::string col_end = NewName("dus_col_end");
       std::string col_lt_end = NewName("dus_col_lt_end");
       std::string row_in = NewName("dus_row_in");
       std::string col_in = NewName("dus_col_in");
       in_update = NewName("dus_in_update");
-      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %s",
                                       row_ge_start, row, starts[0]));
-      body->push_back(absl::StrFormat(
-          "  %s = icmp ult i64 %s, %d", row_lt_end, row,
-          starts[0] + update->shape().dimensions(0)));
-      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", row_end,
+                                      starts[0],
+                                      update->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %s",
+                                      row_lt_end, row, row_end));
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %s",
                                       col_ge_start, col, starts[1]));
-      body->push_back(absl::StrFormat(
-          "  %s = icmp ult i64 %s, %d", col_lt_end, col,
-          starts[1] + update->shape().dimensions(1)));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %d", col_end,
+                                      starts[1],
+                                      update->shape().dimensions(1)));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %s",
+                                      col_lt_end, col, col_end));
       body->push_back(absl::StrFormat("  %s = and i1 %s, %s", row_in,
                                       row_ge_start, row_lt_end));
       body->push_back(absl::StrFormat("  %s = and i1 %s, %s", col_in,
@@ -1714,9 +1726,9 @@ class ElementwiseAirEmitter {
       std::string local_col = NewName("dus_local_col");
       std::string row_offset = NewName("dus_row_offset");
       update_index = NewName("dus_update_index");
-      body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", local_row, row,
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_row, row,
                                       starts[0]));
-      body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", local_col, col,
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_col, col,
                                       starts[1]));
       body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
                                       local_row, update_minor));
@@ -3167,6 +3179,24 @@ class ElementwiseAirEmitter {
     metadata_args.push_back(absl::StrFormat("!%d", output_metadata));
     metadata_args.push_back(absl::StrFormat("!%d", params_metadata));
     metadata_args.push_back(absl::StrFormat("!%d", gid_metadata));
+    const int module_flags_metadata = gid_metadata + 1;
+    const int compile_options_metadata = module_flags_metadata + 8;
+    const int ident_metadata = compile_options_metadata + 3;
+    const int version_metadata = ident_metadata + 1;
+    const int language_version_metadata = version_metadata + 1;
+    const int source_file_name_metadata = language_version_metadata + 1;
+    std::vector<std::string> module_flag_refs;
+    module_flag_refs.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+      module_flag_refs.push_back(
+          absl::StrFormat("!%d", module_flags_metadata + i));
+    }
+    std::vector<std::string> compile_option_refs;
+    compile_option_refs.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      compile_option_refs.push_back(
+          absl::StrFormat("!%d", compile_options_metadata + i));
+    }
 
     std::string store_result;
     if (result_is_pred) {
@@ -3238,12 +3268,12 @@ attributes #0 = { mustprogress nounwind "approx-func-fp-math"="true" "frame-poin
 attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
 
 !air.kernel = !{!0}
-!llvm.module.flags = !{!10, !11, !12, !13, !14, !15, !16, !17}
-!air.compile_options = !{!18, !19, !20}
-!llvm.ident = !{!21}
-!air.version = !{!22}
-!air.language_version = !{!23}
-!air.source_file_name = !{!24}
+!llvm.module.flags = !{%s}
+!air.compile_options = !{%s}
+!llvm.ident = !{!%d}
+!air.version = !{!%d}
+!air.language_version = !{!%d}
+!air.source_file_name = !{!%d}
 
 !0 = !{void (%s)* @elementwise_f32, !1, !2}
 !1 = !{}
@@ -3252,6 +3282,11 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
                                          absl::StrJoin(args, ",\n"),
                                          absl::StrJoin(expression_body_, "\n"),
                                          store_result,
+                                         absl::StrJoin(module_flag_refs, ", "),
+                                         absl::StrJoin(compile_option_refs, ", "),
+                                         ident_metadata, version_metadata,
+                                         language_version_metadata,
+                                         source_file_name_metadata,
                                          absl::StrJoin(signature_types, ", "),
                                          absl::StrJoin(metadata_args, ", "));
 
@@ -3299,23 +3334,32 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
         "!%d = !{i32 %d, !\"air.thread_position_in_grid\", "
         "!\"air.arg_type_name\", !\"uint3\", !\"air.arg_name\", !\"gid\"}\n",
         gid_metadata, static_cast<int>(parameter_numbers_.size() + 2));
-    absl::StrAppend(&module, R"(
-!10 = !{i32 1, !"wchar_size", i32 4}
-!11 = !{i32 7, !"air.max_device_buffers", i32 31}
-!12 = !{i32 7, !"air.max_constant_buffers", i32 31}
-!13 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
-!14 = !{i32 7, !"air.max_textures", i32 128}
-!15 = !{i32 7, !"air.max_read_write_textures", i32 8}
-!16 = !{i32 7, !"air.max_samplers", i32 16}
-!17 = !{i32 7, !"frame-pointer", i32 2}
-!18 = !{!"air.compile.denorms_disable"}
-!19 = !{!"air.compile.fast_math_enable"}
-!20 = !{!"air.compile.framebuffer_fetch_enable"}
-!21 = !{!"xla direct AIR elementwise"}
-!22 = !{i32 2, i32 7, i32 0}
-!23 = !{!"Metal", i32 3, i32 2, i32 0}
-!24 = !{!"xla/service/gpu/metal_elementwise_air"}
-)");
+    absl::StrAppendFormat(
+        &module,
+        R"(
+!%d = !{i32 1, !"wchar_size", i32 4}
+!%d = !{i32 7, !"air.max_device_buffers", i32 31}
+!%d = !{i32 7, !"air.max_constant_buffers", i32 31}
+!%d = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+!%d = !{i32 7, !"air.max_textures", i32 128}
+!%d = !{i32 7, !"air.max_read_write_textures", i32 8}
+!%d = !{i32 7, !"air.max_samplers", i32 16}
+!%d = !{i32 7, !"frame-pointer", i32 2}
+!%d = !{!"air.compile.denorms_disable"}
+!%d = !{!"air.compile.fast_math_enable"}
+!%d = !{!"air.compile.framebuffer_fetch_enable"}
+!%d = !{!"xla direct AIR elementwise"}
+!%d = !{i32 2, i32 7, i32 0}
+!%d = !{!"Metal", i32 3, i32 2, i32 0}
+!%d = !{!"xla/service/gpu/metal_elementwise_air"}
+)",
+        module_flags_metadata, module_flags_metadata + 1,
+        module_flags_metadata + 2, module_flags_metadata + 3,
+        module_flags_metadata + 4, module_flags_metadata + 5,
+        module_flags_metadata + 6, module_flags_metadata + 7,
+        compile_options_metadata, compile_options_metadata + 1,
+        compile_options_metadata + 2, ident_metadata, version_metadata,
+        language_version_metadata, source_file_name_metadata);
     return module;
   }
 
