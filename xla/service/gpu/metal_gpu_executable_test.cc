@@ -2708,6 +2708,201 @@ absl::StatusOr<Literal> ExecuteMetalBatchedWindowScatterS32() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReduceMinU16Rank3Dims02() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_min_u16_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(U16, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Min(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_min_u16_rank3_dims02");
+  Shape input_shape = ShapeUtil::MakeShape(U16, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<uint16_t>(&builder, 65535), reducer, {0, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<uint16_t>(
+            {dim0, dim1, dim2},
+            static_cast<uint16_t>(100 + dim0 * 20 + dim1 * 5 + dim2));
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceSumS32Rank3Dim0() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_sum_s32_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Add(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_sum_s32_rank3_dim0");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<int32_t>(&builder, 0), reducer, {0});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<int32_t>(
+            {dim0, dim1, dim2},
+            static_cast<int32_t>(dim0 * 100 + dim1 * 10 + dim2));
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceAndU32Rank3Dims12() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_and_u32_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(U32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  And(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_and_u32_rank3_dims12");
+  Shape input_shape = ShapeUtil::MakeShape(U32, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<uint32_t>(&builder, ~uint32_t{0}), reducer, {1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        uint32_t value = 0xfffffff0u | static_cast<uint32_t>((dim0 + 1) << 1);
+        if (((dim1 + dim2) & 1) == 0) {
+          value |= 1u;
+        }
+        input_literal.Set<uint32_t>({dim0, dim1, dim2}, value);
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceAndU8Rank3Dims02() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_and_u8_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(U8, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  And(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_and_u8_rank3_dims02");
+  Shape input_shape = ShapeUtil::MakeShape(U8, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<uint8_t>(&builder, uint8_t{0xff}), reducer, {0, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        uint8_t value = static_cast<uint8_t>(0xf0u | ((dim1 + 1) << 1));
+        if (((dim0 + dim2) & 1) == 0) {
+          value |= 1u;
+        }
+        input_literal.Set<uint8_t>({dim0, dim1, dim2}, value);
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceOrS32Rank3Dims12() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_or_s32_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Or(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_or_s32_rank3_dims12");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<int32_t>(&builder, 0), reducer, {1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<int32_t>(
+            {dim0, dim1, dim2},
+            static_cast<int32_t>(((dim0 + 1) << 8) | (dim1 << 4) | dim2));
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReduceOrPredRank3Dims12() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_or_pred_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(PRED, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  Or(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_or_pred_rank3_dims12");
+  Shape input_shape = ShapeUtil::MakeShape(PRED, {3, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Reduce(input, ConstantR0<bool>(&builder, false), reducer, {1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        input_literal.Set<bool>({dim0, dim1, dim2},
+                                dim0 == 1 && dim1 == 2 && dim2 == 3);
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
                                                  float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -5607,6 +5802,101 @@ TEST(MetalGpuExecutableTest, ElementwiseReduceWindowPaddedLogAddExp) {
     expected = logaddexp(expected, values[i]);
     EXPECT_NEAR(actual.Get<float>({i}), expected, 1e-5f) << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceMinU16Rank3Dims02) {
+  auto result = ExecuteMetalReduceMinU16Rank3Dims02();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U16, {4})));
+  for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+    EXPECT_EQ(actual.Get<uint16_t>({dim1}),
+              static_cast<uint16_t>(100 + dim1 * 5))
+        << "at " << dim1;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceSumS32Rank3Dim0) {
+  auto result = ExecuteMetalReduceSumS32Rank3Dim0();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {4, 5})));
+  for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+    for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+      EXPECT_EQ(actual.Get<int32_t>({dim1, dim2}),
+                static_cast<int32_t>(300 + 3 * (dim1 * 10 + dim2)))
+          << "at (" << dim1 << ", " << dim2 << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceAndU32Rank3Dims12) {
+  auto result = ExecuteMetalReduceAndU32Rank3Dims12();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U32, {3})));
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    EXPECT_EQ(actual.Get<uint32_t>({dim0}),
+              0xfffffff0u | static_cast<uint32_t>((dim0 + 1) << 1))
+        << "at " << dim0;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceAndU8Rank3Dims02) {
+  auto result = ExecuteMetalReduceAndU8Rank3Dims02();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U8, {4})));
+  for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+    EXPECT_EQ(actual.Get<uint8_t>({dim1}),
+              static_cast<uint8_t>(0xf0u | ((dim1 + 1) << 1)))
+        << "at " << dim1;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceOrS32Rank3Dims12) {
+  auto result = ExecuteMetalReduceOrS32Rank3Dims12();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {3})));
+  for (int64_t dim0 = 0; dim0 < 3; ++dim0) {
+    int32_t expected = 0;
+    for (int64_t dim1 = 0; dim1 < 4; ++dim1) {
+      for (int64_t dim2 = 0; dim2 < 5; ++dim2) {
+        expected |= static_cast<int32_t>(((dim0 + 1) << 8) | (dim1 << 4) |
+                                         dim2);
+      }
+    }
+    EXPECT_EQ(actual.Get<int32_t>({dim0}), expected) << "at " << dim0;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceOrPredRank3Dims12) {
+  auto result = ExecuteMetalReduceOrPredRank3Dims12();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {3})));
+  EXPECT_FALSE(actual.Get<bool>({0}));
+  EXPECT_TRUE(actual.Get<bool>({1}));
+  EXPECT_FALSE(actual.Get<bool>({2}));
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseConditional) {

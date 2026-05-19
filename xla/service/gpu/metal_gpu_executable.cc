@@ -7162,6 +7162,233 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitReduce(const HloInstruction* instr,
                                          std::vector<std::string>* body) {
+    const HloInstruction* reduce_root = instr->to_apply() == nullptr
+                                            ? nullptr
+                                            : instr->to_apply()->root_instruction();
+    const PrimitiveType reduce_type = instr->shape().element_type();
+    const bool is_rank3_s32_add =
+        reduce_type == S32 && reduce_root != nullptr &&
+        reduce_root->opcode() == HloOpcode::kAdd;
+    const bool is_rank3_bitwise =
+        (IsIntegerElementType(reduce_type) || reduce_type == PRED) &&
+        reduce_root != nullptr &&
+        (reduce_root->opcode() == HloOpcode::kAnd ||
+         reduce_root->opcode() == HloOpcode::kOr ||
+         reduce_root->opcode() == HloOpcode::kXor);
+    if ((is_rank3_s32_add || is_rank3_bitwise) &&
+        instr->operand_count() == 2 &&
+        instr->operand(0)->shape().element_type() == reduce_type &&
+        instr->operand(0)->shape().IsArray() &&
+        instr->operand(0)->shape().dimensions().size() == 3 &&
+        instr->operand(1)->IsConstant() &&
+        instr->operand(1)->shape().element_type() == reduce_type &&
+        ShapeUtil::IsEffectiveScalar(instr->operand(1)->shape()) &&
+        ShapeUtil::ElementsIn(instr->shape()) ==
+            ShapeUtil::ElementsIn(result_shape_)) {
+      const HloInstruction* input = instr->operand(0);
+      const char* reduce_ir_type = ValueIrType(reduce_type);
+      std::string reduce_op_name;
+      switch (reduce_root->opcode()) {
+        case HloOpcode::kAdd:
+          reduce_op_name = "add";
+          break;
+        case HloOpcode::kAnd:
+          reduce_op_name = "and";
+          break;
+        case HloOpcode::kOr:
+          reduce_op_name = "or";
+          break;
+        case HloOpcode::kXor:
+          reduce_op_name = "xor";
+          break;
+        default:
+          return absl::UnimplementedError(
+              "Metal direct AIR rank-3 reduce has unsupported reducer.");
+      }
+      const std::string reduce_op =
+          absl::StrCat(reduce_op_name, " ", reduce_ir_type);
+      const std::string reduce_name_prefix =
+          absl::StrCat("reduce_",
+                       primitive_util::LowercasePrimitiveTypeName(reduce_type));
+      bool reduced[3] = {false, false, false};
+      bool valid_dimensions = !instr->dimensions().empty();
+      for (int64_t dim : instr->dimensions()) {
+        if (dim < 0 || dim >= 3 || reduced[dim]) {
+          valid_dimensions = false;
+          break;
+        }
+        reduced[dim] = true;
+      }
+      std::vector<int64_t> expected_result_dims;
+      std::vector<int64_t> retained_dims;
+      for (int64_t dim = 0; dim < 3; ++dim) {
+        if (!reduced[dim]) {
+          expected_result_dims.push_back(input->shape().dimensions(dim));
+          retained_dims.push_back(dim);
+        }
+      }
+      if (valid_dimensions &&
+          instr->shape().dimensions() == absl::Span<const int64_t>(
+                                             expected_result_dims)) {
+        auto format_unsigned_init = [&](uint64_t value) {
+          const int bit_width = ElementBitWidth(reduce_type);
+          const uint64_t sign_bit = uint64_t{1} << (bit_width - 1);
+          if (value < sign_bit) {
+            return absl::StrCat(value);
+          }
+          return absl::StrCat(static_cast<int64_t>(value) -
+                              static_cast<int64_t>(uint64_t{1} << bit_width));
+        };
+        std::string accumulator;
+        switch (reduce_type) {
+          case S32:
+            accumulator =
+                absl::StrCat(instr->operand(1)->literal().Get<int32_t>({}));
+            break;
+          case S16:
+            accumulator =
+                absl::StrCat(instr->operand(1)->literal().Get<int16_t>({}));
+            break;
+          case S8:
+            accumulator = absl::StrCat(static_cast<int>(
+                instr->operand(1)->literal().Get<int8_t>({})));
+            break;
+          case U32:
+            accumulator = format_unsigned_init(
+                instr->operand(1)->literal().Get<uint32_t>({}));
+            break;
+          case U16:
+            accumulator = format_unsigned_init(
+                instr->operand(1)->literal().Get<uint16_t>({}));
+            break;
+          case U8:
+            accumulator = format_unsigned_init(
+                instr->operand(1)->literal().Get<uint8_t>({}));
+            break;
+          case PRED:
+            accumulator = instr->operand(1)->literal().Get<bool>({})
+                              ? "true"
+                              : "false";
+            break;
+          default:
+            valid_dimensions = false;
+            break;
+        }
+        std::vector<std::string> coords(3);
+        if (retained_dims.size() == 1) {
+          coords[retained_dims[0]] = "%idx";
+        } else if (retained_dims.size() == 2) {
+          const int64_t minor = instr->shape().dimensions(1);
+          std::string major =
+              NewName(absl::StrCat(reduce_name_prefix, "_major"));
+          std::string minor_value =
+              NewName(absl::StrCat(reduce_name_prefix, "_minor"));
+          body->push_back(
+              absl::StrFormat("  %s = udiv i64 %%idx, %d", major, minor));
+          body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d",
+                                          minor_value, minor));
+          coords[retained_dims[0]] = major;
+          coords[retained_dims[1]] = minor_value;
+        } else if (retained_dims.size() > 2) {
+          valid_dimensions = false;
+        }
+
+        if (valid_dimensions) {
+          const int64_t dim0_count =
+              reduced[0] ? input->shape().dimensions(0) : 1;
+          const int64_t dim1_count =
+              reduced[1] ? input->shape().dimensions(1) : 1;
+          const int64_t dim2_count =
+              reduced[2] ? input->shape().dimensions(2) : 1;
+          const int64_t dim1_stride = input->shape().dimensions(2);
+          const int64_t dim0_stride =
+              input->shape().dimensions(1) * input->shape().dimensions(2);
+          for (int64_t dim0 = 0; dim0 < dim0_count; ++dim0) {
+            for (int64_t dim1 = 0; dim1 < dim1_count; ++dim1) {
+              for (int64_t dim2 = 0; dim2 < dim2_count; ++dim2) {
+                const std::string coord0 =
+                    reduced[0] ? absl::StrCat(dim0) : coords[0];
+                const std::string coord1 =
+                    reduced[1] ? absl::StrCat(dim1) : coords[1];
+                const std::string coord2 =
+                    reduced[2] ? absl::StrCat(dim2) : coords[2];
+                std::string dim0_offset =
+                    NewName(absl::StrCat(reduce_name_prefix, "_dim0_offset"));
+                std::string dim1_offset =
+                    NewName(absl::StrCat(reduce_name_prefix, "_dim1_offset"));
+                std::string base_index =
+                    NewName(absl::StrCat(reduce_name_prefix, "_base_index"));
+                std::string source_index =
+                    NewName(absl::StrCat(reduce_name_prefix, "_source_index"));
+                body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                                dim0_offset, coord0,
+                                                dim0_stride));
+                body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                                dim1_offset, coord1,
+                                                dim1_stride));
+                body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
+                                                base_index, dim0_offset,
+                                                dim1_offset));
+                body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
+                                                source_index, base_index,
+                                                coord2));
+                TF_ASSIGN_OR_RETURN(
+                    std::string value,
+                    EmitLoadFromLinearIndex(input, source_index, body));
+                accumulator = EmitOp(reduce_op, accumulator, value, body);
+              }
+            }
+          }
+          return accumulator;
+        }
+      }
+    }
+    if (IsU16Array(instr->shape()) && instr->operand_count() == 2 &&
+        IsU16Array(instr->operand(0)->shape()) &&
+        instr->shape().dimensions().size() == 1 &&
+        instr->operand(0)->shape().dimensions().size() == 3 &&
+        instr->dimensions().size() == 2 && instr->dimensions()[0] == 0 &&
+        instr->dimensions()[1] == 2 &&
+        instr->shape().dimensions(0) ==
+            instr->operand(0)->shape().dimensions(1) &&
+        instr->operand(1)->IsConstant() &&
+        IsScalarLikeSupported(instr->operand(1)->shape()) &&
+        instr->to_apply()->root_instruction()->opcode() == HloOpcode::kMinimum &&
+        ShapeUtil::ElementsIn(instr->shape()) ==
+            ShapeUtil::ElementsIn(result_shape_)) {
+      const HloInstruction* input = instr->operand(0);
+      const int64_t input_dim0 = input->shape().dimensions(0);
+      const int64_t input_dim1 = input->shape().dimensions(1);
+      const int64_t input_dim2 = input->shape().dimensions(2);
+      std::string accumulator =
+          absl::StrCat(instr->operand(1)->literal().Get<uint16_t>({}));
+      for (int64_t dim0 = 0; dim0 < input_dim0; ++dim0) {
+        for (int64_t dim2 = 0; dim2 < input_dim2; ++dim2) {
+          std::string dim0_offset = NewName("reduce_u16_dim0_offset");
+          std::string dim1_offset = NewName("reduce_u16_dim1_offset");
+          std::string base_index = NewName("reduce_u16_base_index");
+          std::string source_index = NewName("reduce_u16_source_index");
+          body->push_back(absl::StrFormat("  %s = mul i64 %%idx, %d",
+                                          dim1_offset, input_dim2));
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                          base_index, dim1_offset, dim2));
+          if (dim0 == 0) {
+            source_index = base_index;
+          } else {
+            body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                            dim0_offset, base_index,
+                                            dim0 * input_dim1 * input_dim2));
+            source_index = dim0_offset;
+          }
+          TF_ASSIGN_OR_RETURN(std::string value,
+                              EmitLoadFromLinearIndex(input, source_index,
+                                                      body));
+          accumulator =
+              EmitIntCompareSelect("ult", value, accumulator, body, U16);
+        }
+      }
+      return accumulator;
+    }
     if (!IsPredArray(instr->shape()) || instr->operand_count() != 2 ||
         !IsPredArray(instr->operand(0)->shape()) ||
         instr->dimensions().size() != 1 || instr->dimensions()[0] != 1 ||
