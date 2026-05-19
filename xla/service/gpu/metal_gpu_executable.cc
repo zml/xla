@@ -1100,10 +1100,10 @@ class ElementwiseAirEmitter {
           "f32/s32/pred arrays with one start index per dimension.");
     }
     const int64_t rank = instr->shape().dimensions().size();
-    if (rank != 1 && rank != 2) {
+    if (rank != 1 && rank != 2 && rank != 3) {
       return absl::UnimplementedError(
-          "Metal direct AIR dynamic-slice currently supports only rank-1 and "
-          "rank-2 arrays.");
+          "Metal direct AIR dynamic-slice currently supports only rank-1, "
+          "rank-2, and rank-3 arrays.");
     }
 
     std::vector<std::string> starts;
@@ -1129,26 +1129,67 @@ class ElementwiseAirEmitter {
       return source_index;
     }
 
-    const int64_t result_minor = instr->shape().dimensions(1);
-    const int64_t operand_minor = operand->shape().dimensions(1);
-    std::string row = NewName("dynamic_slice_row");
-    std::string col = NewName("dynamic_slice_col");
-    std::string source_row = NewName("dynamic_slice_source_row");
-    std::string source_col = NewName("dynamic_slice_source_col");
-    std::string row_offset = NewName("dynamic_slice_row_offset");
+    if (rank == 2) {
+      const int64_t result_minor = instr->shape().dimensions(1);
+      const int64_t operand_minor = operand->shape().dimensions(1);
+      std::string row = NewName("dynamic_slice_row");
+      std::string col = NewName("dynamic_slice_col");
+      std::string source_row = NewName("dynamic_slice_source_row");
+      std::string source_col = NewName("dynamic_slice_source_col");
+      std::string row_offset = NewName("dynamic_slice_row_offset");
+      std::string source_index = NewName("dynamic_slice_index");
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %s, %d", row, index, result_minor));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %s, %d", col, index, result_minor));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_row, row,
+                                      starts[0]));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_col, col,
+                                      starts[1]));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      source_row, operand_minor));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      row_offset, source_col));
+      return source_index;
+    }
+
+    const int64_t result_dim1 = instr->shape().dimensions(1);
+    const int64_t result_dim2 = instr->shape().dimensions(2);
+    const int64_t operand_dim1 = operand->shape().dimensions(1);
+    const int64_t operand_dim2 = operand->shape().dimensions(2);
+    std::string plane = NewName("dynamic_slice_plane");
+    std::string dim0 = NewName("dynamic_slice_dim0");
+    std::string dim1 = NewName("dynamic_slice_dim1");
+    std::string dim2 = NewName("dynamic_slice_dim2");
+    body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", dim0, index,
+                                    result_dim1 * result_dim2));
+    body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", plane, index,
+                                    result_dim1 * result_dim2));
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %s, %d", dim1, plane, result_dim2));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %s, %d", dim2, plane, result_dim2));
+    std::string source_dim0 = NewName("dynamic_slice_source_dim0");
+    std::string source_dim1 = NewName("dynamic_slice_source_dim1");
+    std::string source_dim2 = NewName("dynamic_slice_source_dim2");
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_dim0,
+                                    dim0, starts[0]));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_dim1,
+                                    dim1, starts[1]));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_dim2,
+                                    dim2, starts[2]));
+    std::string dim0_offset = NewName("dynamic_slice_dim0_offset");
+    std::string dim1_offset = NewName("dynamic_slice_dim1_offset");
+    std::string base_index = NewName("dynamic_slice_base_index");
     std::string source_index = NewName("dynamic_slice_index");
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %s, %d", row, index, result_minor));
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %s, %d", col, index, result_minor));
-    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_row, row,
-                                    starts[0]));
-    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_col, col,
-                                    starts[1]));
-    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
-                                    source_row, operand_minor));
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", dim0_offset,
+                                    source_dim0, operand_dim1 * operand_dim2));
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", dim1_offset,
+                                    source_dim1, operand_dim2));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", base_index,
+                                    dim0_offset, dim1_offset));
     body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
-                                    row_offset, source_col));
+                                    base_index, source_dim2));
     return source_index;
   }
 
@@ -2202,10 +2243,11 @@ class ElementwiseAirEmitter {
     }
     const int64_t rank = instr->shape().dimensions().size();
     if (rank != update->shape().dimensions().size() ||
-        instr->operand_count() != rank + 2 || (rank != 1 && rank != 2)) {
+        instr->operand_count() != rank + 2 ||
+        (rank != 1 && rank != 2 && rank != 3)) {
       return absl::UnimplementedError(
           "Metal direct AIR dynamic-update-slice currently supports only "
-          "rank-1 and rank-2 updates.");
+          "rank-1, rank-2, and rank-3 updates.");
     }
 
     std::vector<std::string> starts;
@@ -2245,7 +2287,7 @@ class ElementwiseAirEmitter {
       update_index = NewName("dus_update_index");
       body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %s",
                                       update_index, starts[0]));
-    } else {
+    } else if (rank == 2) {
       const int64_t result_minor = instr->shape().dimensions(1);
       const int64_t update_minor = update->shape().dimensions(1);
       std::string row = NewName("dus_row");
@@ -2295,6 +2337,72 @@ class ElementwiseAirEmitter {
                                       local_row, update_minor));
       body->push_back(absl::StrFormat("  %s = add i64 %s, %s", update_index,
                                       row_offset, local_col));
+    } else {
+      const int64_t result_dim1 = instr->shape().dimensions(1);
+      const int64_t result_dim2 = instr->shape().dimensions(2);
+      const int64_t update_dim1 = update->shape().dimensions(1);
+      const int64_t update_dim2 = update->shape().dimensions(2);
+      std::string plane = NewName("dus_plane");
+      std::string dim0 = NewName("dus_dim0");
+      std::string dim1 = NewName("dus_dim1");
+      std::string dim2 = NewName("dus_dim2");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d", dim0,
+                                      result_dim1 * result_dim2));
+      body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", plane,
+                                      result_dim1 * result_dim2));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %s, %d", dim1, plane, result_dim2));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %s, %d", dim2, plane, result_dim2));
+
+      std::vector<std::string> dim_values = {dim0, dim1, dim2};
+      std::vector<std::string> in_dims;
+      in_dims.reserve(3);
+      for (int64_t dim = 0; dim < 3; ++dim) {
+        std::string ge_start = NewName("dus_ge_start");
+        std::string end = NewName("dus_end");
+        std::string lt_end = NewName("dus_lt_end");
+        std::string dim_in = NewName("dus_dim_in");
+        body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %s",
+                                        ge_start, dim_values[dim],
+                                        starts[dim]));
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", end,
+                                        starts[dim],
+                                        update->shape().dimensions(dim)));
+        body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %s",
+                                        lt_end, dim_values[dim], end));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", dim_in,
+                                        ge_start, lt_end));
+        in_dims.push_back(dim_in);
+      }
+      std::string dim01_in = NewName("dus_dim01_in");
+      in_update = NewName("dus_in_update");
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", dim01_in,
+                                      in_dims[0], in_dims[1]));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_update,
+                                      dim01_in, in_dims[2]));
+
+      std::string local_dim0 = NewName("dus_local_dim0");
+      std::string local_dim1 = NewName("dus_local_dim1");
+      std::string local_dim2 = NewName("dus_local_dim2");
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_dim0,
+                                      dim0, starts[0]));
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_dim1,
+                                      dim1, starts[1]));
+      body->push_back(absl::StrFormat("  %s = sub i64 %s, %s", local_dim2,
+                                      dim2, starts[2]));
+      std::string dim0_offset = NewName("dus_dim0_offset");
+      std::string dim1_offset = NewName("dus_dim1_offset");
+      std::string base_index = NewName("dus_base_index");
+      update_index = NewName("dus_update_index");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", dim0_offset,
+                                      local_dim0, update_dim1 * update_dim2));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", dim1_offset,
+                                      local_dim1, update_dim2));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", base_index,
+                                      dim0_offset, dim1_offset));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", update_index,
+                                      base_index, local_dim2));
     }
 
     std::string safe_update_index = NewName("dus_safe_update_index");

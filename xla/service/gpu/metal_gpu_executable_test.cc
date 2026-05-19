@@ -714,6 +714,44 @@ absl::StatusOr<Literal> ExecuteMetalS32DynamicSliceDynamicStart() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalDynamicSliceRank3() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dynamic_slice_rank3");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp dim0 = Parameter(&builder, 1, scalar_shape, "dim0");
+  XlaOp dim1 = Parameter(&builder, 2, scalar_shape, "dim1");
+  XlaOp dim2 = Parameter(&builder, 3, scalar_shape, "dim2");
+  DynamicSlice(input, {dim0, dim1, dim2}, {1, 2, 3});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array3D<float> values(2, 3, 4);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        values(i, j, k) = static_cast<float>(i * 12 + j * 4 + k);
+      }
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(values);
+  Literal dim0_literal = LiteralUtil::CreateR0<int32_t>(1);
+  Literal dim1_literal = LiteralUtil::CreateR0<int32_t>(1);
+  Literal dim2_literal = LiteralUtil::CreateR0<int32_t>(1);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> dim0_data,
+                      client->TransferToServer(dim0_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> dim1_data,
+                      client->TransferToServer(dim1_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> dim2_data,
+                      client->TransferToServer(dim2_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), dim0_data.get(),
+                                        dim1_data.get(), dim2_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConcatenateRank2(int64_t dim) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2154,6 +2192,25 @@ TEST(MetalGpuExecutableTest, ElementwiseS32DynamicSliceDynamicStart) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceRank3) {
+  auto result = ExecuteMetalDynamicSliceRank3();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {1, 2, 3})));
+  for (int64_t i = 0; i < 1; ++i) {
+    for (int64_t j = 0; j < 2; ++j) {
+      for (int64_t k = 0; k < 3; ++k) {
+        EXPECT_EQ(actual.Get<float>({i, j, k}),
+                  static_cast<float>((i + 1) * 12 + (j + 1) * 4 + (k + 1)))
+            << "at (" << i << ", " << j << ", " << k << ")";
+      }
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseScatterSet) {
   auto result = ExecuteMetalScatter(/*add=*/false);
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2454,6 +2511,77 @@ TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSliceDynamicStart) {
       }
       EXPECT_EQ(actual.Get<float>({row, col}), expected)
           << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseDynamicUpdateSliceRank3) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_elementwise_dynamic_update_slice_rank3");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  Shape update_shape = ShapeUtil::MakeShape(F32, {1, 2, 2});
+  Shape scalar_shape = ShapeUtil::MakeShape(S32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp update = Parameter(&builder, 1, update_shape, "update");
+  XlaOp dim0 = Parameter(&builder, 2, scalar_shape, "dim0");
+  XlaOp dim1 = Parameter(&builder, 3, scalar_shape, "dim1");
+  XlaOp dim2 = Parameter(&builder, 4, scalar_shape, "dim2");
+  DynamicUpdateSlice(input, update, {dim0, dim1, dim2});
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+
+  Array3D<float> input_values(2, 3, 4);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        input_values(i, j, k) = static_cast<float>(i * 12 + j * 4 + k);
+      }
+    }
+  }
+  Array3D<float> update_values(1, 2, 2);
+  for (int64_t j = 0; j < 2; ++j) {
+    for (int64_t k = 0; k < 2; ++k) {
+      update_values(0, j, k) = -1.0f - static_cast<float>(j * 2 + k);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(input_values);
+  Literal update_literal = LiteralUtil::CreateR3FromArray3D(update_values);
+  Literal dim0_literal = LiteralUtil::CreateR0<int32_t>(1);
+  Literal dim1_literal = LiteralUtil::CreateR0<int32_t>(1);
+  Literal dim2_literal = LiteralUtil::CreateR0<int32_t>(1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> input_data,
+                          client->TransferToServer(input_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> update_data,
+                          client->TransferToServer(update_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> dim0_data,
+                          client->TransferToServer(dim0_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> dim1_data,
+                          client->TransferToServer(dim1_literal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalData> dim2_data,
+                          client->TransferToServer(dim2_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), update_data.get(),
+                                        dim0_data.get(), dim1_data.get(),
+                                        dim2_data.get()};
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(), input_shape));
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        float expected = input_values(i, j, k);
+        if (i == 1 && j >= 1 && j < 3 && k >= 1 && k < 3) {
+          expected = update_values(0, j - 1, k - 1);
+        }
+        EXPECT_EQ(actual.Get<float>({i, j, k}), expected)
+            << "at (" << i << ", " << j << ", " << k << ")";
+      }
     }
   }
 }
