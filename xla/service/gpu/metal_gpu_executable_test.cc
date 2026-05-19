@@ -280,6 +280,24 @@ absl::StatusOr<Literal> ExecuteMetalConv2D() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalRfft() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_rfft");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {8});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Fft(input, FftType::RFFT, {8});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      LiteralUtil::CreateR1<float>({0.0f, 1.0f, 2.0f, 3.0f,
+                                    4.0f, 5.0f, 6.0f, 7.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 template <typename BuildFn>
 absl::StatusOr<Literal> ExecuteMetalElementwiseBinary(const char* name,
                                                       BuildFn build) {
@@ -1315,6 +1333,32 @@ TEST(MetalGpuExecutableTest, Conv2DUsesScalarAirFallback) {
       EXPECT_EQ(actual.Get<float>({0, row, col, 0}), expected)
           << "at (" << row << ", " << col << ")";
     }
+  }
+}
+
+TEST(MetalGpuExecutableTest, RfftUsesScalarAirFallback) {
+  auto result = ExecuteMetalRfft();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {5})));
+  const double pi = std::acos(-1.0);
+  for (int64_t k = 0; k < 5; ++k) {
+    float expected_real = 0.0f;
+    float expected_imag = 0.0f;
+    for (int64_t n = 0; n < 8; ++n) {
+      const double angle = -2.0 * pi * static_cast<double>(k) *
+                           static_cast<double>(n) / 8.0;
+      expected_real += static_cast<float>(n) *
+                       static_cast<float>(std::cos(angle));
+      expected_imag += static_cast<float>(n) *
+                       static_cast<float>(std::sin(angle));
+    }
+    const complex64 value = actual.Get<complex64>({k});
+    EXPECT_NEAR(value.real(), expected_real, 1.0e-4f) << "real at " << k;
+    EXPECT_NEAR(value.imag(), expected_imag, 1.0e-4f) << "imag at " << k;
   }
 }
 

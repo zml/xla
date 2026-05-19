@@ -148,6 +148,10 @@ bool IsS32Array(const Shape& shape) {
   return shape.element_type() == S32 && shape.IsArray();
 }
 
+bool IsC64Array(const Shape& shape) {
+  return shape.element_type() == C64 && shape.IsArray();
+}
+
 bool IsScalarLikeF32(const Shape& shape) {
   return shape.element_type() == F32 && ShapeUtil::IsEffectiveScalar(shape);
 }
@@ -174,6 +178,8 @@ const char* ElementIrType(PrimitiveType type) {
       return "i32";
     case PRED:
       return "i8";
+    case C64:
+      return "<2 x float>";
     default:
       return "float";
   }
@@ -191,13 +197,21 @@ const char* ElementAirTypeName(PrimitiveType type) {
       return "int";
     case PRED:
       return "bool";
+    case C64:
+      return "float2";
     default:
       return "float";
   }
 }
 
 int ElementTypeSize(PrimitiveType type) {
-  return type == PRED ? 1 : 4;
+  if (type == PRED) {
+    return 1;
+  }
+  if (type == C64) {
+    return 8;
+  }
+  return 4;
 }
 
 std::string FloatLiteral(float value) {
@@ -338,6 +352,13 @@ class ElementwiseAirEmitter {
       : result_shape_(std::move(result_shape)) {}
 
   absl::StatusOr<std::string> Emit(const HloInstruction* root) {
+    if (IsC64Array(root->shape())) {
+      std::vector<std::string> body;
+      TF_ASSIGN_OR_RETURN(std::string value, EmitComplexValue(root, &body));
+      expression_body_ = std::move(body);
+      result_value_ = std::move(value);
+      return BuildModule();
+    }
     if (!IsSupportedElementwiseArray(root->shape())) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise supports only f32, s32, and pred "
@@ -536,6 +557,102 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise does not support HLO opcode %s.",
             HloOpcodeString(instr->opcode())));
     }
+  }
+
+  absl::StatusOr<std::string> EmitComplexValue(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (instr->opcode() == HloOpcode::kCall) {
+      const HloComputation* callee = instr->to_apply();
+      if (callee->num_parameters() != instr->operand_count()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR complex call operand count does not match "
+            "callee parameter count.");
+      }
+      CallParameterScope scope;
+      scope.computation = callee;
+      for (int64_t i = 0; i < instr->operand_count(); ++i) {
+        scope.arguments[i] = instr->operand(i);
+      }
+      call_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+      return EmitComplexValue(callee->root_instruction(), body);
+    }
+    if (instr->opcode() == HloOpcode::kFft) {
+      return EmitRfft(instr, body);
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR complex path does not support HLO opcode %s.",
+        HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitRfft(const HloInstruction* instr,
+                                       std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    if (instr->fft_type() != FftType::RFFT || !IsC64Array(instr->shape()) ||
+        !IsF32Array(input->shape()) ||
+        instr->shape().dimensions().size() != 1 ||
+        input->shape().dimensions().size() != 1 ||
+        instr->fft_length().size() != 1 ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR FFT currently supports only rank-1 f32 RFFT to "
+          "c64.");
+    }
+    const int64_t fft_length = instr->fft_length()[0];
+    if (fft_length <= 0 || input->shape().dimensions(0) != fft_length ||
+        instr->shape().dimensions(0) != fft_length / 2 + 1 ||
+        fft_length > 64) {
+      return absl::UnimplementedError(
+          "Metal direct AIR RFFT currently supports static lengths up to 64.");
+    }
+
+    const double pi = std::acos(-1.0);
+    std::string selected_real;
+    std::string selected_imag;
+    for (int64_t k = 0; k < instr->shape().dimensions(0); ++k) {
+      std::string real = "0x0000000000000000";
+      std::string imag = "0x0000000000000000";
+      for (int64_t n = 0; n < fft_length; ++n) {
+        TF_ASSIGN_OR_RETURN(std::string sample,
+                            EmitLoadFromLinearIndex(input, absl::StrCat(n),
+                                                    body));
+        const double angle =
+            -2.0 * pi * static_cast<double>(k) * static_cast<double>(n) /
+            static_cast<double>(fft_length);
+        const std::string real_coeff =
+            FloatLiteral(static_cast<float>(std::cos(angle)));
+        const std::string imag_coeff =
+            FloatLiteral(static_cast<float>(std::sin(angle)));
+        std::string real_term =
+            EmitOp("fmul fast float", sample, real_coeff, body);
+        std::string imag_term =
+            EmitOp("fmul fast float", sample, imag_coeff, body);
+        real = EmitOp("fadd fast float", real, real_term, body);
+        imag = EmitOp("fadd fast float", imag, imag_term, body);
+      }
+      if (k == 0) {
+        selected_real = real;
+        selected_imag = imag;
+        continue;
+      }
+      std::string is_lane = NewName("rfft_is_lane");
+      body->push_back(
+          absl::StrFormat("  %s = icmp eq i64 %%idx, %d", is_lane, k));
+      selected_real =
+          EmitTypedSelect(F32, is_lane, real, selected_real, body, "rfft_real");
+      selected_imag =
+          EmitTypedSelect(F32, is_lane, imag, selected_imag, body, "rfft_imag");
+    }
+
+    std::string real_part = NewName("rfft_complex_real");
+    std::string complex_value = NewName("rfft_complex");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        selected_real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1", complex_value,
+        real_part, selected_imag));
+    return complex_value;
   }
 
   absl::StatusOr<std::string> EmitLoadFromLinearIndex(
@@ -3740,9 +3857,12 @@ class ElementwiseAirEmitter {
   store i32 %s, i32 addrspace(1)* %%out_ptr, align 4)",
                                      result_value_);
     } else {
-      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds float, float addrspace(1)* %%out, i64 %%idx
-  store float %s, float addrspace(1)* %%out_ptr, align 4)",
-                                     result_value_);
+      const char* ir_type = ElementIrType(result_type);
+      const int alignment = ElementTypeSize(result_type);
+      store_result = absl::StrFormat(
+          R"(  %%out_ptr = getelementptr inbounds %s, %s addrspace(1)* %%out, i64 %%idx
+  store %s %s, %s addrspace(1)* %%out_ptr, align %d)",
+          ir_type, ir_type, ir_type, result_value_, ir_type, alignment);
     }
 
     std::string module = absl::StrFormat(R"(
