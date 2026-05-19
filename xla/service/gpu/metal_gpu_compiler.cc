@@ -21,6 +21,8 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/metal_gpu_executable.h"
@@ -38,6 +40,47 @@ absl::Status DirectAirNotWired() {
       "Metal direct AIR compilation is not wired into XLA yet.");
 }
 
+bool IsPackedSubbyteArray(const Shape& shape) {
+  return shape.IsArray() &&
+         (shape.element_type() == S4 || shape.element_type() == U4);
+}
+
+void SetPackedSubbyteLayouts(Shape* shape) {
+  if (shape->IsTuple()) {
+    for (Shape& subshape : *shape->mutable_tuple_shapes()) {
+      SetPackedSubbyteLayouts(&subshape);
+    }
+    return;
+  }
+  if (IsPackedSubbyteArray(*shape)) {
+    shape->mutable_layout()->set_element_size_in_bits(4);
+  }
+}
+
+absl::Status SetPackedSubbyteLayouts(ShapeLayout* shape_layout) {
+  Shape shape = shape_layout->shape();
+  SetPackedSubbyteLayouts(&shape);
+  return shape_layout->CopyLayoutFromShape(shape);
+}
+
+absl::Status NormalizePackedSubbyteLayouts(HloModule* module) {
+  for (HloComputation* computation : module->computations()) {
+    for (HloInstruction* instruction : computation->instructions()) {
+      SetPackedSubbyteLayouts(instruction->mutable_shape());
+    }
+  }
+
+  ComputationLayout* entry_layout =
+      module->mutable_entry_computation_layout();
+  for (int64_t i = 0; i < entry_layout->parameter_count(); ++i) {
+    TF_RETURN_IF_ERROR(
+        SetPackedSubbyteLayouts(entry_layout->mutable_parameter_layout(i)));
+  }
+  TF_RETURN_IF_ERROR(
+      SetPackedSubbyteLayouts(entry_layout->mutable_result_layout()));
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 se::Platform::Id MetalGpuCompiler::PlatformId() const {
@@ -47,6 +90,7 @@ se::Platform::Id MetalGpuCompiler::PlatformId() const {
 absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
+  TF_RETURN_IF_ERROR(NormalizePackedSubbyteLayouts(module.get()));
   return std::move(module);
 }
 

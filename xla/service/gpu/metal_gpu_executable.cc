@@ -190,6 +190,11 @@ bool IsOrderStatisticArray(const Shape& shape) {
 
 const char* ElementIrType(PrimitiveType type) {
   switch (type) {
+    case S4:
+    case U4:
+    case S8:
+    case U8:
+      return "i8";
     case F32:
       return "float";
     case F16:
@@ -220,6 +225,12 @@ const char* ValueIrType(PrimitiveType type) {
 
 const char* ElementAirTypeName(PrimitiveType type) {
   switch (type) {
+    case S4:
+    case U4:
+    case U8:
+      return "uchar";
+    case S8:
+      return "char";
     case F32:
       return "float";
     case F16:
@@ -239,6 +250,9 @@ const char* ElementAirTypeName(PrimitiveType type) {
 }
 
 int ElementTypeSize(PrimitiveType type) {
+  if (type == S4 || type == U4 || type == S8 || type == U8) {
+    return 1;
+  }
   if (type == PRED) {
     return 1;
   }
@@ -249,6 +263,13 @@ int ElementTypeSize(PrimitiveType type) {
     return 8;
   }
   return 4;
+}
+
+int ElementBitWidth(PrimitiveType type) {
+  if (type == S4 || type == U4) {
+    return 4;
+  }
+  return ElementTypeSize(type) * 8;
 }
 
 std::string FloatLiteral(float value) {
@@ -3575,13 +3596,73 @@ class ElementwiseAirEmitter {
     const Shape& src_shape = instr->operand(0)->shape();
     const PrimitiveType src_type = src_shape.element_type();
     const PrimitiveType dst_type = instr->shape().element_type();
-    if (ElementTypeSize(src_type) != ElementTypeSize(dst_type) ||
-        ShapeUtil::ElementsIn(src_shape) != ShapeUtil::ElementsIn(instr->shape()) ||
+    const int src_bit_width = ElementBitWidth(src_type);
+    const int dst_bit_width = ElementBitWidth(dst_type);
+    if (ShapeUtil::ElementsIn(src_shape) * src_bit_width !=
+            ShapeUtil::ElementsIn(instr->shape()) * dst_bit_width ||
         ShapeUtil::ElementsIn(instr->shape()) !=
             ShapeUtil::ElementsIn(result_shape_)) {
       return absl::UnimplementedError(
           "Metal direct AIR bitcast-convert currently supports only "
-          "same-width elementwise bitcasts.");
+          "shape-preserving bitcasts with matching total bit widths.");
+    }
+
+    if ((src_type == S4 || src_type == U4) && dst_type == F16) {
+      const HloInstruction* operand = instr->operand(0);
+      if (operand->opcode() != HloOpcode::kParameter) {
+        return absl::UnimplementedError(
+            "Metal direct AIR s4/u4 to f16 bitcast-convert currently supports "
+            "only parameter operands.");
+      }
+      const int input_index =
+          InputIndexForParameter(operand->parameter_number(), src_type);
+      std::string byte_base = NewName("bitcast_byte_base");
+      std::string byte1_index = NewName("bitcast_byte1_index");
+      std::string ptr0 = NewName("bitcast_ptr");
+      std::string ptr1 = NewName("bitcast_ptr");
+      std::string byte0 = NewName("bitcast_byte");
+      std::string byte1 = NewName("bitcast_byte");
+      std::string word0 = NewName("bitcast_word");
+      std::string word1 = NewName("bitcast_word");
+      std::string word1_shifted = NewName("bitcast_word");
+      std::string bits = NewName("bitcast_bits");
+      std::string half_value = NewName("bitcast_half");
+      std::string float_value = NewName("bitcast_float");
+      body->push_back(
+          absl::StrFormat("  %s = mul i64 %%idx, 2", byte_base));
+      body->push_back(
+          absl::StrFormat("  %s = add i64 %s, 1", byte1_index, byte_base));
+      body->push_back(absl::StrFormat(
+          "  %s = getelementptr inbounds i8, i8 addrspace(1)* %%arg%d, i64 %s",
+          ptr0, input_index, byte_base));
+      body->push_back(absl::StrFormat(
+          "  %s = getelementptr inbounds i8, i8 addrspace(1)* %%arg%d, i64 %s",
+          ptr1, input_index, byte1_index));
+      body->push_back(absl::StrFormat(
+          "  %s = load i8, i8 addrspace(1)* %s, align 1", byte0, ptr0));
+      body->push_back(absl::StrFormat(
+          "  %s = load i8, i8 addrspace(1)* %s, align 1", byte1, ptr1));
+      body->push_back(
+          absl::StrFormat("  %s = zext i8 %s to i16", word0, byte0));
+      body->push_back(
+          absl::StrFormat("  %s = zext i8 %s to i16", word1, byte1));
+      body->push_back(
+          absl::StrFormat("  %s = shl i16 %s, 8", word1_shifted, word1));
+      body->push_back(absl::StrFormat("  %s = or i16 %s, %s", bits, word0,
+                                      word1_shifted));
+      body->push_back(
+          absl::StrFormat("  %s = bitcast i16 %s to half", half_value, bits));
+      body->push_back(absl::StrFormat("  %s = fpext half %s to float",
+                                      float_value, half_value));
+      return float_value;
+    }
+
+    if (ElementTypeSize(src_type) != ElementTypeSize(dst_type) ||
+        ShapeUtil::ElementsIn(src_shape) !=
+            ShapeUtil::ElementsIn(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR bitcast-convert currently supports only "
+          "same-width elementwise bitcasts apart from packed s4/u4 to f16.");
     }
 
     TF_ASSIGN_OR_RETURN(

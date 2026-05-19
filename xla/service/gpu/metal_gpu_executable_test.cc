@@ -16,6 +16,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -37,6 +38,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/types.h"
 
 namespace xla {
 namespace {
@@ -1436,6 +1438,26 @@ absl::StatusOr<Literal> ExecuteMetalBitcastConvertU16ToF16() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalBitcastConvertS4ToF16() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_bitcast_convert_s4_to_f16");
+  Shape input_shape = ShapeUtil::MakeShape(S4, {4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BitcastConvertType(input, F16);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      LiteralUtil::CreateR1<s4>({s4{1}, s4{-2}, s4{-3}, s4{4}});
+  input_literal.mutable_shape_do_not_use()
+      ->mutable_layout()
+      ->set_element_size_in_bits(4);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
                                               float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -1591,6 +1613,12 @@ void ExpectScalarPred(const Literal& actual, bool expected) {
   ASSERT_TRUE(
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {})));
   EXPECT_EQ(actual.Get<bool>({}), expected);
+}
+
+uint16_t HalfBits(half value) {
+  uint16_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
 }
 
 void ExpectScalarS32(const Literal& actual, int32_t expected) {
@@ -3635,6 +3663,17 @@ TEST(MetalGpuExecutableTest, BitcastConvertU16ToF16) {
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<half>({i}), expected[i]) << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, BitcastConvertS4ToF16) {
+  auto result = ExecuteMetalBitcastConvertS4ToF16();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F16, {})));
+  EXPECT_EQ(HalfBits(actual.Get<half>({})), 0x4de1);
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {
