@@ -689,9 +689,10 @@ class ElementwiseAirEmitter {
       return EmitLoadFromLinearIndex(instr->operand(0), index, body);
     }
     if (instr->opcode() == HloOpcode::kIota) {
+      const auto* iota = Cast<HloIotaInstruction>(instr);
       if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
           instr->shape().dimensions().size() != 1 ||
-          instr->dimensions().size() != 1 || instr->dimensions(0) != 0) {
+          iota->iota_dimension() != 0) {
         return absl::UnimplementedError(
             "Metal direct AIR linear load iota currently supports only rank-1 "
             "f32/s32 iotas over dimension 0.");
@@ -2097,18 +2098,54 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitIota(const HloInstruction* instr,
                                        std::vector<std::string>* body) {
     if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
-        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
-        instr->shape().dimensions().size() != 1) {
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise iota currently supports only f32/s32 "
+          "iotas with the final result element count.");
+    }
+    const int64_t rank = instr->shape().dimensions().size();
+    const auto* iota = Cast<HloIotaInstruction>(instr);
+    if (rank != 1 && rank != 2) {
       return absl::UnimplementedError(
           "Metal direct AIR elementwise iota currently supports only rank-1 "
-          "f32/s32 iota results over dimension 0.");
+          "and rank-2 iota results.");
+    }
+    std::string source_index;
+    if (rank == 1) {
+      if (iota->iota_dimension() != 0) {
+        return absl::UnimplementedError(
+            "Metal direct AIR rank-1 iota dimension must be 0.");
+      }
+      source_index = "%idx";
+    } else {
+      if (iota->iota_dimension() < 0 || iota->iota_dimension() > 1) {
+        return absl::UnimplementedError(
+            "Metal direct AIR rank-2 iota dimension must be 0 or 1.");
+      }
+      const int64_t minor = instr->shape().dimensions(1);
+      source_index =
+          NewName(iota->iota_dimension() == 0 ? "iota_row" : "iota_col");
+      if (iota->iota_dimension() == 0) {
+        body->push_back(
+            absl::StrFormat("  %s = udiv i64 %%idx, %d", source_index, minor));
+      } else {
+        body->push_back(
+            absl::StrFormat("  %s = urem i64 %%idx, %d", source_index, minor));
+      }
     }
     if (instr->shape().element_type() == S32) {
-      return "%idx32";
+      if (rank == 1) {
+        return "%idx32";
+      }
+      std::string value = NewName("iota_s32");
+      body->push_back(
+          absl::StrFormat("  %s = trunc i64 %s to i32", value, source_index));
+      return value;
     }
     std::string value = NewName("iota");
-    body->push_back(
-        absl::StrFormat("  %s = uitofp i64 %%idx to float", value));
+    body->push_back(absl::StrFormat("  %s = uitofp i64 %s to float", value,
+                                    source_index));
     return value;
   }
 
@@ -2706,69 +2743,137 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitPad(const HloInstruction* instr,
                                       bool force_scalar,
                                       std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    const int64_t rank = instr->shape().dimensions().size();
     if (force_scalar || (!IsF32Array(instr->shape()) &&
                          !IsS32Array(instr->shape())) ||
-        instr->shape().dimensions().size() != 1 ||
-        instr->operand(0)->shape().dimensions().size() != 1 ||
-        instr->shape().element_type() !=
-            instr->operand(0)->shape().element_type() ||
-        instr->padding_config().dimensions_size() != 1) {
+        (rank != 1 && rank != 2) ||
+        input->shape().dimensions().size() != rank ||
+        instr->shape().element_type() != input->shape().element_type() ||
+        instr->padding_config().dimensions_size() != rank ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_)) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise pad currently supports only rank-1 "
+          "Metal direct AIR elementwise pad currently supports only rank-1/rank-2 "
           "f32/s32 array results.");
     }
-    const auto& dimension = instr->padding_config().dimensions(0);
-    const int64_t low_padding = dimension.edge_padding_low();
-    const int64_t high_padding = dimension.edge_padding_high();
-    const int64_t interior_padding = dimension.interior_padding();
-    const int64_t input_elements =
-        ShapeUtil::ElementsIn(instr->operand(0)->shape());
-    if (low_padding < 0 || high_padding < 0 || interior_padding != 0 ||
-        input_elements <= 0 ||
-        input_elements + low_padding + high_padding !=
-            ShapeUtil::ElementsIn(instr->shape())) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise pad currently supports only "
-          "non-negative edge padding without interior padding.");
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      const auto& dimension = instr->padding_config().dimensions(dim);
+      if (dimension.edge_padding_low() < 0 ||
+          dimension.edge_padding_high() < 0 ||
+          dimension.interior_padding() != 0 ||
+          input->shape().dimensions(dim) <= 0 ||
+          input->shape().dimensions(dim) + dimension.edge_padding_low() +
+                  dimension.edge_padding_high() !=
+              instr->shape().dimensions(dim)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR elementwise pad currently supports only "
+            "non-negative edge padding without interior padding.");
+      }
     }
 
     TF_ASSIGN_OR_RETURN(std::string pad_value,
                         EmitValue(instr->operand(1), /*force_scalar=*/true,
                                   body));
-    std::string after_low = NewName("pad_after_low");
-    std::string before_end = NewName("pad_before_end");
-    std::string in_input = NewName("pad_in_input");
-    body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %d",
-                                    after_low, low_padding));
-    body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %d",
-                                    before_end,
-                                    low_padding + input_elements));
-    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_input,
-                                    after_low, before_end));
+    std::string in_input;
+    std::string safe_index;
+    if (rank == 1) {
+      const auto& dimension = instr->padding_config().dimensions(0);
+      const int64_t low_padding = dimension.edge_padding_low();
+      const int64_t input_elements = ShapeUtil::ElementsIn(input->shape());
+      std::string after_low = NewName("pad_after_low");
+      std::string before_end = NewName("pad_before_end");
+      in_input = NewName("pad_in_input");
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %%idx, %d",
+                                      after_low, low_padding));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %d",
+                                      before_end,
+                                      low_padding + input_elements));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_input,
+                                      after_low, before_end));
 
-    std::string source_index = "%idx";
-    if (low_padding != 0) {
-      source_index = NewName("pad_source");
-      body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
-                                      source_index, low_padding));
+      std::string source_index = "%idx";
+      if (low_padding != 0) {
+        source_index = NewName("pad_source");
+        body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
+                                        source_index, low_padding));
+      }
+      std::string low_clamped = NewName("pad_low_clamped");
+      safe_index = NewName("pad_safe_index");
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", low_clamped, after_low,
+          source_index));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 %d", safe_index, before_end,
+          low_clamped, input_elements - 1));
+    } else {
+      const int64_t result_cols = instr->shape().dimensions(1);
+      const int64_t input_cols = input->shape().dimensions(1);
+      const int64_t row_low =
+          instr->padding_config().dimensions(0).edge_padding_low();
+      const int64_t col_low =
+          instr->padding_config().dimensions(1).edge_padding_low();
+      std::string row = NewName("pad_row");
+      std::string col = NewName("pad_col");
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %%idx, %d", row, result_cols));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %%idx, %d", col, result_cols));
+      std::string row_after_low = NewName("pad_row_after_low");
+      std::string row_before_end = NewName("pad_row_before_end");
+      std::string col_after_low = NewName("pad_col_after_low");
+      std::string col_before_end = NewName("pad_col_before_end");
+      std::string row_in = NewName("pad_row_in");
+      std::string col_in = NewName("pad_col_in");
+      in_input = NewName("pad_in_input");
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                      row_after_low, row, row_low));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
+                                      row_before_end, row,
+                                      row_low + input->shape().dimensions(0)));
+      body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                      col_after_low, col, col_low));
+      body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
+                                      col_before_end, col,
+                                      col_low + input->shape().dimensions(1)));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", row_in,
+                                      row_after_low, row_before_end));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", col_in,
+                                      col_after_low, col_before_end));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_input,
+                                      row_in, col_in));
+
+      std::string source_row = row;
+      if (row_low != 0) {
+        source_row = NewName("pad_source_row");
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", source_row,
+                                        row, row_low));
+      }
+      std::string source_col = col;
+      if (col_low != 0) {
+        source_col = NewName("pad_source_col");
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", source_col,
+                                        col, col_low));
+      }
+      std::string safe_row = NewName("pad_safe_row");
+      std::string safe_col = NewName("pad_safe_col");
+      std::string row_offset = NewName("pad_row_offset");
+      safe_index = NewName("pad_safe_index");
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe_row, row_in,
+          source_row));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe_col, col_in,
+          source_col));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      safe_row, input_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", safe_index,
+                                      row_offset, safe_col));
     }
-    std::string low_clamped = NewName("pad_low_clamped");
-    std::string safe_index = NewName("pad_safe_index");
-    body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, i64 %s, i64 0", low_clamped, after_low,
-        source_index));
-    body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, i64 %s, i64 %d", safe_index, before_end,
-        low_clamped, input_elements - 1));
     TF_ASSIGN_OR_RETURN(std::string input_value,
-                        EmitLoadFromLinearIndex(instr->operand(0), safe_index,
-                                                body));
-    const char* ir_type = ElementIrType(instr->shape().element_type());
-    std::string selected = NewName("pad_select");
-    body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, %s %s, %s %s", selected, in_input, ir_type,
-        input_value, ir_type, pad_value));
-    return selected;
+                        EmitLoadFromLinearIndex(input, safe_index, body));
+    return EmitTypedSelect(instr->shape().element_type(), in_input, input_value,
+                           pad_value, body, "pad_select");
   }
 
   absl::StatusOr<std::string> EmitLogicalBinary(

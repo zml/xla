@@ -430,6 +430,37 @@ absl::StatusOr<Literal> ExecuteMetalPadCall() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalPadRank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_elementwise_pad_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {2, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  PaddingConfig padding;
+  PaddingConfig::PaddingConfigDimension* rows = padding.add_dimensions();
+  rows->set_edge_padding_low(1);
+  rows->set_edge_padding_high(1);
+  rows->set_interior_padding(0);
+  PaddingConfig::PaddingConfigDimension* cols = padding.add_dimensions();
+  cols->set_edge_padding_low(2);
+  cols->set_edge_padding_high(1);
+  cols->set_interior_padding(0);
+  Pad(input, ConstantR0<float>(&builder, 5.0f), padding);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(2, 3);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      values(row, col) = static_cast<float>(row * 3 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalGatherSelect() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -937,6 +968,17 @@ absl::StatusOr<Literal> ExecuteMetalS32Iota() {
   XlaBuilder builder("metal_s32_iota");
   Add(Iota(&builder, S32, 16), Broadcast(ConstantR0<int32_t>(&builder, 1),
                                         {16}));
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+  std::vector<GlobalData*> arguments;
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalIotaRank2(int64_t iota_dimension) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_iota_rank2");
+  Shape shape = ShapeUtil::MakeShape(F32, {3, 4});
+  Iota(&builder, shape, iota_dimension);
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
   std::vector<GlobalData*> arguments;
   return client->ExecuteAndTransfer(computation, arguments);
@@ -1927,6 +1969,25 @@ TEST(MetalGpuExecutableTest, ElementwisePadCall) {
                             /*high_padding=*/3, /*pad_value=*/1.5f);
 }
 
+TEST(MetalGpuExecutableTest, ElementwisePadRank2) {
+  auto result = ExecuteMetalPadRank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {4, 6})));
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 6; ++col) {
+      const bool in_input = row >= 1 && row < 3 && col >= 2 && col < 5;
+      const float expected =
+          in_input ? static_cast<float>((row - 1) * 3 + (col - 2)) : 5.0f;
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseGatherSelect) {
   auto result = ExecuteMetalGatherSelect();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2612,6 +2673,38 @@ TEST(MetalGpuExecutableTest, ElementwiseS32Iota) {
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {16})));
   for (int64_t i = 0; i < 16; ++i) {
     EXPECT_EQ(actual.Get<int32_t>({i}), static_cast<int32_t>(i + 1));
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseIotaRank2Dim0) {
+  auto result = ExecuteMetalIotaRank2(/*iota_dimension=*/0);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}), static_cast<float>(row))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseIotaRank2Dim1) {
+  auto result = ExecuteMetalIotaRank2(/*iota_dimension=*/1);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}), static_cast<float>(col))
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 
