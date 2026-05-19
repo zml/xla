@@ -24,6 +24,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/layout_util.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/metal_gpu_executable.h"
 #include "xla/shape_util.h"
@@ -81,6 +82,18 @@ absl::Status NormalizePackedSubbyteLayouts(HloModule* module) {
   return absl::OkStatus();
 }
 
+absl::Status NormalizeRootLayoutToEntryOutput(HloModule* module) {
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  const Shape& output_shape = module->entry_computation_layout().result_shape();
+  if (!ShapeUtil::Compatible(root->shape(), output_shape)) {
+    return absl::InvalidArgumentError(
+        "Metal direct AIR root shape is not compatible with the entry output "
+        "layout.");
+  }
+  return LayoutUtil::CopyLayoutBetweenShapes(output_shape,
+                                             root->mutable_shape());
+}
+
 }  // namespace
 
 se::Platform::Id MetalGpuCompiler::PlatformId() const {
@@ -91,6 +104,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
   TF_RETURN_IF_ERROR(NormalizePackedSubbyteLayouts(module.get()));
+  TF_RETURN_IF_ERROR(NormalizeRootLayoutToEntryOutput(module.get()));
   return std::move(module);
 }
 

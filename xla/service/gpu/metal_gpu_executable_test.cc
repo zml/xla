@@ -242,6 +242,119 @@ absl::StatusOr<Literal> ExecuteMetalBatchedDotBf16() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalDotBf16NonLeadingBatch() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_bf16_non_leading_batch");
+  Shape lhs_shape = ShapeUtil::MakeShape(BF16, {2, 2, 24, 5});
+  Shape rhs_shape = ShapeUtil::MakeShape(BF16, {5, 5, 2, 24});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_batch_dimensions(0);
+  dnums.add_lhs_batch_dimensions(3);
+  dnums.add_rhs_batch_dimensions(2);
+  dnums.add_rhs_batch_dimensions(1);
+  dnums.add_lhs_contracting_dimensions(2);
+  dnums.add_rhs_contracting_dimensions(3);
+  DotGeneral(lhs, rhs, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  for (int64_t b0 = 0; b0 < 2; ++b0) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t k = 0; k < 24; ++k) {
+        for (int64_t b1 = 0; b1 < 5; ++b1) {
+          lhs_literal.Set<bfloat16>(
+              {b0, row, k, b1},
+              bfloat16(static_cast<float>((b0 * 240 + row * 120 + k * 5 +
+                                           b1) %
+                                              17 -
+                                          8) *
+                       0.125f));
+        }
+      }
+    }
+  }
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t col = 0; col < 5; ++col) {
+    for (int64_t b1 = 0; b1 < 5; ++b1) {
+      for (int64_t b0 = 0; b0 < 2; ++b0) {
+        for (int64_t k = 0; k < 24; ++k) {
+          rhs_literal.Set<bfloat16>(
+              {col, b1, b0, k},
+              bfloat16(static_cast<float>((col * 240 + b1 * 48 + b0 * 24 +
+                                           k) %
+                                              19 -
+                                          9) *
+                       0.0625f));
+        }
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalDotC64NonLeadingBatch() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_dot_c64_non_leading_batch");
+  Shape lhs_shape = ShapeUtil::MakeShape(C64, {2, 2, 4, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(C64, {5, 3, 2, 4});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_batch_dimensions(0);
+  dnums.add_lhs_batch_dimensions(3);
+  dnums.add_rhs_batch_dimensions(2);
+  dnums.add_rhs_batch_dimensions(1);
+  dnums.add_lhs_contracting_dimensions(2);
+  dnums.add_rhs_contracting_dimensions(3);
+  DotGeneral(lhs, rhs, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal lhs_literal = Literal::CreateFromShape(lhs_shape);
+  for (int64_t b0 = 0; b0 < 2; ++b0) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t k = 0; k < 4; ++k) {
+        for (int64_t b1 = 0; b1 < 3; ++b1) {
+          lhs_literal.Set<complex64>(
+              {b0, row, k, b1},
+              complex64(static_cast<float>(b0 * 24 + row * 12 + k * 3 + b1) *
+                            0.125f,
+                        static_cast<float>(row - k + b1) * 0.25f));
+        }
+      }
+    }
+  }
+  Literal rhs_literal = Literal::CreateFromShape(rhs_shape);
+  for (int64_t col = 0; col < 5; ++col) {
+    for (int64_t b1 = 0; b1 < 3; ++b1) {
+      for (int64_t b0 = 0; b0 < 2; ++b0) {
+        for (int64_t k = 0; k < 4; ++k) {
+          rhs_literal.Set<complex64>(
+              {col, b1, b0, k},
+              complex64(static_cast<float>(col * 24 + b1 * 8 + b0 * 4 + k -
+                                           7) *
+                            0.0625f,
+                        static_cast<float>(col - b0 - k) * 0.125f));
+        }
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalBatchedDotF16Rank4() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -315,6 +428,52 @@ absl::StatusOr<Literal> ExecuteMetalConv1D() {
   kernel_values(2, 0, 0) = -1.0f;
   Literal input_literal = LiteralUtil::CreateR3FromArray3D(input_values);
   Literal kernel_literal = LiteralUtil::CreateR3FromArray3D(kernel_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv1DU16FeatureGroupPadding() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_1d_u16_feature_group_padding");
+  Shape input_shape = ShapeUtil::MakeShape(U16, {2, 3, 4});
+  Shape kernel_shape = ShapeUtil::MakeShape(U16, {4, 2, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_feature_dimension(0);
+  dnums.set_input_batch_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.add_kernel_spatial_dimensions(1);
+  dnums.set_kernel_input_feature_dimension(2);
+  dnums.add_output_spatial_dimensions(0);
+  dnums.set_output_batch_dimension(1);
+  dnums.set_output_feature_dimension(2);
+  ConvGeneralDilated(input, kernel, {2}, {{0, 2}}, {}, {}, dnums,
+                     /*feature_group_count=*/2, /*batch_group_count=*/1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t f = 0; f < 2; ++f) {
+    for (int64_t b = 0; b < 3; ++b) {
+      for (int64_t x = 0; x < 4; ++x) {
+        input_literal.Set<uint16_t>(
+            {f, b, x}, static_cast<uint16_t>(f * 100 + b * 10 + x));
+      }
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  for (int64_t o = 0; o < 4; ++o) {
+    for (int64_t k = 0; k < 2; ++k) {
+      kernel_literal.Set<uint16_t>({o, k, 0},
+                                   static_cast<uint16_t>(o + k + 1));
+    }
+  }
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
@@ -575,6 +734,55 @@ absl::StatusOr<Literal> ExecuteMetalConv2DInt8EmptyWidth() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConv2DS8PreferredF32() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_2d_s8_preferred_f32");
+  Shape input_shape = ShapeUtil::MakeShape(S8, {1, 1, 3, 3});
+  Shape kernel_shape = ShapeUtil::MakeShape(S8, {1, 1, 2, 2});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.add_input_spatial_dimensions(3);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.add_kernel_spatial_dimensions(2);
+  dnums.add_kernel_spatial_dimensions(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.add_output_spatial_dimensions(3);
+  std::vector<std::pair<int64_t, int64_t>> padding = {{0, 0}, {0, 0}};
+  ConvGeneralDilated(input, kernel, {1, 1}, padding, {}, {}, dnums,
+                     /*feature_group_count=*/1, /*batch_group_count=*/1,
+                     /*precision_config=*/nullptr, F32);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t h = 0; h < 3; ++h) {
+    for (int64_t w = 0; w < 3; ++w) {
+      input_literal.Set<int8_t>(
+          {0, 0, h, w}, static_cast<int8_t>(h * 3 + w - 4));
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  const int8_t kernel_values[2][2] = {{2, -1}, {3, 1}};
+  for (int64_t h = 0; h < 2; ++h) {
+    for (int64_t w = 0; w < 2; ++w) {
+      kernel_literal.Set<int8_t>({0, 0, h, w}, kernel_values[h][w]);
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConv2DFeatureGroup() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -620,6 +828,61 @@ absl::StatusOr<Literal> ExecuteMetalConv2DFeatureGroup() {
               {o, i, h, w},
               static_cast<float>((o * 8 + i * 4 + h * 2 + w) % 9 - 4) *
                   0.25f);
+        }
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv2DS32FeatureGroupDilation() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_2d_s32_feature_group_dilation");
+  Shape input_shape = ShapeUtil::MakeShape(S32, {1, 4, 4, 5});
+  Shape kernel_shape = ShapeUtil::MakeShape(S32, {4, 2, 2, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.add_input_spatial_dimensions(3);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.add_kernel_spatial_dimensions(2);
+  dnums.add_kernel_spatial_dimensions(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.add_output_spatial_dimensions(3);
+  std::vector<std::pair<int64_t, int64_t>> padding = {{1, 0}, {2, 1}};
+  ConvGeneralDilated(input, kernel, {2, 1}, padding, {1, 2}, {1, 2}, dnums,
+                     /*feature_group_count=*/2, /*batch_group_count=*/1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t c = 0; c < 4; ++c) {
+    for (int64_t h = 0; h < 4; ++h) {
+      for (int64_t w = 0; w < 5; ++w) {
+        input_literal.Set<int32_t>(
+            {0, c, h, w}, static_cast<int32_t>((c * 20 + h * 5 + w) % 17 - 8));
+      }
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  for (int64_t o = 0; o < 4; ++o) {
+    for (int64_t i = 0; i < 2; ++i) {
+      for (int64_t h = 0; h < 2; ++h) {
+        for (int64_t w = 0; w < 3; ++w) {
+          kernel_literal.Set<int32_t>(
+              {o, i, h, w},
+              static_cast<int32_t>((o * 12 + i * 6 + h * 3 + w) % 7 - 3));
         }
       }
     }
@@ -796,6 +1059,60 @@ absl::StatusOr<Literal> ExecuteMetalComplexConv2DBatchGroupDilation() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalComplexConv2DFeatureGroup() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_conv_2d_feature_group");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {1, 2, 2, 4});
+  Shape kernel_shape = ShapeUtil::MakeShape(C64, {1, 1, 2, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.add_input_spatial_dimensions(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.set_input_feature_dimension(3);
+  dnums.add_kernel_spatial_dimensions(0);
+  dnums.add_kernel_spatial_dimensions(1);
+  dnums.set_kernel_input_feature_dimension(2);
+  dnums.set_kernel_output_feature_dimension(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.add_output_spatial_dimensions(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.set_output_feature_dimension(3);
+  std::vector<std::pair<int64_t, int64_t>> padding = {{0, 0}, {0, 0}};
+  ConvGeneralDilated(input, kernel, {1, 1}, padding, {}, {}, dnums,
+                     /*feature_group_count=*/2, /*batch_group_count=*/1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t h = 0; h < 2; ++h) {
+    for (int64_t w = 0; w < 2; ++w) {
+      for (int64_t c = 0; c < 4; ++c) {
+        input_literal.Set<complex64>(
+            {0, h, w, c},
+            complex64(static_cast<float>(h * 8 + w * 4 + c) * 0.125f,
+                      static_cast<float>(c - h - w) * 0.25f));
+      }
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t o = 0; o < 4; ++o) {
+      kernel_literal.Set<complex64>(
+          {0, 0, i, o},
+          complex64(static_cast<float>(i * 4 + o - 3) * 0.25f,
+                    static_cast<float>(o - i) * 0.125f));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalComplexConv0DBatchGroup() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -872,6 +1189,30 @@ absl::StatusOr<Literal> ExecuteMetalComplexTranspose() {
       input_literal.Set<complex64>(
           {row, col}, complex64(static_cast<float>(row * 3 + col),
                                 static_cast<float>(row - col)));
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalBroadcastC64Rank2ToRank3() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_broadcast_c64_rank2_to_rank3");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {2, 3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BroadcastInDim(input, {4, 2, 3}, {1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      input_literal.Set<complex64>(
+          {row, col},
+          complex64(static_cast<float>(row * 3 + col),
+                    static_cast<float>(row - col) * 0.25f));
     }
   }
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
@@ -1433,6 +1774,57 @@ absl::StatusOr<Literal> ExecuteMetalReverseRank2() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReverseRank3() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_reverse_rank3");
+  Shape shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Rev(input, {0, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array3D<float> values(2, 3, 4);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        values(i, j, k) = static_cast<float>(i * 12 + j * 4 + k);
+      }
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalReverseRank4Bf16() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_reverse_rank4_bf16");
+  Shape shape = ShapeUtil::MakeShape(BF16, {2, 2, 3, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Rev(input, {1, 2});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(shape);
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 2; ++j) {
+      for (int64_t k = 0; k < 3; ++k) {
+        for (int64_t l = 0; l < 4; ++l) {
+          input_literal.Set<bfloat16>(
+              {i, j, k, l},
+              bfloat16(static_cast<float>(i * 24 + j * 12 + k * 4 + l)));
+        }
+      }
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalDynamicSliceDynamicStart() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1790,6 +2182,36 @@ absl::StatusOr<Literal> ExecuteMetalReduceWindowRank2(HloOpcode opcode,
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReduceWindowPaddedLogAddExp() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_window_logaddexp_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  XlaOp diff = Sub(lhs, rhs);
+  XlaOp nan_diff = Ne(diff, diff);
+  XlaOp fallback = Add(lhs, rhs);
+  XlaOp stable = Add(Max(lhs, rhs), Log1p(Exp(Neg(Abs(diff)))));
+  Select(nan_diff, fallback, stable);
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_window_padded_logaddexp");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  ReduceWindowWithGeneralPadding(
+      input, ConstantR0<float>(&builder, -std::numeric_limits<float>::infinity()),
+      reducer, {4}, {1}, {}, {}, {{3, 0}});
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<float> values = {-1.0f, -0.25f, 0.5f, 1.25f};
+  Literal input_literal = LiteralUtil::CreateR1<float>(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConditional() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1987,8 +2409,18 @@ absl::StatusOr<Literal> ExecuteMetalConvert(PrimitiveType input_type,
   ConvertElementType(input, output_type);
   TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
 
-  Literal input_literal =
-      input_type == F32 ? MakeElementwiseLhs() : MakeElementwiseS32();
+  Literal input_literal = [&] {
+    if (input_type == F32) {
+      return MakeElementwiseLhs();
+    }
+    if (input_type == S32) {
+      return MakeElementwiseS32();
+    }
+    if (input_type == PRED) {
+      return MakeElementwisePred();
+    }
+    return Literal::CreateFromShape(input_shape);
+  }();
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   std::vector<GlobalData*> arguments = {input_data.get()};
@@ -2421,6 +2853,85 @@ TEST(MetalGpuExecutableTest, BatchedDotBf16UsesScalarAirFallback) {
   }
 }
 
+TEST(MetalGpuExecutableTest, DotBf16NonLeadingBatchUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotBf16NonLeadingBatch();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(BF16, {2, 5, 2, 5})));
+
+  auto lhs_value = [](int64_t b0, int64_t row, int64_t k, int64_t b1) {
+    return static_cast<float>(bfloat16(
+        static_cast<float>((b0 * 240 + row * 120 + k * 5 + b1) % 17 - 8) *
+        0.125f));
+  };
+  auto rhs_value = [](int64_t col, int64_t b1, int64_t b0, int64_t k) {
+    return static_cast<float>(bfloat16(
+        static_cast<float>((col * 240 + b1 * 48 + b0 * 24 + k) % 19 - 9) *
+        0.0625f));
+  };
+  for (int64_t b0 = 0; b0 < 2; ++b0) {
+    for (int64_t b1 = 0; b1 < 5; ++b1) {
+      for (int64_t row = 0; row < 2; ++row) {
+        for (int64_t col = 0; col < 5; ++col) {
+          float expected = 0.0f;
+          for (int64_t k = 0; k < 24; ++k) {
+            expected += lhs_value(b0, row, k, b1) *
+                        rhs_value(col, b1, b0, k);
+          }
+          EXPECT_EQ(actual.Get<bfloat16>({b0, b1, row, col}),
+                    bfloat16(expected))
+              << "at (" << b0 << ", " << b1 << ", " << row << ", " << col
+              << ")";
+        }
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, DotC64NonLeadingBatchUsesScalarAirFallback) {
+  auto result = ExecuteMetalDotC64NonLeadingBatch();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(C64, {2, 3, 2, 5})));
+
+  auto lhs_value = [](int64_t b0, int64_t row, int64_t k, int64_t b1) {
+    return complex64(static_cast<float>(b0 * 24 + row * 12 + k * 3 + b1) *
+                         0.125f,
+                     static_cast<float>(row - k + b1) * 0.25f);
+  };
+  auto rhs_value = [](int64_t col, int64_t b1, int64_t b0, int64_t k) {
+    return complex64(static_cast<float>(col * 24 + b1 * 8 + b0 * 4 + k - 7) *
+                         0.0625f,
+                     static_cast<float>(col - b0 - k) * 0.125f);
+  };
+  for (int64_t b0 = 0; b0 < 2; ++b0) {
+    for (int64_t b1 = 0; b1 < 3; ++b1) {
+      for (int64_t row = 0; row < 2; ++row) {
+        for (int64_t col = 0; col < 5; ++col) {
+          complex64 expected(0.0f, 0.0f);
+          for (int64_t k = 0; k < 4; ++k) {
+            expected += lhs_value(b0, row, k, b1) *
+                        rhs_value(col, b1, b0, k);
+          }
+          const complex64 value = actual.Get<complex64>({b0, b1, row, col});
+          EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f)
+              << "real at (" << b0 << ", " << b1 << ", " << row << ", "
+              << col << ")";
+          EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f)
+              << "imag at (" << b0 << ", " << b1 << ", " << row << ", "
+              << col << ")";
+        }
+      }
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, BatchedDotF16Rank4UsesScalarAirFallback) {
   auto result = ExecuteMetalBatchedDotF16Rank4();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2456,6 +2967,42 @@ TEST(MetalGpuExecutableTest, Conv1DUsesScalarAirFallback) {
   std::vector<float> expected = {0.0f, 2.0f, 4.0f};
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({0, i, 0}), expected[i]) << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv1DU16FeatureGroupPadding) {
+  auto result = ExecuteMetalConv1DU16FeatureGroupPadding();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(U16, {3, 3, 4})));
+
+  auto input_value = [](int64_t f, int64_t b, int64_t x) {
+    return static_cast<uint16_t>(f * 100 + b * 10 + x);
+  };
+  auto kernel_value = [](int64_t o, int64_t k) {
+    return static_cast<uint16_t>(o + k + 1);
+  };
+  for (int64_t x = 0; x < 3; ++x) {
+    for (int64_t b = 0; b < 3; ++b) {
+      for (int64_t o = 0; o < 4; ++o) {
+        const int64_t feature_group = o / 2;
+        uint16_t expected = 0;
+        for (int64_t k = 0; k < 2; ++k) {
+          const int64_t input_x = x * 2 + k;
+          if (input_x >= 4) {
+            continue;
+          }
+          expected = static_cast<uint16_t>(
+              expected + input_value(feature_group, b, input_x) *
+                             kernel_value(o, k));
+        }
+        EXPECT_EQ(actual.Get<uint16_t>({x, b, o}), expected)
+            << "at (" << x << ", " << b << ", " << o << ")";
+      }
+    }
   }
 }
 
@@ -2585,6 +3132,33 @@ TEST(MetalGpuExecutableTest, Conv2DInt8EmptyWidthReturnsEmptyResult) {
                                     ShapeUtil::MakeShape(S8, {2, 4, 9, 0})));
 }
 
+TEST(MetalGpuExecutableTest, Conv2DS8PreferredF32) {
+  auto result = ExecuteMetalConv2DS8PreferredF32();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {1, 1, 2, 2})));
+
+  auto input_value = [](int64_t h, int64_t w) {
+    return static_cast<float>(h * 3 + w - 4);
+  };
+  const float kernel_values[2][2] = {{2.0f, -1.0f}, {3.0f, 1.0f}};
+  for (int64_t oh = 0; oh < 2; ++oh) {
+    for (int64_t ow = 0; ow < 2; ++ow) {
+      float expected = 0.0f;
+      for (int64_t kh = 0; kh < 2; ++kh) {
+        for (int64_t kw = 0; kw < 2; ++kw) {
+          expected += input_value(oh + kh, ow + kw) * kernel_values[kh][kw];
+        }
+      }
+      EXPECT_FLOAT_EQ(actual.Get<float>({0, 0, oh, ow}), expected)
+          << "at (" << oh << ", " << ow << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, Conv2DFeatureGroupUsesScalarAirFallback) {
   auto result = ExecuteMetalConv2DFeatureGroup();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2615,6 +3189,50 @@ TEST(MetalGpuExecutableTest, Conv2DFeatureGroupUsesScalarAirFallback) {
           }
         }
         EXPECT_EQ(actual.Get<float>({0, o, oh, ow}), expected)
+            << "at (" << o << ", " << oh << ", " << ow << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv2DS32FeatureGroupDilation) {
+  auto result = ExecuteMetalConv2DS32FeatureGroupDilation();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(S32, {1, 4, 2, 8})));
+
+  auto input_value = [](int64_t c, int64_t h, int64_t w) {
+    return static_cast<int32_t>((c * 20 + h * 5 + w) % 17 - 8);
+  };
+  auto kernel_value = [](int64_t o, int64_t i, int64_t h, int64_t w) {
+    return static_cast<int32_t>((o * 12 + i * 6 + h * 3 + w) % 7 - 3);
+  };
+  for (int64_t o = 0; o < 4; ++o) {
+    const int64_t feature_group = o / 2;
+    for (int64_t oh = 0; oh < 2; ++oh) {
+      for (int64_t ow = 0; ow < 8; ++ow) {
+        int32_t expected = 0;
+        for (int64_t i = 0; i < 2; ++i) {
+          for (int64_t kh = 0; kh < 2; ++kh) {
+            const int64_t dilated_h = oh * 2 + kh - 1;
+            if (dilated_h < 0 || dilated_h >= 4) {
+              continue;
+            }
+            for (int64_t kw = 0; kw < 3; ++kw) {
+              const int64_t dilated_w = ow + kw * 2 - 2;
+              if (dilated_w < 0 || dilated_w >= 9 || dilated_w % 2 != 0) {
+                continue;
+              }
+              expected += input_value(feature_group * 2 + i, dilated_h,
+                                      dilated_w / 2) *
+                          kernel_value(o, i, kh, kw);
+            }
+          }
+        }
+        EXPECT_EQ(actual.Get<int32_t>({0, o, oh, ow}), expected)
             << "at (" << o << ", " << oh << ", " << ow << ")";
       }
     }
@@ -2740,6 +3358,41 @@ TEST(MetalGpuExecutableTest, ComplexConv2DBatchGroupDilation) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ComplexConv2DFeatureGroup) {
+  auto result = ExecuteMetalComplexConv2DFeatureGroup();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(C64, {1, 2, 2, 4})));
+  auto input_value = [](int64_t h, int64_t w, int64_t c) {
+    return complex64(static_cast<float>(h * 8 + w * 4 + c) * 0.125f,
+                     static_cast<float>(c - h - w) * 0.25f);
+  };
+  auto kernel_value = [](int64_t i, int64_t o) {
+    return complex64(static_cast<float>(i * 4 + o - 3) * 0.25f,
+                     static_cast<float>(o - i) * 0.125f);
+  };
+  for (int64_t h = 0; h < 2; ++h) {
+    for (int64_t w = 0; w < 2; ++w) {
+      for (int64_t o = 0; o < 4; ++o) {
+        const int64_t feature_group = o / 2;
+        complex64 expected(0.0f, 0.0f);
+        for (int64_t i = 0; i < 2; ++i) {
+          expected += input_value(h, w, feature_group * 2 + i) *
+                      kernel_value(i, o);
+        }
+        const complex64 value = actual.Get<complex64>({0, h, w, o});
+        EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f)
+            << "real at (" << h << ", " << w << ", " << o << ")";
+        EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f)
+            << "imag at (" << h << ", " << w << ", " << o << ")";
+      }
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ComplexConv0DBatchGroup) {
   auto result = ExecuteMetalComplexConv0DBatchGroup();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2817,6 +3470,26 @@ TEST(MetalGpuExecutableTest, ComplexTranspose) {
                                                << col << ")";
       EXPECT_EQ(value.imag(), expected.imag()) << "imag at (" << row << ", "
                                                << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, BroadcastC64Rank2ToRank3) {
+  auto result = ExecuteMetalBroadcastC64Rank2ToRank3();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(C64, {4, 2, 3})));
+  for (int64_t batch = 0; batch < 4; ++batch) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t col = 0; col < 3; ++col) {
+        const complex64 expected(static_cast<float>(row * 3 + col),
+                                 static_cast<float>(row - col) * 0.25f);
+        EXPECT_EQ(actual.Get<complex64>({batch, row, col}), expected)
+            << "at (" << batch << ", " << row << ", " << col << ")";
+      }
     }
   }
 }
@@ -3699,6 +4372,47 @@ TEST(MetalGpuExecutableTest, ElementwiseReverseRank2) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseReverseRank3) {
+  auto result = ExecuteMetalReverseRank3();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F32, {2, 3, 4})));
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 3; ++j) {
+      for (int64_t k = 0; k < 4; ++k) {
+        EXPECT_EQ(actual.Get<float>({i, j, k}),
+                  static_cast<float>((1 - i) * 12 + j * 4 + (3 - k)))
+            << "at (" << i << ", " << j << ", " << k << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReverseRank4Bf16) {
+  auto result = ExecuteMetalReverseRank4Bf16();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(BF16, {2, 2, 3, 4})));
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t j = 0; j < 2; ++j) {
+      for (int64_t k = 0; k < 3; ++k) {
+        for (int64_t l = 0; l < 4; ++l) {
+          const float expected =
+              static_cast<float>(i * 24 + (1 - j) * 12 + (2 - k) * 4 + l);
+          EXPECT_EQ(actual.Get<bfloat16>({i, j, k, l}), bfloat16(expected))
+              << "at (" << i << ", " << j << ", " << k << ", " << l << ")";
+        }
+      }
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseDynamicSliceDynamicStart) {
   auto result = ExecuteMetalDynamicSliceDynamicStart();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -3890,6 +4604,29 @@ TEST(MetalGpuExecutableTest, ElementwiseReduceWindowRank2Max) {
                 static_cast<float>((row + 1) * 5 + col + 1))
           << "at (" << row << ", " << col << ")";
     }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceWindowPaddedLogAddExp) {
+  auto result = ExecuteMetalReduceWindowPaddedLogAddExp();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {4})));
+
+  const std::vector<float> values = {-1.0f, -0.25f, 0.5f, 1.25f};
+  auto logaddexp = [](float lhs, float rhs) {
+    if (std::isnan(lhs - rhs)) {
+      return lhs + rhs;
+    }
+    return std::max(lhs, rhs) + std::log1p(std::exp(-std::abs(lhs - rhs)));
+  };
+  float expected = -std::numeric_limits<float>::infinity();
+  for (int64_t i = 0; i < values.size(); ++i) {
+    expected = logaddexp(expected, values[i]);
+    EXPECT_NEAR(actual.Get<float>({i}), expected, 1e-5f) << "at " << i;
   }
 }
 
@@ -4468,6 +5205,27 @@ TEST(MetalGpuExecutableTest, ElementwiseIota) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseS32EffectiveScalarConstant) {
+  auto client_result = GetMetalClient();
+  if (absl::IsFailedPrecondition(client_result.status())) {
+    GTEST_SKIP() << client_result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(LocalClient * client, std::move(client_result));
+
+  XlaBuilder builder("metal_s32_effective_scalar_constant");
+  ConstantLiteral(&builder, LiteralUtil::CreateR1<int32_t>({7}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, builder.Build());
+  std::vector<GlobalData*> arguments;
+  auto result = client->ExecuteAndTransfer(computation, arguments);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S32, {1})));
+  EXPECT_EQ(actual.Get<int32_t>({0}), 7);
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseS32Iota) {
   auto result = ExecuteMetalS32Iota();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -4692,6 +5450,54 @@ TEST(MetalGpuExecutableTest, ConvertS32ToF32) {
   ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
     return static_cast<float>(input.Get<int32_t>({i}));
   });
+}
+
+TEST(MetalGpuExecutableTest, ConvertPredToBF16) {
+  auto result = ExecuteMetalConvert(PRED, BF16);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(BF16, {kElementCount})));
+  Literal input = MakeElementwisePred();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    EXPECT_EQ(actual.Get<bfloat16>({i}),
+              bfloat16(input.Get<bool>({i}) ? 1.0f : 0.0f))
+        << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ConvertPredToU16) {
+  auto result = ExecuteMetalConvert(PRED, U16);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(U16, {kElementCount})));
+  Literal input = MakeElementwisePred();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    EXPECT_EQ(actual.Get<uint16_t>({i}),
+              static_cast<uint16_t>(input.Get<bool>({i}) ? 1 : 0))
+        << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ConvertPredToC64) {
+  auto result = ExecuteMetalConvert(PRED, C64);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(C64, {kElementCount})));
+  Literal input = MakeElementwisePred();
+  for (int64_t i = 0; i < kElementCount; ++i) {
+    EXPECT_EQ(actual.Get<complex64>({i}),
+              complex64(input.Get<bool>({i}) ? 1.0f : 0.0f, 0.0f))
+        << "at " << i;
+  }
 }
 
 TEST(MetalGpuExecutableTest, BitcastConvertU16ToF16) {

@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -58,6 +60,7 @@ limitations under the License.
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/subprocess.h"
+#include "xla/types.h"
 
 namespace xla {
 namespace gpu {
@@ -219,7 +222,11 @@ bool IsScalarLikeS32(const Shape& shape) {
 }
 
 bool IsScalarLikeSupported(const Shape& shape) {
-  return (shape.element_type() == F32 || shape.element_type() == S32 ||
+  return (shape.element_type() == F32 || shape.element_type() == F16 ||
+          shape.element_type() == BF16 || shape.element_type() == S32 ||
+          shape.element_type() == S16 || shape.element_type() == S8 ||
+          shape.element_type() == U32 || shape.element_type() == U16 ||
+          shape.element_type() == U8 ||
           shape.element_type() == PRED) &&
          ShapeUtil::IsEffectiveScalar(shape);
 }
@@ -352,6 +359,69 @@ std::string DefaultIrValue(PrimitiveType type) {
     default:
       return "0";
   }
+}
+
+bool IsScalarConvolutionElementType(PrimitiveType type) {
+  switch (type) {
+    case F32:
+    case F16:
+    case BF16:
+    case S8:
+    case S16:
+    case S32:
+    case U8:
+    case U16:
+    case U32:
+    case PRED:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsFloatAccumulatorElementType(PrimitiveType type) {
+  return type == F32 || type == F16 || type == BF16;
+}
+
+bool IsSignedIntegerElementType(PrimitiveType type) {
+  return type == S8 || type == S16 || type == S32;
+}
+
+bool IsUnsignedIntegerElementType(PrimitiveType type) {
+  return type == U8 || type == U16 || type == U32;
+}
+
+bool IsIntegerElementType(PrimitiveType type) {
+  return IsSignedIntegerElementType(type) || IsUnsignedIntegerElementType(type);
+}
+
+bool IsSupportedConvolutionElementPair(PrimitiveType input_type,
+                                       PrimitiveType result_type) {
+  if (!IsScalarConvolutionElementType(input_type) ||
+      !IsScalarConvolutionElementType(result_type)) {
+    return false;
+  }
+  if (input_type == result_type) {
+    return true;
+  }
+  if ((input_type == F16 || input_type == BF16) && result_type == F32) {
+    return true;
+  }
+  if (IsIntegerElementType(input_type) &&
+      IsFloatAccumulatorElementType(result_type)) {
+    return true;
+  }
+  if (IsSignedIntegerElementType(input_type) &&
+      IsSignedIntegerElementType(result_type) &&
+      ElementBitWidth(input_type) <= ElementBitWidth(result_type)) {
+    return true;
+  }
+  if (IsUnsignedIntegerElementType(input_type) &&
+      IsUnsignedIntegerElementType(result_type) &&
+      ElementBitWidth(input_type) <= ElementBitWidth(result_type)) {
+    return true;
+  }
+  return false;
 }
 
 bool IsZeroValue(const HloInstruction* instruction) {
@@ -556,6 +626,11 @@ class ElementwiseAirEmitter {
     absl::flat_hash_map<int64_t, const HloInstruction*> arguments;
   };
 
+  struct ScalarParameterScope {
+    const HloComputation* computation = nullptr;
+    absl::flat_hash_map<int64_t, std::string> values;
+  };
+
   absl::StatusOr<std::string> EmitValue(const HloInstruction* instr,
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
@@ -579,16 +654,46 @@ class ElementwiseAirEmitter {
             "Metal direct AIR elementwise currently supports only f32/s32 scalar "
             "constants.");
       }
+      std::vector<int64_t> index(instr->shape().dimensions().size(), 0);
       if (instr->shape().element_type() == S32) {
-        return absl::StrCat(instr->literal().Get<int32_t>({}));
+        return absl::StrCat(instr->literal().Get<int32_t>(index));
+      }
+      if (instr->shape().element_type() == S16) {
+        return absl::StrCat(instr->literal().Get<int16_t>(index));
+      }
+      if (instr->shape().element_type() == S8) {
+        return absl::StrCat(
+            static_cast<int>(instr->literal().Get<int8_t>(index)));
+      }
+      if (instr->shape().element_type() == U32) {
+        return absl::StrCat(instr->literal().Get<uint32_t>(index));
+      }
+      if (instr->shape().element_type() == U16) {
+        return absl::StrCat(instr->literal().Get<uint16_t>(index));
+      }
+      if (instr->shape().element_type() == U8) {
+        return absl::StrCat(
+            static_cast<unsigned int>(instr->literal().Get<uint8_t>(index)));
       }
       if (instr->shape().element_type() == PRED) {
-        return instr->literal().Get<bool>({}) ? "true" : "false";
+        return instr->literal().Get<bool>(index) ? "true" : "false";
       }
-      return FloatLiteral(instr->literal().Get<float>({}));
+      if (instr->shape().element_type() == F16) {
+        return FloatLiteral(
+            static_cast<float>(instr->literal().Get<half>(index)));
+      }
+      if (instr->shape().element_type() == BF16) {
+        return FloatLiteral(
+            static_cast<float>(instr->literal().Get<bfloat16>(index)));
+      }
+      return FloatLiteral(instr->literal().Get<float>(index));
     }
 
     if (instr->opcode() == HloOpcode::kParameter) {
+      if (std::optional<std::string> override =
+              ScalarParameterOverride(instr)) {
+        return *override;
+      }
       if (const HloInstruction* override = CallParameterOverride(instr)) {
         return EmitValue(override, force_scalar, body);
       }
@@ -763,13 +868,26 @@ class ElementwiseAirEmitter {
       }
       return EmitComplexConvolution2D(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kConvert) {
+      return EmitComplexConvert(instr, body);
+    }
+    if (instr->opcode() == HloOpcode::kDot) {
+      return EmitComplexDot(instr, body);
+    }
+    if (instr->opcode() == HloOpcode::kBroadcast) {
+      if (!IsC64Array(instr->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR complex broadcast supports only c64 arrays.");
+      }
+      return EmitLoadFromLinearIndex(instr, "%idx", body);
+    }
     if (instr->opcode() == HloOpcode::kTranspose &&
         ShapeUtil::Equal(instr->shape(), result_shape_)) {
       if (!IsC64Array(instr->shape()) || !IsC64Array(instr->operand(0)->shape())) {
         return absl::UnimplementedError(
             "Metal direct AIR complex root transpose supports only c64 arrays.");
       }
-      return EmitLoadFromLinearIndex(instr->operand(0), "%idx", body);
+      return EmitLoadFromLinearIndex(instr, "%idx", body);
     }
     if (instr->opcode() == HloOpcode::kParameter ||
         instr->opcode() == HloOpcode::kBitcast ||
@@ -784,6 +902,257 @@ class ElementwiseAirEmitter {
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR complex path does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitComplexConvert(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    const PrimitiveType src_type = operand->shape().element_type();
+    if (!IsC64Array(instr->shape()) ||
+        instr->shape().dimensions() != operand->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex convert requires a c64 array result with "
+          "the same dimensions as the operand.");
+    }
+    if (src_type == C64) {
+      return EmitComplexValue(operand, body);
+    }
+    if (src_type != PRED && src_type != F32 && src_type != F16 &&
+        src_type != BF16) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex convert currently supports only pred and "
+          "real floating-point operands.");
+    }
+
+    TF_ASSIGN_OR_RETURN(
+        std::string source,
+        EmitValue(operand, ShapeUtil::IsEffectiveScalar(instr->shape()), body));
+    std::string real = source;
+    if (src_type == PRED) {
+      real = NewName("complex_convert_real");
+      body->push_back(
+          absl::StrFormat("  %s = uitofp i1 %s to float", real, source));
+    }
+    std::string real_part = NewName("complex_convert_insert_real");
+    std::string complex_value = NewName("complex_convert_value");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float 0x0000000000000000, i32 1",
+        complex_value, real_part));
+    return complex_value;
+  }
+
+  absl::StatusOr<std::string> EmitComplexDot(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* lhs = instr->operand(0);
+    const HloInstruction* rhs = instr->operand(1);
+    if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        !IsC64Array(instr->shape()) || !IsC64Array(lhs->shape()) ||
+        !IsC64Array(rhs->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex dot requires c64 arrays matching the "
+          "final result.");
+    }
+    const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
+    if (dnums.lhs_contracting_dimensions_size() != 1 ||
+        dnums.rhs_contracting_dimensions_size() != 1 ||
+        dnums.lhs_batch_dimensions_size() !=
+            dnums.rhs_batch_dimensions_size()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex dot currently supports one contracting "
+          "dimension and matching batch dimensions.");
+    }
+
+    const int64_t lhs_rank = lhs->shape().dimensions().size();
+    const int64_t rhs_rank = rhs->shape().dimensions().size();
+    const int64_t result_rank = instr->shape().dimensions().size();
+    const int64_t lhs_contract = dnums.lhs_contracting_dimensions(0);
+    const int64_t rhs_contract = dnums.rhs_contracting_dimensions(0);
+    std::vector<bool> lhs_used(lhs_rank, false);
+    std::vector<bool> rhs_used(rhs_rank, false);
+    auto mark_dim = [](std::vector<bool>* used, int64_t dim) {
+      if (dim < 0 || dim >= static_cast<int64_t>(used->size()) ||
+          (*used)[dim]) {
+        return false;
+      }
+      (*used)[dim] = true;
+      return true;
+    };
+    if (!mark_dim(&lhs_used, lhs_contract) ||
+        !mark_dim(&rhs_used, rhs_contract) ||
+        lhs->shape().dimensions(lhs_contract) !=
+            rhs->shape().dimensions(rhs_contract)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex dot dimension numbers do not match.");
+    }
+
+    std::vector<int64_t> lhs_batch;
+    std::vector<int64_t> rhs_batch;
+    std::vector<int64_t> result_dims;
+    result_dims.reserve(result_rank);
+    for (int64_t i = 0; i < dnums.lhs_batch_dimensions_size(); ++i) {
+      const int64_t lhs_dim = dnums.lhs_batch_dimensions(i);
+      const int64_t rhs_dim = dnums.rhs_batch_dimensions(i);
+      if (!mark_dim(&lhs_used, lhs_dim) || !mark_dim(&rhs_used, rhs_dim) ||
+          lhs->shape().dimensions(lhs_dim) !=
+              rhs->shape().dimensions(rhs_dim)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR complex dot batch dimensions do not match.");
+      }
+      lhs_batch.push_back(lhs_dim);
+      rhs_batch.push_back(rhs_dim);
+      result_dims.push_back(lhs->shape().dimensions(lhs_dim));
+    }
+
+    std::vector<int64_t> lhs_outer;
+    std::vector<int64_t> rhs_outer;
+    for (int64_t dim = 0; dim < lhs_rank; ++dim) {
+      if (!lhs_used[dim]) {
+        lhs_outer.push_back(dim);
+        result_dims.push_back(lhs->shape().dimensions(dim));
+      }
+    }
+    for (int64_t dim = 0; dim < rhs_rank; ++dim) {
+      if (!rhs_used[dim]) {
+        rhs_outer.push_back(dim);
+        result_dims.push_back(rhs->shape().dimensions(dim));
+      }
+    }
+    if (result_dims.size() != result_rank) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex dot result rank does not match dot "
+          "dimension numbers.");
+    }
+    for (int64_t dim = 0; dim < result_rank; ++dim) {
+      if (instr->shape().dimensions(dim) != result_dims[dim]) {
+        return absl::UnimplementedError(
+            "Metal direct AIR complex dot result dimensions do not match.");
+      }
+    }
+
+    auto emit_coords = [&](const Shape& shape, absl::string_view index,
+                           absl::string_view prefix) {
+      const int64_t rank = shape.dimensions().size();
+      std::vector<std::string> coords(rank);
+      std::string remaining(index);
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (dim == rank - 1) {
+          coords[dim] = remaining;
+          break;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string coord = NewName(absl::StrCat(prefix, "_coord"));
+        std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+        body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                        remaining, stride));
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                        remaining, stride));
+        coords[dim] = coord;
+        remaining = rem;
+      }
+      return coords;
+    };
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string linear = "0";
+      const int64_t rank = shape.dimensions().size();
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (coords[dim] == "0") {
+          continue;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string term = coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(prefix, "_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          coords[dim], stride));
+        }
+        if (linear == "0") {
+          linear = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(prefix, "_index"));
+          body->push_back(
+              absl::StrFormat("  %s = add i64 %s, %s", sum, linear, term));
+          linear = sum;
+        }
+      }
+      return linear;
+    };
+
+    std::vector<std::string> out_coords =
+        emit_coords(instr->shape(), "%idx", "complex_dot_out");
+    const int64_t k = lhs->shape().dimensions(lhs_contract);
+    std::string acc_real = "0x0000000000000000";
+    std::string acc_imag = "0x0000000000000000";
+    for (int64_t kk = 0; kk < k; ++kk) {
+      std::vector<std::string> lhs_coords(lhs_rank, "0");
+      std::vector<std::string> rhs_coords(rhs_rank, "0");
+      int64_t result_dim = 0;
+      for (int64_t i = 0; i < lhs_batch.size(); ++i, ++result_dim) {
+        lhs_coords[lhs_batch[i]] = out_coords[result_dim];
+        rhs_coords[rhs_batch[i]] = out_coords[result_dim];
+      }
+      for (int64_t dim : lhs_outer) {
+        lhs_coords[dim] = out_coords[result_dim++];
+      }
+      for (int64_t dim : rhs_outer) {
+        rhs_coords[dim] = out_coords[result_dim++];
+      }
+      lhs_coords[lhs_contract] = absl::StrCat(kk);
+      rhs_coords[rhs_contract] = absl::StrCat(kk);
+
+      std::string lhs_index =
+          emit_linear_index(lhs->shape(), lhs_coords, "complex_dot_lhs");
+      std::string rhs_index =
+          emit_linear_index(rhs->shape(), rhs_coords, "complex_dot_rhs");
+      TF_ASSIGN_OR_RETURN(std::string lhs_value,
+                          EmitLoadFromLinearIndex(lhs, lhs_index, body));
+      TF_ASSIGN_OR_RETURN(std::string rhs_value,
+                          EmitLoadFromLinearIndex(rhs, rhs_index, body));
+      std::string lhs_real = NewName("complex_dot_lhs_real");
+      std::string lhs_imag = NewName("complex_dot_lhs_imag");
+      std::string rhs_real = NewName("complex_dot_rhs_real");
+      std::string rhs_imag = NewName("complex_dot_rhs_imag");
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 0", lhs_real,
+          lhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 1", lhs_imag,
+          lhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 0", rhs_real,
+          rhs_value));
+      body->push_back(absl::StrFormat(
+          "  %s = extractelement <2 x float> %s, i32 1", rhs_imag,
+          rhs_value));
+      std::string rr = EmitOp("fmul fast float", lhs_real, rhs_real, body);
+      std::string ii = EmitOp("fmul fast float", lhs_imag, rhs_imag, body);
+      std::string ri = EmitOp("fmul fast float", lhs_real, rhs_imag, body);
+      std::string ir = EmitOp("fmul fast float", lhs_imag, rhs_real, body);
+      std::string product_real = EmitOp("fsub fast float", rr, ii, body);
+      std::string product_imag = EmitOp("fadd fast float", ri, ir, body);
+      acc_real = EmitOp("fadd fast float", acc_real, product_real, body);
+      acc_imag = EmitOp("fadd fast float", acc_imag, product_imag, body);
+    }
+
+    std::string real_part = NewName("complex_dot_real");
+    std::string complex_value = NewName("complex_dot_value");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        acc_real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1",
+        complex_value, real_part, acc_imag));
+    return complex_value;
   }
 
   absl::StatusOr<std::string> EmitRfft(const HloInstruction* instr,
@@ -1063,10 +1432,10 @@ class ElementwiseAirEmitter {
         dnums.kernel_spatial_dimensions_size() != 2 ||
         dnums.output_spatial_dimensions_size() != 2 ||
         instr->window().dimensions().size() != 2 ||
-        instr->feature_group_count() != 1) {
+        instr->feature_group_count() <= 0 || instr->batch_group_count() <= 0) {
       return absl::UnimplementedError(
           "Metal direct AIR complex convolution currently supports only c64 "
-          "rank-4 2D convolutions without feature groups.");
+          "rank-4 2D convolutions with positive group counts.");
     }
 
     auto valid_permutation = [](std::vector<int64_t> dims) {
@@ -1108,12 +1477,15 @@ class ElementwiseAirEmitter {
     const int64_t output_spatial0_dim = dnums.output_spatial_dimensions(0);
     const int64_t output_spatial1_dim = dnums.output_spatial_dimensions(1);
 
+    const int64_t feature_group_count = instr->feature_group_count();
     const int64_t batch_group_count = instr->batch_group_count();
     const int64_t input_batch = lhs->shape().dimensions(input_batch_dim);
     const int64_t output_batch = instr->shape().dimensions(output_batch_dim);
     const int64_t in_features = lhs->shape().dimensions(input_feature_dim);
     const int64_t out_features =
         rhs->shape().dimensions(kernel_output_feature_dim);
+    const int64_t rhs_input_features =
+        rhs->shape().dimensions(kernel_input_feature_dim);
     const int64_t in_spatial0 = lhs->shape().dimensions(input_spatial0_dim);
     const int64_t in_spatial1 = lhs->shape().dimensions(input_spatial1_dim);
     const int64_t kernel_spatial0 =
@@ -1124,9 +1496,10 @@ class ElementwiseAirEmitter {
         instr->shape().dimensions(output_spatial0_dim);
     const int64_t out_spatial1 =
         instr->shape().dimensions(output_spatial1_dim);
-    if (batch_group_count <= 0 || input_batch != output_batch * batch_group_count ||
+    if (input_batch != output_batch * batch_group_count ||
+        in_features != rhs_input_features * feature_group_count ||
+        out_features % feature_group_count != 0 ||
         out_features % batch_group_count != 0 ||
-        rhs->shape().dimensions(kernel_input_feature_dim) != in_features ||
         instr->shape().dimensions(output_feature_dim) != out_features) {
       return absl::UnimplementedError(
           "Metal direct AIR complex convolution dimensions do not match.");
@@ -1304,6 +1677,15 @@ class ElementwiseAirEmitter {
                                       input_batch_coord, out_batch,
                                       batch_group_offset));
     }
+    std::string feature_group = "0";
+    if (feature_group_count != 1) {
+      const int64_t out_features_per_feature_group =
+          out_features / feature_group_count;
+      feature_group = NewName("complex_conv_feature_group");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d",
+                                      feature_group, oc,
+                                      out_features_per_feature_group));
+    }
 
     std::string acc_real = "0x0000000000000000";
     std::string acc_imag = "0x0000000000000000";
@@ -1323,10 +1705,23 @@ class ElementwiseAirEmitter {
         body->push_back(
             absl::StrFormat("  %s = and i1 %s, %s", in_bounds, ok0, ok1));
 
-        for (int64_t ic = 0; ic < in_features; ++ic) {
+        for (int64_t ic = 0; ic < rhs_input_features; ++ic) {
+          std::string lhs_feature = absl::StrCat(ic);
+          if (feature_group_count != 1) {
+            std::string feature_group_offset =
+                NewName("complex_conv_feature_group_offset");
+            lhs_feature = NewName("complex_conv_lhs_feature");
+            body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                            feature_group_offset,
+                                            feature_group,
+                                            rhs_input_features));
+            body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                            lhs_feature, feature_group_offset,
+                                            ic));
+          }
           std::vector<std::string> lhs_coords(4, "0");
           lhs_coords[input_batch_dim] = input_batch_coord;
-          lhs_coords[input_feature_dim] = absl::StrCat(ic);
+          lhs_coords[input_feature_dim] = lhs_feature;
           lhs_coords[input_spatial0_dim] = safe0;
           lhs_coords[input_spatial1_dim] = safe1;
           std::string lhs_index =
@@ -1428,6 +1823,63 @@ class ElementwiseAirEmitter {
         return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
       }
       return EmitBroadcastFromLinearIndex(instr, index, body);
+    }
+    if (instr->opcode() == HloOpcode::kConvert) {
+      const PrimitiveType src_type = instr->operand(0)->shape().element_type();
+      const PrimitiveType dst_type = instr->shape().element_type();
+      TF_ASSIGN_OR_RETURN(
+          std::string value,
+          EmitLoadFromLinearIndex(instr->operand(0), index, body));
+      if (src_type == dst_type ||
+          (IsFloatAccumulatorElementType(src_type) &&
+           IsFloatAccumulatorElementType(dst_type))) {
+        return value;
+      }
+      std::string converted = NewName("linear_convert");
+      if (src_type == PRED && IsFloatAccumulatorElementType(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = uitofp i1 %s to float",
+                                        converted, value));
+        return converted;
+      }
+      if (IsSignedIntegerElementType(src_type) &&
+          IsFloatAccumulatorElementType(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = sitofp %s %s to float",
+                                        converted, ElementIrType(src_type),
+                                        value));
+        return converted;
+      }
+      if (IsUnsignedIntegerElementType(src_type) &&
+          IsFloatAccumulatorElementType(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = uitofp %s %s to float",
+                                        converted, ElementIrType(src_type),
+                                        value));
+        return converted;
+      }
+      if (src_type == PRED && IsIntegerElementType(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = zext i1 %s to %s", converted,
+                                        value, ElementIrType(dst_type)));
+        return converted;
+      }
+      if (IsSignedIntegerElementType(src_type) &&
+          IsSignedIntegerElementType(dst_type) &&
+          ElementBitWidth(src_type) < ElementBitWidth(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = sext %s %s to %s", converted,
+                                        ElementIrType(src_type), value,
+                                        ElementIrType(dst_type)));
+        return converted;
+      }
+      if (IsUnsignedIntegerElementType(src_type) &&
+          IsUnsignedIntegerElementType(dst_type) &&
+          ElementBitWidth(src_type) < ElementBitWidth(dst_type)) {
+        body->push_back(absl::StrFormat("  %s = zext %s %s to %s", converted,
+                                        ElementIrType(src_type), value,
+                                        ElementIrType(dst_type)));
+        return converted;
+      }
+      return absl::UnimplementedError(absl::StrFormat(
+          "Metal direct AIR linear load convert does not support %s to %s.",
+          primitive_util::LowercasePrimitiveTypeName(src_type),
+          primitive_util::LowercasePrimitiveTypeName(dst_type)));
     }
     if (instr->opcode() == HloOpcode::kIota) {
       const auto* iota = Cast<HloIotaInstruction>(instr);
@@ -1787,49 +2239,57 @@ class ElementwiseAirEmitter {
           "arrays with matching operand and result shapes.");
     }
     const int64_t rank = instr->shape().dimensions().size();
-    if (rank != 1 && rank != 2) {
-      return absl::UnimplementedError(
-          "Metal direct AIR reverse currently supports only rank-1 and "
-          "rank-2 arrays.");
-    }
 
-    if (rank == 1) {
-      if (!HasReverseDimension(instr, 0)) {
-        return std::string(index);
+    std::vector<std::string> coords(rank);
+    std::string remaining(index);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      if (dim == rank - 1) {
+        coords[dim] = remaining;
+        break;
       }
-      std::string reversed = NewName("reverse_index");
-      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", reversed,
-                                      instr->shape().dimensions(0) - 1,
-                                      index));
-      return reversed;
+      int64_t stride = 1;
+      for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+        stride *= instr->shape().dimensions(minor_dim);
+      }
+      std::string coord = NewName("reverse_coord");
+      std::string rem = NewName("reverse_rem");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                      remaining, stride));
+      body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                      remaining, stride));
+      coords[dim] = coord;
+      remaining = rem;
     }
 
-    const int64_t rows = instr->shape().dimensions(0);
-    const int64_t cols = instr->shape().dimensions(1);
-    std::string row = NewName("reverse_row");
-    std::string col = NewName("reverse_col");
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %s, %d", row, index, cols));
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %s, %d", col, index, cols));
-    std::string source_row = row;
-    std::string source_col = col;
-    if (HasReverseDimension(instr, 0)) {
-      source_row = NewName("reverse_source_row");
-      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", source_row,
-                                      rows - 1, row));
+    std::string source_index = "0";
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      std::string coord = coords[dim];
+      if (HasReverseDimension(instr, dim)) {
+        std::string reversed = NewName("reverse_source_coord");
+        body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", reversed,
+                                        instr->shape().dimensions(dim) - 1,
+                                        coord));
+        coord = reversed;
+      }
+      int64_t stride = 1;
+      for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+        stride *= instr->shape().dimensions(minor_dim);
+      }
+      std::string term = coord;
+      if (stride != 1) {
+        term = NewName("reverse_term");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term, coord,
+                                        stride));
+      }
+      if (source_index == "0") {
+        source_index = term;
+      } else {
+        std::string sum = NewName("reverse_index");
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", sum,
+                                        source_index, term));
+        source_index = sum;
+      }
     }
-    if (HasReverseDimension(instr, 1)) {
-      source_col = NewName("reverse_source_col");
-      body->push_back(absl::StrFormat("  %s = sub i64 %d, %s", source_col,
-                                      cols - 1, col));
-    }
-    std::string row_offset = NewName("reverse_row_offset");
-    std::string source_index = NewName("reverse_index");
-    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
-                                    source_row, cols));
-    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
-                                    row_offset, source_col));
     return source_index;
   }
 
@@ -1956,7 +2416,7 @@ class ElementwiseAirEmitter {
           "Metal direct AIR root transpose requires supported arrays with "
           "matching element types, ranks, and result element count.");
     }
-    return EmitLoadFromLinearIndex(operand, "%idx", body);
+    return EmitLoadFromLinearIndex(instr, "%idx", body);
   }
 
   absl::StatusOr<std::string> EmitTransposeSourceIndex(
@@ -2150,9 +2610,184 @@ class ElementwiseAirEmitter {
                                  batch0_count * batch1_count, m, n, k, body);
     }
 
-    return absl::UnimplementedError(
-        "Metal direct AIR dot fallback currently supports only rank-2 matmul "
-        "or rank-3/rank-4 batched matmul with leading batch dimensions.");
+    return EmitGenericDot(instr, body);
+  }
+
+  absl::StatusOr<std::string> EmitGenericDot(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* lhs = instr->operand(0);
+    const HloInstruction* rhs = instr->operand(1);
+    const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
+    if (dnums.lhs_contracting_dimensions_size() != 1 ||
+        dnums.rhs_contracting_dimensions_size() != 1 ||
+        dnums.lhs_batch_dimensions_size() !=
+            dnums.rhs_batch_dimensions_size()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dot fallback currently supports one contracting "
+          "dimension and matching batch dimensions.");
+    }
+
+    const int64_t lhs_rank = lhs->shape().dimensions().size();
+    const int64_t rhs_rank = rhs->shape().dimensions().size();
+    const int64_t result_rank = instr->shape().dimensions().size();
+    const int64_t lhs_contract = dnums.lhs_contracting_dimensions(0);
+    const int64_t rhs_contract = dnums.rhs_contracting_dimensions(0);
+    std::vector<bool> lhs_used(lhs_rank, false);
+    std::vector<bool> rhs_used(rhs_rank, false);
+    auto mark_dim = [](std::vector<bool>* used, int64_t dim) {
+      if (dim < 0 || dim >= static_cast<int64_t>(used->size()) ||
+          (*used)[dim]) {
+        return false;
+      }
+      (*used)[dim] = true;
+      return true;
+    };
+    if (!mark_dim(&lhs_used, lhs_contract) ||
+        !mark_dim(&rhs_used, rhs_contract) ||
+        lhs->shape().dimensions(lhs_contract) !=
+            rhs->shape().dimensions(rhs_contract)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dot fallback dimension numbers do not match.");
+    }
+
+    std::vector<int64_t> lhs_batch;
+    std::vector<int64_t> rhs_batch;
+    lhs_batch.reserve(dnums.lhs_batch_dimensions_size());
+    rhs_batch.reserve(dnums.rhs_batch_dimensions_size());
+    std::vector<int64_t> result_dims;
+    result_dims.reserve(result_rank);
+    for (int64_t i = 0; i < dnums.lhs_batch_dimensions_size(); ++i) {
+      const int64_t lhs_dim = dnums.lhs_batch_dimensions(i);
+      const int64_t rhs_dim = dnums.rhs_batch_dimensions(i);
+      if (!mark_dim(&lhs_used, lhs_dim) || !mark_dim(&rhs_used, rhs_dim) ||
+          lhs->shape().dimensions(lhs_dim) !=
+              rhs->shape().dimensions(rhs_dim)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR dot fallback batch dimensions do not match.");
+      }
+      lhs_batch.push_back(lhs_dim);
+      rhs_batch.push_back(rhs_dim);
+      result_dims.push_back(lhs->shape().dimensions(lhs_dim));
+    }
+
+    std::vector<int64_t> lhs_outer;
+    std::vector<int64_t> rhs_outer;
+    for (int64_t dim = 0; dim < lhs_rank; ++dim) {
+      if (!lhs_used[dim]) {
+        lhs_outer.push_back(dim);
+        result_dims.push_back(lhs->shape().dimensions(dim));
+      }
+    }
+    for (int64_t dim = 0; dim < rhs_rank; ++dim) {
+      if (!rhs_used[dim]) {
+        rhs_outer.push_back(dim);
+        result_dims.push_back(rhs->shape().dimensions(dim));
+      }
+    }
+    if (result_dims.size() != result_rank) {
+      return absl::UnimplementedError(
+          "Metal direct AIR dot fallback result rank does not match dot "
+          "dimension numbers.");
+    }
+    for (int64_t dim = 0; dim < result_rank; ++dim) {
+      if (instr->shape().dimensions(dim) != result_dims[dim]) {
+        return absl::UnimplementedError(
+            "Metal direct AIR dot fallback result dimensions do not match.");
+      }
+    }
+
+    auto emit_coords = [&](const Shape& shape, absl::string_view index,
+                           absl::string_view prefix) {
+      const int64_t rank = shape.dimensions().size();
+      std::vector<std::string> coords(rank);
+      std::string remaining(index);
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (dim == rank - 1) {
+          coords[dim] = remaining;
+          break;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string coord = NewName(absl::StrCat(prefix, "_coord"));
+        std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+        body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                        remaining, stride));
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                        remaining, stride));
+        coords[dim] = coord;
+        remaining = rem;
+      }
+      return coords;
+    };
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string linear = "0";
+      const int64_t rank = shape.dimensions().size();
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (coords[dim] == "0") {
+          continue;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string term = coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(prefix, "_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          coords[dim], stride));
+        }
+        if (linear == "0") {
+          linear = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(prefix, "_index"));
+          body->push_back(
+              absl::StrFormat("  %s = add i64 %s, %s", sum, linear, term));
+          linear = sum;
+        }
+      }
+      return linear;
+    };
+
+    std::vector<std::string> out_coords =
+        emit_coords(instr->shape(), "%idx", "dot_generic_out");
+    const int64_t k = lhs->shape().dimensions(lhs_contract);
+    std::string accumulator = "0x0000000000000000";
+    for (int64_t kk = 0; kk < k; ++kk) {
+      std::vector<std::string> lhs_coords(lhs_rank, "0");
+      std::vector<std::string> rhs_coords(rhs_rank, "0");
+      int64_t result_dim = 0;
+      for (int64_t i = 0; i < lhs_batch.size(); ++i, ++result_dim) {
+        lhs_coords[lhs_batch[i]] = out_coords[result_dim];
+        rhs_coords[rhs_batch[i]] = out_coords[result_dim];
+      }
+      for (int64_t dim : lhs_outer) {
+        lhs_coords[dim] = out_coords[result_dim++];
+      }
+      for (int64_t dim : rhs_outer) {
+        rhs_coords[dim] = out_coords[result_dim++];
+      }
+      lhs_coords[lhs_contract] = absl::StrCat(kk);
+      rhs_coords[rhs_contract] = absl::StrCat(kk);
+
+      std::string lhs_index =
+          emit_linear_index(lhs->shape(), lhs_coords, "dot_generic_lhs");
+      std::string rhs_index =
+          emit_linear_index(rhs->shape(), rhs_coords, "dot_generic_rhs");
+      TF_ASSIGN_OR_RETURN(std::string lhs_value,
+                          EmitLoadFromLinearIndex(lhs, lhs_index, body));
+      TF_ASSIGN_OR_RETURN(std::string rhs_value,
+                          EmitLoadFromLinearIndex(rhs, rhs_index, body));
+      std::string product =
+          EmitOp("fmul fast float", lhs_value, rhs_value, body);
+      TF_ASSIGN_OR_RETURN(accumulator,
+                          EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
+                                           product, body));
+    }
+    return accumulator;
   }
 
   absl::StatusOr<std::string> EmitRank2Dot(
@@ -2234,14 +2869,24 @@ class ElementwiseAirEmitter {
     const HloInstruction* rhs = instr->operand(1);
     const ConvolutionDimensionNumbers& dnums =
         instr->convolution_dimension_numbers();
-    const PrimitiveType conv_type = instr->shape().element_type();
-    if ((conv_type == F32 || conv_type == F16 || conv_type == BF16) &&
-        lhs->shape().element_type() == conv_type &&
-        rhs->shape().element_type() == conv_type &&
+    const PrimitiveType result_type = instr->shape().element_type();
+    const PrimitiveType conv_type = result_type;
+    const PrimitiveType lhs_type = lhs->shape().element_type();
+    const PrimitiveType rhs_type = rhs->shape().element_type();
+    if (lhs_type == rhs_type &&
+        IsSupportedConvolutionElementPair(lhs_type, result_type) &&
         instr->shape().dimensions().size() == 4 &&
         lhs->shape().dimensions().size() == 4 &&
         rhs->shape().dimensions().size() == 4) {
       return EmitConvolution2D(instr, body);
+    }
+    if (IsScalarConvolutionElementType(result_type) &&
+        lhs->shape().element_type() == result_type &&
+        rhs->shape().element_type() == result_type &&
+        instr->shape().dimensions().size() == 5 &&
+        lhs->shape().dimensions().size() == 5 &&
+        rhs->shape().dimensions().size() == 5) {
+      return EmitConvolutionND(instr, /*spatial_rank=*/3, body);
     }
     auto is_conv0d_type = [](PrimitiveType type) {
       switch (type) {
@@ -2269,95 +2914,333 @@ class ElementwiseAirEmitter {
         instr->window().dimensions().empty()) {
       return EmitConvolution0D(instr, body);
     }
-    if (!IsF32Array(instr->shape()) || !IsF32Array(lhs->shape()) ||
-        !IsF32Array(rhs->shape()) ||
+    auto is_conv1d_type = [](PrimitiveType type) {
+      switch (type) {
+        case F32:
+        case F16:
+        case BF16:
+        case S8:
+        case S16:
+        case S32:
+        case U8:
+        case U16:
+        case U32:
+        case PRED:
+          return true;
+        default:
+          return false;
+      }
+    };
+    if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        !is_conv1d_type(conv_type) ||
+        lhs->shape().element_type() != conv_type ||
+        rhs->shape().element_type() != conv_type ||
         instr->shape().dimensions().size() != 3 ||
         lhs->shape().dimensions().size() != 3 ||
         rhs->shape().dimensions().size() != 3 ||
-        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
-        dnums.input_batch_dimension() != 0 ||
         dnums.input_spatial_dimensions_size() != 1 ||
-        dnums.input_spatial_dimensions(0) != 1 ||
-        dnums.input_feature_dimension() != 2 ||
         dnums.kernel_spatial_dimensions_size() != 1 ||
-        dnums.kernel_spatial_dimensions(0) != 0 ||
-        dnums.kernel_input_feature_dimension() != 1 ||
-        dnums.kernel_output_feature_dimension() != 2 ||
-        dnums.output_batch_dimension() != 0 ||
         dnums.output_spatial_dimensions_size() != 1 ||
-        dnums.output_spatial_dimensions(0) != 1 ||
-        dnums.output_feature_dimension() != 2 ||
-        instr->window().dimensions().size() != 1) {
+        instr->window().dimensions().size() != 1 ||
+        instr->feature_group_count() <= 0 || instr->batch_group_count() <= 0) {
       return absl::UnimplementedError(
           "Metal direct AIR convolution currently supports only rank-3 "
-          "NWC/WIO/NWC f32 1D convolutions.");
+          "scalar 1D convolutions with positive group counts.");
     }
+
+    auto valid_permutation = [](std::vector<int64_t> dims) {
+      if (dims.size() != 3) {
+        return false;
+      }
+      absl::c_sort(dims);
+      return dims[0] == 0 && dims[1] == 1 && dims[2] == 2;
+    };
+    if (!valid_permutation({dnums.input_batch_dimension(),
+                            dnums.input_feature_dimension(),
+                            dnums.input_spatial_dimensions(0)}) ||
+        !valid_permutation({dnums.kernel_output_feature_dimension(),
+                            dnums.kernel_input_feature_dimension(),
+                            dnums.kernel_spatial_dimensions(0)}) ||
+        !valid_permutation({dnums.output_batch_dimension(),
+                            dnums.output_feature_dimension(),
+                            dnums.output_spatial_dimensions(0)})) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 1D convolution dimension numbers must be valid "
+          "rank-3 permutations.");
+    }
+
+    const int64_t input_batch_dim = dnums.input_batch_dimension();
+    const int64_t input_feature_dim = dnums.input_feature_dimension();
+    const int64_t input_spatial_dim = dnums.input_spatial_dimensions(0);
+    const int64_t kernel_output_feature_dim =
+        dnums.kernel_output_feature_dimension();
+    const int64_t kernel_input_feature_dim =
+        dnums.kernel_input_feature_dimension();
+    const int64_t kernel_spatial_dim = dnums.kernel_spatial_dimensions(0);
+    const int64_t output_batch_dim = dnums.output_batch_dimension();
+    const int64_t output_feature_dim = dnums.output_feature_dimension();
+    const int64_t output_spatial_dim = dnums.output_spatial_dimensions(0);
+
+    const int64_t feature_group_count = instr->feature_group_count();
+    const int64_t batch_group_count = instr->batch_group_count();
+    const int64_t input_batch = lhs->shape().dimensions(input_batch_dim);
+    const int64_t output_batch =
+        instr->shape().dimensions(output_batch_dim);
+    const int64_t in_features = lhs->shape().dimensions(input_feature_dim);
+    const int64_t out_features =
+        rhs->shape().dimensions(kernel_output_feature_dim);
+    const int64_t rhs_input_features =
+        rhs->shape().dimensions(kernel_input_feature_dim);
+    const int64_t in_spatial = lhs->shape().dimensions(input_spatial_dim);
+    const int64_t kernel_spatial =
+        rhs->shape().dimensions(kernel_spatial_dim);
+    const int64_t out_spatial =
+        instr->shape().dimensions(output_spatial_dim);
+
     const WindowDimension& dim = instr->window().dimensions(0);
-    if (dim.stride() != 1 || dim.padding_low() != 0 ||
-        dim.padding_high() != 0 || dim.base_dilation() != 1 ||
-        dim.window_dilation() != 1 || dim.window_reversal()) {
+    if (dim.stride() <= 0 || dim.base_dilation() <= 0 ||
+        dim.window_dilation() <= 0 || dim.window_reversal()) {
       return absl::UnimplementedError(
-          "Metal direct AIR convolution currently supports only VALID "
-          "stride-1 non-dilated 1D convolutions.");
+          "Metal direct AIR convolution does not support invalid dilation, "
+          "stride, or window reversal.");
+    }
+    auto effective_size = [](int64_t size, int64_t dilation) {
+      return size == 0 ? 0 : (size - 1) * dilation + 1;
+    };
+    const int64_t effective_input =
+        effective_size(in_spatial, dim.base_dilation());
+    const int64_t effective_kernel =
+        effective_size(kernel_spatial, dim.window_dilation());
+    const int64_t expected_out_spatial =
+        (effective_input + dim.padding_low() + dim.padding_high() -
+         effective_kernel) /
+            dim.stride() +
+        1;
+    if (input_batch != output_batch * batch_group_count ||
+        in_features != rhs_input_features * feature_group_count ||
+        out_features % feature_group_count != 0 ||
+        out_features % batch_group_count != 0 ||
+        instr->shape().dimensions(output_feature_dim) != out_features ||
+        out_spatial != expected_out_spatial ||
+        dim.size() != kernel_spatial) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 1D convolution dimensions do not match.");
     }
 
-    const int64_t out_w = instr->shape().dimensions(1);
-    const int64_t out_c = instr->shape().dimensions(2);
-    const int64_t in_w = lhs->shape().dimensions(1);
-    const int64_t in_c = lhs->shape().dimensions(2);
-    const int64_t kernel_w = rhs->shape().dimensions(0);
-    if (rhs->shape().dimensions(1) != in_c ||
-        rhs->shape().dimensions(2) != out_c) {
-      return absl::UnimplementedError(
-          "Metal direct AIR convolution feature dimensions do not match.");
+    if (in_features == 0 || rhs_input_features == 0 || in_spatial == 0 ||
+        kernel_spatial == 0) {
+      return DefaultIrValue(conv_type);
     }
 
-    std::string oc = NewName("conv_out_channel");
-    std::string output_linear = NewName("conv_output_linear");
-    std::string ow = NewName("conv_out_width");
-    std::string batch = NewName("conv_batch");
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %%idx, %d", oc, out_c));
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %%idx, %d", output_linear, out_c));
-    body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", ow,
-                                    output_linear, out_w));
-    body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", batch,
-                                    output_linear, out_w));
+    auto emit_coords = [&](const Shape& shape, absl::string_view index,
+                           absl::string_view prefix) {
+      std::vector<std::string> coords(3);
+      std::string remaining(index);
+      for (int64_t dim = 0; dim < 3; ++dim) {
+        if (dim == 2) {
+          coords[dim] = remaining;
+          break;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < 3; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string coord = NewName(absl::StrCat(prefix, "_coord"));
+        std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+        body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                        remaining, stride));
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                        remaining, stride));
+        coords[dim] = coord;
+        remaining = rem;
+      }
+      return coords;
+    };
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string linear = "0";
+      for (int64_t dim = 0; dim < 3; ++dim) {
+        if (coords[dim] == "0") {
+          continue;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < 3; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string term = coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(prefix, "_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          coords[dim], stride));
+        }
+        if (linear == "0") {
+          linear = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(prefix, "_index"));
+          body->push_back(
+              absl::StrFormat("  %s = add i64 %s, %s", sum, linear, term));
+          linear = sum;
+        }
+      }
+      return linear;
+    };
+    auto scaled_spatial = [&](absl::string_view output_coord,
+                              const WindowDimension& window,
+                              int64_t kernel_coord,
+                              absl::string_view prefix) {
+      std::string coord(output_coord);
+      if (window.stride() != 1) {
+        std::string scaled = NewName(absl::StrCat(prefix, "_scaled"));
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        coord, window.stride()));
+        coord = scaled;
+      }
+      const int64_t kernel_offset = kernel_coord * window.window_dilation();
+      if (kernel_offset != 0) {
+        std::string shifted = NewName(absl::StrCat(prefix, "_kernel"));
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        coord, kernel_offset));
+        coord = shifted;
+      }
+      if (window.padding_low() != 0) {
+        std::string padded = NewName(absl::StrCat(prefix, "_padded"));
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", padded,
+                                        coord, window.padding_low()));
+        coord = padded;
+      }
+      return coord;
+    };
+    auto emit_undilated_input = [&](absl::string_view dilated_coord,
+                                    int64_t effective_input,
+                                    int64_t base_dilation,
+                                    absl::string_view prefix) {
+      std::string ge0 = NewName(absl::StrCat(prefix, "_ge0"));
+      std::string lt = NewName(absl::StrCat(prefix, "_lt"));
+      std::string in_range = NewName(absl::StrCat(prefix, "_in_range"));
+      std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+      std::string divisible = NewName(absl::StrCat(prefix, "_divisible"));
+      std::string ok = NewName(absl::StrCat(prefix, "_ok"));
+      std::string undilated = NewName(absl::StrCat(prefix, "_undilated"));
+      std::string safe = NewName(absl::StrCat(prefix, "_safe"));
+      body->push_back(absl::StrFormat("  %s = icmp sge i64 %s, 0", ge0,
+                                      dilated_coord));
+      body->push_back(absl::StrFormat("  %s = icmp slt i64 %s, %d", lt,
+                                      dilated_coord, effective_input));
+      body->push_back(
+          absl::StrFormat("  %s = and i1 %s, %s", in_range, ge0, lt));
+      body->push_back(absl::StrFormat("  %s = srem i64 %s, %d", rem,
+                                      dilated_coord, base_dilation));
+      body->push_back(
+          absl::StrFormat("  %s = icmp eq i64 %s, 0", divisible, rem));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", ok, in_range,
+                                      divisible));
+      body->push_back(absl::StrFormat("  %s = sdiv i64 %s, %d", undilated,
+                                      dilated_coord, base_dilation));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe, ok, undilated));
+      return std::pair<std::string, std::string>(safe, ok);
+    };
 
-    std::string accumulator = "0x0000000000000000";
-    for (int64_t kw = 0; kw < kernel_w; ++kw) {
-      for (int64_t ic = 0; ic < in_c; ++ic) {
-        std::string batch_lhs_offset = NewName("conv_lhs_batch_offset");
-        std::string iw = NewName("conv_input_width");
-        std::string lhs_width_offset = NewName("conv_lhs_width_offset");
-        std::string lhs_base_index = NewName("conv_lhs_base_index");
-        std::string lhs_index = NewName("conv_lhs_index");
-        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
-                                        batch_lhs_offset, batch, in_w * in_c));
-        body->push_back(
-            absl::StrFormat("  %s = add i64 %s, %d", iw, ow, kw));
-        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
-                                        lhs_width_offset, iw, in_c));
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", lhs_base_index,
-                                        batch_lhs_offset, lhs_width_offset));
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", lhs_index,
-                                        lhs_base_index, ic));
-        std::string rhs_channel_offset = NewName("conv_rhs_channel_offset");
-        std::string rhs_index = NewName("conv_rhs_index");
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
-                                        rhs_channel_offset, oc,
-                                        (kw * in_c + ic) * out_c));
-        rhs_index = rhs_channel_offset;
+    std::vector<std::string> out_coords =
+        emit_coords(instr->shape(), "%idx", "conv_out");
+    const std::string& out_batch = out_coords[output_batch_dim];
+    const std::string& oc = out_coords[output_feature_dim];
+    const std::string& out_spatial_coord = out_coords[output_spatial_dim];
+
+    std::string input_batch_coord = out_batch;
+    if (batch_group_count != 1) {
+      const int64_t out_features_per_batch_group =
+          out_features / batch_group_count;
+      std::string batch_group = NewName("conv_batch_group");
+      std::string batch_group_offset = NewName("conv_batch_group_offset");
+      input_batch_coord = NewName("conv_input_batch");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", batch_group,
+                                      oc, out_features_per_batch_group));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                      batch_group_offset, batch_group,
+                                      output_batch));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
+                                      input_batch_coord, out_batch,
+                                      batch_group_offset));
+    }
+    std::string feature_group = "0";
+    if (feature_group_count != 1) {
+      const int64_t out_features_per_feature_group =
+          out_features / feature_group_count;
+      feature_group = NewName("conv_feature_group");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d",
+                                      feature_group, oc,
+                                      out_features_per_feature_group));
+    }
+
+    const bool float_accumulator =
+        conv_type == F32 || conv_type == F16 || conv_type == BF16;
+    const bool pred_accumulator = conv_type == PRED;
+    const char* accumulator_type =
+        float_accumulator ? "float" : ValueIrType(conv_type);
+    std::string accumulator = DefaultIrValue(conv_type);
+    for (int64_t k = 0; k < kernel_spatial; ++k) {
+      std::string dilated =
+          scaled_spatial(out_spatial_coord, dim, k, "conv_input");
+      auto [safe_spatial, in_bounds] = emit_undilated_input(
+          dilated, effective_input, dim.base_dilation(), "conv_input");
+      for (int64_t ic = 0; ic < rhs_input_features; ++ic) {
+        std::string lhs_feature = absl::StrCat(ic);
+        if (feature_group_count != 1) {
+          std::string feature_group_offset =
+              NewName("conv_feature_group_offset");
+          lhs_feature = NewName("conv_lhs_feature");
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                          feature_group_offset, feature_group,
+                                          rhs_input_features));
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                          lhs_feature, feature_group_offset,
+                                          ic));
+        }
+        std::vector<std::string> lhs_coords(3, "0");
+        lhs_coords[input_batch_dim] = input_batch_coord;
+        lhs_coords[input_feature_dim] = lhs_feature;
+        lhs_coords[input_spatial_dim] = safe_spatial;
+        std::string lhs_index =
+            emit_linear_index(lhs->shape(), lhs_coords, "conv_lhs");
+
+        std::vector<std::string> rhs_coords(3, "0");
+        rhs_coords[kernel_output_feature_dim] = oc;
+        rhs_coords[kernel_input_feature_dim] = absl::StrCat(ic);
+        rhs_coords[kernel_spatial_dim] = absl::StrCat(k);
+        std::string rhs_index =
+            emit_linear_index(rhs->shape(), rhs_coords, "conv_rhs");
         TF_ASSIGN_OR_RETURN(std::string lhs_value,
                             EmitLoadFromLinearIndex(lhs, lhs_index, body));
         TF_ASSIGN_OR_RETURN(std::string rhs_value,
                             EmitLoadFromLinearIndex(rhs, rhs_index, body));
-        std::string product =
-            EmitOp("fmul fast float", lhs_value, rhs_value, body);
-        TF_ASSIGN_OR_RETURN(accumulator,
-                            EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
-                                             product, body));
+        std::string product;
+        std::string contribution = NewName("conv_contribution");
+        if (float_accumulator) {
+          product = EmitOp("fmul fast float", lhs_value, rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, float %s, float 0x0000000000000000",
+              contribution, in_bounds, product));
+          TF_ASSIGN_OR_RETURN(
+              accumulator,
+              EmitF32ReducerOp(HloOpcode::kAdd, accumulator, contribution,
+                               body));
+        } else if (pred_accumulator) {
+          product = EmitOp("and i1", lhs_value, rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, i1 %s, i1 false", contribution,
+              in_bounds, product));
+          accumulator = EmitOp("or i1", accumulator, contribution, body);
+        } else {
+          product = EmitOp(absl::StrCat("mul ", accumulator_type), lhs_value,
+                           rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, %s %s, %s 0", contribution, in_bounds,
+              accumulator_type, product, accumulator_type));
+          accumulator = EmitOp(absl::StrCat("add ", accumulator_type),
+                               accumulator, contribution, body);
+        }
       }
     }
     return accumulator;
@@ -2557,17 +3440,64 @@ class ElementwiseAirEmitter {
     return accumulator;
   }
 
+  absl::StatusOr<std::string> EmitConvolutionCastValue(
+      absl::string_view value, PrimitiveType input_type,
+      PrimitiveType result_type, std::vector<std::string>* body) {
+    if (input_type == result_type ||
+        ((input_type == F16 || input_type == BF16) && result_type == F32)) {
+      return std::string(value);
+    }
+    if (IsFloatAccumulatorElementType(result_type)) {
+      std::string converted = NewName("conv_cast");
+      if (IsSignedIntegerElementType(input_type)) {
+        body->push_back(absl::StrFormat("  %s = sitofp %s %s to float",
+                                        converted, ElementIrType(input_type),
+                                        value));
+        return converted;
+      }
+      if (IsUnsignedIntegerElementType(input_type)) {
+        body->push_back(absl::StrFormat("  %s = uitofp %s %s to float",
+                                        converted, ElementIrType(input_type),
+                                        value));
+        return converted;
+      }
+    }
+    if (IsSignedIntegerElementType(input_type) &&
+        IsSignedIntegerElementType(result_type) &&
+        ElementBitWidth(input_type) < ElementBitWidth(result_type)) {
+      std::string converted = NewName("conv_cast");
+      body->push_back(absl::StrFormat("  %s = sext %s %s to %s", converted,
+                                      ElementIrType(input_type), value,
+                                      ElementIrType(result_type)));
+      return converted;
+    }
+    if (IsUnsignedIntegerElementType(input_type) &&
+        IsUnsignedIntegerElementType(result_type) &&
+        ElementBitWidth(input_type) < ElementBitWidth(result_type)) {
+      std::string converted = NewName("conv_cast");
+      body->push_back(absl::StrFormat("  %s = zext %s %s to %s", converted,
+                                      ElementIrType(input_type), value,
+                                      ElementIrType(result_type)));
+      return converted;
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR convolution does not support %s inputs with %s "
+        "results.",
+        primitive_util::LowercasePrimitiveTypeName(input_type),
+        primitive_util::LowercasePrimitiveTypeName(result_type)));
+  }
+
   absl::StatusOr<std::string> EmitConvolution2D(
       const HloInstruction* instr, std::vector<std::string>* body) {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
     const ConvolutionDimensionNumbers& dnums =
         instr->convolution_dimension_numbers();
-    const PrimitiveType conv_type = instr->shape().element_type();
+    const PrimitiveType result_type = instr->shape().element_type();
+    const PrimitiveType input_type = lhs->shape().element_type();
     if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
-        (conv_type != F32 && conv_type != F16 && conv_type != BF16) ||
-        lhs->shape().element_type() != conv_type ||
-        rhs->shape().element_type() != conv_type ||
+        !IsSupportedConvolutionElementPair(input_type, result_type) ||
+        rhs->shape().element_type() != input_type ||
         instr->shape().dimensions().size() != 4 ||
         lhs->shape().dimensions().size() != 4 ||
         rhs->shape().dimensions().size() != 4 ||
@@ -2578,7 +3508,7 @@ class ElementwiseAirEmitter {
         instr->feature_group_count() <= 0 || instr->batch_group_count() <= 0) {
       return absl::UnimplementedError(
           "Metal direct AIR convolution currently supports only rank-4 "
-          "f32/f16/bf16 2D convolutions with positive group counts.");
+          "scalar 2D convolutions with positive group counts.");
     }
 
     auto valid_permutation = [](std::vector<int64_t> dims) {
@@ -2688,7 +3618,7 @@ class ElementwiseAirEmitter {
 
     if (in_features == 0 || rhs_input_features == 0 || in_spatial0 == 0 ||
         in_spatial1 == 0 || kernel_spatial0 == 0 || kernel_spatial1 == 0) {
-      return DefaultIrValue(conv_type);
+      return DefaultIrValue(result_type);
     }
 
     auto emit_coords = [&](const Shape& shape, absl::string_view index,
@@ -2834,7 +3764,12 @@ class ElementwiseAirEmitter {
                                       out_features_per_feature_group));
     }
 
-    std::string accumulator = "0x0000000000000000";
+    const bool float_accumulator =
+        IsFloatAccumulatorElementType(result_type);
+    const bool pred_accumulator = result_type == PRED;
+    const char* accumulator_type =
+        float_accumulator ? "float" : ValueIrType(result_type);
+    std::string accumulator = DefaultIrValue(result_type);
     for (int64_t k0 = 0; k0 < kernel_spatial0; ++k0) {
       for (int64_t k1 = 0; k1 < kernel_spatial1; ++k1) {
         std::string dilated0 =
@@ -2884,18 +3819,450 @@ class ElementwiseAirEmitter {
                               EmitLoadFromLinearIndex(lhs, lhs_index, body));
           TF_ASSIGN_OR_RETURN(std::string rhs_value,
                               EmitLoadFromLinearIndex(rhs, rhs_index, body));
-          std::string product =
-              EmitOp("fmul fast float", lhs_value, rhs_value, body);
+          TF_ASSIGN_OR_RETURN(lhs_value, EmitConvolutionCastValue(
+                                             lhs_value, input_type, result_type,
+                                             body));
+          TF_ASSIGN_OR_RETURN(rhs_value, EmitConvolutionCastValue(
+                                             rhs_value, input_type, result_type,
+                                             body));
+          std::string product;
           std::string contribution = NewName("conv_contribution");
-          body->push_back(absl::StrFormat(
-              "  %s = select i1 %s, float %s, float 0x0000000000000000",
-              contribution, in_bounds, product));
-          TF_ASSIGN_OR_RETURN(accumulator,
-                            EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
-                                               contribution, body));
+          if (float_accumulator) {
+            product = EmitOp("fmul fast float", lhs_value, rhs_value, body);
+            body->push_back(absl::StrFormat(
+                "  %s = select i1 %s, float %s, float 0x0000000000000000",
+                contribution, in_bounds, product));
+            TF_ASSIGN_OR_RETURN(
+                accumulator,
+                EmitF32ReducerOp(HloOpcode::kAdd, accumulator, contribution,
+                                 body));
+          } else if (pred_accumulator) {
+            product = EmitOp("and i1", lhs_value, rhs_value, body);
+            body->push_back(absl::StrFormat(
+                "  %s = select i1 %s, i1 %s, i1 false", contribution,
+                in_bounds, product));
+            accumulator = EmitOp("or i1", accumulator, contribution, body);
+          } else {
+            product = EmitOp(absl::StrCat("mul ", accumulator_type), lhs_value,
+                             rhs_value, body);
+            body->push_back(absl::StrFormat(
+                "  %s = select i1 %s, %s %s, %s 0", contribution, in_bounds,
+                accumulator_type, product, accumulator_type));
+            accumulator = EmitOp(absl::StrCat("add ", accumulator_type),
+                                 accumulator, contribution, body);
+          }
         }
       }
     }
+    return accumulator;
+  }
+
+  absl::StatusOr<std::string> EmitConvolutionND(
+      const HloInstruction* instr, int64_t spatial_rank,
+      std::vector<std::string>* body) {
+    const HloInstruction* lhs = instr->operand(0);
+    const HloInstruction* rhs = instr->operand(1);
+    const ConvolutionDimensionNumbers& dnums =
+        instr->convolution_dimension_numbers();
+    const PrimitiveType conv_type = instr->shape().element_type();
+    const int64_t rank = spatial_rank + 2;
+
+    auto is_conv_type = [](PrimitiveType type) {
+      switch (type) {
+        case F32:
+        case F16:
+        case BF16:
+        case S8:
+        case S16:
+        case S32:
+        case U8:
+        case U16:
+        case U32:
+        case PRED:
+          return true;
+        default:
+          return false;
+      }
+    };
+    if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        !is_conv_type(conv_type) || lhs->shape().element_type() != conv_type ||
+        rhs->shape().element_type() != conv_type ||
+        instr->shape().dimensions().size() != rank ||
+        lhs->shape().dimensions().size() != rank ||
+        rhs->shape().dimensions().size() != rank ||
+        dnums.input_spatial_dimensions_size() != spatial_rank ||
+        dnums.kernel_spatial_dimensions_size() != spatial_rank ||
+        dnums.output_spatial_dimensions_size() != spatial_rank ||
+        instr->window().dimensions().size() != spatial_rank ||
+        instr->feature_group_count() <= 0 || instr->batch_group_count() <= 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR convolution currently supports only scalar "
+          "rank-N convolutions with positive group counts.");
+    }
+
+    auto valid_permutation = [&](std::vector<int64_t> dims) {
+      if (dims.size() != rank) {
+        return false;
+      }
+      absl::c_sort(dims);
+      for (int64_t i = 0; i < rank; ++i) {
+        if (dims[i] != i) {
+          return false;
+        }
+      }
+      return true;
+    };
+    std::vector<int64_t> input_dims = {dnums.input_batch_dimension(),
+                                       dnums.input_feature_dimension()};
+    std::vector<int64_t> kernel_dims = {
+        dnums.kernel_output_feature_dimension(),
+        dnums.kernel_input_feature_dimension()};
+    std::vector<int64_t> output_dims = {dnums.output_batch_dimension(),
+                                        dnums.output_feature_dimension()};
+    std::vector<int64_t> input_spatial_dims;
+    std::vector<int64_t> kernel_spatial_dims;
+    std::vector<int64_t> output_spatial_dims;
+    input_spatial_dims.reserve(spatial_rank);
+    kernel_spatial_dims.reserve(spatial_rank);
+    output_spatial_dims.reserve(spatial_rank);
+    for (int64_t i = 0; i < spatial_rank; ++i) {
+      input_spatial_dims.push_back(dnums.input_spatial_dimensions(i));
+      kernel_spatial_dims.push_back(dnums.kernel_spatial_dimensions(i));
+      output_spatial_dims.push_back(dnums.output_spatial_dimensions(i));
+      input_dims.push_back(input_spatial_dims.back());
+      kernel_dims.push_back(kernel_spatial_dims.back());
+      output_dims.push_back(output_spatial_dims.back());
+    }
+    if (!valid_permutation(input_dims) || !valid_permutation(kernel_dims) ||
+        !valid_permutation(output_dims)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR convolution dimension numbers must be valid "
+          "rank-N permutations.");
+    }
+
+    const int64_t input_batch_dim = dnums.input_batch_dimension();
+    const int64_t input_feature_dim = dnums.input_feature_dimension();
+    const int64_t kernel_output_feature_dim =
+        dnums.kernel_output_feature_dimension();
+    const int64_t kernel_input_feature_dim =
+        dnums.kernel_input_feature_dimension();
+    const int64_t output_batch_dim = dnums.output_batch_dimension();
+    const int64_t output_feature_dim = dnums.output_feature_dimension();
+    const int64_t feature_group_count = instr->feature_group_count();
+    const int64_t batch_group_count = instr->batch_group_count();
+    const int64_t input_batch = lhs->shape().dimensions(input_batch_dim);
+    const int64_t output_batch =
+        instr->shape().dimensions(output_batch_dim);
+    const int64_t in_features = lhs->shape().dimensions(input_feature_dim);
+    const int64_t out_features =
+        rhs->shape().dimensions(kernel_output_feature_dim);
+    const int64_t rhs_input_features =
+        rhs->shape().dimensions(kernel_input_feature_dim);
+
+    auto effective_size = [](int64_t size, int64_t dilation) {
+      return size == 0 ? 0 : (size - 1) * dilation + 1;
+    };
+    std::vector<int64_t> input_spatial_sizes;
+    std::vector<int64_t> kernel_spatial_sizes;
+    std::vector<int64_t> output_spatial_sizes;
+    std::vector<int64_t> effective_input_sizes;
+    input_spatial_sizes.reserve(spatial_rank);
+    kernel_spatial_sizes.reserve(spatial_rank);
+    output_spatial_sizes.reserve(spatial_rank);
+    effective_input_sizes.reserve(spatial_rank);
+    for (int64_t i = 0; i < spatial_rank; ++i) {
+      const WindowDimension& window = instr->window().dimensions(i);
+      if (window.stride() <= 0 || window.base_dilation() <= 0 ||
+          window.window_dilation() <= 0 || window.window_reversal()) {
+        return absl::UnimplementedError(
+            "Metal direct AIR convolution does not support invalid dilation, "
+            "stride, or window reversal.");
+      }
+      const int64_t input_size =
+          lhs->shape().dimensions(input_spatial_dims[i]);
+      const int64_t kernel_size =
+          rhs->shape().dimensions(kernel_spatial_dims[i]);
+      const int64_t output_size =
+          instr->shape().dimensions(output_spatial_dims[i]);
+      const int64_t effective_input =
+          effective_size(input_size, window.base_dilation());
+      const int64_t effective_kernel =
+          effective_size(kernel_size, window.window_dilation());
+      const int64_t expected_output =
+          (effective_input + window.padding_low() + window.padding_high() -
+           effective_kernel) /
+              window.stride() +
+          1;
+      if (output_size != expected_output || window.size() != kernel_size) {
+        return absl::UnimplementedError(
+            "Metal direct AIR convolution spatial dimensions do not match.");
+      }
+      input_spatial_sizes.push_back(input_size);
+      kernel_spatial_sizes.push_back(kernel_size);
+      output_spatial_sizes.push_back(output_size);
+      effective_input_sizes.push_back(effective_input);
+    }
+    if (input_batch != output_batch * batch_group_count ||
+        in_features != rhs_input_features * feature_group_count ||
+        out_features % feature_group_count != 0 ||
+        out_features % batch_group_count != 0 ||
+        instr->shape().dimensions(output_feature_dim) != out_features) {
+      return absl::UnimplementedError(
+          "Metal direct AIR convolution dimensions do not match.");
+    }
+    if (in_features == 0 || rhs_input_features == 0) {
+      return DefaultIrValue(conv_type);
+    }
+    for (int64_t i = 0; i < spatial_rank; ++i) {
+      if (input_spatial_sizes[i] == 0 || kernel_spatial_sizes[i] == 0) {
+        return DefaultIrValue(conv_type);
+      }
+    }
+
+    auto emit_coords = [&](const Shape& shape, absl::string_view index,
+                           absl::string_view prefix) {
+      std::vector<std::string> coords(rank);
+      std::string remaining(index);
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (dim == rank - 1) {
+          coords[dim] = remaining;
+          break;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string coord = NewName(absl::StrCat(prefix, "_coord"));
+        std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+        body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                        remaining, stride));
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                        remaining, stride));
+        coords[dim] = coord;
+        remaining = rem;
+      }
+      return coords;
+    };
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string linear = "0";
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        if (coords[dim] == "0") {
+          continue;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string term = coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(prefix, "_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          coords[dim], stride));
+        }
+        if (linear == "0") {
+          linear = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(prefix, "_index"));
+          body->push_back(
+              absl::StrFormat("  %s = add i64 %s, %s", sum, linear, term));
+          linear = sum;
+        }
+      }
+      return linear;
+    };
+    auto scaled_spatial = [&](absl::string_view output_coord,
+                              const WindowDimension& window,
+                              int64_t kernel_coord,
+                              absl::string_view prefix) {
+      std::string coord(output_coord);
+      if (window.stride() != 1) {
+        std::string scaled = NewName(absl::StrCat(prefix, "_scaled"));
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        coord, window.stride()));
+        coord = scaled;
+      }
+      const int64_t kernel_offset = kernel_coord * window.window_dilation();
+      if (kernel_offset != 0) {
+        std::string shifted = NewName(absl::StrCat(prefix, "_kernel"));
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        coord, kernel_offset));
+        coord = shifted;
+      }
+      if (window.padding_low() != 0) {
+        std::string padded = NewName(absl::StrCat(prefix, "_padded"));
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", padded,
+                                        coord, window.padding_low()));
+        coord = padded;
+      }
+      return coord;
+    };
+    auto emit_undilated_input = [&](absl::string_view dilated_coord,
+                                    int64_t effective_input,
+                                    int64_t base_dilation,
+                                    absl::string_view prefix) {
+      std::string ge0 = NewName(absl::StrCat(prefix, "_ge0"));
+      std::string lt = NewName(absl::StrCat(prefix, "_lt"));
+      std::string in_range = NewName(absl::StrCat(prefix, "_in_range"));
+      std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+      std::string divisible = NewName(absl::StrCat(prefix, "_divisible"));
+      std::string ok = NewName(absl::StrCat(prefix, "_ok"));
+      std::string undilated = NewName(absl::StrCat(prefix, "_undilated"));
+      std::string safe = NewName(absl::StrCat(prefix, "_safe"));
+      body->push_back(absl::StrFormat("  %s = icmp sge i64 %s, 0", ge0,
+                                      dilated_coord));
+      body->push_back(absl::StrFormat("  %s = icmp slt i64 %s, %d", lt,
+                                      dilated_coord, effective_input));
+      body->push_back(
+          absl::StrFormat("  %s = and i1 %s, %s", in_range, ge0, lt));
+      body->push_back(absl::StrFormat("  %s = srem i64 %s, %d", rem,
+                                      dilated_coord, base_dilation));
+      body->push_back(
+          absl::StrFormat("  %s = icmp eq i64 %s, 0", divisible, rem));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", ok, in_range,
+                                      divisible));
+      body->push_back(absl::StrFormat("  %s = sdiv i64 %s, %d", undilated,
+                                      dilated_coord, base_dilation));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe, ok, undilated));
+      return std::pair<std::string, std::string>(safe, ok);
+    };
+
+    std::vector<std::string> out_coords =
+        emit_coords(instr->shape(), "%idx", "conv_nd_out");
+    const std::string& out_batch = out_coords[output_batch_dim];
+    const std::string& oc = out_coords[output_feature_dim];
+
+    std::string input_batch_coord = out_batch;
+    if (batch_group_count != 1) {
+      const int64_t out_features_per_batch_group =
+          out_features / batch_group_count;
+      std::string batch_group = NewName("conv_nd_batch_group");
+      std::string batch_group_offset =
+          NewName("conv_nd_batch_group_offset");
+      input_batch_coord = NewName("conv_nd_input_batch");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", batch_group,
+                                      oc, out_features_per_batch_group));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                      batch_group_offset, batch_group,
+                                      output_batch));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
+                                      input_batch_coord, out_batch,
+                                      batch_group_offset));
+    }
+    std::string feature_group = "0";
+    if (feature_group_count != 1) {
+      const int64_t out_features_per_feature_group =
+          out_features / feature_group_count;
+      feature_group = NewName("conv_nd_feature_group");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d",
+                                      feature_group, oc,
+                                      out_features_per_feature_group));
+    }
+
+    const bool float_accumulator =
+        conv_type == F32 || conv_type == F16 || conv_type == BF16;
+    const bool pred_accumulator = conv_type == PRED;
+    const char* accumulator_type =
+        float_accumulator ? "float" : ValueIrType(conv_type);
+    std::string accumulator = DefaultIrValue(conv_type);
+    std::vector<int64_t> kernel_coords(spatial_rank, 0);
+    std::function<absl::Status(int64_t)> emit_kernel_loop;
+    emit_kernel_loop = [&](int64_t spatial_dim) -> absl::Status {
+      if (spatial_dim != spatial_rank) {
+        for (int64_t k = 0; k < kernel_spatial_sizes[spatial_dim]; ++k) {
+          kernel_coords[spatial_dim] = k;
+          TF_RETURN_IF_ERROR(emit_kernel_loop(spatial_dim + 1));
+        }
+        return absl::OkStatus();
+      }
+
+      std::vector<std::string> safe_spatial(spatial_rank);
+      std::string in_bounds = "true";
+      for (int64_t i = 0; i < spatial_rank; ++i) {
+        const WindowDimension& window = instr->window().dimensions(i);
+        std::string dilated =
+            scaled_spatial(out_coords[output_spatial_dims[i]], window,
+                           kernel_coords[i], "conv_nd_input");
+        auto [safe, ok] = emit_undilated_input(
+            dilated, effective_input_sizes[i], window.base_dilation(),
+            "conv_nd_input");
+        safe_spatial[i] = safe;
+        if (in_bounds == "true") {
+          in_bounds = ok;
+        } else {
+          std::string combined = NewName("conv_nd_in_bounds");
+          body->push_back(absl::StrFormat("  %s = and i1 %s, %s", combined,
+                                          in_bounds, ok));
+          in_bounds = combined;
+        }
+      }
+
+      for (int64_t ic = 0; ic < rhs_input_features; ++ic) {
+        std::string lhs_feature = absl::StrCat(ic);
+        if (feature_group_count != 1) {
+          std::string feature_group_offset =
+              NewName("conv_nd_feature_group_offset");
+          lhs_feature = NewName("conv_nd_lhs_feature");
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
+                                          feature_group_offset, feature_group,
+                                          rhs_input_features));
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %d",
+                                          lhs_feature, feature_group_offset,
+                                          ic));
+        }
+        std::vector<std::string> lhs_coords(rank, "0");
+        lhs_coords[input_batch_dim] = input_batch_coord;
+        lhs_coords[input_feature_dim] = lhs_feature;
+        for (int64_t i = 0; i < spatial_rank; ++i) {
+          lhs_coords[input_spatial_dims[i]] = safe_spatial[i];
+        }
+        std::string lhs_index =
+            emit_linear_index(lhs->shape(), lhs_coords, "conv_nd_lhs");
+
+        std::vector<std::string> rhs_coords(rank, "0");
+        rhs_coords[kernel_output_feature_dim] = oc;
+        rhs_coords[kernel_input_feature_dim] = absl::StrCat(ic);
+        for (int64_t i = 0; i < spatial_rank; ++i) {
+          rhs_coords[kernel_spatial_dims[i]] = absl::StrCat(kernel_coords[i]);
+        }
+        std::string rhs_index =
+            emit_linear_index(rhs->shape(), rhs_coords, "conv_nd_rhs");
+        TF_ASSIGN_OR_RETURN(std::string lhs_value,
+                            EmitLoadFromLinearIndex(lhs, lhs_index, body));
+        TF_ASSIGN_OR_RETURN(std::string rhs_value,
+                            EmitLoadFromLinearIndex(rhs, rhs_index, body));
+        std::string product;
+        std::string contribution = NewName("conv_nd_contribution");
+        if (float_accumulator) {
+          product = EmitOp("fmul fast float", lhs_value, rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, float %s, float 0x0000000000000000",
+              contribution, in_bounds, product));
+          TF_ASSIGN_OR_RETURN(
+              accumulator,
+              EmitF32ReducerOp(HloOpcode::kAdd, accumulator, contribution,
+                               body));
+        } else if (pred_accumulator) {
+          product = EmitOp("and i1", lhs_value, rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, i1 %s, i1 false", contribution,
+              in_bounds, product));
+          accumulator = EmitOp("or i1", accumulator, contribution, body);
+        } else {
+          product = EmitOp(absl::StrCat("mul ", accumulator_type), lhs_value,
+                           rhs_value, body);
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, %s %s, %s 0", contribution, in_bounds,
+              accumulator_type, product, accumulator_type));
+          accumulator = EmitOp(absl::StrCat("add ", accumulator_type),
+                               accumulator, contribution, body);
+        }
+      }
+      return absl::OkStatus();
+    };
+    TF_RETURN_IF_ERROR(emit_kernel_loop(0));
     return accumulator;
   }
 
@@ -4361,57 +5728,234 @@ class ElementwiseAirEmitter {
       const HloInstruction* instr, std::vector<std::string>* body) {
     const HloInstruction* input = instr->operand(0);
     const int64_t rank = instr->shape().dimensions().size();
-    if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
-        instr->operand_count() != 2 || (rank != 1 && rank != 2) ||
+    const PrimitiveType reduce_type = instr->shape().element_type();
+    const bool supported_reduce_type =
+        IsFloatAccumulatorElementType(reduce_type) ||
+        IsIntegerElementType(reduce_type);
+    if (!supported_reduce_type ||
+        input->shape().element_type() != reduce_type ||
+        instr->operand(1)->shape().element_type() != reduce_type ||
+        instr->operand_count() != 2 ||
+        (rank != 1 && rank != 2 && rank != 3) ||
         input->shape().dimensions().size() != rank ||
         ShapeUtil::ElementsIn(instr->shape()) !=
             ShapeUtil::ElementsIn(result_shape_) ||
         instr->window().dimensions().size() != rank) {
       return absl::UnimplementedError(
           "Metal direct AIR reduce-window currently supports only "
-          "rank-1/rank-2 f32 results.");
+          "rank-1/rank-2/rank-3 floating-point and integer results.");
     }
     for (int64_t i = 0; i < rank; ++i) {
       const WindowDimension& dim = instr->window().dimensions(i);
-      if (dim.stride() != 1 || dim.padding_low() != 0 ||
-          dim.padding_high() != 0 || dim.base_dilation() != 1 ||
+      if (dim.stride() != 1 || dim.padding_low() < 0 ||
+          dim.padding_high() < 0 || dim.base_dilation() != 1 ||
           dim.window_dilation() != 1 || dim.window_reversal() ||
-          instr->shape().dimensions(i) !=
-              input->shape().dimensions(i) - dim.size() + 1) {
+          instr->shape().dimensions(i) != input->shape().dimensions(i) +
+                                              dim.padding_low() +
+                                              dim.padding_high() - dim.size() +
+                                              1) {
         return absl::UnimplementedError(
-            "Metal direct AIR reduce-window currently supports only VALID "
-            "stride-1 non-dilated windows.");
+            "Metal direct AIR reduce-window currently supports only "
+            "non-negative padded stride-1 non-dilated windows.");
       }
     }
 
-    const HloOpcode reducer_opcode =
-        instr->to_apply()->root_instruction()->opcode();
-    if (reducer_opcode != HloOpcode::kAdd &&
-        reducer_opcode != HloOpcode::kMaximum &&
-        reducer_opcode != HloOpcode::kMinimum &&
-        reducer_opcode != HloOpcode::kMultiply) {
+    const HloComputation* reducer = instr->to_apply();
+    if (reducer->num_parameters() != 2 ||
+        reducer->parameter_instruction(0)->shape().element_type() !=
+            reduce_type ||
+        reducer->parameter_instruction(1)->shape().element_type() !=
+            reduce_type ||
+        !ShapeUtil::IsEffectiveScalar(
+            reducer->parameter_instruction(0)->shape()) ||
+        !ShapeUtil::IsEffectiveScalar(
+            reducer->parameter_instruction(1)->shape())) {
       return absl::UnimplementedError(
-          "Metal direct AIR reduce-window currently supports add, multiply, "
-          "maximum, and minimum reducers.");
+          "Metal direct AIR reduce-window currently supports only binary "
+          "scalar reducers with matching supported element types.");
     }
 
-    TF_ASSIGN_OR_RETURN(std::string accumulator,
+    const char* accumulator_ir_type = ValueIrType(reduce_type);
+    TF_ASSIGN_OR_RETURN(std::string init_value,
                         EmitValue(instr->operand(1), /*force_scalar=*/true,
                                   body));
+    auto apply_reducer = [&](absl::string_view accumulator,
+                             absl::string_view value)
+        -> absl::StatusOr<std::string> {
+      ScalarParameterScope scope;
+      scope.computation = reducer;
+      scope.values[0] = std::string(accumulator);
+      scope.values[1] = std::string(value);
+      scalar_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] {
+        scalar_parameter_scopes_.pop_back();
+      };
+      return EmitValue(reducer->root_instruction(), /*force_scalar=*/true,
+                       body);
+    };
+    auto offset_source = [&](absl::string_view out_coord, int64_t offset,
+                             int64_t padding_low,
+                             absl::string_view prefix) -> std::string {
+      const int64_t delta = offset - padding_low;
+      if (delta == 0) {
+        return std::string(out_coord);
+      }
+      std::string source = NewName(prefix);
+      if (delta > 0) {
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", source,
+                                        out_coord, delta));
+      } else {
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", source,
+                                        out_coord, -delta));
+      }
+      return source;
+    };
+    auto in_bounds = [&](absl::string_view source, int64_t bound,
+                         absl::string_view prefix) -> std::string {
+      std::string ge0 = NewName(absl::StrCat(prefix, "_ge0"));
+      std::string lt = NewName(absl::StrCat(prefix, "_lt"));
+      std::string ok = NewName(absl::StrCat(prefix, "_ok"));
+      body->push_back(
+          absl::StrFormat("  %s = icmp sge i64 %s, 0", ge0, source));
+      body->push_back(
+          absl::StrFormat("  %s = icmp slt i64 %s, %d", lt, source, bound));
+      body->push_back(absl::StrFormat("  %s = and i1 %s, %s", ok, ge0, lt));
+      return ok;
+    };
+    auto safe_index = [&](absl::string_view source,
+                          absl::string_view predicate,
+                          absl::string_view prefix) -> std::string {
+      std::string safe = NewName(prefix);
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i64 %s, i64 0", safe, predicate, source));
+      return safe;
+    };
+    auto select_accumulator = [&](absl::string_view predicate,
+                                  absl::string_view candidate,
+                                  absl::string_view accumulator_value)
+        -> std::string {
+      std::string selected = NewName("reduce_window_accumulator");
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, %s %s, %s %s", selected, predicate,
+          accumulator_ir_type, candidate, accumulator_ir_type,
+          accumulator_value));
+      return selected;
+    };
+    const bool init_is_negative_infinity =
+        init_value == FloatLiteral(-std::numeric_limits<float>::infinity());
+    auto select_identity_candidate = [&](absl::string_view accumulator_value,
+                                         absl::string_view value,
+                                         absl::string_view candidate)
+        -> std::string {
+      if (!init_is_negative_infinity) {
+        return std::string(candidate);
+      }
+      std::string accumulator_bits = NewName("reduce_window_accumulator_bits");
+      std::string is_init = NewName("reduce_window_accumulator_is_init");
+      std::string selected = NewName("reduce_window_identity_candidate");
+      body->push_back(absl::StrFormat("  %s = bitcast float %s to i32",
+                                      accumulator_bits, accumulator_value));
+      body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, -8388608",
+                                      is_init, accumulator_bits));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, float %s, float %s", selected, is_init, value,
+          candidate));
+      return selected;
+    };
+
+    std::string accumulator = init_value;
     if (rank == 1) {
       const WindowDimension& dim = instr->window().dimensions(0);
       for (int64_t offset = 0; offset < dim.size(); ++offset) {
-        std::string source_index = "%idx";
-        if (offset != 0) {
-          source_index = NewName("reduce_window_index");
-          body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
-                                          source_index, offset));
-        }
+        std::string source = offset_source("%idx", offset, dim.padding_low(),
+                                           "reduce_window_source");
+        std::string ok =
+            in_bounds(source, input->shape().dimensions(0), "reduce_window");
+        std::string source_index =
+            safe_index(source, ok, "reduce_window_safe_index");
         TF_ASSIGN_OR_RETURN(std::string value,
                             EmitLoadFromLinearIndex(input, source_index, body));
-        TF_ASSIGN_OR_RETURN(accumulator,
-                            EmitF32ReducerOp(reducer_opcode, accumulator, value,
-                                             body));
+        TF_ASSIGN_OR_RETURN(std::string candidate,
+                            apply_reducer(accumulator, value));
+        candidate =
+            select_identity_candidate(accumulator, value, candidate);
+        accumulator = select_accumulator(ok, candidate, accumulator);
+      }
+      return accumulator;
+    }
+
+    if (rank == 3) {
+      const int64_t result_dim1 = instr->shape().dimensions(1);
+      const int64_t result_dim2 = instr->shape().dimensions(2);
+      const int64_t input_dim1 = input->shape().dimensions(1);
+      const int64_t input_dim2 = input->shape().dimensions(2);
+      std::string out0 = NewName("reduce_window_dim0");
+      std::string plane = NewName("reduce_window_plane");
+      std::string out1 = NewName("reduce_window_dim1");
+      std::string out2 = NewName("reduce_window_dim2");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d", out0,
+                                      result_dim1 * result_dim2));
+      body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", plane,
+                                      result_dim1 * result_dim2));
+      body->push_back(
+          absl::StrFormat("  %s = udiv i64 %s, %d", out1, plane, result_dim2));
+      body->push_back(
+          absl::StrFormat("  %s = urem i64 %s, %d", out2, plane, result_dim2));
+      const WindowDimension& dim0 = instr->window().dimensions(0);
+      const WindowDimension& dim1 = instr->window().dimensions(1);
+      const WindowDimension& dim2 = instr->window().dimensions(2);
+      for (int64_t offset0 = 0; offset0 < dim0.size(); ++offset0) {
+        for (int64_t offset1 = 0; offset1 < dim1.size(); ++offset1) {
+          for (int64_t offset2 = 0; offset2 < dim2.size(); ++offset2) {
+            std::string source0 =
+                offset_source(out0, offset0, dim0.padding_low(),
+                              "reduce_window_source_dim0");
+            std::string source1 =
+                offset_source(out1, offset1, dim1.padding_low(),
+                              "reduce_window_source_dim1");
+            std::string source2 =
+                offset_source(out2, offset2, dim2.padding_low(),
+                              "reduce_window_source_dim2");
+            std::string ok0 =
+                in_bounds(source0, input->shape().dimensions(0),
+                          "reduce_window_dim0");
+            std::string ok1 =
+                in_bounds(source1, input->shape().dimensions(1),
+                          "reduce_window_dim1");
+            std::string ok2 =
+                in_bounds(source2, input->shape().dimensions(2),
+                          "reduce_window_dim2");
+            std::string ok01 = NewName("reduce_window_ok");
+            std::string ok = NewName("reduce_window_ok");
+            body->push_back(
+                absl::StrFormat("  %s = and i1 %s, %s", ok01, ok0, ok1));
+            body->push_back(
+                absl::StrFormat("  %s = and i1 %s, %s", ok, ok01, ok2));
+            source0 = safe_index(source0, ok, "reduce_window_safe_dim0");
+            source1 = safe_index(source1, ok, "reduce_window_safe_dim1");
+            source2 = safe_index(source2, ok, "reduce_window_safe_dim2");
+            std::string term0 = NewName("reduce_window_term0");
+            std::string term1 = NewName("reduce_window_term1");
+            std::string base = NewName("reduce_window_base");
+            std::string source_index = NewName("reduce_window_index");
+            body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term0,
+                                            source0, input_dim1 * input_dim2));
+            body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term1,
+                                            source1, input_dim2));
+            body->push_back(absl::StrFormat("  %s = add i64 %s, %s", base,
+                                            term0, term1));
+            body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
+                                            source_index, base, source2));
+            TF_ASSIGN_OR_RETURN(
+                std::string value,
+                EmitLoadFromLinearIndex(input, source_index, body));
+            TF_ASSIGN_OR_RETURN(std::string candidate,
+                                apply_reducer(accumulator, value));
+            candidate =
+                select_identity_candidate(accumulator, value, candidate);
+            accumulator = select_accumulator(ok, candidate, accumulator);
+          }
+        }
       }
       return accumulator;
     }
@@ -4428,18 +5972,23 @@ class ElementwiseAirEmitter {
     const WindowDimension& col_dim = instr->window().dimensions(1);
     for (int64_t row_offset = 0; row_offset < row_dim.size(); ++row_offset) {
       for (int64_t col_offset = 0; col_offset < col_dim.size(); ++col_offset) {
-        std::string source_row = out_row;
-        if (row_offset != 0) {
-          source_row = NewName("reduce_window_source_row");
-          body->push_back(absl::StrFormat("  %s = add i64 %s, %d", source_row,
-                                          out_row, row_offset));
-        }
-        std::string source_col = out_col;
-        if (col_offset != 0) {
-          source_col = NewName("reduce_window_source_col");
-          body->push_back(absl::StrFormat("  %s = add i64 %s, %d", source_col,
-                                          out_col, col_offset));
-        }
+        std::string source_row =
+            offset_source(out_row, row_offset, row_dim.padding_low(),
+                          "reduce_window_source_row");
+        std::string source_col =
+            offset_source(out_col, col_offset, col_dim.padding_low(),
+                          "reduce_window_source_col");
+        std::string row_ok =
+            in_bounds(source_row, input->shape().dimensions(0),
+                      "reduce_window_row");
+        std::string col_ok =
+            in_bounds(source_col, input->shape().dimensions(1),
+                      "reduce_window_col");
+        std::string ok = NewName("reduce_window_ok");
+        body->push_back(
+            absl::StrFormat("  %s = and i1 %s, %s", ok, row_ok, col_ok));
+        source_row = safe_index(source_row, ok, "reduce_window_safe_row");
+        source_col = safe_index(source_col, ok, "reduce_window_safe_col");
         std::string row_base = NewName("reduce_window_row_base");
         std::string source_index = NewName("reduce_window_index");
         body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_base,
@@ -4448,9 +5997,11 @@ class ElementwiseAirEmitter {
                                         row_base, source_col));
         TF_ASSIGN_OR_RETURN(std::string value,
                             EmitLoadFromLinearIndex(input, source_index, body));
-        TF_ASSIGN_OR_RETURN(accumulator,
-                            EmitF32ReducerOp(reducer_opcode, accumulator, value,
-                                             body));
+        TF_ASSIGN_OR_RETURN(std::string candidate,
+                            apply_reducer(accumulator, value));
+        candidate =
+            select_identity_candidate(accumulator, value, candidate);
+        accumulator = select_accumulator(ok, candidate, accumulator);
       }
     }
     return accumulator;
@@ -4500,6 +6051,21 @@ class ElementwiseAirEmitter {
       }
     }
     return nullptr;
+  }
+
+  std::optional<std::string> ScalarParameterOverride(
+      const HloInstruction* instr) const {
+    for (auto it = scalar_parameter_scopes_.rbegin();
+         it != scalar_parameter_scopes_.rend(); ++it) {
+      if (instr->parent() != it->computation) {
+        continue;
+      }
+      auto value = it->values.find(instr->parameter_number());
+      if (value != it->values.end()) {
+        return value->second;
+      }
+    }
+    return std::nullopt;
   }
 
   absl::StatusOr<std::string> EmitClamp(const HloInstruction* instr,
@@ -4654,14 +6220,18 @@ class ElementwiseAirEmitter {
     }
 
     std::string converted = NewName("convert");
-    if (src_type == PRED && dst_type == F32) {
+    if (src_type == PRED &&
+        (dst_type == F32 || dst_type == F16 || dst_type == BF16)) {
       body->push_back(absl::StrFormat("  %s = uitofp i1 %s to float",
                                       converted, value));
       return converted;
     }
-    if (src_type == PRED && dst_type == S32) {
-      body->push_back(
-          absl::StrFormat("  %s = zext i1 %s to i32", converted, value));
+    if (src_type == PRED &&
+        (dst_type == S8 || dst_type == U8 || dst_type == S16 ||
+         dst_type == U16 || dst_type == S32 || dst_type == U32)) {
+      const char* dst_ir_type = ElementIrType(dst_type);
+      body->push_back(absl::StrFormat("  %s = zext i1 %s to %s", converted,
+                                      value, dst_ir_type));
       return converted;
     }
     if (src_type == F32 && dst_type == S32) {
@@ -4953,11 +6523,12 @@ class ElementwiseAirEmitter {
         return EmitGather(instr->operand(1), body);
       }
     }
-    if (!IsF32Array(instr->shape())) {
+    if (!IsF32Array(instr->shape()) && !IsF16Array(instr->shape()) &&
+        !IsBF16Array(instr->shape())) {
       if (!IsS32Array(instr->shape())) {
         return absl::UnimplementedError(
             "Metal direct AIR elementwise select currently supports only "
-            "f32/s32 array results.");
+            "floating-point and s32 array results.");
       }
     }
     TF_ASSIGN_OR_RETURN(std::string pred,
@@ -4970,7 +6541,7 @@ class ElementwiseAirEmitter {
                         EmitValue(instr->operand(2), IsScalarOperand(instr, 2),
                                   body));
     std::string value = NewName("select");
-    const char* ir_type = ElementIrType(instr->shape().element_type());
+    const char* ir_type = ValueIrType(instr->shape().element_type());
     body->push_back(absl::StrFormat("  %s = select i1 %s, %s %s, %s %s",
                                     value, pred, ir_type, on_true, ir_type,
                                     on_false));
@@ -5673,25 +7244,40 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string rhs,
                         EmitValue(instr->operand(1), IsScalarOperand(instr, 1),
                                   body));
-    if (instr->shape().element_type() == S32) {
+    const PrimitiveType type = instr->shape().element_type();
+    if (IsIntegerElementType(type)) {
+      const char* ir_type = ValueIrType(type);
       switch (instr->opcode()) {
         case HloOpcode::kAdd:
-          return EmitOp("add i32", lhs, rhs, body);
+          return EmitOp(absl::StrCat("add ", ir_type), lhs, rhs, body);
         case HloOpcode::kSubtract:
-          return EmitOp("sub i32", lhs, rhs, body);
+          return EmitOp(absl::StrCat("sub ", ir_type), lhs, rhs, body);
         case HloOpcode::kMultiply:
-          return EmitOp("mul i32", lhs, rhs, body);
+          return EmitOp(absl::StrCat("mul ", ir_type), lhs, rhs, body);
         case HloOpcode::kDivide:
-          return EmitOp("sdiv i32", lhs, rhs, body);
+          if (type == S32) {
+            return EmitOp("sdiv i32", lhs, rhs, body);
+          }
+          break;
         case HloOpcode::kRemainder:
-          return EmitS32Remainder(lhs, rhs, body);
+          if (type == S32) {
+            return EmitS32Remainder(lhs, rhs, body);
+          }
+          break;
         case HloOpcode::kMaximum:
-          return EmitIntCompareSelect("sgt", lhs, rhs, body);
+          return EmitIntCompareSelect(
+              IsSignedIntegerElementType(type) ? "sgt" : "ugt", lhs, rhs,
+              body, type);
         case HloOpcode::kMinimum:
-          return EmitIntCompareSelect("slt", lhs, rhs, body);
+          return EmitIntCompareSelect(
+              IsSignedIntegerElementType(type) ? "slt" : "ult", lhs, rhs,
+              body, type);
         default:
-          return absl::InternalError("Unexpected s32 binary HLO opcode.");
+          break;
       }
+      return absl::UnimplementedError(
+          "Metal direct AIR integer binary op is not supported for this "
+          "element type.");
     }
     switch (instr->opcode()) {
       case HloOpcode::kAdd:
@@ -5801,13 +7387,14 @@ class ElementwiseAirEmitter {
       body->push_back(absl::StrFormat("  %s = sub i32 0, %s", name, value));
       return name;
     }
-    if (instr->shape().element_type() == F32) {
+    if (IsFloatAccumulatorElementType(instr->shape().element_type())) {
       body->push_back(absl::StrFormat("  %s = fneg fast float %s", name,
                                       value));
       return name;
     }
     return absl::UnimplementedError(
-        "Metal direct AIR negate currently supports only f32 and s32 arrays.");
+        "Metal direct AIR negate currently supports only floating-point and "
+        "s32 arrays.");
   }
 
   absl::StatusOr<std::string> EmitSign(const HloInstruction* instr,
@@ -6011,9 +7598,10 @@ class ElementwiseAirEmitter {
       body->push_back(absl::StrFormat("  %s = sub i32 0, %s", neg, value));
       return EmitIntCompareSelect("sgt", value, neg, body);
     }
-    if (instr->shape().element_type() != F32) {
+    if (!IsFloatAccumulatorElementType(instr->shape().element_type())) {
       return absl::UnimplementedError(
-          "Metal direct AIR abs currently supports only f32 and s32 arrays.");
+          "Metal direct AIR abs currently supports only floating-point and "
+          "s32 arrays.");
     }
     std::string neg = NewName("neg");
     body->push_back(absl::StrFormat("  %s = fneg fast float %s", neg, value));
@@ -6407,6 +7995,7 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   bool raw_byte_result_ = false;
   bool raw_bf16_result_ = false;
   std::vector<CallParameterScope> call_parameter_scopes_;
+  std::vector<ScalarParameterScope> scalar_parameter_scopes_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
   std::vector<PrimitiveType> parameter_types_;
@@ -7560,10 +9149,7 @@ class MetalReductionExecutable final : public Executable {
                            std::vector<uint8_t> metallib)
       : Executable(std::move(module)),
         config_(config),
-        result_shape_(this->module()
-                          .entry_computation()
-                          ->root_instruction()
-                          ->shape()),
+        result_shape_(this->module().output_shape()),
         metallib_(std::move(metallib)) {}
 
   Shape result_shape() const override { return result_shape_; }
@@ -7777,10 +9363,7 @@ class MetalConvertExecutable final : public Executable {
                          std::vector<uint8_t> metallib)
       : Executable(std::move(module)),
         config_(config),
-        result_shape_(this->module()
-                          .entry_computation()
-                          ->root_instruction()
-                          ->shape()),
+        result_shape_(this->module().output_shape()),
         metallib_(std::move(metallib)) {}
 
   Shape result_shape() const override { return result_shape_; }
@@ -7874,10 +9457,7 @@ class MetalElementwiseExecutable final : public Executable {
                              std::vector<uint8_t> metallib)
       : Executable(std::move(module)),
         parameter_numbers_(std::move(parameter_numbers)),
-        result_shape_(this->module()
-                          .entry_computation()
-                          ->root_instruction()
-                          ->shape()),
+        result_shape_(this->module().output_shape()),
         num_elements_(num_elements),
         metallib_(std::move(metallib)) {}
 
@@ -8013,10 +9593,7 @@ class MetalTopKTupleExecutable final : public Executable {
       : Executable(std::move(module)),
         values_parameter_numbers_(std::move(values_parameter_numbers)),
         indices_parameter_numbers_(std::move(indices_parameter_numbers)),
-        result_shape_(this->module()
-                          .entry_computation()
-                          ->root_instruction()
-                          ->shape()),
+        result_shape_(this->module().output_shape()),
         num_elements_(ShapeUtil::ElementsIn(result_shape_.tuple_shapes(0))),
         values_metallib_(std::move(values_metallib)),
         indices_metallib_(std::move(indices_metallib)) {}
@@ -8184,10 +9761,7 @@ MetalMatmulExecutable::MetalMatmulExecutable(std::shared_ptr<HloModule> module,
                                              std::vector<uint8_t> metallib)
     : Executable(std::move(module)),
       config_(config),
-      result_shape_(this->module()
-                        .entry_computation()
-                        ->root_instruction()
-                        ->shape()),
+      result_shape_(this->module().output_shape()),
       kernel_name_(config.use_simdgroup
                        ? (config.relu ? "matmul_relu_simdgroup_8x8"
                                       : "matmul_simdgroup_8x8")
