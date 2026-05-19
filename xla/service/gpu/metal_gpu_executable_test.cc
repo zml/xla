@@ -630,6 +630,38 @@ absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConditional() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape shape = ShapeUtil::MakeShape(F32, {kElementCount});
+  XlaBuilder true_builder("metal_cond_true");
+  XlaOp true_input = Parameter(&true_builder, 0, shape, "input");
+  Add(true_input, Broadcast(ConstantR0<float>(&true_builder, 1.0f),
+                            {kElementCount}));
+  TF_ASSIGN_OR_RETURN(XlaComputation true_computation, true_builder.Build());
+
+  XlaBuilder false_builder("metal_cond_false");
+  XlaOp false_input = Parameter(&false_builder, 0, shape, "input");
+  Sub(false_input, Broadcast(ConstantR0<float>(&false_builder, 1.0f),
+                             {kElementCount}));
+  TF_ASSIGN_OR_RETURN(XlaComputation false_computation, false_builder.Build());
+
+  XlaBuilder builder("metal_conditional");
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  XlaOp pred = Parameter(&builder, 1, ShapeUtil::MakeShape(PRED, {}), "pred");
+  Conditional(pred, input, true_computation, input, false_computation);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = MakeElementwiseLhs();
+  Literal pred_literal = LiteralUtil::CreateR0<bool>(true);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> pred_data,
+                      client->TransferToServer(pred_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), pred_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1762,6 +1794,17 @@ TEST(MetalGpuExecutableTest, ElementwiseReduceWindowMax) {
               static_cast<float>(i + 2) * 0.25f - 2.0f)
         << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseConditional) {
+  auto result = ExecuteMetalConditional();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  Literal input = MakeElementwiseLhs();
+  ExpectMatchesElementwiseReference(
+      actual, [&](int64_t i) { return input.Get<float>({i}) + 1.0f; });
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {

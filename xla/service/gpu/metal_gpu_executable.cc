@@ -415,6 +415,8 @@ class ElementwiseAirEmitter {
         return EmitClamp(instr, body);
       case HloOpcode::kConcatenate:
         return EmitConcatenate(instr, body);
+      case HloOpcode::kConditional:
+        return EmitConditional(instr, body);
       case HloOpcode::kConvolution:
         return EmitConvolution(instr, body);
       case HloOpcode::kConvert:
@@ -1074,6 +1076,65 @@ class ElementwiseAirEmitter {
       }
     }
     return accumulator;
+  }
+
+  absl::StatusOr<std::string> EmitConditional(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        instr->branch_count() != 2 || instr->operand_count() != 3) {
+      return absl::UnimplementedError(
+          "Metal direct AIR conditional currently supports only two-way "
+          "conditionals with array results matching the final result.");
+    }
+
+    if (instr->operand(0)->shape().element_type() == PRED) {
+      TF_ASSIGN_OR_RETURN(std::string pred,
+                          EmitValue(instr->operand(0), /*force_scalar=*/true,
+                                    body));
+      TF_ASSIGN_OR_RETURN(std::string on_true,
+                          EmitConditionalBranch(instr->true_computation(),
+                                                instr->operand(1), body));
+      TF_ASSIGN_OR_RETURN(std::string on_false,
+                          EmitConditionalBranch(instr->false_computation(),
+                                                instr->operand(2), body));
+      return EmitTypedSelect(instr->shape().element_type(), pred, on_true,
+                             on_false, body, "conditional_select");
+    }
+
+    if (instr->operand(0)->shape().element_type() != S32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR conditional branch index must be pred or s32.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string branch_index,
+                        EmitValue(instr->operand(0), /*force_scalar=*/true,
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string branch0,
+                        EmitConditionalBranch(instr->branch_computation(0),
+                                              instr->operand(1), body));
+    TF_ASSIGN_OR_RETURN(std::string branch1,
+                        EmitConditionalBranch(instr->branch_computation(1),
+                                              instr->operand(2), body));
+    std::string is_branch1 = NewName("conditional_is_branch1");
+    body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, 1", is_branch1,
+                                    branch_index));
+    return EmitTypedSelect(instr->shape().element_type(), is_branch1, branch1,
+                           branch0, body, "conditional_select");
+  }
+
+  absl::StatusOr<std::string> EmitConditionalBranch(
+      const HloComputation* branch, const HloInstruction* argument,
+      std::vector<std::string>* body) {
+    if (branch->num_parameters() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR conditional branches must take one parameter.");
+    }
+    CallParameterScope scope;
+    scope.computation = branch;
+    scope.arguments[0] = argument;
+    call_parameter_scopes_.push_back(std::move(scope));
+    absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+    return EmitValue(branch->root_instruction(), /*force_scalar=*/false, body);
   }
 
   absl::StatusOr<std::string> EmitConcatenate(const HloInstruction* instr,
@@ -1852,9 +1913,10 @@ class ElementwiseAirEmitter {
                                           std::vector<std::string>* body) {
     const PrimitiveType src_type = instr->operand(0)->shape().element_type();
     const PrimitiveType dst_type = instr->shape().element_type();
-    TF_ASSIGN_OR_RETURN(std::string value,
-                        EmitValue(instr->operand(0), /*force_scalar=*/false,
-                                  body));
+    TF_ASSIGN_OR_RETURN(
+        std::string value,
+        EmitValue(instr->operand(0), ShapeUtil::IsEffectiveScalar(instr->shape()),
+                  body));
     if (src_type == dst_type) {
       return value;
     }
@@ -2902,6 +2964,19 @@ class ElementwiseAirEmitter {
                                     predicate, lhs, rhs));
     body->push_back(absl::StrFormat(
         "  %s = select i1 %s, i32 %s, i32 %s", value, cmp, lhs, rhs));
+    return value;
+  }
+
+  std::string EmitTypedSelect(PrimitiveType type, absl::string_view pred,
+                              absl::string_view on_true,
+                              absl::string_view on_false,
+                              std::vector<std::string>* body,
+                              absl::string_view prefix) {
+    std::string value = NewName(prefix);
+    const char* ir_type = ElementIrType(type);
+    body->push_back(absl::StrFormat("  %s = select i1 %s, %s %s, %s %s",
+                                    value, pred, ir_type, on_true, ir_type,
+                                    on_false));
     return value;
   }
 
