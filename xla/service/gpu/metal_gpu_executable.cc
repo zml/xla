@@ -153,6 +153,10 @@ bool IsU16Array(const Shape& shape) {
   return shape.element_type() == U16 && shape.IsArray();
 }
 
+bool IsBF16Array(const Shape& shape) {
+  return shape.element_type() == BF16 && shape.IsArray();
+}
+
 bool IsC64Array(const Shape& shape) {
   return shape.element_type() == C64 && shape.IsArray();
 }
@@ -173,7 +177,7 @@ bool IsScalarLikeSupported(const Shape& shape) {
 
 bool IsSupportedElementwiseArray(const Shape& shape) {
   return IsF32Array(shape) || IsPredArray(shape) || IsS32Array(shape) ||
-         IsU16Array(shape);
+         IsU16Array(shape) || IsBF16Array(shape);
 }
 
 bool IsOrderStatisticArray(const Shape& shape) {
@@ -187,6 +191,7 @@ const char* ElementIrType(PrimitiveType type) {
     case S32:
       return "i32";
     case U16:
+    case BF16:
       return "i16";
     case PRED:
       return "i8";
@@ -198,6 +203,9 @@ const char* ElementIrType(PrimitiveType type) {
 }
 
 const char* ValueIrType(PrimitiveType type) {
+  if (type == BF16) {
+    return "float";
+  }
   return type == PRED ? "i1" : ElementIrType(type);
 }
 
@@ -208,6 +216,7 @@ const char* ElementAirTypeName(PrimitiveType type) {
     case S32:
       return "int";
     case U16:
+    case BF16:
       return "ushort";
     case PRED:
       return "bool";
@@ -222,7 +231,7 @@ int ElementTypeSize(PrimitiveType type) {
   if (type == PRED) {
     return 1;
   }
-  if (type == U16) {
+  if (type == U16 || type == BF16) {
     return 2;
   }
   if (type == C64) {
@@ -1262,12 +1271,15 @@ class ElementwiseAirEmitter {
                                       std::vector<std::string>* body) {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
-    if (!IsF32Array(instr->shape()) || !IsF32Array(lhs->shape()) ||
-        !IsF32Array(rhs->shape()) ||
+    const PrimitiveType dot_type = instr->shape().element_type();
+    if ((dot_type != F32 && dot_type != BF16) ||
+        lhs->shape().element_type() != dot_type ||
+        rhs->shape().element_type() != dot_type ||
+        !lhs->shape().IsArray() || !rhs->shape().IsArray() ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
-          "Metal direct AIR dot fallback currently supports only f32 arrays "
-          "matching the final result.");
+          "Metal direct AIR dot fallback currently supports only f32 and bf16 "
+          "arrays matching the final result.");
     }
 
     if (instr->shape().dimensions().size() == 2 &&
@@ -4616,6 +4628,19 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat(
         "  %s = load %s, %s addrspace(1)* %s, align %d", value, ir_type,
         ir_type, ptr, ElementTypeSize(type)));
+    if (type == BF16) {
+      std::string extended = NewName("bf16_zext");
+      std::string shifted = NewName("bf16_shift");
+      std::string converted = NewName("bf16_float");
+      body->push_back(
+          absl::StrFormat("  %s = zext i16 %s to i32", extended, value));
+      body->push_back(
+          absl::StrFormat("  %s = shl i32 %s, 16", shifted, extended));
+      body->push_back(
+          absl::StrFormat("  %s = bitcast i32 %s to float", converted,
+                          shifted));
+      return converted;
+    }
     if (type == PRED) {
       std::string pred = NewName("pred");
       body->push_back(
@@ -4769,6 +4794,17 @@ class ElementwiseAirEmitter {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
   %%out_i8 = zext i1 %s to i8
   store i8 %%out_i8, i8 addrspace(1)* %%out_ptr, align 1)",
+                                     result_value_);
+    } else if (result_type == BF16) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i16, i16 addrspace(1)* %%out, i64 %%idx
+  %%out_bits = bitcast float %s to i32
+  %%out_lsb = lshr i32 %%out_bits, 16
+  %%out_lsb1 = and i32 %%out_lsb, 1
+  %%out_bias = add i32 32767, %%out_lsb1
+  %%out_rounded = add i32 %%out_bits, %%out_bias
+  %%out_bf32 = lshr i32 %%out_rounded, 16
+  %%out_bf16 = trunc i32 %%out_bf32 to i16
+  store i16 %%out_bf16, i16 addrspace(1)* %%out_ptr, align 2)",
                                      result_value_);
     } else if (result_type == S32) {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i32, i32 addrspace(1)* %%out, i64 %%idx
