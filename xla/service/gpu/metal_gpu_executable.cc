@@ -1269,6 +1269,9 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitGetTupleElement(
       const HloInstruction* instr, std::vector<std::string>* body) {
+    if (instr->operand(0)->opcode() == HloOpcode::kWhile) {
+      return EmitSimpleWhileAccumulator(instr, body);
+    }
     if (instr->operand(0)->opcode() != HloOpcode::kTopK ||
         instr->shape().dimensions().size() != 1 ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
@@ -1300,6 +1303,114 @@ class ElementwiseAirEmitter {
     return EmitRank1F32OrderStatistic(
         input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
         /*return_index=*/false);
+  }
+
+  absl::StatusOr<std::string> EmitSimpleWhileAccumulator(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* while_instr = instr->operand(0);
+    if (instr->tuple_index() != 1 || !IsScalarLikeF32(instr->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        while_instr->operand_count() != 1 ||
+        while_instr->operand(0)->opcode() != HloOpcode::kTuple ||
+        while_instr->operand(0)->operand_count() != 3) {
+      return absl::UnimplementedError(
+          "Metal direct AIR while currently supports only returning the f32 "
+          "accumulator from a narrow scalar loop tuple.");
+    }
+
+    const HloInstruction* init_tuple = while_instr->operand(0);
+    const HloInstruction* init_iter = init_tuple->operand(0);
+    const HloInstruction* init_acc = init_tuple->operand(1);
+    const HloInstruction* input = init_tuple->operand(2);
+    if (!init_iter->IsConstant() || !IsScalarLikeS32(init_iter->shape()) ||
+        !init_acc->IsConstant() || !IsScalarLikeF32(init_acc->shape()) ||
+        !IsF32Array(input->shape()) || input->shape().dimensions().size() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR while accumulator requires constant scalar init "
+          "values and a rank-1 f32 input.");
+    }
+
+    const HloInstruction* cond_root =
+        while_instr->while_condition()->root_instruction();
+    if (cond_root->opcode() != HloOpcode::kCompare ||
+        cond_root->comparison_direction() != ComparisonDirection::kLt ||
+        cond_root->operand(1)->opcode() != HloOpcode::kConstant ||
+        !IsScalarLikeS32(cond_root->operand(1)->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR while accumulator requires an i < constant "
+          "condition.");
+    }
+    const int32_t limit = cond_root->operand(1)->literal().Get<int32_t>({});
+
+    const HloInstruction* body_root =
+        while_instr->while_body()->root_instruction();
+    if (body_root->opcode() != HloOpcode::kTuple ||
+        body_root->operand_count() != 3 ||
+        body_root->operand(0)->opcode() != HloOpcode::kAdd ||
+        body_root->operand(1)->opcode() != HloOpcode::kAdd) {
+      return absl::UnimplementedError(
+          "Metal direct AIR while accumulator requires tuple(i + c, acc + "
+          "value, input) body.");
+    }
+    TF_ASSIGN_OR_RETURN(int32_t step, ExtractS32ConstantAddend(body_root->operand(0)));
+    if (step <= 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR while accumulator requires a positive step.");
+    }
+
+    const int32_t init_iter_value = init_iter->literal().Get<int32_t>({});
+    const float init_acc_value = init_acc->literal().Get<float>({});
+    const std::string header = NewLabel("while_header");
+    const std::string loop_body = NewLabel("while_body");
+    const std::string done = NewLabel("while_done");
+    const std::string iter = NewName("while_iter");
+    const std::string acc = NewName("while_acc");
+    const std::string in_range = NewName("while_in_range");
+    const std::string iter64 = NewName("while_iter64");
+    const std::string next_acc = NewName("while_next_acc");
+    const std::string next_iter = NewName("while_next_iter");
+
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+    body->push_back(absl::StrFormat("%s:", header));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ %d, %%body ], [ %s, %%%s ]", iter,
+        init_iter_value, next_iter, loop_body));
+    body->push_back(absl::StrFormat(
+        "  %s = phi float [ %s, %%body ], [ %s, %%%s ]", acc,
+        FloatLiteral(init_acc_value), next_acc, loop_body));
+    body->push_back(absl::StrFormat("  %s = icmp slt i32 %s, %d", in_range,
+                                    iter, limit));
+    body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
+                                    in_range, loop_body, done));
+
+    body->push_back(absl::StrFormat("%s:", loop_body));
+    body->push_back(absl::StrFormat("  %s = sext i32 %s to i64", iter64,
+                                    iter));
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitLoadFromLinearIndex(input, iter64, body));
+    body->push_back(absl::StrFormat("  %s = fadd fast float %s, %s",
+                                    next_acc, acc, value));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, %d", next_iter, iter,
+                                    step));
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+
+    body->push_back(absl::StrFormat("%s:", done));
+    return acc;
+  }
+
+  absl::StatusOr<int32_t> ExtractS32ConstantAddend(
+      const HloInstruction* instr) {
+    if (instr->opcode() != HloOpcode::kAdd) {
+      return absl::UnimplementedError(
+          "Metal direct AIR expected an s32 add instruction.");
+    }
+    for (const HloInstruction* operand : instr->operands()) {
+      if (operand->IsConstant() && IsScalarLikeS32(operand->shape())) {
+        return operand->literal().Get<int32_t>({});
+      }
+    }
+    return absl::UnimplementedError(
+        "Metal direct AIR expected an s32 constant addend.");
   }
 
   absl::StatusOr<std::string> EmitRank1F32OrderStatistic(

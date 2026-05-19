@@ -662,6 +662,51 @@ absl::StatusOr<Literal> ExecuteMetalConditional() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalWhileAccumulator() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape index_shape = ShapeUtil::MakeShape(S32, {});
+  Shape acc_shape = ShapeUtil::MakeShape(F32, {});
+  Shape input_shape = ShapeUtil::MakeShape(F32, {16});
+  Shape state_shape = ShapeUtil::MakeTupleShape(
+      {index_shape, acc_shape, input_shape});
+
+  XlaBuilder cond_builder("metal_while_cond");
+  XlaOp cond_state = Parameter(&cond_builder, 0, state_shape, "state");
+  Lt(GetTupleElement(cond_state, 0), ConstantR0<int32_t>(&cond_builder, 4));
+  TF_ASSIGN_OR_RETURN(XlaComputation condition, cond_builder.Build());
+
+  XlaBuilder body_builder("metal_while_body");
+  XlaOp body_state = Parameter(&body_builder, 0, state_shape, "state");
+  XlaOp i = GetTupleElement(body_state, 0);
+  XlaOp acc = GetTupleElement(body_state, 1);
+  XlaOp input = GetTupleElement(body_state, 2);
+  XlaOp next_i = Add(i, ConstantR0<int32_t>(&body_builder, 1));
+  XlaOp slice = DynamicSlice(input, {i}, {1});
+  XlaOp value = Reshape(slice, {});
+  Tuple(&body_builder, {next_i, Add(acc, value), input});
+  TF_ASSIGN_OR_RETURN(XlaComputation body, body_builder.Build());
+
+  XlaBuilder builder("metal_while_accumulator");
+  XlaOp entry_input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp init = Tuple(&builder, {ConstantR0<int32_t>(&builder, 0),
+                               ConstantR0<float>(&builder, 0.0f),
+                               entry_input});
+  XlaOp result = While(condition, body, init);
+  GetTupleElement(result, 1);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<float> values(16);
+  for (int64_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<float>(i) * 0.25f - 2.0f;
+  }
+  Literal input_literal = LiteralUtil::CreateR1<float>(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1805,6 +1850,19 @@ TEST(MetalGpuExecutableTest, ElementwiseConditional) {
   Literal input = MakeElementwiseLhs();
   ExpectMatchesElementwiseReference(
       actual, [&](int64_t i) { return input.Get<float>({i}) + 1.0f; });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseWhileAccumulator) {
+  auto result = ExecuteMetalWhileAccumulator();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected = 0.0f;
+  for (int64_t i = 0; i < 4; ++i) {
+    expected += static_cast<float>(i) * 0.25f - 2.0f;
+  }
+  ExpectScalarNear(actual, expected, 1.0e-5f);
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {
