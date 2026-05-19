@@ -2765,6 +2765,60 @@ absl::StatusOr<Literal> ExecuteMetalWhileVectorAccumulator() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalScalarTupleWhile() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape pred_shape = ShapeUtil::MakeShape(PRED, {});
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  Shape state_shape =
+      ShapeUtil::MakeTupleShape({pred_shape, scalar_shape, scalar_shape});
+
+  XlaBuilder cond_builder("metal_scalar_tuple_while_cond");
+  XlaOp cond_state = Parameter(&cond_builder, 0, state_shape, "state");
+  GetTupleElement(cond_state, 0);
+  TF_ASSIGN_OR_RETURN(XlaComputation condition, cond_builder.Build());
+
+  XlaBuilder body_builder("metal_scalar_tuple_while_body");
+  XlaOp body_state = Parameter(&body_builder, 0, state_shape, "state");
+  XlaOp i = GetTupleElement(body_state, 1);
+  XlaOp acc = GetTupleElement(body_state, 2);
+  XlaOp next_i = Add(i, ConstantR0<float>(&body_builder, 1.0f));
+  XlaOp next_acc = Add(acc, next_i);
+  XlaOp keep_going = Lt(next_i, ConstantR0<float>(&body_builder, 4.0f));
+  Tuple(&body_builder, {keep_going, next_i, next_acc});
+  TF_ASSIGN_OR_RETURN(XlaComputation body, body_builder.Build());
+
+  XlaBuilder builder("metal_scalar_tuple_while");
+  XlaOp init = Tuple(&builder, {ConstantR0<bool>(&builder, true),
+                               ConstantR0<float>(&builder, 0.0f),
+                               ConstantR0<float>(&builder, 0.0f)});
+  XlaOp result = While(condition, body, init);
+  GetTupleElement(result, 2);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<GlobalData*> arguments;
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalIsFinite() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_is_finite");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  IsFinite(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR1<float>(
+      {0.0f, std::numeric_limits<float>::infinity(),
+       -std::numeric_limits<float>::infinity(),
+       std::numeric_limits<float>::quiet_NaN()});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalIota() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -5333,6 +5387,31 @@ TEST(MetalGpuExecutableTest, ElementwiseWhileVectorAccumulator) {
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<float>({i}), expected[i]) << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseScalarTupleWhile) {
+  auto result = ExecuteMetalScalarTupleWhile();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {})));
+  EXPECT_EQ(actual.Get<float>({}), 10.0f);
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseIsFinite) {
+  auto result = ExecuteMetalIsFinite();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(PRED, {4})));
+  EXPECT_TRUE(actual.Get<bool>({0}));
+  EXPECT_FALSE(actual.Get<bool>({1}));
+  EXPECT_FALSE(actual.Get<bool>({2}));
+  EXPECT_FALSE(actual.Get<bool>({3}));
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSlice) {

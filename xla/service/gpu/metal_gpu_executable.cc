@@ -667,6 +667,11 @@ class ElementwiseAirEmitter {
     absl::flat_hash_map<int64_t, std::string> values;
   };
 
+  struct TupleScalarParameterScope {
+    const HloComputation* computation = nullptr;
+    absl::flat_hash_map<int64_t, std::vector<std::string>> values;
+  };
+
   absl::StatusOr<std::string> EmitValue(const HloInstruction* instr,
                                         bool force_scalar,
                                         std::vector<std::string>* body) {
@@ -807,6 +812,8 @@ class ElementwiseAirEmitter {
         return EmitLogicalBinary(instr, body);
       case HloOpcode::kNot:
         return EmitNot(instr, body);
+      case HloOpcode::kIsFinite:
+        return EmitIsFinite(instr, body);
       case HloOpcode::kShiftLeft:
       case HloOpcode::kShiftRightArithmetic:
       case HloOpcode::kShiftRightLogical:
@@ -4792,6 +4799,10 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitGetTupleElement(
       const HloInstruction* instr, std::vector<std::string>* body) {
+    if (std::optional<std::string> override =
+            TupleScalarParameterOverride(instr)) {
+      return *override;
+    }
     if (instr->operand(0)->opcode() == HloOpcode::kWhile) {
       return EmitSimpleWhileAccumulator(instr, body);
     }
@@ -4951,6 +4962,18 @@ class ElementwiseAirEmitter {
       return EmitSimpleWhileVectorAccumulator(instr, body);
     }
 
+    if (ShapeUtil::IsEffectiveScalar(instr->shape()) &&
+        IsScalarLikeSupported(instr->shape())) {
+      const size_t original_body_size = body->size();
+      const std::string original_block = current_block_;
+      auto generic_while = EmitScalarWhileTupleElement(instr, body);
+      if (generic_while.ok()) {
+        return *generic_while;
+      }
+      body->resize(original_body_size);
+      current_block_ = original_block;
+    }
+
     const HloInstruction* while_instr = instr->operand(0);
     if (instr->tuple_index() != 1 || !IsScalarLikeF32(instr->shape()) ||
         !ShapeUtil::Equal(instr->shape(), result_shape_) ||
@@ -5040,6 +5063,151 @@ class ElementwiseAirEmitter {
 
     body->push_back(absl::StrFormat("%s:", done));
     return acc;
+  }
+
+  absl::StatusOr<std::string> EmitScalarWhileTupleElement(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* while_instr = instr->operand(0);
+    if (while_instr->opcode() != HloOpcode::kWhile ||
+        while_instr->operand_count() != 1 ||
+        while_instr->operand(0)->opcode() != HloOpcode::kTuple ||
+        !while_instr->shape().IsTuple()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scalar while requires a tuple init operand.");
+    }
+
+    const HloInstruction* init_tuple = while_instr->operand(0);
+    const int64_t tuple_size = init_tuple->operand_count();
+    if (tuple_size <= 0 || instr->tuple_index() < 0 ||
+        instr->tuple_index() >= tuple_size ||
+        ShapeUtil::TupleElementCount(while_instr->shape()) != tuple_size ||
+        !ShapeUtil::Equal(while_instr->shape().tuple_shapes(instr->tuple_index()),
+                          instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scalar while tuple shape does not match the "
+          "requested tuple element.");
+    }
+
+    std::vector<PrimitiveType> tuple_types;
+    tuple_types.reserve(tuple_size);
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      const Shape& tuple_shape = while_instr->shape().tuple_shapes(i);
+      if (!IsScalarLikeSupported(tuple_shape) ||
+          !ShapeUtil::Equal(init_tuple->operand(i)->shape(), tuple_shape)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR scalar while currently supports only scalar "
+            "supported tuple elements.");
+      }
+      tuple_types.push_back(tuple_shape.element_type());
+    }
+
+    const HloInstruction* cond_root =
+        while_instr->while_condition()->root_instruction();
+    if (!IsScalarLikeSupported(cond_root->shape()) ||
+        cond_root->shape().element_type() != PRED) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scalar while requires a scalar pred condition.");
+    }
+
+    const HloInstruction* body_root =
+        while_instr->while_body()->root_instruction();
+    if (body_root->opcode() != HloOpcode::kTuple ||
+        body_root->operand_count() != tuple_size) {
+      return absl::UnimplementedError(
+          "Metal direct AIR scalar while requires a tuple body root matching "
+          "the loop state.");
+    }
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      if (!ShapeUtil::Equal(body_root->operand(i)->shape(),
+                            while_instr->shape().tuple_shapes(i))) {
+        return absl::UnimplementedError(
+            "Metal direct AIR scalar while body element shape does not match "
+            "the loop state.");
+      }
+    }
+
+    std::vector<std::string> init_values;
+    init_values.reserve(tuple_size);
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      TF_ASSIGN_OR_RETURN(std::string init_value,
+                          EmitValue(init_tuple->operand(i),
+                                    /*force_scalar=*/true, body));
+      init_values.push_back(std::move(init_value));
+    }
+
+    const std::string entry_block = current_block_;
+    const std::string header = NewLabel("while_scalar_header");
+    const std::string loop_body = NewLabel("while_scalar_body");
+    const std::string done = NewLabel("while_scalar_done");
+    std::vector<std::string> current_values;
+    current_values.reserve(tuple_size);
+    std::vector<std::string> next_values;
+    next_values.reserve(tuple_size);
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      current_values.push_back(NewName("while_scalar_value"));
+      next_values.push_back(NewName("while_scalar_next"));
+    }
+
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+    body->push_back(absl::StrFormat("%s:", header));
+    current_block_ = header;
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      body->push_back(absl::StrFormat(
+          "  %s = phi %s [ %s, %%%s ], [ %s, %%%s ]", current_values[i],
+          ValueIrType(tuple_types[i]), init_values[i], entry_block,
+          next_values[i], loop_body));
+    }
+
+    TupleScalarParameterScope cond_scope;
+    cond_scope.computation = while_instr->while_condition();
+    cond_scope.values[0] = current_values;
+    tuple_scalar_parameter_scopes_.push_back(std::move(cond_scope));
+    absl::Cleanup pop_cond_scope = [this] {
+      tuple_scalar_parameter_scopes_.pop_back();
+    };
+    TF_ASSIGN_OR_RETURN(std::string keep_going,
+                        EmitValue(cond_root, /*force_scalar=*/true, body));
+    body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
+                                    keep_going, loop_body, done));
+
+    body->push_back(absl::StrFormat("%s:", loop_body));
+    current_block_ = loop_body;
+    TupleScalarParameterScope body_scope;
+    body_scope.computation = while_instr->while_body();
+    body_scope.values[0] = current_values;
+    tuple_scalar_parameter_scopes_.push_back(std::move(body_scope));
+    absl::Cleanup pop_body_scope = [this] {
+      tuple_scalar_parameter_scopes_.pop_back();
+    };
+    for (int64_t i = 0; i < tuple_size; ++i) {
+      TF_ASSIGN_OR_RETURN(std::string next_value,
+                          EmitValue(body_root->operand(i),
+                                    /*force_scalar=*/true, body));
+      EmitTrivialScalarCopy(tuple_types[i], next_value, next_values[i], body);
+    }
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+
+    body->push_back(absl::StrFormat("%s:", done));
+    current_block_ = done;
+    return current_values[instr->tuple_index()];
+  }
+
+  void EmitTrivialScalarCopy(PrimitiveType type, absl::string_view source,
+                             absl::string_view destination,
+                             std::vector<std::string>* body) {
+    if (type == PRED) {
+      body->push_back(absl::StrFormat("  %s = or i1 %s, false", destination,
+                                      source));
+      return;
+    }
+    if (IsFloatAccumulatorElementType(type)) {
+      body->push_back(absl::StrFormat(
+          "  %s = fadd fast float %s, 0x0000000000000000", destination,
+          source));
+      return;
+    }
+    body->push_back(absl::StrFormat("  %s = add %s %s, 0", destination,
+                                    ValueIrType(type), source));
   }
 
   absl::StatusOr<std::string> EmitSimpleWhileVectorAccumulator(
@@ -6392,6 +6560,31 @@ class ElementwiseAirEmitter {
       if (value != it->values.end()) {
         return value->second;
       }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> TupleScalarParameterOverride(
+      const HloInstruction* instr) const {
+    if (instr->opcode() != HloOpcode::kGetTupleElement ||
+        instr->operand(0)->opcode() != HloOpcode::kParameter) {
+      return std::nullopt;
+    }
+    const HloInstruction* parameter = instr->operand(0);
+    for (auto it = tuple_scalar_parameter_scopes_.rbegin();
+         it != tuple_scalar_parameter_scopes_.rend(); ++it) {
+      if (parameter->parent() != it->computation) {
+        continue;
+      }
+      auto tuple_values = it->values.find(parameter->parameter_number());
+      if (tuple_values == it->values.end()) {
+        continue;
+      }
+      if (instr->tuple_index() < 0 ||
+          instr->tuple_index() >= tuple_values->second.size()) {
+        return std::nullopt;
+      }
+      return tuple_values->second[instr->tuple_index()];
     }
     return std::nullopt;
   }
@@ -8175,6 +8368,30 @@ class ElementwiseAirEmitter {
     return selected;
   }
 
+  absl::StatusOr<std::string> EmitIsFinite(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsPredArray(instr->shape()) ||
+        !IsFloatAccumulatorElementType(
+            instr->operand(0)->shape().element_type())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR is-finite currently supports only floating-point "
+          "operands with pred results.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
+                                  body));
+    std::string bits = NewName("isfinite_bits");
+    std::string exponent = NewName("isfinite_exponent");
+    std::string finite = NewName("isfinite");
+    body->push_back(
+        absl::StrFormat("  %s = bitcast float %s to i32", bits, value));
+    body->push_back(absl::StrFormat("  %s = and i32 %s, 2139095040", exponent,
+                                    bits));
+    body->push_back(absl::StrFormat("  %s = icmp ne i32 %s, 2139095040",
+                                    finite, exponent));
+    return finite;
+  }
+
   absl::StatusOr<std::string> EmitAbs(const HloInstruction* instr,
                                       std::vector<std::string>* body) {
     TF_ASSIGN_OR_RETURN(std::string value,
@@ -8603,11 +8820,13 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   bool raw_bf16_result_ = false;
   std::vector<CallParameterScope> call_parameter_scopes_;
   std::vector<ScalarParameterScope> scalar_parameter_scopes_;
+  std::vector<TupleScalarParameterScope> tuple_scalar_parameter_scopes_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
   std::vector<PrimitiveType> parameter_types_;
   std::vector<std::string> expression_body_;
   std::string result_value_;
+  std::string current_block_ = "body";
   int next_value_id_ = 0;
 };
 
