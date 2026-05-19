@@ -161,6 +161,11 @@ bool IsBF16Array(const Shape& shape) {
   return shape.element_type() == BF16 && shape.IsArray();
 }
 
+bool IsPackedSubbyteArray(const Shape& shape) {
+  return shape.IsArray() &&
+         (shape.element_type() == S4 || shape.element_type() == U4);
+}
+
 bool IsC64Array(const Shape& shape) {
   return shape.element_type() == C64 && shape.IsArray();
 }
@@ -270,6 +275,12 @@ int ElementBitWidth(PrimitiveType type) {
     return 4;
   }
   return ElementTypeSize(type) * 8;
+}
+
+int64_t PackedByteSize(const Shape& shape) {
+  return (ShapeUtil::ElementsIn(shape) * ElementBitWidth(shape.element_type()) +
+          7) /
+         8;
 }
 
 std::string FloatLiteral(float value) {
@@ -407,7 +418,8 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalAirToMetallib(
 class ElementwiseAirEmitter {
  public:
   explicit ElementwiseAirEmitter(Shape result_shape)
-      : result_shape_(std::move(result_shape)) {}
+      : result_shape_(std::move(result_shape)),
+        num_work_items_(ShapeUtil::ElementsIn(result_shape_)) {}
 
   absl::StatusOr<std::string> Emit(const HloInstruction* root) {
     if (IsC64Array(root->shape())) {
@@ -417,10 +429,12 @@ class ElementwiseAirEmitter {
       result_value_ = std::move(value);
       return BuildModule();
     }
-    if (!IsSupportedElementwiseArray(root->shape())) {
+    if (!IsSupportedElementwiseArray(root->shape()) &&
+        !(root->opcode() == HloOpcode::kBitcastConvert &&
+          IsPackedSubbyteArray(root->shape()))) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise supports only f32, s32, and pred "
-          "arrays.");
+          "Metal direct AIR elementwise supports only f32, f16, bf16, s32, "
+          "u16, pred, and packed subbyte bitcast-convert arrays.");
     }
     std::vector<std::string> body;
     TF_ASSIGN_OR_RETURN(std::string value,
@@ -459,6 +473,7 @@ class ElementwiseAirEmitter {
   const std::vector<int64_t>& parameter_numbers() const {
     return parameter_numbers_;
   }
+  int64_t num_work_items() const { return num_work_items_; }
 
  private:
   struct CallParameterScope {
@@ -3607,6 +3622,36 @@ class ElementwiseAirEmitter {
           "shape-preserving bitcasts with matching total bit widths.");
     }
 
+    if ((dst_type == S4 || dst_type == U4) &&
+        ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      const HloInstruction* operand = instr->operand(0);
+      if (operand->opcode() != HloOpcode::kParameter) {
+        return absl::UnimplementedError(
+            "Metal direct AIR bitcast-convert to s4/u4 currently supports "
+            "only parameter operands.");
+      }
+      raw_byte_result_ = true;
+      num_work_items_ = PackedByteSize(instr->shape());
+      const int input_index =
+          InputIndexForParameter(operand->parameter_number(), src_type);
+      const char* src_ir_type = ElementIrType(src_type);
+      std::string raw_arg = absl::StrFormat("%%arg%d", input_index);
+      if (std::string(src_ir_type) != "i8") {
+        raw_arg = NewName("bitcast_raw_arg");
+        body->push_back(absl::StrFormat(
+            "  %s = bitcast %s addrspace(1)* %%arg%d to i8 addrspace(1)*",
+            raw_arg, src_ir_type, input_index));
+      }
+      std::string ptr = NewName("bitcast_ptr");
+      std::string byte = NewName("bitcast_byte");
+      body->push_back(absl::StrFormat(
+          "  %s = getelementptr inbounds i8, i8 addrspace(1)* %s, i64 %%idx",
+          ptr, raw_arg));
+      body->push_back(absl::StrFormat(
+          "  %s = load i8, i8 addrspace(1)* %s, align 1", byte, ptr));
+      return byte;
+    }
+
     if ((src_type == S4 || src_type == U4) && dst_type == F16) {
       const HloInstruction* operand = instr->operand(0);
       if (operand->opcode() != HloOpcode::kParameter) {
@@ -4987,7 +5032,11 @@ class ElementwiseAirEmitter {
     }
 
     std::string store_result;
-    if (result_is_pred) {
+    if (raw_byte_result_) {
+      store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
+  store i8 %s, i8 addrspace(1)* %%out_ptr, align 1)",
+                                     result_value_);
+    } else if (result_is_pred) {
       store_result = absl::StrFormat(R"(  %%out_ptr = getelementptr inbounds i8, i8 addrspace(1)* %%out, i64 %%idx
   %%out_i8 = zext i1 %s to i8
   store i8 %%out_i8, i8 addrspace(1)* %%out_ptr, align 1)",
@@ -5171,6 +5220,8 @@ attributes #1 = { mustprogress nofree nosync nounwind readnone willreturn }
   }
 
   Shape result_shape_;
+  int64_t num_work_items_ = 0;
+  bool raw_byte_result_ = false;
   std::vector<CallParameterScope> call_parameter_scopes_;
   absl::flat_hash_map<int64_t, int> parameter_to_input_index_;
   std::vector<int64_t> parameter_numbers_;
@@ -6524,6 +6575,7 @@ class MetalElementwiseExecutable final : public Executable {
  public:
   MetalElementwiseExecutable(std::shared_ptr<HloModule> module,
                              std::vector<int64_t> parameter_numbers,
+                             int64_t num_elements,
                              std::vector<uint8_t> metallib)
       : Executable(std::move(module)),
         parameter_numbers_(std::move(parameter_numbers)),
@@ -6531,7 +6583,7 @@ class MetalElementwiseExecutable final : public Executable {
                           .entry_computation()
                           ->root_instruction()
                           ->shape()),
-        num_elements_(ShapeUtil::ElementsIn(result_shape_)),
+        num_elements_(num_elements),
         metallib_(std::move(metallib)) {}
 
   Shape result_shape() const override { return result_shape_; }
@@ -6618,7 +6670,8 @@ absl::StatusOr<std::unique_ptr<Executable>> BuildMetalElementwiseExecutable(
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
                       CompileMetalAirToMetallib(air, "metal_elementwise_air"));
   return std::make_unique<MetalElementwiseExecutable>(
-      std::move(module), emitter.parameter_numbers(), std::move(metallib));
+      std::move(module), emitter.parameter_numbers(), emitter.num_work_items(),
+      std::move(metallib));
 }
 
 absl::StatusOr<const HloInstruction*> MatchTopKTupleRoot(

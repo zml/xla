@@ -1458,6 +1458,22 @@ absl::StatusOr<Literal> ExecuteMetalBitcastConvertS4ToF16() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalBitcastConvertF32ToU4() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_bitcast_convert_f32_to_u4");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  BitcastConvertType(input, U4);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = LiteralUtil::CreateR0<float>(1.0f);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReduction(HloOpcode opcode,
                                               float init_value) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
@@ -3674,6 +3690,21 @@ TEST(MetalGpuExecutableTest, BitcastConvertS4ToF16) {
   ASSERT_TRUE(
       ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F16, {})));
   EXPECT_EQ(HalfBits(actual.Get<half>({})), 0x4de1);
+}
+
+TEST(MetalGpuExecutableTest, BitcastConvertF32ToU4) {
+  auto result = ExecuteMetalBitcastConvertF32ToU4();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U4, {8})));
+  const std::vector<u4> expected = {u4{0}, u4{0}, u4{0},  u4{0},
+                                    u4{0}, u4{8}, u4{15}, u4{3}};
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<u4>({i}), expected[i]) << "at " << i;
+  }
 }
 
 TEST(MetalGpuExecutableTest, ReductionSum) {
