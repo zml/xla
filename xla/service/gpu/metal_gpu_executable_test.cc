@@ -2278,6 +2278,50 @@ absl::StatusOr<Literal> ExecuteMetalClampS16ScalarBounds() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalNegS16Rank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_neg_s16_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(S16, {3, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Neg(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  int16_t value = -6;
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      input_literal.Set<int16_t>({row, col}, value++);
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalSignS8Rank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_sign_s8_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(S8, {3, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Sign(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  int8_t values[12] = {-7, -1, 0, 1, 5, -3, 0, 9, -8, 2, 0, 4};
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      input_literal.Set<int8_t>({row, col}, values[row * 4 + col]);
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReverseRank2() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -5557,6 +5601,43 @@ TEST(MetalGpuExecutableTest, ElementwiseClampS16ScalarBounds) {
       EXPECT_EQ(actual.Get<int16_t>({row, col}), expected)
           << "at [" << row << ", " << col << "]";
       ++value;
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseNegS16Rank2) {
+  auto result = ExecuteMetalNegS16Rank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S16, {3, 4})));
+  int16_t value = -6;
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<int16_t>({row, col}), static_cast<int16_t>(-value))
+          << "at [" << row << ", " << col << "]";
+      ++value;
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSignS8Rank2) {
+  auto result = ExecuteMetalSignS8Rank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S8, {3, 4})));
+  int8_t values[12] = {-7, -1, 0, 1, 5, -3, 0, 9, -8, 2, 0, 4};
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const int8_t value = values[row * 4 + col];
+      const int8_t expected = value < 0 ? -1 : (value > 0 ? 1 : 0);
+      EXPECT_EQ(actual.Get<int8_t>({row, col}), expected)
+          << "at [" << row << ", " << col << "]";
     }
   }
 }

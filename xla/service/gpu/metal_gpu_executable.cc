@@ -2158,9 +2158,10 @@ class ElementwiseAirEmitter {
                           EmitLoadFromLinearIndex(instr->operand(0), index,
                                                   body));
       std::string negated = NewName("linear_neg");
-      if (instr->shape().element_type() == S32) {
-        body->push_back(
-            absl::StrFormat("  %s = sub i32 0, %s", negated, value));
+      if (IsIntegerElementType(instr->shape().element_type())) {
+        const char* ir_type = ElementIrType(instr->shape().element_type());
+        body->push_back(absl::StrFormat("  %s = sub %s 0, %s", negated,
+                                        ir_type, value));
         return negated;
       }
       if (instr->shape().element_type() == F32) {
@@ -2169,8 +2170,8 @@ class ElementwiseAirEmitter {
         return negated;
       }
       return absl::UnimplementedError(
-          "Metal direct AIR linear load negate currently supports only f32 "
-          "and s32 arrays.");
+          "Metal direct AIR linear load negate currently supports only "
+          "floating-point and integer arrays.");
     }
     if (instr->opcode() == HloOpcode::kCall) {
       const HloComputation* callee = instr->to_apply();
@@ -8759,8 +8760,10 @@ class ElementwiseAirEmitter {
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
                                   body));
     std::string name = NewName("unary");
-    if (instr->shape().element_type() == S32) {
-      body->push_back(absl::StrFormat("  %s = sub i32 0, %s", name, value));
+    if (IsIntegerElementType(instr->shape().element_type())) {
+      const char* ir_type = ElementIrType(instr->shape().element_type());
+      body->push_back(
+          absl::StrFormat("  %s = sub %s 0, %s", name, ir_type, value));
       return name;
     }
     if (IsFloatAccumulatorElementType(instr->shape().element_type())) {
@@ -8770,7 +8773,7 @@ class ElementwiseAirEmitter {
     }
     return absl::UnimplementedError(
         "Metal direct AIR negate currently supports only floating-point and "
-        "s32 arrays.");
+        "integer arrays.");
   }
 
   absl::StatusOr<std::string> EmitSign(const HloInstruction* instr,
@@ -8778,26 +8781,40 @@ class ElementwiseAirEmitter {
     if (instr->shape().element_type() == F32) {
       return EmitIntrinsicUnary(instr, "air.sign.f32", body);
     }
-    if (instr->shape().element_type() != S32) {
+    const PrimitiveType type = instr->shape().element_type();
+    if (!IsIntegerElementType(type)) {
       return absl::UnimplementedError(
-          "Metal direct AIR sign currently supports only f32 and s32 arrays.");
+          "Metal direct AIR sign currently supports only f32 and integer "
+          "arrays.");
     }
     TF_ASSIGN_OR_RETURN(std::string value,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
                                   body));
+    const char* ir_type = ElementIrType(type);
+    if (IsUnsignedIntegerElementType(type)) {
+      std::string nonzero = NewName("sign_nonzero");
+      std::string result = NewName("sign_result");
+      body->push_back(
+          absl::StrFormat("  %s = icmp ne %s %s, 0", nonzero, ir_type, value));
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, %s 1, %s 0", result, nonzero, ir_type,
+          ir_type));
+      return result;
+    }
     std::string positive = NewName("sign_positive");
     std::string negative = NewName("sign_negative");
     std::string nonnegative_result = NewName("sign_nonnegative_result");
     std::string result = NewName("sign_result");
-    body->push_back(
-        absl::StrFormat("  %s = icmp sgt i32 %s, 0", positive, value));
-    body->push_back(
-        absl::StrFormat("  %s = icmp slt i32 %s, 0", negative, value));
+    body->push_back(absl::StrFormat("  %s = icmp sgt %s %s, 0", positive,
+                                    ir_type, value));
+    body->push_back(absl::StrFormat("  %s = icmp slt %s %s, 0", negative,
+                                    ir_type, value));
     body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, i32 1, i32 0", nonnegative_result, positive));
+        "  %s = select i1 %s, %s 1, %s 0", nonnegative_result, positive,
+        ir_type, ir_type));
     body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, i32 -1, i32 %s", result, negative,
-        nonnegative_result));
+        "  %s = select i1 %s, %s -1, %s %s", result, negative, ir_type,
+        ir_type, nonnegative_result));
     return result;
   }
 
