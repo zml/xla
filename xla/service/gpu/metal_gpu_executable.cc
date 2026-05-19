@@ -800,6 +800,9 @@ class ElementwiseAirEmitter {
         return EmitBitcastConvert(instr, body);
       case HloOpcode::kConvert:
         return EmitConvert(instr, body);
+      case HloOpcode::kReal:
+      case HloOpcode::kImag:
+        return EmitComplexPart(instr, force_scalar, body);
       case HloOpcode::kDot:
         return EmitDot(instr, body);
       case HloOpcode::kDynamicSlice:
@@ -952,6 +955,12 @@ class ElementwiseAirEmitter {
     if (instr->opcode() == HloOpcode::kGather) {
       return EmitComplexGather(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kComplex) {
+      return EmitComplexConstructor(instr, body);
+    }
+    if (instr->opcode() == HloOpcode::kLog) {
+      return EmitComplexLog(instr, body);
+    }
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (!IsC64Array(instr->shape())) {
         return absl::UnimplementedError(
@@ -980,6 +989,126 @@ class ElementwiseAirEmitter {
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR complex path does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitComplexConstructor(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 2 ||
+        !IsF32Array(instr->operand(0)->shape()) ||
+        !IsF32Array(instr->operand(1)->shape()) ||
+        instr->operand(0)->shape().dimensions() != instr->shape().dimensions() ||
+        instr->operand(1)->shape().dimensions() != instr->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex constructor requires c64 result and two "
+          "f32 operands with matching dimensions.");
+    }
+
+    TF_ASSIGN_OR_RETURN(std::string real,
+                        EmitValue(instr->operand(0),
+                                  ShapeUtil::IsEffectiveScalar(
+                                      instr->operand(0)->shape()),
+                                  body));
+    TF_ASSIGN_OR_RETURN(std::string imag,
+                        EmitValue(instr->operand(1),
+                                  ShapeUtil::IsEffectiveScalar(
+                                      instr->operand(1)->shape()),
+                                  body));
+    std::string real_part = NewName("complex_insert_real");
+    std::string complex_value = NewName("complex_value");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1",
+        complex_value, real_part, imag));
+    return complex_value;
+  }
+
+  absl::StatusOr<std::string> EmitComplexPart(
+      const HloInstruction* instr, bool force_scalar,
+      std::vector<std::string>* body) {
+    if ((instr->opcode() != HloOpcode::kReal &&
+         instr->opcode() != HloOpcode::kImag) ||
+        instr->operand_count() != 1 || !IsF32Array(instr->shape()) ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions() != instr->operand(0)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex part extraction requires real/imag from "
+          "c64 to f32 with matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(
+        std::string complex_value,
+        EmitLoadFromLinearIndex(
+            instr->operand(0),
+            (force_scalar || ShapeUtil::IsEffectiveScalar(instr->shape()))
+                ? "0"
+                : "%idx",
+            body));
+    std::string value =
+        NewName(instr->opcode() == HloOpcode::kReal ? "complex_real"
+                                                    : "complex_imag");
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 %d", value, complex_value,
+        instr->opcode() == HloOpcode::kReal ? 0 : 1));
+    return value;
+  }
+
+  absl::StatusOr<std::string> EmitComplexLog(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    if (!IsC64Array(instr->shape()) || instr->operand_count() != 1 ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions() !=
+            instr->operand(0)->shape().dimensions()) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex log requires c64 input and output with "
+          "matching dimensions.");
+    }
+    TF_ASSIGN_OR_RETURN(std::string source,
+                        EmitComplexValue(instr->operand(0), body));
+    std::string real = NewName("complex_log_real");
+    std::string imag = NewName("complex_log_imag");
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 0", real, source));
+    body->push_back(absl::StrFormat(
+        "  %s = extractelement <2 x float> %s, i32 1", imag, source));
+    std::string real_sq = EmitOp("fmul fast float", real, real, body);
+    std::string imag_sq = EmitOp("fmul fast float", imag, imag, body);
+    std::string norm_sq = EmitOp("fadd fast float", real_sq, imag_sq, body);
+    std::string log_norm_sq = NewName("complex_log_norm");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_log.f32(float %s)", log_norm_sq,
+        norm_sq));
+    std::string log_real =
+        EmitOp("fmul fast float", FloatLiteral(0.5f), log_norm_sq, body);
+    std::string angle = NewName("complex_log_angle");
+    body->push_back(absl::StrFormat(
+        "  %s = call fast float @air.fast_atan2.f32(float %s, float %s)",
+        angle, imag, real));
+    std::string real_zero = NewName("complex_log_real_zero");
+    std::string imag_zero = NewName("complex_log_imag_zero");
+    std::string both_zero = NewName("complex_log_both_zero");
+    std::string selected_angle = NewName("complex_log_selected_angle");
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast oeq float %s, 0x0000000000000000", real_zero,
+        real));
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast oeq float %s, 0x0000000000000000", imag_zero,
+        imag));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", both_zero,
+                                    real_zero, imag_zero));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float 0x0000000000000000, float %s",
+        selected_angle, both_zero, angle));
+
+    std::string real_part = NewName("complex_log_insert_real");
+    std::string complex_value = NewName("complex_log_value");
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> undef, float %s, i32 0", real_part,
+        log_real));
+    body->push_back(absl::StrFormat(
+        "  %s = insertelement <2 x float> %s, float %s, i32 1",
+        complex_value, real_part, selected_angle));
+    return complex_value;
   }
 
   absl::StatusOr<std::string> EmitComplexGather(
@@ -6815,7 +6944,9 @@ class ElementwiseAirEmitter {
       }
       body->push_back(absl::StrFormat("  %s = icmp %s i1 %s, %s", cmp,
                                       predicate, lhs, rhs));
-    } else if (instr->operand(0)->shape().element_type() == S32) {
+    } else if (IsIntegerElementType(instr->operand(0)->shape().element_type())) {
+      const PrimitiveType type = instr->operand(0)->shape().element_type();
+      const bool is_signed = IsSignedIntegerElementType(type);
       absl::string_view predicate;
       switch (instr->comparison_direction()) {
         case ComparisonDirection::kEq:
@@ -6825,20 +6956,21 @@ class ElementwiseAirEmitter {
           predicate = "ne";
           break;
         case ComparisonDirection::kGe:
-          predicate = "sge";
+          predicate = is_signed ? "sge" : "uge";
           break;
         case ComparisonDirection::kGt:
-          predicate = "sgt";
+          predicate = is_signed ? "sgt" : "ugt";
           break;
         case ComparisonDirection::kLe:
-          predicate = "sle";
+          predicate = is_signed ? "sle" : "ule";
           break;
         case ComparisonDirection::kLt:
-          predicate = "slt";
+          predicate = is_signed ? "slt" : "ult";
           break;
       }
-      body->push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
-                                      predicate, lhs, rhs));
+      body->push_back(absl::StrFormat("  %s = icmp %s %s %s, %s", cmp,
+                                      predicate, ElementIrType(type), lhs,
+                                      rhs));
     } else {
       absl::string_view predicate;
       switch (instr->comparison_direction()) {
@@ -7446,13 +7578,10 @@ class ElementwiseAirEmitter {
         return EmitGather(instr->operand(1), body);
       }
     }
-    if (!IsF32Array(instr->shape()) && !IsF16Array(instr->shape()) &&
-        !IsBF16Array(instr->shape())) {
-      if (!IsS32Array(instr->shape())) {
-        return absl::UnimplementedError(
-            "Metal direct AIR elementwise select currently supports only "
-            "floating-point and s32 array results.");
-      }
+    if (!IsSupportedElementwiseArray(instr->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise select currently supports only "
+          "supported elementwise array results.");
     }
     TF_ASSIGN_OR_RETURN(std::string pred,
                         EmitValue(instr->operand(0), /*force_scalar=*/false,

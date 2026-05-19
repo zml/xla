@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -1375,6 +1376,25 @@ absl::StatusOr<Literal> ExecuteMetalBroadcastC64Rank2ToRank3() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalComplexLogRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_complex_log_rank1");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {3});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  Log(input);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  input_literal.Set<complex64>({0}, complex64(1.25f, 0.5f));
+  input_literal.Set<complex64>({1}, complex64(2.0f, -0.75f));
+  input_literal.Set<complex64>({2}, complex64(0.5f, 1.5f));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 template <typename BuildFn>
 absl::StatusOr<Literal> ExecuteMetalElementwiseBinary(const char* name,
                                                       BuildFn build) {
@@ -2314,6 +2334,30 @@ absl::StatusOr<Literal> ExecuteMetalSignS8Rank2() {
   for (int64_t row = 0; row < 3; ++row) {
     for (int64_t col = 0; col < 4; ++col) {
       input_literal.Set<int8_t>({row, col}, values[row * 4 + col]);
+    }
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalSelectU32Rank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_select_u32_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(U32, {3, 4});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp zero = Broadcast(ConstantR0<uint32_t>(&builder, 0), {3, 4});
+  XlaOp one = Broadcast(ConstantR0<uint32_t>(&builder, 1), {3, 4});
+  Select(Ne(input, zero), one, zero);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  uint32_t values[12] = {0, 1, 2, 0, 5, 0, 9, 10, 0, 3, 4, 0};
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      input_literal.Set<uint32_t>({row, col}, values[row * 4 + col]);
     }
   }
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
@@ -4549,6 +4593,25 @@ TEST(MetalGpuExecutableTest, BroadcastC64Rank2ToRank3) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ComplexLogRank1) {
+  auto result = ExecuteMetalComplexLogRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(C64, {3})));
+  const complex64 inputs[3] = {complex64(1.25f, 0.5f),
+                               complex64(2.0f, -0.75f),
+                               complex64(0.5f, 1.5f)};
+  for (int64_t i = 0; i < 3; ++i) {
+    const complex64 expected = std::log(inputs[i]);
+    const complex64 value = actual.Get<complex64>({i});
+    EXPECT_NEAR(value.real(), expected.real(), 1.0e-5f) << "real at " << i;
+    EXPECT_NEAR(value.imag(), expected.imag(), 1.0e-5f) << "imag at " << i;
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseAdd) {
   auto result = ExecuteMetalElementwiseBinary(
       "metal_elementwise_add",
@@ -5637,6 +5700,24 @@ TEST(MetalGpuExecutableTest, ElementwiseSignS8Rank2) {
       const int8_t value = values[row * 4 + col];
       const int8_t expected = value < 0 ? -1 : (value > 0 ? 1 : 0);
       EXPECT_EQ(actual.Get<int8_t>({row, col}), expected)
+          << "at [" << row << ", " << col << "]";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseSelectU32Rank2) {
+  auto result = ExecuteMetalSelectU32Rank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U32, {3, 4})));
+  uint32_t values[12] = {0, 1, 2, 0, 5, 0, 9, 10, 0, 3, 4, 0};
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const uint32_t value = values[row * 4 + col];
+      EXPECT_EQ(actual.Get<uint32_t>({row, col}), value == 0 ? 0 : 1)
           << "at [" << row << ", " << col << "]";
     }
   }
