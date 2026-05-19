@@ -1802,6 +1802,174 @@ absl::StatusOr<Literal> ExecuteMetalBatchedGatherS32Rank3Window() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalGatherU32Rank3Rows() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_gather_u32_rank3_rows");
+  Shape input_shape = ShapeUtil::MakeShape(U32, {3, 4, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {2, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+
+  GatherDimensionNumbers dnums;
+  dnums.add_offset_dims(1);
+  dnums.add_offset_dims(2);
+  dnums.add_collapsed_slice_dims(0);
+  dnums.add_start_index_map(0);
+  dnums.set_index_vector_dim(1);
+  Gather(input, indices, dnums, {1, 4, 5}, /*indices_are_sorted=*/false);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t batch = 0; batch < 3; ++batch) {
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        input_literal.Set<uint32_t>(
+            {batch, row, col},
+            static_cast<uint32_t>(batch * 20 + row * 5 + col));
+      }
+    }
+  }
+  Array2D<int32_t> index_values(2, 1);
+  index_values(0, 0) = 0;
+  index_values(1, 0) = 2;
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalGatherU16Rank3TwoAxes() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_gather_u16_rank3_two_axes");
+  Shape input_shape = ShapeUtil::MakeShape(U16, {3, 4, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {2, 2});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+
+  GatherDimensionNumbers dnums;
+  dnums.add_offset_dims(1);
+  dnums.add_collapsed_slice_dims(0);
+  dnums.add_collapsed_slice_dims(1);
+  dnums.add_start_index_map(0);
+  dnums.add_start_index_map(1);
+  dnums.set_index_vector_dim(1);
+  Gather(input, indices, dnums, {1, 1, 5}, /*indices_are_sorted=*/false);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t batch = 0; batch < 3; ++batch) {
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        input_literal.Set<uint16_t>(
+            {batch, row, col},
+            static_cast<uint16_t>(batch * 20 + row * 5 + col));
+      }
+    }
+  }
+  Array2D<int32_t> index_values(2, 2);
+  index_values(0, 0) = 0;
+  index_values(0, 1) = 1;
+  index_values(1, 0) = 2;
+  index_values(1, 1) = 3;
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalGatherC64Rank3Rows() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_gather_c64_rank3_rows");
+  Shape input_shape = ShapeUtil::MakeShape(C64, {3, 4, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {3, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+
+  GatherDimensionNumbers dnums;
+  dnums.add_offset_dims(1);
+  dnums.add_offset_dims(2);
+  dnums.add_collapsed_slice_dims(0);
+  dnums.add_start_index_map(0);
+  dnums.set_index_vector_dim(1);
+  Gather(input, indices, dnums, {1, 4, 5}, /*indices_are_sorted=*/false);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t batch = 0; batch < 3; ++batch) {
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        input_literal.Set<complex64>(
+            {batch, row, col},
+            complex64(static_cast<float>(batch * 20 + row * 5 + col),
+                      static_cast<float>(batch - row - col) * 0.25f));
+      }
+    }
+  }
+  Array2D<int32_t> index_values(3, 1);
+  index_values(0, 0) = 0;
+  index_values(1, 0) = 2;
+  index_values(2, 0) = 1;
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalGatherBf16Rank3OuterAxes() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_gather_bf16_rank3_outer_axes");
+  Shape input_shape = ShapeUtil::MakeShape(BF16, {3, 4, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {2, 2});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+
+  GatherDimensionNumbers dnums;
+  dnums.add_offset_dims(1);
+  dnums.add_collapsed_slice_dims(0);
+  dnums.add_collapsed_slice_dims(2);
+  dnums.add_start_index_map(0);
+  dnums.add_start_index_map(2);
+  dnums.set_index_vector_dim(1);
+  Gather(input, indices, dnums, {1, 4, 1}, /*indices_are_sorted=*/false);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t batch = 0; batch < 3; ++batch) {
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        input_literal.Set<bfloat16>(
+            {batch, row, col},
+            bfloat16(static_cast<float>(batch * 20 + row * 5 + col)));
+      }
+    }
+  }
+  Array2D<int32_t> index_values(2, 2);
+  index_values(0, 0) = 0;
+  index_values(0, 1) = 1;
+  index_values(1, 0) = 2;
+  index_values(1, 1) = 3;
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalSortRank1() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -4793,6 +4961,96 @@ TEST(MetalGpuExecutableTest, ElementwiseBatchedGatherS32Rank3Window) {
         EXPECT_EQ(actual.Get<int32_t>({batch1, batch0, col}), expected)
             << "at (" << batch1 << ", " << batch0 << ", " << col << ")";
       }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherU32Rank3Rows) {
+  auto result = ExecuteMetalGatherU32Rank3Rows();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(U32, {2, 4, 5})));
+  const int64_t source_batches[2] = {0, 2};
+  for (int64_t batch = 0; batch < 2; ++batch) {
+    const int64_t source_batch = source_batches[batch];
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        const uint32_t expected =
+            static_cast<uint32_t>(source_batch * 20 + row * 5 + col);
+        EXPECT_EQ(actual.Get<uint32_t>({batch, row, col}), expected)
+            << "at (" << batch << ", " << row << ", " << col << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherU16Rank3TwoAxes) {
+  auto result = ExecuteMetalGatherU16Rank3TwoAxes();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(U16, {2, 5})));
+  const int64_t source_indices[2][2] = {{0, 1}, {2, 3}};
+  for (int64_t batch = 0; batch < 2; ++batch) {
+    const int64_t source_batch = source_indices[batch][0];
+    const int64_t source_row = source_indices[batch][1];
+    for (int64_t col = 0; col < 5; ++col) {
+      const uint16_t expected =
+          static_cast<uint16_t>(source_batch * 20 + source_row * 5 + col);
+      EXPECT_EQ(actual.Get<uint16_t>({batch, col}), expected)
+          << "at (" << batch << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherC64Rank3Rows) {
+  auto result = ExecuteMetalGatherC64Rank3Rows();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(C64, {3, 4, 5})));
+  const int64_t source_batches[3] = {0, 2, 1};
+  for (int64_t batch = 0; batch < 3; ++batch) {
+    const int64_t source_batch = source_batches[batch];
+    for (int64_t row = 0; row < 4; ++row) {
+      for (int64_t col = 0; col < 5; ++col) {
+        const complex64 expected(
+            static_cast<float>(source_batch * 20 + row * 5 + col),
+            static_cast<float>(source_batch - row - col) * 0.25f);
+        const complex64 value = actual.Get<complex64>({batch, row, col});
+        EXPECT_EQ(value.real(), expected.real())
+            << "real at (" << batch << ", " << row << ", " << col << ")";
+        EXPECT_EQ(value.imag(), expected.imag())
+            << "imag at (" << batch << ", " << row << ", " << col << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherBf16Rank3OuterAxes) {
+  auto result = ExecuteMetalGatherBf16Rank3OuterAxes();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(BF16, {2, 4})));
+  const int64_t source_indices[2][2] = {{0, 1}, {2, 3}};
+  for (int64_t batch = 0; batch < 2; ++batch) {
+    const int64_t source_batch = source_indices[batch][0];
+    const int64_t source_col = source_indices[batch][1];
+    for (int64_t row = 0; row < 4; ++row) {
+      const float expected =
+          static_cast<float>(source_batch * 20 + row * 5 + source_col);
+      EXPECT_EQ(actual.Get<bfloat16>({batch, row}), bfloat16(expected))
+          << "at (" << batch << ", " << row << ")";
     }
   }
 }

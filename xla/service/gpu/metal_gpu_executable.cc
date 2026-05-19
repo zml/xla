@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/index_util.h"
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/embed_metal_air_kernels.h"
 #include "xla/service/service_executable_run_options.h"
@@ -365,6 +366,37 @@ std::string DefaultIrValue(PrimitiveType type) {
       return "zeroinitializer";
     default:
       return "0";
+  }
+}
+
+std::string LiteralElementIrValue(const Literal& literal, const Shape& shape,
+                                  int64_t linear_index) {
+  const DimensionVector index =
+      IndexUtil::LinearIndexToMultidimensionalIndex(shape, linear_index);
+  switch (shape.element_type()) {
+    case S32:
+      return absl::StrCat(literal.Get<int32_t>(index));
+    case S16:
+      return absl::StrCat(literal.Get<int16_t>(index));
+    case S8:
+      return absl::StrCat(static_cast<int>(literal.Get<int8_t>(index)));
+    case U32:
+      return absl::StrCat(literal.Get<uint32_t>(index));
+    case U16:
+      return absl::StrCat(literal.Get<uint16_t>(index));
+    case U8:
+      return absl::StrCat(
+          static_cast<unsigned int>(literal.Get<uint8_t>(index)));
+    case PRED:
+      return literal.Get<bool>(index) ? "true" : "false";
+    case F16:
+      return FloatLiteral(static_cast<float>(literal.Get<half>(index)));
+    case BF16:
+      return FloatLiteral(static_cast<float>(literal.Get<bfloat16>(index)));
+    case F32:
+      return FloatLiteral(literal.Get<float>(index));
+    default:
+      return DefaultIrValue(shape.element_type());
   }
 }
 
@@ -917,6 +949,9 @@ class ElementwiseAirEmitter {
     if (instr->opcode() == HloOpcode::kDot) {
       return EmitComplexDot(instr, body);
     }
+    if (instr->opcode() == HloOpcode::kGather) {
+      return EmitComplexGather(instr, body);
+    }
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (!IsC64Array(instr->shape())) {
         return absl::UnimplementedError(
@@ -945,6 +980,67 @@ class ElementwiseAirEmitter {
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR complex path does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitComplexGather(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const GatherDimensionNumbers& dnums = instr->gather_dimension_numbers();
+    if (!IsC64Array(instr->shape()) ||
+        !IsC64Array(instr->operand(0)->shape()) ||
+        instr->shape().dimensions().size() != 3 ||
+        instr->operand(0)->shape().dimensions().size() != 3 ||
+        !IsS32Array(instr->operand(1)->shape()) ||
+        instr->operand(1)->shape().dimensions().size() != 2 ||
+        instr->operand(1)->shape().dimensions(1) != 1 ||
+        dnums.offset_dims_size() != 2 || dnums.offset_dims(0) != 1 ||
+        dnums.offset_dims(1) != 2 ||
+        dnums.collapsed_slice_dims_size() != 1 ||
+        dnums.collapsed_slice_dims(0) != 0 ||
+        dnums.start_index_map_size() != 1 || dnums.start_index_map(0) != 0 ||
+        dnums.operand_batching_dims_size() != 0 ||
+        dnums.start_indices_batching_dims_size() != 0 ||
+        dnums.index_vector_dim() != 1 ||
+        instr->gather_slice_sizes().size() != 3 ||
+        instr->gather_slice_sizes()[0] != 1 ||
+        instr->gather_slice_sizes()[1] !=
+            instr->operand(0)->shape().dimensions(1) ||
+        instr->gather_slice_sizes()[2] !=
+            instr->operand(0)->shape().dimensions(2) ||
+        instr->shape().dimensions(0) !=
+            instr->operand(1)->shape().dimensions(0) ||
+        instr->shape().dimensions(1) !=
+            instr->operand(0)->shape().dimensions(1) ||
+        instr->shape().dimensions(2) !=
+            instr->operand(0)->shape().dimensions(2)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR complex gather currently supports only rank-3 row "
+          "gathers with scalar start indices.");
+    }
+
+    const HloInstruction* input = instr->operand(0);
+    const HloInstruction* indices = instr->operand(1);
+    const int64_t input_rows = input->shape().dimensions(0);
+    const int64_t input_mid = input->shape().dimensions(1);
+    const int64_t input_cols = input->shape().dimensions(2);
+    const int64_t input_minor_plane = input_mid * input_cols;
+
+    std::string gather_index = NewName("complex_gather_row_index");
+    std::string offset = NewName("complex_gather_row_offset");
+    body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d",
+                                    gather_index, input_minor_plane));
+    body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", offset,
+                                    input_minor_plane));
+    TF_ASSIGN_OR_RETURN(std::string raw_row,
+                        EmitLoadFromLinearIndex(indices, gather_index, body));
+    std::string source_row =
+        EmitClampedStartIndex(raw_row, input_rows - 1, body);
+    std::string row_offset = NewName("complex_gather_row_offset");
+    std::string source_index = NewName("complex_gather_source_index");
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                    source_row, input_minor_plane));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                    row_offset, offset));
+    return EmitLoadFromLinearIndex(input, source_index, body);
   }
 
   absl::StatusOr<std::string> EmitComplexConvert(
@@ -1840,9 +1936,31 @@ class ElementwiseAirEmitter {
       std::vector<std::string>* body) {
     if (instr->IsConstant()) {
       if (!IsScalarLikeSupported(instr->shape())) {
-        return absl::UnimplementedError(
-            "Metal direct AIR linear load currently supports only scalar "
-            "constants.");
+        if (!IsSupportedElementwiseArray(instr->shape())) {
+          return absl::UnimplementedError(
+              "Metal direct AIR linear load constants require a supported "
+              "array element type.");
+        }
+        const int64_t element_count = ShapeUtil::ElementsIn(instr->shape());
+        if (element_count <= 0) {
+          return DefaultIrValue(instr->shape().element_type());
+        }
+        std::string selected =
+            LiteralElementIrValue(instr->literal(), instr->shape(), 0);
+        const char* ir_type = ValueIrType(instr->shape().element_type());
+        for (int64_t i = 1; i < element_count; ++i) {
+          std::string is_index = NewName("const_index");
+          std::string next_selected = NewName("const_value");
+          body->push_back(
+              absl::StrFormat("  %s = icmp eq i64 %s, %d", is_index, index, i));
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, %s %s, %s %s", next_selected, is_index,
+              ir_type,
+              LiteralElementIrValue(instr->literal(), instr->shape(), i),
+              ir_type, selected));
+          selected = next_selected;
+        }
+        return selected;
       }
       return EmitValue(instr, /*force_scalar=*/true, body);
     }
@@ -2081,24 +2199,44 @@ class ElementwiseAirEmitter {
                              on_false, body, "linear_select");
     }
     if (instr->opcode() == HloOpcode::kAdd ||
-        instr->opcode() == HloOpcode::kSubtract) {
+        instr->opcode() == HloOpcode::kSubtract ||
+        instr->opcode() == HloOpcode::kMultiply ||
+        instr->opcode() == HloOpcode::kRemainder) {
       TF_ASSIGN_OR_RETURN(std::string lhs,
                           EmitLinearOperand(instr->operand(0), index, body));
       TF_ASSIGN_OR_RETURN(std::string rhs,
                           EmitLinearOperand(instr->operand(1), index, body));
       if (instr->shape().element_type() == S32) {
-        return EmitOp(instr->opcode() == HloOpcode::kAdd ? "add i32"
-                                                         : "sub i32",
-                      lhs, rhs, body);
+        switch (instr->opcode()) {
+          case HloOpcode::kAdd:
+            return EmitOp("add i32", lhs, rhs, body);
+          case HloOpcode::kSubtract:
+            return EmitOp("sub i32", lhs, rhs, body);
+          case HloOpcode::kMultiply:
+            return EmitOp("mul i32", lhs, rhs, body);
+          case HloOpcode::kRemainder:
+            return EmitS32Remainder(lhs, rhs, body);
+          default:
+            return absl::InternalError("Unexpected linear s32 binary opcode.");
+        }
       }
       if (instr->shape().element_type() == F32) {
-        return EmitOp(instr->opcode() == HloOpcode::kAdd ? "fadd fast float"
-                                                         : "fsub fast float",
-                      lhs, rhs, body);
+        switch (instr->opcode()) {
+          case HloOpcode::kAdd:
+            return EmitOp("fadd fast float", lhs, rhs, body);
+          case HloOpcode::kSubtract:
+            return EmitOp("fsub fast float", lhs, rhs, body);
+          case HloOpcode::kMultiply:
+            return EmitOp("fmul fast float", lhs, rhs, body);
+          case HloOpcode::kRemainder:
+            return EmitF32Remainder(lhs, rhs, body);
+          default:
+            return absl::InternalError("Unexpected linear f32 binary opcode.");
+        }
       }
       return absl::UnimplementedError(
-          "Metal direct AIR linear load add/subtract currently supports only "
-          "f32 and s32 arrays.");
+          "Metal direct AIR linear load binary ops currently support only f32 "
+          "and s32 arrays.");
     }
     if (instr->opcode() == HloOpcode::kCompare) {
       return EmitLinearCompare(instr, index, body);
@@ -7628,6 +7766,205 @@ class ElementwiseAirEmitter {
       std::string source_index = NewName("gather_window1d_source_index");
       body->push_back(
           absl::StrFormat("  %s = add i64 %s, %s", source_index, start, offset));
+      return EmitLoadFromLinearIndex(input, source_index, body);
+    }
+    if (IsSupportedElementwiseArray(instr->shape()) &&
+        IsSupportedElementwiseArray(instr->operand(0)->shape()) &&
+        instr->shape().element_type() ==
+            instr->operand(0)->shape().element_type() &&
+        instr->shape().dimensions().size() == 3 &&
+        instr->operand(0)->shape().dimensions().size() == 3 &&
+        IsS32Array(instr->operand(1)->shape()) &&
+        instr->operand(1)->shape().dimensions().size() == 2 &&
+        instr->operand(1)->shape().dimensions(1) == 1 &&
+        dnums.offset_dims_size() == 2 && dnums.offset_dims(0) == 1 &&
+        dnums.offset_dims(1) == 2 &&
+        dnums.collapsed_slice_dims_size() == 1 &&
+        dnums.collapsed_slice_dims(0) == 0 &&
+        dnums.start_index_map_size() == 1 && dnums.start_index_map(0) == 0 &&
+        dnums.operand_batching_dims_size() == 0 &&
+        dnums.start_indices_batching_dims_size() == 0 &&
+        dnums.index_vector_dim() == 1 &&
+        instr->gather_slice_sizes().size() == 3 &&
+        instr->gather_slice_sizes()[0] == 1 &&
+        instr->gather_slice_sizes()[1] ==
+            instr->operand(0)->shape().dimensions(1) &&
+        instr->gather_slice_sizes()[2] ==
+            instr->operand(0)->shape().dimensions(2) &&
+        instr->shape().dimensions(0) ==
+            instr->operand(1)->shape().dimensions(0) &&
+        instr->shape().dimensions(1) ==
+            instr->operand(0)->shape().dimensions(1) &&
+        instr->shape().dimensions(2) ==
+            instr->operand(0)->shape().dimensions(2)) {
+      const HloInstruction* input = instr->operand(0);
+      const HloInstruction* indices = instr->operand(1);
+      const int64_t input_rows = input->shape().dimensions(0);
+      const int64_t input_mid = input->shape().dimensions(1);
+      const int64_t input_cols = input->shape().dimensions(2);
+      const int64_t result_minor_plane = input_mid * input_cols;
+
+      std::string gather_index = NewName("gather_rank3_row_index");
+      std::string offset = NewName("gather_rank3_row_offset");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d",
+                                      gather_index, result_minor_plane));
+      body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", offset,
+                                      result_minor_plane));
+      TF_ASSIGN_OR_RETURN(std::string raw_row,
+                          EmitLoadFromLinearIndex(indices, gather_index, body));
+      std::string source_row =
+          EmitClampedStartIndex(raw_row, input_rows - 1, body);
+      std::string row_offset = NewName("gather_rank3_row_row_offset");
+      std::string source_index = NewName("gather_rank3_row_source_index");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      source_row, result_minor_plane));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      row_offset, offset));
+      return EmitLoadFromLinearIndex(input, source_index, body);
+    }
+    if (IsSupportedElementwiseArray(instr->shape()) &&
+        IsSupportedElementwiseArray(instr->operand(0)->shape()) &&
+        instr->shape().element_type() ==
+            instr->operand(0)->shape().element_type() &&
+        instr->shape().dimensions().size() == 2 &&
+        instr->operand(0)->shape().dimensions().size() == 3 &&
+        IsS32Array(instr->operand(1)->shape()) &&
+        instr->operand(1)->shape().dimensions().size() == 2 &&
+        instr->operand(1)->shape().dimensions(1) == 2 &&
+        dnums.offset_dims_size() == 1 && dnums.offset_dims(0) == 1 &&
+        dnums.collapsed_slice_dims_size() == 2 &&
+        dnums.collapsed_slice_dims(0) == 0 &&
+        dnums.collapsed_slice_dims(1) == 1 &&
+        dnums.start_index_map_size() == 2 &&
+        dnums.start_index_map(0) == 0 && dnums.start_index_map(1) == 1 &&
+        dnums.operand_batching_dims_size() == 0 &&
+        dnums.start_indices_batching_dims_size() == 0 &&
+        dnums.index_vector_dim() == 1 &&
+        instr->gather_slice_sizes().size() == 3 &&
+        instr->gather_slice_sizes()[0] == 1 &&
+        instr->gather_slice_sizes()[1] == 1 &&
+        instr->gather_slice_sizes()[2] ==
+            instr->operand(0)->shape().dimensions(2) &&
+        instr->shape().dimensions(0) ==
+            instr->operand(1)->shape().dimensions(0) &&
+        instr->shape().dimensions(1) ==
+            instr->operand(0)->shape().dimensions(2)) {
+      const HloInstruction* input = instr->operand(0);
+      const HloInstruction* indices = instr->operand(1);
+      const int64_t input_batches = input->shape().dimensions(0);
+      const int64_t input_rows = input->shape().dimensions(1);
+      const int64_t input_cols = input->shape().dimensions(2);
+      const int64_t input_batch_stride = input_rows * input_cols;
+
+      std::string gather_index = NewName("gather_rank3_two_axis_index");
+      std::string col = NewName("gather_rank3_two_axis_col");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d",
+                                      gather_index, input_cols));
+      body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", col,
+                                      input_cols));
+      std::string indices_base = NewName("gather_rank3_two_axis_indices_base");
+      std::string row_index_offset =
+          NewName("gather_rank3_two_axis_row_index_offset");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, 2", indices_base,
+                                      gather_index));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, 1",
+                                      row_index_offset, indices_base));
+      TF_ASSIGN_OR_RETURN(std::string raw_batch,
+                          EmitLoadFromLinearIndex(indices, indices_base, body));
+      TF_ASSIGN_OR_RETURN(
+          std::string raw_row,
+          EmitLoadFromLinearIndex(indices, row_index_offset, body));
+      std::string source_batch =
+          EmitClampedStartIndex(raw_batch, input_batches - 1, body);
+      std::string source_row =
+          EmitClampedStartIndex(raw_row, input_rows - 1, body);
+
+      std::string batch_offset = NewName("gather_rank3_two_axis_batch_offset");
+      std::string row_offset = NewName("gather_rank3_two_axis_row_offset");
+      std::string source_base = NewName("gather_rank3_two_axis_source_base");
+      std::string source_index = NewName("gather_rank3_two_axis_source_index");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", batch_offset,
+                                      source_batch, input_batch_stride));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      source_row, input_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_base,
+                                      batch_offset, row_offset));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      source_base, col));
+      return EmitLoadFromLinearIndex(input, source_index, body);
+    }
+    if (IsSupportedElementwiseArray(instr->shape()) &&
+        IsSupportedElementwiseArray(instr->operand(0)->shape()) &&
+        instr->shape().element_type() ==
+            instr->operand(0)->shape().element_type() &&
+        instr->shape().dimensions().size() == 2 &&
+        instr->operand(0)->shape().dimensions().size() == 3 &&
+        IsS32Array(instr->operand(1)->shape()) &&
+        instr->operand(1)->shape().dimensions().size() == 2 &&
+        instr->operand(1)->shape().dimensions(1) == 2 &&
+        dnums.offset_dims_size() == 1 && dnums.offset_dims(0) == 1 &&
+        dnums.collapsed_slice_dims_size() == 2 &&
+        dnums.collapsed_slice_dims(0) == 0 &&
+        dnums.collapsed_slice_dims(1) == 2 &&
+        dnums.start_index_map_size() == 2 &&
+        dnums.start_index_map(0) == 0 && dnums.start_index_map(1) == 2 &&
+        dnums.operand_batching_dims_size() == 0 &&
+        dnums.start_indices_batching_dims_size() == 0 &&
+        dnums.index_vector_dim() == 1 &&
+        instr->gather_slice_sizes().size() == 3 &&
+        instr->gather_slice_sizes()[0] == 1 &&
+        instr->gather_slice_sizes()[1] ==
+            instr->operand(0)->shape().dimensions(1) &&
+        instr->gather_slice_sizes()[2] == 1 &&
+        instr->shape().dimensions(0) ==
+            instr->operand(1)->shape().dimensions(0) &&
+        instr->shape().dimensions(1) ==
+            instr->operand(0)->shape().dimensions(1)) {
+      const HloInstruction* input = instr->operand(0);
+      const HloInstruction* indices = instr->operand(1);
+      const int64_t input_batches = input->shape().dimensions(0);
+      const int64_t input_rows = input->shape().dimensions(1);
+      const int64_t input_cols = input->shape().dimensions(2);
+      const int64_t input_batch_stride = input_rows * input_cols;
+
+      std::string gather_index = NewName("gather_rank3_outer_axis_index");
+      std::string row = NewName("gather_rank3_outer_axis_row");
+      body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d",
+                                      gather_index, input_rows));
+      body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", row,
+                                      input_rows));
+      std::string indices_base =
+          NewName("gather_rank3_outer_axis_indices_base");
+      std::string col_index_offset =
+          NewName("gather_rank3_outer_axis_col_index_offset");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, 2", indices_base,
+                                      gather_index));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, 1",
+                                      col_index_offset, indices_base));
+      TF_ASSIGN_OR_RETURN(std::string raw_batch,
+                          EmitLoadFromLinearIndex(indices, indices_base, body));
+      TF_ASSIGN_OR_RETURN(
+          std::string raw_col,
+          EmitLoadFromLinearIndex(indices, col_index_offset, body));
+      std::string source_batch =
+          EmitClampedStartIndex(raw_batch, input_batches - 1, body);
+      std::string source_col =
+          EmitClampedStartIndex(raw_col, input_cols - 1, body);
+
+      std::string batch_offset =
+          NewName("gather_rank3_outer_axis_batch_offset");
+      std::string row_offset = NewName("gather_rank3_outer_axis_row_offset");
+      std::string source_base = NewName("gather_rank3_outer_axis_source_base");
+      std::string source_index =
+          NewName("gather_rank3_outer_axis_source_index");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", batch_offset,
+                                      source_batch, input_batch_stride));
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      row, input_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_base,
+                                      batch_offset, row_offset));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      source_base, source_col));
       return EmitLoadFromLinearIndex(input, source_index, body);
     }
     if (IsF32Array(instr->shape()) && IsF32Array(instr->operand(0)->shape()) &&
