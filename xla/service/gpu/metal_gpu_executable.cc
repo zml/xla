@@ -820,6 +820,11 @@ class ElementwiseAirEmitter {
       }
       return EmitLoadFromLinearIndex(instr->operand(0), index, body);
     }
+    if (instr->opcode() == HloOpcode::kTranspose) {
+      TF_ASSIGN_OR_RETURN(std::string source_index,
+                          EmitTransposeSourceIndex(instr, index, body));
+      return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+    }
     if (instr->opcode() == HloOpcode::kBroadcast) {
       if (IsScalarLikeSupported(instr->operand(0)->shape())) {
         return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
@@ -1341,16 +1346,104 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitTranspose(const HloInstruction* instr,
                                             std::vector<std::string>* body) {
     const HloInstruction* operand = instr->operand(0);
-    if (!IsF32Array(instr->shape()) || !IsF32Array(operand->shape()) ||
-        instr->shape().dimensions().size() != 2 ||
-        operand->shape().dimensions().size() != 2 ||
-        instr->dimensions().size() != 2 || instr->dimensions()[0] != 1 ||
-        instr->dimensions()[1] != 0) {
+    if (ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_) ||
+        !IsSupportedElementwiseArray(instr->shape()) ||
+        !IsSupportedElementwiseArray(operand->shape()) ||
+        instr->shape().element_type() != operand->shape().element_type() ||
+        instr->shape().dimensions().size() !=
+            operand->shape().dimensions().size() ||
+        instr->dimensions().size() != instr->shape().dimensions().size()) {
       return absl::UnimplementedError(
-          "Metal direct AIR elementwise transpose currently supports only "
-          "rank-2 f32 transposes with permutation {1,0}.");
+          "Metal direct AIR root transpose requires supported arrays with "
+          "matching element types, ranks, and result element count.");
     }
     return EmitLoadFromLinearIndex(operand, "%idx", body);
+  }
+
+  absl::StatusOr<std::string> EmitTransposeSourceIndex(
+      const HloInstruction* instr, absl::string_view linear_index,
+      std::vector<std::string>* body) {
+    const HloInstruction* operand = instr->operand(0);
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
+        !IsSupportedElementwiseArray(operand->shape()) ||
+        instr->shape().element_type() != operand->shape().element_type() ||
+        instr->shape().dimensions().size() !=
+            operand->shape().dimensions().size() ||
+        instr->dimensions().size() != instr->shape().dimensions().size() ||
+        ShapeUtil::ElementsIn(instr->shape()) == 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR transpose requires supported non-empty arrays with "
+          "matching element types and ranks.");
+    }
+
+    const int64_t rank = instr->shape().dimensions().size();
+    if (rank == 0) {
+      return "0";
+    }
+
+    std::vector<bool> seen(rank, false);
+    for (int64_t result_dim = 0; result_dim < rank; ++result_dim) {
+      const int64_t operand_dim = instr->dimensions()[result_dim];
+      if (operand_dim < 0 || operand_dim >= rank || seen[operand_dim] ||
+          instr->shape().dimensions(result_dim) !=
+              operand->shape().dimensions(operand_dim)) {
+        return absl::UnimplementedError(
+            "Metal direct AIR transpose has an invalid permutation.");
+      }
+      seen[operand_dim] = true;
+    }
+
+    std::vector<int64_t> result_strides(rank, 1);
+    for (int64_t dim = rank - 2; dim >= 0; --dim) {
+      result_strides[dim] =
+          result_strides[dim + 1] * instr->shape().dimensions(dim + 1);
+    }
+    std::vector<int64_t> operand_strides(rank, 1);
+    for (int64_t dim = rank - 2; dim >= 0; --dim) {
+      operand_strides[dim] =
+          operand_strides[dim + 1] * operand->shape().dimensions(dim + 1);
+    }
+
+    std::vector<std::string> operand_coords(rank, "0");
+    for (int64_t result_dim = 0; result_dim < rank; ++result_dim) {
+      const int64_t result_dim_size = instr->shape().dimensions(result_dim);
+      std::string coord = "0";
+      if (result_dim_size != 1) {
+        coord = std::string(linear_index);
+        if (result_strides[result_dim] != 1) {
+          coord = NewName("transpose_div");
+          body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                          linear_index,
+                                          result_strides[result_dim]));
+        }
+        std::string rem = NewName("transpose_coord");
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem, coord,
+                                        result_dim_size));
+        coord = rem;
+      }
+      operand_coords[instr->dimensions()[result_dim]] = coord;
+    }
+
+    std::string source_index = "0";
+    for (int64_t operand_dim = 0; operand_dim < rank; ++operand_dim) {
+      std::string term = operand_coords[operand_dim];
+      if (term != "0" && operand_strides[operand_dim] != 1) {
+        term = NewName("transpose_term");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                        operand_coords[operand_dim],
+                                        operand_strides[operand_dim]));
+      }
+      if (source_index == "0") {
+        source_index = term;
+      } else if (term != "0") {
+        std::string sum = NewName("transpose_index");
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", sum,
+                                        source_index, term));
+        source_index = sum;
+      }
+    }
+    return source_index;
   }
 
   absl::StatusOr<std::string> EmitDot(const HloInstruction* instr,
