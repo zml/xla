@@ -2103,27 +2103,32 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitReduceWindow(
       const HloInstruction* instr, std::vector<std::string>* body) {
     const HloInstruction* input = instr->operand(0);
+    const int64_t rank = instr->shape().dimensions().size();
     if (!IsF32Array(instr->shape()) || !IsF32Array(input->shape()) ||
-        instr->operand_count() != 2 ||
-        instr->shape().dimensions().size() != 1 ||
-        input->shape().dimensions().size() != 1 ||
+        instr->operand_count() != 2 || (rank != 1 && rank != 2) ||
+        input->shape().dimensions().size() != rank ||
         ShapeUtil::ElementsIn(instr->shape()) !=
             ShapeUtil::ElementsIn(result_shape_) ||
-        instr->window().dimensions().size() != 1) {
+        instr->window().dimensions().size() != rank) {
       return absl::UnimplementedError(
-          "Metal direct AIR reduce-window currently supports only rank-1 f32 "
-          "results.");
+          "Metal direct AIR reduce-window currently supports only "
+          "rank-1/rank-2 f32 results.");
     }
-    const WindowDimension& dim = instr->window().dimensions(0);
-    if (dim.stride() != 1 || dim.padding_low() != 0 ||
-        dim.padding_high() != 0 || dim.base_dilation() != 1 ||
-        dim.window_dilation() != 1 || dim.window_reversal()) {
-      return absl::UnimplementedError(
-          "Metal direct AIR reduce-window currently supports only unpadded "
-          "stride-1 non-dilated windows.");
+    for (int64_t i = 0; i < rank; ++i) {
+      const WindowDimension& dim = instr->window().dimensions(i);
+      if (dim.stride() != 1 || dim.padding_low() != 0 ||
+          dim.padding_high() != 0 || dim.base_dilation() != 1 ||
+          dim.window_dilation() != 1 || dim.window_reversal() ||
+          instr->shape().dimensions(i) !=
+              input->shape().dimensions(i) - dim.size() + 1) {
+        return absl::UnimplementedError(
+            "Metal direct AIR reduce-window currently supports only VALID "
+            "stride-1 non-dilated windows.");
+      }
     }
 
-    const HloOpcode reducer_opcode = instr->to_apply()->root_instruction()->opcode();
+    const HloOpcode reducer_opcode =
+        instr->to_apply()->root_instruction()->opcode();
     if (reducer_opcode != HloOpcode::kAdd &&
         reducer_opcode != HloOpcode::kMaximum &&
         reducer_opcode != HloOpcode::kMinimum &&
@@ -2136,18 +2141,60 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string accumulator,
                         EmitValue(instr->operand(1), /*force_scalar=*/true,
                                   body));
-    for (int64_t offset = 0; offset < dim.size(); ++offset) {
-      std::string source_index = "%idx";
-      if (offset != 0) {
-        source_index = NewName("reduce_window_index");
-        body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
-                                        source_index, offset));
+    if (rank == 1) {
+      const WindowDimension& dim = instr->window().dimensions(0);
+      for (int64_t offset = 0; offset < dim.size(); ++offset) {
+        std::string source_index = "%idx";
+        if (offset != 0) {
+          source_index = NewName("reduce_window_index");
+          body->push_back(absl::StrFormat("  %s = add i64 %%idx, %d",
+                                          source_index, offset));
+        }
+        TF_ASSIGN_OR_RETURN(std::string value,
+                            EmitLoadFromLinearIndex(input, source_index, body));
+        TF_ASSIGN_OR_RETURN(accumulator,
+                            EmitF32ReducerOp(reducer_opcode, accumulator, value,
+                                             body));
       }
-      TF_ASSIGN_OR_RETURN(std::string value,
-                          EmitLoadFromLinearIndex(input, source_index, body));
-      TF_ASSIGN_OR_RETURN(accumulator,
-                          EmitF32ReducerOp(reducer_opcode, accumulator, value,
-                                           body));
+      return accumulator;
+    }
+
+    const int64_t result_cols = instr->shape().dimensions(1);
+    const int64_t input_cols = input->shape().dimensions(1);
+    std::string out_row = NewName("reduce_window_row");
+    std::string out_col = NewName("reduce_window_col");
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %%idx, %d", out_row, result_cols));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %%idx, %d", out_col, result_cols));
+    const WindowDimension& row_dim = instr->window().dimensions(0);
+    const WindowDimension& col_dim = instr->window().dimensions(1);
+    for (int64_t row_offset = 0; row_offset < row_dim.size(); ++row_offset) {
+      for (int64_t col_offset = 0; col_offset < col_dim.size(); ++col_offset) {
+        std::string source_row = out_row;
+        if (row_offset != 0) {
+          source_row = NewName("reduce_window_source_row");
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %d", source_row,
+                                          out_row, row_offset));
+        }
+        std::string source_col = out_col;
+        if (col_offset != 0) {
+          source_col = NewName("reduce_window_source_col");
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %d", source_col,
+                                          out_col, col_offset));
+        }
+        std::string row_base = NewName("reduce_window_row_base");
+        std::string source_index = NewName("reduce_window_index");
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_base,
+                                        source_row, input_cols));
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                        row_base, source_col));
+        TF_ASSIGN_OR_RETURN(std::string value,
+                            EmitLoadFromLinearIndex(input, source_index, body));
+        TF_ASSIGN_OR_RETURN(accumulator,
+                            EmitF32ReducerOp(reducer_opcode, accumulator, value,
+                                             body));
+      }
     }
     return accumulator;
   }

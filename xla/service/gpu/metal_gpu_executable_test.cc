@@ -739,6 +739,46 @@ absl::StatusOr<Literal> ExecuteMetalReduceWindow(HloOpcode opcode,
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalReduceWindowRank2(HloOpcode opcode,
+                                                     float init_value) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder reducer_builder("metal_reduce_window_rank2_reducer");
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaOp lhs = Parameter(&reducer_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&reducer_builder, 1, scalar_shape, "rhs");
+  switch (opcode) {
+    case HloOpcode::kAdd:
+      Add(lhs, rhs);
+      break;
+    case HloOpcode::kMaximum:
+      Max(lhs, rhs);
+      break;
+    default:
+      return absl::InvalidArgumentError("Unexpected reduce-window opcode.");
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation reducer, reducer_builder.Build());
+
+  XlaBuilder builder("metal_reduce_window_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  ReduceWindow(input, ConstantR0<float>(&builder, init_value), reducer, {2, 2},
+               {1, 1}, Padding::kValid);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      values(row, col) = static_cast<float>(row * 5 + col);
+    }
+  }
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConditional() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2000,6 +2040,45 @@ TEST(MetalGpuExecutableTest, ElementwiseReduceWindowMax) {
     EXPECT_EQ(actual.Get<float>({i}),
               static_cast<float>(i + 2) * 0.25f - 2.0f)
         << "at " << i;
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceWindowRank2Sum) {
+  auto result = ExecuteMetalReduceWindowRank2(HloOpcode::kAdd, 0.0f);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      const float expected =
+          static_cast<float>(row * 5 + col) +
+          static_cast<float>(row * 5 + col + 1) +
+          static_cast<float>((row + 1) * 5 + col) +
+          static_cast<float>((row + 1) * 5 + col + 1);
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseReduceWindowRank2Max) {
+  auto result = ExecuteMetalReduceWindowRank2(
+      HloOpcode::kMaximum, -std::numeric_limits<float>::infinity());
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {3, 4})));
+  for (int64_t row = 0; row < 3; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}),
+                static_cast<float>((row + 1) * 5 + col + 1))
+          << "at (" << row << ", " << col << ")";
+    }
   }
 }
 
