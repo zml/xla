@@ -3738,10 +3738,12 @@ cc_library(
 cc_library(
     name = "metal_gpu_compiler_impl",
     srcs = [
+        "metal_custom_call_executable.cc",
         "metal_gpu_compiler.cc",
         "metal_gpu_executable.cc",
     ],
     hdrs = [
+        "metal_custom_call_executable.h",
         "metal_gpu_compiler.h",
         "metal_gpu_executable.h",
     ],
@@ -3751,7 +3753,16 @@ cc_library(
     ],
     deps = [
         ":embed_metal_air_kernels",
+        ":backend_configs_cc",
         "//xla:shape_util",
+        "//xla:types",
+        "//xla/ffi",
+        "//xla/ffi:attribute_map",
+        "//xla/ffi:call_frame",
+        "//xla/ffi:execution_state",
+        "//xla/ffi:ffi_api",
+        "//xla/ffi:ffi_registry",
+        "//xla/ffi:invoke",
         "//xla/hlo/ir:hlo",
         "//xla/service:compiler",
         "//xla/service:executable",
@@ -3773,6 +3784,9 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//mlir:AsmParser",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
     ],
 )
 
@@ -3795,6 +3809,36 @@ xla_cc_test(
         "//xla:shape_util",
         "//xla/service:platform_util",
         "//xla/stream_executor:platform",
+        "//xla/stream_executor/metal:metal_platform",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_custom_call_test",
+    srcs = ["metal_custom_call_test.cc"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_gpu_compiler",
+        ":gpu_transfer_manager",
+        "//xla/client:client_library",
+        "//xla/hlo/builder:xla_builder",
+        "//xla:literal",
+        "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla/ffi",
+        "//xla/ffi:ffi_api",
+        "//xla/ffi/api:c_api_internal",
+        "//xla/service:platform_util",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:stream",
         "//xla/stream_executor/metal:metal_platform",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",

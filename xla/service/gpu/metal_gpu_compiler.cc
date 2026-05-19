@@ -26,6 +26,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/layout_util.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/metal_custom_call_executable.h"
 #include "xla/service/gpu/metal_gpu_executable.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
@@ -111,6 +112,12 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
 absl::StatusOr<std::unique_ptr<Executable>> MetalGpuCompiler::RunBackend(
     std::unique_ptr<HloModule> module, se::StreamExecutor* executor,
     const CompileOptions& options) {
+  if (module->entry_computation()->root_instruction()->opcode() ==
+      HloOpcode::kCustomCall) {
+    auto shared_module = std::shared_ptr<HloModule>(std::move(module));
+    return BuildMetalCustomCallExecutable(std::move(shared_module));
+  }
+
   absl::StatusOr<MetalMatmulConfig> matmul_config = MatchMetalMatmul(*module);
   if (matmul_config.ok()) {
     TF_ASSIGN_OR_RETURN(std::vector<uint8_t> metallib,
