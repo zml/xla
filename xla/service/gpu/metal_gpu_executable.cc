@@ -1638,11 +1638,23 @@ class ElementwiseAirEmitter {
     const HloInstruction* rhs = instr->operand(1);
     const ConvolutionDimensionNumbers& dnums =
         instr->convolution_dimension_numbers();
-    if (IsF32Array(instr->shape()) && IsF32Array(lhs->shape()) &&
-        IsF32Array(rhs->shape()) && instr->shape().dimensions().size() == 4 &&
+    const PrimitiveType conv_type = instr->shape().element_type();
+    if ((conv_type == F32 || conv_type == F16 || conv_type == BF16) &&
+        lhs->shape().element_type() == conv_type &&
+        rhs->shape().element_type() == conv_type &&
+        instr->shape().dimensions().size() == 4 &&
         lhs->shape().dimensions().size() == 4 &&
         rhs->shape().dimensions().size() == 4) {
       return EmitConvolution2D(instr, body);
+    }
+    if ((conv_type == F32 || conv_type == F16 || conv_type == BF16) &&
+        lhs->shape().element_type() == conv_type &&
+        rhs->shape().element_type() == conv_type &&
+        instr->shape().dimensions().size() == 2 &&
+        lhs->shape().dimensions().size() == 2 &&
+        rhs->shape().dimensions().size() == 2 &&
+        instr->window().dimensions().empty()) {
+      return EmitConvolution0D(instr, body);
     }
     if (!IsF32Array(instr->shape()) || !IsF32Array(lhs->shape()) ||
         !IsF32Array(rhs->shape()) ||
@@ -1738,125 +1750,389 @@ class ElementwiseAirEmitter {
     return accumulator;
   }
 
+  absl::StatusOr<std::string> EmitConvolution0D(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* lhs = instr->operand(0);
+    const HloInstruction* rhs = instr->operand(1);
+    const ConvolutionDimensionNumbers& dnums =
+        instr->convolution_dimension_numbers();
+    const PrimitiveType conv_type = instr->shape().element_type();
+    if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        (conv_type != F32 && conv_type != F16 && conv_type != BF16) ||
+        lhs->shape().element_type() != conv_type ||
+        rhs->shape().element_type() != conv_type ||
+        instr->shape().dimensions().size() != 2 ||
+        lhs->shape().dimensions().size() != 2 ||
+        rhs->shape().dimensions().size() != 2 ||
+        dnums.input_spatial_dimensions_size() != 0 ||
+        dnums.kernel_spatial_dimensions_size() != 0 ||
+        dnums.output_spatial_dimensions_size() != 0 ||
+        instr->window().dimensions().size() != 0 ||
+        instr->feature_group_count() != 1 || instr->batch_group_count() != 1) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 0D convolution currently supports only ungrouped "
+          "f32/f16/bf16 rank-2 convolutions.");
+    }
+
+    auto valid_rank2_dims = [](int64_t dim0, int64_t dim1) {
+      return (dim0 == 0 && dim1 == 1) || (dim0 == 1 && dim1 == 0);
+    };
+    if (!valid_rank2_dims(dnums.input_batch_dimension(),
+                          dnums.input_feature_dimension()) ||
+        !valid_rank2_dims(dnums.kernel_input_feature_dimension(),
+                          dnums.kernel_output_feature_dimension()) ||
+        !valid_rank2_dims(dnums.output_batch_dimension(),
+                          dnums.output_feature_dimension())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 0D convolution dimension numbers must be valid "
+          "rank-2 permutations.");
+    }
+
+    const int64_t input_batch_dim = dnums.input_batch_dimension();
+    const int64_t input_feature_dim = dnums.input_feature_dimension();
+    const int64_t kernel_input_feature_dim =
+        dnums.kernel_input_feature_dimension();
+    const int64_t kernel_output_feature_dim =
+        dnums.kernel_output_feature_dimension();
+    const int64_t output_batch_dim = dnums.output_batch_dimension();
+    const int64_t output_feature_dim = dnums.output_feature_dimension();
+    const int64_t batch_count = lhs->shape().dimensions(input_batch_dim);
+    const int64_t in_features = lhs->shape().dimensions(input_feature_dim);
+    const int64_t out_features =
+        rhs->shape().dimensions(kernel_output_feature_dim);
+    if (rhs->shape().dimensions(kernel_input_feature_dim) != in_features ||
+        instr->shape().dimensions(output_batch_dim) != batch_count ||
+        instr->shape().dimensions(output_feature_dim) != out_features) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 0D convolution dimensions do not match.");
+    }
+
+    std::vector<std::string> out_coords(2);
+    std::string out_coord0 = NewName("conv0d_out_coord");
+    std::string out_coord1 = NewName("conv0d_out_coord");
+    body->push_back(absl::StrFormat("  %s = udiv i64 %%idx, %d", out_coord0,
+                                    instr->shape().dimensions(1)));
+    body->push_back(absl::StrFormat("  %s = urem i64 %%idx, %d", out_coord1,
+                                    instr->shape().dimensions(1)));
+    out_coords[0] = out_coord0;
+    out_coords[1] = out_coord1;
+    const std::string& batch = out_coords[output_batch_dim];
+    const std::string& oc = out_coords[output_feature_dim];
+
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string major_term = coords[0];
+      if (shape.dimensions(1) != 1 && major_term != "0") {
+        std::string scaled = NewName(absl::StrCat(prefix, "_major"));
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        major_term, shape.dimensions(1)));
+        major_term = scaled;
+      }
+      if (major_term == "0") {
+        return coords[1];
+      }
+      if (coords[1] == "0") {
+        return major_term;
+      }
+      std::string index = NewName(absl::StrCat(prefix, "_index"));
+      body->push_back(
+          absl::StrFormat("  %s = add i64 %s, %s", index, major_term,
+                          coords[1]));
+      return index;
+    };
+
+    std::string accumulator = "0x0000000000000000";
+    for (int64_t ic = 0; ic < in_features; ++ic) {
+      std::vector<std::string> lhs_coords(2, "0");
+      lhs_coords[input_batch_dim] = batch;
+      lhs_coords[input_feature_dim] = absl::StrCat(ic);
+      std::string lhs_index =
+          emit_linear_index(lhs->shape(), lhs_coords, "conv0d_lhs");
+
+      std::vector<std::string> rhs_coords(2, "0");
+      rhs_coords[kernel_input_feature_dim] = absl::StrCat(ic);
+      rhs_coords[kernel_output_feature_dim] = oc;
+      std::string rhs_index =
+          emit_linear_index(rhs->shape(), rhs_coords, "conv0d_rhs");
+
+      TF_ASSIGN_OR_RETURN(std::string lhs_value,
+                          EmitLoadFromLinearIndex(lhs, lhs_index, body));
+      TF_ASSIGN_OR_RETURN(std::string rhs_value,
+                          EmitLoadFromLinearIndex(rhs, rhs_index, body));
+      std::string product =
+          EmitOp("fmul fast float", lhs_value, rhs_value, body);
+      TF_ASSIGN_OR_RETURN(accumulator,
+                          EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
+                                           product, body));
+    }
+    return accumulator;
+  }
+
   absl::StatusOr<std::string> EmitConvolution2D(
       const HloInstruction* instr, std::vector<std::string>* body) {
     const HloInstruction* lhs = instr->operand(0);
     const HloInstruction* rhs = instr->operand(1);
     const ConvolutionDimensionNumbers& dnums =
         instr->convolution_dimension_numbers();
+    const PrimitiveType conv_type = instr->shape().element_type();
     if (!ShapeUtil::Equal(instr->shape(), result_shape_) ||
-        dnums.input_batch_dimension() != 0 ||
+        (conv_type != F32 && conv_type != F16 && conv_type != BF16) ||
+        lhs->shape().element_type() != conv_type ||
+        rhs->shape().element_type() != conv_type ||
+        instr->shape().dimensions().size() != 4 ||
+        lhs->shape().dimensions().size() != 4 ||
+        rhs->shape().dimensions().size() != 4 ||
         dnums.input_spatial_dimensions_size() != 2 ||
-        dnums.input_spatial_dimensions(0) != 1 ||
-        dnums.input_spatial_dimensions(1) != 2 ||
-        dnums.input_feature_dimension() != 3 ||
         dnums.kernel_spatial_dimensions_size() != 2 ||
-        dnums.kernel_spatial_dimensions(0) != 0 ||
-        dnums.kernel_spatial_dimensions(1) != 1 ||
-        dnums.kernel_input_feature_dimension() != 2 ||
-        dnums.kernel_output_feature_dimension() != 3 ||
-        dnums.output_batch_dimension() != 0 ||
         dnums.output_spatial_dimensions_size() != 2 ||
-        dnums.output_spatial_dimensions(0) != 1 ||
-        dnums.output_spatial_dimensions(1) != 2 ||
-        dnums.output_feature_dimension() != 3 ||
-        instr->window().dimensions().size() != 2) {
+        instr->window().dimensions().size() != 2 ||
+        instr->feature_group_count() != 1 || instr->batch_group_count() != 1) {
       return absl::UnimplementedError(
           "Metal direct AIR convolution currently supports only rank-4 "
-          "NHWC/HWIO/NHWC f32 2D convolutions.");
+          "ungrouped f32/f16/bf16 2D convolutions.");
     }
+
+    auto valid_permutation = [](std::vector<int64_t> dims) {
+      if (dims.size() != 4) {
+        return false;
+      }
+      absl::c_sort(dims);
+      return dims[0] == 0 && dims[1] == 1 && dims[2] == 2 && dims[3] == 3;
+    };
+    if (!valid_permutation({dnums.input_batch_dimension(),
+                            dnums.input_feature_dimension(),
+                            dnums.input_spatial_dimensions(0),
+                            dnums.input_spatial_dimensions(1)}) ||
+        !valid_permutation({dnums.kernel_output_feature_dimension(),
+                            dnums.kernel_input_feature_dimension(),
+                            dnums.kernel_spatial_dimensions(0),
+                            dnums.kernel_spatial_dimensions(1)}) ||
+        !valid_permutation({dnums.output_batch_dimension(),
+                            dnums.output_feature_dimension(),
+                            dnums.output_spatial_dimensions(0),
+                            dnums.output_spatial_dimensions(1)})) {
+      return absl::UnimplementedError(
+          "Metal direct AIR 2D convolution dimension numbers must be valid "
+          "rank-4 permutations.");
+    }
+
+    const int64_t input_batch_dim = dnums.input_batch_dimension();
+    const int64_t input_feature_dim = dnums.input_feature_dimension();
+    const int64_t input_spatial0_dim = dnums.input_spatial_dimensions(0);
+    const int64_t input_spatial1_dim = dnums.input_spatial_dimensions(1);
+    const int64_t kernel_output_feature_dim =
+        dnums.kernel_output_feature_dimension();
+    const int64_t kernel_input_feature_dim =
+        dnums.kernel_input_feature_dimension();
+    const int64_t kernel_spatial0_dim = dnums.kernel_spatial_dimensions(0);
+    const int64_t kernel_spatial1_dim = dnums.kernel_spatial_dimensions(1);
+    const int64_t output_batch_dim = dnums.output_batch_dimension();
+    const int64_t output_feature_dim = dnums.output_feature_dimension();
+    const int64_t output_spatial0_dim = dnums.output_spatial_dimensions(0);
+    const int64_t output_spatial1_dim = dnums.output_spatial_dimensions(1);
+
+    const int64_t batch_count = lhs->shape().dimensions(input_batch_dim);
+    const int64_t in_features = lhs->shape().dimensions(input_feature_dim);
+    const int64_t out_features =
+        rhs->shape().dimensions(kernel_output_feature_dim);
+    const int64_t in_spatial0 = lhs->shape().dimensions(input_spatial0_dim);
+    const int64_t in_spatial1 = lhs->shape().dimensions(input_spatial1_dim);
+    const int64_t kernel_spatial0 =
+        rhs->shape().dimensions(kernel_spatial0_dim);
+    const int64_t kernel_spatial1 =
+        rhs->shape().dimensions(kernel_spatial1_dim);
+    const int64_t out_spatial0 =
+        instr->shape().dimensions(output_spatial0_dim);
+    const int64_t out_spatial1 =
+        instr->shape().dimensions(output_spatial1_dim);
+
     for (int64_t i = 0; i < 2; ++i) {
       const WindowDimension& dim = instr->window().dimensions(i);
-      if (dim.stride() != 1 || dim.padding_low() != 0 ||
-          dim.padding_high() != 0 || dim.base_dilation() != 1 ||
+      if (dim.stride() <= 0 || dim.base_dilation() != 1 ||
           dim.window_dilation() != 1 || dim.window_reversal()) {
         return absl::UnimplementedError(
-            "Metal direct AIR convolution currently supports only VALID "
-            "stride-1 non-dilated 2D convolutions.");
+            "Metal direct AIR convolution currently supports only non-dilated "
+            "2D convolutions without window reversal.");
       }
     }
 
-    const int64_t out_h = instr->shape().dimensions(1);
-    const int64_t out_w = instr->shape().dimensions(2);
-    const int64_t out_c = instr->shape().dimensions(3);
-    const int64_t in_h = lhs->shape().dimensions(1);
-    const int64_t in_w = lhs->shape().dimensions(2);
-    const int64_t in_c = lhs->shape().dimensions(3);
-    const int64_t kernel_h = rhs->shape().dimensions(0);
-    const int64_t kernel_w = rhs->shape().dimensions(1);
-    if (rhs->shape().dimensions(2) != in_c ||
-        rhs->shape().dimensions(3) != out_c ||
-        instr->shape().dimensions(0) != lhs->shape().dimensions(0) ||
-        out_h != in_h - kernel_h + 1 || out_w != in_w - kernel_w + 1) {
+    const WindowDimension& window0 = instr->window().dimensions(0);
+    const WindowDimension& window1 = instr->window().dimensions(1);
+    const int64_t expected_out_spatial0 =
+        (in_spatial0 + window0.padding_low() + window0.padding_high() -
+         kernel_spatial0) /
+            window0.stride() +
+        1;
+    const int64_t expected_out_spatial1 =
+        (in_spatial1 + window1.padding_low() + window1.padding_high() -
+         kernel_spatial1) /
+            window1.stride() +
+        1;
+    if (rhs->shape().dimensions(kernel_input_feature_dim) != in_features ||
+        instr->shape().dimensions(output_batch_dim) != batch_count ||
+        instr->shape().dimensions(output_feature_dim) != out_features ||
+        out_spatial0 != expected_out_spatial0 ||
+        out_spatial1 != expected_out_spatial1 ||
+        window0.size() != kernel_spatial0 ||
+        window1.size() != kernel_spatial1) {
       return absl::UnimplementedError(
           "Metal direct AIR 2D convolution dimensions do not match.");
     }
 
-    std::string oc = NewName("conv_out_channel");
-    std::string output_linear = NewName("conv_output_linear");
-    std::string ow = NewName("conv_out_width");
-    std::string output_spatial = NewName("conv_output_spatial");
-    std::string oh = NewName("conv_out_height");
-    std::string batch = NewName("conv_batch");
-    body->push_back(
-        absl::StrFormat("  %s = urem i64 %%idx, %d", oc, out_c));
-    body->push_back(
-        absl::StrFormat("  %s = udiv i64 %%idx, %d", output_linear, out_c));
-    body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", ow,
-                                    output_linear, out_w));
-    body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", output_spatial,
-                                    output_linear, out_w));
-    body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", oh,
-                                    output_spatial, out_h));
-    body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", batch,
-                                    output_spatial, out_h));
+    auto emit_coords = [&](const Shape& shape, absl::string_view index,
+                           absl::string_view prefix) {
+      std::vector<std::string> coords(4);
+      std::string remaining(index);
+      for (int64_t dim = 0; dim < 4; ++dim) {
+        if (dim == 3) {
+          coords[dim] = remaining;
+          break;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < 4; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string coord = NewName(absl::StrCat(prefix, "_coord"));
+        std::string rem = NewName(absl::StrCat(prefix, "_rem"));
+        body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                        remaining, stride));
+        body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                        remaining, stride));
+        coords[dim] = coord;
+        remaining = rem;
+      }
+      return coords;
+    };
+    auto emit_linear_index = [&](const Shape& shape,
+                                 const std::vector<std::string>& coords,
+                                 absl::string_view prefix) {
+      std::string linear = "0";
+      for (int64_t dim = 0; dim < 4; ++dim) {
+        if (coords[dim] == "0") {
+          continue;
+        }
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < 4; ++minor_dim) {
+          stride *= shape.dimensions(minor_dim);
+        }
+        std::string term = coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(prefix, "_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          coords[dim], stride));
+        }
+        if (linear == "0") {
+          linear = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(prefix, "_index"));
+          body->push_back(
+              absl::StrFormat("  %s = add i64 %s, %s", sum, linear, term));
+          linear = sum;
+        }
+      }
+      return linear;
+    };
+    auto scaled_spatial = [&](absl::string_view output_coord, int64_t stride,
+                              int64_t kernel_coord, int64_t padding_low,
+                              absl::string_view prefix) {
+      std::string coord(output_coord);
+      if (stride != 1) {
+        std::string scaled = NewName(absl::StrCat(prefix, "_scaled"));
+        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", scaled,
+                                        coord, stride));
+        coord = scaled;
+      }
+      if (kernel_coord != 0) {
+        std::string shifted = NewName(absl::StrCat(prefix, "_kernel"));
+        body->push_back(absl::StrFormat("  %s = add i64 %s, %d", shifted,
+                                        coord, kernel_coord));
+        coord = shifted;
+      }
+      if (padding_low != 0) {
+        std::string padded = NewName(absl::StrCat(prefix, "_padded"));
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d", padded,
+                                        coord, padding_low));
+        coord = padded;
+      }
+      return coord;
+    };
+
+    std::vector<std::string> out_coords =
+        emit_coords(instr->shape(), "%idx", "conv_out");
+    const std::string& batch = out_coords[output_batch_dim];
+    const std::string& oc = out_coords[output_feature_dim];
+    const std::string& out0 = out_coords[output_spatial0_dim];
+    const std::string& out1 = out_coords[output_spatial1_dim];
 
     std::string accumulator = "0x0000000000000000";
-    for (int64_t kh = 0; kh < kernel_h; ++kh) {
-      for (int64_t kw = 0; kw < kernel_w; ++kw) {
-        for (int64_t ic = 0; ic < in_c; ++ic) {
-          std::string batch_lhs_offset = NewName("conv_lhs_batch_offset");
-          std::string ih = NewName("conv_input_height");
-          std::string iw = NewName("conv_input_width");
-          std::string lhs_height_offset = NewName("conv_lhs_height_offset");
-          std::string lhs_width_offset = NewName("conv_lhs_width_offset");
-          std::string lhs_height_index = NewName("conv_lhs_height_index");
-          std::string lhs_spatial_index = NewName("conv_lhs_spatial_index");
-          std::string lhs_index = NewName("conv_lhs_index");
-          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
-                                          batch_lhs_offset, batch,
-                                          in_h * in_w * in_c));
-          body->push_back(
-              absl::StrFormat("  %s = add i64 %s, %d", ih, oh, kh));
-          body->push_back(
-              absl::StrFormat("  %s = add i64 %s, %d", iw, ow, kw));
-          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
-                                          lhs_height_offset, ih, in_w * in_c));
-          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d",
-                                          lhs_width_offset, iw, in_c));
-          body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
-                                          lhs_height_index, batch_lhs_offset,
-                                          lhs_height_offset));
-          body->push_back(absl::StrFormat("  %s = add i64 %s, %s",
-                                          lhs_spatial_index, lhs_height_index,
-                                          lhs_width_offset));
-          body->push_back(absl::StrFormat("  %s = add i64 %s, %d", lhs_index,
-                                          lhs_spatial_index, ic));
+    for (int64_t k0 = 0; k0 < kernel_spatial0; ++k0) {
+      for (int64_t k1 = 0; k1 < kernel_spatial1; ++k1) {
+        std::string input0 =
+            scaled_spatial(out0, window0.stride(), k0, window0.padding_low(),
+                           "conv_input0");
+        std::string input1 =
+            scaled_spatial(out1, window1.stride(), k1, window1.padding_low(),
+                           "conv_input1");
+        std::string input0_ge0 = NewName("conv_input0_ge0");
+        std::string input0_lt = NewName("conv_input0_lt");
+        std::string input1_ge0 = NewName("conv_input1_ge0");
+        std::string input1_lt = NewName("conv_input1_lt");
+        std::string input0_ok = NewName("conv_input0_ok");
+        std::string input1_ok = NewName("conv_input1_ok");
+        std::string in_bounds = NewName("conv_in_bounds");
+        body->push_back(absl::StrFormat("  %s = icmp sge i64 %s, 0",
+                                        input0_ge0, input0));
+        body->push_back(absl::StrFormat("  %s = icmp slt i64 %s, %d",
+                                        input0_lt, input0, in_spatial0));
+        body->push_back(absl::StrFormat("  %s = icmp sge i64 %s, 0",
+                                        input1_ge0, input1));
+        body->push_back(absl::StrFormat("  %s = icmp slt i64 %s, %d",
+                                        input1_lt, input1, in_spatial1));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", input0_ok,
+                                        input0_ge0, input0_lt));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", input1_ok,
+                                        input1_ge0, input1_lt));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_bounds,
+                                        input0_ok, input1_ok));
+        std::string safe_input0 = NewName("conv_safe_input0");
+        std::string safe_input1 = NewName("conv_safe_input1");
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, i64 %s, i64 0", safe_input0, in_bounds,
+            input0));
+        body->push_back(absl::StrFormat(
+            "  %s = select i1 %s, i64 %s, i64 0", safe_input1, in_bounds,
+            input1));
 
-          std::string rhs_kernel_offset = NewName("conv_rhs_kernel_offset");
-          body->push_back(absl::StrFormat(
-              "  %s = add i64 %s, %d", rhs_kernel_offset, oc,
-              ((kh * kernel_w + kw) * in_c + ic) * out_c));
+        for (int64_t ic = 0; ic < in_features; ++ic) {
+          std::vector<std::string> lhs_coords(4, "0");
+          lhs_coords[input_batch_dim] = batch;
+          lhs_coords[input_feature_dim] = absl::StrCat(ic);
+          lhs_coords[input_spatial0_dim] = safe_input0;
+          lhs_coords[input_spatial1_dim] = safe_input1;
+          std::string lhs_index =
+              emit_linear_index(lhs->shape(), lhs_coords, "conv_lhs");
+
+          std::vector<std::string> rhs_coords(4, "0");
+          rhs_coords[kernel_output_feature_dim] = oc;
+          rhs_coords[kernel_input_feature_dim] = absl::StrCat(ic);
+          rhs_coords[kernel_spatial0_dim] = absl::StrCat(k0);
+          rhs_coords[kernel_spatial1_dim] = absl::StrCat(k1);
+          std::string rhs_index =
+              emit_linear_index(rhs->shape(), rhs_coords, "conv_rhs");
           TF_ASSIGN_OR_RETURN(std::string lhs_value,
                               EmitLoadFromLinearIndex(lhs, lhs_index, body));
           TF_ASSIGN_OR_RETURN(std::string rhs_value,
-                              EmitLoadFromLinearIndex(rhs, rhs_kernel_offset,
-                                                      body));
+                              EmitLoadFromLinearIndex(rhs, rhs_index, body));
           std::string product =
               EmitOp("fmul fast float", lhs_value, rhs_value, body);
+          std::string contribution = NewName("conv_contribution");
+          body->push_back(absl::StrFormat(
+              "  %s = select i1 %s, float %s, float 0x0000000000000000",
+              contribution, in_bounds, product));
           TF_ASSIGN_OR_RETURN(accumulator,
-                              EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
-                                               product, body));
+                            EmitF32ReducerOp(HloOpcode::kAdd, accumulator,
+                                               contribution, body));
         }
       }
     }

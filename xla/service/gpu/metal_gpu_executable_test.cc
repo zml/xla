@@ -323,6 +323,47 @@ absl::StatusOr<Literal> ExecuteMetalConv1D() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConv0DIsDot() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_0d_is_dot");
+  Shape lhs_shape = ShapeUtil::MakeShape(F32, {10, 5});
+  Shape rhs_shape = ShapeUtil::MakeShape(F32, {5, 7});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.set_kernel_input_feature_dimension(0);
+  dnums.set_kernel_output_feature_dimension(1);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  ConvGeneralDilated(lhs, rhs, {}, {}, {}, {}, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> lhs_values(10, 5);
+  for (int64_t row = 0; row < 10; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      lhs_values(row, col) = static_cast<float>((row * 5 + col) % 9 - 4);
+    }
+  }
+  Array2D<float> rhs_values(5, 7);
+  for (int64_t row = 0; row < 5; ++row) {
+    for (int64_t col = 0; col < 7; ++col) {
+      rhs_values(row, col) =
+          static_cast<float>((row * 7 + col) % 11 - 5) * 0.25f;
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR2FromArray2D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR2FromArray2D(rhs_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalConv2D() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -360,6 +401,65 @@ absl::StatusOr<Literal> ExecuteMetalConv2D() {
   kernel_values(1, 1, 0, 0) = 1.0f;
   Literal input_literal = LiteralUtil::CreateR4FromArray4D(input_values);
   Literal kernel_literal = LiteralUtil::CreateR4FromArray4D(kernel_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv2DNchwF16SameLower() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_2d_nchw_f16_same_lower");
+  Shape input_shape = ShapeUtil::MakeShape(F16, {2, 2, 9, 10});
+  Shape kernel_shape = ShapeUtil::MakeShape(F16, {3, 2, 4, 5});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.set_input_feature_dimension(1);
+  dnums.add_input_spatial_dimensions(2);
+  dnums.add_input_spatial_dimensions(3);
+  dnums.set_kernel_output_feature_dimension(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.add_kernel_spatial_dimensions(2);
+  dnums.add_kernel_spatial_dimensions(3);
+  dnums.set_output_batch_dimension(0);
+  dnums.set_output_feature_dimension(1);
+  dnums.add_output_spatial_dimensions(2);
+  dnums.add_output_spatial_dimensions(3);
+  std::vector<std::pair<int64_t, int64_t>> padding = {{2, 1}, {2, 2}};
+  ConvGeneralDilated(input, kernel, {2, 1}, padding, {}, {}, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  for (int64_t b = 0; b < 2; ++b) {
+    for (int64_t c = 0; c < 2; ++c) {
+      for (int64_t h = 0; h < 9; ++h) {
+        for (int64_t w = 0; w < 10; ++w) {
+          const float value =
+              static_cast<float>((b * 180 + c * 90 + h * 10 + w) % 17 - 8) /
+              8.0f;
+          input_literal.Set<half>({b, c, h, w}, half(value));
+        }
+      }
+    }
+  }
+  Literal kernel_literal = Literal::CreateFromShape(kernel_shape);
+  for (int64_t o = 0; o < 3; ++o) {
+    for (int64_t c = 0; c < 2; ++c) {
+      for (int64_t h = 0; h < 4; ++h) {
+        for (int64_t w = 0; w < 5; ++w) {
+          const float value =
+              static_cast<float>((o * 40 + c * 20 + h * 5 + w) % 11 - 5) /
+              16.0f;
+          kernel_literal.Set<half>({o, c, h, w}, half(value));
+        }
+      }
+    }
+  }
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
@@ -1965,6 +2065,28 @@ TEST(MetalGpuExecutableTest, Conv1DUsesScalarAirFallback) {
   }
 }
 
+TEST(MetalGpuExecutableTest, Conv0DIsDotUsesScalarAirFallback) {
+  auto result = ExecuteMetalConv0DIsDot();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {10, 7})));
+  for (int64_t row = 0; row < 10; ++row) {
+    for (int64_t col = 0; col < 7; ++col) {
+      float expected = 0.0f;
+      for (int64_t k = 0; k < 5; ++k) {
+        const float lhs = static_cast<float>((row * 5 + k) % 9 - 4);
+        const float rhs = static_cast<float>((k * 7 + col) % 11 - 5) * 0.25f;
+        expected += lhs * rhs;
+      }
+      EXPECT_EQ(actual.Get<float>({row, col}), expected)
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, Conv2DUsesScalarAirFallback) {
   auto result = ExecuteMetalConv2D();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -1983,6 +2105,56 @@ TEST(MetalGpuExecutableTest, Conv2DUsesScalarAirFallback) {
           4.0f;
       EXPECT_EQ(actual.Get<float>({0, row, col, 0}), expected)
           << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv2DNchwF16SameLowerUsesScalarAirFallback) {
+  auto result = ExecuteMetalConv2DNchwF16SameLower();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(ShapeUtil::Compatible(
+      actual.shape(), ShapeUtil::MakeShape(F16, {2, 3, 5, 10})));
+
+  auto input_value = [](int64_t b, int64_t c, int64_t h, int64_t w) {
+    return static_cast<float>(
+        half(static_cast<float>((b * 180 + c * 90 + h * 10 + w) % 17 - 8) /
+             8.0f));
+  };
+  auto kernel_value = [](int64_t o, int64_t c, int64_t h, int64_t w) {
+    return static_cast<float>(
+        half(static_cast<float>((o * 40 + c * 20 + h * 5 + w) % 11 - 5) /
+             16.0f));
+  };
+
+  for (int64_t b = 0; b < 2; ++b) {
+    for (int64_t o = 0; o < 3; ++o) {
+      for (int64_t oh = 0; oh < 5; ++oh) {
+        for (int64_t ow = 0; ow < 10; ++ow) {
+          float expected = 0.0f;
+          for (int64_t kh = 0; kh < 4; ++kh) {
+            const int64_t ih = oh * 2 + kh - 2;
+            if (ih < 0 || ih >= 9) {
+              continue;
+            }
+            for (int64_t kw = 0; kw < 5; ++kw) {
+              const int64_t iw = ow + kw - 2;
+              if (iw < 0 || iw >= 10) {
+                continue;
+              }
+              for (int64_t c = 0; c < 2; ++c) {
+                expected += input_value(b, c, ih, iw) *
+                            kernel_value(o, c, kh, kw);
+              }
+            }
+          }
+          EXPECT_NEAR(static_cast<float>(actual.Get<half>({b, o, oh, ow})),
+                      static_cast<float>(half(expected)), 1.0e-3f)
+              << "at (" << b << ", " << o << ", " << oh << ", " << ow << ")";
+        }
+      }
     }
   }
 }
