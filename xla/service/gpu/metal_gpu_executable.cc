@@ -507,6 +507,8 @@ class ElementwiseAirEmitter {
         return EmitConditional(instr, body);
       case HloOpcode::kConvolution:
         return EmitConvolution(instr, body);
+      case HloOpcode::kBitcastConvert:
+        return EmitBitcastConvert(instr, body);
       case HloOpcode::kConvert:
         return EmitConvert(instr, body);
       case HloOpcode::kDot:
@@ -3564,6 +3566,61 @@ class ElementwiseAirEmitter {
     }
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR elementwise convert does not support %s to %s.",
+        primitive_util::LowercasePrimitiveTypeName(src_type),
+        primitive_util::LowercasePrimitiveTypeName(dst_type)));
+  }
+
+  absl::StatusOr<std::string> EmitBitcastConvert(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const Shape& src_shape = instr->operand(0)->shape();
+    const PrimitiveType src_type = src_shape.element_type();
+    const PrimitiveType dst_type = instr->shape().element_type();
+    if (ElementTypeSize(src_type) != ElementTypeSize(dst_type) ||
+        ShapeUtil::ElementsIn(src_shape) != ShapeUtil::ElementsIn(instr->shape()) ||
+        ShapeUtil::ElementsIn(instr->shape()) !=
+            ShapeUtil::ElementsIn(result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR bitcast-convert currently supports only "
+          "same-width elementwise bitcasts.");
+    }
+
+    TF_ASSIGN_OR_RETURN(
+        std::string value,
+        EmitValue(instr->operand(0), ShapeUtil::IsEffectiveScalar(instr->shape()),
+                  body));
+    if (src_type == U16 && dst_type == F16) {
+      std::string half_value = NewName("bitcast_half");
+      std::string float_value = NewName("bitcast_float");
+      body->push_back(
+          absl::StrFormat("  %s = bitcast i16 %s to half", half_value, value));
+      body->push_back(absl::StrFormat("  %s = fpext half %s to float",
+                                      float_value, half_value));
+      return float_value;
+    }
+    if (src_type == F16 && dst_type == U16) {
+      std::string half_value = NewName("bitcast_half");
+      std::string bits = NewName("bitcast_bits");
+      body->push_back(absl::StrFormat("  %s = fptrunc float %s to half",
+                                      half_value, value));
+      body->push_back(
+          absl::StrFormat("  %s = bitcast half %s to i16", bits, half_value));
+      return bits;
+    }
+    if (src_type == S32 && dst_type == F32) {
+      std::string float_value = NewName("bitcast_float");
+      body->push_back(
+          absl::StrFormat("  %s = bitcast i32 %s to float", float_value,
+                          value));
+      return float_value;
+    }
+    if (src_type == F32 && dst_type == S32) {
+      std::string bits = NewName("bitcast_bits");
+      body->push_back(
+          absl::StrFormat("  %s = bitcast float %s to i32", bits, value));
+      return bits;
+    }
+    return absl::UnimplementedError(absl::StrFormat(
+        "Metal direct AIR bitcast-convert does not support %s to %s.",
         primitive_util::LowercasePrimitiveTypeName(src_type),
         primitive_util::LowercasePrimitiveTypeName(dst_type)));
   }
