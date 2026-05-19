@@ -23,6 +23,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "xla/array2d.h"
+#include "xla/array3d.h"
 #include "xla/client/client.h"
 #include "xla/client/client_library.h"
 #include "xla/hlo/builder/lib/math.h"
@@ -149,6 +150,87 @@ absl::StatusOr<Literal> ExecuteMetalMatmul(bool relu) {
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
                       client->TransferToServer(rhs_literal));
   std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalBatchedDot() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_batched_dot");
+  Shape lhs_shape = ShapeUtil::MakeShape(F32, {2, 2, 3});
+  Shape rhs_shape = ShapeUtil::MakeShape(F32, {2, 3, 4});
+  XlaOp lhs = Parameter(&builder, 0, lhs_shape, "lhs");
+  XlaOp rhs = Parameter(&builder, 1, rhs_shape, "rhs");
+  DotDimensionNumbers dnums;
+  dnums.add_lhs_batch_dimensions(0);
+  dnums.add_rhs_batch_dimensions(0);
+  dnums.add_lhs_contracting_dimensions(2);
+  dnums.add_rhs_contracting_dimensions(1);
+  DotGeneral(lhs, rhs, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array3D<float> lhs_values(2, 2, 3);
+  Array3D<float> rhs_values(2, 3, 4);
+  for (int64_t b = 0; b < 2; ++b) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t col = 0; col < 3; ++col) {
+        lhs_values(b, row, col) =
+            static_cast<float>(b * 6 + row * 3 + col) * 0.1f;
+      }
+    }
+    for (int64_t row = 0; row < 3; ++row) {
+      for (int64_t col = 0; col < 4; ++col) {
+        rhs_values(b, row, col) =
+            static_cast<float>(b * 12 + row * 4 + col) / 7.0f;
+      }
+    }
+  }
+  Literal lhs_literal = LiteralUtil::CreateR3FromArray3D(lhs_values);
+  Literal rhs_literal = LiteralUtil::CreateR3FromArray3D(rhs_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> lhs_data,
+                      client->TransferToServer(lhs_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> rhs_data,
+                      client->TransferToServer(rhs_literal));
+  std::vector<GlobalData*> arguments = {lhs_data.get(), rhs_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalConv1D() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_conv_1d");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {1, 5, 1});
+  Shape kernel_shape = ShapeUtil::MakeShape(F32, {3, 1, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp kernel = Parameter(&builder, 1, kernel_shape, "kernel");
+  ConvolutionDimensionNumbers dnums;
+  dnums.set_input_batch_dimension(0);
+  dnums.add_input_spatial_dimensions(1);
+  dnums.set_input_feature_dimension(2);
+  dnums.add_kernel_spatial_dimensions(0);
+  dnums.set_kernel_input_feature_dimension(1);
+  dnums.set_kernel_output_feature_dimension(2);
+  dnums.set_output_batch_dimension(0);
+  dnums.add_output_spatial_dimensions(1);
+  dnums.set_output_feature_dimension(2);
+  ConvWithGeneralDimensions(input, kernel, {1}, Padding::kValid, dnums);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array3D<float> input_values(1, 5, 1);
+  for (int64_t i = 0; i < 5; ++i) {
+    input_values(0, i, 0) = static_cast<float>(i);
+  }
+  Array3D<float> kernel_values(3, 1, 1);
+  kernel_values(0, 0, 0) = 1.0f;
+  kernel_values(1, 0, 0) = 2.0f;
+  kernel_values(2, 0, 0) = -1.0f;
+  Literal input_literal = LiteralUtil::CreateR3FromArray3D(input_values);
+  Literal kernel_literal = LiteralUtil::CreateR3FromArray3D(kernel_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> kernel_data,
+                      client->TransferToServer(kernel_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), kernel_data.get()};
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
@@ -899,6 +981,46 @@ TEST(MetalGpuExecutableTest, SmallMatmulUsesScalarAirFallback) {
       EXPECT_NEAR(actual.Get<float>({row, col}), expected, 1.0e-5f)
           << "at (" << row << ", " << col << ")";
     }
+  }
+}
+
+TEST(MetalGpuExecutableTest, BatchedDotUsesScalarAirFallback) {
+  auto result = ExecuteMetalBatchedDot();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {2, 2, 4})));
+  for (int64_t b = 0; b < 2; ++b) {
+    for (int64_t row = 0; row < 2; ++row) {
+      for (int64_t col = 0; col < 4; ++col) {
+        float expected = 0.0f;
+        for (int64_t kk = 0; kk < 3; ++kk) {
+          const float lhs =
+              static_cast<float>(b * 6 + row * 3 + kk) * 0.1f;
+          const float rhs =
+              static_cast<float>(b * 12 + kk * 4 + col) / 7.0f;
+          expected += lhs * rhs;
+        }
+        EXPECT_NEAR(actual.Get<float>({b, row, col}), expected, 1.0e-5f)
+            << "at (" << b << ", " << row << ", " << col << ")";
+      }
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, Conv1DUsesScalarAirFallback) {
+  auto result = ExecuteMetalConv1D();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {1, 3, 1})));
+  std::vector<float> expected = {0.0f, 2.0f, 4.0f};
+  for (int64_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.Get<float>({0, i, 0}), expected[i]) << "at " << i;
   }
 }
 
