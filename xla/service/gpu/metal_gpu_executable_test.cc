@@ -401,6 +401,49 @@ absl::StatusOr<Literal> ExecuteMetalGatherSelect() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalGatherRank2(bool gather_rows) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_gather_rank2");
+  Shape input_shape = ShapeUtil::MakeShape(F32, {4, 5});
+  Shape index_shape = ShapeUtil::MakeShape(S32, {2, 1});
+  XlaOp input = Parameter(&builder, 0, input_shape, "input");
+  XlaOp indices = Parameter(&builder, 1, index_shape, "indices");
+
+  GatherDimensionNumbers dnums;
+  dnums.set_index_vector_dim(1);
+  if (gather_rows) {
+    dnums.add_offset_dims(1);
+    dnums.add_collapsed_slice_dims(0);
+    dnums.add_start_index_map(0);
+    Gather(input, indices, dnums, {1, 5}, /*indices_are_sorted=*/false);
+  } else {
+    dnums.add_offset_dims(0);
+    dnums.add_collapsed_slice_dims(1);
+    dnums.add_start_index_map(1);
+    Gather(input, indices, dnums, {4, 1}, /*indices_are_sorted=*/false);
+  }
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(4, 5);
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 5; ++col) {
+      values(row, col) = static_cast<float>(row * 5 + col);
+    }
+  }
+  Array2D<int32_t> index_values(2, 1);
+  index_values(0, 0) = gather_rows ? 0 : 1;
+  index_values(1, 0) = gather_rows ? 2 : 3;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  Literal index_literal = LiteralUtil::CreateR2FromArray2D(index_values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> index_data,
+                      client->TransferToServer(index_literal));
+  std::vector<GlobalData*> arguments = {input_data.get(), index_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalSortRank1() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -1739,6 +1782,42 @@ TEST(MetalGpuExecutableTest, ElementwiseGatherSelect) {
   }
   TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
   ExpectMatchesGatherReference(actual, MakeGatherInput());
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherRank2Rows) {
+  auto result = ExecuteMetalGatherRank2(/*gather_rows=*/true);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {2, 5})));
+  for (int64_t row = 0; row < 2; ++row) {
+    const int64_t source_row = row == 0 ? 0 : 2;
+    for (int64_t col = 0; col < 5; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}),
+                static_cast<float>(source_row * 5 + col))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseGatherRank2Cols) {
+  auto result = ExecuteMetalGatherRank2(/*gather_rows=*/false);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(F32, {4, 2})));
+  for (int64_t row = 0; row < 4; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      const int64_t source_col = col == 0 ? 1 : 3;
+      EXPECT_EQ(actual.Get<float>({row, col}),
+                static_cast<float>(row * 5 + source_col))
+          << "at (" << row << ", " << col << ")";
+    }
+  }
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSortRank1) {

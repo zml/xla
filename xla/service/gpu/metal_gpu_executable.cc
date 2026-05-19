@@ -179,6 +179,10 @@ const char* ElementIrType(PrimitiveType type) {
   }
 }
 
+const char* ValueIrType(PrimitiveType type) {
+  return type == PRED ? "i1" : ElementIrType(type);
+}
+
 const char* ElementAirTypeName(PrimitiveType type) {
   switch (type) {
     case F32:
@@ -537,6 +541,14 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitLoadFromLinearIndex(
       const HloInstruction* instr, absl::string_view index,
       std::vector<std::string>* body) {
+    if (instr->IsConstant()) {
+      if (!IsScalarLikeSupported(instr->shape())) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load currently supports only scalar "
+            "constants.");
+      }
+      return EmitValue(instr, /*force_scalar=*/true, body);
+    }
     if (instr->opcode() == HloOpcode::kBitcast ||
         instr->opcode() == HloOpcode::kReshape) {
       if (ShapeUtil::ElementsIn(instr->shape()) !=
@@ -548,6 +560,9 @@ class ElementwiseAirEmitter {
       return EmitLoadFromLinearIndex(instr->operand(0), index, body);
     }
     if (instr->opcode() == HloOpcode::kBroadcast) {
+      if (IsScalarLikeSupported(instr->operand(0)->shape())) {
+        return EmitValue(instr->operand(0), /*force_scalar=*/true, body);
+      }
       if (ShapeUtil::ElementsIn(instr->shape()) !=
           ShapeUtil::ElementsIn(instr->operand(0)->shape())) {
         return absl::UnimplementedError(
@@ -609,6 +624,103 @@ class ElementwiseAirEmitter {
           "Metal direct AIR linear load negate currently supports only f32 "
           "and s32 arrays.");
     }
+    if (instr->opcode() == HloOpcode::kCall) {
+      const HloComputation* callee = instr->to_apply();
+      if (callee->num_parameters() != instr->operand_count()) {
+        return absl::InvalidArgumentError(
+            "Metal direct AIR linear load call operand count does not match "
+            "callee parameter count.");
+      }
+      CallParameterScope scope;
+      scope.computation = callee;
+      for (int64_t i = 0; i < instr->operand_count(); ++i) {
+        scope.arguments[i] = instr->operand(i);
+      }
+      call_parameter_scopes_.push_back(std::move(scope));
+      absl::Cleanup pop_scope = [this] { call_parameter_scopes_.pop_back(); };
+      return EmitLoadFromLinearIndex(callee->root_instruction(), index, body);
+    }
+    if (instr->opcode() == HloOpcode::kSelect) {
+      TF_ASSIGN_OR_RETURN(std::string pred,
+                          EmitLinearOperand(instr->operand(0), index, body));
+      TF_ASSIGN_OR_RETURN(std::string on_true,
+                          EmitLinearOperand(instr->operand(1), index, body));
+      TF_ASSIGN_OR_RETURN(std::string on_false,
+                          EmitLinearOperand(instr->operand(2), index, body));
+      return EmitTypedSelect(instr->shape().element_type(), pred, on_true,
+                             on_false, body, "linear_select");
+    }
+    if (instr->opcode() == HloOpcode::kAdd ||
+        instr->opcode() == HloOpcode::kSubtract) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          EmitLinearOperand(instr->operand(0), index, body));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          EmitLinearOperand(instr->operand(1), index, body));
+      if (instr->shape().element_type() == S32) {
+        return EmitOp(instr->opcode() == HloOpcode::kAdd ? "add i32"
+                                                         : "sub i32",
+                      lhs, rhs, body);
+      }
+      if (instr->shape().element_type() == F32) {
+        return EmitOp(instr->opcode() == HloOpcode::kAdd ? "fadd fast float"
+                                                         : "fsub fast float",
+                      lhs, rhs, body);
+      }
+      return absl::UnimplementedError(
+          "Metal direct AIR linear load add/subtract currently supports only "
+          "f32 and s32 arrays.");
+    }
+    if (instr->opcode() == HloOpcode::kCompare) {
+      return EmitLinearCompare(instr, index, body);
+    }
+    if (instr->opcode() == HloOpcode::kAnd ||
+        instr->opcode() == HloOpcode::kOr ||
+        instr->opcode() == HloOpcode::kXor) {
+      TF_ASSIGN_OR_RETURN(std::string lhs,
+                          EmitLinearOperand(instr->operand(0), index, body));
+      TF_ASSIGN_OR_RETURN(std::string rhs,
+                          EmitLinearOperand(instr->operand(1), index, body));
+      if (instr->shape().element_type() == PRED) {
+        switch (instr->opcode()) {
+          case HloOpcode::kAnd:
+            return EmitOp("and i1", lhs, rhs, body);
+          case HloOpcode::kOr:
+            return EmitOp("or i1", lhs, rhs, body);
+          case HloOpcode::kXor:
+            return EmitOp("xor i1", lhs, rhs, body);
+          default:
+            return absl::InternalError("Unexpected pred logical HLO opcode.");
+        }
+      }
+      if (instr->shape().element_type() == S32) {
+        switch (instr->opcode()) {
+          case HloOpcode::kAnd:
+            return EmitOp("and i32", lhs, rhs, body);
+          case HloOpcode::kOr:
+            return EmitOp("or i32", lhs, rhs, body);
+          case HloOpcode::kXor:
+            return EmitOp("xor i32", lhs, rhs, body);
+          default:
+            return absl::InternalError("Unexpected s32 logical HLO opcode.");
+        }
+      }
+      return absl::UnimplementedError(
+          "Metal direct AIR linear load logical ops currently support only "
+          "pred and s32 arrays.");
+    }
+    if (instr->opcode() == HloOpcode::kReduce) {
+      if (!IsPredArray(instr->shape()) || instr->operand_count() != 2 ||
+          !IsPredArray(instr->operand(0)->shape()) ||
+          instr->dimensions().size() != 1 || instr->dimensions()[0] != 1 ||
+          instr->operand(0)->shape().dimensions().size() != 2 ||
+          instr->operand(0)->shape().dimensions(1) != 1 ||
+          instr->to_apply()->root_instruction()->opcode() != HloOpcode::kAnd) {
+        return absl::UnimplementedError(
+            "Metal direct AIR linear load reduce currently supports only pred "
+            "rank-2 degenerate reduce-and.");
+      }
+      return EmitLoadFromLinearIndex(instr->operand(0), index, body);
+    }
     if (instr->opcode() == HloOpcode::kParameter) {
       if (const HloInstruction* override = CallParameterOverride(instr)) {
         return EmitLoadFromLinearIndex(override, index, body);
@@ -621,6 +733,98 @@ class ElementwiseAirEmitter {
     return absl::UnimplementedError(absl::StrFormat(
         "Metal direct AIR linear load does not support HLO opcode %s.",
         HloOpcodeString(instr->opcode())));
+  }
+
+  absl::StatusOr<std::string> EmitLinearOperand(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    if (ShapeUtil::IsEffectiveScalar(instr->shape())) {
+      return EmitValue(instr, /*force_scalar=*/true, body);
+    }
+    return EmitLoadFromLinearIndex(instr, index, body);
+  }
+
+  absl::StatusOr<std::string> EmitLinearCompare(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    TF_ASSIGN_OR_RETURN(std::string lhs,
+                        EmitLinearOperand(instr->operand(0), index, body));
+    TF_ASSIGN_OR_RETURN(std::string rhs,
+                        EmitLinearOperand(instr->operand(1), index, body));
+    std::string cmp = NewName("linear_cmp");
+    if (instr->operand(0)->shape().element_type() == S32) {
+      absl::string_view predicate;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        case ComparisonDirection::kGe:
+          predicate = "sge";
+          break;
+        case ComparisonDirection::kGt:
+          predicate = "sgt";
+          break;
+        case ComparisonDirection::kLe:
+          predicate = "sle";
+          break;
+        case ComparisonDirection::kLt:
+          predicate = "slt";
+          break;
+      }
+      body->push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+      return cmp;
+    }
+    if (instr->operand(0)->shape().element_type() == PRED) {
+      absl::string_view predicate;
+      switch (instr->comparison_direction()) {
+        case ComparisonDirection::kEq:
+          predicate = "eq";
+          break;
+        case ComparisonDirection::kNe:
+          predicate = "ne";
+          break;
+        default:
+          return absl::UnimplementedError(
+              "Metal direct AIR linear predicate compare supports only EQ and "
+              "NE.");
+      }
+      body->push_back(absl::StrFormat("  %s = icmp %s i1 %s, %s", cmp,
+                                      predicate, lhs, rhs));
+      return cmp;
+    }
+    if (instr->operand(0)->shape().element_type() != F32) {
+      return absl::UnimplementedError(
+          "Metal direct AIR linear compare supports only f32, s32, and pred "
+          "operands.");
+    }
+    absl::string_view predicate;
+    switch (instr->comparison_direction()) {
+      case ComparisonDirection::kEq:
+        predicate = "oeq";
+        break;
+      case ComparisonDirection::kNe:
+        predicate = "one";
+        break;
+      case ComparisonDirection::kGe:
+        predicate = "oge";
+        break;
+      case ComparisonDirection::kGt:
+        predicate = "ogt";
+        break;
+      case ComparisonDirection::kLe:
+        predicate = "ole";
+        break;
+      case ComparisonDirection::kLt:
+        predicate = "olt";
+        break;
+    }
+    body->push_back(absl::StrFormat("  %s = fcmp fast %s float %s, %s", cmp,
+                                    predicate, lhs, rhs));
+    return cmp;
   }
 
   absl::StatusOr<std::string> EmitSliceSourceIndex(
@@ -2441,6 +2645,11 @@ class ElementwiseAirEmitter {
   absl::StatusOr<std::string> EmitGather(const HloInstruction* instr,
                                          std::vector<std::string>* body) {
     const GatherDimensionNumbers& dnums = instr->gather_dimension_numbers();
+    if (IsF32Array(instr->shape()) && IsF32Array(instr->operand(0)->shape()) &&
+        instr->shape().dimensions().size() == 2 &&
+        instr->operand(0)->shape().dimensions().size() == 2) {
+      return EmitRank2Gather(instr, body);
+    }
     if (!IsF32Array(instr->shape()) || !IsF32Array(instr->operand(0)->shape()) ||
         instr->shape().dimensions().size() != 1 ||
         instr->operand(0)->shape().dimensions().size() != 1 ||
@@ -2513,6 +2722,78 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("  %s = sext i32 %s to i64",
                                     source_index, clamped));
     return EmitLoadFromLinearIndex(instr->operand(0), source_index, body);
+  }
+
+  absl::StatusOr<std::string> EmitRank2Gather(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* input = instr->operand(0);
+    const HloInstruction* indices = instr->operand(1);
+    const GatherDimensionNumbers& dnums = instr->gather_dimension_numbers();
+    if (!IsS32Array(indices->shape()) ||
+        indices->shape().dimensions().size() != 2 ||
+        indices->shape().dimensions(1) != 1 ||
+        dnums.offset_dims_size() != 1 ||
+        dnums.collapsed_slice_dims_size() != 1 ||
+        dnums.start_index_map_size() != 1 || dnums.index_vector_dim() != 1 ||
+        instr->gather_slice_sizes().size() != 2) {
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-2 gather requires rank-2 scalar start "
+          "indices.");
+    }
+
+    const int64_t input_rows = input->shape().dimensions(0);
+    const int64_t input_cols = input->shape().dimensions(1);
+    const int64_t index_count = indices->shape().dimensions(0);
+    const bool gather_rows =
+        dnums.offset_dims(0) == 1 && dnums.collapsed_slice_dims(0) == 0 &&
+        dnums.start_index_map(0) == 0 && instr->gather_slice_sizes()[0] == 1 &&
+        instr->gather_slice_sizes()[1] == input_cols &&
+        instr->shape().dimensions(0) == index_count &&
+        instr->shape().dimensions(1) == input_cols;
+    const bool gather_cols =
+        dnums.offset_dims(0) == 0 && dnums.collapsed_slice_dims(0) == 1 &&
+        dnums.start_index_map(0) == 1 &&
+        instr->gather_slice_sizes()[0] == input_rows &&
+        instr->gather_slice_sizes()[1] == 1 &&
+        instr->shape().dimensions(0) == input_rows &&
+        instr->shape().dimensions(1) == index_count;
+    if (!gather_rows && !gather_cols) {
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-2 gather currently supports gathering rows "
+          "or columns with scalar start indices.");
+    }
+
+    const int64_t result_cols = instr->shape().dimensions(1);
+    std::string row = NewName("gather_row");
+    std::string col = NewName("gather_col");
+    body->push_back(
+        absl::StrFormat("  %s = udiv i64 %%idx, %d", row, result_cols));
+    body->push_back(
+        absl::StrFormat("  %s = urem i64 %%idx, %d", col, result_cols));
+
+    TF_ASSIGN_OR_RETURN(
+        std::string raw_index,
+        EmitLoadFromLinearIndex(indices, gather_rows ? row : col, body));
+    std::string clamped_index = EmitClampedStartIndex(
+        raw_index, gather_rows ? input_rows - 1 : input_cols - 1, body);
+
+    std::string source_index;
+    if (gather_rows) {
+      std::string row_offset = NewName("gather_row_offset");
+      source_index = NewName("gather_source_index");
+      body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                      clamped_index, input_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      row_offset, col));
+    } else {
+      std::string row_offset = NewName("gather_row_offset");
+      source_index = NewName("gather_source_index");
+      body->push_back(
+          absl::StrFormat("  %s = mul i64 %s, %d", row_offset, row, input_cols));
+      body->push_back(absl::StrFormat("  %s = add i64 %s, %s", source_index,
+                                      row_offset, clamped_index));
+    }
+    return EmitLoadFromLinearIndex(input, source_index, body);
   }
 
   absl::StatusOr<std::vector<int64_t>> EvaluateS32Array(
@@ -3168,7 +3449,7 @@ class ElementwiseAirEmitter {
                               std::vector<std::string>* body,
                               absl::string_view prefix) {
     std::string value = NewName(prefix);
-    const char* ir_type = ElementIrType(type);
+    const char* ir_type = ValueIrType(type);
     body->push_back(absl::StrFormat("  %s = select i1 %s, %s %s, %s %s",
                                     value, pred, ir_type, on_true, ir_type,
                                     on_false));
