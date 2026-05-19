@@ -885,6 +885,38 @@ absl::StatusOr<Literal> ExecuteMetalClamp() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalClampS16ScalarBounds() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_clamp_s16_scalar_bounds");
+  Shape scalar_shape = ShapeUtil::MakeShape(S16, {});
+  Shape input_shape = ShapeUtil::MakeShape(S16, {2, 3});
+  XlaOp min = Parameter(&builder, 0, scalar_shape, "min");
+  XlaOp input = Parameter(&builder, 1, input_shape, "input");
+  XlaOp max = Parameter(&builder, 2, scalar_shape, "max");
+  Clamp(min, input, max);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal min_literal = LiteralUtil::CreateR0<int16_t>(-2);
+  Literal input_literal = Literal::CreateFromShape(input_shape);
+  int16_t value = -4;
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      input_literal.Set<int16_t>({row, col}, value++);
+    }
+  }
+  Literal max_literal = LiteralUtil::CreateR0<int16_t>(1);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> min_data,
+                      client->TransferToServer(min_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> max_data,
+                      client->TransferToServer(max_literal));
+  std::vector<GlobalData*> arguments = {min_data.get(), input_data.get(),
+                                        max_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalReverseRank2() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -2773,6 +2805,26 @@ TEST(MetalGpuExecutableTest, ElementwiseClamp) {
   ExpectMatchesElementwiseReference(actual, [&](int64_t i) {
     return std::min(std::max(input.Get<float>({i}), -0.5f), 0.75f);
   });
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseClampS16ScalarBounds) {
+  auto result = ExecuteMetalClampS16ScalarBounds();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ASSERT_TRUE(
+      ShapeUtil::Compatible(actual.shape(), ShapeUtil::MakeShape(S16, {2, 3})));
+  int16_t value = -4;
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 3; ++col) {
+      const int16_t expected =
+          std::min<int16_t>(std::max<int16_t>(value, -2), 1);
+      EXPECT_EQ(actual.Get<int16_t>({row, col}), expected)
+          << "at [" << row << ", " << col << "]";
+      ++value;
+    }
+  }
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseReverseRank2) {

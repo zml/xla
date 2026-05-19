@@ -3630,10 +3630,20 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitClamp(const HloInstruction* instr,
                                         std::vector<std::string>* body) {
-    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+    const PrimitiveType type = instr->shape().element_type();
+    if (!IsSupportedElementwiseArray(instr->shape()) || type == PRED ||
         instr->operand_count() != 3) {
       return absl::UnimplementedError(
-          "Metal direct AIR clamp currently supports only f32 and s32 arrays.");
+          "Metal direct AIR clamp currently supports only numeric elementwise "
+          "arrays.");
+    }
+    for (const HloInstruction* operand : instr->operands()) {
+      if (!operand->shape().IsArray() ||
+          operand->shape().element_type() != type) {
+        return absl::UnimplementedError(
+            "Metal direct AIR clamp operands must have the result element "
+            "type.");
+      }
     }
     TF_ASSIGN_OR_RETURN(std::string min,
                         EmitValue(instr->operand(0), IsScalarOperand(instr, 0),
@@ -3644,12 +3654,31 @@ class ElementwiseAirEmitter {
     TF_ASSIGN_OR_RETURN(std::string max,
                         EmitValue(instr->operand(2), IsScalarOperand(instr, 2),
                                   body));
-    if (instr->shape().element_type() == S32) {
-      std::string lower_bounded = EmitIntCompareSelect("sgt", value, min, body);
-      return EmitIntCompareSelect("slt", lower_bounded, max, body);
+    switch (type) {
+      case S8:
+      case S16:
+      case S32: {
+        std::string lower_bounded =
+            EmitIntCompareSelect("sgt", value, min, body, type);
+        return EmitIntCompareSelect("slt", lower_bounded, max, body, type);
+      }
+      case U8:
+      case U16:
+      case U32: {
+        std::string lower_bounded =
+            EmitIntCompareSelect("ugt", value, min, body, type);
+        return EmitIntCompareSelect("ult", lower_bounded, max, body, type);
+      }
+      case F16:
+      case BF16:
+      case F32: {
+        std::string lower_bounded = EmitCompareSelect("ogt", value, min, body);
+        return EmitCompareSelect("olt", lower_bounded, max, body);
+      }
+      default:
+        return absl::UnimplementedError(
+            "Metal direct AIR clamp does not support this element type.");
     }
-    std::string lower_bounded = EmitCompareSelect("ogt", value, min, body);
-    return EmitCompareSelect("olt", lower_bounded, max, body);
   }
 
   absl::StatusOr<std::string> EmitCompare(const HloInstruction* instr,
@@ -5186,13 +5215,16 @@ class ElementwiseAirEmitter {
 
   std::string EmitIntCompareSelect(absl::string_view predicate,
                                    absl::string_view lhs, absl::string_view rhs,
-                                   std::vector<std::string>* body) {
+                                   std::vector<std::string>* body,
+                                   PrimitiveType type = S32) {
     std::string cmp = NewName("cmp");
     std::string value = NewName("select");
-    body->push_back(absl::StrFormat("  %s = icmp %s i32 %s, %s", cmp,
-                                    predicate, lhs, rhs));
+    const char* ir_type = ElementIrType(type);
+    body->push_back(absl::StrFormat("  %s = icmp %s %s %s, %s", cmp,
+                                    predicate, ir_type, lhs, rhs));
     body->push_back(absl::StrFormat(
-        "  %s = select i1 %s, i32 %s, i32 %s", value, cmp, lhs, rhs));
+        "  %s = select i1 %s, %s %s, %s %s", value, cmp, ir_type, lhs,
+        ir_type, rhs));
     return value;
   }
 
