@@ -1922,195 +1922,42 @@ class ElementwiseAirEmitter {
     return EmitValue(branch->root_instruction(), /*force_scalar=*/false, body);
   }
 
-  absl::StatusOr<std::string> EmitConcatenate(const HloInstruction* instr,
-                                              std::vector<std::string>* body) {
-    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
-        instr->dimensions().size() != 1 || instr->operand_count() == 0 ||
-        !ShapeUtil::Equal(instr->shape(), result_shape_)) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise concatenate currently supports only "
-          "f32/s32 concatenates matching the final result shape.");
-    }
-    const int64_t rank = instr->shape().dimensions().size();
-    const int64_t concat_dim = instr->dimensions()[0];
-    if ((rank != 1 && rank != 2) || concat_dim < 0 || concat_dim >= rank) {
-      return absl::UnimplementedError(
-          "Metal direct AIR elementwise concatenate currently supports only "
-          "rank-1 and rank-2 concatenates.");
-    }
-
-    std::string row;
-    std::string col;
-    if (rank == 2) {
-      row = NewName("concat_row");
-      col = NewName("concat_col");
-      const int64_t result_minor = instr->shape().dimensions(1);
-      body->push_back(
-          absl::StrFormat("  %s = udiv i64 %%idx, %d", row, result_minor));
-      body->push_back(
-          absl::StrFormat("  %s = urem i64 %%idx, %d", col, result_minor));
-    }
-
-    std::string selected;
-    int64_t output_offset = 0;
-    for (const HloInstruction* operand : instr->operands()) {
-      if (operand->shape().element_type() != instr->shape().element_type() ||
-          operand->shape().dimensions().size() != rank) {
-        return absl::UnimplementedError(
-            "Metal direct AIR elementwise concatenate operand rank and element "
-            "type must match the result.");
-      }
-      for (int64_t dim = 0; dim < rank; ++dim) {
-        if (dim != concat_dim &&
-            operand->shape().dimensions(dim) != instr->shape().dimensions(dim)) {
-          return absl::UnimplementedError(
-              "Metal direct AIR elementwise concatenate non-concatenated "
-              "dimensions must match the result.");
-        }
-      }
-      const int64_t operand_concat_size =
-          operand->shape().dimensions(concat_dim);
-      if (operand_concat_size == 0) {
-        return absl::UnimplementedError(
-            "Metal direct AIR elementwise concatenate does not support empty "
-            "operands.");
-      }
-
-      std::string in_range;
-      std::string local_index;
-      const int64_t operand_end = output_offset + operand_concat_size;
-      if (rank == 1) {
-        if (output_offset == 0 &&
-            operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = "true";
-        } else if (output_offset == 0) {
-          in_range = NewName("concat_in_range");
-          body->push_back(
-              absl::StrFormat("  %s = icmp ult i64 %%idx, %d", in_range,
-                              operand_end));
-        } else if (operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = NewName("concat_in_range");
-          body->push_back(
-              absl::StrFormat("  %s = icmp uge i64 %%idx, %d", in_range,
-                              output_offset));
-        } else {
-          std::string ge_start = NewName("concat_ge_start");
-          std::string lt_end = NewName("concat_lt_end");
-          in_range = NewName("concat_in_range");
-          body->push_back(
-              absl::StrFormat("  %s = icmp uge i64 %%idx, %d", ge_start,
-                              output_offset));
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %%idx, %d",
-                                          lt_end, operand_end));
-          body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
-                                          ge_start, lt_end));
-        }
-
-        local_index = "%idx";
-        if (output_offset != 0) {
-          local_index = NewName("concat_local_index");
-          body->push_back(absl::StrFormat("  %s = sub i64 %%idx, %d",
-                                          local_index, output_offset));
-        }
-      } else {
-        std::string coord = concat_dim == 0 ? row : col;
-        if (output_offset == 0 &&
-            operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = "true";
-        } else if (output_offset == 0) {
-          in_range = NewName("concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          in_range, coord, operand_end));
-        } else if (operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = NewName("concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          in_range, coord, output_offset));
-        } else {
-          std::string ge_start = NewName("concat_ge_start");
-          std::string lt_end = NewName("concat_lt_end");
-          in_range = NewName("concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          ge_start, coord, output_offset));
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          lt_end, coord, operand_end));
-          body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
-                                          ge_start, lt_end));
-        }
-
-        std::string local_row = row;
-        std::string local_col = col;
-        if (output_offset != 0) {
-          if (concat_dim == 0) {
-            local_row = NewName("concat_local_row");
-            body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
-                                            local_row, row, output_offset));
-          } else {
-            local_col = NewName("concat_local_col");
-            body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
-                                            local_col, col, output_offset));
-          }
-        }
-        const int64_t operand_minor = operand->shape().dimensions(1);
-        std::string row_offset = NewName("concat_row_offset");
-        local_index = NewName("concat_local_index");
-        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
-                                        local_row, operand_minor));
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", local_index,
-                                        row_offset, local_col));
-      }
-      std::string safe_index = local_index;
-      if (in_range != "true") {
-        safe_index = NewName("concat_safe_index");
-        body->push_back(absl::StrFormat(
-            "  %s = select i1 %s, i64 %s, i64 0", safe_index, in_range,
-            local_index));
-      }
-
-      TF_ASSIGN_OR_RETURN(std::string value,
-                          EmitLoadFromLinearIndex(operand, safe_index, body));
-      if (selected.empty()) {
-        selected = value;
-      } else {
-        selected = EmitTypedSelect(instr->shape().element_type(), in_range,
-                                   value, selected, body, "concat_select");
-      }
-      output_offset = operand_end;
-    }
-
-    if (output_offset != instr->shape().dimensions(concat_dim)) {
-      return absl::InvalidArgumentError(
-          "Metal direct AIR concatenate operand sizes do not match result.");
-    }
-    return selected;
-  }
-
-  absl::StatusOr<std::string> EmitConcatenateLinearIndex(
+  absl::StatusOr<std::string> EmitConcatenateAtIndex(
       const HloInstruction* instr, absl::string_view index,
-      std::vector<std::string>* body) {
-    if ((!IsF32Array(instr->shape()) && !IsS32Array(instr->shape())) ||
+      absl::string_view name_prefix, std::vector<std::string>* body) {
+    if (!IsSupportedElementwiseArray(instr->shape()) ||
         instr->dimensions().size() != 1 || instr->operand_count() == 0) {
       return absl::UnimplementedError(
-          "Metal direct AIR linear concatenate currently supports only "
-          "f32/s32 concatenates.");
+          "Metal direct AIR concatenate requires a supported elementwise "
+          "array and one concatenate dimension.");
     }
     const int64_t rank = instr->shape().dimensions().size();
     const int64_t concat_dim = instr->dimensions()[0];
-    if ((rank != 1 && rank != 2) || concat_dim < 0 || concat_dim >= rank) {
+    if ((rank < 1 || rank > 3) || concat_dim < 0 || concat_dim >= rank) {
       return absl::UnimplementedError(
-          "Metal direct AIR linear concatenate currently supports only rank-1 "
-          "and rank-2 concatenates.");
+          "Metal direct AIR concatenate currently supports only rank-1, "
+          "rank-2, and rank-3 concatenates.");
     }
 
-    std::string row;
-    std::string col;
-    if (rank == 2) {
-      row = NewName("linear_concat_row");
-      col = NewName("linear_concat_col");
-      const int64_t result_minor = instr->shape().dimensions(1);
-      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", row, index,
-                                      result_minor));
-      body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", col, index,
-                                      result_minor));
+    std::vector<std::string> coords(rank);
+    std::string remaining(index);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      if (dim == rank - 1) {
+        coords[dim] = remaining;
+        break;
+      }
+      int64_t stride = 1;
+      for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+        stride *= instr->shape().dimensions(minor_dim);
+      }
+      std::string coord = NewName(absl::StrCat(name_prefix, "_coord"));
+      std::string rem = NewName(absl::StrCat(name_prefix, "_rem"));
+      body->push_back(absl::StrFormat("  %s = udiv i64 %s, %d", coord,
+                                      remaining, stride));
+      body->push_back(absl::StrFormat("  %s = urem i64 %s, %d", rem,
+                                      remaining, stride));
+      coords[dim] = coord;
+      remaining = rem;
     }
 
     std::string selected;
@@ -2119,15 +1966,15 @@ class ElementwiseAirEmitter {
       if (operand->shape().element_type() != instr->shape().element_type() ||
           operand->shape().dimensions().size() != rank) {
         return absl::UnimplementedError(
-            "Metal direct AIR linear concatenate operand rank and element "
-            "type must match the result.");
+            "Metal direct AIR concatenate operand rank and element type must "
+            "match the result.");
       }
       for (int64_t dim = 0; dim < rank; ++dim) {
         if (dim != concat_dim &&
             operand->shape().dimensions(dim) != instr->shape().dimensions(dim)) {
           return absl::UnimplementedError(
-              "Metal direct AIR linear concatenate non-concatenated "
-              "dimensions must match the result.");
+              "Metal direct AIR concatenate non-concatenated dimensions must "
+              "match the result.");
         }
       }
 
@@ -2135,93 +1982,69 @@ class ElementwiseAirEmitter {
           operand->shape().dimensions(concat_dim);
       if (operand_concat_size == 0) {
         return absl::UnimplementedError(
-            "Metal direct AIR linear concatenate does not support empty "
-            "operands.");
+            "Metal direct AIR concatenate does not support empty operands.");
       }
       const int64_t operand_end = output_offset + operand_concat_size;
 
       std::string in_range;
-      std::string local_index;
-      if (rank == 1) {
-        if (output_offset == 0 &&
-            operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = "true";
-        } else if (output_offset == 0) {
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          in_range, index, operand_end));
-        } else if (operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          in_range, index, output_offset));
-        } else {
-          std::string ge_start = NewName("linear_concat_ge_start");
-          std::string lt_end = NewName("linear_concat_lt_end");
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          ge_start, index, output_offset));
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          lt_end, index, operand_end));
-          body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
-                                          ge_start, lt_end));
-        }
-
-        local_index = std::string(index);
-        if (output_offset != 0) {
-          local_index = NewName("linear_concat_local_index");
-          body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
-                                          local_index, index, output_offset));
-        }
+      const std::string& coord = coords[concat_dim];
+      if (output_offset == 0 &&
+          operand_end == instr->shape().dimensions(concat_dim)) {
+        in_range = "true";
+      } else if (output_offset == 0) {
+        in_range = NewName(absl::StrCat(name_prefix, "_in_range"));
+        body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
+                                        in_range, coord, operand_end));
+      } else if (operand_end == instr->shape().dimensions(concat_dim)) {
+        in_range = NewName(absl::StrCat(name_prefix, "_in_range"));
+        body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                        in_range, coord, output_offset));
       } else {
-        std::string coord = concat_dim == 0 ? row : col;
-        if (output_offset == 0 &&
-            operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = "true";
-        } else if (output_offset == 0) {
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          in_range, coord, operand_end));
-        } else if (operand_end == instr->shape().dimensions(concat_dim)) {
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          in_range, coord, output_offset));
-        } else {
-          std::string ge_start = NewName("linear_concat_ge_start");
-          std::string lt_end = NewName("linear_concat_lt_end");
-          in_range = NewName("linear_concat_in_range");
-          body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
-                                          ge_start, coord, output_offset));
-          body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d",
-                                          lt_end, coord, operand_end));
-          body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
-                                          ge_start, lt_end));
-        }
+        std::string ge_start = NewName(absl::StrCat(name_prefix, "_ge_start"));
+        std::string lt_end = NewName(absl::StrCat(name_prefix, "_lt_end"));
+        in_range = NewName(absl::StrCat(name_prefix, "_in_range"));
+        body->push_back(absl::StrFormat("  %s = icmp uge i64 %s, %d",
+                                        ge_start, coord, output_offset));
+        body->push_back(absl::StrFormat("  %s = icmp ult i64 %s, %d", lt_end,
+                                        coord, operand_end));
+        body->push_back(absl::StrFormat("  %s = and i1 %s, %s", in_range,
+                                        ge_start, lt_end));
+      }
 
-        std::string local_row = row;
-        std::string local_col = col;
-        if (output_offset != 0) {
-          if (concat_dim == 0) {
-            local_row = NewName("linear_concat_local_row");
-            body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
-                                            local_row, row, output_offset));
-          } else {
-            local_col = NewName("linear_concat_local_col");
-            body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
-                                            local_col, col, output_offset));
-          }
+      std::vector<std::string> local_coords = coords;
+      if (output_offset != 0) {
+        local_coords[concat_dim] =
+            NewName(absl::StrCat(name_prefix, "_local_coord"));
+        body->push_back(absl::StrFormat("  %s = sub i64 %s, %d",
+                                        local_coords[concat_dim], coord,
+                                        output_offset));
+      }
+
+      std::string local_index = "0";
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        int64_t stride = 1;
+        for (int64_t minor_dim = dim + 1; minor_dim < rank; ++minor_dim) {
+          stride *= operand->shape().dimensions(minor_dim);
         }
-        const int64_t operand_minor = operand->shape().dimensions(1);
-        std::string row_offset = NewName("linear_concat_row_offset");
-        local_index = NewName("linear_concat_local_index");
-        body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
-                                        local_row, operand_minor));
-        body->push_back(absl::StrFormat("  %s = add i64 %s, %s", local_index,
-                                        row_offset, local_col));
+        std::string term = local_coords[dim];
+        if (stride != 1) {
+          term = NewName(absl::StrCat(name_prefix, "_local_term"));
+          body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", term,
+                                          local_coords[dim], stride));
+        }
+        if (local_index == "0") {
+          local_index = term;
+        } else {
+          std::string sum = NewName(absl::StrCat(name_prefix, "_local_index"));
+          body->push_back(absl::StrFormat("  %s = add i64 %s, %s", sum,
+                                          local_index, term));
+          local_index = sum;
+        }
       }
 
       std::string safe_index = local_index;
       if (in_range != "true") {
-        safe_index = NewName("linear_concat_safe_index");
+        safe_index = NewName(absl::StrCat(name_prefix, "_safe_index"));
         body->push_back(absl::StrFormat(
             "  %s = select i1 %s, i64 %s, i64 0", safe_index, in_range,
             local_index));
@@ -2234,17 +2057,32 @@ class ElementwiseAirEmitter {
       } else {
         selected = EmitTypedSelect(instr->shape().element_type(), in_range,
                                    value, selected, body,
-                                   "linear_concat_select");
+                                   absl::StrCat(name_prefix, "_select"));
       }
       output_offset = operand_end;
     }
 
     if (output_offset != instr->shape().dimensions(concat_dim)) {
       return absl::InvalidArgumentError(
-          "Metal direct AIR linear concatenate operand sizes do not match "
-          "result.");
+          "Metal direct AIR concatenate operand sizes do not match result.");
     }
     return selected;
+  }
+
+  absl::StatusOr<std::string> EmitConcatenate(const HloInstruction* instr,
+                                              std::vector<std::string>* body) {
+    if (!ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      return absl::UnimplementedError(
+          "Metal direct AIR elementwise concatenate must match the final "
+          "result shape.");
+    }
+    return EmitConcatenateAtIndex(instr, "%idx", "concat", body);
+  }
+
+  absl::StatusOr<std::string> EmitConcatenateLinearIndex(
+      const HloInstruction* instr, absl::string_view index,
+      std::vector<std::string>* body) {
+    return EmitConcatenateAtIndex(instr, index, "linear_concat", body);
   }
 
   absl::StatusOr<bool> SortDescending(const HloInstruction* instr) {

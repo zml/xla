@@ -1070,6 +1070,53 @@ absl::StatusOr<Literal> ExecuteMetalConcatenateRank2(int64_t dim) {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalConcatenateRank3(int64_t dim) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_concatenate_rank3");
+  std::vector<int64_t> operand_sizes = {3, 1, 4};
+  std::vector<Shape> operand_shapes;
+  std::vector<XlaOp> operands;
+  for (int64_t operand_size : operand_sizes) {
+    std::vector<int64_t> dimensions = {2, 3, 4};
+    dimensions[dim] = operand_size;
+    operand_shapes.push_back(ShapeUtil::MakeShape(S32, dimensions));
+    operands.push_back(
+        Parameter(&builder, operands.size(), operand_shapes.back(), "input"));
+  }
+  ConcatInDim(&builder, operands, dim);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  std::vector<Literal> literals;
+  for (int64_t operand_index = 0; operand_index < operand_shapes.size();
+       ++operand_index) {
+    const Shape& shape = operand_shapes[operand_index];
+    Literal literal = Literal::CreateFromShape(shape);
+    for (int64_t i = 0; i < shape.dimensions(0); ++i) {
+      for (int64_t j = 0; j < shape.dimensions(1); ++j) {
+        for (int64_t k = 0; k < shape.dimensions(2); ++k) {
+          int32_t value = static_cast<int32_t>(
+              operand_index * 1000 + (i * shape.dimensions(1) + j) *
+                                         shape.dimensions(2) +
+              k);
+          literal.Set<int32_t>({i, j, k}, value);
+        }
+      }
+    }
+    literals.push_back(std::move(literal));
+  }
+
+  std::vector<std::unique_ptr<GlobalData>> data;
+  std::vector<GlobalData*> arguments;
+  for (const Literal& literal : literals) {
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                        client->TransferToServer(literal));
+    arguments.push_back(input_data.get());
+    data.push_back(std::move(input_data));
+  }
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalScatter(bool add) {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -3536,6 +3583,49 @@ TEST(MetalGpuExecutableTest, ElementwiseConcatenateRank2Dim1) {
                                : 100.0f + static_cast<float>(row);
       EXPECT_EQ(actual.Get<float>({row, col}), expected)
           << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseConcatenateRank3) {
+  std::vector<int64_t> operand_sizes = {3, 1, 4};
+  for (int64_t dim = 0; dim < 3; ++dim) {
+    auto result = ExecuteMetalConcatenateRank3(dim);
+    if (absl::IsFailedPrecondition(result.status())) {
+      GTEST_SKIP() << result.status();
+    }
+    TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+    std::vector<int64_t> result_dimensions = {2, 3, 4};
+    result_dimensions[dim] = 8;
+    ASSERT_TRUE(ShapeUtil::Compatible(
+        actual.shape(), ShapeUtil::MakeShape(S32, result_dimensions)));
+
+    for (int64_t i = 0; i < result_dimensions[0]; ++i) {
+      for (int64_t j = 0; j < result_dimensions[1]; ++j) {
+        for (int64_t k = 0; k < result_dimensions[2]; ++k) {
+          std::vector<int64_t> coords = {i, j, k};
+          int64_t offset = 0;
+          int64_t operand_index = 0;
+          for (; operand_index < operand_sizes.size(); ++operand_index) {
+            if (coords[dim] < offset + operand_sizes[operand_index]) {
+              break;
+            }
+            offset += operand_sizes[operand_index];
+          }
+          std::vector<int64_t> local_coords = coords;
+          local_coords[dim] -= offset;
+          std::vector<int64_t> operand_dimensions = {2, 3, 4};
+          operand_dimensions[dim] = operand_sizes[operand_index];
+          int32_t expected = static_cast<int32_t>(
+              operand_index * 1000 +
+              (local_coords[0] * operand_dimensions[1] + local_coords[1]) *
+                  operand_dimensions[2] +
+              local_coords[2]);
+          EXPECT_EQ(actual.Get<int32_t>({i, j, k}), expected)
+              << "for dim " << dim << " at (" << i << ", " << j << ", " << k
+              << ")";
+        }
+      }
     }
   }
 }
