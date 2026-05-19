@@ -1988,6 +1988,20 @@ class ElementwiseAirEmitter {
 
   absl::StatusOr<std::string> EmitSort(const HloInstruction* instr,
                                        std::vector<std::string>* body) {
+    if (IsF32Array(instr->shape()) && instr->operand_count() == 1 &&
+        IsF32Array(instr->operand(0)->shape()) &&
+        instr->shape().dimensions().size() == 2 &&
+        instr->operand(0)->shape().dimensions().size() == 2 &&
+        instr->dimensions().size() == 1 && instr->dimensions()[0] == 1 &&
+        ShapeUtil::Equal(instr->shape(), instr->operand(0)->shape()) &&
+        ShapeUtil::Equal(instr->shape(), result_shape_)) {
+      TF_ASSIGN_OR_RETURN(bool descending, SortDescending(instr));
+      return EmitRank2F32OrderStatistic(
+          instr->operand(0), instr->shape().dimensions(0),
+          instr->shape().dimensions(1), instr->shape().dimensions(1),
+          descending, body, /*return_index=*/false);
+    }
+
     if (!IsF32Array(instr->shape()) || instr->operand_count() != 1 ||
         !IsF32Array(instr->operand(0)->shape()) ||
         instr->shape().dimensions().size() != 1 ||
@@ -2011,17 +2025,39 @@ class ElementwiseAirEmitter {
     if (instr->operand(0)->opcode() == HloOpcode::kWhile) {
       return EmitSimpleWhileAccumulator(instr, body);
     }
+    if (instr->operand(0)->opcode() == HloOpcode::kReduce) {
+      return EmitArgmaxReduceTupleElement(instr, body);
+    }
     if (instr->operand(0)->opcode() != HloOpcode::kTopK ||
-        instr->shape().dimensions().size() != 1 ||
         !ShapeUtil::Equal(instr->shape(), result_shape_)) {
       return absl::UnimplementedError(
           "Metal direct AIR get-tuple-element currently supports only the "
-          "values or indices output of rank-1 f32 topk.");
+          "values or indices output of rank-1/rank-2 f32 topk.");
     }
 
     const auto* topk = Cast<HloTopKInstruction>(instr->operand(0));
     const HloInstruction* input = topk->operand(0);
+    if (IsF32Array(input->shape()) && input->shape().dimensions().size() == 2 &&
+        instr->shape().dimensions().size() == 2 &&
+        instr->shape().dimensions(0) == input->shape().dimensions(0) &&
+        instr->shape().dimensions(1) == topk->k()) {
+      if (instr->tuple_index() == 1 && IsS32Array(instr->shape())) {
+        return EmitRank2F32OrderStatistic(
+            input, input->shape().dimensions(0), input->shape().dimensions(1),
+            topk->k(), topk->largest(), body, /*return_index=*/true);
+      }
+      if (instr->tuple_index() == 0 && IsF32Array(instr->shape())) {
+        return EmitRank2F32OrderStatistic(
+            input, input->shape().dimensions(0), input->shape().dimensions(1),
+            topk->k(), topk->largest(), body, /*return_index=*/false);
+      }
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-2 topk get-tuple-element supports only f32 "
+          "values or s32 indices.");
+    }
+
     if (!IsF32Array(input->shape()) || input->shape().dimensions().size() != 1 ||
+        instr->shape().dimensions().size() != 1 ||
         ShapeUtil::ElementsIn(instr->shape()) != topk->k()) {
       return absl::UnimplementedError(
           "Metal direct AIR topk values currently supports only rank-1 f32 "
@@ -2042,6 +2078,89 @@ class ElementwiseAirEmitter {
     return EmitRank1F32OrderStatistic(
         input, ShapeUtil::ElementsIn(input->shape()), topk->largest(), body,
         /*return_index=*/false);
+  }
+
+  absl::StatusOr<std::string> EmitArgmaxReduceTupleElement(
+      const HloInstruction* instr, std::vector<std::string>* body) {
+    const HloInstruction* reduce = instr->operand(0);
+    if (instr->tuple_index() != 1 || !IsScalarLikeS32(instr->shape()) ||
+        !ShapeUtil::Equal(instr->shape(), result_shape_) ||
+        reduce->operand_count() != 4 || reduce->dimensions().size() != 1 ||
+        reduce->dimensions()[0] != 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR argmax reduce currently supports only a rank-1 "
+          "f32 input reduced to a scalar s32 index.");
+    }
+    const HloInstruction* input = reduce->operand(0);
+    const HloInstruction* iota = reduce->operand(1);
+    const HloInstruction* init_value = reduce->operand(2);
+    const HloInstruction* init_index = reduce->operand(3);
+    if (!IsF32Array(input->shape()) || input->shape().dimensions().size() != 1 ||
+        iota->opcode() != HloOpcode::kIota || !IsS32Array(iota->shape()) ||
+        iota->shape().dimensions().size() != 1 ||
+        iota->shape().dimensions(0) != input->shape().dimensions(0) ||
+        !init_value->IsConstant() || !IsScalarLikeF32(init_value->shape()) ||
+        !init_index->IsConstant() || !IsScalarLikeS32(init_index->shape())) {
+      return absl::UnimplementedError(
+          "Metal direct AIR argmax reduce requires rank-1 f32 input, rank-1 "
+          "s32 iota, and scalar constant initial values.");
+    }
+
+    const int64_t input_elements = input->shape().dimensions(0);
+    if (input_elements <= 0) {
+      return absl::UnimplementedError(
+          "Metal direct AIR argmax reduce does not support empty inputs.");
+    }
+
+    const int32_t init_index_value =
+        init_index->literal().Get<int32_t>({});
+    const float init_value_value = init_value->literal().Get<float>({});
+    const std::string header = NewLabel("argmax_header");
+    const std::string loop_body = NewLabel("argmax_body");
+    const std::string done = NewLabel("argmax_done");
+    const std::string i = NewName("argmax_i");
+    const std::string best_index = NewName("argmax_best_index");
+    const std::string best_value = NewName("argmax_best_value");
+    const std::string in_range = NewName("argmax_in_range");
+    const std::string i64 = NewName("argmax_i64");
+    const std::string better = NewName("argmax_better");
+    const std::string next_best_value = NewName("argmax_next_best_value");
+    const std::string next_best_index = NewName("argmax_next_best_index");
+    const std::string next_i = NewName("argmax_next_i");
+
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+    body->push_back(absl::StrFormat("%s:", header));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ 0, %%body ], [ %s, %%%s ]", i, next_i,
+        loop_body));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ %d, %%body ], [ %s, %%%s ]", best_index,
+        init_index_value, next_best_index, loop_body));
+    body->push_back(absl::StrFormat(
+        "  %s = phi float [ %s, %%body ], [ %s, %%%s ]", best_value,
+        FloatLiteral(init_value_value), next_best_value, loop_body));
+    body->push_back(absl::StrFormat("  %s = icmp ult i32 %s, %d", in_range, i,
+                                    input_elements));
+    body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
+                                    in_range, loop_body, done));
+
+    body->push_back(absl::StrFormat("%s:", loop_body));
+    body->push_back(absl::StrFormat("  %s = zext i32 %s to i64", i64, i));
+    TF_ASSIGN_OR_RETURN(std::string value,
+                        EmitLoadFromLinearIndex(input, i64, body));
+    body->push_back(absl::StrFormat("  %s = fcmp fast ogt float %s, %s",
+                                    better, value, best_value));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, float %s, float %s", next_best_value, better,
+        value, best_value));
+    body->push_back(absl::StrFormat(
+        "  %s = select i1 %s, i32 %s, i32 %s", next_best_index, better, i,
+        best_index));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, 1", next_i, i));
+    body->push_back(absl::StrFormat("  br label %%%s", header));
+
+    body->push_back(absl::StrFormat("%s:", done));
+    return best_index;
   }
 
   absl::StatusOr<std::string> EmitSimpleWhileAccumulator(
@@ -2246,6 +2365,138 @@ class ElementwiseAirEmitter {
     body->push_back(absl::StrFormat("%s:", after_inner));
     body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %%idx32",
                                     has_output_rank, rank));
+    if (return_index) {
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, i32 %s, i32 %s", selected_next,
+          has_output_rank, j, selected));
+    } else {
+      body->push_back(absl::StrFormat(
+          "  %s = select i1 %s, float %s, float %s", selected_next,
+          has_output_rank, candidate_value, selected));
+    }
+    body->push_back(absl::StrFormat("  %s = add i32 %s, 1", j_next, j));
+    body->push_back(absl::StrFormat("  br label %%%s", outer));
+
+    body->push_back(absl::StrFormat("%s:", done));
+    return selected;
+  }
+
+  absl::StatusOr<std::string> EmitRank2F32OrderStatistic(
+      const HloInstruction* input, int64_t rows, int64_t input_cols,
+      int64_t output_cols, bool descending, std::vector<std::string>* body,
+      bool return_index) {
+    if (rows <= 0 || input_cols <= 0 || output_cols <= 0 ||
+        output_cols > input_cols) {
+      return absl::UnimplementedError(
+          "Metal direct AIR rank-2 ordering requires non-empty row-wise "
+          "inputs and k <= columns.");
+    }
+
+    const std::string output_row = NewName("order2_output_row");
+    const std::string output_rank = NewName("order2_output_rank");
+    const std::string row64 = NewName("order2_row64");
+    const std::string row_offset = NewName("order2_row_offset");
+    body->push_back(absl::StrFormat("  %s = udiv i32 %%idx32, %d", output_row,
+                                    output_cols));
+    body->push_back(absl::StrFormat("  %s = urem i32 %%idx32, %d",
+                                    output_rank, output_cols));
+    body->push_back(
+        absl::StrFormat("  %s = zext i32 %s to i64", row64, output_row));
+    body->push_back(absl::StrFormat("  %s = mul i64 %s, %d", row_offset,
+                                    row64, input_cols));
+
+    const std::string outer = NewLabel("order2_outer");
+    const std::string candidate = NewLabel("order2_candidate");
+    const std::string inner = NewLabel("order2_inner");
+    const std::string inner_body = NewLabel("order2_inner_body");
+    const std::string after_inner = NewLabel("order2_after_inner");
+    const std::string done = NewLabel("order2_done");
+    const std::string j = NewName("order2_j");
+    const std::string selected = NewName("order2_selected");
+    const std::string j_in_range = NewName("order2_j_in_range");
+    const std::string j64 = NewName("order2_j64");
+    const std::string candidate_index = NewName("order2_candidate_index");
+    const std::string i = NewName("order2_i");
+    const std::string rank = NewName("order2_rank");
+    const std::string i_in_range = NewName("order2_i_in_range");
+    const std::string i64 = NewName("order2_i64");
+    const std::string other_index = NewName("order2_other_index");
+    const std::string ordered = NewName("order2_ordered");
+    const std::string equal = NewName("order2_equal");
+    const std::string tie_before = NewName("order2_tie_before");
+    const std::string stable_tie = NewName("order2_stable_tie");
+    const std::string before = NewName("order2_before");
+    const std::string rank_inc = NewName("order2_rank_inc");
+    const std::string rank_next = NewName("order2_rank_next");
+    const std::string i_next = NewName("order2_i_next");
+    const std::string has_output_rank = NewName("order2_has_output_rank");
+    const std::string selected_next = NewName("order2_selected_next");
+    const std::string j_next = NewName("order2_j_next");
+    const absl::string_view selected_type = return_index ? "i32" : "float";
+    const absl::string_view selected_init =
+        return_index ? "0" : "0x0000000000000000";
+
+    body->push_back(absl::StrFormat("  br label %%%s", outer));
+    body->push_back(absl::StrFormat("%s:", outer));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ 0, %%body ], [ %s, %%%s ]", j, j_next,
+        after_inner));
+    body->push_back(absl::StrFormat(
+        "  %s = phi %s [ %s, %%body ], [ %s, %%%s ]", selected,
+        selected_type, selected_init, selected_next, after_inner));
+    body->push_back(absl::StrFormat("  %s = icmp ult i32 %s, %d", j_in_range,
+                                    j, input_cols));
+    body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
+                                    j_in_range, candidate, done));
+
+    body->push_back(absl::StrFormat("%s:", candidate));
+    body->push_back(absl::StrFormat("  %s = zext i32 %s to i64", j64, j));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", candidate_index,
+                                    row_offset, j64));
+    TF_ASSIGN_OR_RETURN(std::string candidate_value,
+                        EmitLoadFromLinearIndex(input, candidate_index, body));
+    body->push_back(absl::StrFormat("  br label %%%s", inner));
+
+    body->push_back(absl::StrFormat("%s:", inner));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ 0, %%%s ], [ %s, %%%s ]", i, candidate, i_next,
+        inner_body));
+    body->push_back(absl::StrFormat(
+        "  %s = phi i32 [ 0, %%%s ], [ %s, %%%s ]", rank, candidate,
+        rank_next, inner_body));
+    body->push_back(absl::StrFormat("  %s = icmp ult i32 %s, %d", i_in_range,
+                                    i, input_cols));
+    body->push_back(absl::StrFormat("  br i1 %s, label %%%s, label %%%s",
+                                    i_in_range, inner_body, after_inner));
+
+    body->push_back(absl::StrFormat("%s:", inner_body));
+    body->push_back(absl::StrFormat("  %s = zext i32 %s to i64", i64, i));
+    body->push_back(absl::StrFormat("  %s = add i64 %s, %s", other_index,
+                                    row_offset, i64));
+    TF_ASSIGN_OR_RETURN(std::string other_value,
+                        EmitLoadFromLinearIndex(input, other_index, body));
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast %s float %s, %s", ordered,
+        descending ? "ogt" : "olt", other_value, candidate_value));
+    body->push_back(absl::StrFormat(
+        "  %s = fcmp fast oeq float %s, %s", equal, other_value,
+        candidate_value));
+    body->push_back(
+        absl::StrFormat("  %s = icmp ult i32 %s, %s", tie_before, i, j));
+    body->push_back(absl::StrFormat("  %s = and i1 %s, %s", stable_tie,
+                                    equal, tie_before));
+    body->push_back(absl::StrFormat("  %s = or i1 %s, %s", before, ordered,
+                                    stable_tie));
+    body->push_back(
+        absl::StrFormat("  %s = zext i1 %s to i32", rank_inc, before));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, %s", rank_next, rank,
+                                    rank_inc));
+    body->push_back(absl::StrFormat("  %s = add i32 %s, 1", i_next, i));
+    body->push_back(absl::StrFormat("  br label %%%s", inner));
+
+    body->push_back(absl::StrFormat("%s:", after_inner));
+    body->push_back(absl::StrFormat("  %s = icmp eq i32 %s, %s",
+                                    has_output_rank, rank, output_rank));
     if (return_index) {
       body->push_back(absl::StrFormat(
           "  %s = select i1 %s, i32 %s, i32 %s", selected_next,

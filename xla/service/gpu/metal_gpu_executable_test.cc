@@ -27,6 +27,7 @@ limitations under the License.
 #include "xla/array4d.h"
 #include "xla/client/client.h"
 #include "xla/client/client_library.h"
+#include "xla/hlo/builder/lib/arithmetic.h"
 #include "xla/hlo/builder/lib/math.h"
 #include "xla/hlo/builder/xla_builder.h"
 #include "xla/hlo/builder/xla_computation.h"
@@ -563,6 +564,38 @@ absl::StatusOr<Literal> ExecuteMetalSortRank1() {
   return client->ExecuteAndTransfer(computation, arguments);
 }
 
+absl::StatusOr<Literal> ExecuteMetalSortRank2() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  Shape scalar_shape = ShapeUtil::MakeShape(F32, {});
+  XlaBuilder comparator_builder("metal_sort_rank2_comparator");
+  XlaOp lhs = Parameter(&comparator_builder, 0, scalar_shape, "lhs");
+  XlaOp rhs = Parameter(&comparator_builder, 1, scalar_shape, "rhs");
+  Lt(lhs, rhs);
+  TF_ASSIGN_OR_RETURN(XlaComputation comparator, comparator_builder.Build());
+
+  XlaBuilder builder("metal_sort_rank2");
+  Shape shape = ShapeUtil::MakeShape(F32, {2, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  Sort({input}, comparator, 1, /*is_stable=*/true);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(2, 4);
+  values(0, 0) = 3.0f;
+  values(0, 1) = 1.0f;
+  values(0, 2) = 2.0f;
+  values(0, 3) = 1.0f;
+  values(1, 0) = 0.0f;
+  values(1, 1) = 5.0f;
+  values(1, 2) = 4.0f;
+  values(1, 3) = -1.0f;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
 absl::StatusOr<Literal> ExecuteMetalTopKValuesRank1() {
   TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
 
@@ -591,6 +624,49 @@ absl::StatusOr<Literal> ExecuteMetalTopKIndicesRank1() {
 
   Literal input_literal = LiteralUtil::CreateR1<float>(
       {1.5f, -2.0f, 0.25f, 4.0f, 0.25f, -1.0f, 3.0f, 2.0f});
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalTopKRank2(bool indices) {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder(indices ? "metal_topk_indices_rank2"
+                            : "metal_topk_values_rank2");
+  Shape shape = ShapeUtil::MakeShape(F32, {2, 4});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  GetTupleElement(TopK(input, 2, /*largest=*/true), indices ? 1 : 0);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Array2D<float> values(2, 4);
+  values(0, 0) = 1.0f;
+  values(0, 1) = 4.0f;
+  values(0, 2) = 3.0f;
+  values(0, 3) = 4.0f;
+  values(1, 0) = 6.0f;
+  values(1, 1) = 2.0f;
+  values(1, 2) = 5.0f;
+  values(1, 3) = 0.0f;
+  Literal input_literal = LiteralUtil::CreateR2FromArray2D(values);
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
+                      client->TransferToServer(input_literal));
+  std::vector<GlobalData*> arguments = {input_data.get()};
+  return client->ExecuteAndTransfer(computation, arguments);
+}
+
+absl::StatusOr<Literal> ExecuteMetalArgmaxRank1() {
+  TF_ASSIGN_OR_RETURN(LocalClient * client, GetMetalClient());
+
+  XlaBuilder builder("metal_argmax_rank1");
+  Shape shape = ShapeUtil::MakeShape(F32, {5});
+  XlaOp input = Parameter(&builder, 0, shape, "input");
+  ArgMax(input, S32, 0);
+  TF_ASSIGN_OR_RETURN(XlaComputation computation, builder.Build());
+
+  Literal input_literal =
+      LiteralUtil::CreateR1<float>({1.0f, 7.0f, 3.0f, 7.0f, 6.0f});
   TF_ASSIGN_OR_RETURN(std::unique_ptr<GlobalData> input_data,
                       client->TransferToServer(input_literal));
   std::vector<GlobalData*> arguments = {input_data.get()};
@@ -2144,6 +2220,24 @@ TEST(MetalGpuExecutableTest, ElementwiseSortRank1) {
   }
 }
 
+TEST(MetalGpuExecutableTest, ElementwiseSortRank2) {
+  auto result = ExecuteMetalSortRank2();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected[2][4] = {{1.0f, 1.0f, 2.0f, 3.0f},
+                          {-1.0f, 0.0f, 4.0f, 5.0f}};
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {2, 4})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 4; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}), expected[row][col])
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
 TEST(MetalGpuExecutableTest, ElementwiseTopKValuesRank1) {
   auto result = ExecuteMetalTopKValuesRank1();
   if (absl::IsFailedPrecondition(result.status())) {
@@ -2170,6 +2264,49 @@ TEST(MetalGpuExecutableTest, ElementwiseTopKIndicesRank1) {
   for (int64_t i = 0; i < expected.size(); ++i) {
     EXPECT_EQ(actual.Get<int32_t>({i}), expected[i]) << "at " << i;
   }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKValuesRank2) {
+  auto result = ExecuteMetalTopKRank2(/*indices=*/false);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  float expected[2][2] = {{4.0f, 4.0f}, {6.0f, 5.0f}};
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(F32, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      EXPECT_EQ(actual.Get<float>({row, col}), expected[row][col])
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseTopKIndicesRank2) {
+  auto result = ExecuteMetalTopKRank2(/*indices=*/true);
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  int32_t expected[2][2] = {{1, 3}, {0, 2}};
+  ASSERT_TRUE(ShapeUtil::Compatible(actual.shape(),
+                                    ShapeUtil::MakeShape(S32, {2, 2})));
+  for (int64_t row = 0; row < 2; ++row) {
+    for (int64_t col = 0; col < 2; ++col) {
+      EXPECT_EQ(actual.Get<int32_t>({row, col}), expected[row][col])
+          << "at (" << row << ", " << col << ")";
+    }
+  }
+}
+
+TEST(MetalGpuExecutableTest, ElementwiseArgmaxRank1) {
+  auto result = ExecuteMetalArgmaxRank1();
+  if (absl::IsFailedPrecondition(result.status())) {
+    GTEST_SKIP() << result.status();
+  }
+  TF_ASSERT_OK_AND_ASSIGN(Literal actual, std::move(result));
+  ExpectScalarS32(actual, 1);
 }
 
 TEST(MetalGpuExecutableTest, ElementwiseSortDescendingExpression) {
