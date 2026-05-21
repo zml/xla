@@ -16,11 +16,15 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_SYCL_SYCL_EXECUTOR_H_
 #define XLA_STREAM_EXECUTOR_SYCL_SYCL_EXECUTOR_H_
 
+#include <map>
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/numeric/int128.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/platform.h"
@@ -219,10 +223,19 @@ class SyclExecutor : public gpu::GpuExecutor {
   absl::flat_hash_map<ModuleHandle, ze_module_handle_t> in_memory_modules_
       ABSL_GUARDED_BY(in_memory_modules_mu_);
 
+  // Stable storage for fingerprint-backed module handles. ModuleHandle stores
+  // an opaque pointer, so this map owns one stable address per SPIR-V
+  // fingerprint for the lifetime of the executor.
+  std::map<absl::uint128, absl::uint128> spirv_fingerprint_handles_
+      ABSL_GUARDED_BY(in_memory_modules_mu_);
+
   // Set of loaded kernels. This contains all kernels loaded by this executor,
   // including in-process kernels.
   absl::flat_hash_set<const Kernel*> loaded_kernels_
       ABSL_GUARDED_BY(in_memory_modules_mu_);
+
+  ModuleHandle GetModuleHandleForSpirvFingerprint(absl::uint128 fingerprint)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(in_memory_modules_mu_);
 
   // Loads a SPIR-V binary into a Level Zero module for the current SYCL
   // context. If the module is already loaded, increments its reference count
@@ -230,8 +243,8 @@ class SyclExecutor : public gpu::GpuExecutor {
   // and sets its reference count to 1.
   // Internally acquires in_memory_modules_mu_; the caller should not hold it.
   // Returns a handle to the loaded module on success, or an error status.
-  absl::StatusOr<ModuleHandle> LoadModuleFromSpirv(const char* spirv,
-                                                   const size_t size);
+  absl::StatusOr<ModuleHandle> LoadModuleFromSpirv(
+      absl::Span<const uint8_t> spirv);
 
   // Unloads the given SPIR-V module when its reference count reaches zero.
   // Removes the module from caches and destroys it.

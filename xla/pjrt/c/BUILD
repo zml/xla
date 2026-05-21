@@ -6,6 +6,8 @@ load(
     "@local_config_sycl//sycl:build_defs.bzl",
     "if_sycl_is_configured",
 )
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load(
     "//xla:xla.default.bzl",
     "xla_cc_binary",
@@ -748,6 +750,21 @@ xla_cc_binary(
     ]) + if_sycl_is_configured([
         "//xla/stream_executor:sycl_platform",
     ]),
+)
+
+pkg_files(
+    name = "pjrt_oneapi_plugin_file",
+    srcs = [":pjrt_c_api_gpu_plugin.so"],
+    prefix = "pjrt-oneapi_linux-amd64/lib",
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_tar(
+    name = "pjrt_oneapi_plugin_sandbox",
+    out = "pjrt-oneapi_linux-amd64.tar.gz",
+    srcs = [":pjrt_oneapi_plugin_file"],
+    extension = "tar.gz",
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
