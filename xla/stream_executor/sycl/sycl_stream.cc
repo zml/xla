@@ -125,6 +125,15 @@ absl::Status SyclStream::RecordEvent(Event* event) {
                    SyclGetRecentEventFromStream(stream_handle_.get()));
   // Update the event to the most recent one on the stream.
   static_cast<SyclEvent*>(event)->SetEvent(recent_event);
+  // SyclEvent* sycl_event = static_cast<SyclEvent*>(event);
+  // TF_ASSIGN_OR_RETURN(std::optional<::sycl::event> recent_event,
+  //                     SyclGetRecentEventFromStream(stream_handle_.get()));
+  // if (!recent_event.has_value()) {
+  //   return absl::InternalError(
+  //       "RecordEvent: No event returned from SyclGetRecentEventFromStream");
+  // }
+  // // Update the event to the most recent one on the stream.
+  // sycl_event->SetEvent(recent_event.value());
   VLOG(2) << "Recording SYCL event on stream " << stream_handle_.get();
   return absl::OkStatus();
 }

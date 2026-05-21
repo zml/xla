@@ -172,9 +172,7 @@ class SyclBlasSupport : public blas::BlasSupport {
                           const DeviceAddressBase& b, int ldb, const void* beta,
                           DeviceAddressBase* c, int ldc,
                           const EngineOptions& engine_options,
-                          blas::CallContext context) override {
-    return absl::UnimplementedError("DoBlasGemm is not implemented");
-  }
+                          blas::CallContext context) override;
 
   bool GetBlasGemmAlgorithms(
       Stream* stream, const gpu::MatrixDescriptor& a,
@@ -194,10 +192,7 @@ class SyclBlasSupport : public blas::BlasSupport {
       blas::ComputationType computation_type, blas::AlgorithmType algorithm,
       const EngineOptions& engine_options,
       blas::ProfileResult* output_profile_result,
-      blas::CallContext context) override {
-    return absl::UnimplementedError(
-        "DoBlasGemmWithAlgorithm is not implemented");
-  }
+      blas::CallContext context) override;
 
   bool DoBlasGemmBatched(Stream* stream, blas::Transpose transa,
                          blas::Transpose transb, uint64_t m, uint64_t n,
@@ -284,10 +279,7 @@ class SyclBlasSupport : public blas::BlasSupport {
       const void* alpha, const DeviceAddressBase& a, int lda, int64_t stride_a,
       const DeviceAddressBase& b, int ldb, int64_t stride_b, const void* beta,
       DeviceAddressBase* c, int ldc, int64_t stride_c, int batch_count,
-      const EngineOptions& engine_options, blas::CallContext context) override {
-    return absl::UnimplementedError(
-        "DoBlasGemmStridedBatched is not implemented");
-  }
+      const EngineOptions& engine_options, blas::CallContext context) override;
 
   absl::Status DoBlasGemmStridedBatchedWithAlgorithm(
       Stream* stream, blas::Transpose transa, blas::Transpose transb,
@@ -299,10 +291,7 @@ class SyclBlasSupport : public blas::BlasSupport {
       blas::ComputationType computation_type, blas::AlgorithmType algorithm,
       const EngineOptions& engine_options,
       blas::ProfileResult* output_profile_result,
-      blas::CallContext context) override {
-    return absl::UnimplementedError(
-        "SyclBlas::DoBlasGemmStridedBatchedWithAlgorithm is not implemented");
-  }
+      blas::CallContext context) override;
 
   bool DoBlasTrsm(Stream* stream, blas::Side side, blas::UpperLower uplo,
                   blas::Transpose transa, blas::Diagonal diag, uint64_t m,

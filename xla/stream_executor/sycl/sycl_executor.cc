@@ -34,6 +34,8 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/device_description.h"
@@ -246,6 +248,16 @@ absl::uint128 Fingerprint128(const absl::string_view s) {
   return absl::MakeUint128(fp.high64, fp.low64);
 }
 
+absl::uint128 FingerprintSpirv(absl::Span<const uint8_t> spirv) {
+  return Fingerprint128(absl::string_view(
+      reinterpret_cast<const char*>(spirv.data()), spirv.size()));
+}
+
+std::string FingerprintToString(absl::uint128 fingerprint) {
+  return absl::StrFormat("%016x%016x", absl::Uint128High64(fingerprint),
+                         absl::Uint128Low64(fingerprint));
+}
+
 // Retrieves the device address and size of a global symbol from a Level Zero
 // module in the given SYCL context.
 absl::Status GetModuleSymbol(SyclContext* context, ze_module_handle_t module,
@@ -437,6 +449,13 @@ dnn::DnnSupport* SyclExecutor::AsDnn() {
   return dnn.get();
 }
 
+ModuleHandle SyclExecutor::GetModuleHandleForSpirvFingerprint(
+    absl::uint128 fingerprint) {
+  auto [it, inserted] =
+      spirv_fingerprint_handles_.emplace(fingerprint, fingerprint);
+  return ModuleHandle{&it->second};
+}
+
 absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
     const KernelLoaderSpec& spec) {
   // Check that a SPIR-V binary is provided in the spec.
@@ -448,19 +467,31 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
   // Create a new SyclKernel instance for the loaded kernel.
   auto sycl_kernel = std::make_unique<SyclKernel>(this);
   const std::string& kernel_name = spec.kernel_name();
-  const char* spirv_binary = reinterpret_cast<const char*>(
-      spec.cuda_cubin_in_memory()->cubin_bytes.data());
-  size_t spirv_size = spec.cuda_cubin_in_memory()->cubin_bytes.size();
+  std::optional<CudaCubinInMemory> cubin = spec.cuda_cubin_in_memory();
+  absl::Span<const uint8_t> spirv = cubin->cubin_bytes;
+  const char* spirv_binary =
+      reinterpret_cast<const char*>(spirv.data());
+  size_t spirv_size = spirv.size();
+  absl::uint128 fingerprint = FingerprintSpirv(spirv);
+  const std::string fingerprint_str = FingerprintToString(fingerprint);
 
-  ModuleHandle module_handle{spirv_binary};
+  ModuleHandle module_handle;
   ze_module_handle_t module = nullptr;
 
   // Check if the module is already loaded.
   {
     absl::MutexLock lock{&in_memory_modules_mu_};
-    auto in_mem_it = in_memory_modules_.find(module_handle);
-    if (in_mem_it != in_memory_modules_.end()) {
-      module = in_mem_it->second;
+    module_handle = GetModuleHandleForSpirvFingerprint(fingerprint);
+    auto gpu_bin_it = gpu_binary_to_module_.find(module_handle);
+    if (gpu_bin_it != gpu_binary_to_module_.end()) {
+      module = gpu_bin_it->second.first;
+      ++(gpu_bin_it->second.second);
+      VLOG(2) << "SyclExecutor::LoadKernel: SPIR-V fingerprint "
+              << fingerprint_str << " cache hit as module " << module
+              << ", refcount " << gpu_bin_it->second.second;
+    } else {
+      VLOG(2) << "SyclExecutor::LoadKernel: SPIR-V fingerprint "
+              << fingerprint_str << " cache miss";
     }
   }
 
@@ -471,8 +502,20 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
   if (module == nullptr) {
     ASSIGN_OR_RETURN(module, LoadLevelZeroModule(sycl_context_.get(),
                                                  spirv_binary, spirv_size));
+    // absl::Time load_start = absl::Now();
+    // absl::StatusOr<ze_module_handle_t> loaded_module =
+    //     LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size);
+    // absl::Duration load_duration = absl::Now() - load_start;
+    // VLOG(2) << "SyclExecutor::LoadKernel: LoadLevelZeroModule for SPIR-V "
+    //         << "fingerprint " << fingerprint_str << " took "
+    //         << absl::ToInt64Microseconds(load_duration) << " us";
+    // if (!loaded_module.ok()) {
+    //   return loaded_module.status();
+    // }
+    // module = *loaded_module;
     {
       absl::MutexLock lock{&in_memory_modules_mu_};
+      module_handle = GetModuleHandleForSpirvFingerprint(fingerprint);
       // Try to insert the newly loaded module into the cache.
       auto [in_mem_it, inserted] =
           in_memory_modules_.emplace(module_handle, module);
@@ -487,6 +530,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
         auto gpu_bin_it = gpu_binary_to_module_.find(module_handle);
         if (gpu_bin_it != gpu_binary_to_module_.end()) {
           ++(gpu_bin_it->second.second);
+          VLOG(2) << "SyclExecutor::LoadKernel: SPIR-V fingerprint "
+                  << fingerprint_str << " cache hit after load as module "
+                  << module << ", refcount " << gpu_bin_it->second.second;
         } else {
           // This should not happen since in_memory_modules_ and
           // gpu_binary_to_module_ should be consistent.
@@ -497,6 +543,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
         // Newly inserted module: Set reference count to 1 in
         // gpu_binary_to_module_.
         gpu_binary_to_module_[module_handle] = std::make_pair(module, 1);
+        VLOG(2) << "SyclExecutor::LoadKernel: SPIR-V fingerprint "
+                << fingerprint_str << " loaded as module " << module
+                << ", refcount 1";
       }
     }
   }
@@ -573,9 +622,7 @@ void SyclExecutor::UnloadKernel(const Kernel* kernel) {
 absl::StatusOr<ModuleHandle> SyclExecutor::LoadModule(
     const MultiModuleLoaderSpec& spec) {
   if (spec.has_cuda_cubin_in_memory()) {
-    return LoadModuleFromSpirv(
-        reinterpret_cast<const char*>(spec.cuda_cubin_in_memory().data()),
-        spec.cuda_cubin_in_memory().size());
+    return LoadModuleFromSpirv(spec.cuda_cubin_in_memory());
   }
   return absl::InternalError(
       "SyclExecutor::LoadModule: No SPIR-V binary found, cannot load module.");
@@ -831,23 +878,26 @@ absl::StatusOr<const SyclKernel*> SyclExecutor::GetSyclKernel(
 }
 
 absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
-    const char* spirv_binary, size_t spirv_size) {
-  // TODO(intel-tf):
-  // 1. Use absl::Span<const uint8_t> for SPIR-V binary input.
-  // 2. Compute a fingerprint of the SPIR-V binary to use as the module handle
-  //    instead of the raw pointer.
-  ModuleHandle module_handle{spirv_binary};
+    absl::Span<const uint8_t> spirv) {
+  const char* spirv_binary = reinterpret_cast<const char*>(spirv.data());
+  size_t spirv_size = spirv.size();
+  absl::uint128 fingerprint = FingerprintSpirv(spirv);
+  const std::string fingerprint_str = FingerprintToString(fingerprint);
+  ModuleHandle module_handle;
   {
     absl::MutexLock lock(&in_memory_modules_mu_);
+    module_handle = GetModuleHandleForSpirvFingerprint(fingerprint);
     auto it = gpu_binary_to_module_.find(module_handle);
     if (it != gpu_binary_to_module_.end()) {
       // Module already loaded: increment reference count.
       ++(it->second.second);
-      VLOG(2) << "LoadModuleFromSpirv: SPIR-V "
-              << static_cast<const void*>(spirv_binary)
-              << " is already loaded as module " << it->second.first;
+      VLOG(2) << "LoadModuleFromSpirv: SPIR-V fingerprint "
+              << fingerprint_str << " cache hit as module " << it->second.first
+              << ", refcount " << it->second.second;
       return module_handle;
     }
+    VLOG(2) << "LoadModuleFromSpirv: SPIR-V fingerprint " << fingerprint_str
+            << " cache miss";
   }
 
   // Load module outside the lock since it is a slow operation.
@@ -858,9 +908,21 @@ absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
   ASSIGN_OR_RETURN(
       ze_module_handle_t lz_module_handle,
       LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size));
+  // absl::Time load_start = absl::Now();
+  // absl::StatusOr<ze_module_handle_t> loaded_module =
+  //     LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size);
+  // absl::Duration load_duration = absl::Now() - load_start;
+  // VLOG(2) << "LoadModuleFromSpirv: LoadLevelZeroModule for SPIR-V "
+  //         << "fingerprint " << fingerprint_str << " took "
+  //         << absl::ToInt64Microseconds(load_duration) << " us";
+  // if (!loaded_module.ok()) {
+  //   return loaded_module.status();
+  // }
+  // ze_module_handle_t lz_module_handle = *loaded_module;
 
   {
     absl::MutexLock lock(&in_memory_modules_mu_);
+    module_handle = GetModuleHandleForSpirvFingerprint(fingerprint);
     auto it = gpu_binary_to_module_.find(module_handle);
     if (it != gpu_binary_to_module_.end()) {
       // Another thread loaded the module first.
@@ -868,9 +930,9 @@ absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
       // and also to avoid resource leaks.
       UnloadLevelZeroModule(sycl_context_.get(), lz_module_handle);
       ++(it->second.second);
-      VLOG(2) << "LoadModuleFromSpirv: SPIR-V "
-              << static_cast<const void*>(spirv_binary)
-              << " is already loaded as module " << it->second.first;
+      VLOG(2) << "LoadModuleFromSpirv: SPIR-V fingerprint "
+              << fingerprint_str << " cache hit after load as module "
+              << it->second.first << ", refcount " << it->second.second;
       return module_handle;
     }
     // Cache the newly loaded module and set its reference count to 1.
@@ -878,9 +940,8 @@ absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
     gpu_binary_to_module_[module_handle] =
         std::make_pair(lz_module_handle, /*reference count=*/1);
   }
-  VLOG(2) << "LoadModuleFromSpirv: Loaded SPIR-V "
-          << static_cast<const void*>(spirv_binary) << " as module "
-          << lz_module_handle;
+  VLOG(2) << "LoadModuleFromSpirv: SPIR-V fingerprint " << fingerprint_str
+          << " loaded as module " << lz_module_handle << ", refcount 1";
   return module_handle;
 }
 

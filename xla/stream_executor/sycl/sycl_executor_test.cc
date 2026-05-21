@@ -99,6 +99,14 @@ TEST_F(SyclExecutorTest, GetSyclKernel) {
   ModuleHandle module_handle;
   module_spec.AddCudaCubinInMemory(spv_bin);
   TF_ASSERT_OK_AND_ASSIGN(module_handle, executor->LoadModule(module_spec));
+  std::vector<uint8_t> spv_bin_copy(spv_bin);
+  MultiModuleLoaderSpec duplicate_module_spec;
+  duplicate_module_spec.AddCudaCubinInMemory(spv_bin_copy);
+  TF_ASSERT_OK_AND_ASSIGN(ModuleHandle duplicate_module_handle,
+                          executor->LoadModule(duplicate_module_spec));
+  EXPECT_EQ(module_handle, duplicate_module_handle);
+  EXPECT_TRUE(executor->UnloadModule(duplicate_module_handle));
+
   auto global_consts = gpu_exec->constants();
   EXPECT_EQ(global_consts.size(), 1);
   for (auto& const_info : global_consts) {
@@ -107,6 +115,7 @@ TEST_F(SyclExecutorTest, GetSyclKernel) {
         global_status,
         executor->GetSymbol(const_info.symbol_name, module_handle));
   }
+  EXPECT_TRUE(executor->UnloadModule(module_handle));
 
   // The per-fusion kernel binary is stored inside the CustomKernel's loader
   // spec. Load the kernel directly from that spec.
