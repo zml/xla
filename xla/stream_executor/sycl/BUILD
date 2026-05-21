@@ -313,6 +313,7 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:fingerprint",
     ],
@@ -541,10 +542,24 @@ xla_test(
     ],
 )
 
-cc_library(
+sycl_library(
     name = "sycl_blas_lt_plugin",
-    srcs = ["sycl_blas_lt.cc"],
+    srcs = [
+        "sycl_blas_lt.cc",
+        "@oneapi//:mkl/2025.1/lib/libmkl_core.so",
+        "@oneapi//:mkl/2025.1/lib/libmkl_core.so.2",
+        "@oneapi//:mkl/2025.1/lib/libmkl_intel_ilp64.so",
+        "@oneapi//:mkl/2025.1/lib/libmkl_intel_ilp64.so.2",
+        "@oneapi//:mkl/2025.1/lib/libmkl_sequential.so",
+        "@oneapi//:mkl/2025.1/lib/libmkl_sequential.so.2",
+        "@oneapi//:mkl/2025.1/lib/libmkl_sycl_blas.so",
+        "@oneapi//:mkl/2025.1/lib/libmkl_sycl_blas.so.5",
+    ],
     hdrs = ["sycl_blas_lt.h"],
+    textual_hdrs = ["@oneapi//:all"],
+    copts = [
+        "-isystemexternal/oneapi/mkl/2025.1/include",
+    ],
     tags = [
         "gpu",
         "oneapi-only",
@@ -558,6 +573,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/gpu:gpu_blas_lt",
         "//xla/stream_executor/platform:initialize",
+        ":sycl_stream",
     ],
     alwayslink = True,
 )
