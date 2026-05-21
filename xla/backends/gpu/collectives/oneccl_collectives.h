@@ -38,7 +38,7 @@ class OnecclCollectives : public GpuCollectives {
   bool IsImplemented() const final { return true; }
 
   absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final {
-    return absl::OkStatus();
+    return MultiDeviceUnsupported();
   }
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
@@ -46,21 +46,21 @@ class OnecclCollectives : public GpuCollectives {
                       const std::optional<CliqueIds>& clique_ids,
                       absl::Span<const DeviceRank> ranks,
                       const Collectives::Config& config) final {
-    return absl::OkStatus();
+    return MultiDeviceUnsupported();
   }
 
   absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator() final {
-    return absl::OkStatus();
+    return MultiDeviceUnsupported();
   }
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(
       absl::Span<const Communicator* const> comms, int32_t color,
       absl::Span<const RankId> keys, const Collectives::Config& config,
       absl::Span<const DeviceRank> ranks) final {
-    return absl::OkStatus();
+    return MultiDeviceUnsupported();
   }
   absl::StatusOr<void*> Allocate(uint64_t bytes) final {
-    return absl::OkStatus();
+    return MultiDeviceUnsupported();
   }
 
   absl::Status Deallocate(void* location) final { return absl::OkStatus(); }
@@ -68,6 +68,13 @@ class OnecclCollectives : public GpuCollectives {
   absl::StatusOr<CliqueIdCallback> InitializeTopology(
       const Topology& topology) {
     return nullptr;
+  }
+
+ private:
+  static absl::Status MultiDeviceUnsupported() {
+    return absl::UnimplementedError(
+        "oneAPI multi-device collectives are not supported; set "
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0 to select a single device");
   }
 };
 }  // namespace xla::gpu
