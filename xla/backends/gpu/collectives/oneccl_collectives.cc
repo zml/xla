@@ -65,7 +65,21 @@ namespace {
 
 absl::once_flag ccl_init_once;
 
-void InitCclOnce() { ccl::init(); }
+void SetOnecclEnvDefault(const char* name, const char* value) {
+  if (std::getenv(name) != nullptr) return;
+  if (::setenv(name, value, /*overwrite=*/0) != 0) {
+    LOG(WARNING) << "Failed to set oneCCL default " << name << "=" << value;
+  }
+}
+
+void InitCclOnce() {
+  // On Arc B-series, oneCCL's large SYCL kernels currently reset or crash the
+  // device in the one-thread-per-rank configuration. Keep these collectives on
+  // oneCCL's PCIe/LL P2P path unless the user explicitly overrides the choice.
+  SetOnecclEnvDefault("CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD", "1073741824");
+  SetOnecclEnvDefault("CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD", "33554432");
+  ccl::init();
+}
 
 absl::Status EnsureCclInitialized() {
   try {
@@ -204,15 +218,6 @@ absl::StatusOr<ccl::reduction> ToCclReduction(ReductionKind kind) {
   }
 }
 
-void* BufferAt(se::DeviceAddressBase base, uint64_t offset) {
-  return reinterpret_cast<std::byte*>(base.opaque()) + offset;
-}
-
-se::DeviceAddressBase DeviceAddressAt(se::DeviceAddressBase base,
-                                       uint64_t offset, uint64_t bytes) {
-  return se::DeviceAddressBase(BufferAt(base, offset), bytes);
-}
-
 absl::StatusOr<se::Stream*> ToStream(const Communicator::Executor& executor) {
   auto* gpu_executor = tsl::down_cast<const GpuCollectives::Executor*>(
       &executor);
@@ -267,9 +272,6 @@ class OnecclCommunicator : public GpuCommunicator {
  public:
   OnecclCommunicator(se::StreamExecutor* stream_executor, ccl::communicator comm)
       : stream_executor_(stream_executor), comm_(std::move(comm)) {}
-  ~OnecclCommunicator() override {
-    stream_executor_->Deallocate(&allgather_scratch_);
-  }
 
   absl::Status Abort() final { return absl::OkStatus(); }
   absl::Status HealthCheck() const final { return absl::OkStatus(); }
@@ -355,25 +357,6 @@ class OnecclCommunicator : public GpuCommunicator {
   const ccl::communicator& comm() const { return comm_; }
 
  private:
-  absl::StatusOr<se::DeviceAddressBase> GetAllGatherScratch(
-      se::Stream* stream, uint64_t bytes) {
-    absl::MutexLock lock(&scratch_mu_);
-    if (allgather_scratch_.opaque() != nullptr &&
-        allgather_scratch_.size() >= bytes) {
-      return allgather_scratch_;
-    }
-    if (allgather_scratch_.opaque() != nullptr) {
-      TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
-      stream_executor_->Deallocate(&allgather_scratch_);
-    }
-    allgather_scratch_ = stream_executor_->Allocate(bytes);
-    if (allgather_scratch_.is_null() && bytes != 0) {
-      return ResourceExhausted(
-          "Failed to allocate %d bytes for oneCCL allgather scratch", bytes);
-    }
-    return allgather_scratch_;
-  }
-
   absl::Status LaunchAllReduce(se::DeviceAddressBase send_buffer,
                                se::DeviceAddressBase recv_buffer,
                                PrimitiveType dtype, size_t count,
@@ -389,7 +372,8 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::allreduce(send_buffer.opaque(), recv_buffer.opaque(), count,
-                     ccl_dtype, reduction, comm_, stream);
+                     ccl_dtype, reduction, comm_, stream)
+          .wait();
     });
   }
 
@@ -412,7 +396,8 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::broadcast(recv_buffer.opaque(), count, ccl_dtype, root.value(),
-                     comm_, stream);
+                     comm_, stream)
+          .wait();
     });
   }
 
@@ -431,7 +416,8 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::reduce_scatter(send_buffer.opaque(), recv_buffer.opaque(), count,
-                          ccl_dtype, reduction, comm_, stream);
+                          ccl_dtype, reduction, comm_, stream)
+          .wait();
     });
   }
 
@@ -439,30 +425,18 @@ class OnecclCommunicator : public GpuCommunicator {
                                se::DeviceAddressBase recv_buffer,
                                PrimitiveType dtype, size_t count,
                                const Executor& executor) final {
-    TF_ASSIGN_OR_RETURN(se::Stream * xla_stream, ToStream(executor));
     TF_ASSIGN_OR_RETURN(ccl::stream stream, ToCclStream(executor));
     TF_ASSIGN_OR_RETURN(ccl::datatype ccl_dtype,
-                        ToCclDataType(dtype, /*is_reduction_op=*/true));
-    const size_t segment_bytes = primitive_util::ByteWidth(dtype) * count;
-    const size_t total_bytes = segment_bytes * comm_.size();
-    int rank = comm_.rank();
-    LogOnecclCollective("all-gather-as-all-reduce", rank, comm_.size(), dtype,
-                        count, total_bytes);
-    TF_ASSIGN_OR_RETURN(se::DeviceAddressBase allreduce_output,
-                        GetAllGatherScratch(xla_stream, total_bytes));
-    se::DeviceAddressBase allgather_buffer = recv_buffer;
-    TF_RETURN_IF_ERROR(xla_stream->MemZero(&allgather_buffer, total_bytes));
-    se::DeviceAddressBase local_slice =
-        DeviceAddressAt(recv_buffer, rank * segment_bytes, segment_bytes);
-    TF_RETURN_IF_ERROR(xla_stream->Memcpy(&local_slice, send_buffer,
-                                          segment_bytes));
-    count = ToCclCount(dtype, count * comm_.size());
-    TF_RETURN_IF_ERROR(RunCcl([&] {
-      ccl::allreduce(recv_buffer.opaque(), allreduce_output.opaque(), count,
-                     ccl_dtype, ccl::reduction::sum, comm_, stream);
-    }));
-    return xla_stream->Memcpy(&allgather_buffer, allreduce_output,
-                              total_bytes);
+                        ToCclDataType(dtype, /*is_reduction_op=*/false));
+    LogOnecclCollective("all-gather", comm_.rank(), comm_.size(), dtype, count,
+                        primitive_util::ByteWidth(dtype) * count *
+                            comm_.size());
+    count = ToCclCount(dtype, count);
+    return RunCcl([&] {
+      ccl::allgather(send_buffer.opaque(), recv_buffer.opaque(), count,
+                     ccl_dtype, comm_, stream)
+          .wait();
+    });
   }
 
   absl::Status LaunchAllToAll(
@@ -491,7 +465,8 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::alltoall(ccl_send_buffers, ccl_recv_buffers, count, ccl_dtype,
-                    comm_, stream);
+                    comm_, stream)
+          .wait();
     });
   }
 
@@ -512,16 +487,21 @@ class OnecclCommunicator : public GpuCommunicator {
                         count, primitive_util::ByteWidth(dtype) * count);
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
+      std::vector<ccl::event> events;
+      events.reserve(target_ranks.size() + (source_rank.has_value() ? 1 : 0));
       ccl::group_start();
       for (RankId target : target_ranks) {
-        ccl::send(send_buffer.opaque(), count, ccl_dtype, target.value(),
-                  comm_, stream);
+        events.push_back(ccl::send(send_buffer.opaque(), count, ccl_dtype,
+                                   target.value(), comm_, stream));
       }
       if (source_rank.has_value()) {
-        ccl::recv(recv_buffer.opaque(), count, ccl_dtype, source_rank->value(),
-                  comm_, stream);
+        events.push_back(ccl::recv(recv_buffer.opaque(), count, ccl_dtype,
+                                   source_rank->value(), comm_, stream));
       }
       ccl::group_end();
+      for (ccl::event& event : events) {
+        event.wait();
+      }
     });
   }
 
@@ -534,7 +514,8 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::send(send_buffer.opaque(), count, ccl_dtype, peer.value(), comm_,
-                stream);
+                stream)
+          .wait();
     });
   }
 
@@ -547,14 +528,13 @@ class OnecclCommunicator : public GpuCommunicator {
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
       ccl::recv(recv_buffer.opaque(), count, ccl_dtype, peer.value(), comm_,
-                stream);
+                stream)
+          .wait();
     });
   }
 
   se::StreamExecutor* stream_executor_;
   ccl::communicator comm_;
-  absl::Mutex scratch_mu_;
-  se::DeviceAddressBase allgather_scratch_ ABSL_GUARDED_BY(scratch_mu_);
 };
 
 absl::StatusOr<std::unique_ptr<Communicator>> Cast(
