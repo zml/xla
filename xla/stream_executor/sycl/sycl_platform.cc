@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_platform.h"
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -29,6 +30,7 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/sycl/sycl_executor.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
+#include "xla/tsl/platform/env.h"
 
 namespace stream_executor {
 namespace sycl {
@@ -73,8 +75,28 @@ SyclPlatform::GetUncachedExecutor(int ordinal) {
 
 }  // namespace sycl
 
+namespace {
+
+void ConfigureLevelZeroRuntimeDefaults() {
+  // The oneAPI 2026.0 Level Zero V2 adapter may choose the experimental
+  // zeKernelLaunchWithArgs path for regular SYCL kernel launches. Current B70
+  // drivers report it as unsupported, so default to the older set-args launch
+  // path unless the user explicitly configured the adapter.
+  constexpr const char* kDisableLaunchWithArgs =
+      "UR_L0_V2_DISABLE_ZE_LAUNCH_KERNEL_WITH_ARGS";
+  if (std::getenv(kDisableLaunchWithArgs) == nullptr) {
+    int result = tsl::setenv(kDisableLaunchWithArgs, "1", /*overwrite=*/0);
+    if (result != 0) {
+      LOG(WARNING) << "Failed to set " << kDisableLaunchWithArgs;
+    }
+  }
+}
+
+}  // namespace
+
 // Initializes and registers the SYCL platform if it is not already registered.
 static void InitializeSyclPlatform() {
+  ConfigureLevelZeroRuntimeDefaults();
   auto status = PlatformManager::PlatformWithName("SYCL");
   if (!status.ok()) {
     TF_CHECK_OK(PlatformManager::RegisterPlatform(

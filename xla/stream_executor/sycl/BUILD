@@ -559,11 +559,11 @@ sycl_library(
     hdrs = ["sycl_blas_lt.h"],
     textual_hdrs = ["@oneapi//:all"],
     copts = [
-        "-isystemexternal/oneapi/mkl/2025.1/include",
+        "-isystemexternal/oneapi/mkl/2026.0/include",
     ],
     linkopts = [
-        "-Lexternal/oneapi/mkl/2025.1/lib",
-        "-Wl,-rpath,/home/steeve/xla/bazel-xla/external/oneapi/mkl/2025.1/lib",
+        "-Lexternal/oneapi/mkl/2026.0/lib",
+        "-Wl,-rpath,/home/steeve/xla/bazel-xla/external/oneapi/mkl/2026.0/lib",
         "-lmkl_sycl_blas",
         "-lmkl_intel_ilp64",
         "-lmkl_sequential",

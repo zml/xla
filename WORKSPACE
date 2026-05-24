@@ -1,6 +1,11 @@
 # buildifier: disable=load-on-top
 workspace(name = "xla")
 
+local_repository(
+    name = "rules_ml_toolchain",
+    path = "../rules_ml_toolchain",
+)
+
 # Initialize the XLA repository and all dependencies.
 #
 # The cascade of load() statements and xla_workspace?() calls works around the
