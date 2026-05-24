@@ -105,11 +105,51 @@ KvsStore& ProcessKvsStore() {
   return *store;
 }
 
+struct StreamStore {
+  absl::Mutex mu;
+  absl::flat_hash_map<::sycl::queue*, std::shared_ptr<ccl::stream>> streams
+      ABSL_GUARDED_BY(mu);
+};
+
+StreamStore& ProcessStreamStore() {
+  static auto* store = new StreamStore;
+  return *store;
+}
+
+absl::StatusOr<ccl::stream> GetOrCreateCclStream(::sycl::queue* queue) {
+  absl::MutexLock lock(&ProcessStreamStore().mu);
+  auto it = ProcessStreamStore().streams.find(queue);
+  if (it != ProcessStreamStore().streams.end()) {
+    return *it->second;
+  }
+
+  try {
+    auto stream = std::make_shared<ccl::stream>(ccl::create_stream(*queue));
+    auto [inserted, _] = ProcessStreamStore().streams.emplace(queue, stream);
+    return *inserted->second;
+  } catch (const std::exception& e) {
+    return Internal("oneCCL stream creation failed: %s", e.what());
+  }
+}
+
 bool LogOnecclCollectives() {
   const char* value = std::getenv("XLA_SYCL_LOG_ONECCL_COLLECTIVES");
   if (value == nullptr) return false;
   std::string flag(value);
   return flag == "1" || flag == "true" || flag == "TRUE";
+}
+
+bool BlockHostOnOnecclCollectives() {
+  const char* value = std::getenv("XLA_SYCL_ONECCL_BLOCKING_WAIT");
+  if (value == nullptr) return false;
+  std::string flag(value);
+  return flag == "1" || flag == "true" || flag == "TRUE";
+}
+
+void MaybeWaitForOnecclEvent(ccl::event event) {
+  if (BlockHostOnOnecclCollectives()) {
+    event.wait();
+  }
 }
 
 void LogOnecclCollective(const char* op, int rank, int comm_size,
@@ -240,7 +280,7 @@ absl::StatusOr<ccl::stream> ToCclStream(
     const Communicator::Executor& executor) {
   TF_ASSIGN_OR_RETURN(se::Stream * stream, ToStream(executor));
   TF_ASSIGN_OR_RETURN(::sycl::queue * queue, ToSyclQueue(stream));
-  return ccl::create_stream(*queue);
+  return GetOrCreateCclStream(queue);
 }
 
 absl::StatusOr<stream_executor::sycl::SyclExecutor*> ToSyclExecutor(
@@ -371,9 +411,9 @@ class OnecclCommunicator : public GpuCommunicator {
                         primitive_util::ByteWidth(dtype) * count);
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::allreduce(send_buffer.opaque(), recv_buffer.opaque(), count,
-                     ccl_dtype, reduction, comm_, stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::allreduce(
+          send_buffer.opaque(), recv_buffer.opaque(), count, ccl_dtype,
+          reduction, comm_, stream));
     });
   }
 
@@ -395,9 +435,8 @@ class OnecclCommunicator : public GpuCommunicator {
                         primitive_util::ByteWidth(dtype) * count);
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::broadcast(recv_buffer.opaque(), count, ccl_dtype, root.value(),
-                     comm_, stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::broadcast(
+          recv_buffer.opaque(), count, ccl_dtype, root.value(), comm_, stream));
     });
   }
 
@@ -415,9 +454,9 @@ class OnecclCommunicator : public GpuCommunicator {
                         count, primitive_util::ByteWidth(dtype) * count);
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::reduce_scatter(send_buffer.opaque(), recv_buffer.opaque(), count,
-                          ccl_dtype, reduction, comm_, stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::reduce_scatter(
+          send_buffer.opaque(), recv_buffer.opaque(), count, ccl_dtype,
+          reduction, comm_, stream));
     });
   }
 
@@ -433,9 +472,9 @@ class OnecclCommunicator : public GpuCommunicator {
                             comm_.size());
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::allgather(send_buffer.opaque(), recv_buffer.opaque(), count,
-                     ccl_dtype, comm_, stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::allgather(
+          send_buffer.opaque(), recv_buffer.opaque(), count, ccl_dtype, comm_,
+          stream));
     });
   }
 
@@ -464,9 +503,8 @@ class OnecclCommunicator : public GpuCommunicator {
                         primitive_util::ByteWidth(dtype) * count);
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::alltoall(ccl_send_buffers, ccl_recv_buffers, count, ccl_dtype,
-                    comm_, stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::alltoall(
+          ccl_send_buffers, ccl_recv_buffers, count, ccl_dtype, comm_, stream));
     });
   }
 
@@ -500,7 +538,7 @@ class OnecclCommunicator : public GpuCommunicator {
       }
       ccl::group_end();
       for (ccl::event& event : events) {
-        event.wait();
+        MaybeWaitForOnecclEvent(std::move(event));
       }
     });
   }
@@ -513,9 +551,8 @@ class OnecclCommunicator : public GpuCommunicator {
                         ToCclDataType(dtype, /*is_reduction_op=*/false));
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::send(send_buffer.opaque(), count, ccl_dtype, peer.value(), comm_,
-                stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::send(send_buffer.opaque(), count, ccl_dtype,
+                                        peer.value(), comm_, stream));
     });
   }
 
@@ -527,9 +564,8 @@ class OnecclCommunicator : public GpuCommunicator {
                         ToCclDataType(dtype, /*is_reduction_op=*/false));
     count = ToCclCount(dtype, count);
     return RunCcl([&] {
-      ccl::recv(recv_buffer.opaque(), count, ccl_dtype, peer.value(), comm_,
-                stream)
-          .wait();
+      MaybeWaitForOnecclEvent(ccl::recv(recv_buffer.opaque(), count, ccl_dtype,
+                                        peer.value(), comm_, stream));
     });
   }
 
