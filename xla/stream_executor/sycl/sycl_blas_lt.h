@@ -130,38 +130,26 @@ class SyclBlasSupport : public blas::BlasSupport {
   bool DoBlasGemv(Stream* stream, blas::Transpose trans, uint64_t m, uint64_t n,
                   float alpha, const DeviceAddress<float>& a, int lda,
                   const DeviceAddress<float>& x, int incx, float beta,
-                  DeviceAddress<float>* y, int incy) override {
-    LOG(ERROR) << "DoBlasGemv is not implemented";
-    return false;
-  }
+                  DeviceAddress<float>* y, int incy) override;
 
   bool DoBlasGemv(Stream* stream, blas::Transpose trans, uint64_t m, uint64_t n,
                   double alpha, const DeviceAddress<double>& a, int lda,
                   const DeviceAddress<double>& x, int incx, double beta,
-                  DeviceAddress<double>* y, int incy) override {
-    LOG(ERROR) << "DoBlasGemv is not implemented";
-    return false;
-  }
+                  DeviceAddress<double>* y, int incy) override;
 
   bool DoBlasGemv(Stream* stream, blas::Transpose trans, uint64_t m, uint64_t n,
                   std::complex<float> alpha,
                   const DeviceAddress<std::complex<float>>& a, int lda,
                   const DeviceAddress<std::complex<float>>& x, int incx,
                   std::complex<float> beta,
-                  DeviceAddress<std::complex<float>>* y, int incy) override {
-    LOG(ERROR) << "DoBlasGemv is not implemented";
-    return false;
-  }
+                  DeviceAddress<std::complex<float>>* y, int incy) override;
 
   bool DoBlasGemv(Stream* stream, blas::Transpose trans, uint64_t m, uint64_t n,
                   std::complex<double> alpha,
                   const DeviceAddress<std::complex<double>>& a, int lda,
                   const DeviceAddress<std::complex<double>>& x, int incx,
                   std::complex<double> beta,
-                  DeviceAddress<std::complex<double>>* y, int incy) override {
-    LOG(ERROR) << "DoBlasGemv is not implemented";
-    return false;
-  }
+                  DeviceAddress<std::complex<double>>* y, int incy) override;
 
   absl::Status DoBlasGemm(Stream* stream, blas::Transpose transa,
                           blas::Transpose transb, uint64_t m, uint64_t n,

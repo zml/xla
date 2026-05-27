@@ -1839,14 +1839,17 @@ void AddGemmRewriterPasses(HloPassPipeline& pipeline,
   // above.
   pipeline.AddPass<DotAlgorithmRewriter>();
 
+  const bool enable_blaslt =
+      !gpu_version.IsOneAPI() && debug_options.xla_gpu_enable_cublaslt();
+
   GemmRewriterOptions fp8_options{GemmRewriterOptions::DType::kFp8Only,
                                   bias_mode};
-  fp8_options.enable_cublaslt = true;
+  fp8_options.enable_cublaslt = enable_blaslt;
   pipeline.AddPass<GemmRewriter>(gpu_version, toolkit_version, fp8_options);
   pipeline.AddPass<GemmRewriter>(
       gpu_version, toolkit_version,
       GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only, bias_mode,
-                          debug_options.xla_gpu_enable_cublaslt()});
+                          enable_blaslt});
 }
 }  // namespace
 
