@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 
 #include "absl/time/time.h"
@@ -52,6 +53,60 @@ bool SyclGemvFastPathEnabled() {
 bool SyclBlasLoggingEnabled() {
   static const bool enabled = EnvFlagEnabled("XLA_SYCL_LOG_BLAS", false);
   return enabled;
+}
+
+oneapi::mkl::blas::compute_mode SyclGemmComputeMode() {
+  const char* value = std::getenv("XLA_SYCL_GEMM_COMPUTE_MODE");
+  if (value == nullptr) {
+    return oneapi::mkl::blas::compute_mode::unset;
+  }
+  if (std::strcmp(value, "standard") == 0) {
+    return oneapi::mkl::blas::compute_mode::standard;
+  }
+  if (std::strcmp(value, "prefer_alternate") == 0) {
+    return oneapi::mkl::blas::compute_mode::prefer_alternate;
+  }
+  if (std::strcmp(value, "force_alternate") == 0) {
+    return oneapi::mkl::blas::compute_mode::force_alternate;
+  }
+  if (std::strcmp(value, "any") == 0) {
+    return oneapi::mkl::blas::compute_mode::any;
+  }
+  if (std::strcmp(value, "float_to_bf16") == 0) {
+    return oneapi::mkl::blas::compute_mode::float_to_bf16;
+  }
+  if (std::strcmp(value, "float_to_bf16x2") == 0) {
+    return oneapi::mkl::blas::compute_mode::float_to_bf16x2;
+  }
+  if (std::strcmp(value, "float_to_bf16x3") == 0) {
+    return oneapi::mkl::blas::compute_mode::float_to_bf16x3;
+  }
+  return oneapi::mkl::blas::compute_mode::unset;
+}
+
+const char* ComputeModeName(oneapi::mkl::blas::compute_mode mode) {
+  switch (mode) {
+    case oneapi::mkl::blas::compute_mode::unset:
+      return "unset";
+    case oneapi::mkl::blas::compute_mode::standard:
+      return "standard";
+    case oneapi::mkl::blas::compute_mode::prefer_alternate:
+      return "prefer_alternate";
+    case oneapi::mkl::blas::compute_mode::force_alternate:
+      return "force_alternate";
+    case oneapi::mkl::blas::compute_mode::any:
+      return "any";
+    case oneapi::mkl::blas::compute_mode::float_to_bf16:
+      return "float_to_bf16";
+    case oneapi::mkl::blas::compute_mode::float_to_bf16x2:
+      return "float_to_bf16x2";
+    case oneapi::mkl::blas::compute_mode::float_to_bf16x3:
+      return "float_to_bf16x3";
+    case oneapi::mkl::blas::compute_mode::float_to_tf32:
+      return "float_to_tf32";
+    case oneapi::mkl::blas::compute_mode::complex_3m:
+      return "complex_3m";
+  }
 }
 
 const char* TransposeName(blas::Transpose trans) {
@@ -113,11 +168,12 @@ void LogSyclBlasCall(const char* path, blas::DataType dtype,
   }
   std::fprintf(stderr,
                "xla_sycl_blas path=%s dtype=%s transa=%s transb=%s "
-               "m=%llu n=%llu k=%llu lda=%d ldb=%d ldc=%d\n",
+               "m=%llu n=%llu k=%llu lda=%d ldb=%d ldc=%d mode=%s\n",
                path, DataTypeName(dtype), TransposeName(transa),
                TransposeName(transb), static_cast<unsigned long long>(m),
                static_cast<unsigned long long>(n),
-               static_cast<unsigned long long>(k), lda, ldb, ldc);
+               static_cast<unsigned long long>(k), lda, ldb, ldc,
+               ComputeModeName(SyclGemmComputeMode()));
 }
 
 oneapi::mkl::transpose AsOneMklTranspose(blas::Transpose trans) {
@@ -181,7 +237,7 @@ absl::Status DoOneMklGemm(Stream* stream, blas::Transpose transa,
       static_cast<const AType*>(a.opaque()), static_cast<std::int64_t>(lda),
       static_cast<const AType*>(b.opaque()), static_cast<std::int64_t>(ldb),
       ReadScale<Scale>(beta), static_cast<CType*>(c->opaque()),
-      static_cast<std::int64_t>(ldc));
+      static_cast<std::int64_t>(ldc), SyclGemmComputeMode());
   return absl::OkStatus();
 }
 
@@ -207,7 +263,7 @@ absl::Status DoOneMklGemmStridedBatched(
       static_cast<std::int64_t>(stride_b), ReadScale<Scale>(beta),
       static_cast<CType*>(c->opaque()), static_cast<std::int64_t>(ldc),
       static_cast<std::int64_t>(stride_c),
-      static_cast<std::int64_t>(batch_count));
+      static_cast<std::int64_t>(batch_count), SyclGemmComputeMode());
   return absl::OkStatus();
 }
 
