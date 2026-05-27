@@ -121,6 +121,9 @@ class SpecializeTopkVisitor : public DfsHloRewriteVisitor {
       : compute_capability_(std::move(compute_capability)) {}
 
   absl::Status HandleCustomCall(HloInstruction* inst) override {
+    if (compute_capability_.IsOneAPI()) {
+      return absl::OkStatus();
+    }
     HloCustomCallInstruction* topk = DynCast<HloCustomCallInstruction>(inst);
     if (topk == nullptr || topk->custom_call_target() != "TopK") {
       return absl::OkStatus();

@@ -442,6 +442,38 @@ ENTRY cluster {
   run_topk_pass();
 }
 
+TEST_F(TopkRewriterTest, RewriteReshapedIota) {
+  const std::string hlo_string = R"(
+HloModule module
+)" + getComparator() + R"(
+ENTRY cluster {
+  %arg_tuple.1 = f32[1,1234567] parameter(0)
+  %iota.4 = s32[1234567]{0} iota(), iota_dimension=0
+  %reshape.5 = s32[1,1234567]{1,0} reshape(iota.4)
+  %sort.27 = (f32[1,1234567], s32[1,1234567]) sort(%arg_tuple.1, %reshape.5),
+    dimensions={1}, is_stable=true, to_apply=%compare
+  %get-tuple-element.28 = f32[1,1234567] get-tuple-element(%sort.27), index=0
+  %slice.29 = f32[1,5] slice(%get-tuple-element.28), slice={[0:1], [0:5]}
+  %get-tuple-element.30 = s32[1,1234567] get-tuple-element(%sort.27), index=1
+  %slice.31 = s32[1,5] slice(%get-tuple-element.30), slice={[0:1], [0:5]}
+  ROOT %tuple.32 = (f32[1,5], s32[1,5]) tuple(%slice.29, %slice.31)
+})";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TopkRewriter rewriter(
+      [](const HloSortInstruction*, int64_t) { return true; });
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  TF_ASSERT_OK(HloDCE().Run(module.get()).status());
+  EXPECT_TRUE(changed);
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              GmockMatch(m::Tuple(
+                  m::GetTupleElement(m::CustomCall(m::Parameter(0)), 0),
+                  m::GetTupleElement(m::CustomCall(m::Parameter(0)), 1))));
+  const HloInstruction* cc =
+      module->entry_computation()->root_instruction()->operand(0)->operand(0);
+  EXPECT_THAT(cc->custom_call_target(), "TopK");
+}
+
 TEST_F(TopkRewriterTest, RoundTripOnlyIota) {
   const std::string hlo_string = R"(
 HloModule module
