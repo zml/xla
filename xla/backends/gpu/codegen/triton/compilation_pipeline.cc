@@ -26,6 +26,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
+#include "xla/stream_executor/sycl/oneapi_compute_capability.h"
 
 namespace xla::gpu {
 
@@ -89,16 +90,31 @@ void CreateTritonRocmPipeline(
     const stream_executor::RocmComputeCapability& rocm_cc, int num_warps,
     int num_ctas, int num_stages);
 
-void CreateTritonPipeline(mlir::OpPassManager* pm,
-                          const stream_executor::GpuComputeCapability& gpu_cc,
-                          int num_warps, int num_ctas, int num_stages) {
-  if (auto* cuda_cc = gpu_cc.cuda_compute_capability()) {
-    return CreateTritonCudaPipeline(pm, *cuda_cc, num_warps, num_ctas,
-                                    num_stages);
-  }
+absl::Status CreateTritonXpuPipeline(
+    mlir::OpPassManager* pm,
+    const stream_executor::OneAPIComputeCapability& oneapi_cc,
+    int threads_per_warp, int num_warps, int num_ctas, int num_stages);
 
-  CreateTritonRocmPipeline(pm, *gpu_cc.rocm_compute_capability(), num_warps,
-                           num_ctas, num_stages);
+absl::Status CreateTritonPipeline(
+    mlir::OpPassManager* pm,
+    const stream_executor::DeviceDescription& device_info, int num_warps,
+    int num_ctas, int num_stages) {
+  const stream_executor::GpuComputeCapability& gpu_cc =
+      device_info.gpu_compute_capability();
+  if (auto* cuda_cc = gpu_cc.cuda_compute_capability()) {
+    CreateTritonCudaPipeline(pm, *cuda_cc, num_warps, num_ctas, num_stages);
+    return absl::OkStatus();
+  }
+  if (auto* rocm_cc = gpu_cc.rocm_compute_capability()) {
+    CreateTritonRocmPipeline(pm, *rocm_cc, num_warps, num_ctas, num_stages);
+    return absl::OkStatus();
+  }
+  if (auto* oneapi_cc = gpu_cc.oneapi_compute_capability()) {
+    return CreateTritonXpuPipeline(pm, *oneapi_cc,
+                                   device_info.threads_per_warp(), num_warps,
+                                   num_ctas, num_stages);
+  }
+  return absl::FailedPreconditionError("Unsupported GPU target for Triton.");
 }
 
 }  // namespace xla::gpu

@@ -20,15 +20,21 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/sycl/oneapi_compute_capability.h"
 
 namespace xla {
 namespace gpu {
 
 using ::testing::Contains;
+
+constexpr uint32_t kBmgIpVersion = (0x14u << 22) | (0x2u << 14);
+constexpr uint32_t kUnknownOneapiIpVersion = 0x99u << 22;
 
 TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
   mlir::MLIRContext ctx;
@@ -45,6 +51,36 @@ TEST(CompilationPipelineTest, ContainsUnswitchLoopsCompositePass) {
     pass_names.push_back(pass.getName().str());
   }
   ASSERT_THAT(pass_names, Contains("TritonXLAUnswitchLoopsComposite"));
+}
+
+TEST(CompilationPipelineTest, SelectsOneApiXpuPipeline) {
+  mlir::MLIRContext ctx;
+  mlir::PassManager pm(&ctx);
+  stream_executor::DeviceDescription device_info;
+  device_info.set_oneapi_compute_capability(kBmgIpVersion);
+  device_info.set_threads_per_warp(16);
+
+  absl::Status status = CreateTritonPipeline(&pm, device_info,
+                                             /*num_warps=*/4,
+                                             /*num_ctas=*/1,
+                                             /*num_stages=*/3);
+
+  EXPECT_TRUE(status.ok()) << status;
+}
+
+TEST(CompilationPipelineTest, RejectsUnknownOneApiArchitecture) {
+  mlir::MLIRContext ctx;
+  mlir::PassManager pm(&ctx);
+  stream_executor::DeviceDescription device_info;
+  device_info.set_oneapi_compute_capability(kUnknownOneapiIpVersion);
+  device_info.set_threads_per_warp(16);
+
+  absl::Status status = CreateTritonPipeline(&pm, device_info,
+                                             /*num_warps=*/4,
+                                             /*num_ctas=*/1,
+                                             /*num_stages=*/3);
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
 }
 
 }  // namespace gpu

@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_CODEGEN_TRITON_COMPILATION_PIPELINE_H_
 #define XLA_BACKENDS_GPU_CODEGEN_TRITON_COMPILATION_PIPELINE_H_
 
+#include "absl/status/status.h"
 #include "mlir/Pass/PassManager.h"
 #include "xla/stream_executor/device_description.h"
 
@@ -29,9 +30,10 @@ void CreateTritonXlaPipeline(
     bool enable_pdl);
 
 // Creates a Triton compilation pipeline.
-void CreateTritonPipeline(mlir::OpPassManager* pm,
-                          const stream_executor::GpuComputeCapability& gpu_cc,
-                          int num_warps, int num_ctas, int num_stages);
+absl::Status CreateTritonPipeline(
+    mlir::OpPassManager* pm,
+    const stream_executor::DeviceDescription& device_info, int num_warps,
+    int num_ctas, int num_stages);
 
 // Returns the default PTX version for a given CUDA compute capability.
 int GetDefaultPtxVersion(const stream_executor::CudaComputeCapability& cuda_cc);

@@ -58,7 +58,11 @@ CodegenDecision IsTritonSupportedDataType(
     case S64:
     case F16:
     case F32:
+      return CodegenDecision::Allow();
     case F64:
+      if (gpu_version.IsOneAPI()) {
+        return CodegenDecision::Forbid("F64 is not supported on oneAPI.");
+      }
       return CodegenDecision::Allow();
     case F8E5M2:
     case F8E4M3FN:
@@ -80,6 +84,9 @@ CodegenDecision IsTritonSupportedDataType(
           "F8E4M3FNUZ/F8E5M2FNUZ is only supported on ROCm.");
     case BF16:
       if (gpu_version.IsCuda()) {
+        return CodegenDecision::Allow();
+      }
+      if (gpu_version.IsOneAPI()) {
         return CodegenDecision::Allow();
       }
       if (gpu_version.IsRocm()) {
@@ -314,6 +321,11 @@ CodegenDecision IsTritonSupportedInstructionImpl(
 CodegenDecision CanTritonHandleReduce(
     const HloReduceInstruction& reduce,
     const se::GpuComputeCapability& gpu_version) {
+  if (gpu_version.IsOneAPI()) {
+    return CodegenDecision::Forbid(
+        "Triton reductions on oneAPI are not enabled yet.");
+  }
+
   if (reduce.shape().element_type() == PrimitiveType::F8E4M3FN ||
       reduce.shape().element_type() == PrimitiveType::F8E5M2 ||
       (gpu_version.IsRocm() &&
@@ -437,14 +449,15 @@ CodegenDecision AreTypesSupportedByAlgUnsetDot(
     }
   }
 
-  std::vector<PrimitiveType> supported_float_types = {BF16, F16, F32, F8E4M3FN,
-                                                      F8E5M2};
+  std::vector<PrimitiveType> supported_float_types = {BF16, F16, F32};
   if (gpu_version.IsRocm()) {
     // The F64 type for dot operations in Triton is not currently supported
     // on ROCm so it is excluded.
     supported_float_types.insert(supported_float_types.end(),
-                                 {F8E4M3FNUZ, F8E5M2FNUZ});
-  } else {
+                                 {F8E4M3FN, F8E5M2, F8E4M3FNUZ, F8E5M2FNUZ});
+  } else if (gpu_version.IsCuda()) {
+    supported_float_types.insert(supported_float_types.end(),
+                                 {F8E4M3FN, F8E5M2});
     supported_float_types.push_back(F64);
   }
 
@@ -792,9 +805,12 @@ absl::Status EnsureTritonSupportsComputeCapability(
       gpu_compute_capability.cuda_compute_capability();
   auto rocm_compute_capability =
       gpu_compute_capability.rocm_compute_capability();
-  if (!cuda_compute_capability && !rocm_compute_capability) {
+  auto oneapi_compute_capability =
+      gpu_compute_capability.oneapi_compute_capability();
+  if (!cuda_compute_capability && !rocm_compute_capability &&
+      !oneapi_compute_capability) {
     return absl::FailedPreconditionError(
-        "Triton support is only enabled for CUDA and ROCm GPUs.");
+        "Triton support is only enabled for CUDA, ROCm, and oneAPI GPUs.");
   }
 
   if (cuda_compute_capability && !cuda_compute_capability->IsAtLeastAmpere()) {

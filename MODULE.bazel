@@ -117,6 +117,7 @@ use_repo(
     "highwayhash",
     "hwloc",
     "implib_so",
+    "intel_xpu_triton",
     "llvm-raw",
     "llvm_openmp",
     "mkl_dnn_acl_compatible",
