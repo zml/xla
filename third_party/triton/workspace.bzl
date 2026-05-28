@@ -1,18 +1,9 @@
 """Provides the repository macro to import Triton."""
 
-load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
-load("//third_party/triton:common/series.bzl", "common_patch_list")
-load("//third_party/triton:oss_only/series.bzl", "oss_only_patch_list")
-
 def repo():
     """Imports Triton."""
 
-    TRITON_COMMIT = "feb6c04abe15e74faa23f0935ae74c0a38c5e37f"
-    TRITON_SHA256 = "faa578064028ac67e95eb94e20b5d1be666bae472ee4e2a5d5be8f8e51ef8818"
-    tf_http_archive(
+    native.local_repository(
         name = "triton",
-        sha256 = TRITON_SHA256,
-        strip_prefix = "triton-" + TRITON_COMMIT,
-        urls = tf_mirror_urls("https://github.com/triton-lang/triton/archive/{}.tar.gz".format(TRITON_COMMIT)),
-        patch_file = common_patch_list + oss_only_patch_list,
+        path = "/home/steeve/xla-triton",
     )

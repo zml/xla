@@ -118,12 +118,9 @@ void MakeTTGIR(mlir::OpPassManager* pm,
   pm->addPass(mt::gpu::createTritonGPUCombineTensorSelectAndIf());
   pm->addPass(mt::gpu::createTritonGPUOptimizeThreadLocality());
   pm->addPass(mtgi::createTritonIntelGPUOptimizeDotOperands());
-  // This Intel pass currently reaches Triton's NVIDIA dot-layout conversion
-  // when used as an overlay on XLA's pinned Triton, and crashes on decode GEMMs.
-  // Keep the rest of the XPU pipeline enabled and leave 2D block-load lowering
-  // for a tighter compatibility pass.
-  // The cache-control and data-duplication passes have the same pinned-Triton
-  // layout compatibility issue for DotOperandEncodingAttr.
+  pm->addPass(mtgi::createTritonIntelGPULowerTo2DBlockLoad());
+  pm->addPass(mtgi::createTritonIntelGPUAnnotateCacheControl());
+  pm->addPass(mtgi::createTritonIntelGPUReduceDataDuplication());
   pm->addPass(mt::gpu::createTritonGPUReorderInstructions());
   pm->addPass(mt::createTritonLoopAwareCSE());
   pm->addPass(mlir::createSCCPPass());

@@ -250,7 +250,7 @@ cc_library(
     name = "TritonGENIR",
     copts = _intel_copts,
     includes = _intel_includes,
-    srcs = glob(["third_party/intel/lib/Dialect/TritonGEN/IR/*.cpp"]),
+    srcs = [],
     hdrs = glob(["third_party/intel/include/Dialect/TritonGEN/IR/*.h"]),
     deps = _mlir_common_deps + [
         ":triton_gen_attr_inc_gen",
@@ -267,7 +267,7 @@ cc_library(
     name = "TritonIntelGPUIR",
     copts = _intel_copts,
     includes = _intel_includes,
-    srcs = glob(["third_party/intel/lib/Dialect/TritonIntelGPU/IR/*.cpp"]),
+    srcs = [],
     hdrs = glob(["third_party/intel/include/Dialect/TritonIntelGPU/IR/*.h"]),
     deps = _mlir_common_deps + [
         ":TritonGENIR",
