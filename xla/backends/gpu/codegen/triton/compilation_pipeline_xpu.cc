@@ -28,7 +28,10 @@ limitations under the License.
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
@@ -44,6 +47,34 @@ namespace {
 namespace mt = ::mlir::triton;
 namespace mti = ::mlir::triton::intel;
 namespace mtgi = ::mlir::triton::gpu::intel;
+
+class SetTritonXpuModuleAttrsPass
+    : public mlir::PassWrapper<SetTritonXpuModuleAttrsPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+ public:
+  explicit SetTritonXpuModuleAttrsPass(int num_warps)
+      : num_warps_(num_warps) {}
+
+  llvm::StringRef getArgument() const override {
+    return "xla-set-triton-xpu-module-attrs";
+  }
+
+  llvm::StringRef getDescription() const override {
+    return "Sets Triton module attributes required by the Intel XPU backend";
+  }
+
+  void runOnOperation() override {
+    mlir::ModuleOp module = getOperation();
+    mlir::Builder builder(module.getContext());
+    if (!module->hasAttr("ttg.total-num-warps")) {
+      module->setAttr("ttg.total-num-warps",
+                      builder.getI32IntegerAttr(num_warps_));
+    }
+  }
+
+ private:
+  int num_warps_;
+};
 
 absl::StatusOr<std::string> TargetArch(
     const stream_executor::OneAPIComputeCapability& cc) {
@@ -72,9 +103,19 @@ mtgi::TritonAnnotateModuleOptions AnnotationOptions(
   const bool supports_bf16 = cc.IsBMG() || cc.IsPVC();
   options.supportBF16Conversion = supports_bf16;
   options.supportBfloat16Arithmetic = supports_bf16;
-  options.supportDPAS = cc.IsBMG() || cc.IsPVC() || cc.IsDG2();
-  options.support2DBlockIO = cc.IsBMG() || cc.IsPVC();
-  options.supportPredicatedIO = cc.IsBMG() || cc.IsPVC();
+  // TODO: Re-enable once oneAPI Triton autotuning has a trusted reference path.
+  // The current DPAS lowering can compile and launch on BMG but produces wrong
+  // Llama logits, and SYCL autotuning does not yet have a non-Triton GEMM
+  // backend to reject a unanimously-wrong Triton cluster.
+  options.supportDPAS = false;
+  // XLA currently routes Triton-generated LLVM through the existing SYCL
+  // SPIR-V path. Intel's 2D block IO lowering emits image-handle SPIR-V that
+  // is not accepted by that path yet, so leave it disabled for autotuning.
+  options.support2DBlockIO = false;
+  // The current LLVM SPIR-V backend aliases OpPredicatedStoreINTEL with
+  // OpConvertHandleToImageINTEL in module analysis, which rejects the i1
+  // predicate operand as an image handle. Use regular masked IO for now.
+  options.supportPredicatedIO = false;
   options.supportPrefetch256Bytes = cc.IsBMG();
   options.support256bLoadStore = cc.IsBMG();
   return options;
@@ -118,7 +159,6 @@ void MakeTTGIR(mlir::OpPassManager* pm,
   pm->addPass(mt::gpu::createTritonGPUCombineTensorSelectAndIf());
   pm->addPass(mt::gpu::createTritonGPUOptimizeThreadLocality());
   pm->addPass(mtgi::createTritonIntelGPUOptimizeDotOperands());
-  pm->addPass(mtgi::createTritonIntelGPULowerTo2DBlockLoad());
   pm->addPass(mtgi::createTritonIntelGPUAnnotateCacheControl());
   pm->addPass(mtgi::createTritonIntelGPUReduceDataDuplication());
   pm->addPass(mt::gpu::createTritonGPUReorderInstructions());
@@ -129,7 +169,8 @@ void MakeTTGIR(mlir::OpPassManager* pm,
   pm->addPass(mti::createTritonIntelRemoveMasks());
 }
 
-void MakeLLIR(mlir::OpPassManager* pm) {
+void MakeLLIR(mlir::OpPassManager* pm, int num_warps) {
+  pm->addPass(std::make_unique<SetTritonXpuModuleAttrsPass>(num_warps));
   pm->addPass(mlir::createSCFToControlFlowPass());
   pm->addPass(mlir::createInlinerPass());
   pm->addPass(mlir::createConvertIndexToLLVMPass());
@@ -161,7 +202,7 @@ absl::Status CreateTritonXpuPipeline(
   MakeTTIR(pm);
   MakeTTGIR(pm, oneapi_cc, threads_per_warp, num_warps, num_ctas, num_stages,
             *target_arch);
-  MakeLLIR(pm);
+  MakeLLIR(pm, num_warps);
   return absl::OkStatus();
 }
 

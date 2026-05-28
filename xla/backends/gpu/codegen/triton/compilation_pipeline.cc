@@ -110,9 +110,12 @@ absl::Status CreateTritonPipeline(
     return absl::OkStatus();
   }
   if (auto* oneapi_cc = gpu_cc.oneapi_compute_capability()) {
-    return CreateTritonXpuPipeline(pm, *oneapi_cc,
-                                   device_info.threads_per_warp(), num_warps,
-                                   num_ctas, num_stages);
+    // Intel Triton DPAS lowering is parameterized by the hardware subgroup
+    // size. XLA's SYCL DeviceDescription records the largest supported
+    // subgroup as threads_per_warp, but the Intel XPU backend expects the
+    // DPAS subgroup size of 16 for Xe targets.
+    return CreateTritonXpuPipeline(pm, *oneapi_cc, /*threads_per_warp=*/16,
+                                   num_warps, num_ctas, num_stages);
   }
   return absl::FailedPreconditionError("Unsupported GPU target for Triton.");
 }

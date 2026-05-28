@@ -186,7 +186,8 @@ absl::StatusOr<TritonFusion::EmitResult> TritonFusion::Emit(
     if (fusion.GetModule()
             ->config()
             .debug_options()
-            .xla_gpu_experimental_enable_triton_warp_specialization()) {
+            .xla_gpu_experimental_enable_triton_warp_specialization() ||
+        analysis_.device_info().gpu_compute_capability().IsOneAPI()) {
       launch_config = this->GetLaunchConfig(triton_wrapper_result.thread_dims);
     } else {
       launch_config = this->GetLaunchConfig();

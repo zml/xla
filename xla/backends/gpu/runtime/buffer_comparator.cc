@@ -171,7 +171,15 @@ template <typename ElementT, typename ComparisonT>
 static absl::StatusOr<bool> CompareEqualParameterized(
     const ComparisonParams& params) {
   XLA_SCOPED_LOGGING_TIMER("BufferComparator::CompareEqual");
-  TF_ASSIGN_OR_RETURN(bool result, DeviceCompare<ElementT>(params));
+  absl::StatusOr<bool> device_result = DeviceCompare<ElementT>(params);
+  if (!device_result.ok()) {
+    if (absl::IsNotFound(device_result.status()) ||
+        absl::IsUnimplemented(device_result.status())) {
+      return HostCompare<ElementT, ComparisonT>(params);
+    }
+    return device_result.status();
+  }
+  bool result = *device_result;
   if (result) return true;
   if (!params.run_host_compare) return false;
 

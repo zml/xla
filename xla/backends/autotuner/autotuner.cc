@@ -428,9 +428,20 @@ tsl::Future<Autotuner::Config> Autotuner::TuneBestConfig(
 
         if (executable_candidates.empty()) {
           LogConfigResults(*instr, results);
+          std::string first_failure;
+          for (const ConfigResult& result : results) {
+            if (result.failure.has_value()) {
+              first_failure = result.failure->ToString();
+              break;
+            }
+          }
           return absl::InternalError(
               absl::StrCat("Autotuner failed for HLO: ", instr->ToString(),
-                           ". No configs could be compiled."));
+                           ". No configs could be compiled.",
+                           first_failure.empty()
+                               ? ""
+                               : absl::StrCat(" First failure: ",
+                                              first_failure)));
         }
         VLOG(1) << "Successfully compiled " << executable_candidates.size()
                 << " configs out of " << executables.size() << " configs with "
