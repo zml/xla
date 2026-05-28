@@ -1408,9 +1408,24 @@ absl::Status RunPostFusionVerificationPasses(
   HloPassPipeline pipeline("post-fusion-verification-pipeline optimization",
                            compilation_stats);
 
-  if (hlo_module->config()
-          .debug_options()
-          .xla_gpu_verify_triton_fusion_numerics()) {
+  const DebugOptions& debug_options = hlo_module->config().debug_options();
+  const std::string& oneapi_validation_mode =
+      debug_options.xla_gpu_oneapi_triton_validation_mode();
+  if (gpu_target_config.device_description.gpu_compute_capability()
+          .IsOneAPI() &&
+      oneapi_validation_mode != "off" &&
+      oneapi_validation_mode != "fallback" &&
+      oneapi_validation_mode != "strict") {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Unsupported xla_gpu_oneapi_triton_validation_mode: ",
+        oneapi_validation_mode));
+  }
+  const bool verify_oneapi_triton =
+      gpu_target_config.device_description.gpu_compute_capability()
+          .IsOneAPI() &&
+      oneapi_validation_mode != "off";
+  if (debug_options.xla_gpu_verify_triton_fusion_numerics() ||
+      verify_oneapi_triton) {
     if (stream_exec != nullptr) {
       pipeline.AddPass<TritonFusionNumericsVerifier>(
           *stream_exec, options.device_allocator, alias_info, mlir_context);

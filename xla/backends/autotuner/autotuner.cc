@@ -698,13 +698,16 @@ absl::StatusOr<std::vector<Autotuner::ConfigResult>> Autotuner::ProfileAll(
   }
 
   // Untrusted configs create consensus clusters only if the trusted phase
-  // found no usable reference.
+  // found no usable reference and the platform allows untrusted consensus.
   const bool has_trusted_reference = !clusters.empty();
+  const bool allow_untrusted_consensus =
+      !autotune_config_.require_trusted_reference;
   for (auto it = first_untrusted; it != profile_order.end(); ++it) {
     const int i = *it;
     config_results[i] = ProfileCandidate(
         candidates[i], *input_buffers, clusters, /*is_trusted_config=*/false,
-        /*allow_new_cluster=*/!has_trusted_reference);
+        /*allow_new_cluster=*/!has_trusted_reference &&
+            allow_untrusted_consensus);
   }
 
   if (autotune_config_.check_buffers) {
@@ -758,6 +761,14 @@ Autotuner::ConfigResult Autotuner::ProfileCandidate(
         assigned_cluster = AssignToOutputCluster(
             clusters, profile_result->output_buffer.value(), is_trusted_config,
             allow_new_cluster);
+        if (assigned_cluster < 0) {
+          failure = Failure{
+              FailureKind::kWrongResults,
+              autotune_config_.require_trusted_reference && !is_trusted_config
+                  ? "No trusted reference output was available for this "
+                    "untrusted config."
+                  : "Output disagrees with trusted reference cluster."};
+        }
       }
     }
   }
@@ -1010,7 +1021,8 @@ std::string AutotuneConfig::ToString() const {
       "  \"select_first_config\": %s,\n"
       "  \"use_default_config\": %s,\n"
       "  \"dump_hlos\": %s,\n"
-      "  \"allow_reg_spills\": %s\n"
+      "  \"allow_reg_spills\": %s,\n"
+      "  \"require_trusted_reference\": %s\n"
       "}",
       check_buffers ? "true" : "false", relative_tolerance,
       crash_on_check_failure ? "true" : "false", scratch_bytes_window_size_us,
@@ -1018,7 +1030,8 @@ std::string AutotuneConfig::ToString() const {
       exclude_cublas_config ? "true" : "false",
       select_first_config ? "true" : "false",
       use_default_config ? "true" : "false", dump_hlos ? "true" : "false",
-      allow_reg_spills ? "true" : "false");
+      allow_reg_spills ? "true" : "false",
+      require_trusted_reference ? "true" : "false");
 }
 
 AutotunerCacheInterface::CacheStats Autotuner::GetCacheStats() {

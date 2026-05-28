@@ -84,6 +84,9 @@ struct AutotuneConfig {
   bool dump_hlos = false;
   // Whether to allow or discard configs that ptxas warns will spill registers.
   bool allow_reg_spills = false;
+  // If true, untrusted configs are rejected unless at least one trusted config
+  // compiled and produced the reference output cluster.
+  bool require_trusted_reference = false;
 
   std::string ToString() const;
 };

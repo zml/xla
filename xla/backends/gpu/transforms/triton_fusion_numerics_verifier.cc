@@ -82,10 +82,18 @@ absl::StatusOr<const HloFusionInstruction*> AsTritonFusion(
   const FusionBackendConfig& backend_config =
       gpu_config.fusion_backend_config();
   if (backend_config.kind() == kTritonFusionKind ||
+      backend_config.kind() == kTritonGemmFusionKind ||
       backend_config.kind() == kTritonNestedGemmFusionKind) {
     return fusion;
   }
   return nullptr;
+}
+
+absl::StatusOr<HloFusionInstruction*> AsMutableTritonFusion(
+    HloInstruction* hlo) {
+  TF_ASSIGN_OR_RETURN(const HloFusionInstruction* fusion,
+                      AsTritonFusion(hlo));
+  return const_cast<HloFusionInstruction*>(fusion);
 }
 
 class FusionToCallVisitor : public DfsHloRewriteVisitor {
@@ -159,13 +167,14 @@ std::unique_ptr<HloModule> NewHloModuleWithTritonFromFusion(
 namespace triton_fusion_numerics_pass_internal {
 
 absl::Status ForAllTritonFusions(
-    const HloModule& module,
+    HloModule& module,
     const absl::flat_hash_set<absl::string_view>& execution_threads,
-    absl::AnyInvocable<absl::Status(const HloFusionInstruction&)> fn) {
+    absl::AnyInvocable<absl::Status(HloFusionInstruction&)> fn) {
   for (HloComputation* computation :
        module.MakeNonfusionComputations(execution_threads)) {
     for (HloInstruction* instruction : computation->instructions()) {
-      TF_ASSIGN_OR_RETURN(auto triton_fusion, AsTritonFusion(instruction));
+      TF_ASSIGN_OR_RETURN(auto triton_fusion,
+                          AsMutableTritonFusion(instruction));
       if (triton_fusion != nullptr) {
         VLOG(2) << "processing fusion " << triton_fusion->name();
         TF_RETURN_IF_ERROR(fn(*triton_fusion));
@@ -237,6 +246,31 @@ absl::StatusOr<ScopedShapedBuffer> CompileAndRunFusion(
 
 namespace {
 
+bool IsOneApiFallbackMode(const DebugOptions& debug_options,
+                          const se::StreamExecutor& stream_executor) {
+  return stream_executor.GetDeviceDescription()
+             .gpu_compute_capability()
+             .IsOneAPI() &&
+         debug_options.xla_gpu_oneapi_triton_validation_mode() == "fallback";
+}
+
+bool IsOneApiStrictMode(const DebugOptions& debug_options,
+                        const se::StreamExecutor& stream_executor) {
+  return stream_executor.GetDeviceDescription()
+             .gpu_compute_capability()
+             .IsOneAPI() &&
+         debug_options.xla_gpu_oneapi_triton_validation_mode() == "strict";
+}
+
+absl::Status RewriteToRegularFusion(HloFusionInstruction& fusion) {
+  TF_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                      fusion.backend_config<GpuBackendConfig>());
+  gpu_config.clear_fusion_backend_config();
+  TF_RETURN_IF_ERROR(fusion.set_backend_config(std::move(gpu_config)));
+  fusion.set_fusion_kind(HloInstruction::FusionKind::kInput);
+  return absl::OkStatus();
+}
+
 TritonFusionNumericsVerifier::FusionCacheKey CacheKeyForFusion(
     const HloFusionInstruction& fusion) {
   std::unique_ptr<HloModule> module = ExtractInstructionIntoNewModule(fusion);
@@ -303,6 +337,12 @@ absl::StatusOr<bool> TritonFusionNumericsVerifier::RunImpl(
   profile_options.redzone_padding_bytes =
       debug_options.xla_gpu_redzone_padding_bytes();
   profile_options.should_init_buffers = true;
+  if (stream_executor_.GetDeviceDescription()
+          .gpu_compute_capability()
+          .IsOneAPI()) {
+    profile_options.redzone_padding_bytes = 0;
+    profile_options.should_init_buffers = false;
+  }
 
   std::unique_ptr<GpuProfiler> profiler =
       GpuProfiler::Create(&stream_executor_, profile_options, allocator_);
@@ -312,18 +352,34 @@ absl::StatusOr<bool> TritonFusionNumericsVerifier::RunImpl(
 
   TF_RETURN_IF_ERROR(triton_fusion_numerics_pass_internal::ForAllTritonFusions(
       *module, execution_threads,
-      [&](const HloFusionInstruction& fusion) -> absl::Status {
+      [&](HloFusionInstruction& fusion) -> absl::Status {
         auto key = CacheKeyForFusion(fusion);
         if (auto it = fusion_result_cache_.find(key);
             it != fusion_result_cache_.end()) {
           ++cache_hits_;
+          if (!it->second.ok() &&
+              IsOneApiFallbackMode(debug_options, stream_executor_)) {
+            TF_RETURN_IF_ERROR(RewriteToRegularFusion(fusion));
+            return absl::OkStatus();
+          }
           return it->second;
         }
         auto result = VerifyTritonFusion(*profiler, fusion, debug_options);
+        if (!result.ok() &&
+            IsOneApiFallbackMode(debug_options, stream_executor_)) {
+          VLOG(1) << "Falling back oneAPI Triton fusion " << fusion.name()
+                  << " to regular GPU fusion: " << result;
+          TF_RETURN_IF_ERROR(RewriteToRegularFusion(fusion));
+          return absl::OkStatus();
+        }
+        if (!result.ok() &&
+            !IsOneApiStrictMode(debug_options, stream_executor_)) {
+          return result;
+        }
         fusion_result_cache_[key] = result;
         return result;
       }));
-  return false;
+  return true;
 }
 
 }  // namespace xla::gpu

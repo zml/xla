@@ -253,9 +253,12 @@ AutotunerPass::GetGpuAutotunerBackends(
     disabled_autotune_backends.push_back(autotuner::Backend::CUDNN);
     disabled_autotune_backends.push_back(autotuner::Backend::ROCBLAS);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT);
+    disabled_autotune_backends.push_back(autotuner::Backend::ONEMKL);
     disabled_autotune_backends.push_back(autotuner::Backend::MIOPEN);
     disabled_autotune_backends.push_back(autotuner::Backend::ROCBLAS_FISSION);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT_FISSION);
+    disabled_autotune_backends.push_back(
+        autotuner::Backend::ONEMKL_FISSION);
   }
 
   if (!debug_options.xla_gpu_enable_cublaslt()) {
@@ -359,6 +362,8 @@ absl::StatusOr<std::unique_ptr<AutotunerPass>> AutotunerPass::Create(
       // comparator kernel is unavailable. Redzone checking still needs a SYCL
       // kernel, so keep it disabled while preserving output correctness checks.
       profile_options.redzone_padding_bytes = 0;
+      profile_options.should_init_buffers = false;
+      autotune_config.require_trusted_reference = true;
     }
     profiler = GpuProfiler::Create(stream_executor, profile_options, allocator);
   }

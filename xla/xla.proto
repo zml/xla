@@ -989,6 +989,10 @@ message DebugOptions {
   // If true, tune unroll_factor for loops in native GPU emitters.
   optional bool xla_gpu_native_emitter_tune_unroll_factor_for_loops = 478;
 
+  // Validation policy for Triton fusions on oneAPI/SYCL. Supported values are
+  // "off", "fallback", and "strict".
+  optional string xla_gpu_oneapi_triton_validation_mode = 481;
+
   // If true, NCCL collectives (e.g., AllReduce) execute asynchronously. If
   // xla_gpu_nccl_blocking_communicators is false, then
   // xla_gpu_nccl_async_execution must be true.

@@ -338,6 +338,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 
   opts.set_xla_gpu_enable_triton_gemm(true);
   opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
+  opts.set_xla_gpu_oneapi_triton_validation_mode("fallback");
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
   opts.set_xla_gpu_triton_gemm_any(true);
   opts.set_xla_gpu_experimental_gemm_fusion_v2(false);
@@ -2177,6 +2178,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_verify_triton_fusion_numerics(),
       "Whether to verify that the numeric results of Triton fusions match the "
       "results of regular emitters."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_oneapi_triton_validation_mode",
+      string_setter_for(
+          &DebugOptions::set_xla_gpu_oneapi_triton_validation_mode),
+      debug_options->xla_gpu_oneapi_triton_validation_mode(),
+      "Validation policy for Triton fusions on oneAPI/SYCL. Supported values "
+      "are 'off', 'fallback', and 'strict'."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_enable_cudnn_int8x32_convolution_reordering",
       bool_setter_for(
