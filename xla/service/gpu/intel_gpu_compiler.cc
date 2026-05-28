@@ -51,8 +51,10 @@ absl::Status IntelGpuCompiler::AddConvAndGemmAutotuningPass(
     const se::SemanticVersion& toolkit_version, const AliasInfo* alias_info,
     const DebugOptions& debug_options, mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn) {
-  // Return OkStatus as a stub.
-  return absl::OkStatus();
+  return GpuCompiler::AddConvAndGemmAutotuningPass(
+      pipeline, hlo_module, gpu_version, options, thread_pool, stream_exec,
+      target_config, key_value_store, toolkit_version, alias_info,
+      debug_options, mlir_context, shape_size_fn);
 }
 
 absl::Status IntelGpuCompiler::AddAutotunerPass(
@@ -64,8 +66,9 @@ absl::Status IntelGpuCompiler::AddAutotunerPass(
     mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
     const MultiProcessKeyValueStore& key_value_store) {
-  // Return OkStatus as a stub.
-  return absl::OkStatus();
+  return GpuCompiler::AddAutotunerPass(
+      pipeline, hlo_module, gpu_version, options, thread_pool, stream_executor,
+      target_config, alias_info, mlir_context, shape_size_fn, key_value_store);
 }
 
 absl::StatusOr<GpuCompiler::BackendCompileResult>

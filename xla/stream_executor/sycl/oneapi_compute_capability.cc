@@ -28,11 +28,11 @@ namespace stream_executor {
 
 OneAPIComputeCapabilityProto OneAPIComputeCapability::ToProto() const {
   OneAPIComputeCapabilityProto proto;
-  if (generation_ == 0xc && version_ == 0x3c) {
+  if (IsPVC()) {
     proto.set_architecture("PVC");
-  } else if (generation_ == 0x14 && version_ == 0x1) {
+  } else if (IsBMG()) {
     proto.set_architecture("BMG");
-  } else if (generation_ == 0xc && version_ == 0x37) {
+  } else if (IsDG2()) {
     proto.set_architecture("DG2");
   }
   // This stub implementation currently disregards the "variant" proto field.

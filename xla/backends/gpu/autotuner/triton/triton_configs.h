@@ -28,6 +28,7 @@ enum class TritonConfigsPlatform {
   kBlackwellConsumer,  // SM 12.0 (RTX 5090, etc.)
   kDefaultCuda,
   kDefaultRocm,
+  kDefaultXpu,
   kHopper,
 };
 

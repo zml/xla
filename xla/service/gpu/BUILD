@@ -3712,6 +3712,7 @@ cc_library(
     ]),
     deps = [
         ":intel_gpu_compiler_impl",
+        "//xla/backends/gpu/autotuner:factory_sycl",
         "//xla/stream_executor/sycl:sycl_platform_id",
     ],
     alwayslink = True,  # Contains compiler registration

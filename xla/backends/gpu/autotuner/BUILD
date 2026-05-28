@@ -821,6 +821,31 @@ cc_library(
 )
 
 cc_library(
+    name = "factory_sycl",
+    srcs = ["factory_sycl.cc"],
+    tags = [
+        "gpu",
+        "oneapi-only",
+    ],
+    deps = [
+        ":factory",
+        ":triton",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/service:compiler",
+        "//xla/service:hlo_cost_analysis",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/platform:platform_object_registry",
+        "//xla/stream_executor/sycl:sycl_platform_id",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//mlir:IR",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "factory",
     hdrs = ["factory.h"],
     deps = [

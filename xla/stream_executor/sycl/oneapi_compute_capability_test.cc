@@ -41,6 +41,12 @@ TEST(OneAPIComputeCapabilityTest, ToProtoTest2) {
   EXPECT_EQ(proto.architecture(), "BMG");
 }
 
+TEST(OneAPIComputeCapabilityTest, BmgVersionTwoToProto) {
+  OneAPIComputeCapabilityProto proto =
+      OneAPIComputeCapability(0x14, 0x2).ToProto();
+  EXPECT_EQ(proto.architecture(), "BMG");
+}
+
 TEST(OneAPIComputeCapabilityTest, ToString) {
   EXPECT_EQ(OneAPIComputeCapability::BMG().ToString(), "BMG");
 }

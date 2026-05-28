@@ -28,6 +28,8 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
@@ -71,6 +73,26 @@ int64_t EstimateMemoryBandwidth(const OneAPIComputeCapability& oneapi_cc) {
   } else {
     return 456'000'000'000;  // Default to BMG bandwidth.
   }
+}
+
+uint32_t IpVersionFor(const OneAPIComputeCapability& oneapi_cc) {
+  return (oneapi_cc.generation() << 22) | (oneapi_cc.version() << 14);
+}
+
+uint32_t NormalizeIpVersion(uint32_t ip_version, absl::string_view name) {
+  OneAPIComputeCapability oneapi_cc(ip_version);
+  if (oneapi_cc.IsBMG() || oneapi_cc.IsPVC() || oneapi_cc.IsDG2()) {
+    return ip_version;
+  }
+
+  std::string lower_name = absl::AsciiStrToLower(name);
+  if (absl::StrContains(lower_name, " b70 ") ||
+      absl::StrContains(lower_name, " b580 ") ||
+      absl::StrContains(lower_name, " b570 ") ||
+      absl::StrContains(lower_name, " battlemage")) {
+    return IpVersionFor(OneAPIComputeCapability::BMG());
+  }
+  return ip_version;
 }
 
 // TODO(intel-tf): Use direct Level Zero API when available.
@@ -211,7 +233,8 @@ CreateOneApiDeviceDescription(int device_ordinal) {
   desc.set_name(device_props.name);
   desc.set_device_vendor("Intel Corporation");
 
-  desc.set_oneapi_compute_capability(ip_version_ext.ipVersion);
+  desc.set_oneapi_compute_capability(
+      NormalizeIpVersion(ip_version_ext.ipVersion, device_props.name));
 
   SemanticVersion driver_version =
       GetOrDefaultLevelZeroDriverVersion(lz_driver);
@@ -244,6 +267,8 @@ CreateOneApiDeviceDescription(int device_ordinal) {
       DetermineThreadsPerWarp(compute_props, device_props));
   desc.set_threads_per_core_limit(compute_props.maxTotalGroupSize);
   desc.set_threads_per_block_limit(compute_props.maxTotalGroupSize);
+  desc.set_registers_per_core_limit(65536);
+  desc.set_registers_per_block_limit(65536);
 
   desc.set_clock_rate_ghz(static_cast<float>(device_props.coreClockRate) /
                           1000.0f);

@@ -72,6 +72,9 @@ std::vector<TritonGemmConfig> GetDefaultTritonConfigs(
   if (compute_capability.IsRocm()) {
     return GetTritonConfigsForPlatform(TritonConfigsPlatform::kDefaultRocm);
   }
+  if (compute_capability.IsOneAPI()) {
+    return GetTritonConfigsForPlatform(TritonConfigsPlatform::kDefaultXpu);
+  }
 
   CHECK(compute_capability.IsCuda());
   auto* cuda_compute_capability = compute_capability.cuda_compute_capability();

@@ -241,9 +241,11 @@ int TritonDotFusionSearchSpace::GetDesiredTotalWarps() const {
 TritonDotFusionSearchSpace::OutputTile
 TritonDotFusionSearchSpace::GetMaxOutputTile() const {
   constexpr int kRegisterSizeInBits = 32;
+  const int64_t registers_per_block_limit =
+      std::max<int64_t>(device_description_.registers_per_block_limit(), 1);
+  const int compute_bitwidth = std::max(compute_bitwidth_, 1);
   const int64_t max_elements_per_cta =
-      device_description_.registers_per_block_limit() * kRegisterSizeInBits /
-      compute_bitwidth_;
+      registers_per_block_limit * kRegisterSizeInBits / compute_bitwidth;
   auto limit_other_size_to_fit = [max_elements_per_cta](int64_t this_size) {
     return PreviousPowerOfTwo(max_elements_per_cta / this_size);
   };
@@ -300,7 +302,10 @@ TritonDotFusionSearchSpace::GetMinOutputTile() const {
   // size is different).
   constexpr OutputTile kMinSupportedTile = {16, 8};
   constexpr OutputTile kMinWgmmaTile = {64, 8};
-  if (device_description_.cuda_compute_capability().IsAtLeastHopper() &&
+  const se::GpuComputeCapability gpu_cc =
+      device_description_.gpu_compute_capability();
+  if (gpu_cc.IsCuda() &&
+      gpu_cc.cuda_compute_capability()->IsAtLeastHopper() &&
       !should_optimize_for_occupancy_) {
     VLOG(5) << "Computing output_tile: Want to use wgmma, so output_tile >= "
             << kMinWgmmaTile.lhs_dim << "x" << kMinWgmmaTile.rhs_dim;
@@ -319,7 +324,10 @@ int TritonDotFusionSearchSpace::GetMinWarpsPerCta() const {
     // TODO: b/422419331 - Remove this once Triton properly handles 32-bit dots.
     return kMinWarpsPerCtaForOccupancy;
   }
-  if (device_description_.cuda_compute_capability().IsAtLeastHopper() &&
+  const se::GpuComputeCapability gpu_cc =
+      device_description_.gpu_compute_capability();
+  if (gpu_cc.IsCuda() &&
+      gpu_cc.cuda_compute_capability()->IsAtLeastHopper() &&
       !should_optimize_for_occupancy_) {
     VLOG(5) << "Computing num_warps: Want to use wgmma, so num_warps >= "
             << kMinWarpsPerCtaForWgmma;

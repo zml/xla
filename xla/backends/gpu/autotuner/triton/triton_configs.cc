@@ -44,6 +44,17 @@ std::vector<TritonGemmConfig> ParseConfig(absl::string_view config_str) {
   return configs;
 };
 
+std::vector<TritonGemmConfig> GetDefaultXpuConfigs() {
+  return {
+      TritonGemmConfig(/*block_m=*/16, /*block_n=*/16, /*block_k=*/32,
+                       /*num_stages=*/1, /*num_warps=*/2),
+      TritonGemmConfig(/*block_m=*/32, /*block_n=*/32, /*block_k=*/32,
+                       /*num_stages=*/1, /*num_warps=*/4),
+      TritonGemmConfig(/*block_m=*/64, /*block_n=*/32, /*block_k=*/32,
+                       /*num_stages=*/1, /*num_warps=*/4),
+  };
+}
+
 }  // namespace
 
 const std::vector<TritonGemmConfig>& GetTritonConfigsForPlatform(
@@ -60,6 +71,7 @@ const std::vector<TritonGemmConfig>& GetTritonConfigsForPlatform(
             ParseConfig(configs::get_cuda())},
            {TritonConfigsPlatform::kDefaultRocm,
             ParseConfig(configs::get_rocm())},
+           {TritonConfigsPlatform::kDefaultXpu, GetDefaultXpuConfigs()},
            {TritonConfigsPlatform::kHopper, ParseConfig(configs::get_h100())}});
   return kConfigs->at(platform);
 }
