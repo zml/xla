@@ -214,7 +214,6 @@ _intel_includes = [
 ]
 
 _intel_copts = [
-    "-DgetScratchSizeInBytesOld=getScratchSizeInBytes",
     "-Wno-ctad-maybe-unsupported",
     "-Wno-deprecated-declarations",
     "-Wno-implicit-fallthrough",
