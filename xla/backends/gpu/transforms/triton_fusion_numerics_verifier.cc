@@ -341,7 +341,6 @@ absl::StatusOr<bool> TritonFusionNumericsVerifier::RunImpl(
           .gpu_compute_capability()
           .IsOneAPI()) {
     profile_options.redzone_padding_bytes = 0;
-    profile_options.should_init_buffers = false;
   }
 
   std::unique_ptr<GpuProfiler> profiler =

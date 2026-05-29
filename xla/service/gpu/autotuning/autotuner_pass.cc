@@ -362,8 +362,12 @@ absl::StatusOr<std::unique_ptr<AutotunerPass>> AutotunerPass::Create(
       // comparator kernel is unavailable. Redzone checking still needs a SYCL
       // kernel, so keep it disabled while preserving output correctness checks.
       profile_options.redzone_padding_bytes = 0;
-      profile_options.should_init_buffers = false;
-      autotune_config.require_trusted_reference = true;
+      if (debug_options.xla_gpu_oneapi_triton_validation_mode() != "off") {
+        autotune_config.check_buffers = true;
+        autotune_config.select_first_config = false;
+        autotune_config.require_trusted_reference = true;
+        profile_options.should_init_buffers = true;
+      }
     }
     profiler = GpuProfiler::Create(stream_executor, profile_options, allocator);
   }

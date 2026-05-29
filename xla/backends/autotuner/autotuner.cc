@@ -395,6 +395,14 @@ tsl::Future<Autotuner::Config> Autotuner::TuneBestConfig(
   if (supported_configs.size() == 1) {
     VLOG(1) << "Found only one supported config: "
             << supported_configs[0].ToString();
+    if (autotune_config_.check_buffers &&
+        autotune_config_.require_trusted_reference &&
+        supported_configs[0].codegen_backend->CanProduceWrongResults()) {
+      return absl::InternalError(absl::StrCat(
+          "Autotuning failed for HLO: ", instr->ToString(),
+          ". Only one supported config was found and it is not trusted: ",
+          supported_configs[0].ToString()));
+    }
     std::vector<ConfigResult> results;
     results.push_back({std::move(supported_configs[0]), std::nullopt,
                        absl::ZeroDuration(), 0});
@@ -447,8 +455,16 @@ tsl::Future<Autotuner::Config> Autotuner::TuneBestConfig(
                 << " configs out of " << executables.size() << " configs with "
                 << results.size() << " compilation failures.";
 
-        bool skip_profiling = executable_candidates.size() == 1 ||
-                              autotune_config_.select_first_config;
+        bool only_untrusted_config =
+            executable_candidates.size() == 1 &&
+            executable_candidates[0]
+                .config.codegen_backend->CanProduceWrongResults();
+        bool skip_profiling =
+            autotune_config_.select_first_config ||
+            (executable_candidates.size() == 1 &&
+             !(autotune_config_.check_buffers &&
+               autotune_config_.require_trusted_reference &&
+               only_untrusted_config));
         if (skip_profiling) {
           VLOG(1) << "Skipping profiling and using the "
                   << (autotune_config_.select_first_config ? "first" : "only")

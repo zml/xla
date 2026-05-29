@@ -518,7 +518,26 @@ static void InitializeTypedBuffer(se::Stream* stream,
       stream_executor::gpu::GpuKernelRegistry::GetGlobalRegistry()
           .LoadKernel<stream_executor::gpu::RepeatBufferKernel>(executor);
   if (!kernel.ok()) {
-    LOG(FATAL) << "Could not load RepeatBufferKernel: " << kernel.status();
+    LOG_FIRST_N(WARNING, 1)
+        << "Could not load RepeatBufferKernel; falling back to host-side "
+           "buffer initialization: "
+        << kernel.status();
+    std::vector<T> repeat_buffer(host_buffer_size);
+    std::copy(host_buffer->begin() + host_index, host_buffer->end(),
+              repeat_buffer.begin());
+    std::copy(host_buffer->begin(), host_buffer->begin() + host_index,
+              repeat_buffer.begin() + (host_buffer_size - host_index));
+
+    int64_t offset = first_size + second_size;
+    while (elements_to_fill > 0) {
+      int64_t chunk_size = std::min<int64_t>(host_buffer_size, elements_to_fill);
+      se::DeviceAddressBase mem =
+          buffer.GetByteSlice(offset * sizeof(T), chunk_size * sizeof(T));
+      CHECK_OK(stream->Memcpy(&mem, repeat_buffer.data(), mem.size()));
+      offset += chunk_size;
+      elements_to_fill -= chunk_size;
+    }
+    return;
   }
   // Launch the kernel with at least host_buffer_bytes threads. Each thread
   // will read one byte of `host_buffer` from the start of `buffer`, where the
