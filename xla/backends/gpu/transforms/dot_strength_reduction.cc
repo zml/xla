@@ -56,6 +56,24 @@ HloInstruction* ConvertTo(HloInstruction* instruction, PrimitiveType type,
       HloInstruction::CreateConvert(new_shape, instruction), metadata);
 }
 
+bool IsOneApiGemvType(PrimitiveType type) {
+  return type == BF16 || type == F16 || type == F32;
+}
+
+bool ShouldPreserveOneApiGemv(const HloDotInstruction& dot, bool lhs_is_vector,
+                              bool rhs_is_vector) {
+  if (!lhs_is_vector && !rhs_is_vector) {
+    return false;
+  }
+  if (lhs_is_vector && rhs_is_vector) {
+    return false;
+  }
+
+  return IsOneApiGemvType(dot.operand(0)->shape().element_type()) &&
+         IsOneApiGemvType(dot.operand(1)->shape().element_type()) &&
+         IsOneApiGemvType(dot.shape().element_type());
+}
+
 // Transposes the dot operand to make dimensions in "batch, non-contracting,
 // contracting" order, sorted by index within each category.
 HloInstruction* PermuteDotOperandDimensions(HloInstruction* operand,
@@ -245,6 +263,11 @@ bool DotStrengthReduction::InstructionMatchesPattern(
   CHECK_OK(is_too_small.status());
   if (is_too_small.value()) {
     return true;
+  }
+
+  if (compute_capability_.IsOneAPI() &&
+      ShouldPreserveOneApiGemv(*dot, lhs_is_vector, rhs_is_vector)) {
+    return false;
   }
 
   // If GemmFusion cannot handle this dot, we should strength-reduce it so that

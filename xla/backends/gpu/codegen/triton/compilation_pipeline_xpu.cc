@@ -103,11 +103,7 @@ mtgi::TritonAnnotateModuleOptions AnnotationOptions(
   const bool supports_bf16 = cc.IsBMG() || cc.IsPVC();
   options.supportBF16Conversion = supports_bf16;
   options.supportBfloat16Arithmetic = supports_bf16;
-  // TODO: Re-enable once oneAPI Triton autotuning has a trusted reference path.
-  // The current DPAS lowering can compile and launch on BMG but produces wrong
-  // Llama logits, and SYCL autotuning does not yet have a non-Triton GEMM
-  // backend to reject a unanimously-wrong Triton cluster.
-  options.supportDPAS = false;
+  options.supportDPAS = cc.IsBMG() || cc.IsPVC();
   // XLA currently routes Triton-generated LLVM through the existing SYCL
   // SPIR-V path. Intel's 2D block IO lowering emits image-handle SPIR-V that
   // is not accepted by that path yet, so leave it disabled for autotuning.

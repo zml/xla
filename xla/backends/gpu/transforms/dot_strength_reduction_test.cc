@@ -25,6 +25,7 @@ limitations under the License.
 #include "xla/hlo/testlib/verified_hlo_module.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/sycl/oneapi_compute_capability.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
@@ -206,6 +207,24 @@ ENTRY entry {
                           ParseAndReturnVerifiedModule(hlo_string));
   DotStrengthReduction pass{
       se::GpuComputeCapability(se::CudaComputeCapability::Ampere())};
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(DotStrengthReductionTest,
+       OneApiVectorMatrixDotShouldNotBeStrengthReduced) {
+  const std::string& hlo_string = R"(
+HloModule m
+
+ENTRY entry {
+  p0 = bf16[4096] parameter(0)
+  p1 = bf16[4096,14336] parameter(1)
+  ROOT dot = bf16[14336] dot(p0, p1), lhs_contracting_dims={0}, rhs_contracting_dims={0}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  DotStrengthReduction pass{
+      se::GpuComputeCapability(se::OneAPIComputeCapability::BMG())};
   TF_ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
   EXPECT_FALSE(changed);
 }
