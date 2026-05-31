@@ -217,33 +217,55 @@ absl::StatusOr<llvm::Function*> BuildKernelPrototype(
 
 absl::StatusOr<llvm::Function*> RemoveUnusedTritonAbiArguments(
     llvm::Module* llvm_module, IrEmitterContext& ir_emitter_context,
-    const std::string& sanitized_kernel_name, bool keep_scratch) {
+    const std::string& sanitized_kernel_name, bool keep_scratch,
+    bool keep_sycl_local_memory_arg) {
   llvm::Function* impl_fn = llvm_module->getFunction(sanitized_kernel_name);
   TF_RET_CHECK(impl_fn);
   impl_fn->setName(ir_emitter_context.GetSanitizedUniqueName(
       sanitized_kernel_name + "_impl"));
 
-  constexpr int arg_to_remove = 2;
+  const int64_t num_original_args = impl_fn->arg_size();
+  const bool has_sycl_local_memory_arg =
+      keep_sycl_local_memory_arg && num_original_args > 0 &&
+      llvm::isa<llvm::PointerType>(
+          impl_fn->getArg(num_original_args - 1)->getType()) &&
+      llvm::cast<llvm::PointerType>(
+          impl_fn->getArg(num_original_args - 1)->getType())
+              ->getAddressSpace() == 3;
 
-  auto fn_attrs = impl_fn->getAttributes();
+  const int64_t num_triton_abi_args = has_sycl_local_memory_arg ? 3 : 2;
+  const int64_t first_triton_abi_arg = num_original_args - num_triton_abi_args;
+  const int64_t sycl_local_memory_arg =
+      has_sycl_local_memory_arg ? num_original_args - 1 : -1;
+
+  llvm::AttributeList old_attrs = impl_fn->getAttributes();
+  llvm::SmallVector<llvm::AttributeSet, 8> new_param_attrs;
   llvm::SmallVector<llvm::Type*, 8> arg_types;
+  llvm::SmallVector<llvm::Argument*, 8> kept_args;
 
   for (uint32_t i = 0; i < impl_fn->arg_size(); i++) {
-    bool is_scratch = (i == impl_fn->arg_size() - 2);
-    bool should_keep = (i < impl_fn->arg_size() - arg_to_remove) ||
-                       (is_scratch && keep_scratch);
+    const bool is_sycl_local_memory = i == sycl_local_memory_arg;
+    const bool is_scratch =
+        has_sycl_local_memory_arg
+            ? (i >= first_triton_abi_arg && i < sycl_local_memory_arg)
+            : (i == impl_fn->arg_size() - 2);
+    const bool should_keep = (i < first_triton_abi_arg) ||
+                             is_sycl_local_memory ||
+                             (is_scratch && keep_scratch);
 
     if (should_keep) {
-      arg_types.push_back(impl_fn->getArg(i)->getType());
+      llvm::Argument* arg = impl_fn->getArg(i);
+      kept_args.push_back(arg);
+      arg_types.push_back(arg->getType());
+      new_param_attrs.push_back(old_attrs.getParamAttrs(i));
       if (is_scratch) {
-        fn_attrs = fn_attrs.addParamAttribute(
-            llvm_module->getContext(), i,
-            llvm::Attribute::getWithAlignment(llvm_module->getContext(),
-                                              llvm::Align(128)));
+        llvm::AttrBuilder builder(llvm_module->getContext(),
+                                  new_param_attrs.back());
+        builder.addAlignmentAttr(llvm::Align(128));
+        new_param_attrs.back() =
+            llvm::AttributeSet::get(llvm_module->getContext(), builder);
       }
     } else {
-      fn_attrs = fn_attrs.removeParamAttributes(llvm_module->getContext(), i);
-
       auto arg = impl_fn->getArg(i);
       arg->replaceAllUsesWith(llvm::ConstantPointerNull::get(
           llvm::cast<llvm::PointerType>(arg->getType())));
@@ -252,6 +274,10 @@ absl::StatusOr<llvm::Function*> RemoveUnusedTritonAbiArguments(
 
   llvm::FunctionType* new_type =
       llvm::FunctionType::get(impl_fn->getReturnType(), arg_types, false);
+  llvm::AttributeList fn_attrs =
+      llvm::AttributeList::get(llvm_module->getContext(),
+                               old_attrs.getFnAttrs(), old_attrs.getRetAttrs(),
+                               new_param_attrs);
 
   auto inserted =
       llvm_module
@@ -260,7 +286,7 @@ absl::StatusOr<llvm::Function*> RemoveUnusedTritonAbiArguments(
   llvm::Function* new_function = static_cast<llvm::Function*>(inserted);
 
   new_function->copyMetadata(impl_fn, 0);
-  new_function->setAttributes(impl_fn->getAttributes());
+  new_function->setAttributes(fn_attrs);
 
   // Set the correct calling convention for the target GPU.
   // Triton generates PTX_Kernel CC even for AMD, so we need to use
@@ -271,9 +297,9 @@ absl::StatusOr<llvm::Function*> RemoveUnusedTritonAbiArguments(
   new_function->splice(new_function->begin(), impl_fn);
 
   for (const auto& [impl_fn_arg, kernel_arg] :
-       llvm::zip(impl_fn->args(), new_function->args())) {
-    kernel_arg.setName(impl_fn_arg.getName());
-    impl_fn_arg.replaceAllUsesWith(&kernel_arg);
+       llvm::zip(kept_args, new_function->args())) {
+    kernel_arg.setName(impl_fn_arg->getName());
+    impl_fn_arg->replaceAllUsesWith(&kernel_arg);
   }
 
   impl_fn->eraseFromParent();

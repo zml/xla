@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/gpu_profiler.h"
 
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -337,8 +338,10 @@ absl::Status GpuProfiler::CheckOutputBuffer(ScopedShapedBuffer& output,
   return ShapeUtil::ForEachLeafShapeWithStatus(
       reference.on_device_shape(),
       [&](const Shape& subshape, const ShapeIndex& index) -> absl::Status {
+        const bool verbose_compare =
+            std::getenv("XLA_GPU_AUTOTUNE_VERBOSE_COMPARE") != nullptr;
         BufferComparator comparator(subshape, rtol,
-                                    /*verbose=*/false);
+                                    /*verbose=*/verbose_compare);
 
         TF_ASSIGN_OR_RETURN(
             bool outputs_match,

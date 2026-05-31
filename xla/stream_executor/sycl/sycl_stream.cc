@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_stream.h"
 
+#include <cstdint>
+
 #include "xla/tsl/platform/logging.h"
 
 namespace stream_executor::sycl {
@@ -80,6 +82,12 @@ absl::Status LaunchSyclKernel(
       VLOG(2) << "Setting kernel argument " << arg_index
               << " at address: " << arg_ptrs[arg_index];
       cgh.set_arg(arg_index, arg_ptrs[arg_index]);
+    }
+
+    if (shared_mem_bytes > 0) {
+      using share_mem_t = ::sycl::local_accessor<int8_t, 1>;
+      share_mem_t local_buffer(shared_mem_bytes, cgh);
+      cgh.set_arg(num_args, local_buffer);
     }
 
     if (num_args == 0) {

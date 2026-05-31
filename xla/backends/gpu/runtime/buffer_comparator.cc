@@ -62,6 +62,12 @@ template <typename ElementT>
 static absl::StatusOr<bool> DeviceCompare(const ComparisonParams& params) {
   se::StreamExecutor* executor = params.stream->parent();
 
+  TF_ASSIGN_OR_RETURN(
+      auto comparison_kernel,
+      stream_executor::gpu::GpuKernelRegistry::GetGlobalRegistry()
+          .LoadKernel<stream_executor::gpu::BufferComparatorKernel<ElementT>>(
+              executor));
+
   se::DeviceAddressHandle out(executor, executor->AllocateScalar<uint64_t>());
 
   TF_RETURN_IF_ERROR(
@@ -74,12 +80,6 @@ static absl::StatusOr<bool> DeviceCompare(const ComparisonParams& params) {
   se::DeviceAddress<ElementT> current_typed(params.current);
   se::DeviceAddress<ElementT> expected_typed(params.expected);
   uint64_t buffer_size = current_typed.ElementCount();
-
-  TF_ASSIGN_OR_RETURN(
-      auto comparison_kernel,
-      stream_executor::gpu::GpuKernelRegistry::GetGlobalRegistry()
-          .LoadKernel<stream_executor::gpu::BufferComparatorKernel<ElementT>>(
-              executor));
 
   const se::DeviceDescription& gpu_device_info =
       executor->GetDeviceDescription();

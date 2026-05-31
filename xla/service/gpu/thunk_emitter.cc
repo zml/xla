@@ -1304,7 +1304,11 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTritonCustomCall(
       ASSIGN_OR_RETURN(llvm::Function * kernel,
                        RemoveUnusedTritonAbiArguments(
                            result.llvm_module.get(), *ir_emitter_context_,
-                           kernel_name, call.global_scratch_memory_size > 0));
+                           kernel_name, call.global_scratch_memory_size > 0,
+                           ir_emitter_context_->gpu_device_info()
+                                   .gpu_compute_capability()
+                                   .IsOneAPI() &&
+                               result.shmem_bytes > 0));
 
       AnnotateAttrsIfUnset(kernel_arguments, *kernel);
       TF_RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(

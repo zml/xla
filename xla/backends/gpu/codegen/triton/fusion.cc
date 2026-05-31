@@ -200,7 +200,13 @@ absl::StatusOr<TritonFusion::EmitResult> TritonFusion::Emit(
         llvm::Function * kernel,
         RemoveUnusedTritonAbiArguments(local_module.get(), ir_emitter_context,
                                        sanitized_kernel_name,
-                                       /*keep_scratch=*/false));
+                                       /*keep_scratch=*/false,
+                                       /*keep_sycl_local_memory_arg=*/
+                                       analysis_.device_info()
+                                               .gpu_compute_capability()
+                                               .IsOneAPI() &&
+                                           triton_wrapper_result.shmem_bytes >
+                                               0));
 
     AnnotateAttrsIfUnset(kernel_arguments, *kernel);
     PopulateNvvmAnnotations(local_module.get(), kernel, triton_wrapper_result);
