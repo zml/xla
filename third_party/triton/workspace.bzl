@@ -5,5 +5,5 @@ def repo():
 
     native.local_repository(
         name = "triton",
-        path = "/home/steeve/intel-xpu-backend-for-triton",
+        path = "/home/steeve/xla-triton",
     )
