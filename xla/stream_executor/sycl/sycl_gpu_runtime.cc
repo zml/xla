@@ -37,13 +37,6 @@ absl::Status IsValidDeviceOrdinal(int device_ordinal,
       function_name, ": Invalid device ordinal: ", device_ordinal));
 }
 
-// Returns true if the oneAPI version is 2024.2 or newer.
-// oneAPI 2024.2 corresponds to __LIBSYCL_MAJOR_VERSION == 7 and
-// __LIBSYCL_MINOR_VERSION == 2.
-bool IsOneAPIVersionAtLeast2024_2() {
-  return (__LIBSYCL_MAJOR_VERSION >= 7) && (__LIBSYCL_MINOR_VERSION >= 2);
-}
-
 absl::Status MemcpyDeviceToHost(::sycl::queue* stream_handle, void* dst_host,
                                 const void* src_device, size_t byte_count,
                                 bool async = false) {
@@ -410,17 +403,14 @@ absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle) {
 absl::StatusOr<::sycl::event> SyclGetRecentEventFromStream(
     ::sycl::queue* stream_handle) {
   try {
-    if (IsOneAPIVersionAtLeast2024_2()) {
-      // Zero overhead: Does not submit a barrier or enqueue work.
-      std::optional<::sycl::event> event =
-          stream_handle->ext_oneapi_get_last_event();
-      if (event.has_value()) {
-        return event.value();
-      }
-      // Submit a barrier if no prior event exists.
-      return stream_handle->ext_oneapi_submit_barrier();
+#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20240000
+    // Zero overhead: Does not submit a barrier or enqueue work.
+    std::optional<::sycl::event> event =
+        stream_handle->ext_oneapi_get_last_event();
+    if (event.has_value()) {
+      return event.value();
     }
-    // Always submit a barrier on older oneAPI versions.
+#endif
     return stream_handle->ext_oneapi_submit_barrier();
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(absl::StrCat(

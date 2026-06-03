@@ -2762,10 +2762,16 @@ GpuCompiler::CompileToBackendResult(
 
       return std::move(result.binary);
     };
+    tsl::thread::ThreadPool* custom_kernel_thread_pool =
+        gpu_topology.gpu_target_config()
+                .device_description.gpu_compute_capability()
+                .IsOneAPI()
+            ? nullptr
+            : thread_pool.get_mutable();
     CubinCustomKernelCompiler kernel_compiler(
         std::move(llvm_compiler),
         gpu_topology.gpu_target_config().device_description,
-        module->config().debug_options(), thread_pool.get_mutable());
+        module->config().debug_options(), custom_kernel_thread_pool);
     kernel_compiler.SetPreOptimizationHook([&](const llvm::Module& module) {
       CallUserPreOptimizationHook(module);
     });

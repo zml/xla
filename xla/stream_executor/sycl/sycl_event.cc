@@ -75,11 +75,13 @@ absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
         "WaitStreamOnEvent: Failed to check event status before waiting: " +
         std::string(e.what()));
   }
-  std::vector<::sycl::event> event_list{event};
-  stream_handle->submit([&](::sycl::handler& cgh) {
-    cgh.depends_on(event_list);
-    cgh.host_task([=]() {});
-  });
+  try {
+    stream_handle->ext_oneapi_submit_barrier(std::vector<::sycl::event>{event});
+  } catch (const ::sycl::exception& e) {
+    return absl::InternalError(
+        "WaitStreamOnEvent: Failed to submit event barrier: " +
+        std::string(e.what()));
+  }
   return absl::OkStatus();
 }
 
