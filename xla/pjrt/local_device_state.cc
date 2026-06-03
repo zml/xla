@@ -260,6 +260,20 @@ absl::Status LocalDeviceState::ThenExecuteCallback(
     return tag.empty() ? "ThenExecuteCallback"
                        : absl::StrCat("ThenExecuteCallback:", tag);
   });
+  if (stream->parent()->GetPlatform()->id() ==
+      stream_executor::sycl::kSyclPlatformId) {
+    callback_thread_->Schedule(
+        [stream, callback{std::move(callback)},
+         error_cb{std::move(error_cb)}]() mutable {
+          absl::Status status = stream->BlockHostUntilDone();
+          if (status.ok()) {
+            std::move(callback)();
+          } else if (error_cb) {
+            std::move(error_cb)(status);
+          }
+        });
+    return absl::OkStatus();
+  }
   if (callback_stream_map_.has_value()) {
     se::Stream* callback_exec_stream = nullptr;
     {

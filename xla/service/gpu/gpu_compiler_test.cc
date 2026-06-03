@@ -1614,7 +1614,13 @@ class GpuCompilerSelectKTest
 TEST_P(GpuCompilerSelectKTest, SelectKOrCustomKernelThunk) {
   auto [n, k, expected_impl] = GetParam();
 
+  bool is_oneapi = device_description().gpu_compute_capability().IsOneAPI();
   bool is_rocm = device_description().gpu_compute_capability().IsRocm();
+
+  if (is_oneapi) {
+    expected_impl = (n >= 1024 && k <= 16) ? TopKImpl::kSelectK
+                                           : TopKImpl::kSort;
+  }
 
   if (is_rocm && expected_impl == TopKImpl::kSelectK) {
     GTEST_SKIP() << "raft::select_k is not supported in ROCm.";
