@@ -218,6 +218,7 @@ static bool HasIota(HloSortInstruction* sort, HloInstruction* data) {
     return m::Iota().WithShape(m::Shape().WithElementType(S32).WithDims(dims));
   };
   return Match(sort->operand(1), match_iota(data->shape().dimensions())) ||
+         Match(sort->operand(1), m::Reshape(match_iota(sort_dims))) ||
          Match(sort->operand(1), m::Broadcast(match_iota(sort_dims)));
 }
 

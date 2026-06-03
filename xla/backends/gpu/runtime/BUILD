@@ -1684,8 +1684,43 @@ cc_library(
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_address_allocator",
         "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
         "@com_google_absl//absl/status",
     ],
+)
+
+cc_library(
+    name = "select_k_exec_sycl",
+    srcs = ["select_k_exec_sycl.cc"],
+    hdrs = ["select_k_exec.h"],
+    copts = select({
+        "@rules_ml_toolchain//common:is_sycl_enabled": ["-sycl_compile"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "@rules_ml_toolchain//common:is_sycl_enabled": [
+            "-link_stage",
+            "-lirc",
+        ],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "oneapi-only",
+    ],
+    deps = [
+        "//xla:types",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:device_address_allocator",
+        "//xla/stream_executor:stream",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ] + select({
+        "@rules_ml_toolchain//common:is_sycl_enabled": [
+            "@oneapi//:headers",
+            "@oneapi//:libs",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 xla_test(
@@ -1720,6 +1755,31 @@ xla_test(
     ],
 )
 
+xla_test(
+    name = "select_k_exec_sycl_test",
+    srcs = ["select_k_exec_sycl_test.cc"],
+    backends = ["gpu"],
+    tags = [
+        "oneapi-only",
+    ],
+    deps = [
+        ":select_k_exec_sycl",
+        "//xla:types",
+        "//xla/service:platform_util",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor:stream_executor_memory_allocator",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "select_k_thunk",
     srcs = ["select_k_thunk.cc"],
@@ -1747,10 +1807,12 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:statusor",
-    ] + if_cuda_is_configured(
-        [":select_k_exec_raft"],
-        no_cuda = [":select_k_exec_stub"],
-    ),
+    ] + select({
+        "@rules_ml_toolchain//common:is_sycl_enabled": [":select_k_exec_sycl"],
+        "@local_config_cuda//cuda:using_clang": [":select_k_exec_raft"],
+        "@local_config_cuda//cuda:using_nvcc": [":select_k_exec_raft"],
+        "//conditions:default": [":select_k_exec_stub"],
+    }),
 )
 
 xla_cc_test(

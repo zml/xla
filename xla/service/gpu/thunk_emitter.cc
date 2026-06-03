@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1249,6 +1250,28 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
                        GetDefaultBufferAlignment(), instr));
 
   auto dtype = data_shape.element_type();
+  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
+      instr, ir_emitter_context_->GetNextThunkId());
+  if (ir_emitter_context_->gpu_compute_capability().IsOneAPI()) {
+    if (dtype != PrimitiveType::F32 && dtype != PrimitiveType::BF16) {
+      return absl::UnimplementedError(
+          absl::StrCat("oneAPI TopK unsupported dtype: ",
+                       primitive_util::LowercasePrimitiveTypeName(dtype)));
+    }
+    if (k > 16) {
+      return absl::UnimplementedError(
+          absl::StrCat("oneAPI TopK SelectKThunk supports k <= 16, got ", k));
+    }
+    if (batch_size > std::numeric_limits<std::uint32_t>::max() ||
+        n > std::numeric_limits<std::uint32_t>::max()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "oneAPI TopK SelectKThunk dimensions must fit uint32_t, got batch=",
+          batch_size, ", n=", n));
+    }
+    return GetThunkSequence(std::make_unique<SelectKThunk>(
+        std::move(thunk_info), batch_size, n, k, dtype, kernel_arguments));
+  }
+
   bool is_cuda = ir_emitter_context_->gpu_compute_capability().IsCuda();
   if (is_cuda && instr->GetModule()
                      ->config()
@@ -1269,8 +1292,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
     VLOG(3) << "EmitTopKCustomCall: dtype=" << dtype << ", n=" << n
             << ", k=" << k << ", use_raft_select_k=" << use_raft_select_k;
 
-    Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
-        instr, ir_emitter_context_->GetNextThunkId());
     if (use_raft_select_k) {
       return GetThunkSequence(std::make_unique<SelectKThunk>(
           std::move(thunk_info), batch_size, n, k, dtype, kernel_arguments));
@@ -1286,8 +1307,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
                                             "topk", dtype, n, k, batch_size,
                                             platform_name(), wavefront_size));
 
-  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
-      instr, ir_emitter_context_->GetNextThunkId());
   return GetThunkSequence(std::make_unique<CustomKernelThunk>(
       std::move(thunk_info), std::move(kernel), kernel_arguments));
 }
