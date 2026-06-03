@@ -1920,6 +1920,25 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
       }
     }
 
+    if (client->platform_name() == OneapiName() &&
+        result_buffer_or_status.ok()) {
+      // oneAPI/Level Zero currently needs host-side synchronization here to
+      // make PJRT buffer readiness match the async execute contract.
+      VLOG(1) << "Start oneAPI stream synchronization for "
+              << executable->executable()->module().name()
+              << ", device=" << device->DebugString()
+              << ", run_id=" << run_options.run_id().ToInt();
+      absl::Status status = device_state->compute_stream()->BlockHostUntilDone();
+      VLOG(1) << "Finish oneAPI stream synchronization for "
+              << executable->executable()->module().name()
+              << ", device=" << device->DebugString()
+              << ", run_id=" << run_options.run_id().ToInt()
+              << ", ok=" << status.ok();
+      if (!status.ok()) {
+        result_buffer_or_status = status;
+      }
+    }
+
     static constexpr absl::string_view kExecutableName = "executable_name";
     const auto add_error_context = [&](absl::Status status) {
       status.SetPayload(kExecutableName,

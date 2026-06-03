@@ -124,6 +124,45 @@ ENTRY TestComputation {
   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
 }
 
+TEST_F(SortingTest, Bf16VocabArgMaxReduction) {
+  const char* hlo_text = R"(
+HloModule TestModule
+
+argmax {
+  lhs_value = bf16[] parameter(0)
+  lhs_index = s32[] parameter(1)
+  rhs_value = bf16[] parameter(2)
+  rhs_index = s32[] parameter(3)
+  gt = pred[] compare(lhs_value, rhs_value), direction=GT
+  eq = pred[] compare(lhs_value, rhs_value), direction=EQ
+  lower_index = pred[] compare(lhs_index, rhs_index), direction=LT
+  tie = pred[] and(eq, lower_index)
+  select_lhs = pred[] or(gt, tie)
+  value = bf16[] select(select_lhs, lhs_value, rhs_value)
+  index = s32[] select(select_lhs, lhs_index, rhs_index)
+  ROOT tuple = (bf16[], s32[]) tuple(value, index)
+}
+
+ENTRY main {
+  vocab = s32[1,128256]{1,0} iota(), iota_dimension=1
+  vocab_f32 = f32[1,128256]{1,0} convert(vocab)
+  center = f32[] constant(127777)
+  center_bcast = f32[1,128256]{1,0} broadcast(center), dimensions={}
+  distance = f32[1,128256]{1,0} subtract(vocab_f32, center_bcast)
+  abs_distance = f32[1,128256]{1,0} abs(distance)
+  neg_distance = f32[1,128256]{1,0} negate(abs_distance)
+  logits = bf16[1,128256]{1,0} convert(neg_distance)
+  init_value = bf16[] constant(-inf)
+  init_index = s32[] constant(0)
+  argmax_result = (bf16[1]{0}, s32[1]{0}) reduce(
+    logits, vocab, init_value, init_index), dimensions={1}, to_apply=argmax
+  ROOT index = s32[1]{0} get-tuple-element(argmax_result), index=1
+}
+)";
+
+  EXPECT_TRUE(RunAndCompare(hlo_text, ErrorSpec{0, 0}));
+}
+
 TEST_F(SortingTest, PackedElementType) {
   const char* hlo_text = R"(
     HloModule module
@@ -203,6 +242,36 @@ TEST_F(SortingTest, SortFusionWithIotaOperandTinySortDim) {
     ENTRY main {
       p = s32[2]{0} parameter(0)
       ROOT fusion = (s32[2]{0}, s32[2]{0}) fusion(p), kind=kCustom, calls=sort_fusion
+    }
+  )";
+  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
+}
+
+TEST_F(SortingTest, SortFusionWithBFloat16AndIotaOperand) {
+  const char* hlo_text = R"(
+    HloModule module
+
+    sorting_computation {
+      %lhs_key = bf16[] parameter(0)
+      %rhs_key = bf16[] parameter(1)
+      %lhs_index = s32[] parameter(2)
+      %rhs_index = s32[] parameter(3)
+      %lt_key = pred[] compare(%lhs_key, %rhs_key), direction=LT
+      %gt_key = pred[] compare(%rhs_key, %lhs_key), direction=LT
+      %eq_key = pred[] compare(%lt_key, %gt_key), direction=EQ
+      %lt_index = pred[] compare(%lhs_index, %rhs_index), direction=LT
+      ROOT res = pred[] select(%eq_key, %lt_index, %lt_key)
+    }
+
+    sort_fusion {
+      p0 = bf16[4096]{0} parameter(0)
+      iota = s32[4096]{0} iota(), iota_dimension=0
+      ROOT sort = (bf16[4096]{0}, s32[4096]{0}) sort(p0, iota), dimensions={0}, is_stable=true, to_apply=sorting_computation
+    }
+
+    ENTRY main {
+      p = bf16[4096]{0} parameter(0)
+      ROOT fusion = (bf16[4096]{0}, s32[4096]{0}) fusion(p), kind=kCustom, calls=sort_fusion
     }
   )";
   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));

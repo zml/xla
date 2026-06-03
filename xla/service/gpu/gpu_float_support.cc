@@ -198,6 +198,9 @@ bool GpuFloatSupport::IsSupported(const HloInstruction& hlo) const {
     }
     // Reduction.
     case HloOpcode::kReduce:
+      if (LowPrecisionType() == BF16 && compute_capability_.IsOneAPI()) {
+        return false;
+      }
       return absl::c_all_of(hlo.called_computations().front()->instructions(),
                             [this](const HloInstruction* hlo) {
                               return hlo->opcode() == HloOpcode::kParameter ||
@@ -205,6 +208,9 @@ bool GpuFloatSupport::IsSupported(const HloInstruction& hlo) const {
                             });
     // Sort
     case HloOpcode::kSort:
+      if (LowPrecisionType() == BF16 && compute_capability_.IsOneAPI()) {
+        return false;
+      }
       VLOG(10) << "Sort: " << hlo.ToString();
       VLOG(10) << "Comparator: " << hlo.to_apply()->ToString();
       return absl::c_all_of(hlo.to_apply()->instructions(),

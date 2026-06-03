@@ -14,12 +14,16 @@ limitations under the License.
 ==============================================================================*/
 
 #include <cstdint>
+#include <algorithm>
+#include <numeric>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "xla/backends/gpu/runtime/select_k_exec.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/stream_executor/stream_executor.h"
 #include "xla/types.h"  // IWYU pragma: keep
 
 namespace xla::gpu {
@@ -33,8 +37,73 @@ absl::Status select_k_exec(int device_ordinal,
                            se::DeviceAddressBase indices_out,
                            std::uint32_t batch, std::uint32_t n,
                            std::uint32_t k) {
-  return absl::UnimplementedError(
-      "select_k_exec is not implemented on this platform");
+  (void)device_ordinal;
+  (void)allocator;
+  if (k > n) {
+    return absl::InvalidArgumentError("select_k_exec requires k <= n");
+  }
+
+  const uint64_t input_bytes = sizeof(T) * batch * n;
+  const uint64_t output_bytes = sizeof(T) * batch * k;
+  const uint64_t indices_bytes = sizeof(std::uint32_t) * batch * k;
+
+  auto input_alloc = stream->parent()->HostMemoryAllocate(input_bytes);
+  if (!input_alloc.ok()) {
+    return input_alloc.status();
+  }
+  auto output_alloc = stream->parent()->HostMemoryAllocate(output_bytes);
+  if (!output_alloc.ok()) {
+    return output_alloc.status();
+  }
+  auto indices_alloc = stream->parent()->HostMemoryAllocate(indices_bytes);
+  if (!indices_alloc.ok()) {
+    return indices_alloc.status();
+  }
+
+  T* input = reinterpret_cast<T*>((*input_alloc)->address().opaque());
+  T* output = reinterpret_cast<T*>((*output_alloc)->address().opaque());
+  std::uint32_t* indices =
+      reinterpret_cast<std::uint32_t*>((*indices_alloc)->address().opaque());
+
+  absl::Status status = stream->Memcpy(input, data_in, input_bytes);
+  if (!status.ok()) {
+    return status;
+  }
+  status = stream->BlockHostUntilDone();
+  if (!status.ok()) {
+    return status;
+  }
+
+  std::vector<std::uint32_t> order(n);
+  for (std::uint32_t b = 0; b < batch; ++b) {
+    std::iota(order.begin(), order.end(), 0);
+    const T* batch_input = input + static_cast<uint64_t>(b) * n;
+    auto better = [&](std::uint32_t lhs, std::uint32_t rhs) {
+      float lhs_value = static_cast<float>(batch_input[lhs]);
+      float rhs_value = static_cast<float>(batch_input[rhs]);
+      if (lhs_value == rhs_value) {
+        return lhs < rhs;
+      }
+      return lhs_value > rhs_value;
+    };
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), better);
+
+    for (std::uint32_t i = 0; i < k; ++i) {
+      const uint64_t out_index = static_cast<uint64_t>(b) * k + i;
+      output[out_index] = batch_input[order[i]];
+      indices[out_index] = order[i];
+    }
+  }
+
+  status = stream->Memcpy(&data_out, output, output_bytes);
+  if (!status.ok()) {
+    return status;
+  }
+  status = stream->Memcpy(&indices_out, indices, indices_bytes);
+  if (!status.ok()) {
+    return status;
+  }
+  return stream->BlockHostUntilDone();
 }
 
 // Explicit instantiations for supported dtypes.
