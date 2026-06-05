@@ -115,6 +115,8 @@ inline constexpr absl::string_view kUncompilableFusion =
     "__uncompilable_fusion";
 
 inline constexpr absl::string_view kTopKCustomCallTarget = "__gpu$TopK";
+inline constexpr absl::string_view kTopKWithPayloadCustomCallTarget =
+    "__gpu$TopKWithPayload";
 
 // The number of shared memory banks.
 inline constexpr int64_t kNumShmemBanks = 32;

@@ -207,6 +207,43 @@ ENTRY cluster {
   }
 }
 
+TEST_F(TopkRewriterTest, RewriteWithPayloadIndices) {
+  const std::string hlo_string = R"(
+HloModule module
+)" + getCompareComparator() + R"(
+ENTRY cluster {
+  %values = f32[2048,8] parameter(0)
+  %payload = s32[2048,8] parameter(1)
+  %sort = (f32[2048,8], s32[2048,8]) sort(%values, %payload),
+    dimensions={1}, is_stable=true, to_apply=%compare
+  %sorted_values = f32[2048,8] get-tuple-element(%sort), index=0
+  %top_values = f32[2048,4] slice(%sorted_values), slice={[0:2048], [0:4]}
+  %sorted_payload = s32[2048,8] get-tuple-element(%sort), index=1
+  %top_payload = s32[2048,4] slice(%sorted_payload), slice={[0:2048], [0:4]}
+  ROOT %tuple = (f32[2048,4], s32[2048,4]) tuple(%top_values, %top_payload)
+})";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TopkRewriter rewriter(
+      [](const HloSortInstruction*, int64_t) { return true; },
+      TopkRewriter::IndexMode::kPayload);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  TF_ASSERT_OK(HloDCE().Run(module.get()).status());
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->operand_count(), 2);
+  const HloInstruction* value_gte = root->operand(0);
+  const HloInstruction* payload_gte = root->operand(1);
+  ASSERT_EQ(value_gte->opcode(), HloOpcode::kGetTupleElement);
+  ASSERT_EQ(payload_gte->opcode(), HloOpcode::kGetTupleElement);
+  const HloInstruction* cc = value_gte->operand(0);
+  ASSERT_EQ(cc, payload_gte->operand(0));
+  EXPECT_THAT(cc->custom_call_target(), "__gpu$TopKWithPayload");
+  EXPECT_EQ(cc->operand_count(), 2);
+  EXPECT_EQ(cc->operand(1)->name(), "payload");
+}
+
 TEST_F(TopkRewriterTest, RewriteWithBroadcast) {
   for (std::string comparator :
        {getComparator(), getCompareComparator(), getStableComparator()}) {

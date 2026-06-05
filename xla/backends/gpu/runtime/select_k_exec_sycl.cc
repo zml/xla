@@ -72,9 +72,11 @@ inline void InsertCandidate(float value, std::uint32_t index,
 }
 
 template <typename T>
-absl::Status LaunchSelectK(::sycl::queue* queue, const T* data_in, T* data_out,
-                           std::uint32_t* indices_out, std::uint32_t batch,
-                           std::uint32_t n, std::uint32_t k) {
+absl::Status LaunchSelectK(::sycl::queue* queue, const T* data_in,
+                           const std::uint32_t* payload_indices_in,
+                           T* data_out, std::uint32_t* indices_out,
+                           std::uint32_t batch, std::uint32_t n,
+                           std::uint32_t k) {
   if (queue == nullptr) {
     return absl::InternalError("SYCL select_k_exec stream has null queue");
   }
@@ -116,7 +118,11 @@ absl::Status LaunchSelectK(::sycl::queue* queue, const T* data_in, T* data_out,
             for (std::uint32_t col = lid; col < n; col += work_group_size) {
               const float value =
                   static_cast<float>(data_in[row_offset + col]);
-              InsertCandidate(value, col, best_values, best_indices, k);
+              const std::uint32_t payload =
+                  payload_indices_in == nullptr
+                      ? col
+                      : payload_indices_in[row_offset + col];
+              InsertCandidate(value, payload, best_values, best_indices, k);
             }
 
             const std::uint32_t local_offset = lid * k;
@@ -147,9 +153,8 @@ absl::Status LaunchSelectK(::sycl::queue* queue, const T* data_in, T* data_out,
               const std::uint64_t out_offset =
                   static_cast<std::uint64_t>(row) * k;
               for (std::uint32_t i = 0; i < k; ++i) {
-                const std::uint32_t index = row_indices[i];
-                indices_out[out_offset + i] = index;
-                data_out[out_offset + i] = data_in[row_offset + index];
+                indices_out[out_offset + i] = row_indices[i];
+                data_out[out_offset + i] = static_cast<T>(row_values[i]);
               }
             }
           });
@@ -195,7 +200,42 @@ absl::Status select_k_exec(int device_ordinal,
   auto* queue =
       static_cast<::sycl::queue*>(stream->platform_specific_handle().stream);
   return LaunchSelectK(
+      queue, static_cast<const T*>(data_in.opaque()), nullptr,
+      static_cast<T*>(data_out.opaque()),
+      static_cast<std::uint32_t*>(indices_out.opaque()), batch, n, k);
+}
+
+template <typename T>
+absl::Status select_k_payload_exec(
+    int device_ordinal, se::DeviceAddressAllocator* allocator,
+    se::Stream* stream, se::DeviceAddressBase data_in,
+    se::DeviceAddressBase indices_in, se::DeviceAddressBase data_out,
+    se::DeviceAddressBase indices_out, std::uint32_t batch, std::uint32_t n,
+    std::uint32_t k) {
+  (void)device_ordinal;
+  (void)allocator;
+
+  if (k == 0 || batch == 0) {
+    return absl::OkStatus();
+  }
+  if (k > n) {
+    return absl::InvalidArgumentError(
+        "select_k_payload_exec requires k <= n");
+  }
+  if (k > kMaxK) {
+    return absl::UnimplementedError(absl::StrCat(
+        "SYCL select_k_payload_exec supports k <= ", kMaxK, ", got ", k));
+  }
+
+  if (stream == nullptr) {
+    return absl::InternalError(
+        "SYCL select_k_payload_exec received a null stream");
+  }
+  auto* queue =
+      static_cast<::sycl::queue*>(stream->platform_specific_handle().stream);
+  return LaunchSelectK(
       queue, static_cast<const T*>(data_in.opaque()),
+      static_cast<const std::uint32_t*>(indices_in.opaque()),
       static_cast<T*>(data_out.opaque()),
       static_cast<std::uint32_t*>(indices_out.opaque()), batch, n, k);
 }
@@ -210,5 +250,15 @@ template absl::Status select_k_exec<::xla::bfloat16>(
     int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
     se::DeviceAddressBase, se::DeviceAddressBase, std::uint32_t, std::uint32_t,
     std::uint32_t);
+
+template absl::Status select_k_payload_exec<float>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
+template absl::Status select_k_payload_exec<::xla::bfloat16>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
 
 }  // namespace xla::gpu

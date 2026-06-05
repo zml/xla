@@ -2107,6 +2107,8 @@ xla_test(
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/gpu:ffi",
         "//xla/backends/gpu/runtime:async_thunk",
+        "//xla/backends/gpu/runtime:sequential_thunk",
+        "//xla/backends/gpu/runtime:select_k_thunk",
         "//xla/backends/gpu/runtime:thunk",
         "//xla/backends/gpu/runtime:thunk_executor",
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
