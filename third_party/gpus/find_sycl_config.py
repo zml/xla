@@ -178,6 +178,14 @@ def _find_l0_config(base_paths):
     "l0_library_dir": library_path,
   }
 
+def _find_ccl_config(base_paths):
+  header_path = os.path.dirname(_find_header(base_paths, "oneapi/ccl.h"))
+  library_path = os.path.dirname(_find_library(base_paths, "ccl"))
+  return {
+    "ccl_include_dir": header_path,
+    "ccl_library_dir": library_path,
+  }
+
 def find_sycl_config():
   """Returns a dictionary of SYCL components config info."""
   basekit_path = _get_basekit_path()
@@ -195,6 +203,14 @@ def find_sycl_config():
   default_l0_path = ["/usr"]
   l0_paths = _get_legacy_path("L0_INSTALL_PATH", default_l0_path)
   result.update(_find_l0_config(l0_paths))
+
+  default_ccl_path = [
+      basekit_path + "/ccl/latest",
+      basekit_path + "/ccl/2022.0",
+      basekit_path + "/" + _get_basekit_version(),
+  ]
+  ccl_paths = _get_legacy_path("CCL_INSTALL_PATH", default_ccl_path)
+  result.update(_find_ccl_config(ccl_paths))
 
   return result
 
