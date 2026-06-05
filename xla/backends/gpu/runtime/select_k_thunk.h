@@ -51,7 +51,8 @@ class SelectKThunk : public Thunk {
   SelectKThunk(ThunkInfo thunk_info, std::uint32_t batch_size,
                std::uint32_t num_elements, std::uint32_t k,
                xla::PrimitiveType dtype,
-               const emitters::KernelArguments& kernel_arguments);
+               const emitters::KernelArguments& kernel_arguments,
+               bool payload_indices = false);
 
   std::string ToString(int indent) const override;
 
@@ -61,6 +62,8 @@ class SelectKThunk : public Thunk {
   const std::vector<BufferAllocation::Slice>& arguments() const {
     return args_;
   }
+
+  bool payload_indices() const { return payload_indices_; }
 
   absl::StatusOr<ThunkProto> ToProto() const override;
 
@@ -73,6 +76,7 @@ class SelectKThunk : public Thunk {
   std::uint32_t num_elements_;
   std::uint32_t k_;
   xla::PrimitiveType dtype_;
+  bool payload_indices_;
 
   // Buffer slices passed to the kernel as arguments.
   std::vector<BufferAllocation::Slice> args_;

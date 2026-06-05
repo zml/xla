@@ -1179,8 +1179,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
     const HloCustomCallInstruction* instr) {
   auto operands = instr->operands();
   const auto& shape = instr->shape();
-  TF_RET_CHECK(operands.size() == 1)
-      << "Expect only 1 operand for TopK custom call.";
+  const bool payload_indices =
+      instr->custom_call_target() == kTopKWithPayloadCustomCallTarget;
+  TF_RET_CHECK(operands.size() == (payload_indices ? 2 : 1))
+      << "Unexpected operand count for TopK custom call.";
   TF_RET_CHECK(shape.IsTuple())
       << "Expect TopK custom call to have tuple shape.";
   TF_RET_CHECK(shape.tuple_shapes().size() == 2)
@@ -1188,6 +1190,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
          "sub-shapes.";
 
   auto data_shape = operands[0]->shape();
+  if (payload_indices) {
+    TF_RET_CHECK(operands[1]->shape().element_type() == PrimitiveType::S32)
+        << "TopKWithPayload payload indices must be S32.";
+    TF_RET_CHECK(ShapeUtil::SameDimensions(data_shape, operands[1]->shape()))
+        << "TopKWithPayload data and payload shapes must match.";
+  }
   auto top_elements_shape = shape.tuple_shapes()[0];
   auto indices_shape = shape.tuple_shapes()[1];
 
@@ -1230,7 +1238,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
           batch_size, ", n=", n));
     }
     return GetThunkSequence(std::make_unique<SelectKThunk>(
-        std::move(thunk_info), batch_size, n, k, dtype, kernel_arguments));
+        std::move(thunk_info), batch_size, n, k, dtype, kernel_arguments,
+        payload_indices));
+  }
+
+  if (payload_indices) {
+    return absl::UnimplementedError(
+        "TopKWithPayload custom call is only implemented for oneAPI/SYCL");
   }
 
   bool is_cuda = ir_emitter_context_->gpu_compute_capability().IsCuda();

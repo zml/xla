@@ -741,6 +741,11 @@ absl::Status RunOptimizationPasses(
   pipeline.AddPass<TopKSplitter>();
   pipeline.AddPass<TopkSpecializer>(gpu_version);
   pipeline.AddPass<TopkDecomposer>();
+  if (gpu_version.IsOneAPI()) {
+    pipeline.AddPass<TopkRewriter>(
+        [](const HloSortInstruction*, int64_t k) { return k <= 16; },
+        TopkRewriter::IndexMode::kPayload);
+  }
 
   pipeline.AddPass<DotDimensionSorter>();
   pipeline.AddPass<DotDecomposer>();

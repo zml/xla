@@ -282,6 +282,7 @@ message SelectKThunkProto {
   uint32 num_elements = 4;
   uint32 k = 5;
   xla.PrimitiveType dtype = 6;
+  bool payload_indices = 7;
 }
 
 message CublasLtMatmulThunkProto {

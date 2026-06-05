@@ -50,6 +50,19 @@ absl::Status select_k_exec(int device_ordinal,
                            std::uint32_t batch, std::uint32_t n,
                            std::uint32_t k);
 
+// Launches a Top-K selection where indices are payloads supplied by the caller.
+// This is used to merge per-shard TopK results after collectives: `indices_in`
+// contains global token ids, and `indices_out` must preserve those payloads.
+template <typename T>
+absl::Status select_k_payload_exec(
+    int device_ordinal, ::stream_executor::DeviceAddressAllocator* allocator,
+    ::stream_executor::Stream* stream,
+    ::stream_executor::DeviceAddressBase data_in,
+    ::stream_executor::DeviceAddressBase indices_in,
+    ::stream_executor::DeviceAddressBase data_out,
+    ::stream_executor::DeviceAddressBase indices_out, std::uint32_t batch,
+    std::uint32_t n, std::uint32_t k);
+
 }  // namespace xla::gpu
 
 #endif  // XLA_BACKENDS_GPU_RUNTIME_SELECT_K_EXEC_H_

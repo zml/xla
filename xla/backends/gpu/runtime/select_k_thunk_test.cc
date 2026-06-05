@@ -90,5 +90,66 @@ TEST(SelectKThunkTest, ToProto) {
   EXPECT_THAT(deserialized->ToProto(), IsOkAndHolds(EqualsProto(proto)));
 }
 
+TEST(SelectKThunkTest, PayloadIndicesToProto) {
+  auto c1 = HloInstruction::CreateConstant(
+      LiteralUtil::CreateR2<float>({{.125f, 0.875f, .5f, .25f, 0.75f}}));
+  auto topKInst = HloInstruction::CreateCustomCall(
+      ShapeUtil::MakeTupleShape(
+          {ShapeUtil::MakeShape(F32, {1, 3}),
+           ShapeUtil::MakeShape(S32, {1, 3})}),
+      {c1.get()}, "__gpu$TopKWithPayload");
+
+  Thunk::ThunkInfo thunk_info =
+      Thunk::ThunkInfo::WithProfileAnnotation(topKInst.get(), ThunkId{789});
+
+  std::vector<BufferAllocation> buffer_allocations = {
+      {/*index=*/0, /*size=*/20, /*color=*/0},
+      {/*index=*/1, /*size=*/20, /*color=*/0},
+      {/*index=*/2, /*size=*/12, /*color=*/0},
+      {/*index=*/3, /*size=*/12, /*color=*/0}};
+
+  BufferAllocation::Slice slice0(&buffer_allocations[0], /*offset=*/0,
+                                 /*size=*/20);
+  BufferAllocation::Slice slice1(&buffer_allocations[1], /*offset=*/0,
+                                 /*size=*/20);
+  BufferAllocation::Slice slice2(&buffer_allocations[2], /*offset=*/0,
+                                 /*size=*/12);
+  BufferAllocation::Slice slice3(&buffer_allocations[3], /*offset=*/0,
+                                 /*size=*/12);
+
+  emitters::KernelArguments kernel_arguments({
+      emitters::KernelArgument(ShapeUtil::MakeShape(F32, {1, 5}), slice0),
+      emitters::KernelArgument(ShapeUtil::MakeShape(S32, {1, 5}), slice1),
+      emitters::KernelArgument(ShapeUtil::MakeShape(F32, {1, 3}), slice2),
+      emitters::KernelArgument(ShapeUtil::MakeShape(S32, {1, 3}), slice3),
+  });
+
+  SelectKThunk thunk(std::move(thunk_info), 1, 5, 3, F32, kernel_arguments,
+                     /*payload_indices=*/true);
+
+  TF_ASSERT_OK_AND_ASSIGN(ThunkProto proto, thunk.ToProto());
+  EXPECT_THAT(proto, EqualsProto(R"pb(
+                thunk_info { profile_annotation: "custom-call" thunk_id: 789 }
+                select_k_thunk {
+                  args { buffer_allocation_index: 0 size: 20 }
+                  args { buffer_allocation_index: 1 size: 20 }
+                  args { buffer_allocation_index: 2 size: 12 }
+                  args { buffer_allocation_index: 3 size: 12 }
+                  batch_size: 1
+                  num_elements: 5
+                  k: 3
+                  dtype: F32
+                  payload_indices: true
+                }
+              )pb"));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<SelectKThunk> deserialized,
+      SelectKThunk::FromProto(thunk.thunk_info(), proto.select_k_thunk(),
+                              buffer_allocations));
+  EXPECT_TRUE(deserialized->payload_indices());
+  EXPECT_THAT(deserialized->ToProto(), IsOkAndHolds(EqualsProto(proto)));
+}
+
 }  // namespace
 }  // namespace xla::gpu

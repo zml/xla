@@ -51,23 +51,29 @@ namespace xla::gpu {
 SelectKThunk::SelectKThunk(ThunkInfo thunk_info, std::uint32_t batch_size,
                            std::uint32_t num_elements, std::uint32_t k,
                            xla::PrimitiveType dtype,
-                           const emitters::KernelArguments& kernel_arguments)
+                           const emitters::KernelArguments& kernel_arguments,
+                           bool payload_indices)
     : Thunk(Kind::kSelectK, thunk_info),
       batch_size_(batch_size),
       num_elements_(num_elements),
       k_(k),
       dtype_(dtype),
+      payload_indices_(payload_indices),
       args_(kernel_arguments.GetArgumentBufferSlices()) {
-  CHECK_EQ(args_.size(), 3)
-      << "SelectKThunk expects exactly 3 buffer arguments "
-         "(input_data, output_data, output_indices)";
+  CHECK_EQ(args_.size(), payload_indices_ ? 4 : 3)
+      << "SelectKThunk expects "
+      << (payload_indices_ ? 4 : 3)
+      << " buffer arguments (input_data"
+      << (payload_indices_ ? ", input_indices" : "")
+      << ", output_data, output_indices)";
 }
 
 std::string SelectKThunk::ToString(int indent) const {
   const std::string indent_str(indent * 2, ' ');
   return absl::StrCat(indent_str, "SelectKThunk(batch_size=", batch_size_,
                       ", num_elements=", num_elements_, ", k=", k_,
-                      ", dtype=", dtype_, ")");
+                      ", dtype=", dtype_,
+                      ", payload_indices=", payload_indices_, ")");
 }
 
 // Execute the TopK operation on the GPU stream.
@@ -94,10 +100,20 @@ absl::Status SelectKThunk::ExecuteOnStream(const ExecuteParams& params) {
   // Dispatch to the correct typed implementation based on dtype.
   switch (dtype_) {
     case PrimitiveType::F32:
+      if (payload_indices_) {
+        return select_k_payload_exec<float>(
+            device_ordinal, allocator, stream, buffer_args[0], buffer_args[1],
+            buffer_args[2], buffer_args[3], batch_size_, num_elements_, k_);
+      }
       return select_k_exec<float>(
           device_ordinal, allocator, stream, buffer_args[0], buffer_args[1],
           buffer_args[2], batch_size_, num_elements_, k_);
     case PrimitiveType::BF16:
+      if (payload_indices_) {
+        return select_k_payload_exec<::xla::bfloat16>(
+            device_ordinal, allocator, stream, buffer_args[0], buffer_args[1],
+            buffer_args[2], buffer_args[3], batch_size_, num_elements_, k_);
+      }
       return select_k_exec<::xla::bfloat16>(
           device_ordinal, allocator, stream, buffer_args[0], buffer_args[1],
           buffer_args[2], batch_size_, num_elements_, k_);
@@ -117,6 +133,7 @@ absl::StatusOr<ThunkProto> SelectKThunk::ToProto() const {
   select_k_proto->set_num_elements(num_elements_);
   select_k_proto->set_k(k_);
   select_k_proto->set_dtype(dtype_);
+  select_k_proto->set_payload_indices(payload_indices_);
 
   for (const BufferAllocation::Slice& arg : args_) {
     ASSIGN_OR_RETURN(*select_k_proto->add_args(), arg.ToProto());
@@ -139,7 +156,8 @@ absl::StatusOr<std::unique_ptr<SelectKThunk>> SelectKThunk::FromProto(
   }
   return std::make_unique<SelectKThunk>(
       thunk_info, proto.batch_size(), proto.num_elements(), proto.k(),
-      proto.dtype(), emitters::KernelArguments(std::move(arguments)));
+      proto.dtype(), emitters::KernelArguments(std::move(arguments)),
+      proto.payload_indices());
 }
 
 }  // namespace xla::gpu
