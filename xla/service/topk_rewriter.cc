@@ -52,6 +52,8 @@ limitations under the License.
 namespace xla {
 
 namespace m = match;
+static constexpr absl::string_view kTopKWithPayloadCustomCallTarget =
+    "__gpu$TopKWithPayload";
 
 static bool IsNanSafeGt(HloComputation* comp) {
   namespace m = match;
@@ -232,7 +234,16 @@ std::optional<int64_t> TopkRewriter::SortIsInTopK(HloInstruction* inst) {
   }
   HloInstruction* data = sort->mutable_operand(0);
 
-  if (sort->operand_count() == 2 && !HasIota(sort, data)) {
+  if (index_mode_ == IndexMode::kPayload) {
+    if (sort->operand_count() != 2 || !sort->is_stable()) {
+      return std::nullopt;
+    }
+    HloInstruction* payload = sort->mutable_operand(1);
+    if (payload->shape().element_type() != S32 ||
+        !ShapeUtil::SameDimensions(payload->shape(), data->shape())) {
+      return std::nullopt;
+    }
+  } else if (sort->operand_count() == 2 && !HasIota(sort, data)) {
     return std::nullopt;
   }
   if (!IsNanSafeGt(sort->to_apply())) {
@@ -294,8 +305,10 @@ struct TopKCustomCall {
   HloInstruction* index_gte;
 };
 
-TopKCustomCall CreateTopKCustomCall(HloSortInstruction* sort, const int64_t k) {
+TopKCustomCall CreateTopKCustomCall(HloSortInstruction* sort, const int64_t k,
+                                    bool payload_indices) {
   HloInstruction* input = sort->mutable_operand(0);
+  HloInstruction* payload = payload_indices ? sort->mutable_operand(1) : nullptr;
   Shape data_shape = input->shape();
   PrimitiveType element_type = data_shape.element_type();
   bool has_batch = data_shape.dimensions().size() >= 2;
@@ -329,6 +342,21 @@ TopKCustomCall CreateTopKCustomCall(HloSortInstruction* sort, const int64_t k) {
       input = sort->AddInstruction(
           HloInstruction::CreateTranspose(topk_input_shape, input, {1, 0}));
     }
+
+    if (payload_indices) {
+      if (data_shape.dimensions().size() > 2) {
+        payload = sort->AddInstruction(HloInstruction::CreateReshape(
+            sort_dim == 0 ? ShapeUtil::MakeShape(S32, {input_size, batch_size})
+                          : ShapeUtil::MakeShape(S32, {batch_size, input_size}),
+            payload));
+      }
+
+      if (sort_dim == 0) {
+        payload = sort->AddInstruction(HloInstruction::CreateTranspose(
+            ShapeUtil::MakeShape(S32, {batch_size, input_size}), payload,
+            {1, 0}));
+      }
+    }
   } else {
     topk_input_shape = data_shape;
   }
@@ -340,6 +368,10 @@ TopKCustomCall CreateTopKCustomCall(HloSortInstruction* sort, const int64_t k) {
                  ShapeUtil::MakeShape(S32, {batch_size, k})})
           : ShapeUtil::MakeTupleShape({ShapeUtil::MakeShape(element_type, {k}),
                                        ShapeUtil::MakeShape(S32, {k})});
+  std::vector<HloInstruction*> operands = {input};
+  if (payload_indices) {
+    operands.push_back(payload);
+  }
   HloInstruction* topk = sort->AddInstruction(HloInstruction::CreateCustomCall(
       topk_shape, {input}, sort->to_apply(), "TopK"));
   topk->set_raw_backend_config_string(absl::StrFormat(
@@ -401,7 +433,13 @@ absl::StatusOr<HloInstruction*> TopkRewriter::TransformPatternToCustomCall(
     return nullptr;
   }
 
-  TopKCustomCall topkcc = CreateTopKCustomCall(sort, k.value());
+  const bool payload_indices = index_mode_ == IndexMode::kPayload;
+  if (payload_indices && *k > 16) {
+    return nullptr;
+  }
+
+  TopKCustomCall topkcc =
+      CreateTopKCustomCall(sort, k.value(), payload_indices);
 
   for (HloInstruction* user : sort->users()) {
     if (sort->operand_count() == 2) {

@@ -83,11 +83,9 @@ static constexpr int32_t kNumParameters = 2;
 // Helper for allocating memory on the device.
 absl::StatusOr<se::DeviceAddressHandle> AllocateMemory(
     se::StreamExecutor* executor, int64_t size,
-    absl::string_view debug_buffer_name) {
+    absl::string_view debug_buffer_name, stream_executor::MemorySpace space) {
   se::DeviceAddressHandle local_buffer_alloc(
-      executor,
-      executor->Allocate(size, static_cast<int64_t>(
-                                   stream_executor::MemorySpace::kCollective)));
+      executor, executor->Allocate(size, static_cast<int64_t>(space)));
   if (local_buffer_alloc.address().is_null()) {
     return absl::InternalError(absl::StrFormat(
         "Failed to allocate %s for all-reduce.", debug_buffer_name));
@@ -213,15 +211,17 @@ absl::Status CollectiveKernelThunk::Prepare(const PrepareParams& params) {
         kNumSignalFlags * sizeof(int32_t), kXlaAllocatedBufferAlignBytes);
     const int64_t kLocalBufferSize = xla::RoundUpTo<uint64_t>(
         buffers_[0].source_buffer.slice.size(), kXlaAllocatedBufferAlignBytes);
+    const stream_executor::MemorySpace scratch_memory_space =
+        stream_executor::MemorySpace::kCollective;
     ASSIGN_OR_RETURN(
         se::DeviceAddressHandle local_buffers_handle,
         AllocateMemory(params.executor, kLocalBufferSize * kNumBuffers,
-                       "Local buffers"));
+                       "Local buffers", scratch_memory_space));
 
     ASSIGN_OR_RETURN(
         se::DeviceAddressHandle signal_buffers_handle,
         AllocateMemory(params.executor, kSignalBufferSize * kNumBuffers,
-                       "Signal buffers"));
+                       "Signal buffers", scratch_memory_space));
 
     per_stream_memory_.emplace(
         params.executor,

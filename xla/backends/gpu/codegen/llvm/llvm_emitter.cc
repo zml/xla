@@ -830,6 +830,13 @@ AsyncThunkSequence EmitBitonicSortLLVMIR(const HloSortInstruction* sort,
                uint64_t{1} << num_stages);
   // The tile size needs to be a power of 2.
   tile_size = uint64_t{1} << Log2Floor(tile_size);
+  if (ir_emitter_context->target_triple().isSPIROrSPIRV() &&
+      sort->operand_count() > 1) {
+    // The SPIR-V backend currently crashes in pre-legalization on the tiled
+    // shared-memory bitonic kernels emitted for tuple sorts. Fall back to
+    // simple per-mask kernels for correctness when a tuple sort remains.
+    tile_size = 1;
+  }
 
   // If we cannot combine several xor masks together, we don't use
   // tiling, so we calculate the standard launch dimensions for the

@@ -118,4 +118,35 @@ template absl::Status select_k_exec<::xla::bfloat16>(
     se::DeviceAddressBase, se::DeviceAddressBase, std::uint32_t, std::uint32_t,
     std::uint32_t);
 
+template <typename T>
+absl::Status select_k_payload_exec(
+    int device_ordinal, se::DeviceAddressAllocator* allocator,
+    se::Stream* stream, se::DeviceAddressBase data_in,
+    se::DeviceAddressBase indices_in, se::DeviceAddressBase data_out,
+    se::DeviceAddressBase indices_out, std::uint32_t batch, std::uint32_t n,
+    std::uint32_t k) {
+  (void)device_ordinal;
+  (void)allocator;
+  (void)stream;
+  (void)data_in;
+  (void)indices_in;
+  (void)data_out;
+  (void)indices_out;
+  (void)batch;
+  (void)n;
+  (void)k;
+  return absl::UnimplementedError(
+      "select_k_payload_exec is only implemented for oneAPI/SYCL");
+}
+
+template absl::Status select_k_payload_exec<float>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
+template absl::Status select_k_payload_exec<::xla::bfloat16>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
 }  // namespace xla::gpu

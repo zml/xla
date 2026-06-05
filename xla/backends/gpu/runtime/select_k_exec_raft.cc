@@ -354,4 +354,49 @@ absl::Status select_k_exec<::xla::bfloat16>(
                                     data_out, indices_out, batch, n, k);
 }
 
+template <typename T>
+absl::Status select_k_payload_exec(
+    int device_ordinal, se::DeviceAddressAllocator* allocator,
+    se::Stream* stream, se::DeviceAddressBase data_in,
+    se::DeviceAddressBase indices_in, se::DeviceAddressBase data_out,
+    se::DeviceAddressBase indices_out, std::uint32_t batch, std::uint32_t n,
+    std::uint32_t k) {
+  (void)device_ordinal;
+  (void)allocator;
+  (void)stream;
+  (void)data_in;
+  (void)indices_in;
+  (void)data_out;
+  (void)indices_out;
+  (void)batch;
+  (void)n;
+  (void)k;
+  return absl::UnimplementedError(
+      "select_k_payload_exec is only implemented for oneAPI/SYCL");
+}
+
+template absl::Status select_k_payload_exec<float>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
+template absl::Status select_k_payload_exec<nv_bfloat16>(
+    int, se::DeviceAddressAllocator*, se::Stream*, se::DeviceAddressBase,
+    se::DeviceAddressBase, se::DeviceAddressBase, se::DeviceAddressBase,
+    std::uint32_t, std::uint32_t, std::uint32_t);
+
+template <>
+absl::Status select_k_payload_exec<::xla::bfloat16>(
+    int device_ordinal, se::DeviceAddressAllocator* allocator,
+    se::Stream* stream, se::DeviceAddressBase data_in,
+    se::DeviceAddressBase indices_in, se::DeviceAddressBase data_out,
+    se::DeviceAddressBase indices_out, std::uint32_t batch, std::uint32_t n,
+    std::uint32_t k) {
+  static_assert(sizeof(::xla::bfloat16) == sizeof(nv_bfloat16),
+                "xla::bfloat16 and nv_bfloat16 must have the same size");
+  return select_k_payload_exec<nv_bfloat16>(
+      device_ordinal, allocator, stream, data_in, indices_in, data_out,
+      indices_out, batch, n, k);
+}
+
 }  // namespace xla::gpu
