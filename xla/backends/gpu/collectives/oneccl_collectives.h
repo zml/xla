@@ -19,11 +19,15 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
-#include "absl/status/status.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "oneapi/ccl.hpp"
+#include "xla/backends/gpu/collectives/cancellation_token.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/core/collectives/clique_id.h"
 #include "xla/core/collectives/clique_key.h"
@@ -37,45 +41,53 @@ class OnecclCollectives : public GpuCollectives {
  public:
   bool IsImplemented() const final { return true; }
 
-  absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final {
-    return MultiDeviceUnsupported();
-  }
+  absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final;
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
   CreateCommunicators(const CliqueKey& clique_key,
                       const std::optional<CliqueIds>& clique_ids,
                       absl::Span<const DeviceRank> ranks,
                       const Collectives::Config& config) final {
-    return MultiDeviceUnsupported();
+    return CreateCommunicatorsWithCancel(clique_key, clique_ids, ranks, config,
+                                         nullptr);
   }
 
-  absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator() final {
-    return MultiDeviceUnsupported();
-  }
+  absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
+  CreateCommunicatorsWithCancel(
+      const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+      absl::Span<const DeviceRank> ranks, const Collectives::Config& config,
+      std::shared_ptr<CancellationToken> cancel) final;
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(
       absl::Span<const Communicator* const> comms, int32_t color,
       absl::Span<const RankId> keys, const Collectives::Config& config,
       absl::Span<const DeviceRank> ranks) final {
-    return MultiDeviceUnsupported();
-  }
-  absl::StatusOr<void*> Allocate(uint64_t bytes) final {
-    return MultiDeviceUnsupported();
+    return SplitCommunicatorsWithCancel(comms, color, keys, config, ranks,
+                                        nullptr);
   }
 
-  absl::Status Deallocate(void* location) final { return absl::OkStatus(); }
+  absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
+  SplitCommunicatorsWithCancel(absl::Span<const Communicator* const> comms,
+                               int32_t color, absl::Span<const RankId> keys,
+                               const Collectives::Config& config,
+                               absl::Span<const DeviceRank> ranks,
+                               std::shared_ptr<CancellationToken> cancel) final;
+
+  absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator() final;
+
+  absl::StatusOr<void*> Allocate(uint64_t bytes) final;
+
+  absl::Status Deallocate(void* location) final;
 
   absl::StatusOr<CliqueIdCallback> InitializeTopology(
-      const Topology& topology) {
-    return nullptr;
-  }
+      const Topology& topology) final;
 
  private:
-  static absl::Status MultiDeviceUnsupported() {
-    return absl::UnimplementedError(
-        "oneAPI multi-device collectives are not supported; set "
-        "ONEAPI_DEVICE_SELECTOR=level_zero:0 to select a single device");
-  }
+  mutable absl::Mutex mu_;
+  mutable absl::flat_hash_map<std::string, std::shared_ptr<ccl::kvs>>
+      kvs_cache_ ABSL_GUARDED_BY(mu_);
 };
+
 }  // namespace xla::gpu
+
 #endif  // XLA_BACKENDS_GPU_COLLECTIVES_ONECCL_COLLECTIVES_H_

@@ -52,6 +52,25 @@ cc_library(
 )
 
 cc_library(
+    name = "ccl",
+    srcs = [
+        %{ccl_libs}
+    ],
+    data = [
+        %{ccl_libs}
+    ],
+    hdrs = [
+        %{ccl_headers}
+    ],
+    includes = [
+        ".",
+        "ccl/include",
+    ],
+    linkstatic = 1,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "mkl",
     srcs = [
         %{mkl_intel_ilp64_src}

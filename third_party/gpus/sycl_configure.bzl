@@ -45,6 +45,12 @@ def _l0_include_path(sycl_config):
 def _l0_library_path(sycl_config):
     return sycl_config.l0_library_dir
 
+def _ccl_include_path(sycl_config):
+    return sycl_config.ccl_include_dir
+
+def _ccl_library_path(sycl_config):
+    return sycl_config.ccl_library_dir
+
 def _sycl_header_path(repository_ctx, sycl_config, bash_bin):
     sycl_header_path = sycl_config.sycl_toolkit_path
     include_dir = sycl_header_path + "/include"
@@ -70,6 +76,7 @@ def _sycl_include_path(repository_ctx, sycl_config, bash_bin):
     inc_dirs = []
 
     inc_dirs.append(_mkl_include_path(sycl_config))
+    inc_dirs.append(_ccl_include_path(sycl_config))
     inc_dirs.append(_sycl_header_path(repository_ctx, sycl_config, bash_bin) + "/include")
     inc_dirs.append(_sycl_header_path(repository_ctx, sycl_config, bash_bin) + "/include/sycl")
 
@@ -251,6 +258,8 @@ def _find_libs(repository_ctx, sycl_config, bash_bin):
         libs_paths.append(("mkl_sycl_data_fitting", _sycl_lib_paths(repository_ctx, "mkl_sycl_data_fitting", mkl_path)))
     l0_path = _l0_library_path(sycl_config)
     libs_paths.append(("ze_loader", _sycl_lib_paths(repository_ctx, "ze_loader", l0_path)))
+    ccl_path = _ccl_library_path(sycl_config)
+    libs_paths.append(("ccl", _sycl_lib_paths(repository_ctx, "ccl", ccl_path)))
     return _select_sycl_lib_paths(repository_ctx, libs_paths, bash_bin)
 
 def find_sycl_config(repository_ctx):
@@ -279,6 +288,8 @@ def _get_sycl_config(repository_ctx, bash_bin):
     mkl_library_dir = config["mkl_library_dir"]
     l0_include_dir = config["l0_include_dir"]
     l0_library_dir = config["l0_library_dir"]
+    ccl_include_dir = config["ccl_include_dir"]
+    ccl_library_dir = config["ccl_library_dir"]
     return struct(
         sycl_basekit_path = sycl_basekit_path,
         sycl_toolkit_path = sycl_toolkit_path,
@@ -288,6 +299,8 @@ def _get_sycl_config(repository_ctx, bash_bin):
         mkl_library_dir = mkl_library_dir,
         l0_include_dir = l0_include_dir,
         l0_library_dir = l0_library_dir,
+        ccl_include_dir = ccl_include_dir,
+        ccl_library_dir = ccl_library_dir,
     )
 
 def _tpl_path(repository_ctx, labelname):
@@ -457,6 +470,8 @@ def _create_dummy_repository(
             "%{mkl_sycl_libs}": "",
             "%{level_zero_libs}": "",
             "%{level_zero_headers}": "",
+            "%{ccl_libs}": "",
+            "%{ccl_headers}": "",
             "%{sycl_headers}": "",
             "%{copy_rules}": "\n".join(copy_rules) if copy_rules else "",
         },
@@ -536,6 +551,8 @@ def _create_local_sycl_repository(repository_ctx):
             mkl_library_dir = install_path + "/oneapi/mkl/" + oneapi_version + "/lib",
             l0_include_dir = install_path + "/level-zero-1.21.10/include",
             l0_library_dir = install_path + "/lib",
+            ccl_include_dir = install_path + "/oneapi/ccl/latest/include",
+            ccl_library_dir = install_path + "/oneapi/ccl/latest/lib",
         )
     else:
         install_path = repository_ctx.getenv("SYCL_TOOLKIT_PATH") or "/opt/intel/oneapi/compiler/2025.1"
@@ -562,6 +579,12 @@ def _create_local_sycl_repository(repository_ctx):
         name = "level-zero-include",
         src_dir = _l0_include_path(sycl_config),
         out_dir = "level_zero/include/level_zero",
+    ))
+    copy_rules.append(make_copy_dir_rule(
+        repository_ctx,
+        name = "ccl-include",
+        src_dir = _ccl_include_path(sycl_config),
+        out_dir = "ccl/include",
     ))
 
     sycl_libs = _find_libs(repository_ctx, sycl_config, bash_bin)
@@ -603,6 +626,7 @@ def _create_local_sycl_repository(repository_ctx):
             "sycl/lib/" + sycl_libs["mkl_sycl_data_fitting"].file_name,
         )
     level_zero_libs = '"{}",\n'.format("sycl/lib/" + sycl_libs["ze_loader"].file_name)
+    ccl_libs = '"{}",\n'.format("sycl/lib/" + sycl_libs["ccl"].file_name)
 
     def _fmt_src(path):
         return '"%s",\n' % path
@@ -621,6 +645,8 @@ def _create_local_sycl_repository(repository_ctx):
         "%{sycl_headers}": '":mkl-include",\n":sycl-include",\n',
         "%{level_zero_libs}": level_zero_libs,
         "%{level_zero_headers}": '":level-zero-include"',
+        "%{ccl_libs}": ccl_libs,
+        "%{ccl_headers}": '":ccl-include"',
     }
     repository_ctx.template(
         "sycl/BUILD",
