@@ -45,6 +45,8 @@ limitations under the License.
 #include "xla/backends/autotuner/backends.pb.h"
 #include "xla/backends/gpu/ffi.h"
 #include "xla/backends/gpu/runtime/async_thunk.h"
+#include "xla/backends/gpu/runtime/sequential_thunk.h"
+#include "xla/backends/gpu/runtime/select_k_thunk.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
@@ -1701,6 +1703,67 @@ ENTRY main {
     default:
       FAIL() << "Unexpected TopKImpl: " << static_cast<int>(expected_impl);
   }
+}
+
+TEST_F(GpuCompilerTest, OneApiTopKWithPayloadLowersToSelectKThunk) {
+  if (!device_description().gpu_compute_capability().IsOneAPI()) {
+    GTEST_SKIP() << "Payload SelectK lowering is oneAPI-specific.";
+  }
+
+  constexpr absl::string_view hlo_text = R"(
+HloModule m
+
+compare {
+  lhs_value = f32[] parameter(0)
+  rhs_value = f32[] parameter(1)
+  lhs_index = s32[] parameter(2)
+  rhs_index = s32[] parameter(3)
+  ROOT result = pred[] compare(lhs_value, rhs_value), direction=GT
+}
+
+ENTRY main {
+  values = f32[2048,8]{1,0} parameter(0)
+  ids = s32[2048,8]{1,0} parameter(1)
+  sort = (f32[2048,8]{1,0}, s32[2048,8]{1,0}) sort(values, ids),
+    dimensions={1}, is_stable=true, to_apply=compare
+  sorted_values = f32[2048,8]{1,0} get-tuple-element(sort), index=0
+  top_values = f32[2048,4]{1,0} slice(sorted_values),
+    slice={[0:2048], [0:4]}
+  sorted_ids = s32[2048,8]{1,0} get-tuple-element(sort), index=1
+  top_ids = s32[2048,4]{1,0} slice(sorted_ids), slice={[0:2048], [0:4]}
+  ROOT tuple = (f32[2048,4]{1,0}, s32[2048,4]{1,0}) tuple(top_values, top_ids)
+}
+)";
+
+  HloModuleConfig config;
+  DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_experimental_use_raft_select_k(true);
+  config.set_debug_options(debug_options);
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_text, config));
+
+  Compiler::CompileOptions compile_options;
+  compile_options.gpu_topology =
+      GetSingleDeviceGpuTopology(/*platform_version=*/"", gpu_target_config());
+  compile_options.early_exit_with_layouts = false;
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> compiled_module,
+      compiler()->RunHloPasses(module->Clone(), /*executor=*/nullptr,
+                               compile_options));
+
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<Executable> executable,
+      compiler()->RunBackend(std::move(compiled_module), /*executor=*/nullptr,
+                             compile_options));
+
+  const auto* gpu_executable = absl::down_cast<GpuExecutable*>(executable.get());
+  const ThunkSequence& thunks = gpu_executable->thunk_executor().thunks();
+  ASSERT_THAT(thunks, ::testing::ElementsAre(ThunkKindIs(Thunk::kSelectK)));
+
+  const auto* select_k_thunk =
+      tsl::down_cast<const SelectKThunk*>(thunks.front().get());
+  EXPECT_TRUE(select_k_thunk->payload_indices());
 }
 
 XLA_FFI_DEFINE_HANDLER(

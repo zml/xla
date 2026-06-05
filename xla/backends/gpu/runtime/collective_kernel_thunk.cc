@@ -72,11 +72,9 @@ namespace {
 // Helper for allocating memory on the device.
 absl::StatusOr<se::DeviceAddressHandle> AllocateMemory(
     se::StreamExecutor* executor, int64_t size,
-    absl::string_view debug_buffer_name) {
+    absl::string_view debug_buffer_name, stream_executor::MemorySpace space) {
   se::DeviceAddressHandle local_buffer_alloc(
-      executor,
-      executor->Allocate(size, static_cast<int64_t>(
-                                   stream_executor::MemorySpace::kCollective)));
+      executor, executor->Allocate(size, static_cast<int64_t>(space)));
   if (local_buffer_alloc.address().is_null()) {
     return absl::InternalError(absl::StrFormat(
         "Failed to allocate %s for all-reduce.", debug_buffer_name));

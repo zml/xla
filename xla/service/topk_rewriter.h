@@ -37,9 +37,16 @@ namespace xla {
 // the CustomCall and it is more efficient to use that implementation.
 class TopkRewriter : public HloModulePass {
  public:
+  enum class IndexMode {
+    kGenerated,
+    kPayload,
+  };
+
   explicit TopkRewriter(std::function<bool(const HloSortInstruction*, int64_t)>
-                            is_profitable_to_convert)
-      : is_profitable_to_convert_(std::move(is_profitable_to_convert)) {}
+                            is_profitable_to_convert,
+                        IndexMode index_mode = IndexMode::kGenerated)
+      : is_profitable_to_convert_(std::move(is_profitable_to_convert)),
+        index_mode_(index_mode) {}
 
   absl::string_view name() const override { return "topk-rewriter"; }
 
@@ -61,6 +68,7 @@ class TopkRewriter : public HloModulePass {
   // converted into a custom call.
   std::function<bool(const HloSortInstruction*, int64_t)>
       is_profitable_to_convert_;
+  IndexMode index_mode_;
 
   // Matches the input to the sort+iota+slice pattern and converts to custom
   // call if profitable. Returns the custom call if one was created.

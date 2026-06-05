@@ -150,7 +150,8 @@ absl::StatusOr<bool> IsCublasSupportedMatMul(
 
 bool IsCustomCallToTopK(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&
-         hlo.custom_call_target() == kTopKCustomCallTarget;
+         (hlo.custom_call_target() == kTopKCustomCallTarget ||
+          hlo.custom_call_target() == kTopKWithPayloadCustomCallTarget);
 }
 
 bool IsCustomCallToPtxKernel(const HloInstruction& hlo) {
