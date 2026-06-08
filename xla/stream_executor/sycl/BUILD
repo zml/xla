@@ -265,6 +265,41 @@ sycl_library(
     ],
 )
 
+sycl_library(
+    name = "sycl_command_buffer",
+    srcs = ["sycl_command_buffer.cc"],
+    hdrs = ["sycl_command_buffer.h"],
+    tags = [
+        "gpu",
+        "oneapi-only",
+    ],
+    deps = [
+        ":sycl_kernel",
+        ":sycl_stream",
+        "//xla/stream_executor:bit_pattern",
+        "//xla/stream_executor:command_buffer",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:status_macros",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 cc_library(
     name = "sycl_executor",
     srcs = ["sycl_executor.cc"],
@@ -275,6 +310,7 @@ cc_library(
         "oneapi-only",
     ],
     deps = [
+        ":sycl_command_buffer",
         ":sycl_context",
         ":sycl_device_description",
         ":sycl_event",

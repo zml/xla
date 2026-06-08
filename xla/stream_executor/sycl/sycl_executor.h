@@ -143,6 +143,10 @@ class SyclExecutor : public gpu::GpuExecutor {
   // Creates a new SYCL event.
   absl::StatusOr<std::unique_ptr<Event>> CreateEvent() override;
 
+  // Creates a new SYCL command buffer.
+  absl::StatusOr<std::unique_ptr<CommandBuffer>> CreateCommandBuffer(
+      CommandBuffer::Mode mode) override;
+
   // Allocates host memory of the given size (in bytes).
   // Returns a unique_ptr to the allocation or an error on failure.
   absl::StatusOr<std::unique_ptr<MemoryAllocation>> HostMemoryAllocate(
