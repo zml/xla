@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <variant>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/numeric/int128.h"
@@ -256,6 +257,42 @@ absl::uint128 FingerprintSpirv(absl::Span<const uint8_t> spirv) {
 std::string FingerprintToString(absl::uint128 fingerprint) {
   return absl::StrFormat("%016x%016x", absl::Uint128High64(fingerprint),
                          absl::Uint128Low64(fingerprint));
+}
+
+absl::Mutex& PeerAccessMutex() {
+  static auto* mu = new absl::Mutex;
+  return *mu;
+}
+
+absl::flat_hash_set<std::string>& EnabledPeerAccessPairs() {
+  static auto* pairs = new absl::flat_hash_set<std::string>;
+  return *pairs;
+}
+
+std::string PeerAccessKey(int from_ordinal, int to_ordinal) {
+  return absl::StrCat(from_ordinal, "->", to_ordinal);
+}
+
+absl::StatusOr<bool> LevelZeroCanAccessPeer(const sycl::device& device,
+                                            const sycl::device& peer) {
+  try {
+    ze_device_handle_t ze_device =
+        sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device);
+    ze_device_handle_t ze_peer =
+        sycl::get_native<sycl::backend::ext_oneapi_level_zero>(peer);
+    ze_bool_t can_access = false;
+    ze_result_t result =
+        zeDeviceCanAccessPeer(ze_device, ze_peer, &can_access);
+    if (result != ZE_RESULT_SUCCESS) {
+      return absl::InternalError(
+          absl::StrCat("zeDeviceCanAccessPeer failed with Level Zero error ",
+                       result));
+    }
+    return can_access != 0;
+  } catch (const sycl::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Level Zero peer-access query failed: ", e.what()));
+  }
 }
 
 // Retrieves the device address and size of a global symbol from a Level Zero
@@ -830,14 +867,94 @@ void SyclExecutor::DeallocateStream(Stream* stream) {
 }
 
 absl::Status SyclExecutor::EnablePeerAccessTo(StreamExecutor* other) {
-  return absl::UnimplementedError(
-      "SyclExecutor::EnablePeerAccessTo is not implemented.");
+  if (other == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclExecutor::EnablePeerAccessTo: other executor is null");
+  }
+
+  auto* other_executor = dynamic_cast<SyclExecutor*>(other);
+  if (other_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclExecutor::EnablePeerAccessTo: other executor is not a "
+        "SyclExecutor");
+  }
+
+  if (device_ordinal() == other_executor->device_ordinal() ||
+      device_ == other_executor->GetDevice()) {
+    return absl::OkStatus();
+  }
+
+  if (!CanEnablePeerAccessTo(other)) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "SyclExecutor::EnablePeerAccessTo: peer access from device %d to "
+        "device %d is not supported",
+        device_ordinal(), other_executor->device_ordinal()));
+  }
+
+  const std::string key =
+      PeerAccessKey(device_ordinal(), other_executor->device_ordinal());
+  {
+    absl::MutexLock lock(&PeerAccessMutex());
+    auto& enabled_pairs = EnabledPeerAccessPairs();
+    if (enabled_pairs.find(key) != enabled_pairs.end()) {
+      return absl::OkStatus();
+    }
+
+    try {
+      device_.ext_oneapi_enable_peer_access(other_executor->GetDevice());
+    } catch (const sycl::exception& e) {
+      return absl::InternalError(absl::StrFormat(
+          "SyclExecutor::EnablePeerAccessTo: failed to enable peer access "
+          "from device %d to device %d: %s",
+          device_ordinal(), other_executor->device_ordinal(), e.what()));
+    }
+
+    enabled_pairs.insert(key);
+  }
+
+  VLOG(1) << "Enabled SYCL peer access from device " << device_ordinal()
+          << " to device " << other_executor->device_ordinal();
+  return absl::OkStatus();
 }
 
 bool SyclExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {
-  // TODO (intel-tf): Implement this feature for SYCL.
-  LOG(INFO) << "SyclExecutor::CanEnablePeerAccessTo is not implemented.";
-  return false;
+  if (other == nullptr) {
+    LOG(ERROR) << "SyclExecutor::CanEnablePeerAccessTo: other executor is null";
+    return false;
+  }
+
+  auto* other_executor = dynamic_cast<SyclExecutor*>(other);
+  if (other_executor == nullptr) {
+    VLOG(1) << "SyclExecutor::CanEnablePeerAccessTo: other executor is not a "
+               "SyclExecutor";
+    return false;
+  }
+
+  if (device_ordinal() == other_executor->device_ordinal() ||
+      device_ == other_executor->GetDevice()) {
+    return true;
+  }
+
+  const sycl::device peer_device = other_executor->GetDevice();
+  absl::StatusOr<bool> level_zero_can_access =
+      LevelZeroCanAccessPeer(device_, peer_device);
+  if (level_zero_can_access.ok()) {
+    return *level_zero_can_access;
+  }
+
+  VLOG(1) << "SyclExecutor::CanEnablePeerAccessTo: "
+          << level_zero_can_access.status()
+          << "; falling back to SYCL peer-access query";
+  try {
+    return device_.ext_oneapi_can_access_peer(
+        peer_device, sycl::ext::oneapi::peer_access::access_supported);
+  } catch (const sycl::exception& e) {
+    LOG(WARNING) << "SyclExecutor::CanEnablePeerAccessTo: SYCL peer-access "
+                    "query failed from device "
+                 << device_ordinal() << " to device "
+                 << other_executor->device_ordinal() << ": " << e.what();
+    return false;
+  }
 }
 
 bool SyclExecutor::DeviceMemoryUsage(int64_t* free_bytes,
