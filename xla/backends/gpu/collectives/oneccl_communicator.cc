@@ -385,10 +385,10 @@ absl::Status OnecclCommunicator::GroupEnd() {
 }
 
 Future<> OnecclCommunicator::GroupExecute(
-    absl::AnyInvocable<absl::Status(GpuCommunicator*)> f) {
-  return Execute([f = std::move(f), this]() mutable -> absl::Status {
+    absl::AnyInvocable<absl::Status() &&> group) {
+  return Execute([group = std::move(group), this]() mutable -> absl::Status {
     RETURN_IF_ERROR(GroupStart());
-    absl::Status status = f(this);
+    absl::Status status = std::move(group)();
     absl::Status group_status = GroupEnd();
     if (!status.ok()) {
       return status;

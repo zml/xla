@@ -81,8 +81,7 @@ class OnecclCommunicator final : public GpuCommunicator {
   absl::StatusOr<std::unique_ptr<SymmetricMemory>> CreateSymmetricMemory(
       se::DeviceAddressBase addr) final;
 
-  Future<> GroupExecute(
-      absl::AnyInvocable<absl::Status(GpuCommunicator*)> f) final;
+  Future<> GroupExecute(absl::AnyInvocable<absl::Status() &&> group) final;
 
   Future<> AllReduce(se::DeviceAddressBase send_buffer,
                      se::DeviceAddressBase recv_buffer, PrimitiveType dtype,
