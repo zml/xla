@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/sycl/sycl_context.h"
+#include "xla/stream_executor/sycl/sycl_command_buffer.h"
 #include "xla/stream_executor/sycl/sycl_device_description.h"
 #include "xla/stream_executor/sycl/sycl_event.h"
 #include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
@@ -853,6 +854,12 @@ absl::StatusOr<std::unique_ptr<Stream>> SyclExecutor::CreateStream(
 absl::StatusOr<std::unique_ptr<Event>> SyclExecutor::CreateEvent() {
   ASSIGN_OR_RETURN(auto event, SyclEvent::Create(this));
   return std::make_unique<SyclEvent>(std::move(event));
+}
+
+absl::StatusOr<std::unique_ptr<CommandBuffer>>
+SyclExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
+  ASSIGN_OR_RETURN(sycl::context context, GetContext());
+  return SyclCommandBuffer::Create(mode, this, std::move(context), device_);
 }
 
 absl::StatusOr<std::unique_ptr<MemoryAllocation>>
