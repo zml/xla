@@ -9,11 +9,6 @@ load("@rules_ml_toolchain//cc/sysroots:local_sysroot_configure.bzl", "local_sysr
 load("@rules_ml_toolchain//gpu/rocm:hipcc_configure.bzl", "hipcc_configure")
 load("@rules_ml_toolchain//gpu/sycl:sycl_configure.bzl", "sycl_configure")
 load("@rules_ml_toolchain//gpu/sycl:sycl_init_repository.bzl", "sycl_init_repository")
-load(
-    "@rules_ml_toolchain//gpu/sycl:sycl_redist_versions.bzl",
-    "BUILD_TEMPLATES",
-    "REDIST_DICT",
-)
 load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 load("//third_party/absl:workspace.bzl", absl = "repo")
 load("//third_party/benchmark:workspace.bzl", benchmark = "repo")
@@ -79,50 +74,6 @@ load("//tools/toolchains/clang6:repo.bzl", "clang6_configure")
 load("//tools/toolchains/embedded/arm-linux:arm_linux_toolchain_configure.bzl", "arm_linux_toolchain_configure")
 load("//tools/toolchains/remote:configure.bzl", "remote_execution_configure")
 load("//tools/toolchains/remote_config:configs.bzl", "initialize_rbe_configs")
-
-_SYCL_ONEAPI_2026_DIST_KEY = "ubuntu_24.04_2026.0"
-
-_SYCL_2026_REDISTS = {
-    "oneapi": [
-        "https://github.com/neudinger/rules-ml-toolchain-redists/releases/download/oneapi-v2026.0.0.198-ubuntu_24.04-x86_64/intel-oneapi-toolkit-2026.0.0.198-ubuntu_24.04-x86_64.tar.zst",
-        "bd6ee118d17d05078607ca5609fecefb84197ebd1a2c0f24eb6e9ea63f1719a1",
-        "oneapi",
-    ],
-    "level_zero": [
-        "https://d3q76yfpnzmnjx.cloudfront.net/level-zero-1.21.10.tar.gz",
-        "e0ff1c6cb9b551019579a2dd35c3a611240c1b60918c75345faf9514142b9c34",
-        "level-zero-1.21.10",
-    ],
-    "zero_loader": [
-        "https://d3q76yfpnzmnjx.cloudfront.net/ze_loader_libs.tar.gz",
-        "71cbfd8ac59e1231f013e827ea8efe6cf5da36fad771da2e75e202423bd6b82e",
-        "",
-    ],
-}
-
-_SYCL_2026_BUILD_TEMPLATES = {
-    "oneapi": "@rules_ml_toolchain//gpu/sycl:oneapi.BUILD.tpl",
-    "level_zero": "@rules_ml_toolchain//gpu/sycl:level_zero.BUILD",
-    "zero_loader": "@rules_ml_toolchain//gpu/sycl:zero_loader.BUILD",
-}
-
-def _sycl_redist_dict():
-    redist_dict = dict(REDIST_DICT)
-    for dist_name, redist in _SYCL_2026_REDISTS.items():
-        dist_redists = dict(REDIST_DICT[dist_name])
-        dist_redists[_SYCL_ONEAPI_2026_DIST_KEY] = redist
-        redist_dict[dist_name] = dist_redists
-    return redist_dict
-
-def _sycl_build_templates():
-    build_templates = dict(BUILD_TEMPLATES)
-    for dist_name, build_template in _SYCL_2026_BUILD_TEMPLATES.items():
-        dist_build_templates = dict(BUILD_TEMPLATES[dist_name])
-        version_to_template = dict(BUILD_TEMPLATES[dist_name]["version_to_template"])
-        version_to_template[_SYCL_ONEAPI_2026_DIST_KEY] = build_template
-        dist_build_templates["version_to_template"] = version_to_template
-        build_templates[dist_name] = dist_build_templates
-    return build_templates
 
 def _initialize_third_party():
     """ Load third party repositories.  See above load() statements. """
@@ -202,10 +153,7 @@ def _tf_toolchains():
 
     local_clang_configure(name = "local_config_clang")
     local_sysroot_configure(name = "local_sysroot_config")
-    sycl_init_repository(
-        build_templates = _sycl_build_templates(),
-        redist_dict = _sycl_redist_dict(),
-    )
+    sycl_init_repository()
     sycl_configure(name = "local_config_sycl")
     remote_execution_configure(name = "local_config_remote_execution")
 

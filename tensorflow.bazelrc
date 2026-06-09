@@ -318,8 +318,6 @@ common:icpx_clang --copt=-Wno-unknown-warning-option
 common:sycl_hermetic --config=sycl
 common:sycl_hermetic --config=icpx_clang
 common:sycl_hermetic --repo_env=SYCL_BUILD_HERMETIC=1
-common:sycl_hermetic --repo_env=ONEAPI_VERSION=2026.0
-common:sycl_hermetic --repo_env=OS=ubuntu_24.04
 
 # Options to disable default on features
 common:nonccl --define=no_nccl_support=true
