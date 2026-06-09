@@ -1,3 +1,6 @@
+load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
+load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tests:build_defs.bzl", "xla_test")
@@ -152,10 +155,21 @@ cc_library(
     name = "compilation_pipeline",
     srcs = [
         "compilation_pipeline.cc",
+    ] + if_cuda([
         "compilation_pipeline_cuda.cc",
+    ]) + if_sycl([
+        "compilation_pipeline_oneapi.cc",
+    ]) + if_rocm([
         "compilation_pipeline_rocm.cc",
-    ],
+    ]),
     hdrs = ["compilation_pipeline.h"],
+    local_defines = if_cuda([
+        "GOOGLE_CUDA=1",
+    ]) + if_rocm([
+        "TENSORFLOW_USE_ROCM=1",
+    ]) + if_sycl([
+        "TENSORFLOW_USE_SYCL=1",
+    ]),
     deps = [
         ":extern_function_helper",
         "//xla/backends/gpu/codegen/emitters/transforms:passes",
@@ -165,10 +179,9 @@ cc_library(
         "//xla/service:hlo_module_config",
         "//xla/service/gpu:matmul_utils",
         "//xla/stream_executor:device_description",
-        "//xla/stream_executor/cuda:cuda_compute_capability",
-        "//xla/stream_executor/rocm:rocm_compute_capability",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
@@ -177,27 +190,40 @@ cc_library(
         "@llvm-project//mlir:ControlFlowToLLVM",
         "@llvm-project//mlir:IndexToLLVM",
         "@llvm-project//mlir:LLVMDialect",
-        "@llvm-project//mlir:NVVMToLLVM",
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:SCFToControlFlow",
         "@llvm-project//mlir:Transforms",
-        "@triton//:GluonTransforms",
         "@triton//:TritonDialects",
         "@triton//:TritonGPUToLLVM",
         "@triton//:TritonGPUTransforms",
-        "@triton//:TritonInstrumentTransforms",
-        "@triton//:TritonLLVMIR",
-        "@triton//:TritonNvidiaGPUTransforms",
         "@triton//:TritonToTritonGPU",
         "@triton//:TritonToTritonGPUPasses",
         "@triton//:TritonTransforms",
+    ] + if_cuda([
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@llvm-project//mlir:NVVMToLLVM",
+        "@triton//:GluonTransforms",
+        "@triton//:TritonInstrumentTransforms",
+        "@triton//:TritonLLVMIR",
+        "@triton//:TritonNvidiaGPUTransforms",
         "@triton//:WarpSpecialization",
-        "@triton//third_party/amd:TritonAMDGPUToLLVM",
-        "@triton//third_party/amd:TritonAMDGPUTransforms",
         "@triton//third_party/nvidia:NVGPUToLLVM",
         "@triton//third_party/nvidia:NVHopperTransforms",
         "@triton//third_party/nvidia:TritonNVIDIAGPUToLLVM",
-    ],
+    ]) + if_sycl([
+        "//xla/stream_executor/sycl:oneapi_compute_capability",
+        "@llvm-project//mlir:SPIRVDialect",
+        "@triton//:TritonAnnotateModule",
+        "@triton//:TritonGENIR",
+        "@triton//:TritonGENToLLVM",
+        "@triton//:TritonIntelGPUToLLVM",
+        "@triton//:TritonIntelGPUTransforms",
+        "@triton//:TritonIntelTransforms",
+    ]) + if_rocm([
+        "//xla/stream_executor/rocm:rocm_compute_capability",
+        "@triton//third_party/amd:TritonAMDGPUToLLVM",
+        "@triton//third_party/amd:TritonAMDGPUTransforms",
+    ]),
 )
 
 xla_cc_test(

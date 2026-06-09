@@ -171,12 +171,18 @@ absl::Status EmitCompareLoopBody(
     }
     auto compare_keys_index =
         b->CreateXor(current_keys_index, index_typed_constant(xor_mask));
-    // compare_keys_index < iteration_bound
-    llvm::Value* index_is_inbounds =
+    llvm::Value* current_index_is_inbounds =
+        needs_bounds_checks
+            ? b->CreateICmpSLT(current_keys_index,
+                               index_typed_constant(iteration_bound))
+            : b->getInt1(true);
+    llvm::Value* compare_index_is_inbounds =
         needs_bounds_checks
             ? b->CreateICmpSLT(compare_keys_index,
                                index_typed_constant(iteration_bound))
             : b->getInt1(true);
+    llvm::Value* index_is_inbounds =
+        b->CreateAnd(current_index_is_inbounds, compare_index_is_inbounds);
 
     // if (index_is_inbounds)
     KernelSupportLibrary ksl(b);
@@ -246,6 +252,23 @@ absl::Status EmitCompareLoopBody(
 
           return absl::OkStatus();
         }));
+    if (force_write) {
+      llvm::Value* write_current_without_comparison = b->CreateAnd(
+          current_index_is_inbounds, b->CreateNot(compare_index_is_inbounds));
+      RETURN_IF_ERROR(ksl.IfWithStatus(
+          "write_current_without_comparison", write_current_without_comparison,
+          [&]() -> absl::Status {
+            for (int i = 0; i < num_values; ++i) {
+              ASSIGN_OR_RETURN(llvm::Value * address,
+                               element_address(i, current_keys_index));
+              llvm::Type* pointee_type =
+                  element_address_pointee_type(i, current_keys_index);
+              llvm::Value* value = b->CreateLoad(pointee_type, address);
+              write_element(i, current_keys_index, value);
+            }
+            return absl::OkStatus();
+          }));
+    }
   }
   return absl::OkStatus();
 }

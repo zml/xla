@@ -18,6 +18,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -60,6 +61,36 @@ namespace {
 namespace ttir = ::mlir::triton;
 namespace ma = ::mlir::arith;
 namespace xtile = ::xla::xtile;
+
+template <typename T = ttir::LoadOp>
+auto CreateScalarLoad(ImplicitLocOpBuilder& builder, Type result_type,
+                      Value ptr, int)
+    -> decltype(T::create(builder, result_type, ptr, Value(), Value(),
+                          llvm::ArrayRef<int32_t>{},
+                          ttir::PaddingOptionAttr(),
+                          ttir::CacheModifier::NONE,
+                          ttir::EvictionPolicy::NORMAL, false)) {
+  return T::create(builder, result_type, ptr, Value(), Value(),
+                   llvm::ArrayRef<int32_t>{}, ttir::PaddingOptionAttr(),
+                   ttir::CacheModifier::NONE, ttir::EvictionPolicy::NORMAL,
+                   false);
+}
+
+template <typename T = ttir::LoadOp>
+auto CreateScalarLoad(ImplicitLocOpBuilder& builder, Type result_type,
+                      Value ptr, long)
+    -> decltype(T::create(builder, result_type, ptr, Value(), Value(),
+                          ttir::CacheModifier::NONE,
+                          ttir::EvictionPolicy::NORMAL, false)) {
+  return T::create(builder, result_type, ptr, Value(), Value(),
+                   ttir::CacheModifier::NONE, ttir::EvictionPolicy::NORMAL,
+                   false);
+}
+
+ttir::LoadOp CreateScalarLoad(ImplicitLocOpBuilder& builder, Type result_type,
+                              Value ptr) {
+  return CreateScalarLoad(builder, result_type, ptr, 0);
+}
 
 // Get the new arg types of the lowered function by translating memrefs to the
 // corresponding pointer types.
@@ -176,13 +207,7 @@ class XTileSelectBufferToTriton
     auto ptr_addr = mlir::triton::AddPtrOp::create(
         b, memref_to_ptr.getType(), memref_to_ptr, replica_id_i64);
     // Dereference the outer pointer.
-    auto addr_i64 =
-        mlir::triton::LoadOp::create(b, b.getI64Type(), ptr_addr.getResult(),
-                                     /*mask=*/mlir::Value(),
-                                     /*other=*/mlir::Value(),               //
-                                     mlir::triton::CacheModifier::NONE,     //
-                                     mlir::triton::EvictionPolicy::NORMAL,  //
-                                     /*isVolatile=*/false);
+    auto addr_i64 = CreateScalarLoad(b, b.getI64Type(), ptr_addr.getResult());
     auto result_memref_type = mlir::cast<mlir::MemRefType>(op.getType());
     mlir::Type target_ptr_type =
         ttir::getPointerTypeToElement(result_memref_type.getElementType());
