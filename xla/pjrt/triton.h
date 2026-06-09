@@ -31,8 +31,11 @@ struct AsmText {
 struct HsacoPath {
   std::string value;
 };
+struct SpirvBinary {
+  std::string value;
+};
 struct CompilationResult {
-  std::variant<AsmText, HsacoPath> compiled_output;
+  std::variant<AsmText, HsacoPath, SpirvBinary> compiled_output;
   int64_t smem_bytes;
   int32_t global_scratch_size;
   int cluster_dim_x;

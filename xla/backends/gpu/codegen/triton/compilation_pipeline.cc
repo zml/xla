@@ -15,17 +15,14 @@ limitations under the License.
 
 #include "xla/backends/gpu/codegen/triton/compilation_pipeline.h"
 
-#include <cassert>
-
+#include "absl/log/log.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "xla/backends/gpu/codegen/emitters/transforms/passes.h"
 #include "xla/backends/gpu/codegen/triton/transforms/passes.h"
 #include "xla/codegen/emitters/transforms/passes.h"
-#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
-#include "xla/stream_executor/rocm/rocm_compute_capability.h"
 
 namespace xla::gpu {
 
@@ -91,26 +88,50 @@ void CreateTritonXlaPipeline(
       }));
 }
 
+#if defined(GOOGLE_CUDA)
 void CreateTritonCudaPipeline(
     mlir::OpPassManager* pm,
     const stream_executor::CudaComputeCapability& cuda_cc, int num_warps,
     int num_ctas, int num_stages);
+#endif
 
+#if defined(TENSORFLOW_USE_ROCM)
 void CreateTritonRocmPipeline(
     mlir::OpPassManager* pm,
     const stream_executor::RocmComputeCapability& rocm_cc, int num_warps,
     int num_ctas, int num_stages);
+#endif
+
+#if defined(TENSORFLOW_USE_SYCL)
+void CreateTritonOneApiPipeline(
+    mlir::OpPassManager* pm,
+    const stream_executor::OneAPIComputeCapability& oneapi_cc, int num_warps,
+    int num_ctas, int num_stages);
+#endif
 
 void CreateTritonPipeline(mlir::OpPassManager* pm,
                           const stream_executor::GpuComputeCapability& gpu_cc,
                           int num_warps, int num_ctas, int num_stages) {
+#if defined(GOOGLE_CUDA)
   if (auto* cuda_cc = gpu_cc.cuda_compute_capability()) {
     return CreateTritonCudaPipeline(pm, *cuda_cc, num_warps, num_ctas,
                                     num_stages);
   }
+#endif
+#if defined(TENSORFLOW_USE_SYCL)
+  if (auto* oneapi_cc = gpu_cc.oneapi_compute_capability()) {
+    return CreateTritonOneApiPipeline(pm, *oneapi_cc, num_warps, num_ctas,
+                                      num_stages);
+  }
+#endif
+#if defined(TENSORFLOW_USE_ROCM)
+  if (auto* rocm_cc = gpu_cc.rocm_compute_capability()) {
+    return CreateTritonRocmPipeline(pm, *rocm_cc, num_warps, num_ctas,
+                                    num_stages);
+  }
+#endif
 
-  CreateTritonRocmPipeline(pm, *gpu_cc.rocm_compute_capability(), num_warps,
-                           num_ctas, num_stages);
+  LOG(FATAL) << "Unsupported GPU target for Triton: " << gpu_cc.ToString();
 }
 
 }  // namespace xla::gpu

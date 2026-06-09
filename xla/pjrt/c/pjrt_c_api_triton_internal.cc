@@ -32,6 +32,10 @@ namespace pjrt {
 PJRT_Error* PJRT_Triton_Compile(PJRT_Triton_Compile_Args* args) {
   static constexpr size_t PJRT_Triton_Compile_Args_STRUCT_SIZE_V1 =
       PJRT_STRUCT_SIZE(PJRT_Triton_Compile_Args, out_smem_bytes);
+  static constexpr size_t PJRT_Triton_Compile_Args_STRUCT_SIZE_V2 =
+      PJRT_STRUCT_SIZE(PJRT_Triton_Compile_Args, out_path_size);
+  static constexpr size_t PJRT_Triton_Compile_Args_STRUCT_SIZE_V3 =
+      PJRT_STRUCT_SIZE(PJRT_Triton_Compile_Args, out_binary_size);
 
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
       "PJRT_Triton_Compile_Args", PJRT_Triton_Compile_Args_STRUCT_SIZE_V1,
@@ -43,21 +47,28 @@ PJRT_Error* PJRT_Triton_Compile(PJRT_Triton_Compile_Args* args) {
                        absl::string_view(args->arch_name, args->arch_name_size),
                        args->num_warps, args->num_ctas, args->num_stages));
 
-  bool is_v1_struct =
-      args->struct_size == PJRT_Triton_Compile_Args_STRUCT_SIZE_V1;
+  bool supports_path =
+      args->struct_size >= PJRT_Triton_Compile_Args_STRUCT_SIZE_V2;
+  bool supports_binary =
+      args->struct_size >= PJRT_Triton_Compile_Args_STRUCT_SIZE_V3;
   if (xla::triton::AsmText* ptr =
           std::get_if<xla::triton::AsmText>(&result.compiled_output)) {
     char* out_asm = new char[ptr->value.size()];
     std::memcpy(out_asm, ptr->value.data(), ptr->value.size());
     args->out_asm = out_asm;
     args->out_asm_size = ptr->value.size();
-    if (!is_v1_struct) {
+    if (supports_path) {
       args->out_path = nullptr;
       args->out_path_size = 0;
     }
+    if (supports_binary) {
+      args->out_format = PJRT_Triton_OutputFormat_AsmText;
+      args->out_binary = nullptr;
+      args->out_binary_size = 0;
+    }
   } else if (xla::triton::HsacoPath* ptr =
                  std::get_if<xla::triton::HsacoPath>(&result.compiled_output)) {
-    if (is_v1_struct) {
+    if (!supports_path) {
       return StatusToPjRtError(absl::InvalidArgumentError(
           "Triton compilation returned ROCm HsacoPath, but client is using V1 "
           "PJRT_Triton_Compile_Args struct version which only supports CUDA "
@@ -70,6 +81,29 @@ PJRT_Error* PJRT_Triton_Compile(PJRT_Triton_Compile_Args* args) {
     std::memcpy(out_path, ptr->value.data(), ptr->value.size());
     args->out_path = out_path;
     args->out_path_size = ptr->value.size();
+    if (supports_binary) {
+      args->out_format = PJRT_Triton_OutputFormat_HsacoPath;
+      args->out_binary = nullptr;
+      args->out_binary_size = 0;
+    }
+  } else if (xla::triton::SpirvBinary* ptr = std::get_if<xla::triton::SpirvBinary>(
+                 &result.compiled_output)) {
+    if (!supports_binary) {
+      return StatusToPjRtError(absl::InvalidArgumentError(
+          "Triton compilation returned OneAPI SPIR-V binary, but client is "
+          "using a pre-v3 PJRT_Triton_Compile_Args struct version which only "
+          "supports CUDA PTX AsmText or ROCm HsacoPath output."));
+    }
+
+    args->out_asm = nullptr;
+    args->out_asm_size = 0;
+    args->out_path = nullptr;
+    args->out_path_size = 0;
+    args->out_format = PJRT_Triton_OutputFormat_SpirvBinary;
+    char* out_binary = new char[ptr->value.size()];
+    std::memcpy(out_binary, ptr->value.data(), ptr->value.size());
+    args->out_binary = out_binary;
+    args->out_binary_size = ptr->value.size();
   }
   args->out_smem_bytes = result.smem_bytes;
   return nullptr;
