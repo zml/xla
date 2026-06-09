@@ -1,0 +1,67 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+index 0d0b5da10037..b182ef3755e6 100644
+--- a/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVInstructionSelector.cpp
+@@ -229,0 +230,3 @@ class SPIRVInstructionSelector : public InstructionSelector {
++  bool selectUAddO(Register ResVReg, SPIRVTypeInst ResType,
++                   MachineInstr &I) const;
++
+@@ -1225,10 +1227,7 @@ bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
+     return selectFrexp(ResVReg, ResType, I);
+ 
+   case TargetOpcode::G_UADDO:
+-    return selectOverflowArith(ResVReg, ResType, I,
+-                               ResType->getOpcode() == SPIRV::OpTypeVector
+-                                   ? SPIRV::OpIAddCarryV
+-                                   : SPIRV::OpIAddCarryS);
++    return selectUAddO(ResVReg, ResType, I);
+   case TargetOpcode::G_USUBO:
+     return selectOverflowArith(ResVReg, ResType, I,
+                                ResType->getOpcode() == SPIRV::OpTypeVector
+@@ -2402,6 +2401,46 @@ bool SPIRVInstructionSelector::selectAtomicRMW(Register ResVReg,
+   return true;
+ }
+ 
++bool SPIRVInstructionSelector::selectUAddO(Register /*ResVReg*/,
++                                           SPIRVTypeInst ResType,
++                                           MachineInstr &I) const {
++  if (I.getNumDefs() != 2 ||
++      I.getNumOperands() < I.getNumDefs() + 2)
++    return diagnoseUnsupported(I, "Expect two defs and two operands for "
++                                  "unsigned add-with-overflow");
++
++  const unsigned FirstUse = I.getNumDefs();
++  Register SumReg = I.getOperand(0).getReg();
++  Register OverflowReg = I.getOperand(1).getReg();
++  Register LhsReg = I.getOperand(FirstUse).getReg();
++  Register RhsReg = I.getOperand(FirstUse + 1).getReg();
++
++  SPIRVTypeInst BoolType = GR.getOrCreateSPIRVBoolType(I, TII);
++  unsigned ComponentCount = GR.getScalarOrVectorComponentCount(ResType);
++  if (ComponentCount > 1)
++    BoolType = GR.getOrCreateSPIRVVectorType(BoolType, ComponentCount, I, TII);
++
++  unsigned AddOpcode = ResType->getOpcode() == SPIRV::OpTypeVector
++                           ? SPIRV::OpIAddV
++                           : SPIRV::OpIAddS;
++  MachineBasicBlock &BB = *I.getParent();
++  BuildMI(BB, I, I.getDebugLoc(), TII.get(AddOpcode))
++      .addDef(SumReg)
++      .addUse(GR.getSPIRVTypeID(ResType))
++      .addUse(LhsReg)
++      .addUse(RhsReg)
++      .constrainAllUses(TII, TRI, RBI);
++
++  BuildMI(BB, I, I.getDebugLoc(), TII.get(SPIRV::OpULessThan))
++      .addDef(OverflowReg)
++      .addUse(GR.getSPIRVTypeID(BoolType))
++      .addUse(SumReg)
++      .addUse(LhsReg)
++      .constrainAllUses(TII, TRI, RBI);
++
++  return true;
++}
++
+ bool SPIRVInstructionSelector::selectOverflowArith(Register ResVReg,
+                                                    SPIRVTypeInst ResType,
+                                                    MachineInstr &I,

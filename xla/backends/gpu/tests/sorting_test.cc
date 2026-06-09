@@ -247,6 +247,36 @@ TEST_F(SortingTest, SortFusionWithIotaOperandTinySortDim) {
   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
 }
 
+TEST_F(SortingTest, SortFusionWithIotaOperandOddSortDim) {
+  const char* hlo_text = R"(
+    HloModule module
+
+    sorting_computation {
+      %lhs_key = f32[] parameter(0)
+      %rhs_key = f32[] parameter(1)
+      %lhs_index = s32[] parameter(2)
+      %rhs_index = s32[] parameter(3)
+      %lt_key = pred[] compare(%lhs_key, %rhs_key), direction=LT
+      %gt_key = pred[] compare(%rhs_key, %lhs_key), direction=LT
+      %eq_key = pred[] compare(%lt_key, %gt_key), direction=EQ
+      %lt_index = pred[] compare(%lhs_index, %rhs_index), direction=LT
+      ROOT res = pred[] select(%eq_key, %lt_index, %lt_key)
+    }
+
+    sort_fusion {
+      p0 = f32[2,5]{1,0} parameter(0)
+      iota = s32[2,5]{1,0} iota(), iota_dimension=1
+      ROOT sort = (f32[2,5]{1,0}, s32[2,5]{1,0}) sort(p0, iota), dimensions={1}, is_stable=true, to_apply=sorting_computation
+    }
+
+    ENTRY main {
+      p = f32[2,5]{1,0} parameter(0)
+      ROOT fusion = (f32[2,5]{1,0}, s32[2,5]{1,0}) fusion(p), kind=kCustom, calls=sort_fusion
+    }
+  )";
+  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));
+}
+
 TEST_F(SortingTest, SortFusionWithBFloat16AndIotaOperand) {
   const char* hlo_text = R"(
     HloModule module

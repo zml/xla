@@ -92,6 +92,24 @@ PointerType GetTensorPtrType(Type type) {
       static_cast<unsigned>(mlir::NVVM::NVVMMemorySpace::Global));
 }
 
+template <typename T = TensorDescType>
+auto GetTensorDescType(RankedTensorType block_type, int)
+    -> decltype(T::get(block_type.getContext(), block_type)) {
+  return T::get(block_type.getContext(), block_type);
+}
+
+template <typename T = TensorDescType>
+auto GetTensorDescType(RankedTensorType block_type, long)
+    -> decltype(T::get(block_type.getShape(), block_type.getElementType(),
+                       block_type.getEncoding())) {
+  return T::get(block_type.getShape(), block_type.getElementType(),
+                block_type.getEncoding());
+}
+
+TensorDescType GetTensorDescType(RankedTensorType block_type) {
+  return GetTensorDescType(block_type, 0);
+}
+
 // Canonicalizes tile strides. Currently this converts zero strides to 1.
 // If validation is requested and a tile stride is 0:
 // If the corresponding tile shape or original shape value at the same index is
@@ -392,9 +410,7 @@ class RewriteFuncOp : public mlir::OpRewritePattern<func::FuncOp> {
 
       auto result_type =
           RankedTensorType::get(ordered_block_shape, element_type);
-      operand_type = TensorDescType::get(result_type.getShape(),
-                                         result_type.getElementType(),
-                                         result_type.getEncoding());
+      operand_type = GetTensorDescType(result_type);
       // !tt.tensordesc<tensor<block_shape x element_type>> -> !tt.ptr<>
       auto cast_to_orig_type = mlir::UnrealizedConversionCastOp::create(
           builder, operand_type, func_arg);
@@ -499,9 +515,7 @@ class RewriteExtract : public mlir::OpRewritePattern<ExtractOp> {
           tile_type.clone(GetMajorToMinorOrder(sizes, src_layout));
 
       // ptr -> !tt.tensordesc<tile_type>
-      auto desc_type = TensorDescType::get(ordered_type.getShape(),
-                                           ordered_type.getElementType(),
-                                           ordered_type.getEncoding());
+      auto desc_type = GetTensorDescType(ordered_type);
       auto cast_to_tensor_desc = mlir::UnrealizedConversionCastOp::create(
           builder, desc_type, op.getSrc());
 
@@ -633,9 +647,7 @@ class RewriteInsert : public mlir::OpRewritePattern<InsertOp> {
       // ptr -> !tt.tensordesc<tile_type>
       auto result_type =
           tile_type.clone(GetMajorToMinorOrder(sizes, dst_layout));
-      auto desc_type = TensorDescType::get(result_type.getShape(),
-                                           result_type.getElementType(),
-                                           result_type.getEncoding());
+      auto desc_type = GetTensorDescType(result_type);
       auto cast_to_tensor_desc = mlir::UnrealizedConversionCastOp::create(
           builder, desc_type, op.getDst());
 

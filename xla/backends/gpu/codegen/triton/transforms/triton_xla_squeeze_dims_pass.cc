@@ -122,6 +122,32 @@ auto SqueezeElements(ContainerT&& elements, ArrayRef<uint32_t> squeeze_dims) {
   return result;
 }
 
+template <typename InterfaceT>
+auto InferReshapeOpEncoding(InterfaceT* infer_layout_interface,
+                            ArrayRef<int64_t> src_shape, Attribute src_encoding,
+                            ArrayRef<int64_t> dst_shape,
+                            Attribute& dst_encoding, int)
+    -> decltype(infer_layout_interface->inferReshapeOpEncoding(
+        src_shape, src_encoding, dst_shape, dst_encoding,
+        /*allowReorder=*/false, std::optional<Location>{})) {
+  return infer_layout_interface->inferReshapeOpEncoding(
+      src_shape, src_encoding, dst_shape, dst_encoding,
+      /*allowReorder=*/false, std::optional<Location>{});
+}
+
+template <typename InterfaceT>
+auto InferReshapeOpEncoding(InterfaceT* infer_layout_interface,
+                            ArrayRef<int64_t> src_shape, Attribute src_encoding,
+                            ArrayRef<int64_t> dst_shape,
+                            Attribute& dst_encoding, long)
+    -> decltype(infer_layout_interface->inferReshapeOpEncoding(
+        src_shape, src_encoding, dst_shape, dst_encoding,
+        std::optional<Location>{})) {
+  return infer_layout_interface->inferReshapeOpEncoding(
+      src_shape, src_encoding, dst_shape, dst_encoding,
+      std::optional<Location>{});
+}
+
 // Returns a new tensor type with the given dimensions removed.
 RankedTensorType SqueezeTensorType(RankedTensorType type,
                                    ArrayRef<uint32_t> squeeze_dims) {
@@ -131,9 +157,8 @@ RankedTensorType SqueezeTensorType(RankedTensorType type,
     auto inferLayoutInterface =
         cast<DialectInferLayoutInterface>(&encoding.getDialect());
     [[maybe_unused]] LogicalResult result =
-        inferLayoutInterface->inferReshapeOpEncoding(
-            type.getShape(), encoding, shape, encoding, /*allowReorder=*/false,
-            /*loc=*/std::nullopt);
+        InferReshapeOpEncoding(inferLayoutInterface, type.getShape(), encoding,
+                               shape, encoding, 0);
     CHECK(succeeded(result));
   }
   return RankedTensorType::get(shape, type.getElementType(), encoding);

@@ -83,9 +83,11 @@ using StreamPoolMap = absl::flat_hash_map<int /*device_ordinal*/, StreamPool>;
 // can be created per device via GetOrCreateStream when multiple streams are
 // enabled.
 //
-// For now, we set it to 32 so that there is no unbounded growth. However, it
-// can be adjusted based on the device capabilities and workload requirements.
-constexpr int kMaxStreamsPerDevice = 32;
+// For now, keep a fixed upper bound so that there is no unbounded growth. PJRT
+// clients create a fixed set of helper streams per local device, and test
+// processes can create multiple clients sequentially, so the limit needs enough
+// headroom beyond a single client's stream set.
+constexpr int kMaxStreamsPerDevice = 4096;
 
 // Manages pools of SYCL streams (queues) per device. All methods are static and
 // thread-safe via a global mutex. For high concurrency workloads, consider

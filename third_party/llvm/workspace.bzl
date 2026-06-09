@@ -23,6 +23,7 @@ def repo(name):
             "//third_party/llvm:toolchains.patch",
             "//third_party/llvm:lit_test.patch",
             "//third_party/llvm:run_lit.patch",
+            "//third_party/llvm:spirv_uaddo_without_iaddcarry.patch",
         ],
         link_files = {"//third_party/llvm:run_lit.sh": "mlir/run_lit.sh"},
     )
