@@ -37,6 +37,7 @@ sycl_library(
         ":oneccl",
         "@oneccl_v1",
         "@oneccl_v1//:mpi",
+        "@oneccl_v1//:oneccl_v1",
     ],
 )
 
