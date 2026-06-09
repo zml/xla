@@ -25,7 +25,13 @@ limitations under the License.
 extern "C" {
 #endif
 
-#define PJRT_API_TRITON_EXTENSION_VERSION 2
+#define PJRT_API_TRITON_EXTENSION_VERSION 3
+
+typedef enum PJRT_Triton_OutputFormat {
+  PJRT_Triton_OutputFormat_AsmText = 0,
+  PJRT_Triton_OutputFormat_HsacoPath = 1,
+  PJRT_Triton_OutputFormat_SpirvBinary = 2,
+} PJRT_Triton_OutputFormat;
 
 struct PJRT_Triton_Compile_Args {
   size_t struct_size;
@@ -41,8 +47,11 @@ struct PJRT_Triton_Compile_Args {
   int64_t out_smem_bytes;
   const char* out_path;  // owned
   size_t out_path_size;
+  PJRT_Triton_OutputFormat out_format;
+  const char* out_binary;  // owned
+  size_t out_binary_size;
 };
-PJRT_DEFINE_STRUCT_TRAITS(PJRT_Triton_Compile_Args, out_path_size);
+PJRT_DEFINE_STRUCT_TRAITS(PJRT_Triton_Compile_Args, out_binary_size);
 
 // Compiles a given Triton kernel.
 typedef PJRT_Error* PJRT_Triton_Compile(PJRT_Triton_Compile_Args* args);

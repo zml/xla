@@ -1,4 +1,6 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm_is_configured")
+load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load(
     "//xla/stream_executor:build_defs.bzl",
@@ -34,6 +36,15 @@ package_group(
         "//third_party/openxla_pjrt_plugin/...",
         "//third_party/py/jax/...",
         "//third_party/py/torch_tpu/...",
+    ],
+)
+
+selects.config_setting_group(
+    name = "triton_gpu_enabled",
+    match_any = [
+        "@rules_ml_toolchain//common:is_cuda_enabled",
+        "@rules_ml_toolchain//common:is_sycl_enabled",
+        "@local_config_rocm//rocm:using_hipcc",
     ],
 )
 
@@ -1471,17 +1482,64 @@ cc_library(
 )
 
 cc_library(
+    name = "triton_oneapi",
+    srcs = [
+        "triton.h",
+        "triton_oneapi.cc",
+    ],
+    compatible_with = [],
+    tags = [
+        "gpu",
+        "manual",
+        "oneapi-only",
+    ],
+    visibility = internal_visibility([":friends"]),
+    deps = [
+        "//xla:debug_options_flags",
+        "//xla/backends/gpu/codegen/triton:compilation_pipeline",
+        "//xla/service/gpu/llvm_gpu_backend:spirv_backend",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/sycl:oneapi_compute_capability",
+        "//xla/tsl/platform:status_macros",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:TargetParser",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:BuiltinToLLVMIRTranslation",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FuncExtensions",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:LLVMIRTransforms",
+        "@llvm-project//mlir:LLVMToLLVMIRTranslation",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:SPIRVDialect",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:ToLLVMIRTranslation",
+        "@triton//:TritonDialects",
+        "@triton//:TritonGENIR",
+        "@triton//:TritonIntelGPUIR",
+    ],
+)
+
+cc_library(
     name = "triton",
     srcs = [],
     hdrs = ["triton.h"],
     visibility = internal_visibility([":friends"]),
-    deps = if_cuda_or_rocm_is_configured(
-        [],
-        [":triton_stub"],
-    ) + if_rocm_is_configured(
+    deps = select({
+        ":triton_gpu_enabled": [],
+        "//conditions:default": [":triton_stub"],
+    }) + if_rocm_is_configured(
         [":triton_rocm"],
     ) + if_cuda_is_configured(
         [":triton_cuda"],
+    ) + if_sycl(
+        [":triton_oneapi"],
     ) + [
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",

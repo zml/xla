@@ -1377,8 +1377,7 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
                   *buffer_assignment, GetDefaultBufferAlignment(), instr));
           auto launch_dimensions = LaunchDimensions(
               se::BlockDim(call.grid_x, call.grid_y, call.grid_z),
-              se::ThreadDim(call.num_warps *
-                            gpu_device_info.threads_per_warp()));
+              result.thread_dims);
 
           ASSIGN_OR_RETURN(
               llvm::Function * kernel,
