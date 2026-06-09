@@ -127,6 +127,8 @@ use_repo(
     "net_zstd",
     "nvshmem",
     "nvtx_archive",
+    "oneccl",
+    "oneccl_v1",
     "onednn",
     "onednn_async",
     "org_sqlite",
