@@ -106,6 +106,8 @@ def _initialize_third_party():
     net_zstd()
     nvshmem()
     nvtx()
+    oneccl_v1()
+    oneccl_v2()
     onednn()
     oneccl_v1()
     oneccl_v2()
