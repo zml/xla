@@ -95,6 +95,16 @@ void InitOnecclOnce() {
   ccl::init();
 }
 
+void SetOnecclAllLocalEnvDefaults() {
+  // Single-process, all-local GPU cliques do not run under MPI or another
+  // launcher, so tell oneCCL to bootstrap with a single local process unless
+  // the caller has explicitly configured a launcher/topology.
+  SetOnecclEnvDefault("CCL_PROCESS_LAUNCHER", "none");
+  SetOnecclEnvDefault("CCL_LOCAL_SIZE", "1");
+  SetOnecclEnvDefault("CCL_LOCAL_RANK", "0");
+  SetOnecclEnvDefault("CCL_ATL_TRANSPORT", "ofi");
+}
+
 absl::Status EnsureOnecclInitialized() {
   try {
     absl::call_once(ccl_init_once, InitOnecclOnce);
@@ -375,11 +385,15 @@ OnecclCollectives::CreateCommunicatorsWithCancel(
     const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
     absl::Span<const DeviceRank> ranks, const Collectives::Config& config,
     std::shared_ptr<CancellationToken> cancel) {
-  TF_RETURN_IF_ERROR(EnsureOnecclInitialized());
-
   if (ranks.empty()) {
     return InvalidArgument("oneCCL communicator creation requires ranks");
   }
+  if (ranks.size() == clique_key.num_devices()) {
+    SetOnecclAllLocalEnvDefaults();
+  }
+
+  TF_RETURN_IF_ERROR(EnsureOnecclInitialized());
+
   if (clique_ids.has_value() && clique_ids->size() > 1) {
     return Unimplemented(
         "oneCCL C++ KVS bootstrap uses one address per communicator set; "
@@ -648,6 +662,11 @@ absl::Status OnecclCollectives::Deallocate(void* location) {
 
 absl::StatusOr<GpuCollectives::CliqueIdCallback>
 OnecclCollectives::InitializeTopology(const Topology& topology) {
+  if (topology.num_processes == 1) {
+    SetOnecclAllLocalEnvDefaults();
+    return nullptr;
+  }
+
   if (topology.num_processes > 1) {
     auto oneccl_id_store = std::make_shared<OnecclIdStore>(
         topology.process_id, topology.device_to_process,
