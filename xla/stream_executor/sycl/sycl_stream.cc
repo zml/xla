@@ -15,6 +15,10 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_stream.h"
 
+#include <cstddef>
+#include <cstdint>
+
+#include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/platform/logging.h"
 
@@ -50,28 +54,64 @@ absl::Status LaunchSyclKernel(
   ::sycl::range<3> local_range(thread_dim_z, thread_dim_y, thread_dim_x);
   ::sycl::nd_range<3> nd_range(global_range, local_range);
 
-  stream_handle->submit([&](::sycl::handler& cgh) {
-    if (kernel_params == nullptr) {
-      VLOG(2) << "LaunchSyclKernel: No kernel parameters provided; launching "
-                 "kernel.";
-      cgh.parallel_for(nd_range, *function);
-      return;
-    }
-
+  void** arg_ptrs = nullptr;
+  size_t num_args = 0;
+  if (kernel_params != nullptr) {
     // kernel_params is expected to be an array of two pointers:
     // kernel_params[0]: pointer to array of kernel argument pointers
     // kernel_params[1]: pointer to number of kernel arguments
     if (kernel_params[0] == nullptr || kernel_params[1] == nullptr) {
-      LOG(ERROR)
-          << "LaunchSyclKernel: kernel_params[0] or kernel_params[1] is null, "
-             "cannot set kernel arguments.";
-      return;
+      return absl::InvalidArgumentError(
+          "LaunchSyclKernel: kernel_params[0] or kernel_params[1] is null, "
+          "cannot set kernel arguments.");
     }
 
-    void** arg_ptrs = static_cast<void**>(kernel_params[0]);
+    arg_ptrs = static_cast<void**>(kernel_params[0]);
     size_t* num_args_ptr = static_cast<size_t*>(kernel_params[1]);
-    size_t num_args = num_args_ptr ? *num_args_ptr : 0;
+    num_args = num_args_ptr ? *num_args_ptr : 0;
+  }
 
+  size_t reflected_total_args =
+      num_args + (shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+  try {
+    reflected_total_args =
+        function->get_info<::sycl::info::kernel::num_args>();
+    size_t required_args =
+        num_args + (shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+    if (shared_mem_bytes > 0) {
+      if (reflected_total_args < required_args) {
+        return absl::InternalError(absl::StrCat(
+            "LaunchSyclKernel: kernel '", kernel_name,
+            "' reports ", reflected_total_args,
+            " reflected arguments but requires at least ", required_args,
+            " for ", shared_mem_bytes, " bytes of shared memory."));
+      }
+    } else {
+      required_args = num_args;
+    }
+    if (required_args > reflected_total_args) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("LaunchSyclKernel: kernel '", kernel_name, "' has ",
+                       num_args,
+                       " packed arguments, but reflected SYCL arity is only ",
+                       reflected_total_args, "."));
+    }
+    size_t max_packed_args =
+        reflected_total_args - (shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+    if (num_args > max_packed_args) {
+      VLOG(1) << "LaunchSyclKernel: kernel '" << kernel_name << "' has "
+              << num_args << " packed regular arguments, but reflected SYCL "
+              << "arity can accept " << max_packed_args
+              << "; ignoring trailing packed arguments.";
+      num_args = max_packed_args;
+    }
+  } catch (const ::sycl::exception& e) {
+    VLOG(1) << "LaunchSyclKernel: failed to reflect argument count for kernel '"
+            << kernel_name << "': " << e.what()
+            << "; using packed argument count " << num_args;
+  }
+
+  stream_handle->submit([&](::sycl::handler& cgh) {
     for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
       if (arg_ptrs[arg_index] == nullptr) {
         LOG(ERROR) << "LaunchSyclKernel: kernel argument " << arg_index
@@ -86,6 +126,21 @@ absl::Status LaunchSyclKernel(
     if (num_args == 0) {
       VLOG(2)
           << "LaunchSyclKernel: No kernel arguments to set; launching kernel.";
+    }
+    if (shared_mem_bytes > 0) {
+      using shared_mem_t = ::sycl::local_accessor<int8_t, 1>;
+      shared_mem_t local_buffer(shared_mem_bytes, cgh);
+      VLOG(2) << "Setting shared memory argument " << num_args
+              << " with " << shared_mem_bytes << " bytes.";
+      cgh.set_arg(num_args, local_buffer);
+    }
+    for (size_t arg_index =
+             num_args + (shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+         arg_index < reflected_total_args; ++arg_index) {
+      void* scratch_arg = nullptr;
+      VLOG(2) << "Setting trailing scratch argument " << arg_index
+              << " to null.";
+      cgh.set_arg(arg_index, scratch_arg);
     }
     cgh.parallel_for(nd_range, *function);
   });
