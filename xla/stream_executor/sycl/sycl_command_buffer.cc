@@ -371,9 +371,32 @@ GraphNode AddLaunchNode(ModifiableGraph& graph, LaunchCommand& command,
       graph.add([params, dynamic_args](::sycl::handler& cgh) mutable {
         ::sycl::nd_range<3> nd_range =
             SyclNdRange(params.threads, params.blocks);
+        size_t reflected_total_args =
+            dynamic_args.size() +
+            (params.shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+        try {
+          reflected_total_args =
+              params.function->get_info<::sycl::info::kernel::num_args>();
+        } catch (const ::sycl::exception& e) {
+          VLOG(1) << "Failed to reflect argument count for kernel '"
+                  << params.kernel_name << "': " << e.what()
+                  << "; using packed argument count.";
+        }
         for (size_t arg_index = 0; arg_index < dynamic_args.size();
              ++arg_index) {
           cgh.set_arg(arg_index, dynamic_args[arg_index]);
+        }
+        if (params.shared_mem_bytes > 0) {
+          ::sycl::local_accessor<int8_t, 1> local_buffer(
+              params.shared_mem_bytes, cgh);
+          cgh.set_arg(dynamic_args.size(), local_buffer);
+        }
+        for (size_t arg_index =
+                 dynamic_args.size() +
+                 (params.shared_mem_bytes > 0 ? size_t{1} : size_t{0});
+             arg_index < reflected_total_args; ++arg_index) {
+          void* scratch_arg = nullptr;
+          cgh.set_arg(arg_index, scratch_arg);
         }
         cgh.parallel_for(nd_range, *params.function);
       });
