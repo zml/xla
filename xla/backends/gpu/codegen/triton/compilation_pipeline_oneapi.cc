@@ -14,8 +14,11 @@ limitations under the License.
 ==============================================================================*/
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
+#include "llvm/ADT/SmallVector.h"
 #include "intel/include/Dialect/Triton/Transforms/Passes.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Passes.h"
 #include "intel/include/TritonAnnotateModule/Passes.h"
@@ -25,6 +28,7 @@ limitations under the License.
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
@@ -86,95 +90,137 @@ std::string TargetArch(const stream_executor::OneAPIComputeCapability& cc) {
   return "spir64";
 }
 
+// Mirrors XPUBackend.annotate_module() as closely as possible
 mtgi::TritonAnnotateModuleOptions AnnotationOptions(
     const stream_executor::OneAPIComputeCapability& cc, int threads_per_warp,
     const std::string& target_arch) {
   mtgi::TritonAnnotateModuleOptions options;
+  const bool is_pvc_or_bmg = cc.IsBMG() || cc.IsPVC();
+
   options.minSGSize = std::max(threads_per_warp, 1);
   options.threadsPerWarp = options.minSGSize;
   options.targetArch = target_arch;
 
-  const bool supports_bf16 = cc.IsBMG() || cc.IsPVC();
-  options.supportBF16Conversion = supports_bf16;
-  options.supportBfloat16Arithmetic = supports_bf16;
-  options.supportDPAS = cc.IsBMG() || cc.IsPVC();
-  // Keep these disabled until the existing LLVM SPIR-V path accepts the
-  // corresponding Intel extension patterns end-to-end.
-  options.support2DBlockIO = false;
-  options.supportPredicatedIO = false;
-  options.supportPrefetch256Bytes = cc.IsBMG();
+  options.supportDPAS = is_pvc_or_bmg;
+  options.supportBF16Conversion = is_pvc_or_bmg;      // has_bfloat16_conversion
+  options.supportBfloat16Arithmetic = is_pvc_or_bmg;  // has_bfloat16_arithmetic
+
+  options.support2DBlockIO = is_pvc_or_bmg;
+  options.supportPredicatedIO = is_pvc_or_bmg;
+
+  // has_256b_prefetch / has_256b_load_store are an Xe3P+ feature; the python
+  // backend defaults both to False (parse_target, pending a driver prop) and
+  // PVC/BMG are Xe2, so they are off here (matching python).
+  // (OneAPIComputeCapability exposes no Xe3P / 256b capability query.)
+  options.supportPrefetch256Bytes = false;
+  options.support256bLoadStore = false;
+
+  options.supportRoundedDivideSqrt = is_pvc_or_bmg;
+  options.useClRoundedDivideSqrt = false;
+  options.isLTS = false;
+  options.isFastMath = false;
   return options;
 }
 
+// Mirrors XPUBackend.make_ttir().
 void MakeTTIR(mlir::OpPassManager* pm) {
-  pm->addPass(mlir::createInlinerPass());
-  pm->addPass(mti::createTritonIntelBlockPointerToTensorDesc());
-  pm->addPass(mti::createTritonIntelTensorDescToBlockPointer());
-  pm->addPass(mt::createTritonRewriteTensorDescriptorToPointer());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mti::createTritonIntelRemoveBoundaryChecks());
-  pm->addPass(mti::createTritonIntelRemoveMasks());
-  pm->addPass(mti::createTritonIntelStrideVersioning());
-  pm->addPass(mti::createTritonIntelFuseReshape());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mt::createTritonCombineOps());
-  pm->addPass(mt::createTritonReorderBroadcast());
-  pm->addPass(mlir::createCSEPass());
-  pm->addPass(mlir::createLoopInvariantCodeMotionPass());
-  pm->addPass(mlir::createSymbolDCEPass());
-  pm->addPass(mt::createTritonLoopUnroll());
+  pm->addPass(mlir::createInlinerPass());                            // inliner
+  pm->addPass(mti::createTritonRewriteTensorDescriptorToPointer());  // rewrite_tensor_descriptor_to_pointer
+  pm->addPass(mlir::createCSEPass());                                // cse
+  pm->addPass(mt::createTritonLoopInvariantCodeMotion());            // triton_licm
+  pm->addPass(mti::createTritonIntelRemoveMasks());                  // remove_masks
+  pm->addPass(mti::createTritonIntelStrideVersioning());             // stride_versioning
+  pm->addPass(mti::createTritonIntelFuseReshape());                  // fuse_reshape
+  pm->addPass(mti::createTritonIntelGPUFoldTrueCmpI());              // fold_true_cmpi
+  pm->addNestedPass<mt::FuncOp>(
+      mti::createTritonIntelGPUPrepareIfCombining());                // prepare_if_combining (FuncOp pass)
+  pm->addPass(mlir::createCanonicalizerPass());                      // canonicalizer
+  pm->addPass(mt::createTritonCombineOps());                         // combine
+  pm->addPass(mti::createTritonIntelSimplifySignedArithmetic());     // simplify_signed_arithmetic
+  pm->addPass(mt::createTritonReorderBroadcast());                   // reorder_broadcast
+  pm->addPass(mlir::createCSEPass());                                // cse
+  pm->addPass(mlir::createSymbolDCEPass());                          // symbol_dce
+  pm->addPass(mt::createTritonLoopUnroll());                         // loop_unroll
 }
 
+// Mirrors XPUBackend.make_ttgir(). Omits only env-gated/instrumentation passes
+// that are off by default (TRITON_INTEL_ANNOTATE_LATENCIES, fpsan).
 void MakeTTGIR(mlir::OpPassManager* pm,
                const stream_executor::OneAPIComputeCapability& cc,
                int threads_per_warp, int num_warps, int num_ctas,
                int num_stages, const std::string& target_arch) {
+  // annotate_module runs in its own pass manager in python; for DPAS targets
+  // (threads_per_warp == min_sg_size == 16) the warp_size readback is a no-op,
+  // so streaming both passes into one manager is equivalent here.
   pm->addPass(mtgi::createTritonAnnotateModule(
       AnnotationOptions(cc, threads_per_warp, target_arch)));
   pm->addPass(mt::createConvertTritonToTritonGPU(
-      {"xpu", num_warps, threads_per_warp, num_ctas}));
-  pm->addPass(mtgi::createTritonIntelGPUCoalesce());
-  pm->addPass(mtgi::createTritonIntelGPURemoveLayoutConversions());
-  pm->addPass(mtgi::createTritonIntelGPUAccelerateMatmul());
-  pm->addPass(mtgi::createTritonIntelGPUMaterializeBlockPointer());
-  pm->addPass(mtgi::createTritonIntelGPURemoveLayoutConversions());
-  pm->addPass(mtgi::createTritonIntelGPUOptimizeDotOperands());
-  pm->addPass(mtgi::createTritonIntelGPUPipeline({num_stages, false}));
-  pm->addPass(mtgi::createTritonIntelGPUReduceVariableLiveness());
-  pm->addPass(mt::createTritonLoopAwareCSE());
-  pm->addPass(mt::gpu::createTritonGPUFuseNestedLoops());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mt::createTritonLoopInvariantCodeMotion());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mt::gpu::createTritonGPUCombineTensorSelectAndIf());
-  pm->addPass(mt::gpu::createTritonGPUOptimizeThreadLocality());
-  pm->addPass(mtgi::createTritonIntelGPUOptimizeDotOperands());
-  pm->addPass(mtgi::createTritonIntelGPUOptimizeReductionLocality());
-  pm->addPass(mtgi::createTritonIntelGPUReduceDataDuplication());
-  pm->addPass(mt::gpu::createTritonGPUReorderInstructions());
-  pm->addPass(mt::createTritonLoopAwareCSE());
-  pm->addPass(mlir::createSCCPPass());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mlir::createSymbolDCEPass());
+      {"xpu", num_warps, threads_per_warp, num_ctas}));  // convert_to_ttgpuir
+  pm->addPass(mtgi::createTritonIntelGPUCoalesce());     // coalesce
+  // widen_load_store_encoding is gated in python on has_256b_load_store, an
+  // Xe3P+ feature that is False on Xe2 PVC/BMG, so it is not run here.
+  pm->addPass(mtgi::createTritonIntelGPURemoveLayoutConversions());  // remove_layout_conversions
+  pm->addPass(mtgi::createTritonIntelGPUAccelerateMatmul());         // accelerate_matmul
+  pm->addPass(mtgi::createTritonIntelGPUMaterializeBlockPointer());  // materialize_block_pointer
+  pm->addPass(mtgi::createTritonIntelGPURemoveLayoutConversions());  // remove_layout_conversions
+  pm->addPass(mtgi::createTritonIntelGPUOptimizeDotOperands());      // optimize_dot_operands (intel)
+  pm->addPass(mtgi::createTritonIntelGPUHoistLayoutConversions(
+      {/*grfMode=*/"default"}));                          // hoist_layout_conversions
+  pm->addPass(mtgi::createTritonIntelGPUPipeline(
+      {num_stages, /*useBarrier=*/false}));               // pipeline
+  pm->addPass(mtgi::createTritonIntelGPUReduceVariableLiveness());  // reduce_variable_liveness
+  pm->addPass(mt::createTritonLoopAwareCSE());           // loop_aware_cse
+  pm->addPass(mt::gpu::createTritonGPUFuseNestedLoops());  // fuse_nested_loops
+  pm->addPass(mlir::createCanonicalizerPass());          // canonicalizer
+  pm->addPass(mt::createTritonLoopInvariantCodeMotion());  // triton_licm
+  pm->addPass(mlir::createCanonicalizerPass());          // canonicalizer
+  pm->addPass(mt::gpu::createTritonGPUCombineTensorSelectAndIf());  // combine_tensor_select_and_if
+  pm->addPass(mt::gpu::createTritonGPUOptimizeThreadLocality());    // optimize_thread_locality
+  pm->addPass(mt::gpu::createTritonGPUOptimizeDotOperands(
+      {/*hoistLayoutConversion=*/true}));                 // optimize_dot_operands (upstream)
+  pm->addPass(mlir::createCSEPass());                    // cse
+  pm->addPass(mt::gpu::createTritonGPUPrefetch());       // prefetch
+  pm->addPass(mt::gpu::createTritonGPUOptimizeDotOperands(
+      {/*hoistLayoutConversion=*/true}));                 // optimize_dot_operands (upstream)
+  pm->addPass(mtgi::createTritonIntelGPURemoveLayoutConversions());  // remove_layout_conversions
+  pm->addPass(mtgi::createTritonIntelGPUAnnotateCacheControl());     // annotate_cache_control
+  pm->addPass(mtgi::createTritonIntelGPUReduceDataDuplication());    // reduce_data_duplication
+  pm->addPass(mt::gpu::createTritonGPUReorderInstructions());        // reorder_instructions
+  pm->addPass(mt::createTritonLoopAwareCSE());           // loop_aware_cse
+  pm->addPass(mlir::createSymbolDCEPass());              // symbol_dce
+  pm->addPass(mlir::createSCCPPass());                   // sccp
+  pm->addPass(mlir::createCanonicalizerPass());          // canonicalizer
+
+  if (std::getenv("TRITON_INTEL_OPTIMIZE_REDUCTION_LOCALITY") != nullptr){
+    pm->addPass(mtgi::createTritonIntelGPUOptimizeReductionLocality());  // optimize_reduction_locality
+  }
+  
+  // arith_emulate_unsupported_floats(["bf16"], "f32").
+  mlir::arith::ArithEmulateUnsupportedFloatsOptions emulate_opts;
+  emulate_opts.sourceTypeStrs = {"bf16"};
+  emulate_opts.targetTypeStr = "f32";
+  pm->addPass(mlir::arith::createArithEmulateUnsupportedFloats(emulate_opts));
 }
 
+// Mirrors XPUBackend.make_llir()
 void MakeLLIR(mlir::OpPassManager* pm, int num_warps) {
   pm->addPass(std::make_unique<SetTritonOneApiModuleAttrsPass>(num_warps));
-  pm->addPass(mlir::createSCFToControlFlowPass());
-  pm->addPass(mlir::createInlinerPass());
-  pm->addPass(mlir::createConvertIndexToLLVMPass());
-  pm->addPass(mtgi::createIntelAllocateSharedMemory());
-  pm->addPass(mt::gpu::createTritonGPUGlobalScratchAllocationPass());
-  pm->addPass(mtgi::createConvertTritonIntelGPUToLLVM());
-  pm->addPass(mt::createConvertTritonGENToLLVM());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mtgi::createTritonIntelGPURewriteStackPtr());
-  pm->addPass(mlir::createCSEPass());
-  pm->addPass(mlir::createConvertControlFlowToLLVMPass());
-  pm->addPass(mlir::createArithToLLVMConversionPass());
-  pm->addPass(mlir::createCanonicalizerPass());
-  pm->addPass(mlir::createCSEPass());
-  pm->addPass(mlir::createSymbolDCEPass());
+  pm->addPass(mtgi::createTritonIntelGPULowerTo2DBlockLoad());  // lower_to_2d_block_load
+  pm->addPass(mlir::createSCFToControlFlowPass());              // scf_to_cf
+  pm->addPass(mlir::createInlinerPass());                       // inliner (gluon)
+  pm->addPass(mlir::createConvertIndexToLLVMPass());            // index_to_llvmir
+  pm->addPass(mtgi::createIntelAllocateSharedMemory());         // allocate_shared_memory
+  pm->addPass(mt::gpu::createTritonGPUGlobalScratchAllocationPass());  // allocate_global_scratch_memory
+  pm->addPass(mtgi::createConvertTritonIntelGPUToLLVM());       // to_llvmir
+  pm->addPass(mt::createConvertTritonGENToLLVM());              // gen_to_llvm
+  pm->addPass(mlir::createCanonicalizerPass());                 // canonicalizer
+  pm->addPass(mtgi::createTritonIntelGPURewriteStackPtr());     // rewrite_stack_ptr
+  pm->addPass(mlir::createCSEPass());                           // cse
+  pm->addPass(mlir::createConvertControlFlowToLLVMPass());      // (XLA lowering glue)
+  pm->addPass(mlir::createArithToLLVMConversionPass());         // arith_to_llvmir
+  pm->addPass(mlir::createCanonicalizerPass());                 // canonicalizer
+  pm->addPass(mlir::createCSEPass());                           // cse
+  pm->addPass(mlir::createSymbolDCEPass());                     // symbol_dce
 }
 
 }  // namespace
