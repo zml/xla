@@ -212,6 +212,7 @@ cc_library(
         "@triton//third_party/nvidia:TritonNVIDIAGPUToLLVM",
     ]) + if_sycl([
         "//xla/stream_executor/sycl:oneapi_compute_capability",
+        "@llvm-project//mlir:ArithTransforms",
         "@llvm-project//mlir:SPIRVDialect",
         "@triton//:TritonAnnotateModule",
         "@triton//:TritonGENIR",
