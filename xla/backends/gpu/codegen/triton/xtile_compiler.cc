@@ -36,9 +36,13 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
@@ -595,6 +599,19 @@ absl::StatusOr<TritonWrapperResult> CompileTritonToLLVM(
   XLA_VLOG_LINES(5, llvm_ir::DumpToString(ll_triton_module.get()));
   if (should_verify) {
     VerifyModule(*ll_triton_module);
+  }
+
+  // [oneAPI-fix] Materialize Triton's shared memory for the SPIR-V target. T
+  if (target_triple.isSPIRV() && shared_mem_bytes > 0) {
+    llvm::LLVMContext& ctx = ll_triton_module->getContext();
+    if (auto* fn = ll_triton_module->getFunction(kernel_name)) {
+      fn->setMetadata(
+          "xla.shared_mem_bytes",
+          llvm::MDNode::get(ctx, llvm::ConstantAsMetadata::get(
+                                     llvm::ConstantInt::get(
+                                         llvm::Type::getInt32Ty(ctx),
+                                         shared_mem_bytes))));
+    }
   }
 
   // Apply ROCm-specific waves_per_eu attribute if set.
