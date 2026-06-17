@@ -20,16 +20,20 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/no_destructor.h"
+#include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Transforms/Scalar.h"
@@ -305,6 +309,7 @@ absl::StatusOr<std::string> CompileToSPIRV(
     ir_builder.CreateRet(load);
   }
 
+  MaterializeWorkgroupSlm(module);
   return EmitModuleToSPIRV(module, target_machine.get());
 }
 
