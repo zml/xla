@@ -178,6 +178,11 @@ class GpuCommunicator : public Communicator {
     return Future<>(std::move(group)());
   }
 
+  virtual Future<> GroupExecuteCounted(
+      absl::AnyInvocable<absl::Status() &&> group, int64_t num_collectives) {
+    return GroupExecute(std::move(group));
+  }
+
   virtual absl::Status LaunchAllReduce(se::DeviceAddressBase send_buffer,
                                        se::DeviceAddressBase recv_buffer,
                                        PrimitiveType dtype, size_t count,
