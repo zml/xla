@@ -397,6 +397,17 @@ Future<> OnecclCommunicator::GroupExecute(
   });
 }
 
+Future<> OnecclCommunicator::GroupExecuteCounted(
+    absl::AnyInvocable<absl::Status() &&> group, int64_t num_collectives) {
+  // oneCCL groups batch >1 collective. For a single ccl::allreduce (decode
+  // case) the wrapper is pure host overhead: a lone collective is already
+  // complete. Issue bare; keep groups for num_collectives > 1.
+  if (num_collectives == 1) {
+    return Execute(std::move(group));
+  }
+  return GroupExecute(std::move(group));
+}
+
 Future<> OnecclCommunicator::AllReduce(se::DeviceAddressBase send_buffer,
                                        se::DeviceAddressBase recv_buffer,
                                        PrimitiveType dtype, size_t count,
