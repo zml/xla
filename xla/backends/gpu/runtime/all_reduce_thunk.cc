@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/all_reduce_thunk.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -93,14 +94,19 @@ absl::Status RunAllReduce(ReductionKind reduction_kind,
   int device_ordinal = stream.parent()->device_ordinal();
   XLA_VLOG_DEVICE(3, device_ordinal) << "Performing all-reduce";
   auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
-  Future<> future = gpu_comm->GroupExecute([&]() -> absl::Status {
-    for (DeviceBufferPair& buffer : buffers) {
-      RETURN_IF_ERROR(gpu_comm->LaunchAllReduce(
-          buffer.source_buffer, buffer.destination_buffer, buffer.element_type,
-          buffer.element_count, reduction_kind, GpuCollectives::On(stream)));
-    }
-    return absl::OkStatus();
-  });
+  // Pass the collective count so backends can skip group batching for a single
+  // collective (oneCCL: a lone ccl::allreduce needs no group_start/group_end).
+  Future<> future = gpu_comm->GroupExecuteCounted(
+      [&]() -> absl::Status {
+        for (DeviceBufferPair& buffer : buffers) {
+          RETURN_IF_ERROR(gpu_comm->LaunchAllReduce(
+              buffer.source_buffer, buffer.destination_buffer,
+              buffer.element_type, buffer.element_count, reduction_kind,
+              GpuCollectives::On(stream)));
+        }
+        return absl::OkStatus();
+      },
+      static_cast<int64_t>(buffers.size()));
   RETURN_IF_ERROR(future.Await());
   XLA_VLOG_DEVICE(3, device_ordinal) << "Done performing all-reduce";
   return absl::OkStatus();
