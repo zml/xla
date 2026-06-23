@@ -319,7 +319,16 @@ CodegenDecision CanTritonHandleGEMM(
         "Triton backend is not supported on Intel GPUs.");
   }
 
-  CHECK(cuda_compute_capability || rocm_compute_capability);
+  // Triton GEMM codegen exists only for NVIDIA and AMD. Other backends (Metal,
+  // and any future capability) must Forbid gracefully here rather than CHECK-
+  // fail: this is reached from the generic DotStrengthReduction pass (not just
+  // Triton fusion), so a non-CUDA/ROCm device hitting it should fall through to
+  // strength reduction, not abort. (Before the Metal capability was first-class
+  // it masqueraded as CUDA and silently satisfied this CHECK.)
+  if (!cuda_compute_capability && !rocm_compute_capability) {
+    return CodegenDecision::Forbid(
+        "Triton GEMM is only supported on NVIDIA and AMD GPUs.");
+  }
 
   if (dot.precision_config().algorithm() == PrecisionConfig::ALG_UNSET) {
     if (absl::c_any_of(dot.precision_config().operand_precision(),

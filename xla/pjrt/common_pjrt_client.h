@@ -98,6 +98,14 @@ class CommonPjRtClient : public PjRtClient {
     return std::move(shape);
   }
 
+  // Submits any host-side-batched device work for `memory_space`'s device so a
+  // host transfer (ToLiteral / CopyRawToHost) does not deadlock waiting on a
+  // definition event whose producing command buffer is still batched open.
+  // Default no-op: eager-submit backends (CUDA/ROCm/CPU streams) buffer nothing
+  // host-side. The Metal backend overrides this to commit the device's open
+  // command buffer. See se::Stream::FlushBatchedWork.
+  virtual void FlushBatchedWorkForHostTransfer(PjRtMemorySpace* memory_space) {}
+
   // Backend specific handlers for when an oom is detected during execute.
   virtual void CallOomHandlers() const {}
 

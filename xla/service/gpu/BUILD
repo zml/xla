@@ -10,12 +10,15 @@ load(
     "@local_config_sycl//sycl:build_defs.bzl",
     "if_sycl_is_configured",
 )
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test", "xla_internal")
 load("//xla/tests:build_defs.bzl", "xla_test")
+load("//xla/util:build_defs.bzl", "embed_files")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
+    "if_macos",
     "internal_visibility",
     "tsl_copts",
 )
@@ -423,6 +426,22 @@ cc_library(
 )
 
 cc_library(
+    name = "ptx_custom_kernel_emitter_metal",
+    srcs = ["custom_kernel_emitter_metal_stub.cc"],
+    hdrs = ["custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "ptx_custom_kernel_emitter",
     hdrs = ["custom_kernel_emitter.h"],
     tags = ["gpu"],
@@ -432,6 +451,8 @@ cc_library(
         ":ptx_custom_kernel_emitter_rocm",
     ]) + if_sycl_is_configured([
         ":ptx_custom_kernel_emitter_sycl",
+    ]) + if_macos([
+        ":ptx_custom_kernel_emitter_metal",
     ]) + [
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/status:statusor",
@@ -489,6 +510,16 @@ cc_library(
         ":kernel_reuse_cache",
         ":launch_dimensions",
         ":matmul_utils",
+        ":metal_custom_calls",
+        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_gemm_thunk",
+        "//xla/backends/gpu/runtime:metal_gdn_thunk",
+        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
+        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_print_thunk",
+        "//xla/backends/gpu/runtime:metal_topk_thunk",
         ":ptx_custom_kernel_emitter",
         ":stream_executor_util",
         ":triton_call",
@@ -824,6 +855,7 @@ cc_library(
         "//xla/stream_executor/abi:executable_abi_version",
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env_time",
@@ -1073,6 +1105,18 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@tsl//tsl/platform:statusor",
+    ],
+)
+
+# Apple Metal GEMM custom-call targets + predicates (the Metal peer of
+# cublas_cudnn). Header-only; the predicates are tiny inline functions.
+cc_library(
+    name = "metal_custom_calls",
+    hdrs = ["metal_custom_calls.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -1470,6 +1514,9 @@ cc_library(
     name = "gpu_transfer_manager",
     srcs = ["gpu_transfer_manager.cc"],
     hdrs = ["gpu_transfer_manager.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         ":io_feed_manager",
         ":target_constants",
@@ -1487,7 +1534,7 @@ cc_library(
         "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:status_macros",
@@ -1507,7 +1554,9 @@ cc_library(
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:numbers",
         "@tsl//tsl/platform:statusor",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
     alwayslink = True,  # Contains per-platform transfer manager registration
 )
 
@@ -2964,6 +3013,9 @@ cc_library(
     hdrs = ["stream_executor_util.h"],
     compatible_with = get_compatible_with_portable(),
     copts = tsl_copts(),
+    # Target-local (does not propagate to dependents) so CreateKernel can route
+    # to the Metal metallib spec on macOS without affecting CUDA/ROCm builds.
+    local_defines = if_macos(["TENSORFLOW_USE_METAL=1"]),
     deps = [
         ":cublas_cudnn",
         ":launch_dimensions",
@@ -3004,7 +3056,7 @@ cc_library(
         "@tsl//tsl/platform:ml_dtypes",
         "@tsl//tsl/profiler/lib:traceme",
         "@tsl//tsl/profiler/lib:traceme_encode",
-    ],
+    ] + if_macos(["//xla/stream_executor/metal:metal_platform_id"]),
 )
 
 xla_cc_test(
@@ -3789,6 +3841,160 @@ cc_library(
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+# The Metal kernel shader sources (metalBLAS GEMM/GEMV, MLX split-K, vllm paged
+# attention, and the custom flash-attn/kv_write/topk kernels) and their embed
+# targets live in //xla/service/gpu/metal_kernels. metalblas_gemm consumes the
+# inlined metalBLAS bundle via :metalblas_shaders there.
+
+# Standalone C++ port of the metalBLAS matmul dispatcher (pure routing/tile
+# logic, no deps). Golden-verified against the Python original (0 mismatches over
+# 200k rows). Origin: metalBLAS/port — imported here to wire as a matmul backend.
+cc_library(
+    name = "metalblas_dispatch",
+    srcs = ["metalblas_dispatch.cc"],
+    hdrs = ["metalblas_dispatch.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+)
+
+# Runs the metalBLAS dispatcher for a GEMM and compiles the chosen kernel to a
+# metallib (the NN m5_tensor path so far). Pure C++ + xcrun-at-runtime, so it
+# links into the general gpu thunk emitter on every platform (xcrun is only
+# invoked when the live platform is Metal).
+cc_library(
+    name = "metalblas_gemm",
+    srcs = ["metalblas_gemm.cc"],
+    hdrs = ["metalblas_gemm.h"],
+    tags = ["gpu"],
+    deps = [
+        ":metal_air_toolchain",
+        ":metalblas_dispatch",
+        "//xla/service/gpu/metal_kernels:metalblas_shaders",
+        "//xla:xla_data_proto_cc",
+        "//xla/stream_executor:launch_dim",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+# The sole Metal Compiler registration. alwayslink so the static
+# RegisterCompilerFactory initializer survives. metal_gpu_compiler_impl deps
+# :gpu_compiler, so this transitively links the GpuCompiler/GpuExecutable stack.
+cc_library(
+    name = "metal_gpu_compiler",
+    srcs = [
+        "metal_gpu_compiler_registration.cc",
+    ],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_gpu_compiler_impl",
+        "//xla/service:compiler",
+        "//xla/stream_executor/metal:metal_platform_id",
+    ],
+    alwayslink = True,  # Contains compiler registration
+)
+
+cc_library(
+    name = "metal_air_toolchain",
+    srcs = ["metal_air_toolchain.cc"],
+    hdrs = ["metal_air_toolchain.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:status",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:subprocess",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+# GpuCompiler-subclass implementation of the Metal backend: reuses the standard
+# GpuExecutable/thunk runtime and emits Apple AIR at the CompileTargetBinary seam.
+# This is the sole Metal compiler (the legacy standalone MetalGpuCompiler has been
+# removed). See metal-xla-docs/GPUCOMPILER_PORT_PLAN.md.
+cc_library(
+    name = "metal_gpu_compiler_impl",
+    srcs = ["metal_gpu_compiler.cc"],
+    hdrs = ["metal_gpu_compiler.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":gpu_compiler",
+        ":metal_air_metadata",
+        ":metal_air_toolchain",
+        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_gdn_thunk",
+        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
+        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_topk_thunk",
+        ":target_constants",
+        "//xla:shape_util",
+        "//xla:xla_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/transforms/simplifiers:hlo_dce",
+        "//xla/service:compiler",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:ir_headers",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+# Apple AIR module-level metadata helpers (the air-as envelope + the !air.kernel
+# argument descriptors) that the GpuToAIR codegen path stamps onto the lowered
+# LLVM module before printing textual `.ll` for air-as.
+cc_library(
+    name = "metal_air_metadata",
+    srcs = ["metal_air_metadata.cc"],
+    hdrs = ["metal_air_metadata.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TargetParser",
         "@llvm-project//llvm:ir_headers",
     ],
 )

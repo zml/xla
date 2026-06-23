@@ -48,7 +48,7 @@ namespace xla::gpu {
 namespace {
 
 absl::StatusOr<HloInstruction*> SmallBufferOptimization(
-    HloCustomCallInstruction* topk, bool is_cuda,
+    HloCustomCallInstruction* topk, bool is_cuda, bool is_metal,
     bool xla_gpu_experimental_use_raft_select_k) {
   Shape data_shape = topk->operand(0)->shape();
   auto dtype = data_shape.element_type();
@@ -96,6 +96,11 @@ absl::StatusOr<HloInstruction*> SmallBufferOptimization(
         max_k = 64;
       }
     }
+  } else if (is_metal) {
+    // Metal's bucket/radix-select TopK templates the select kernel on
+    // bit_ceil(k) in {1,2,4,8,16,32}, so it handles k up to 32 (the shared
+    // CustomCall TopK path used by other backends is still capped at 16).
+    max_k = 32;
   }
 
   if (k > max_k) {
@@ -128,9 +133,10 @@ class SpecializeTopkVisitor : public DfsHloRewriteVisitor {
     }
     TF_RET_CHECK(topk->operand_count() == 1);
     bool is_cuda = compute_capability_.IsCuda();
+    bool is_metal = compute_capability_.IsMetal();
 
     if (auto small_topk = SmallBufferOptimization(
-            topk, is_cuda,
+            topk, is_cuda, is_metal,
             inst->GetModule()
                 ->config()
                 .debug_options()

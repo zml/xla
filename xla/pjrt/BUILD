@@ -298,6 +298,7 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/concurrency:async_value",
         "//xla/tsl/platform:env",

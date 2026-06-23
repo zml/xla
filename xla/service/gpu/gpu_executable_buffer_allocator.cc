@@ -117,7 +117,16 @@ GpuCollectives* ResolveGpuCollectives(
     return absl::down_cast<GpuCollectives*>(*collectives);
   }
 
-  return GpuCollectives::Default(platform_name);
+  // Single-device backends with no registered collectives (e.g. Metal) have no
+  // default — return nullptr and proceed without collective-memory granularity,
+  // rather than aborting (GpuCollectives::Default CHECK-unwraps this StatusOr).
+  // CUDA/ROCm always have a default, so their path is unchanged.
+  absl::StatusOr<Collectives*> collectives =
+      CollectivesRegistry::Default(platform_name);
+  if (!collectives.ok()) {
+    return nullptr;
+  }
+  return absl::down_cast<GpuCollectives*>(*collectives);
 }
 
 }  // namespace

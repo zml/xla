@@ -177,7 +177,7 @@ class GpuExecutable : public Executable {
       const ServiceExecutableRunOptions* run_options,
       VariantArguments arguments);
 
-  absl::Span<const BufferAllocation* absl_nonnull const> GetAllocations()
+  absl::Span<const BufferAllocation * absl_nonnull const> GetAllocations()
       const override {
     return allocation_ptrs_;
   }
@@ -393,6 +393,16 @@ class GpuExecutable : public Executable {
 
   std::vector<ConstantInfo> constants_;
   std::unique_ptr<GpuModuleGlobals> module_globals_;
+
+  // Metal-only constant globals. Metal has no CUDA module/symbol table, so its
+  // constants are allocated and initialized directly in ResolveConstantGlobals
+  // (GpuModuleGlobals above handles the CUDA path) and cached here per executor.
+  absl::Mutex metal_module_mutex_;
+  absl::flat_hash_map<se::StreamExecutor*,
+                      std::unique_ptr<BufferAllocToDeviceMemoryMap>>
+      metal_module_globals_ ABSL_GUARDED_BY(metal_module_mutex_);
+  absl::flat_hash_map<se::StreamExecutor*, std::vector<se::DeviceAddressBase>>
+      metal_constant_allocations_ ABSL_GUARDED_BY(metal_module_mutex_);
   const absl::flat_hash_map<ShapeIndex, OutputInfo> output_info_;
   bool enable_debug_info_manager_;
   std::unique_ptr<GpuExecutableBufferAllocator> buffer_allocator_;

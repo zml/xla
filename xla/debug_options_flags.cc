@@ -51,8 +51,10 @@ limitations under the License.
 #include "xla/debug_options_parsers.h"
 #include "xla/parse_flags_from_env.h"
 #include "xla/service/collective_utils.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/stream_executor/cuda/nvjitlink_support.h"
 #include "xla/stream_executor/cuda/ptx_compiler_support.h"
+#endif
 #include "xla/tsl/platform/logging.h"  // IWYU pragma: keep
 #include "xla/tsl/util/command_line_flags.h"
 #include "xla/xla.pb.h"
@@ -389,8 +391,12 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_experimental_enable_fusion_block_level_rewriter(false);
 
   opts.set_xla_gpu_default_to_alg_dot_bf16_bf16_f32(false);
+#if TENSORFLOW_USE_METAL
+  opts.set_xla_gpu_enable_libnvptxcompiler(false);
+#else
   opts.set_xla_gpu_enable_libnvptxcompiler(
       stream_executor::IsLibNvPtxCompilerSupported());
+#endif
   opts.set_xla_gpu_libnvjitlink_mode(DebugOptions::LIB_NV_JIT_LINK_MODE_AUTO);
 
   opts.set_xla_gpu_nccl_async_execution(false);
@@ -2602,11 +2608,17 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
   flag_list->push_back(tsl::Flag(
       "xla_gpu_enable_libnvptxcompiler",
       [debug_options](bool enabled) {
+#if TENSORFLOW_USE_METAL
+        if (enabled) {
+          return false;
+        }
+#else
         if (enabled && !stream_executor::IsLibNvPtxCompilerSupported()) {
           // This feature can't be enabled when XLA was built without
           // libnvptxcompiler support.
           return false;
         }
+#endif
         debug_options->set_xla_gpu_enable_libnvptxcompiler(enabled);
         return true;
       },
@@ -2621,7 +2633,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
                     : DebugOptions::LIB_NV_JIT_LINK_MODE_DISABLED);
         return true;
       },
+#if TENSORFLOW_USE_METAL
+      false,
+#else
       stream_executor::IsLibNvJitLinkSupported(),
+#endif
       "Use libnvjitlink for PTX-to-GPU-assembly compilation instead of "
       "calling ptxas."));
   flag_list->push_back(tsl::Flag(

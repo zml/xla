@@ -1,11 +1,11 @@
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
+load("@bazel_skylib//lib:selects.bzl", "selects")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/pjrt/gpu:package_groups.bzl", "xla_gpu_internal_packages")
-load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/tsl:tsl.bzl", "if_google", "internal_visibility")
+load("//xla/tsl:tsl.bzl", "if_google", "if_macos", "internal_visibility")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 # Integrate with PJRT rather than the GPU client directly.
@@ -16,6 +16,14 @@ package(
 )
 
 xla_gpu_internal_packages()
+
+selects.config_setting_group(
+    name = "cuda_enabled_macos",
+    match_all = [
+        "//xla/tsl:is_cuda_enabled",
+        "//xla/tsl:macos",
+    ],
+)
 
 cc_library(
     name = "gpu_helpers",
@@ -54,13 +62,20 @@ cc_library(
     name = "se_gpu_pjrt_client",
     srcs = ["se_gpu_pjrt_client.cc"],
     hdrs = ["se_gpu_pjrt_client.h"],
-    defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
+    defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]) + select({
+        ":cuda_enabled_macos": [],
+        "//xla/tsl:is_cuda_enabled": ["GOOGLE_CUDA=1"],
+        "//conditions:default": [],
+    }) + if_rocm([
+        "TENSORFLOW_USE_ROCM=1",
+    ]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
     ]),
     visibility = internal_visibility(["//xla/pjrt/gpu:legacy_gpu_client_users"]),
     deps = [
         ":gpu_helpers",
-        ":gpu_metrics",
         ":se_gpu_pjrt_runtime_abi_version",
         ":se_gpu_topology_description",
         "//xla:executable_run_options",
@@ -73,20 +88,9 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
         "//xla/backends/cpu:target_machine_options",
-        "//xla/backends/gpu/collectives:allocator_memory_registration",
-        "//xla/backends/gpu/collectives:gpu_clique",
-        "//xla/backends/gpu/collectives:gpu_clique_key",
-        "//xla/backends/gpu/collectives:gpu_cliques",
-        "//xla/backends/gpu/collectives:gpu_collectives",
-        "//xla/backends/gpu/collectives:gpu_communicator",
         "//xla/backends/gpu/target_config",
         "//xla/client:client_library",
         "//xla/client:local_client",
-        "//xla/core/collectives",
-        "//xla/core/collectives:clique_id",
-        "//xla/core/collectives:collectives_registry",
-        "//xla/core/collectives:communicator",
-        "//xla/core/collectives:rank_id",
         "//xla/hlo/builder:xla_computation",
         "//xla/hlo/ir:hlo",
         "//xla/pjrt:async_work_runner",
@@ -194,23 +198,55 @@ cc_library(
         "@tsl//tsl/platform:protobuf",
         "@tsl//tsl/platform:status",
         "@tsl//tsl/platform:statusor",
-        "@tsl//tsl/profiler/lib:connected_traceme",
-        "@tsl//tsl/profiler/lib:nvtx_utils",
         "@tsl//tsl/profiler/lib:traceme",
-    ] + if_cuda_or_rocm([
+    ] + if_macos([], [
         # keep sorted
+        "//xla/backends/gpu/collectives:allocator_memory_registration",
+        "//xla/backends/gpu/collectives:gpu_clique",
+        "//xla/backends/gpu/collectives:gpu_clique_key",
+        "//xla/backends/gpu/collectives:gpu_cliques",
+        "//xla/backends/gpu/collectives:gpu_collectives",
+        "//xla/backends/gpu/collectives:gpu_communicator",
+        "//xla/core/collectives",
+        "//xla/core/collectives:clique_id",
+        "//xla/core/collectives:collectives_registry",
+        "//xla/core/collectives:communicator",
+        "//xla/core/collectives:rank_id",
+    ]) + select({
+        ":cuda_enabled_macos": [],
+        "//xla/tsl:is_cuda_enabled": [
+            # keep sorted
+            ":gpu_metrics",
+            "//xla:debug_options_flags",
+            "//xla/service/gpu:gpu_compiler",
+            "//xla/service/gpu:gpu_constants",
+            "//xla/service/gpu:gpu_executable",
+            "//xla/service/gpu:stream_executor_util",
+        ],
+        "//conditions:default": [],
+    }) + if_rocm([
+        # keep sorted
+        ":gpu_metrics",
         "//xla:debug_options_flags",
         "//xla/service/gpu:gpu_compiler",
         "//xla/service/gpu:gpu_executable",
         "//xla/service/gpu:gpu_executable_buffer_allocator",
         "//xla/service/gpu:stream_executor_util",
-    ]) + if_cuda([
+    ]) + if_macos([
         # keep sorted
-        "//xla/stream_executor/cuda:cuda_compute_capability",
-        "//xla/stream_executor/cuda:cuda_device_address_vmm_allocator",
-        "//xla/stream_executor/gpu:gpu_cudamallocasync_allocator",
-        "@local_config_cuda//cuda:cuda_headers",
-    ]) + if_rocm([
+        "//xla:debug_options_flags",
+        "//xla/stream_executor/metal:metal_platform_id",
+    ]) + select({
+        ":cuda_enabled_macos": [],
+        "//xla/tsl:is_cuda_enabled": [
+            # keep sorted
+            "//xla/stream_executor/cuda:cuda_compute_capability",
+            "//xla/stream_executor/cuda:cuda_device_address_vmm_allocator",
+            "//xla/stream_executor/gpu:gpu_cudamallocasync_allocator",
+            "@local_config_cuda//cuda:cuda_headers",
+        ],
+        "//conditions:default": [],
+    }) + if_rocm([
         # keep sorted
         "//xla/stream_executor/rocm:rocm_device_address_vmm_allocator",
         "@local_config_rocm//rocm:rocm_headers",
@@ -620,6 +656,26 @@ cc_library(
 )
 
 cc_library(
+    name = "se_gpu_pjrt_compiler_metal_registration",
+    srcs = ["se_gpu_pjrt_compiler_metal_registration.cc"],
+    compatible_with = [],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt:stream_executor_platform_id_mapping",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log:check",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "se_gpu_pjrt_compiler",
     hdrs = ["se_gpu_pjrt_compiler.h"],
     # TODO(b/382070262): Migrate users off this target - They should go though the PjRt ABI compatibility layer.
@@ -648,6 +704,8 @@ cc_library(
         ":se_gpu_pjrt_compiler_rocm_registration",
     ]) + if_sycl([
         ":se_gpu_pjrt_compiler_sycl_registration",
+    ]) + if_macos([
+        ":se_gpu_pjrt_compiler_metal_registration",
     ]),
 )
 

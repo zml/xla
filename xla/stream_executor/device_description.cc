@@ -28,6 +28,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/metal/metal_compute_capability.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
@@ -120,6 +121,10 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
     device_description.gpu_compute_capability_ =
         OneAPIComputeCapability(proto.oneapi_compute_capability());
   }
+  if (proto.has_metal_compute_capability()) {
+    device_description.gpu_compute_capability_ =
+        MetalComputeCapability(proto.metal_compute_capability());
+  }
   device_description.core_count_ = proto.core_count();
   device_description.fpus_per_core_ = proto.fpus_per_core();
 
@@ -176,6 +181,9 @@ GpuDeviceInfoProto DeviceDescription::ToProto() const {
   }
   if (auto* ptr = gpu_compute_capability_.oneapi_compute_capability()) {
     *proto.mutable_oneapi_compute_capability() = ptr->ToProto();
+  }
+  if (auto* ptr = gpu_compute_capability_.metal_compute_capability()) {
+    *proto.mutable_metal_compute_capability() = ptr->ToProto();
   }
 
   proto.set_device_vendor(device_vendor_);
@@ -362,6 +370,13 @@ OneAPIComputeCapability DeviceDescription::oneapi_compute_capability() const {
   return OneAPIComputeCapability{};
 }
 
+MetalComputeCapability DeviceDescription::metal_compute_capability() const {
+  if (auto* ptr = gpu_compute_capability_.metal_compute_capability()) {
+    return *ptr;
+  }
+  return MetalComputeCapability{};
+}
+
 bool ThreadDimOk(const DeviceDescription& device_description,
                  const ThreadDim& thread_dim) {
   const int64_t total_threads = thread_dim.x * thread_dim.y * thread_dim.z;
@@ -402,6 +417,9 @@ GpuComputeCapabilityProto GpuComputeCapability::ToProto() const {
   } else if (IsOneAPI()) {
     *proto.mutable_oneapi_compute_capability() =
         oneapi_compute_capability()->ToProto();
+  } else if (IsMetal()) {
+    *proto.mutable_metal_compute_capability() =
+        metal_compute_capability()->ToProto();
   } else {
     *proto.mutable_rocm_compute_capability() =
         rocm_compute_capability()->ToProto();
@@ -426,6 +444,11 @@ absl::StatusOr<GpuComputeCapability> GpuComputeCapability::FromProto(
   if (proto.has_oneapi_compute_capability()) {
     return GpuComputeCapability(
         OneAPIComputeCapability::FromProto(proto.oneapi_compute_capability()));
+  }
+
+  if (proto.has_metal_compute_capability()) {
+    return GpuComputeCapability(
+        MetalComputeCapability::FromProto(proto.metal_compute_capability()));
   }
 
   return absl::InvalidArgumentError(

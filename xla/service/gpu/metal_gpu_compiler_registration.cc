@@ -1,0 +1,35 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Registers MetalGpuCompiler (the GpuCompiler-subclass implementation) as the
+// Compiler for kMetalPlatformId. This is the sole Metal compiler registration
+// (the legacy standalone MetalGpuCompiler was removed); it must be the only
+// RegisterCompilerFactory(kMetalPlatformId) TU linked into the plugin, as
+// Compiler::RegisterCompilerFactory CHECK-fails on a double registration.
+
+#include <memory>
+
+#include "xla/service/compiler.h"
+#include "xla/service/gpu/metal_gpu_compiler.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
+
+static bool InitMetalCompilerModule() {
+  xla::Compiler::RegisterCompilerFactory(
+      stream_executor::metal::kMetalPlatformId,
+      []() { return std::make_unique<xla::gpu::MetalGpuCompiler>(); });
+  return true;
+}
+
+static bool metal_compiler_module_initialized = InitMetalCompilerModule();

@@ -168,6 +168,45 @@ class ThunkEmitter {
 
   absl::StatusOr<ThunkSequence> EmitFftThunk(const HloFftInstruction* instr);
 
+  // Metal: runs a __cublas$lt$matmul GEMM via the in-tree metalBLAS kernels
+  // (there is no cuBLAS-LT on Metal). Falls back to EmitCublasLtMatmulThunk for
+  // any case metalBLAS doesn't wire yet.
+  absl::StatusOr<ThunkSequence> EmitMetalGemmThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // zml.Tensor.print on Metal ("zml$print"): copies the operand to host and
+  // logs a labeled shape + value summary to stderr (debugging tool).
+  absl::StatusOr<ThunkSequence> EmitMetalPrintThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // zml's `.metal_fa` attention backend ("zml$flash_attn"): a fused GQA flash-
+  // attention decode kernel (M=1) replacing sdpa's MPSGraph dots + softmax.
+  absl::StatusOr<ThunkSequence> EmitMetalFlashAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // zml's metal paged-attention backend ("zml$paged_attn"): a tiled (FA-2 style)
+  // paged attention kernel (prefill + decode) reading a paged KV cache via
+  // per-sequence block tables. The vllm-metal tiled kernel, vendored verbatim.
+  absl::StatusOr<ThunkSequence> EmitMetalPagedAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // Backend-generated "metal$kv_write" (RewriteKvCacheWrites): the decode-step
+  // paged KV-cache write — RoPE(k) + raw v at slot, predicated on slot
+  // validity — as one kernel.
+  absl::StatusOr<ThunkSequence> EmitMetalKvWriteThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // zml's Gated DeltaNet recurrence "zml$gdn": the vendored vllm-metal
+  // recurrent delta-rule linear-attention kernel (Qwen3-Next hybrid models).
+  absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitFp8GemvThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
+      const HloCustomCallInstruction* hlo);
+
   absl::StatusOr<ThunkSequence> EmitInfeed(const HloInfeedInstruction* instr);
 
   absl::StatusOr<ThunkSequence> EmitNormThunk(

@@ -219,6 +219,18 @@ class Stream {
   // Otherwise returns an error describing why the blocking failed.
   virtual absl::Status BlockHostUntilDone() = 0;
 
+  // Submits any host-side-batched commands to the device WITHOUT blocking the
+  // host, so asynchronous work — and the completion events that depend on it —
+  // can begin. Default no-op: most backends submit eagerly to a persistent
+  // queue (a CUDA/ROCm stream is always live), so nothing is buffered
+  // host-side. The Metal backend batches several executes into one
+  // MTLCommandBuffer to amortize the per-command-buffer scheduling gap; a host
+  // transfer (D2H readback) is a synchronization point that must commit that
+  // open buffer here, or a host waiter on a definition event still batched in
+  // the open buffer would deadlock (the blocked host cannot issue the further
+  // executes that would otherwise trigger the batch commit).
+  virtual absl::Status FlushBatchedWork() { return absl::OkStatus(); }
+
   // Entrains onto the stream a callback to the host (from the device).
   // Behaves as DoHostCallbackWithStatus below, but the callback should
   // never fail or its failure is inconsequential.

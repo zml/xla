@@ -145,9 +145,9 @@ common:macos --apple_platform_type=macos
 
 # Use cc toolchains from apple_support for Apple builds.
 # https://github.com/bazelbuild/apple_support/tree/master?tab=readme-ov-file#bazel-6-setup
-common:macos --apple_crosstool_top=@local_config_apple_cc//:toolchain
-common:macos --crosstool_top=@local_config_apple_cc//:toolchain
-common:macos --host_crosstool_top=@local_config_apple_cc//:toolchain
+# common:macos --apple_crosstool_top=@local_config_apple_cc//:toolchain
+# common:macos --crosstool_top=@local_config_apple_cc//:toolchain
+# common:macos --host_crosstool_top=@local_config_apple_cc//:toolchain
 
 # gRPC on MacOS requires this #define
 common:macos --copt=-DGRPC_BAZEL_BUILD

@@ -43,6 +43,44 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_mlir_kernel_fusion",
+    srcs = ["metal_mlir_kernel_fusion.cc"],
+    hdrs = ["metal_mlir_kernel_fusion.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":mlir_kernel_emitter",
+        ":reduction",
+        "//xla:future",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen:fusion_emitter",
+        "//xla/backends/gpu/codegen:kernel_compiler",
+        "//xla/backends/gpu/runtime:kernel_thunk",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/codegen:llvm_kernel_source",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:ir_emitter_context",
+        "//xla/service/gpu:metal_air_metadata",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/concurrency:future",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:ir_headers",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_library(
     name = "mlir_kernel_emitter",
     srcs = ["mlir_kernel_emitter.cc"],
     hdrs = ["mlir_kernel_emitter.h"],

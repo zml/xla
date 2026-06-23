@@ -858,7 +858,16 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
   // parallelizing the z dimension (major reduced dimensions). The general
   // recommendation is to use between 128 and 512 threads, so we just go for
   // 256. See https://forums.developer.nvidia.com/t/55529
-  constexpr int64_t kThreadsPerBlockTarget = 256;
+  //
+  // On Metal, the decode weight GEMVs are row reductions with ~192 reduced
+  // threads, which leaves num_threads_kept==1 (one output row per block) under
+  // a 256 target. Single-row blocks are latency-bound on the per-row tree
+  // reduction (~280 GB/s) vs the gate/up tuple fusion's 2-outputs-per-block
+  // (~420 GB/s). A larger target packs multiple rows per block, recovering that
+  // memory-level parallelism. Each row's reduction tree is unchanged, so the
+  // output stays byte-identical.
+  const int64_t kThreadsPerBlockTarget =
+      analysis_.device_info().gpu_compute_capability().IsMetal() ? 512 : 256;
   if (num_threads_reduced * 2 <= kThreadsPerBlockTarget) {
     int64_t kept_size = reduction_dimensions_.dimensions[kRowKept];
     // Increase the size of the y dimension as long as there's remaining

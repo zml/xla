@@ -351,6 +351,15 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {
   }
 
   bool ShouldStageHostToDeviceTransfers(const void* data, int64_t size) {
+    // On Metal (Apple unified memory) the host-to-device staging buffer is a
+    // redundant copy: device buffers are CPU-visible MTLStorageModeShared, so
+    // host data is memcpy'd straight into the device buffer. Skipping staging
+    // removes ~0.3s of one-time weight feeding at model load (the device write
+    // itself dominates and is unchanged); decode is unaffected. Free on
+    // CUDA/ROCm where the disjunct is false at runtime.
+    if (platform_id() == MetalId()) {
+      return false;
+    }
     // Allocating multi-gigabyte pinned buffers can be very slow. In that case,
     // using a staging buffer is probably worse than not using one.
     // TODO(phawkins): add chunking for transfers.
@@ -396,6 +405,12 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {
       int memory_space_kind_id) const override {
     return PjRtDynamicShapeKind::kSuffix;
   }
+
+  // Commits any open (batched) command buffer on the device's compute stream so
+  // a definition event a host transfer is about to wait on can resolve. No-op
+  // for backends whose streams submit eagerly (se::Stream::FlushBatchedWork
+  // default); only the Metal backend overrides FlushBatchedWork.
+  void FlushBatchedWorkForHostTransfer(PjRtMemorySpace* memory_space) override;
 
   using CommonPjRtClient::GetOnDeviceBytesCount;
   absl::StatusOr<int64_t> GetOnDeviceBytesCount(

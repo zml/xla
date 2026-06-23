@@ -60,6 +60,16 @@ static absl::StatusOr<ExecutableAbiVersion> CreateForOneAPI(
   return ExecutableAbiVersion::FromProto(std::move(proto));
 }
 
+// Returns a minimal ABI version for Metal with no platform-specific version
+// info. Compatibility checks will treat this as always-compatible (Metal is
+// JIT-only here, no AOT ABI to version yet), like ROCm/oneAPI.
+static absl::StatusOr<ExecutableAbiVersion> CreateForMetal(
+    const DeviceDescription& /*device_description*/) {
+  ExecutableAbiVersionProto proto;
+  proto.set_platform_name("METAL");
+  return ExecutableAbiVersion::FromProto(std::move(proto));
+}
+
 absl::StatusOr<ExecutableAbiVersion> ExecutableAbiVersion::FromProto(
     const ExecutableAbiVersionProto& proto) {
   return ExecutableAbiVersion(proto);
@@ -75,6 +85,9 @@ ExecutableAbiVersion::FromDeviceDescription(
   }
   if (device_description.gpu_compute_capability().IsOneAPI()) {
     return CreateForOneAPI(device_description);
+  }
+  if (device_description.gpu_compute_capability().IsMetal()) {
+    return CreateForMetal(device_description);
   }
 
   return absl::UnimplementedError(

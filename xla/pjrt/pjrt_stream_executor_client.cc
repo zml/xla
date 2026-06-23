@@ -674,6 +674,25 @@ bool PjRtStreamExecutorClient::IsOnCpu(PjRtMemorySpace* memory_space) {
   return memory_space->kind() == PinnedHostMemorySpace::kKind;
 }
 
+void PjRtStreamExecutorClient::FlushBatchedWorkForHostTransfer(
+    PjRtMemorySpace* memory_space) {
+  // Submit any open (batched) command buffer on the producing device's compute
+  // stream so a definition event the host is about to wait on can resolve.
+  // se::Stream::FlushBatchedWork is a no-op for eager-submit backends, so this
+  // is free on CUDA/ROCm/CPU and only does work on Metal.
+  for (PjRtDevice* device : memory_space->devices()) {
+    auto* se_device = tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+    LocalDeviceState* local_device = se_device->local_device_state();
+    if (local_device == nullptr) continue;
+    se::Stream* stream = local_device->compute_stream();
+    if (stream == nullptr) continue;
+    absl::Status status = stream->FlushBatchedWork();
+    if (!status.ok()) {
+      LOG(ERROR) << "FlushBatchedWork failed during host transfer: " << status;
+    }
+  }
+}
+
 absl::StatusOr<PjRtDeviceEventRef>
 PjRtStreamExecutorClient::LinearizeHostBufferInto(
     const void* data, PrimitiveType type, absl::Span<int64_t const> dims,

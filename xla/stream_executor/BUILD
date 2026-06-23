@@ -71,6 +71,7 @@ cc_library(
         ":semantic_version",
         "//xla:xla_data_proto_cc",
         "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/metal:metal_compute_capability",
         "//xla/stream_executor/rocm:rocm_compute_capability",
         "//xla/stream_executor/sycl:oneapi_compute_capability",
         "//xla/tsl/lib/math:math_util",
@@ -1443,5 +1444,14 @@ alias(
     actual = "//xla/stream_executor/sycl:all_runtime",
     tags = [
         "gpu",
+    ],
+)
+
+alias(
+    name = "metal_platform",
+    actual = "//xla/stream_executor/metal:all_runtime",
+    tags = [
+        "gpu",
+        "metal-only",
     ],
 )

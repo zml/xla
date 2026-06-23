@@ -107,6 +107,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -189,7 +190,7 @@ class GpuExecutableThunkPassBufferAllocator : public ThunkPassBufferAllocator {
       BufferAllocation::Index start_idx)
       : next_idx_(start_idx) {}
 
-  absl::StatusOr<BufferAllocation* absl_nonnull> NewEmptyAllocation(
+  absl::StatusOr<BufferAllocation * absl_nonnull> NewEmptyAllocation(
       int64_t size) override {
     allocations_.push_back(BufferAllocation(next_idx_++, size, /*color=*/0));
     return &allocations_.back();
@@ -320,8 +321,10 @@ static absl::Status RunThunkPasses(const DebugOptions& debug_options,
     pipeline.AddPass(std::make_unique<ThunkBufferDebugPass>(
         ThunkBufferDebugPass::Mode::kFloatChecker, buffer_assignment));
   }
-  pipeline.AddPass(std::make_unique<CommandBufferConversionPass>(
-      hlo_module ? hlo_module->name() : "Anonymous"));
+  if (device_info.platform_version() != "Metal") {
+    pipeline.AddPass(std::make_unique<CommandBufferConversionPass>(
+        hlo_module ? hlo_module->name() : "Anonymous"));
+  }
 
   ASSIGN_OR_RETURN(bool changed,
                    pipeline.Run(&root_thunk->thunks(), debug_options,
@@ -501,6 +504,18 @@ GpuExecutable::GpuExecutable(
 }
 
 GpuExecutable::~GpuExecutable() {
+  // Free the Metal constant globals allocated directly in ResolveConstantGlobals.
+  // (The CUDA path's module handles + globals are owned by GpuModuleGlobals.)
+  {
+    absl::MutexLock lock(&metal_module_mutex_);
+    for (auto& [executor, allocations] : metal_constant_allocations_) {
+      for (se::DeviceAddressBase& allocation : allocations) {
+        executor->Deallocate(&allocation);
+      }
+    }
+    metal_constant_allocations_.clear();
+  }
+
   if (has_module() && enable_debug_info_manager_) {
     XlaDebugInfoManager::Get()->UnregisterModule(module().unique_id());
   }
@@ -526,6 +541,8 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == stream_executor::metal::kMetalPlatformId) {
+    // The Metal backend validates MSL compatibility at library/pipeline load.
   } else {
     return Internal("Unknown platform");
   }
@@ -987,6 +1004,67 @@ absl::Status BarrierAfterExecutable(
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>
 GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
+  se::StreamExecutor* executor = stream->parent();
+
+  if (executor->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    // Apple Metal has no PTX/cubin module to load and no symbol table; allocate
+    // each constant global directly and initialize it from the embedded
+    // content. Cached per executor (GpuModuleGlobals handles the CUDA path).
+    absl::MutexLock lock(metal_module_mutex_);
+    if (auto it = metal_module_globals_.find(executor);
+        it != metal_module_globals_.end()) {
+      return it->second.get();
+    }
+    auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
+    std::vector<se::DeviceAddressBase>& owned_allocations =
+        metal_constant_allocations_[executor];
+    bool submitted_mem_copies = false;
+
+    for (const ConstantInfo& info : constants_) {
+      if (info.allocation_index == -1) continue;
+      absl::Span<const BufferAllocation* const> allocations = GetAllocations();
+      if (info.allocation_index < 0 ||
+          info.allocation_index >= allocations.size()) {
+        return absl::InternalError(absl::StrCat(
+            "Metal constant global ", info.symbol_name,
+            " has invalid allocation index ", info.allocation_index));
+      }
+
+      uint64_t allocation_size = allocations[info.allocation_index]->size();
+      uint64_t content_size = info.content.span().size();
+      uint64_t size = content_size == 0 ? allocation_size : content_size;
+      if (size == 0) {
+        CHECK(globals
+                  ->emplace(info.allocation_index,
+                            se::DeviceAddressBase(nullptr, 0))
+                  .second);
+        continue;
+      }
+      se::DeviceAddressBase global =
+          executor->Allocate(size, /*memory_space=*/0);
+      if (global.opaque() == nullptr) {
+        return absl::InternalError(absl::StrCat(
+            "Failed to allocate Metal constant global ", info.symbol_name));
+      }
+      owned_allocations.push_back(global);
+      if (content_size == 0) {
+        RETURN_IF_ERROR(stream->MemZero(&global, size));
+      } else {
+        RETURN_IF_ERROR(
+            stream->Memcpy(&global, info.content.span().data(), content_size));
+      }
+      submitted_mem_copies = true;
+      CHECK(globals->emplace(info.allocation_index, global).second);
+    }
+
+    if (submitted_mem_copies) {
+      CHECK_OK(stream->BlockHostUntilDone());
+    }
+    return metal_module_globals_.emplace(executor, std::move(globals))
+        .first->second.get();
+  }
+
   return module_globals_->Resolve(stream);
 }
 
@@ -1255,7 +1333,19 @@ absl::Status GpuExecutable::ExecuteThunks(
   }
 
   se::DeviceAddressAllocator* const memory_allocator = run_options->allocator();
-  // Force synchronous execution if the allocator requires it.
+  // Force synchronous execution only if the allocator requires it.
+  //
+  // Metal note: dependent executes are now ordered ON the GPU via a per-device
+  // MTLSharedEvent (producer encodeSignalEvent at RecordEvent / consumer
+  // encodeWaitForEvent at WaitForEventOnStream — see metal_runtime.h and
+  // buffer_sequencing_event.cc, which emits the wait even same-stream for Metal).
+  // That removed the need for the previous per-execute Metal BlockHostUntilDone
+  // (which serialized the ~30-execute/token decode chain to dodge an UNtracked-
+  // access race from MPSGraph's offset-aliased NDArrays), restoring host/GPU
+  // pipelining. Tracked-buffer access (AIR kernels, BFC memory reuse) was already
+  // auto-ordered across command buffers by Metal. So Metal now follows the same
+  // rule as everyone else: block only if the allocator demands synchronous
+  // deallocation (Metal's BFC/MultiDeviceAdapter does not — returns true here).
   const bool block_host_until_done =
       !memory_allocator->AllowsAsynchronousDeallocation();
 

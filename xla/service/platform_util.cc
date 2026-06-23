@@ -34,10 +34,13 @@ limitations under the License.
 #include "xla/debug_options_flags.h"
 #include "xla/service/compiler.h"
 #include "xla/status_macros.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
+#endif
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -53,9 +56,11 @@ namespace xla {
 
 namespace {
 
+#if !TENSORFLOW_USE_METAL
 // Minimum supported CUDA compute capability is 3.5.
 constexpr se::CudaComputeCapability kMinCudaComputeCapability(
     3, 5, se::CudaComputeCapability::FeatureExtension::kNone);
+#endif
 
 bool IsInterpreter(const se::Platform* p) {
   return absl::AsciiStrToLower(p->Name()) == "interpreter";
@@ -75,6 +80,8 @@ std::string CanonicalPlatformName(absl::string_view platform_name) {
     return "rocm";
 #elif TENSORFLOW_USE_SYCL
     return "sycl";
+#elif TENSORFLOW_USE_METAL
+    return "metal";
 #else
     return "cuda";
 #endif
@@ -92,6 +99,7 @@ absl::StatusOr<std::vector<se::Platform*>> GetSupportedPlatforms() {
 // Returns whether the device in StreamExecutor is supported.
 absl::Status IsDeviceSupported(se::StreamExecutor* executor) {
   const auto& description = executor->GetDeviceDescription();
+#if !TENSORFLOW_USE_METAL
   if (executor->GetPlatform()->id() == se::cuda::kCudaPlatformId) {
     // CUDA devices must have a minimum compute capability.
     se::CudaComputeCapability cc = description.cuda_compute_capability();
@@ -102,7 +110,10 @@ absl::Status IsDeviceSupported(se::StreamExecutor* executor) {
           executor->device_ordinal(), kMinCudaComputeCapability.ToString(),
           cc.ToString());
     }
-  } else if (executor->GetPlatform()->id() == se::rocm::kROCmPlatformId) {
+    return absl::OkStatus();
+  }
+#endif
+  if (executor->GetPlatform()->id() == se::rocm::kROCmPlatformId) {
     auto rocm_compute_capability = description.rocm_compute_capability();
     if (!rocm_compute_capability.is_supported_gfx_version()) {
       return Internal(
@@ -168,9 +179,12 @@ absl::StatusOr<se::Platform::Id> PlatformUtil::GetPlatformIdFromCanonicalName(
     absl::string_view platform_name) {
   static const se::Platform::Id kKnownPlatforms[] = {
       se::host::kHostPlatformId,
+#if !TENSORFLOW_USE_METAL
       se::cuda::kCudaPlatformId,
+#endif
       se::rocm::kROCmPlatformId,
       se::sycl::kSyclPlatformId,
+      se::metal::kMetalPlatformId,
   };
 
   for (se::Platform::Id id : kKnownPlatforms) {

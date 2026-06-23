@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/pjrt/device_event.h"
 #include "xla/pjrt/event_pool.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/logging.h"
@@ -63,6 +64,23 @@ void BufferSequencingEvent::WaitForEventOnStream(se::Stream* stream) {
   if (event_.IsError()) {
     return;
   }
+
+  // Metal: command buffers on one queue are NOT implicitly ordered for UNtracked
+  // access (MPSGraph offset-aliased NDArrays — the decode-race source), and a past
+  // wait on this stream does not transitively order independent future command
+  // buffers (each execute is its own command buffer). So always emit an explicit
+  // GPU-side wait (encodeWaitForEvent), bypassing the in-order-stream same-stream
+  // no-op and the streams_defined_on_ cache below. BlockUntilReady above guarantees
+  // the producer's command buffer was committed first (required — see
+  // metal_runtime.h), and a wait for an already-signaled value is a cheap GPU
+  // no-op, so over-emitting is harmless. This preserves host/GPU pipelining where
+  // the old per-execute BlockHostUntilDone (gpu_executable.cc) serialized.
+  if (stream->parent()->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    stream->WaitFor(event_->event.event()).IgnoreError();
+    return;
+  }
+
   if (event_->definition_stream == stream) {
     return;
   }

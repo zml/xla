@@ -30,9 +30,11 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/backends/gpu/collectives/allocator_memory_registration.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
+#endif
 #include "xla/client/local_client.h"
 #include "xla/executable_run_options.h"
 #include "xla/future.h"
@@ -69,6 +71,14 @@ limitations under the License.
 #include "tsl/platform/numa.h"
 
 namespace xla {
+
+// `AllocatorMemoryRegistration` lives in a collectives header that is excluded
+// on Metal (no collective memory). Forward-declare it so the shared_ptr members
+// and parameters below stay well-formed; on Metal the pointer is always null.
+namespace gpu {
+class AllocatorMemoryRegistration;
+}  // namespace gpu
+
 using DeviceTopologyPair =
     std::pair<std::vector<std::unique_ptr<PjRtStreamExecutorDevice>>,
               GpuTopologyProto>;

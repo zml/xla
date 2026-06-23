@@ -860,16 +860,34 @@ class PriorityFusionQueue {
     // Avoid fusing reduce into reduce. Our cost model doesn't currently
     // understand this case due to a lack of tiling analysis.
     // TODO(b/312200883): Remove this.
+    //
+    // On Metal, also count VARIADIC (tuple-output) reductions. The decode
+    // lm_head fuses a large weight GEMV (a non-variadic reduce over the 3072
+    // contraction) into the small-output argmax (a variadic reduce producing a
+    // (f32, s32) tuple). The upstream IsArray() check misses the argmax, so the
+    // GEMV is fused into the argmax fusion and inherits its tiny output tiling
+    // (~500 rows), making the 788MB weight read run at ~half bandwidth from
+    // GPU under-occupancy. Counting the variadic reduce blocks that fusion so
+    // the GEMV stays a standalone, fully-occupied row reduction. Gated to Metal
+    // so CUDA/AMD fusion behavior is unchanged.
+    const bool count_variadic_reduce =
+        device_info_->gpu_compute_capability().IsMetal();
     auto contains_significant_reduce = [&](const HloInstruction* instr) {
       auto fusion = HloFusionAdaptor::ForInstruction(instr);
-      return HloAnyOf(*fusion, [](auto node) {
-        if (!(node.opcode() == HloOpcode::kReduce && node.shape().IsArray())) {
+      return HloAnyOf(*fusion, [&](auto node) {
+        if (node.opcode() != HloOpcode::kReduce) return false;
+        const bool is_array = node.shape().IsArray();
+        if (!is_array &&
+            !(count_variadic_reduce && node.shape().IsTuple())) {
           return false;
         }
-
+        // A variadic reduce's tuple elements share one reduced shape; use the
+        // first leaf to size the reduction.
+        const Shape& out_shape =
+            is_array ? node.shape() : node.shape().tuple_shapes(0);
         int64_t reduction_size =
             ShapeUtil::ElementsIn(node.instruction().operand(0)->shape()) /
-            ShapeUtil::ElementsIn(node.shape());
+            ShapeUtil::ElementsIn(out_shape);
 
         // Small reductions are emitted using the elemental emitter anyway.
         return reduction_size >= 16;

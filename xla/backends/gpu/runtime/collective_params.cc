@@ -75,7 +75,17 @@ static GpuCollectives* ResolveCollectives(
                           << *implementation_name;
     return absl::down_cast<GpuCollectives*>(*collectives);
   }
-  return GpuCollectives::Default(platform_name);
+  // Default (highest-priority) collectives for the platform. Single-device
+  // backends with none registered (e.g. Metal) return nullptr — CollectiveParams
+  // only stores it; it is dereferenced solely by collective thunks, which such
+  // backends never emit. Avoids the GpuCollectives::Default CHECK-fail. CUDA/ROCm
+  // always have a default, so their path is unchanged.
+  absl::StatusOr<Collectives*> collectives =
+      CollectivesRegistry::Default(platform_name);
+  if (!collectives.ok()) {
+    return nullptr;
+  }
+  return tsl::down_cast<GpuCollectives*>(*collectives);
 }
 
 absl::StatusOr<CollectiveParams> CollectiveParams::Create(

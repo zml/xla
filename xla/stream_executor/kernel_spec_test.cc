@@ -92,6 +92,39 @@ TEST(KernelLoaderSpec, OwningCudaCubin) {
   EXPECT_THAT(spec.kernel_name(), "kernel24");
 }
 
+TEST(KernelLoaderSpec, MetalLibrary) {
+  static constexpr std::array<uint8_t, 4> kMetallibData = {0xDE, 0xAD, 0xBE,
+                                                           0xEF};
+  auto spec = KernelLoaderSpec::CreateMetalLibraryInMemorySpec(
+      kMetallibData, "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_metal_library_in_memory());
+
+  EXPECT_THAT(
+      spec.metal_library_in_memory(),
+      Optional(Field(&MetalLibraryInMemory::metallib_bytes, kMetallibData)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
+TEST(KernelLoaderSpec, OwningMetalLibrary) {
+  static constexpr std::array<uint8_t, 4> kMetallibData = {0xDE, 0xAD, 0xBE,
+                                                           0xEF};
+  auto spec = KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+      std::vector<uint8_t>{kMetallibData.begin(), kMetallibData.end()},
+      "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_metal_library_in_memory());
+
+  EXPECT_THAT(
+      spec.metal_library_in_memory(),
+      Optional(Field(&MetalLibraryInMemory::metallib_bytes, kMetallibData)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
 TEST(KernelLoaderSpec, CudaPtx) {
   static constexpr absl::string_view kPtxData = "PTX DEADBEEF";
   auto spec = KernelLoaderSpec::CreateCudaPtxInMemorySpec(kPtxData, "kernel24",
@@ -167,6 +200,35 @@ TEST(KernelLoaderSpec, CubinKernelToProto) {
 
   EXPECT_THAT(spec.ToProto(), IsOkAndHolds(EqualsProto(R"pb(
                 cubin { data: "CUBIN" }
+                kernel_name: "kernel_name"
+                arity: 42
+              )pb")));
+}
+
+TEST(KernelLoaderSpec, MetalLibraryKernelFromProto) {
+  auto proto = ParseTextProtoOrDie<KernelLoaderSpecProto>(R"pb(
+    metal_library { data: "METAL" }
+    kernel_name: "kernel_name"
+    arity: 42
+  )pb");
+
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpec spec,
+                          KernelLoaderSpec::FromProto(proto));
+  EXPECT_THAT(spec.kernel_name(), "kernel_name");
+  std::array<uint8_t, 5> kMetallib = {'M', 'E', 'T', 'A', 'L'};
+  EXPECT_THAT(spec.arity(), 42);
+  EXPECT_THAT(
+      spec.metal_library_in_memory(),
+      Optional(Field(&MetalLibraryInMemory::metallib_bytes, kMetallib)));
+}
+
+TEST(KernelLoaderSpec, MetalLibraryKernelToProto) {
+  std::array<uint8_t, 5> kMetallib = {'M', 'E', 'T', 'A', 'L'};
+  auto spec = KernelLoaderSpec::CreateMetalLibraryInMemorySpec(
+      kMetallib, "kernel_name", /*arity=*/42);
+
+  EXPECT_THAT(spec.ToProto(), IsOkAndHolds(EqualsProto(R"pb(
+                metal_library { data: "METAL" }
                 kernel_name: "kernel_name"
                 arity: 42
               )pb")));

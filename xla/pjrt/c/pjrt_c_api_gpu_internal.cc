@@ -49,13 +49,17 @@ limitations under the License.
 #include "xla/pjrt/c/pjrt_c_api_shardings_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/c/pjrt_c_api_stream_extension.h"
+#if (GOOGLE_CUDA || TENSORFLOW_USE_ROCM) && !TENSORFLOW_USE_METAL
 #include "xla/pjrt/c/pjrt_c_api_triton_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_triton_internal.h"
+#endif
 #include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
 #include "xla/pjrt/c/pjrt_c_api_xla_transform_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_xla_transform_internal.h"
 #include "xla/pjrt/extensions/abi_version/gpu_abi_version_extension.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/pjrt/extensions/cross_host_transfers/pjrt_c_api_cross_host_transfers_extension.h"
+#endif
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/gpu/se_gpu_topology_description.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -66,8 +70,10 @@ limitations under the License.
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_pjrt_client.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/python/custom_call_batch_partitioner.h"
 #include "xla/python/custom_partition_callback.h"
+#endif
 #include "xla/service/compiler.h"
 #include "xla/service/cpu/executable.pb.h"
 #include "xla/service/custom_call_target_registry.h"
@@ -86,6 +92,8 @@ namespace gpu_plugin {
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ROCM"
 #elif TENSORFLOW_USE_SYCL
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ONEAPI"
+#elif TENSORFLOW_USE_METAL
+#define PJRT_GPU_PLUGIN_PLATFORM_NAME "METAL"
 #else
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "CUDA"
 #endif
@@ -325,6 +333,9 @@ PJRT_Error* PJRT_GpuDeviceTopology_Create(
   } else if (plugin_platform == "ONEAPI") {
     platform_id = xla::OneapiId();
     platform_name = xla::OneapiName();
+  } else if (plugin_platform == "METAL") {
+    platform_id = xla::MetalId();
+    platform_name = xla::MetalName();
   } else {
     platform_id = xla::CudaId();
     platform_name = xla::CudaName();
@@ -469,6 +480,7 @@ PJRT_Profiler_Extension profiler_extension{
     /*profiler_api=*/&profiler_api,
 };
 
+#if !TENSORFLOW_USE_METAL
 PJRT_Error* PJRT_Register_Custom_Partitioner(
     PJRT_Register_Custom_Partitioner_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -500,6 +512,7 @@ PJRT_Custom_Partitioner_Extension custom_partitioner{
     /*register_custom_partitioner=*/PJRT_Register_Custom_Partitioner,
     /*register_batch_partitionable=*/PJRT_Register_Batch_Partitionable,
 };
+#endif
 
 PJRT_Error* PJRT_Get_Stream_For_External_Ready_Events(
     PJRT_Get_Stream_For_External_Ready_Events_Args* args) {
@@ -530,7 +543,11 @@ PJRT_Stream_Extension stream{
     PJRT_Extension_Base{
         /*struct_size=*/PJRT_Stream_Extension_STRUCT_SIZE,
         /*type=*/PJRT_Extension_Type::PJRT_Extension_Type_Stream,
+#if TENSORFLOW_USE_METAL
+        /*next=*/&profiler_extension.base,
+#else
         /*next=*/&custom_partitioner.base,
+#endif
     },
     /*get_stream=*/PJRT_Get_Stream_For_External_Ready_Events,
     /*wait_stream=*/PJRT_Wait_Until_Buffer_Ready_On_Stream,
@@ -584,14 +601,25 @@ const PJRT_Api* GetGpuPjrtApi() {
   static PJRT_MemoryDescriptions_Extension memory_descriptions_extension =
       pjrt::CreateMemoryDescriptionsExtension(&ffi_extension.base);
 
+#if TENSORFLOW_USE_METAL
+  static PJRT_Shardings_Extension shardings_extension =
+      pjrt::CreateShardingsExtension(&memory_descriptions_extension.base);
+#else
+#if (GOOGLE_CUDA || TENSORFLOW_USE_ROCM) && !TENSORFLOW_USE_METAL
   static PJRT_Triton_Extension triton_extension =
       pjrt::CreateTritonExtension(&memory_descriptions_extension.base);
 
   static PJRT_CrossHostTransfers_Extension cross_host_transfers_extension =
       pjrt::CreateCrossHostTransfersExtension(&triton_extension.base);
+#else
+  static PJRT_CrossHostTransfers_Extension cross_host_transfers_extension =
+      pjrt::CreateCrossHostTransfersExtension(
+          &memory_descriptions_extension.base);
+#endif
 
   static PJRT_Shardings_Extension shardings_extension =
       pjrt::CreateShardingsExtension(&cross_host_transfers_extension.base);
+#endif
 
   static PJRT_Xla_Transform_Extension xla_transform_extension =
       pjrt::CreateXlaTransformExtension(&shardings_extension.base);

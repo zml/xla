@@ -69,6 +69,27 @@ inline const char* DataLayout() {
 }
 }  // namespace spir
 
+namespace metal {
+// The Apple AIR target triple. KEEP IN SYNC with kAirTriple in
+// metal_air_metadata.cc (captured from `xcrun metal -S -emit-llvm`). TODO:
+// detect the AIR version from the toolchain instead of hardcoding v28/macosx26.
+inline const char* TargetTriple() {
+  static constexpr char kTargetTriple[] = "air64_v28-apple-macosx26.0.0";
+  return kTargetTriple;
+}
+
+// The Apple AIR data layout. KEEP IN SYNC with kAirDataLayout in
+// metal_air_metadata.cc. GpuCompiler derives pointer_size_ (=8) from this.
+inline const char* DataLayout() {
+  static constexpr char kDataLayout[] =
+      "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-"
+      "f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-"
+      "v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-"
+      "n8:16:32";
+  return kDataLayout;
+}
+}  // namespace metal
+
 }  // namespace gpu
 }  // namespace xla
 

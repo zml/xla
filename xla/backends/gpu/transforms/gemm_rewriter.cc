@@ -59,6 +59,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/service/matmul_indexing_utils.h"
 #include "xla/service/pattern_matcher.h"
@@ -353,6 +354,69 @@ std::optional<MatchedFp8Param> MatchFp8Param(HloInstruction* instr) {
 
   param.commutative_ops = {subgraph.begin() + start, subgraph.end()};
   return param;
+}
+
+// === Apple Metal block-scaled low-precision GEMV matching ===
+//
+// DeepSeek/MX-style checkpoints (e.g. Qwen3.x-FP8) store each big weight as a
+// low-precision type (f8e4m3fn today; an MXFP4 type later) with a companion
+// bf16 scale, one value per square block (128x128 for FP8). The model emits the
+// dequant `merge(convert(w_quant) * broadcast(scale))` before the dot, i.e. the
+// multiply runs in the block-split space [N/blk, blk, K/blk, blk]. Unlike the
+// cuBLASLt FP8 path above (one scalar scale per operand), the scale here is a
+// 2-D block tensor, so this needs its own matcher. For decode-shaped GEMVs the
+// dot is rerouted to a fused in-register-dequant kernel, carried on a
+// __metal$gemm custom call as the 3-operand {x, w_quant, scale} form that
+// EmitMetalGemmThunk forks on; prefill keeps the bf16 metalBLAS GEMM.
+
+// Largest batch (M) still rerouted to the fused __metal$gemm$f8 thunk, which
+// dispatches by batch: b==1 -> per-row GEMV, b>1 -> MLX Steel tiled q-GEMM
+// (reads the f8 weight once, reuses across rows+cols). Above this, prefill's
+// bf16 materialization amortizes and the metalBLAS GEMM wins.
+constexpr int64_t kMetalBlockScaledGemvMaxBatch = 16;
+
+// Skip the value-preserving wrapper ops the block dequant puts around the
+// multiply: reshape/bitcast/transpose/copy AND convert. The convert matters --
+// XLA's float-normalization expands the bf16 dequant multiply to f32
+// (convert(w_f8)->f32 * convert(scale)->f32, then convert->bf16), so the dot's
+// weight operand is `convert(f32->bf16)` and the multiply sits behind it.
+HloInstruction* SkipBlockDequantWrapperOps(HloInstruction* instr) {
+  while (HloPredicateIsOp<HloOpcode::kReshape, HloOpcode::kBitcast,
+                          HloOpcode::kTranspose, HloOpcode::kCopy,
+                          HloOpcode::kConvert>(instr)) {
+    instr = instr->mutable_operand(0);
+  }
+  return instr;
+}
+
+// If `operand` (a dot operand) is a block-scaled low-precision dequant, set
+// *w_quant_out / *scale_out to its quantized-weight and block-scale leaves.
+// Matches, in either multiply-operand order and through f32-expanded converts:
+//   wrappers( multiply( wrappers(w_quant), broadcast(wrappers(scale)) ) )
+// The weight leaf is identified by MetalBlockScaledGemmTarget (the supported
+// quant types), so this stays format-agnostic.
+bool MatchMetalBlockScaledDequant(HloInstruction* operand,
+                                  HloInstruction** w_quant_out,
+                                  HloInstruction** scale_out) {
+  HloInstruction* mul = SkipBlockDequantWrapperOps(operand);
+  if (!HloPredicateIsOp<HloOpcode::kMultiply>(mul)) {
+    return false;
+  }
+  for (int i = 0; i < 2; ++i) {
+    HloInstruction* w = SkipBlockDequantWrapperOps(mul->mutable_operand(i));
+    if (MetalBlockScaledGemmTarget(w->shape().element_type()).empty()) {
+      continue;  // not a supported quantized weight leaf on this side
+    }
+    HloInstruction* bcast =
+        SkipBlockDequantWrapperOps(mul->mutable_operand(1 - i));
+    if (!HloPredicateIsOp<HloOpcode::kBroadcast>(bcast)) {
+      continue;
+    }
+    *w_quant_out = w;
+    *scale_out = SkipBlockDequantWrapperOps(bcast->mutable_operand(0));
+    return true;
+  }
+  return false;
 }
 
 // Transposes a matrix by swapping the contracting and non-contracting
@@ -674,7 +738,101 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         toolkit_version_(toolkit_version),
         options_(options) {}
 
+  // Apple Metal only: reroute a decode-shaped dot over a block-scaled
+  // low-precision weight (f8e4m3fn today; see MetalBlockScaledGemmTarget) to a
+  // fused in-register-dequant GEMV, carried on a per-format custom call
+  // (e.g. __metal$gemm$f8) as the 3-operand {x, w_quant, scale} form, which
+  // ThunkEmitter routes to the dequant kernel (never metalBLAS). Mirrors the
+  // CUDA MatchFp8Param/CreateF8CustomCall flow, Metal-side. Returns true iff the
+  // dot was replaced.
+  absl::StatusOr<bool> TryRewriteMetalBlockScaledGemv(HloInstruction* dot) {
+    const DotDimensionNumbers& dnums = dot->dot_dimension_numbers();
+    // Plain rank-2 matmul, no batch, single contraction; require x = lhs [B, K]
+    // and weight = rhs [N, K] both contracting axis 1, so the output is [B, N] --
+    // exactly the GEMV kernel's contract.
+    if (dnums.lhs_batch_dimensions_size() != 0 ||
+        dnums.rhs_batch_dimensions_size() != 0 ||
+        dnums.lhs_contracting_dimensions_size() != 1 ||
+        dnums.rhs_contracting_dimensions_size() != 1 ||
+        dnums.lhs_contracting_dimensions(0) != 1 ||
+        dnums.rhs_contracting_dimensions(0) != 1) {
+      return false;
+    }
+    HloInstruction* x = dot->mutable_operand(0);
+    HloInstruction* weight = dot->mutable_operand(1);
+    if (x->shape().dimensions().size() != 2 ||
+        weight->shape().dimensions().size() != 2 ||
+        x->shape().element_type() != BF16) {
+      return false;
+    }
+    const int64_t b = x->shape().dimensions(0);
+    const int64_t k = x->shape().dimensions(1);
+    const int64_t n = weight->shape().dimensions(0);
+    // Decode only (thin batch). Prefill (large B) keeps the bf16 metalBLAS GEMM.
+    if (b < 1 || b > kMetalBlockScaledGemvMaxBatch ||
+        weight->shape().dimensions(1) != k) {
+      return false;
+    }
+
+    HloInstruction* w_quant = nullptr;
+    HloInstruction* scale = nullptr;
+    if (!MatchMetalBlockScaledDequant(weight, &w_quant, &scale)) {
+      return false;
+    }
+    // The quantized weight must be a supported [N, K] leaf matching the dot's
+    // weight operand exactly (the dequant preserves the 2-D shape; no
+    // transpose). MetalBlockScaledGemmTarget also picks the per-format custom
+    // call target (or "" if unsupported -> decline, falling back to bf16 GEMM).
+    const absl::string_view target =
+        MetalBlockScaledGemmTarget(w_quant->shape().element_type());
+    if (target.empty() || w_quant->shape().dimensions().size() != 2 ||
+        w_quant->shape().dimensions(0) != n ||
+        w_quant->shape().dimensions(1) != k) {
+      return false;
+    }
+    // Scale: bf16, one value per 128x128 block (the FP8 decode kernel's block
+    // size; EmitFp8GemvThunk requires N,K multiples of 128). Decline anything
+    // else so it falls back to the bf16 GEMM rather than hard-erroring at emit.
+    constexpr int64_t kFp8BlockSize = 128;
+    if (scale->shape().element_type() != BF16 ||
+        scale->shape().dimensions().size() != 2 || n % kFp8BlockSize != 0 ||
+        k % kFp8BlockSize != 0 ||
+        scale->shape().dimensions(0) != n / kFp8BlockSize ||
+        scale->shape().dimensions(1) != k / kFp8BlockSize) {
+      return false;
+    }
+    // Output must be exactly the dot's [B, N] bf16 result.
+    const Shape& out_shape = dot->shape();
+    if (out_shape.element_type() != BF16 ||
+        out_shape.dimensions().size() != 2 ||
+        out_shape.dimensions(0) != b || out_shape.dimensions(1) != n) {
+      return false;
+    }
+
+    // Emit the per-format opaque custom call carrying {x, w_quant, scale}; no
+    // backend config -- ThunkEmitter routes it to the fused GEMV kernel by
+    // target (IsMetalFp8Gemm), never to metalBLAS.
+    HloInstruction* call = dot->AddInstruction(HloInstruction::CreateCustomCall(
+        out_shape, {x, w_quant, scale}, target));
+    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, call));
+    VLOG(1) << "Rerouted Metal block-scaled dot into a fused " << target
+            << " GEMV.";
+    return true;
+  }
+
   absl::Status HandleDot(HloInstruction* instr) override {
+    // Apple Metal: in the FP8 pass, try to reroute a decode-shaped dot over a
+    // block-scaled low-precision weight to the fused dequant GEMV (carried on
+    // __metal$gemm). Non-matches fall through; on Metal the kNonFp8Only pass
+    // lowers bf16 dots to metalBLAS via __metal$gemm (prefill + any shape this
+    // declines).
+    if (gpu_version_.IsMetal() &&
+        options_.dtype == GemmRewriterOptions::DType::kFp8Only) {
+      ASSIGN_OR_RETURN(bool rewrote, TryRewriteMetalBlockScaledGemv(instr));
+      if (rewrote) {
+        return absl::OkStatus();
+      }
+    }
     ASSIGN_OR_RETURN(
         bool is_supported_matmul,
         IsCublasSupportedMatMul(*instr,
@@ -700,7 +858,20 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     ASSIGN_OR_RETURN(bool is_matmul_tiny,
                      IsMatrixMultiplicationTooSmallForRewriting(
                          *instr, gemm_rewrite_size_threshold));
-    if (is_matmul_tiny && IsDotSupportedByClassicalEmitters(*instr)) {
+    // Metal's GEMM custom call (__metal$gemm -> metalBLAS) is 2-D only; a batched
+    // dot would fall back to a cuBLAS GemmThunk, which has no BLAS on Metal and
+    // fails loud at runtime. Leave batched dots for the classical (elemental)
+    // emitter instead — the exact path the small batched dots already take and
+    // that the metal_ops mha/gqa tests verify. The 2-D projections still rewrite
+    // to the fast metalBLAS path. (Decode attention is seq=1, so the naive
+    // emitter is cheap there; a tiled batched metalBLAS kernel is a perf
+    // follow-up for prefill.)
+    const bool metal_batched =
+        gpu_version_.IsMetal() &&
+        (instr->dot_dimension_numbers().lhs_batch_dimensions_size() != 0 ||
+         instr->dot_dimension_numbers().rhs_batch_dimensions_size() != 0);
+    if ((is_matmul_tiny || metal_batched) &&
+        IsDotSupportedByClassicalEmitters(*instr)) {
       return absl::OkStatus();
     }
 
@@ -2302,6 +2473,11 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   absl::StatusOr<absl::string_view> GetNonFp8GemmCustomCallTarget(
       const HloInstruction& instr,
       const GemmBackendConfig& gemm_backend_config) const {
+    if (gpu_version_.IsMetal()) {
+      // Apple Metal has no cuBLAS/cuBLAS-LT; the GEMM runs via metalBLAS (the
+      // MetalGemmThunk). Emit an honest Metal target rather than a cuBLAS one.
+      return absl::string_view(kMetalGemmCallTarget);
+    }
     // All internal conditions are met, check if we meet the requirements of
     // cublasLt.
     ASSIGN_OR_RETURN(bool gemm_is_supported_by_cublas_lt,

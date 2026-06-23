@@ -1,6 +1,7 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tests:build_defs.bzl", "xla_test")
+load("//xla/tsl:tsl.bzl", "if_macos")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -156,6 +157,9 @@ cc_library(
     name = "fusions",
     srcs = ["fusions.cc"],
     hdrs = ["fusions.h"],
+    # Target-local: routes the kLoop arm to MetalMlirKernelFusion (AIR) on macOS;
+    # CUDA/ROCm builds compile the stock path and link no metal dep.
+    local_defines = if_macos(["TENSORFLOW_USE_METAL=1"]),
     visibility = [
         "//xla/backends/gpu/codegen:__subpackages__",
         "//xla/service/gpu:__subpackages__",
@@ -182,7 +186,8 @@ cc_library(
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emission_utils",
         "@com_google_absl//absl/status:statusor",
-    ],
+        "@com_google_absl//absl/strings",
+    ] + if_macos(["//xla/backends/gpu/codegen/emitters:metal_mlir_kernel_fusion"]),
 )
 
 cc_library(

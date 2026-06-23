@@ -1841,6 +1841,7 @@ cc_library(
         "//xla/service/gpu:gpu_fusible",
         "//xla/service/gpu:ir_emission_utils",
         "//xla/service/gpu:matmul_utils",
+        "//xla/service/gpu:metal_custom_calls",
         "//xla/stream_executor:blas",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",

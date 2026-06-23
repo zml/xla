@@ -5,6 +5,7 @@ load("//xla/tests:build_defs.bzl", "xla_test")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
+    "if_macos",
     "internal_visibility",
 )
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
@@ -23,6 +24,14 @@ cc_library(
             ":device_tracer_cuda",
         ]) + if_rocm_is_configured([
             ":device_tracer_rocm",
+        ]) + if_macos([
+            # NOTE: unlike if_{cuda,rocm}_is_configured (load-time macros that
+            # vanish when the backend is off), if_macos is a select(), so this
+            # label is referenced in the dep graph on ALL platforms. The
+            # //xla/backends/profiler/metal package must therefore stay LOADABLE
+            # on non-mac (it is: only platform-agnostic loads) — do not add
+            # mac-only load()s there or non-mac analysis of this target breaks.
+            "//xla/backends/profiler/metal:device_tracer_metal",
         ]),
 )
 
