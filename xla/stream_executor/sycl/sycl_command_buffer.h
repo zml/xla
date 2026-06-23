@@ -148,7 +148,8 @@ class SyclCommandBuffer final : public CommandBuffer {
                     ::sycl::context context, ::sycl::device device);
 
   absl::Status Trace(Stream* stream,
-                     absl::AnyInvocable<absl::Status()> function) override;
+                     absl::AnyInvocable<absl::Status(Stream* stream)> function)
+      override;
 
   absl::Status CheckState(State expected, absl::string_view caller) const;
   absl::StatusOr<SyclCommand*> FindOwnedCommand(

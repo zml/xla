@@ -1204,7 +1204,7 @@ std::string SyclCommandBuffer::ToString() const {
 }
 
 absl::Status SyclCommandBuffer::Trace(
-    Stream* stream, absl::AnyInvocable<absl::Status()> function) {
+    Stream* stream, absl::AnyInvocable<absl::Status(Stream* stream)> function) {
   RETURN_IF_ERROR(CheckState(State::kCreate, "Trace"));
   if (!commands_.empty() || graph_artifacts_ != nullptr) {
     return absl::FailedPreconditionError(
@@ -1223,7 +1223,7 @@ absl::Status SyclCommandBuffer::Trace(
     artifacts->graph = std::make_unique<ModifiableGraph>(context_, device_);
     artifacts->graph->begin_recording(*queue);
     recording = true;
-    absl::Status traced = function();
+    absl::Status traced = function(stream);
     artifacts->graph->end_recording(*queue);
     recording = false;
     RETURN_IF_ERROR(traced);
