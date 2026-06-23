@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -134,6 +136,59 @@ void ExpandSubByteBitReverse(llvm::Module* module) {
     call->replaceAllUsesWith(result);
     call->eraseFromParent();
   }
+}
+
+uint64_t SharedMemoryBytes(llvm::Function& func) {
+  llvm::MDNode* metadata = func.getMetadata("xla.shared_mem_bytes");
+  if (metadata == nullptr || metadata->getNumOperands() != 1) {
+    return 0;
+  }
+
+  auto* constant_metadata =
+      llvm::dyn_cast<llvm::ConstantAsMetadata>(metadata->getOperand(0));
+  if (constant_metadata == nullptr) {
+    return 0;
+  }
+
+  auto* shared_mem_bytes =
+      llvm::dyn_cast<llvm::ConstantInt>(constant_metadata->getValue());
+  return shared_mem_bytes == nullptr ? 0 : shared_mem_bytes->getZExtValue();
+}
+
+void MaterializeWorkgroupSlm(llvm::Module* module) {
+  uint64_t shared_mem_bytes = 0;
+  for (llvm::Function& func : *module) {
+    if (func.getCallingConv() == llvm::CallingConv::SPIR_KERNEL) {
+      shared_mem_bytes = std::max(shared_mem_bytes, SharedMemoryBytes(func));
+    }
+  }
+
+  if (shared_mem_bytes == 0) {
+    return;
+  }
+
+  llvm::LLVMContext& context = module->getContext();
+  auto* slm_type =
+      llvm::ArrayType::get(llvm::Type::getInt8Ty(context), shared_mem_bytes);
+  auto* slm = new llvm::GlobalVariable(
+      *module, slm_type, /*isConstant=*/false,
+      llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(slm_type),
+      "xla_workgroup_slm", /*InsertBefore=*/nullptr,
+      llvm::GlobalValue::NotThreadLocal,
+      /*AddressSpace=*/3, /*isExternallyInitialized=*/false);
+  slm->setAlignment(llvm::Align(kConstantBufferAlignBytes));
+
+  if (llvm::GlobalVariable* global_smem = module->getNamedGlobal("global_smem");
+      global_smem != nullptr) {
+    global_smem->replaceAllUsesWith(slm);
+    global_smem->eraseFromParent();
+  }
+
+  llvm::ConstantPointerNull* null_slm = llvm::ConstantPointerNull::get(
+      llvm::PointerType::get(context, /*AddressSpace=*/3));
+  null_slm->replaceAllUsesWith(slm);
+  VLOG(2) << "Materialized " << shared_mem_bytes
+          << " bytes of SPIR-V Workgroup SLM.";
 }
 
 }  // namespace
