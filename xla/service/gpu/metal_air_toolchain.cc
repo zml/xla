@@ -114,6 +114,62 @@ std::string ExpandSplatConstantsForOldAirAs(absl::string_view source) {
   return out;
 }
 
+// The LLVM-23 AsmWriter prints a floating-point constant in decimal (e.g.
+// `4.000000e-04`, the tanh-approximation identity threshold 0.0004) whenever the
+// 6-significant-digit form round-trips back to the same value; otherwise it uses
+// the hex form handled below. air-as (~LLVM-15) is stricter than LLVM-23 when
+// re-parsing a constant: it rejects any *decimal* literal not exactly
+// representable in its type ("floating point constant invalid for type"), e.g.
+// the tanh threshold 0.0004. Rewrite every decimal FP literal to the `0x` +
+// 16-hex-digit form air-as wants. CRUCIAL: that hex is always the *double* bit
+// pattern, and for a `float` operand air-as additionally requires it to be the
+// float-exact double (the single widened to double, low mantissa bits zero) — the
+// nearest double to 0.0004 (0x...EB1C432D) is rejected, only the float-widened
+// double (0x...E0000000) is accepted (verified against air-as directly). So for a
+// float operand we round the decimal through float before widening, exactly like
+// RewriteHexFloatsForOldAirAs; for a double operand we emit the double bits as-is.
+// Precision is read from the nearest preceding `float`/`double` type keyword on
+// the same line (LLVM prints the type just ahead of the operand list, so this is
+// also correct for fptrunc/fpext). The literal must contain a '.' or exponent so
+// plain integer operands (i32 4, getelementptr indices) are never matched; it is
+// anchored to an operand-position delimiter so a number embedded in an identifier,
+// a hex literal (0x.../f0x...), or a quoted version string is left untouched.
+std::string RewriteDecimalFloatsForOldAirAs(absl::string_view source) {
+  static const std::regex kDecimalFp(
+      R"(([\s,(\[<])(-?(?:\d+\.\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|\d+[eE][-+]?\d+)))");
+  const std::string in(source);
+  std::string out;
+  out.reserve(in.size());
+  std::size_t last = 0;
+  for (auto it = std::sregex_iterator(in.begin(), in.end(), kDecimalFp);
+       it != std::sregex_iterator(); ++it) {
+    const std::smatch& m = *it;
+    const std::size_t pos = static_cast<std::size_t>(m.position());
+    out.append(in, last, pos - last);
+
+    // Resolve the operand's precision from the nearest preceding `float` /
+    // `double` keyword on the same line.
+    const std::size_t nl = in.rfind('\n', pos);
+    const std::size_t line_start = (nl == std::string::npos) ? 0 : nl + 1;
+    const std::string prefix = in.substr(line_start, pos - line_start);
+    const std::size_t fpos = prefix.rfind("float");
+    const std::size_t dpos = prefix.rfind("double");
+    const bool is_double = dpos != std::string::npos &&
+                           (fpos == std::string::npos || dpos > fpos);
+
+    const double raw = std::strtod(m[2].str().c_str(), nullptr);
+    // float operand -> round through single so the double is float-exact.
+    const double d = is_double ? raw : static_cast<double>(static_cast<float>(raw));
+    uint64_t dbits;
+    std::memcpy(&dbits, &d, sizeof(dbits));
+    absl::StrAppend(&out, m[1].str());
+    absl::StrAppendFormat(&out, "0x%016X", dbits);
+    last = pos + static_cast<std::size_t>(m.length());
+  }
+  out.append(in, last, std::string::npos);
+  return out;
+}
+
 // The LLVM-23 AsmWriter prints a single-precision float constant as the compact
 // hex literal `f0xXXXXXXXX` (the 32 float bits), which air-as (~LLVM-15) cannot
 // lex ("expected value token"). Rewrite each to the LLVM-15 form `0x` + the 16
@@ -172,8 +228,10 @@ std::string RewriteInfNanForOldAirAs(absl::string_view source) {
 
 absl::StatusOr<std::vector<uint8_t>> CompileMetalAirToMetallib(
     absl::string_view raw_source, absl::string_view temp_name) {
-  const std::string source = RewriteInfNanForOldAirAs(
-      RewriteHexFloatsForOldAirAs(ExpandSplatConstantsForOldAirAs(raw_source)));
+  const std::string source =
+      RewriteInfNanForOldAirAs(RewriteHexFloatsForOldAirAs(
+          RewriteDecimalFloatsForOldAirAs(
+              ExpandSplatConstantsForOldAirAs(raw_source))));
   TF_ASSIGN_OR_RETURN(std::string air_as, FindMetalTool("air-as"));
   TF_ASSIGN_OR_RETURN(std::string air_opt, FindMetalTool("air-opt"));
   TF_ASSIGN_OR_RETURN(std::string metallib, FindMetalTool("metallib"));
