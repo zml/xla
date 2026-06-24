@@ -341,7 +341,7 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
       const int64_t kv_head_stride = kv_position_major_ ? HD : S * HD;     // elems
       kv_pos_stride_ = kv_pos_stride;
 
-      // Compile the fa_vec metallib ONCE (the expensive xcrun step) and keep it;
+      // Compile the fa_vec metallib ONCE (the expensive compile step) and keep it;
       // pipeline variants are built lazily from it on first selection (see
       // EnsureFaVec*). Build only the nsg=4 nwg=1 variant now, so a small-context
       // decode pays the same single-PSO first-token cost as before — no startup

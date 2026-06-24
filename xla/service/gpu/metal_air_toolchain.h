@@ -38,8 +38,7 @@ namespace gpu {
 absl::StatusOr<std::string> RunCommand(std::vector<std::string> argv,
                                        bool capture_stdout);
 
-// Locates a Metal toolchain tool: `$METAL_TOOLCHAIN/<tool_name>` if that env var
-// is set, otherwise `xcrun --find <tool_name>`.
+// Locates a Metal toolchain tool under `$METAL_TOOLCHAIN/<tool_name>`.
 absl::StatusOr<std::string> FindMetalTool(const char* tool_name);
 
 // Assembles textual AIR (`source`, LLVM .ll text) into a `.metallib` via
@@ -47,17 +46,18 @@ absl::StatusOr<std::string> FindMetalTool(const char* tool_name);
 absl::StatusOr<std::vector<uint8_t>> CompileMetalAirToMetallib(
     absl::string_view source, absl::string_view temp_name);
 
-// Compiles Metal Shading Language `source` to a `.metallib` via
-// `xcrun metal -std=metal4.0 -c` -> `metallib`. Optional `subs` are applied as a
-// literal StrReplaceAll on the source first (kernel specialization). Used by the
-// runtime thunks that ship a `.metal` shader (flash-attn, paged-attn, kv-write,
-// topk) — distinct from CompileMetalAirToMetallib's AIR-text path.
+// Compiles Metal Shading Language `source` to a `.metallib` via the Metal
+// compiler (`metal -std=metal4.0 -c`) followed by `metallib`. Optional `subs`
+// are applied as a literal StrReplaceAll on the source first (kernel
+// specialization). Used by the runtime thunks that ship a `.metal` shader
+// (flash-attn, paged-attn, kv-write, topk) — distinct from
+// CompileMetalAirToMetallib's AIR-text path.
 absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallib(
     absl::string_view source,
     const std::vector<std::pair<std::string, std::string>>& subs = {});
 
 // As CompileMetalSourceToMetallib, but memoizes on the substituted source so the
-// (expensive) xcrun compile runs once per distinct specialization per process.
+// (expensive) compilation runs once per distinct specialization per process.
 absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallibCached(
     absl::string_view source,
     const std::vector<std::pair<std::string, std::string>>& subs = {});

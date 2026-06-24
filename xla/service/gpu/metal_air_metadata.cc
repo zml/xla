@@ -34,10 +34,10 @@ namespace metal {
 
 namespace {
 
-// This machine's Metal toolchain emits this triple/datalayout (captured from
-// `xcrun metal -S -emit-llvm`, metal-xla-docs/scratch/air-ref/add.ll). TODO:
-// detect the AIR version from the toolchain instead of hardcoding v28/macosx26
-// (other toolchains emit air64_v27/macosx15) — tracked in LEARNINGS.md.
+// This machine's Metal toolchain emits this triple/datalayout (captured using
+// the Metal compiler with `-S -emit-llvm`). TODO: detect the AIR version from
+// the toolchain instead of hardcoding v28/macosx26 (other toolchains emit
+// air64_v27/macosx15) — tracked in LEARNINGS.md.
 constexpr char kAirTriple[] = "air64_v28-apple-macosx26.0.0";
 constexpr char kAirDataLayout[] =
     "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-"

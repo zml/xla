@@ -242,12 +242,12 @@ absl::Status RelaxFlashAttnKVLayout(HloModule* module) {
 }
 
 // Walk the optimized module and precompile EVERY lazily-JIT'd Metal kernel's
-// pipeline (metallib `xcrun` + PSO) now, while we still have a live executor, so
-// no first-execute path pays the one-time compile (~xcrun + ~70ms PSO). Each
+// pipeline (metallib compile + PSO) now, while we still have a live executor, so
+// no first-execute path pays the one-time compile (~compile + ~70ms PSO). Each
 // thunk's Prewarm warms the metallib cache and Apple's driver pipeline cache for
 // the exact (config, function-constant) variants its Ensure* will request, so
 // the first execute is a pure cache hit. Best-effort per op; dedups configs.
-// (GEMM kernels already `xcrun`-compile at thunk-emit time, inside "Compiled all
+// (GEMM kernels are already compiled at thunk-emit time, inside "Compiled all
 // models"; only their PSO load is lazy — a smaller residual left for later.)
 void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
   absl::flat_hash_set<std::pair<bool, int64_t>> fa_seen;

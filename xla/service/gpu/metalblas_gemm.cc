@@ -47,8 +47,9 @@ namespace se = ::stream_executor;
 // `get_mb_epi() + family_source` with `#define <build_flag> 1` — byte-identical
 // to compiling the upstream binder with that one flag (the binder just #includes
 // every family and lets the #ifdefs select one). `__TOKEN__` tile/dtype
-// placeholders are substituted, then compiled via `xcrun metal -std=metal4.0`
-// (the cooperative-tensor GEMM families need Metal 4) → metallib.
+// placeholders are substituted, then compiled via the Metal compiler
+// (`metal -std=metal4.0`, required for the cooperative-tensor GEMM families)
+// → metallib.
 absl::StatusOr<std::vector<uint8_t>> CompileMetalblasKernelToMetallib(
     absl::string_view build_flag, absl::string_view family_source,
     absl::Span<const std::pair<absl::string_view, std::string>> subs,

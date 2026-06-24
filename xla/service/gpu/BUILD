@@ -3864,9 +3864,9 @@ cc_library(
 )
 
 # Runs the metalBLAS dispatcher for a GEMM and compiles the chosen kernel to a
-# metallib (the NN m5_tensor path so far). Pure C++ + xcrun-at-runtime, so it
-# links into the general gpu thunk emitter on every platform (xcrun is only
-# invoked when the live platform is Metal).
+# metallib (the NN m5_tensor path so far). Pure C++ with runtime Metal
+# compilation, so it links into the general gpu thunk emitter on every platform
+# (the compiler is only invoked when the live platform is Metal).
 cc_library(
     name = "metalblas_gemm",
     srcs = ["metalblas_gemm.cc"],

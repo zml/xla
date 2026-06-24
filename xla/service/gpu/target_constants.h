@@ -71,8 +71,8 @@ inline const char* DataLayout() {
 
 namespace metal {
 // The Apple AIR target triple. KEEP IN SYNC with kAirTriple in
-// metal_air_metadata.cc (captured from `xcrun metal -S -emit-llvm`). TODO:
-// detect the AIR version from the toolchain instead of hardcoding v28/macosx26.
+// metal_air_metadata.cc (captured using the Metal compiler). TODO: detect the
+// AIR version from the toolchain instead of hardcoding v28/macosx26.
 inline const char* TargetTriple() {
   static constexpr char kTargetTriple[] = "air64_v28-apple-macosx26.0.0";
   return kTargetTriple;

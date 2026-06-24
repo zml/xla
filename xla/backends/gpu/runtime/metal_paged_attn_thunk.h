@@ -52,7 +52,7 @@ namespace gpu {
 //     a small chunked-prefill executable that happens to share the decode's
 //     static shape still computes correctly. Falls back to the tiled kernel
 //     when the shape doesn't qualify (or METAL_PAGED_VEC=0).
-// Both are wired like MetalFlashAttnThunk (embedded MSL -> xcrun metal ->
+// Both are wired like MetalFlashAttnThunk (embedded MSL -> Metal compile ->
 // LoadKernelWithConstants -> dispatchThreadgroups).
 //
 // Operand contract (the paged inputs, mirroring ZML's triton paged path):
@@ -97,7 +97,7 @@ class MetalPagedAttnThunk : public Thunk {
   // ALL THREE nsg PSOs (4/8/16) into Apple's driver pipeline cache. Warming all
   // nsg unconditionally (not seqlen-gated) covers both the depth ramp and the
   // defensive kv==0 -> nsg=16 branch, so no decode token — first or ramp
-  // transition — pays `xcrun`/PSO build. Best-effort — failures are swallowed.
+  // transition — pays compile/PSO build. Best-effort — failures are swallowed.
   static void Prewarm(stream_executor::StreamExecutor* executor,
                       PrimitiveType dtype, int64_t head_dim, int64_t block_size,
                       int64_t num_kv_heads);

@@ -138,7 +138,7 @@ absl::StatusOr<MetalGemmLaunch> CompileMetalblasSplitk(int64_t M, int64_t N,
 // shared epilogue (mb_epi.h, the only always-active metalBLAS header) then
 // appends `family_source` (a single vendored family header verbatim), enables it
 // via `#define <build_flag> 1`, substitutes its `__TOKEN__` tile/dtype
-// placeholders, and runs `xcrun metal -std=metal4.0` then `xcrun metallib`.
+// placeholders, and runs the Metal compiler then `metallib`.
 // Compiling `mb_epi + <one family>` is byte-identical to compiling the metalBLAS
 // binder with that single MB_BUILD flag set — every other family's body is
 // `#ifdef MB_BUILD_<NAME>`-guarded and compiles to nothing — so no binder /

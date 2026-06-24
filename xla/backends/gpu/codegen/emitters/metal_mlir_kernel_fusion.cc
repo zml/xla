@@ -50,7 +50,7 @@ namespace {
 
 // The AIR `arg_type_name` / `arg_type_size` / `arg_type_align_size` reflection
 // metadata for a device buffer of the given element type. Spellings/sizes are
-// the ground truth `xcrun metal -emit-llvm` emits for `device <T>*` args. An
+// the ground truth emitted by the Metal compiler for `device <T>*` args. An
 // unmapped type keeps a 4-byte "float" descriptor (the historical default);
 // this is reflection metadata (loads/stores carry their own IR types), so a
 // wrong descriptor does not miscompile — but matching the real element type is

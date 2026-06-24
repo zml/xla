@@ -80,9 +80,9 @@ class MetalFlashAttnThunk : public Thunk {
   BufferUses buffer_uses() const override;
 
   // Precompile, at HLO-compile time (when the compiler detects the zml$flash_attn
-  // custom call and still has a live executor), BOTH the metallib (xcrun, process-
+  // custom call and still has a live executor), BOTH the metallib (process-
   // globally cached) AND the GPU pipeline state (newComputePipelineState, cached by
-  // Apple's driver), so the first execute pays neither (~xcrun + ~70ms PSO).
+  // Apple's driver), so the first execute pays neither (compile + ~70ms PSO).
   // is_prefill selects kernel_flash_attn_ext (prefill, one PSO) vs fa_vec (decode);
   // for decode it warms every nsg the adaptive ramp can reach for this seqlen
   // (nsg=4 always, +8 if seqlen>1024, +16 if seqlen>2048), so no decode token —
@@ -183,11 +183,11 @@ class MetalFlashAttnThunk : public Thunk {
   size_t smem_hc_ ABSL_GUARDED_BY(mu_) = 0;
   // PREFILL fast path (q_len>1): the specialized kernel_flash_attn_ext (FA-2,
   // simdgroup-matrix). Selected when q_len>1 && head_dim==128 && bf16 && seqlen%64==0.
-  // A single PSO (nsg=4) built on the first prefill execute (one xcrun + one PSO,
-  // same first-call cost shape as the decode nsg=4 build). Parallelism comes from
-  // the Q-row blocks (grid dim0 = ceil(q_len/8)), so there is no per-execute nsg
-  // ramp and no host token read — the kernel derives the 2D causal mask on-device
-  // from tok[0] + the query-row index.
+  // A single PSO (nsg=4) built on the first prefill execute (one compile + one
+  // PSO, same first-call cost shape as the decode nsg=4 build). Parallelism comes
+  // from the Q-row blocks (grid dim0 = ceil(q_len/8)), so there is no
+  // per-execute nsg ramp and no host token read — the kernel derives the 2D
+  // causal mask on-device from tok[0] + the query-row index.
   bool use_prefill_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<uint8_t> prefill_lib_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> fa_prefill_ ABSL_GUARDED_BY(mu_);

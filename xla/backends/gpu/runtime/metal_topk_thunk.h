@@ -63,7 +63,7 @@ class MetalTopKThunk : public Thunk {
   BufferUses buffer_uses() const override;
 
   // Compile-time prewarm (MetalGpuCompiler::RunHloPasses): compile the radix
-  // metallib (the dominant first-request `xcrun` cost) + create the 4 PSOs into
+  // metallib (the dominant first-request compile cost) + create the 4 PSOs into
   // Apple's driver pipeline cache, so the first sample's Ensure is a cache hit.
   // dtype selects the 16/32-bit kernels; k selects the templated select kernel.
   // Best-effort — failures are swallowed (the thunk rebuilds at execute).

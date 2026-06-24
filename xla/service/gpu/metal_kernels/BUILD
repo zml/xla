@@ -2,7 +2,7 @@
 #
 # Every kernel is a real `.metal` / `.h` shader source embedded uniformly via
 # `embed_files` (xxd -> a `get_<stem>()` accessor returning the source string),
-# then assembled + `xcrun metal -std=metal4.0`-compiled at runtime by the thunk
+# then assembled and compiled at runtime by the thunk via the Metal toolchain
 # that uses it (see metal_air_toolchain.cc). Runtime `__TOKEN__` / `$N`
 # substitution specializes a shader for the live shapes/dtypes before compile.
 #

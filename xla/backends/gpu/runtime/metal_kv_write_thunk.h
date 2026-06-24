@@ -83,8 +83,8 @@ class MetalKvWriteThunk : public Thunk {
 
   // Compile-time prewarm (MetalGpuCompiler::RunHloPasses): compile the
   // substituted metallib + create the PSO into Apple's driver pipeline cache so
-  // the first decode token's EnsureLoaded is a cache hit (no `xcrun`, no PSO
-  // build). Params must match the thunk's so the warmed kernel matches.
+  // the first decode token's EnsureLoaded is a cache hit (no metallib compile,
+  // no PSO build). Params must match the thunk's so the warmed kernel matches.
   // Best-effort — failures are swallowed (the thunk rebuilds at execute).
   static void Prewarm(stream_executor::StreamExecutor* executor,
                       int64_t num_slots, int64_t kv_heads, int64_t head_dim);
