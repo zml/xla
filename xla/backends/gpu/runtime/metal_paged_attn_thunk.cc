@@ -127,7 +127,8 @@ MetalPagedAttnThunk::MetalPagedAttnThunk(
     BufferAllocation::Slice out, Shape out_shape, int64_t num_heads,
     int64_t num_kv_heads, int64_t head_dim, int64_t block_size, int64_t num_seqs,
     int64_t max_num_blocks_per_seq, int64_t total_q_tokens, float scale,
-    float softcapping, int sliding_window, PrimitiveType element_type)
+    float softcapping, int sliding_window, bool is_causal,
+    PrimitiveType element_type)
     : Thunk(Kind::kCustomCall, std::move(thunk_info)),
       q_(q),
       k_cache_(k_cache),
@@ -153,6 +154,7 @@ MetalPagedAttnThunk::MetalPagedAttnThunk(
       scale_(scale),
       softcapping_(softcapping),
       sliding_window_(sliding_window),
+      is_causal_(is_causal),
       element_type_(element_type) {}
 
 void MetalPagedAttnThunk::Prewarm(se::StreamExecutor* executor,
@@ -170,8 +172,18 @@ void MetalPagedAttnThunk::Prewarm(se::StreamExecutor* executor,
       std::string name = absl::StrCat(
           "paged_attention_tiled_", *dt, "_hs", head_dim, "_bs", block_size,
           "_bq", cfg->bq, "_tk", cfg->tile_kv, "_nt", cfg->num_threads);
-      metal_exec->LoadKernelWithConstants(*lib, name, /*arity=*/22, {})
-          .IgnoreError();
+      // The prewarm scan keys only on (dtype, head_dim, block_size,
+      // num_kv_heads); it does NOT see the custom call's is_causal attribute. So
+      // warm BOTH the causal (IS_CAUSAL=1) and bidirectional (IS_CAUSAL=0) PSO
+      // specializations — both share the already-compiled metallib, only Apple's
+      // pipeline-state build differs, and EnsureLoaded must request the same FC
+      // set for the warm to hit Apple's pipeline cache.
+      using FC = se::metal::MetalFunctionConstant;
+      for (int causal : {1, 0}) {
+        const FC fc[] = {{460, FC::Kind::kInt, causal}};
+        metal_exec->LoadKernelWithConstants(*lib, name, /*arity=*/22, fc)
+            .IgnoreError();
+      }
     }
   }
   // Decode vector kernel (when it qualifies): warm ALL THREE nsg variants.
@@ -213,9 +225,13 @@ absl::Status MetalPagedAttnThunk::EnsureLoaded(se::StreamExecutor* executor) {
   const std::string src = std::string(kPreamble) + get_pagedattention_tiled();
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib, CompileMetalSourceToMetallibCached(src));
   // 22 buffer args (indices 0..21, the verbatim sparse ABI's max + 1) + the
-  // threadgroup-memory arg; arity counts buffer args only.
+  // threadgroup-memory arg; arity counts buffer args only. Function constant 460
+  // (IS_CAUSAL) specializes the masking mode: 1 = causal (default), 0 =
+  // bidirectional. Must match a variant Prewarm warmed to hit Apple's cache.
+  using FC = se::metal::MetalFunctionConstant;
+  const FC fc[] = {{460, FC::Kind::kInt, is_causal_ ? 1 : 0}};
   TF_ASSIGN_OR_RETURN(
-      kernel_, metal_exec->LoadKernelWithConstants(lib, name, /*arity=*/22, {}));
+      kernel_, metal_exec->LoadKernelWithConstants(lib, name, /*arity=*/22, fc));
 
   // smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + SMEM_PAD) * sizeof(T); SMEM_PAD =
   // 16/sizeof(T) = 8 elems for fp16/bf16. (pagedattention_tiled.metal:189-192.)
@@ -322,9 +338,12 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
     // kernel, which handles all of them correctly, just slower.
     // TODO: extend fa_vec_paged with sliding-window masking (Mistral/Gemma
     // decode) and an hd=256 variant (Gemma-shaped decode).
-    use_vec_decode_ = total_q_tokens_ == num_seqs_ && head_dim_ == 128 &&
-                      element_type_ == BF16 && softcapping_ == 0.0f &&
-                      sliding_window_ < 0;
+    // The vector kernel encodes causality in its KV-loop bound (kv_len =
+    // kv_total - query_len + q_pos + 1) and has no bidirectional path, so a
+    // non-causal thunk always uses the tiled kernel (which honors IS_CAUSAL).
+    use_vec_decode_ = is_causal_ && total_q_tokens_ == num_seqs_ &&
+                      head_dim_ == 128 && element_type_ == BF16 &&
+                      softcapping_ == 0.0f && sliding_window_ < 0;
     if (use_vec_decode_) {
       TF_RETURN_IF_ERROR(EnsureVecDecode(executor));
     } else {

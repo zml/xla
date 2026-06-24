@@ -64,10 +64,13 @@ namespace gpu {
 //   query_start_len i32    [num_seqs + 1]        (cumulative query lengths)
 //   -> out        bf16/f16 [total_q_tokens, num_heads, head_dim]
 //
-// Static, non-default params (scale/softcapping/sliding_window) default to
-// scale=1/sqrt(head_dim), softcapping=0, sliding_window=-1 (Llama). Non-default
-// values are carried in scale_/softcapping_/sliding_window_ (set by the matcher
-// from backend-config attributes; TODO once Gemma softcap / Mistral SWA need it).
+// Static, non-default params (scale/softcapping/sliding_window/is_causal)
+// default to scale=1/sqrt(head_dim), softcapping=0, sliding_window=-1,
+// is_causal=true (Llama). Non-default values are carried in
+// scale_/softcapping_/sliding_window_/is_causal_ (set by the matcher from
+// backend-config attributes). is_causal_=false (bidirectional, e.g. the
+// diffusion-draft dflash model) routes to the tiled kernel with its IS_CAUSAL
+// function constant (460) set to 0; the vector decode kernel stays causal-only.
 class MetalPagedAttnThunk : public Thunk {
  public:
   MetalPagedAttnThunk(ThunkInfo thunk_info, BufferAllocation::Slice q,
@@ -82,7 +85,7 @@ class MetalPagedAttnThunk : public Thunk {
                       int64_t head_dim, int64_t block_size, int64_t num_seqs,
                       int64_t max_num_blocks_per_seq, int64_t total_q_tokens,
                       float scale, float softcapping, int sliding_window,
-                      PrimitiveType element_type);
+                      bool is_causal, PrimitiveType element_type);
 
   MetalPagedAttnThunk(const MetalPagedAttnThunk&) = delete;
   MetalPagedAttnThunk& operator=(const MetalPagedAttnThunk&) = delete;
@@ -127,6 +130,11 @@ class MetalPagedAttnThunk : public Thunk {
       max_num_blocks_per_seq_, total_q_tokens_;
   const float scale_, softcapping_;
   const int sliding_window_;
+  // Bidirectional (false) vs causal (true) attention. Carried from the custom
+  // call's is_causal backend-config attribute; selects the tiled kernel's
+  // IS_CAUSAL function constant (460) and forces the tiled path (the vector
+  // decode kernel is causal-only). See metal_paged_attn_thunk.cc.
+  const bool is_causal_;
   const PrimitiveType element_type_;
 
   absl::Mutex mu_;

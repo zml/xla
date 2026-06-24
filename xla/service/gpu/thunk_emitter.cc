@@ -1038,11 +1038,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
   // ZML's metal_attention.zig from AttentionOptions. Absent keys keep the
   // defaults (scale=1/sqrt(head_dim), no softcap, no sliding window, causal),
   // so graphs predating the attributes are unchanged. The tiled kernel applies
-  // all three; the vector decode kernel applies scale only, so the thunk routes
-  // softcapped/windowed decode to the tiled kernel.
+  // all of them (is_causal via its IS_CAUSAL function constant); the vector
+  // decode kernel applies scale only and is causal-only, so the thunk routes
+  // softcapped/windowed/bidirectional cases to the tiled kernel.
   float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   float softcapping = 0.0f;
   int sliding_window = -1;
+  bool is_causal = true;
   if (const std::string& cfg = instr->raw_backend_config_string();
       !cfg.empty()) {
     mlir::Attribute parsed =
@@ -1072,14 +1074,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
         sliding_window = *v;
       }
     }
-    // The tiled kernel masks causally (with an optional sliding window); there
-    // is no bidirectional path. Loud, never silently wrong.
+    // is_causal selects causal (default) vs bidirectional attention. The tiled
+    // kernel honors it through its IS_CAUSAL function constant; is_causal=false
+    // (e.g. the diffusion-draft dflash model) also forces the tiled path off the
+    // causal-only vector decode kernel (see MetalPagedAttnThunk).
     if (const ffi::Scalar* s = scalar("is_causal")) {
-      if (const bool* v = std::get_if<bool>(&s->AsVariant()); v && !*v) {
-        return absl::UnimplementedError(
-            "zml$paged_attn: is_causal=false (bidirectional attention) has no "
-            "Metal kernel path.");
-      }
+      if (const bool* v = std::get_if<bool>(&s->AsVariant())) is_causal = *v;
     }
   }
 
@@ -1104,7 +1104,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
       q, q_shape, k_cache, k_shape, v_cache, v_shape, block_table, bt_shape,
       seq_lens, sl_shape, query_start_len, qsl_shape, out, out_shape, num_heads,
       num_kv_heads, head_dim, block_size, num_seqs, max_num_blocks_per_seq,
-      total_q_tokens, scale, softcapping, sliding_window,
+      total_q_tokens, scale, softcapping, sliding_window, is_causal,
       q_shape.element_type());
   return GetThunkSequence(std::move(thunk));
 }

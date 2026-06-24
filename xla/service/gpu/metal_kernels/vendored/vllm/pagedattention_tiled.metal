@@ -111,6 +111,28 @@ template <int NBYTES> struct LoadUnit;
 template <> struct LoadUnit<8>  { using type = uint2; };
 template <> struct LoadUnit<16> { using type = uint4; };
 
+// ─────────────────────────────────────────────────────────────────────────
+// XLA DELTA: bidirectional (non-causal) attention support.
+//
+// Function constant 460 selects the masking mode at PSO specialization time:
+//   IS_CAUSAL != 0 → causal (decoder). The default for every existing caller;
+//                    folds to the exact verbatim masking below, so the causal
+//                    hot path is bit-identical to the upstream vllm kernel.
+//   IS_CAUSAL == 0 → bidirectional (encoder / diffusion-draft). Each query
+//                    attends to ALL valid keys [0, seq_len) of its sequence.
+//                    Matches vLLM's Triton unified_attention non-causal path:
+//                    scan the whole sequence (no causal early-out), drop the
+//                    (kv_pos > q_abs_pos) term, keep the padding (kv_pos >=
+//                    seq_len) mask and the one-sided sliding-window mask (the
+//                    latter is byte-identical to the causal expression and is
+//                    applied in both modes upstream).
+//
+// Declared `int` (not bool) to reuse the kInt function-constant ABI already
+// used by fa_vec_paged (450/451/452). The thunk ALWAYS provides it (1 = causal
+// by default), so the constant never needs an in-kernel default.
+// ─────────────────────────────────────────────────────────────────────────
+constant int IS_CAUSAL [[function_constant(460)]];
+
 template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
           int BQ = 32, int TILE_KV = 32, int NUM_THREADS = 128>
 [[kernel]] void paged_attention_tiled(
@@ -268,8 +290,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const int tile_start = tile_idx * TILE_KV;
 
     // Causal skip: if the entire tile is beyond the maximum q_abs_pos this
-    // threadgroup will produce, we can stop.
-    if (tile_start > context_len + q_pos_start + valid_q - 1) break;
+    // threadgroup will produce, we can stop. (XLA DELTA: causal-only — the
+    // bidirectional path must scan the whole sequence, so guard the early-out.)
+    if (IS_CAUSAL && tile_start > context_len + q_pos_start + valid_q - 1) break;
 
     // ─ Load K AND V cooperatively (paged, fused, wide-vectorized) ────
     // Both K_smem and V_smem are filled in the same loop:
@@ -372,7 +395,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     const int q_abs_pos = context_len + q_pos_start + sg_idx * 8 + fm;
     const bool row_masked = (sg_idx * 8 + fm) >= valid_q;
     const int min_q_abs_pos = context_len + q_pos_start;
-    const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_pos
+    // XLA DELTA: the causal-frontier term only applies in causal mode. For the
+    // bidirectional path a fully in-bounds tile needs no mask at all (no causal,
+    // no padding), so it still takes the scale-only fast path below.
+    const bool tile_no_mask = (!IS_CAUSAL || (tile_start + TILE_KV - 1) < min_q_abs_pos)
                               && (tile_start + TILE_KV) <= seq_len
                               && softcapping <= 0.0f
                               && sliding_window < 0;
@@ -394,8 +420,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
             s = softcapping * precise::tanh(s_orig / softcapping) * M_LOG2E_F;
           }
           int kv_pos = tile_start + k * 8 + fn + jj;
+          // XLA DELTA: gate the causal term on IS_CAUSAL. The bidirectional path
+          // keeps only the padding mask plus the (unchanged) one-sided sliding
+          // window, which matches the Triton reference for both modes.
           bool masked = row_masked
-                        || (kv_pos > q_abs_pos)
+                        || (IS_CAUSAL && (kv_pos > q_abs_pos))
                         || (kv_pos >= seq_len);
           if (sliding_window >= 0)
             masked = masked || (kv_pos < q_abs_pos + 1 - sliding_window);
