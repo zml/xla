@@ -76,15 +76,9 @@ absl::StatusOr<std::string> FindMetalTool(const char* tool_name) {
   if (const char* toolchain = std::getenv("METAL_TOOLCHAIN")) {
     return absl::StrCat(toolchain, "/", tool_name);
   }
-  TF_ASSIGN_OR_RETURN(std::string path,
-                      RunCommand({"/usr/bin/xcrun", "--find", tool_name},
-                                 /*capture_stdout=*/true));
-  path = std::string(absl::StripAsciiWhitespace(path));
-  if (path.empty()) {
-    return absl::NotFoundError(
-        absl::StrFormat("xcrun could not find %s.", tool_name));
-  }
-  return path;
+
+  return absl::NotFoundError(
+      "METAL_TOOLCHAIN is not set; cannot locate Metal toolchain tools.");
 }
 
 // air-as is an ~LLVM-15-era assembler and rejects the LLVM-17+ vector-splat
