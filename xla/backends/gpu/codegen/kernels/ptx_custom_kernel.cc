@@ -86,10 +86,17 @@ absl::StatusOr<CustomKernel> CreateOwnedCubinCustomKernel(
     std::string kernel_name, std::vector<uint8_t> cubin, int num_args,
     se::BlockDim block_dim, se::ThreadDim thread_dim,
     size_t shared_memory_bytes) {
+#if defined(TENSORFLOW_USE_METAL)
+  se::KernelLoaderSpec kernel_spec =
+      se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+          std::move(cubin), kernel_name, /*arity=*/num_args,
+          IdentityPackingSpec(num_args));
+#else
   se::KernelLoaderSpec kernel_spec =
       se::KernelLoaderSpec::CreateOwningCudaCubinInMemorySpec(
           std::move(cubin), kernel_name, /*arity=*/num_args,
           IdentityPackingSpec(num_args));
+#endif
   return CustomKernel(std::move(kernel_name), std::move(kernel_spec), block_dim,
                       thread_dim, shared_memory_bytes);
 }

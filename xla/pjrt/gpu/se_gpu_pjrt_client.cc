@@ -1404,8 +1404,7 @@ GetStreamExecutorGpuDeviceAllocator(
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
   bool preallocate = allocator_config.preallocate;
 #if TENSORFLOW_USE_METAL
-  if (platform->id() == stream_executor::metal::kMetalPlatformId &&
-      effective_kind == GpuAllocatorConfig::Kind::kDefault) {
+  if (platform->id() == stream_executor::metal::kMetalPlatformId) {
     preallocate = false;
   }
 #endif  // TENSORFLOW_USE_METAL
