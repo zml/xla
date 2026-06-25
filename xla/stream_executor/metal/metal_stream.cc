@@ -403,6 +403,21 @@ absl::Status MetalStream::FlushBatchedWork() {
   return absl::OkStatus();
 }
 
+absl::Status MetalStream::CommitBatchedWorkNoWait() {
+  // Commit the open buffer WITHOUT waiting and WITHOUT recomputing the adaptive
+  // commit cadence — this is NOT a decode token boundary (FlushBatchedWork is).
+  // Used by the PJRT execute path when a host-awaited completion future is
+  // requested (returned futures): such an isolated execute may have no following
+  // execute to reach the adaptive-K commit and no D2H readback to flush, so its
+  // open command buffer (carrying the shared-event signal the definition-event
+  // listener waits on) would never commit, the listener would never fire, and
+  // the host await would deadlock. Committing here fires the listener. Because
+  // it leaves executes_this_token_ / adaptive_k_ untouched, it is safe even when
+  // interleaved mid-token with batched decode executes on this same stream.
+  CommitOpenBufferNoWait();
+  return absl::OkStatus();
+}
+
 void MetalStream::CommitOpenBufferNoWait() {
   if (command_buffer_ == nullptr) return;
   void* committed = metal::CommitBatchCommandBuffer(command_buffer_);

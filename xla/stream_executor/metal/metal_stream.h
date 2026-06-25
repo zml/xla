@@ -60,6 +60,7 @@ class MetalStream : public StreamCommon {
       absl::AnyInvocable<absl::Status() &&> callback) override;
   absl::Status BlockHostUntilDone() override;
   absl::Status FlushBatchedWork() override;
+  absl::Status CommitBatchedWorkNoWait() override;
 
   Stream::PlatformSpecificHandle platform_specific_handle() const override;
 
