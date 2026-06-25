@@ -825,12 +825,19 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   operands.erase(&instr1);
   operands.erase(&instr2);
 
-  // If we generate the same numbers of inputs and outputs as
-  // before, it won't be bigger after fusion. So accept the fusion.
-  // As this is a consumer_producer fusion, this does not change the
-  // consumer numbers of output. So no need to check it.
+  // If we generate the same number of inputs as before, it won't be bigger
+  // after fusion. So accept the fusion for platforms where this is only a soft
+  // heuristic. Metal is different: AIR buffer slots are a hard ABI limit, so an
+  // already-too-large consumer must not bypass the final operand+output check.
   if (is_consumer_producer_fusion &&
       operands.size() <= instr1.operands().size()) {
+    if (device_info.gpu_compute_capability().IsMetal() &&
+        operands.size() + ShapeUtil::SubshapeCount(instr1.shape()) >
+            max_operands_and_outputs) {
+      return FusionDecision::Forbid(
+          "Number of operands and output buffers is larger than allowed budget "
+          "per fusion");
+    }
     return FusionDecision::Allow();
   }
 
