@@ -774,6 +774,7 @@ static int64_t NumUnnestedReductions(const HloInstruction& instr,
 // to true to enable more fusion.
 FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
                                           const HloInstruction& instr2,
+                                          const se::DeviceDescription& device_info,
                                           bool is_consumer_producer_fusion) {
   // Compute the number of outputs of the (possibly multi-output) fusion node
   // we're considering creating.
@@ -800,9 +801,11 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   //
   // This fact may be enough to let us avoid having to compute the true total
   // number of operands, which can be expensive.
+  const int64_t max_operands_and_outputs =
+      MaxOperandsAndOutputsPerFusion(device_info);
   if (instr1.operand_count() + instr2.operand_count() - 1 +
           num_output_buffers <=
-      MaxOperandsAndOutputsPerFusion()) {
+      max_operands_and_outputs) {
     return FusionDecision::Allow();
   } else {
     VLOG(5) << "Operand count of "
@@ -810,8 +813,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
             << " and ( " << instr2.ToString()
             << " ) = " << instr2.operand_count()
             << " and num_output_buffers = " << num_output_buffers
-            << " is bigger than the bound of "
-            << MaxOperandsAndOutputsPerFusion();
+            << " is bigger than the bound of " << max_operands_and_outputs;
   }
 
   // Compute the precise number of operands to the new fusion.
@@ -833,7 +835,7 @@ FusionDecision FusionFitsInParameterLimit(const HloInstruction& instr1,
   }
 
   // Does the new fusion have more operands and outputs than the max?
-  if (operands.size() + num_output_buffers > MaxOperandsAndOutputsPerFusion()) {
+  if (operands.size() + num_output_buffers > max_operands_and_outputs) {
     return FusionDecision::Forbid(
         "Number of operands and output buffers is larger than allowed budget "
         "per fusion");
@@ -868,7 +870,7 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
            << kMaxUnnestedReductionOutputsPerFusion
            << " unnested reductions in fusion";
   }
-  return FusionFitsInParameterLimit(instr1, instr2,
+  return FusionFitsInParameterLimit(instr1, instr2, device_info,
                                     is_consumer_producer_fusion);
 }
 

@@ -774,7 +774,8 @@ class PriorityFusionQueue {
     // regarding the maximum number of parameters that can be passed to a
     // kernel.
     if (auto fits_budget = FusionFitsInParameterLimit(
-            *consumer, *producer, /*is_consumer_producer_fusion=*/true);
+            *consumer, *producer, *device_info_,
+            /*is_consumer_producer_fusion=*/true);
         !fits_budget) {
       return fits_budget;
     }
