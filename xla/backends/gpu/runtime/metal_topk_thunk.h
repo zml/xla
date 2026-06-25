@@ -99,7 +99,7 @@ class MetalTopKThunk : public Thunk {
   // each token via the scan / select, so they're zeroed only at setup).
   stream_executor::DeviceAddressBase hist_ ABSL_GUARDED_BY(mu_);     // B*65536 u32
   stream_executor::DeviceAddressBase thresh_ ABSL_GUARDED_BY(mu_);   // B u32
-  stream_executor::DeviceAddressBase ccount_ ABSL_GUARDED_BY(mu_);   // B u32
+  stream_executor::DeviceAddressBase ccount_ ABSL_GUARDED_BY(mu_);   // B*2 u32
   stream_executor::DeviceAddressBase cok_ ABSL_GUARDED_BY(mu_);      // B*kCap u32
   stream_executor::DeviceAddressBase cix_ ABSL_GUARDED_BY(mu_);      // B*kCap u32
   stream_executor::DeviceAddressBase args_ ABSL_GUARDED_BY(mu_);     // {n,k,cap}

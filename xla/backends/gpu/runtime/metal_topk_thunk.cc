@@ -119,7 +119,7 @@ absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
 
   hist_ = executor->Allocate(static_cast<uint64_t>(batch_) * 16384 * 4, 0);
   thresh_ = executor->Allocate(static_cast<uint64_t>(batch_) * 4, 0);
-  ccount_ = executor->Allocate(static_cast<uint64_t>(batch_) * 4, 0);
+  ccount_ = executor->Allocate(static_cast<uint64_t>(batch_) * 2 * 4, 0);
   cok_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
   cix_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
   args_ = executor->Allocate(sizeof(ArgsHost), 0);
@@ -134,7 +134,7 @@ absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&hist_, zeros.data(),
                                                  static_cast<uint64_t>(batch_) * 16384 * 4));
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&ccount_, zeros.data(),
-                                                 static_cast<uint64_t>(batch_) * 4));
+                                                 static_cast<uint64_t>(batch_) * 2 * 4));
   ArgsHost a = {static_cast<uint32_t>(n_), static_cast<uint32_t>(k_),
                 static_cast<uint32_t>(kCap), 0};
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&args_, &a, sizeof(a)));

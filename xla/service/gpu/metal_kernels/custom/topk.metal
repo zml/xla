@@ -49,15 +49,26 @@ kernel void radix_gather16(device const ushort* logits [[buffer(0)]], constant T
                            device atomic_uint* ccount [[buffer(3)]], device uint* cok [[buffer(4)]], device uint* cix [[buffer(5)]],
                            uint3 tg [[threadgroup_position_in_grid]], uint3 tgpg [[threadgroups_per_grid]], uint3 _t [[thread_position_in_threadgroup]], uint3 _nt [[threads_per_threadgroup]]) {
   uint b = tg.y, tid = _t.x, nt = _nt.x, pth = thresh[b]; device const ushort* row = logits + (ulong)b * a.n;
-  device atomic_uint* cc = ccount + b; device uint* co = cok + (ulong)b * a.cap; device uint* ci = cix + (ulong)b * a.cap;
-  for (uint i = tg.x * nt + tid, s = tgpg.x * nt; i < a.n; i += s) { uint o = okey32_from_u16(row[i]); if ((o >> BSHIFT) >= pth) { uint p = atomic_fetch_add_explicit(cc, 1u, memory_order_relaxed); if (p < a.cap) { co[p] = o; ci[p] = i; } } }
+  device uint* co = cok + (ulong)b * a.cap; device uint* ci = cix + (ulong)b * a.cap;
+  // Two-tier gather: bins STRICTLY above pth are the genuine winners (< k total,
+  // so they fit and must never be evicted); the threshold bin (== pth) is the
+  // over-populated remainder. Use two real counters per row: ccount[2*b] for
+  // winners, ccount[2*b+1] for threshold-bin candidates. Do not bit-pack them:
+  // a full-vocab -inf threshold bin can overflow 16 bits and corrupt the winner
+  // count.
+  device atomic_uint* cg = ccount + (ulong)b * 2;
+  device atomic_uint* ce = cg + 1;
+  for (uint i = tg.x * nt + tid, s = tgpg.x * nt; i < a.n; i += s) { uint o = okey32_from_u16(row[i]); uint bin = o >> BSHIFT; if (bin > pth) { uint p = atomic_fetch_add_explicit(cg, 1u, memory_order_relaxed); if (p < a.k) { co[p] = o; ci[p] = i; } } else if (bin == pth) { uint p = atomic_fetch_add_explicit(ce, 1u, memory_order_relaxed); if (p < a.cap - a.k) { co[a.k + p] = o; ci[a.k + p] = i; } } }
 }
 kernel void radix_gather32(device const uint* logits [[buffer(0)]], constant TKA& a [[buffer(1)]], device const uint* thresh [[buffer(2)]],
                            device atomic_uint* ccount [[buffer(3)]], device uint* cok [[buffer(4)]], device uint* cix [[buffer(5)]],
                            uint3 tg [[threadgroup_position_in_grid]], uint3 tgpg [[threadgroups_per_grid]], uint3 _t [[thread_position_in_threadgroup]], uint3 _nt [[threads_per_threadgroup]]) {
   uint b = tg.y, tid = _t.x, nt = _nt.x, pth = thresh[b]; device const uint* row = logits + (ulong)b * a.n;
-  device atomic_uint* cc = ccount + b; device uint* co = cok + (ulong)b * a.cap; device uint* ci = cix + (ulong)b * a.cap;
-  for (uint i = tg.x * nt + tid, s = tgpg.x * nt; i < a.n; i += s) { uint o = okey32_from_u32(row[i]); if ((o >> BSHIFT) >= pth) { uint p = atomic_fetch_add_explicit(cc, 1u, memory_order_relaxed); if (p < a.cap) { co[p] = o; ci[p] = i; } } }
+  device uint* co = cok + (ulong)b * a.cap; device uint* ci = cix + (ulong)b * a.cap;
+  // Two-tier gather (see radix_gather16).
+  device atomic_uint* cg = ccount + (ulong)b * 2;
+  device atomic_uint* ce = cg + 1;
+  for (uint i = tg.x * nt + tid, s = tgpg.x * nt; i < a.n; i += s) { uint o = okey32_from_u32(row[i]); uint bin = o >> BSHIFT; if (bin > pth) { uint p = atomic_fetch_add_explicit(cg, 1u, memory_order_relaxed); if (p < a.k) { co[p] = o; ci[p] = i; } } else if (bin == pth) { uint p = atomic_fetch_add_explicit(ce, 1u, memory_order_relaxed); if (p < a.cap - a.k) { co[a.k + p] = o; ci[a.k + p] = i; } } }
 }
 
 inline bool sgt(uint2 a, uint2 b) { return a.x == b.x ? a.y < b.y : a.x > b.x; }
@@ -66,17 +77,20 @@ kernel void NAME(device const uint* cok [[buffer(0)]], device const uint* cix [[
                  constant TKA& a [[buffer(3)]], device OUTT* outv [[buffer(4)]], device uint* outi [[buffer(5)]], \
                  threadgroup uint2* sc [[threadgroup(0)]], uint3 tg [[threadgroup_position_in_grid]], uint3 _t [[thread_position_in_threadgroup]], uint3 _nt [[threads_per_threadgroup]]) { \
   uint b = tg.y, tid = _t.x, nt = _nt.x, kreq = a.k, cap = a.cap; \
-  device const uint* co = cok + (ulong)b * cap; device const uint* ci = cix + (ulong)b * cap; device atomic_uint* cc = ccount + b; \
-  const uint SCAP = 2048u; uint cn = min(atomic_load_explicit(cc, memory_order_relaxed), cap); uint nsc = min(cn, SCAP); \
-  for (uint i = tid; i < nsc; i += nt) sc[i] = uint2(co[i], ci[i]); \
+  device const uint* co = cok + (ulong)b * cap; device const uint* ci = cix + (ulong)b * cap; device atomic_uint* cg = ccount + (ulong)b * 2; device atomic_uint* ce = cg + 1; \
+  uint n_gt = min(atomic_load_explicit(cg, memory_order_relaxed), kreq); uint n_eq = min(atomic_load_explicit(ce, memory_order_relaxed), cap - kreq); uint cn = n_gt + n_eq; \
+  const uint SCAP = 2048u; uint nsc = min(n_eq, SCAP); \
+  for (uint i = tid; i < nsc; i += nt) sc[i] = uint2(co[kreq + i], ci[kreq + i]); \
   threadgroup_barrier(mem_flags::mem_threadgroup); \
   if (tid == 0u) { uint2 t[K]; for (int i = 0; i < K; ++i) t[i] = uint2(0u, 0xffffffffu); \
-    for (uint c = 0; c < cn; ++c) { uint2 kv = c < nsc ? sc[c] : uint2(co[c], ci[c]); \
+    for (uint c = 0; c < cn; ++c) { uint2 kv; \
+      if (c < n_gt) kv = uint2(co[c], ci[c]); \
+      else { uint e = c - n_gt; kv = e < nsc ? sc[e] : uint2(co[kreq + e], ci[kreq + e]); } \
       bool p = sgt(t[K-1], kv); t[K-1] = p ? t[K-1] : kv; \
       for (int j = K - 2; j >= 0; --j) { bool q = sgt(t[j], kv); uint2 tt = t[j]; t[j] = q ? t[j] : t[j+1]; t[j+1] = q ? t[j+1] : tt; } } \
     device OUTT* ov = outv + (ulong)b * kreq; device uint* oi = outi + (ulong)b * kreq; \
     for (uint i = 0; i < kreq; ++i) { ov[i] = CONV(t[i].x); oi[i] = t[i].y; } \
-    atomic_store_explicit(cc, 0u, memory_order_relaxed); } }
+    atomic_store_explicit(cg, 0u, memory_order_relaxed); atomic_store_explicit(ce, 0u, memory_order_relaxed); } }
 SEL(radix_sel16_k1, 1, ushort, u16_from_okey32) SEL(radix_sel16_k2, 2, ushort, u16_from_okey32)
 SEL(radix_sel16_k4, 4, ushort, u16_from_okey32) SEL(radix_sel16_k8, 8, ushort, u16_from_okey32) SEL(radix_sel16_k16, 16, ushort, u16_from_okey32)
 SEL(radix_sel16_k32, 32, ushort, u16_from_okey32)
