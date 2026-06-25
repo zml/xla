@@ -200,12 +200,24 @@ std::string RewriteHexFloatsForOldAirAs(absl::string_view source) {
 }
 
 // The LLVM-23 AsmWriter prints floating-point infinity / NaN constants with the
-// `inf` / `-inf` / `nan` keywords, which air-as (~LLVM-15) cannot lex; rewrite
-// them to the hex bit-pattern it expects (float/double inf/nan widen
-// losslessly). Anchored to an operand-position delimiter (space, comma, or '(')
-// so it never touches an identifier that merely contains "inf"/"nan".
+// keyword forms `inf` / `qnan` / `snan`, optionally signed (e.g. `+qnan`,
+// `-inf`; a bf16 NaN broadcast in Qwen-27B emits `bfloat +qnan`), which air-as
+// (~LLVM-15) cannot lex ("expected value token"); rewrite them to the hex bit
+// pattern it expects. CRUCIAL: that pattern is TYPE-DEPENDENT — a 16-bit type
+// must use its own typed-hex prefix (`bfloat 0xR7FC0`, `half 0xH7E00`); the wide
+// 64-bit (double) form is accepted only for `float`/`double`, which air-as
+// narrows losslessly (the typed forms above are exactly what the native `metal`
+// compiler emits for the same constants, verified by compiling an MSL shader).
+// So resolve the operand's type from the nearest preceding float-type keyword on
+// the same line — LLVM prints the type just ahead of the operand and repeats it
+// inside vector constants (`<4 x bfloat> <bfloat +qnan, ...>`), and `\bfloat\b`
+// distinguishes a standalone `float` from the `float` inside `bfloat` (no word
+// boundary between the `b` and `f`). Anchored to an operand-position delimiter so
+// it never touches an identifier that merely contains "inf"/"nan"; a token with
+// no float type on its line (so not actually a float constant) is left untouched.
 std::string RewriteInfNanForOldAirAs(absl::string_view source) {
-  static const std::regex kInfNan(R"(([\s,(])(-?)(inf|nan)\b)");
+  static const std::regex kInfNan(R"(([\s,(<\[])([+-]?)(qnan|snan|nan|inf)\b)");
+  static const std::regex kFpType(R"(\b(bfloat|half|float|double)\b)");
   const std::string in(source);
   std::string out;
   out.reserve(in.size());
@@ -213,14 +225,41 @@ std::string RewriteInfNanForOldAirAs(absl::string_view source) {
   for (auto it = std::sregex_iterator(in.begin(), in.end(), kInfNan);
        it != std::sregex_iterator(); ++it) {
     const std::smatch& m = *it;
-    out.append(in, last, static_cast<std::size_t>(m.position()) - last);
+    const std::size_t pos = static_cast<std::size_t>(m.position());
+
+    // Resolve the operand's float type from the nearest preceding float-type
+    // keyword on the same line (last match wins).
+    const std::size_t nl = in.rfind('\n', pos);
+    const std::size_t line_start = (nl == std::string::npos) ? 0 : nl + 1;
+    const std::string prefix = in.substr(line_start, pos - line_start);
+    std::string type;
+    for (auto t = std::sregex_iterator(prefix.begin(), prefix.end(), kFpType);
+         t != std::sregex_iterator(); ++t) {
+      type = (*t)[1].str();
+    }
+    if (type.empty()) continue;  // not a float constant; leave it untouched.
+
     const bool neg = m[2].str() == "-";
-    const bool is_nan = m[3].str() == "nan";
-    const char* hex = is_nan ? "0x7FF8000000000000"
-                      : neg   ? "0xFFF0000000000000"
-                              : "0x7FF0000000000000";
+    const std::string& kw = m[3].str();
+    const bool is_inf = kw == "inf";
+    const bool is_snan = kw == "snan";
+    std::string hex;
+    if (type == "bfloat") {  // 1+8+7 bits: exp all-ones, quiet bit = mantissa MSB.
+      hex = is_inf ? (neg ? "0xRFF80" : "0xR7F80")
+          : is_snan ? (neg ? "0xRFFA0" : "0xR7FA0")
+                    : (neg ? "0xRFFC0" : "0xR7FC0");
+    } else if (type == "half") {  // 1+5+10 bits.
+      hex = is_inf ? (neg ? "0xHFC00" : "0xH7C00")
+          : is_snan ? (neg ? "0xHFD00" : "0xH7D00")
+                    : (neg ? "0xHFE00" : "0xH7E00");
+    } else {  // float / double: air-as accepts (and narrows) the double bits.
+      hex = is_inf ? (neg ? "0xFFF0000000000000" : "0x7FF0000000000000")
+          : is_snan ? (neg ? "0xFFF4000000000000" : "0x7FF4000000000000")
+                    : (neg ? "0xFFF8000000000000" : "0x7FF8000000000000");
+    }
+    out.append(in, last, pos - last);
     absl::StrAppend(&out, m[1].str(), hex);
-    last = static_cast<std::size_t>(m.position() + m.length());
+    last = pos + static_cast<std::size_t>(m.length());
   }
   out.append(in, last, std::string::npos);
   return out;
