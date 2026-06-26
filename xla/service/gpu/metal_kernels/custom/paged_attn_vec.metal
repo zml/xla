@@ -22,6 +22,7 @@ typedef struct {
 constant int32_t FC_nsg [[function_constant(450)]];  // simdgroups (KV split)
 constant int32_t FC_bs  [[function_constant(451)]];  // page block_size (8/16/32)
 constant int32_t FC_ps  [[function_constant(452)]];  // in-page position stride, elems (= n_kv*hd)
+constant int32_t FC_nwg [[function_constant(453)]];  // position-split workgroups (1 = single-pass; >1 writes f32 partials for fa_vec_paged_reduce)
 
 typedef half4   q4_t;
 typedef bfloat4 k4_t;
@@ -55,9 +56,11 @@ static void fa_vec_paged_impl(
 #define NSG (FC_nsg)
 #define BS  (FC_bs)
 #define PS  (FC_ps)
+#define NWG (FC_nwg)
 
     const int r   = (int) tgpig[2];  // query ROW in [0, total_q_tokens)
     const ushort iq2 = tgpig[1];     // query head
+    const short iwg = (short) tgpig[0];  // position-split workgroup (KV partition)
 
     constexpr short DK4 = DK/4;
     constexpr short DV4 = DV/4;
@@ -154,9 +157,13 @@ static void fa_vec_paged_impl(
 
         // Start at the first KV tile that overlaps the window [kv_lo, kv_len);
         // tiles fully below kv_lo are skipped (the sliding-window win at long
-        // context). Global layers have kv_lo=0 -> ic0 starts at sgitg as before.
+        // context). The in-window tiles are split across NWG workgroups * NSG
+        // simdgroups (split-K / flash-decoding): workgroup iwg's simdgroup sgitg
+        // takes ic0 = ic0_lo + iwg*NSG + sgitg, +NWG*NSG, ... (NWG=1 => the plain
+        // single-pass stride by NSG). This lifts hd512's nsg<=8 occupancy cap at
+        // long context.
         const int ic0_lo = kv_lo / C;
-        for (int ic0 = ic0_lo + sgitg; ; ic0 += NSG) {
+        for (int ic0 = ic0_lo + iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
             const int ic = ic0*C;
             if (ic >= kv_len) {
                 break;
@@ -280,20 +287,38 @@ static void fa_vec_paged_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // final store: bf16, row-major [total_q_tokens, num_heads, hd]
+    // final store: NWG==1 writes the final bf16 output; NWG>1 writes THIS
+    // workgroup's f32 partial (unnormalized O, plus S and M) for
+    // fa_vec_paged_reduce to combine across the NWG position-split workgroups.
+    // (The cross-simdgroup reduce above already combined this workgroup's NSG
+    // simdgroups, so each workgroup contributes one partial.)
     if (sgitg == 0) {
         const int64_t rid = (int64_t)r*(uint)args.num_heads + iq2;
-
-        const float S = ss[0] == 0.0f ? 0.0f : 1.0f/ss[0];
-        device bfloat4 * dst4 = (device bfloat4 *) dst;
-        for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4 + i] = (bfloat4) ((float4) so4[i]*S);
+        if (NWG == 1) {
+            const float S = ss[0] == 0.0f ? 0.0f : 1.0f/ss[0];
+            device bfloat4 * dst4 = (device bfloat4 *) dst;
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[rid*DV4 + i] = (bfloat4) ((float4) so4[i]*S);
+            }
+        } else {
+            const int64_t nrows =
+                (int64_t)cu_seqlens_q[args.num_seqs] * (uint)args.num_heads;
+            device float4 * dst4 = (device float4 *) dst;
+            device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i];
+            }
+            if (tiisg == 0) {
+                dst1[rid*(2*NWG) + 2*iwg + 0] = ss[0];
+                dst1[rid*(2*NWG) + 2*iwg + 1] = ss[1];
+            }
         }
     }
 
 #undef NSG
 #undef BS
 #undef PS
+#undef NWG
 }
 
 // Kernel entry points (same implicit buffer order as the original single kernel,
@@ -320,3 +345,43 @@ kernel void NAME(                                                               
 FA_VEC_PAGED_KERNEL(fa_vec_paged,       128, 128)  // backward-compatible name
 FA_VEC_PAGED_KERNEL(fa_vec_paged_hd256, 256, 256)  // Gemma sliding layers
 FA_VEC_PAGED_KERNEL(fa_vec_paged_hd512, 512, 512)  // Gemma global layers
+
+// Split-K reduce: combine the NWG f32 partials (O, S, M) the split-K partial
+// pass wrote per (query row, head) into the final bf16 output. One threadgroup
+// per row*head; the NWG partials sit in the simdgroup lanes (NWG <= 32, lanes
+// >= NWG masked to identity), then an online-softmax rescale + simd_sum.
+typedef struct { int32_t nrows; } fa_vec_paged_reduce_args;
+constant int32_t FC_red_dv [[function_constant(454)]];  // DV (head_dim)
+
+kernel void fa_vec_paged_reduce(
+        constant fa_vec_paged_reduce_args & args,
+        device const char * htmp,
+        device       char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int nwg = FC_nwg;
+    const int DV  = FC_red_dv;
+    const uint64_t rid = tgpig;
+    const short iwg = tiisg;  // partial index; only [0, nwg) carry real data
+    device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*nwg;
+
+    float M = (iwg < nwg) ? ss[rid*(2*nwg) + 2*iwg + 1] : -FLT_MAX/2;
+    float S = (iwg < nwg) ? ss[rid*(2*nwg) + 2*iwg + 0] : 0.0f;
+
+    const float m  = simd_max(M);
+    const float ms = exp(M - m);
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    const int DV4 = DV/4;
+    device const float4  * htmp4 = (device const float4  *) htmp + rid*DV4*nwg;
+    device       bfloat4 * dst4  = (device       bfloat4 *) dst  + rid*DV4;
+    for (int i = sgitg; i < DV4; i += nwg) {
+        const float4 part = (iwg < nwg) ? (htmp4[i*nwg + iwg]*ms) : float4(0.0f);
+        const float4 v = simd_sum(part);
+        if (iwg == 0) {
+            dst4[i] = (bfloat4) (v*S);
+        }
+    }
+}

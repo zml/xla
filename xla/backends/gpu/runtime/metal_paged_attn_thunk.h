@@ -171,6 +171,19 @@ class MetalPagedAttnThunk : public Thunk {
       ABSL_GUARDED_BY(mu_);
   size_t vec_smem_by_nsg_[3] ABSL_GUARDED_BY(mu_) = {0, 0, 0};
   stream_executor::DeviceAddressBase p_vec_args_ ABSL_GUARDED_BY(mu_);
+
+  // Split-K (flash-decoding) for hd512 global layers at long context: the vec
+  // decode caps KV parallelism at nsg=8 (smem), so past ~4k context the global
+  // layers under-occupy. When use_split_k_, run the partial pass (NWG position-
+  // split workgroups writing f32 partials to p_partial_) + the reduce kernel.
+  static constexpr int kSplitKNwg = 4;     // position-split workgroups
+  static constexpr int kSplitKMinKv = 4096;  // static-capacity gate
+  bool use_split_k_ ABSL_GUARDED_BY(mu_) = false;
+  std::unique_ptr<stream_executor::Kernel> vec_partial_kernel_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> vec_reduce_kernel_ ABSL_GUARDED_BY(mu_);
+  size_t vec_partial_smem_ ABSL_GUARDED_BY(mu_) = 0;
+  stream_executor::DeviceAddressBase p_partial_ ABSL_GUARDED_BY(mu_);
+  stream_executor::DeviceAddressBase p_reduce_args_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace gpu

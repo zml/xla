@@ -294,7 +294,8 @@ absl::Status MetalPagedAttnThunk::EnsureVecVariant(
   const int nsg = kVecNsgVals[idx];
   const FC fc[] = {{450, FC::Kind::kInt, nsg},
                    {451, FC::Kind::kInt, block_size_},
-                   {452, FC::Kind::kInt, num_kv_heads_ * head_dim_}};
+                   {452, FC::Kind::kInt, num_kv_heads_ * head_dim_},
+                   {453, FC::Kind::kInt, 1}};  // nwg=1 (single-pass; split-K below)
   // The vec kernel is specialized per head_dim (DK=DV template); Gemma's global
   // layers are hd512, its sliding layers hd256, everything else hd128.
   const char* vec_name = head_dim_ == 512   ? "fa_vec_paged_hd512"
@@ -324,6 +325,41 @@ absl::Status MetalPagedAttnThunk::EnsureVecDecode(
   a.scale = scale_;
   a.sliding_window = static_cast<int32_t>(sliding_window_);
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_vec_args_, &a, sizeof(a)));
+
+  // Split-K for hd512 global layers when the static KV capacity is large: the
+  // single-pass vec decode caps at nsg=8, so position-split across kSplitKNwg
+  // workgroups (partial pass writes f32 partials) + the reduce kernel.
+  const int64_t kv_capacity = max_num_blocks_per_seq_ * block_size_;
+  use_split_k_ = (head_dim_ == 512 && kv_capacity > kSplitKMinKv);
+  if (use_split_k_) {
+    auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
+    using FC = se::metal::MetalFunctionConstant;
+    const int nwg = kSplitKNwg;
+    const FC pfc[] = {{450, FC::Kind::kInt, 8},  // nsg=8 (hd512 smem cap)
+                      {451, FC::Kind::kInt, static_cast<int>(block_size_)},
+                      {452, FC::Kind::kInt,
+                       static_cast<int>(num_kv_heads_ * head_dim_)},
+                      {453, FC::Kind::kInt, nwg}};
+    TF_ASSIGN_OR_RETURN(vec_partial_kernel_,
+                        metal_exec->LoadKernelWithConstants(
+                            vec_lib_, "fa_vec_paged_hd512", /*arity=*/8, pfc));
+    vec_partial_smem_ = PagedFaVecSmem(head_dim_, 8);
+    const FC rfc[] = {{453, FC::Kind::kInt, nwg},
+                      {454, FC::Kind::kInt, static_cast<int>(head_dim_)}};
+    TF_ASSIGN_OR_RETURN(vec_reduce_kernel_,
+                        metal_exec->LoadKernelWithConstants(
+                            vec_lib_, "fa_vec_paged_reduce", /*arity=*/3, rfc));
+    const int64_t nrows = total_q_tokens_ * num_heads_;
+    const int64_t partial_bytes = nrows * (head_dim_ * nwg + 2 * nwg) * 4;
+    p_partial_ = executor->Allocate(partial_bytes, 0);
+    p_reduce_args_ = executor->Allocate(sizeof(int32_t), 0);
+    if (p_partial_.opaque() == nullptr || p_reduce_args_.opaque() == nullptr) {
+      return absl::ResourceExhaustedError("zml$paged_attn: split-K scratch alloc.");
+    }
+    const int32_t nrows32 = static_cast<int32_t>(nrows);
+    TF_RETURN_IF_ERROR(
+        executor->SynchronousMemcpy(&p_reduce_args_, &nrows32, sizeof(nrows32)));
+  }
   return absl::OkStatus();
 }
 
@@ -383,6 +419,32 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
   // decode well-parallelized (the ramp's whole purpose); a short context just
   // over-parallelizes slightly. Matches CUDA's static-grid dispatch.
   if (use_vec_decode_) {
+    const se::DeviceAddressBase out = allocs.GetDeviceAddress(out_);
+    // Split-K (hd512 long context): partial pass over kSplitKNwg position-split
+    // workgroups -> f32 partials in p_partial_, then the reduce kernel combines
+    // them into out. Lifts the nsg<=8 occupancy cap for the global layers.
+    if (use_split_k_) {
+      se::KernelArgsPackedArray pa(/*num_args=*/8);
+      pa.add_argument(p_vec_args_);
+      pa.add_argument(allocs.GetDeviceAddress(q_));
+      pa.add_argument(allocs.GetDeviceAddress(k_cache_));
+      pa.add_argument(allocs.GetDeviceAddress(v_cache_));
+      pa.add_argument(allocs.GetDeviceAddress(block_table_));
+      pa.add_argument(allocs.GetDeviceAddress(seq_lens_));
+      pa.add_argument(allocs.GetDeviceAddress(query_start_len_));
+      pa.add_argument(p_partial_);  // dst = f32 partial scratch
+      pa.add_shared_bytes(vec_partial_smem_);
+      TF_RETURN_IF_ERROR(vec_partial_kernel_->Launch(
+          se::ThreadDim(32, 8, 1),
+          se::BlockDim(kSplitKNwg, num_heads_, total_q_tokens_), stream, pa));
+      se::KernelArgsPackedArray ra(/*num_args=*/3);
+      ra.add_argument(p_reduce_args_);  // 0 {nrows}
+      ra.add_argument(p_partial_);      // 1 htmp
+      ra.add_argument(out);             // 2 dst
+      return vec_reduce_kernel_->Launch(
+          se::ThreadDim(32, kSplitKNwg, 1),
+          se::BlockDim(num_heads_ * total_q_tokens_, 1, 1), stream, ra);
+    }
     const int64_t kv_capacity = max_num_blocks_per_seq_ * block_size_;
     int idx = kv_capacity <= 1024 ? 0 : (kv_capacity <= 2048 ? 1 : 2);
     // hd512's vec shmem is (3*512+128)*nsg*2 B: nsg=16 -> 53 KB, over the 32 KB
@@ -397,7 +459,7 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
     args.add_argument(allocs.GetDeviceAddress(block_table_));  // 4 block_tables
     args.add_argument(allocs.GetDeviceAddress(seq_lens_));     // 5 seq_lens
     args.add_argument(allocs.GetDeviceAddress(query_start_len_));  // 6 cu_seqlens_q
-    args.add_argument(allocs.GetDeviceAddress(out_));          // 7 dst
+    args.add_argument(out);                                   // 7 dst
     args.add_shared_bytes(vec_smem_by_nsg_[idx]);
     return vec_kernel_by_nsg_[idx]->Launch(
         se::ThreadDim(32, kVecNsgVals[idx], 1),
