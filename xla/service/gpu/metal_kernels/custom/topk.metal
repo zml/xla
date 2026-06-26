@@ -97,3 +97,28 @@ SEL(radix_sel16_k32, 32, ushort, u16_from_okey32) SEL(radix_sel16_k64, 64, ushor
 SEL(radix_sel32_k1, 1, uint, u32_from_okey32) SEL(radix_sel32_k2, 2, uint, u32_from_okey32)
 SEL(radix_sel32_k4, 4, uint, u32_from_okey32) SEL(radix_sel32_k8, 8, uint, u32_from_okey32) SEL(radix_sel32_k16, 16, uint, u32_from_okey32)
 SEL(radix_sel32_k32, 32, uint, u32_from_okey32) SEL(radix_sel32_k64, 64, uint, u32_from_okey32)
+
+// Single-pass small-n TopK. One thread runs the SAME (okey desc, index asc)
+// insertion select as the radix SEL path, reading the input directly — no
+// histogram/scan/gather, so ONE dispatch instead of four. The top-k under that
+// total order is unique, so this is byte-identical to the 4-pass radix result.
+// Used for small n only (MoE router topk: n = #experts ~32-128); a single
+// thread over the whole vocab would be far too slow, so large-n keeps radix.
+#define SEL1(NAME, K, INT, OUTT, OKEY, CONV) \
+kernel void NAME(device const INT* logits [[buffer(0)]], constant TKA& a [[buffer(1)]], \
+                 device OUTT* outv [[buffer(2)]], device uint* outi [[buffer(3)]], \
+                 uint3 tg [[threadgroup_position_in_grid]], uint3 _t [[thread_position_in_threadgroup]]) { \
+  if (_t.x != 0u) return; \
+  uint b = tg.y, n = a.n, kreq = a.k; device const INT* row = logits + (ulong)b * n; \
+  uint2 t[K]; for (int i = 0; i < K; ++i) t[i] = uint2(0u, 0xffffffffu); \
+  for (uint c = 0; c < n; ++c) { uint2 kv = uint2(OKEY(row[c]), c); \
+    bool p = sgt(t[K-1], kv); t[K-1] = p ? t[K-1] : kv; \
+    for (int j = K - 2; j >= 0; --j) { bool q = sgt(t[j], kv); uint2 tt = t[j]; t[j] = q ? t[j] : t[j+1]; t[j+1] = q ? t[j+1] : tt; } } \
+  device OUTT* ov = outv + (ulong)b * kreq; device uint* oi = outi + (ulong)b * kreq; \
+  for (uint i = 0; i < kreq; ++i) { ov[i] = CONV(t[i].x); oi[i] = t[i].y; } }
+SEL1(topk1_16_k1, 1, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k2, 2, ushort, ushort, okey32_from_u16, u16_from_okey32)
+SEL1(topk1_16_k4, 4, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k8, 8, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k16, 16, ushort, ushort, okey32_from_u16, u16_from_okey32)
+SEL1(topk1_16_k32, 32, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k64, 64, ushort, ushort, okey32_from_u16, u16_from_okey32)
+SEL1(topk1_32_k1, 1, uint, uint, okey32_from_u32, u32_from_okey32) SEL1(topk1_32_k2, 2, uint, uint, okey32_from_u32, u32_from_okey32)
+SEL1(topk1_32_k4, 4, uint, uint, okey32_from_u32, u32_from_okey32) SEL1(topk1_32_k8, 8, uint, uint, okey32_from_u32, u32_from_okey32) SEL1(topk1_32_k16, 16, uint, uint, okey32_from_u32, u32_from_okey32)
+SEL1(topk1_32_k32, 32, uint, uint, okey32_from_u32, u32_from_okey32) SEL1(topk1_32_k64, 64, uint, uint, okey32_from_u32, u32_from_okey32)

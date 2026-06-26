@@ -102,6 +102,9 @@ void MetalTopKThunk::Prewarm(se::StreamExecutor* executor, PrimitiveType dtype,
   load("radix_scan", 3);
   load(b16 ? "radix_gather16" : "radix_gather32", 6);
   load(absl::StrCat("radix_sel", b16 ? "16" : "32", "_k", k_rounded), 6);
+  // Prewarm doesn't know n, so warm the single-pass kernel too (used for small-n
+  // router topk); a wasted PSO compile here is harmless.
+  load(absl::StrCat("topk1_", b16 ? "16" : "32", "_k", k_rounded), 4);
 }
 
 absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
@@ -109,8 +112,9 @@ absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Metal TopK radix: k=", k_, " > ", kMaxMetalTopK));
   }
-  if (executor_ == executor && hist_.opaque() != nullptr) return absl::OkStatus();
+  if (executor_ == executor && args_.opaque() != nullptr) return absl::OkStatus();
   executor_ = executor;
+  single_pass_ = (n_ <= kSinglePassMaxN);
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
   const bool b16 = (dtype_ != F32);  // BF16/F16 -> 16-bit path
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib, CompileMetalSourceToMetallibCached(get_topk()));
@@ -119,30 +123,43 @@ absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
       -> absl::StatusOr<std::unique_ptr<se::Kernel>> {
     return metal_exec->LoadKernelWithConstants(lib, name, arity, no_fc);
   };
-  TF_ASSIGN_OR_RETURN(hist_pso_, load(b16 ? "radix_hist16" : "radix_hist32", 3));
-  TF_ASSIGN_OR_RETURN(scan_pso_, load("radix_scan", 3));
-  TF_ASSIGN_OR_RETURN(gather_pso_, load(b16 ? "radix_gather16" : "radix_gather32", 6));
-  TF_ASSIGN_OR_RETURN(
-      select_pso_, load(absl::StrCat("radix_sel", b16 ? "16" : "32", "_k", k_rounded_), 6));
 
-  hist_ = executor->Allocate(static_cast<uint64_t>(batch_) * 16384 * 4, 0);
-  thresh_ = executor->Allocate(static_cast<uint64_t>(batch_) * 4, 0);
-  ccount_ = executor->Allocate(static_cast<uint64_t>(batch_) * 2 * 4, 0);
-  cok_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
-  cix_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
-  args_ = executor->Allocate(sizeof(ArgsHost), 0);
-  if (hist_.opaque() == nullptr || thresh_.opaque() == nullptr ||
-      ccount_.opaque() == nullptr || cok_.opaque() == nullptr ||
-      cix_.opaque() == nullptr || args_.opaque() == nullptr) {
-    return absl::ResourceExhaustedError("Metal TopK radix: scratch alloc failed.");
+  if (single_pass_) {
+    // One dispatch: the single-thread insertion select reads the input directly,
+    // no histogram/scan/gather scratch needed.
+    TF_ASSIGN_OR_RETURN(
+        single_pass_pso_,
+        load(absl::StrCat("topk1_", b16 ? "16" : "32", "_k", k_rounded_), 4));
+  } else {
+    TF_ASSIGN_OR_RETURN(hist_pso_, load(b16 ? "radix_hist16" : "radix_hist32", 3));
+    TF_ASSIGN_OR_RETURN(scan_pso_, load("radix_scan", 3));
+    TF_ASSIGN_OR_RETURN(gather_pso_, load(b16 ? "radix_gather16" : "radix_gather32", 6));
+    TF_ASSIGN_OR_RETURN(
+        select_pso_, load(absl::StrCat("radix_sel", b16 ? "16" : "32", "_k", k_rounded_), 6));
+
+    hist_ = executor->Allocate(static_cast<uint64_t>(batch_) * 16384 * 4, 0);
+    thresh_ = executor->Allocate(static_cast<uint64_t>(batch_) * 4, 0);
+    ccount_ = executor->Allocate(static_cast<uint64_t>(batch_) * 2 * 4, 0);
+    cok_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
+    cix_ = executor->Allocate(static_cast<uint64_t>(batch_) * kCap * 4, 0);
+    if (hist_.opaque() == nullptr || thresh_.opaque() == nullptr ||
+        ccount_.opaque() == nullptr || cok_.opaque() == nullptr ||
+        cix_.opaque() == nullptr) {
+      return absl::ResourceExhaustedError("Metal TopK radix: scratch alloc failed.");
+    }
+    // hist + ccount must start zeroed (the histogram does atomic_add; the scan and
+    // select self-clear them after each token, so this is a one-time setup).
+    std::vector<char> zeros(static_cast<size_t>(batch_) * 16384 * 4, 0);
+    TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&hist_, zeros.data(),
+                                                   static_cast<uint64_t>(batch_) * 16384 * 4));
+    TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&ccount_, zeros.data(),
+                                                   static_cast<uint64_t>(batch_) * 2 * 4));
   }
-  // hist + ccount must start zeroed (the histogram does atomic_add; the scan and
-  // select self-clear them after each token, so this is a one-time setup).
-  std::vector<char> zeros(static_cast<size_t>(batch_) * 16384 * 4, 0);
-  TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&hist_, zeros.data(),
-                                                 static_cast<uint64_t>(batch_) * 16384 * 4));
-  TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&ccount_, zeros.data(),
-                                                 static_cast<uint64_t>(batch_) * 2 * 4));
+
+  args_ = executor->Allocate(sizeof(ArgsHost), 0);  // sentinel + n/k/cap (both paths)
+  if (args_.opaque() == nullptr) {
+    return absl::ResourceExhaustedError("Metal TopK: args alloc failed.");
+  }
   ArgsHost a = {static_cast<uint32_t>(n_), static_cast<uint32_t>(k_),
                 static_cast<uint32_t>(kCap), 0};
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&args_, &a, sizeof(a)));
@@ -155,7 +172,7 @@ absl::Status MetalTopKThunk::ExecuteOnStream(const ExecuteParams& params) {
   const BufferAllocations& allocs = *params.buffer_allocations;
 
   absl::MutexLock lock(&mu_);
-  if (executor_ != executor || hist_.opaque() == nullptr) {
+  if (executor_ != executor || args_.opaque() == nullptr) {
     TF_RETURN_IF_ERROR(Ensure(executor));
   }
   const se::DeviceAddressBase data = allocs.GetDeviceAddress(data_);
@@ -163,6 +180,18 @@ absl::Status MetalTopKThunk::ExecuteOnStream(const ExecuteParams& params) {
   const se::DeviceAddressBase outi = allocs.GetDeviceAddress(top_idxs_);
   const int64_t B = batch_;
   const int kGx = 64;  // x-threadgroups for the histogram/gather grid-stride
+
+  // Small-n single-dispatch path: one threadgroup per row, only thread 0 runs the
+  // exact insertion select directly on the input. Byte-identical to radix.
+  if (single_pass_) {
+    se::KernelArgsPackedArray args(4);
+    args.add_argument(data);
+    args.add_argument(args_);
+    args.add_argument(outv);
+    args.add_argument(outi);
+    return single_pass_pso_->Launch(se::ThreadDim(32, 1, 1), se::BlockDim(1, B, 1),
+                                    stream, args);
+  }
 
   // Pass 1: histogram. Grid (kGx, B, 1) x 256 threads.
   {

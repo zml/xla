@@ -89,8 +89,17 @@ class MetalTopKThunk : public Thunk {
   // top-16 tie would clamp the gather — never happens for model logits.)
   static constexpr int64_t kCap = 16384;
 
+  // Small n (MoE router: n = #experts) takes a single-dispatch path: one thread
+  // runs the exact radix insertion-select directly on the input, byte-identical
+  // to the 4-pass radix result but 1 dispatch instead of 4 (decode is dispatch-
+  // count-bound, so this is a real win when a topk fires per layer). Large n
+  // (decode sampling over the full vocab) keeps radix.
+  static constexpr int64_t kSinglePassMaxN = 1024;
+
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
+  bool single_pass_ ABSL_GUARDED_BY(mu_) = false;
+  std::unique_ptr<stream_executor::Kernel> single_pass_pso_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> hist_pso_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> scan_pso_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> gather_pso_ ABSL_GUARDED_BY(mu_);
