@@ -678,8 +678,14 @@ absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
   return absl::OkStatus();
 }
 
+// Env-gated standalone KPROF reporter (defined below; forward-declared so the
+// commit funnels can drive it without the xprof tracer being attached).
+void MetalKprofMaybeStart();
+void MetalKprofReport();
+
 void* CommitBatchCommandBuffer(void* batch_command_buffer) {
   if (batch_command_buffer == nullptr) return nullptr;
+  MetalKprofMaybeStart();  // env-gated: start a profiling session on first use
   @autoreleasepool {
     MPSCommandBuffer* mpscb = Obj<MPSCommandBuffer*>(batch_command_buffer);
     FlushConcurrentEncoder(mpscb.commandBuffer);
@@ -695,6 +701,7 @@ void* CommitBatchCommandBuffer(void* batch_command_buffer) {
     if (MetalProfilingEnabled()) {
       [committed waitUntilCompleted];
       MetalProfilingResolveStep(nullptr);
+      MetalKprofReport();  // env-gated: aggregate + periodic histogram
     }
     return RetainObj(committed);
   }
@@ -708,6 +715,7 @@ void CommitBatchCommandBufferWithCompletion(
     std::move(on_complete)();
     return;
   }
+  MetalKprofMaybeStart();  // env-gated: start a profiling session on first use
   @autoreleasepool {
     MPSCommandBuffer* mpscb = Obj<MPSCommandBuffer*>(batch_command_buffer);
     FlushConcurrentEncoder(mpscb.commandBuffer);
@@ -731,6 +739,7 @@ void CommitBatchCommandBufferWithCompletion(
     if (MetalProfilingEnabled()) {
       [mpscb.commandBuffer waitUntilCompleted];
       MetalProfilingResolveStep(nullptr);
+      MetalKprofReport();  // env-gated: aggregate + periodic histogram
     }
   }
 }
@@ -885,6 +894,71 @@ std::vector<MetalProfileEvent> MetalProfilingDrain() {
 uint64_t MetalProfilingDroppedCount() {
   std::lock_guard<std::mutex> lock(g_prof_mu);
   return g_prof_dropped;
+}
+
+// === Env-gated per-kernel GPU-time reporter (METAL_KPROF=1) =================
+// Lightweight standalone decode profiler (re-adds the removed KPROF tool): with
+// METAL_KPROF set, lazily starts a profiling session and prints, every
+// METAL_KPROF_EVERY commits (default 400 ~= 100 decode tokens), a histogram of
+// GPU time aggregated by kernel name. Profiling forces a per-dispatch encoder
+// plus a per-commit waitUntilCompleted, so it SERIALIZES and slows the run --
+// this is a measurement mode, never the production fast path.
+static bool MetalKprofWanted() {
+  static const bool on = [] {
+    const char* e = std::getenv("METAL_KPROF");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+
+void MetalKprofMaybeStart() {
+  if (!MetalKprofWanted()) return;
+  static std::once_flag once;
+  std::call_once(once, [] { MetalProfilingStart(); });
+}
+
+void MetalKprofReport() {
+  if (!MetalKprofWanted()) return;
+  static const int report_every = [] {
+    const char* e = std::getenv("METAL_KPROF_EVERY");
+    int v = e ? std::atoi(e) : 400;
+    return v > 0 ? v : 400;
+  }();
+  struct Agg {
+    uint64_t ns = 0;
+    uint64_t count = 0;
+  };
+  static std::mutex mu;
+  static std::unordered_map<std::string, Agg> agg;
+  static int commits = 0;
+  static uint64_t total_ns = 0;
+
+  std::vector<MetalProfileEvent> evs = MetalProfilingDrain();
+  std::lock_guard<std::mutex> lock(mu);
+  for (const auto& ev : evs) {
+    std::string key = ev.name;
+    auto pos = key.find(" grid=");
+    if (pos != std::string::npos) key.resize(pos);
+    Agg& a = agg[key];
+    const uint64_t d = ev.end_ns - ev.start_ns;
+    a.ns += d;
+    a.count += 1;
+    total_ns += d;
+  }
+  if (++commits < report_every) return;
+  std::vector<std::pair<std::string, Agg>> rows(agg.begin(), agg.end());
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+  LOG(INFO) << "=== METAL_KPROF: GPU time by kernel over " << commits
+            << " commits (total GPU " << (total_ns / 1.0e6) << " ms) ===";
+  for (const auto& [name, a] : rows) {
+    LOG(INFO) << "  " << (a.ns / 1.0e6) << " ms  "
+              << (total_ns ? 100.0 * a.ns / total_ns : 0.0) << "%  n=" << a.count
+              << "  " << name;
+  }
+  agg.clear();
+  commits = 0;
+  total_ns = 0;
 }
 
 absl::Status WaitUntilCompleted(void* command_buffer) {

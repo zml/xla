@@ -85,6 +85,34 @@ absl::Status MetalStream::WaitFor(Stream* other) {
   return other->BlockHostUntilDone();
 }
 
+// === Env-gated decode batching diagnostics (METAL_KPROF=1) =================
+// Counts, per decode token, how the cross-execute sync resolves: commits and
+// which WaitFor branch each consumer hit. Logged + reset at the token boundary
+// (FlushBatchedWork). Pinpoints why the adaptive-K batch commits collapse to
+// one-per-execute on a given model. Single-host-thread stream model -> plain
+// ints. Zero overhead unless METAL_KPROF is set.
+namespace {
+bool BatchDbgEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("METAL_KPROF");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+struct BatchDbg {
+  int commits = 0;        // command buffers committed this token
+  int re_commit = 0;      // RecordEvent adaptive-K commits
+  int foic_commit = 0;    // FlushOpenBufferIfCarrying (cross-stream) commits
+  int nowait_commit = 0;  // CommitOpenBufferNoWait commits (token-boundary etc.)
+  int w_inbuf = 0;        // WaitFor case1 in-buffer elide
+  int w_signaled = 0;     // WaitFor case2 already-signaled elide
+  int w_covered = 0;      // WaitFor case3 covered-by-earlier (+commit-through)
+  int w_xbuf = 0;         // WaitFor case4 cross-buffer (commit + GPU wait)
+  int w_hostsync = 0;     // WaitFor host Synchronize fallback
+};
+BatchDbg g_bdbg;
+}  // namespace
+
 absl::Status MetalStream::RecordEvent(Event* event) {
   auto* metal_event = dynamic_cast<MetalEvent*>(event);
   if (metal_event == nullptr) {
@@ -119,6 +147,7 @@ absl::Status MetalStream::RecordEvent(Event* event) {
       pending_signal_high_ = 0;
       signals_since_commit_ = 0;
       waited_value_high_ = 0;
+      if (BatchDbgEnabled()) { ++g_bdbg.commits; ++g_bdbg.re_commit; }
     }
   } else {
     // No open command buffer: the batch already committed at an adaptive-K /
@@ -152,6 +181,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     if (metal_event->shared_event() == executor_->shared_event() &&
         command_buffer_ != nullptr && value > last_signaled_value_ &&
         value <= pending_signal_high_) {
+      if (BatchDbgEnabled()) ++g_bdbg.w_inbuf;
       return absl::OkStatus();
     }
     // ALREADY-SIGNALED fast path: if the GPU has ALREADY crossed `value`
@@ -170,6 +200,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     // 49.5 -> 62 tok/s at batch 1).
     if (metal_event->shared_event() == executor_->shared_event() &&
         metal::SharedEventSignaledValue(metal_event->shared_event()) >= value) {
+      if (BatchDbgEnabled()) ++g_bdbg.w_signaled;
       return absl::OkStatus();
     }
     // COVERED-BY-EARLIER-WAIT fast path: the open buffer already carries a
@@ -181,9 +212,11 @@ absl::Status MetalStream::WaitFor(Event* event) {
     // orders against signals that actually get committed.
     if (metal_event->shared_event() == executor_->shared_event() &&
         command_buffer_ != nullptr && value <= waited_value_high_) {
+      if (BatchDbgEnabled()) ++g_bdbg.w_covered;
       executor_->CommitOpenBufferThrough(value);
       return absl::OkStatus();
     }
+    if (BatchDbgEnabled()) ++g_bdbg.w_xbuf;
     // GPU-side wait across buffers: encode a wait for the producer's signal at
     // the START of this stream's open buffer; the kernels encoded next won't run
     // until the producer's buffer signals — NO host block, so executes pipeline.
@@ -201,6 +234,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     return absl::OkStatus();
   }
   // No GPU signal associated (empty producer, or a non-Metal event) — host sync.
+  if (BatchDbgEnabled()) ++g_bdbg.w_hostsync;
   return event->Synchronize();
 }
 
@@ -391,6 +425,20 @@ absl::Status MetalStream::FlushBatchedWork() {
   // clamp to [1, commit_every_ ceiling]. Done unconditionally (before the
   // open-buffer check) — the boundary stands even if the tail already committed.
   // ONLY here: a cross-stream FlushOpenBufferIfCarrying is not a token boundary.
+  if (BatchDbgEnabled()) {
+    static int tok = 0;
+    if ((tok++ % 32) == 0) {
+      LOG(INFO) << "METAL_KPROF batch/token: executes=" << executes_this_token_
+                << " adaptive_k=" << adaptive_k_ << " commits=" << g_bdbg.commits
+                << " (re=" << g_bdbg.re_commit << " foic=" << g_bdbg.foic_commit
+                << " nowait=" << g_bdbg.nowait_commit << ")"
+                << " | WaitFor inbuf=" << g_bdbg.w_inbuf
+                << " signaled=" << g_bdbg.w_signaled
+                << " covered=" << g_bdbg.w_covered << " xbuf=" << g_bdbg.w_xbuf
+                << " hostsync=" << g_bdbg.w_hostsync;
+    }
+    g_bdbg = BatchDbg{};
+  }
   if (executes_this_token_ > 0) {
     const int t = target_commits_per_token_;
     int k = (executes_this_token_ + t / 2) / t;  // round(executes / target)
@@ -428,6 +476,7 @@ void MetalStream::CommitOpenBufferNoWait() {
   signals_since_commit_ = 0;
   waited_value_high_ = 0;
   if (committed != nullptr) ReleaseObject(committed);
+  if (BatchDbgEnabled()) { ++g_bdbg.commits; ++g_bdbg.nowait_commit; }
 }
 
 void MetalStream::FlushOpenBufferIfCarrying(uint64_t value) {
@@ -449,6 +498,7 @@ void MetalStream::FlushOpenBufferIfCarrying(uint64_t value) {
   pending_signal_high_ = 0;
   signals_since_commit_ = 0;  // match FlushBatchedWork: keep cadence accounting consistent.
   waited_value_high_ = 0;
+  if (BatchDbgEnabled()) { ++g_bdbg.commits; ++g_bdbg.foic_commit; }
 }
 
 absl::Status MetalStream::LaunchKernel(
