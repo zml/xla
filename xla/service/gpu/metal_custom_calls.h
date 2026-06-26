@@ -86,6 +86,18 @@ inline bool IsMetalMoeGemm(const HloInstruction& hlo) {
          hlo.custom_call_target() == kMetalMoeGemmF8CallTarget;
 }
 
+// The bf16/f16 (un-quantized) sibling of the grouped MoE GEMV above: same
+// grouped per-row-against-its-expert matmul and same MetalMoeGemvThunk, but the
+// weights are bf16/f16 with no block scales. The call carries
+//   {x_rows[R,K] bf16, w[E,N,K] bf16, expert_id[R] s32} -> out[R,N] bf16
+// (no scale operand). Used by the LFM2 MoE path, which has no fp8 weights.
+inline constexpr absl::string_view kMetalMoeGemmCallTarget = "__metal$moe_gemm";
+
+inline bool IsMetalMoeGemmBf16(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kMetalMoeGemmCallTarget;
+}
+
 }  // namespace gpu
 }  // namespace xla
 

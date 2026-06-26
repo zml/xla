@@ -1277,15 +1277,19 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     const HloCustomCallInstruction* instr) {
-  if (instr->operand_count() != 4) {
-    return absl::InvalidArgumentError(
-        "metal MoE block-scaled fp8 GEMV expects 4 operands "
-        "(x, w, scale, expert_id).");
+  // Two flavors share one thunk: the fp8 block-scaled call carries a scale
+  // operand (x, w_f8, scale, expert_id); the bf16 call drops it (x, w, expert_id).
+  const bool is_fp8 =
+      instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
+  const int64_t expected_operands = is_fp8 ? 4 : 3;
+  if (instr->operand_count() != expected_operands) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metal MoE GEMV expects ", expected_operands, " operands."));
   }
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
-  const Shape& scale_shape = instr->operand(2)->shape();
-  const Shape& expert_id_shape = instr->operand(3)->shape();
+  const int expert_id_idx = is_fp8 ? 3 : 2;
+  const Shape& expert_id_shape = instr->operand(expert_id_idx)->shape();
 
   // Single output [R, N] bf16 (tolerate a 1-tuple too).
   const bool is_tuple = instr->shape().IsTuple();
@@ -1293,11 +1297,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
       is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
 
   if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 3 ||
-      scale_shape.dimensions().size() != 3 ||
       expert_id_shape.dimensions().size() != 1 ||
       out_shape.dimensions().size() != 2) {
     return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: unexpected operand ranks.");
+        "metal MoE GEMV: unexpected operand ranks.");
   }
 
   const int64_t r = x_shape.dimensions(0);
@@ -1307,45 +1310,54 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
 
   if (r == 0 || k == 0 || n == 0 || e == 0) {
     return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: invalid dimension (must be > 0).");
+        "metal MoE GEMV: invalid dimension (must be > 0).");
   }
   if (w_shape.dimensions(2) != k || out_shape.dimensions(0) != r ||
       out_shape.dimensions(1) != n || expert_id_shape.dimensions(0) != r) {
     return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: inconsistent x/w/expert_id/out "
-        "shapes.");
+        "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
   }
   if (k % 128 != 0 || n % 128 != 0) {
     return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: N and K must be multiples of the 128 "
-        "block size.");
+        "metal MoE GEMV: N and K must be multiples of the 128 block size.");
   }
-  if (scale_shape.dimensions(0) != e || scale_shape.dimensions(1) != n / 128 ||
-      scale_shape.dimensions(2) != k / 128) {
-    return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: scale must be [E, N/128, K/128].");
-  }
-  if (w_shape.element_type() != F8E4M3FN) {
-    return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: w must be f8e4m3fn.");
+  const PrimitiveType expected_w = is_fp8 ? F8E4M3FN : BF16;
+  if (w_shape.element_type() != expected_w) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metal MoE GEMV: w must be ",
+        is_fp8 ? "f8e4m3fn" : "bf16", "."));
   }
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: x and out must be bf16.");
+        "metal MoE GEMV: x and out must be bf16.");
   }
   if (expert_id_shape.element_type() != S32) {
-    return absl::UnimplementedError(
-        "metal MoE block-scaled fp8 GEMV: expert_id must be s32.");
+    return absl::UnimplementedError("metal MoE GEMV: expert_id must be s32.");
+  }
+
+  // The scale operand is fp8-only; bf16 passes empty slice/shape.
+  BufferAllocation::Slice scale;
+  Shape scale_shape;
+  if (is_fp8) {
+    scale_shape = instr->operand(2)->shape();
+    if (scale_shape.dimensions().size() != 3 ||
+        scale_shape.dimensions(0) != e ||
+        scale_shape.dimensions(1) != n / 128 ||
+        scale_shape.dimensions(2) != k / 128) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: scale must be [E, N/128, K/128].");
+    }
+    TF_ASSIGN_OR_RETURN(scale,
+                        GetAllocationSliceForHlo(instr->operand(2), {}));
   }
 
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
                       GetAllocationSliceForHlo(instr->operand(0), {}));
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
                       GetAllocationSliceForHlo(instr->operand(1), {}));
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scale,
-                      GetAllocationSliceForHlo(instr->operand(2), {}));
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice expert_id,
-                      GetAllocationSliceForHlo(instr->operand(3), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice expert_id,
+      GetAllocationSliceForHlo(instr->operand(expert_id_idx), {}));
   TF_ASSIGN_OR_RETURN(
       BufferAllocation::Slice out,
       GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
@@ -3653,7 +3665,7 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   // Model-emitted grouped block-scaled FP8 GEMV for MoE experts: the model does
   // top-k routing and emits __metal$moe_gemm$f8 with {x_rows, w[E,N,K]_f8,
   // scale, expert_id}; route it to the grouped FP8 GEMV kernel.
-  if (IsMetalMoeGemm(*hlo)) {
+  if (IsMetalMoeGemm(*hlo) || IsMetalMoeGemmBf16(*hlo)) {
     return EmitMoeGemvThunk(custom_call);
   }
   // Apple Metal has no cuBLAS/cuBLAS-LT. GemmRewriter emits an honest

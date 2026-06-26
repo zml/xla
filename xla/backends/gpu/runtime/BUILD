@@ -5559,6 +5559,7 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/service/gpu:buffer_allocations",
         "//xla/service/gpu:metal_air_toolchain",
+        "//xla/service/gpu/metal_kernels:bf16_moe_gemv",
         "//xla/service/gpu/metal_kernels:fp8_moe_gemv",
         "//xla/service/gpu/metal_kernels:metalblas_shaders",
         "//xla/service/gpu/metal_kernels:moe_argsort",

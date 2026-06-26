@@ -25,6 +25,7 @@ limitations under the License.
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
+#include "xla/service/gpu/metal_kernels/bf16_moe_gemv.h"
 #include "xla/service/gpu/metal_kernels/fp8_moe_gemv.h"
 #include "xla/service/gpu/metal_kernels/metalblas_shaders.h"
 #include "xla/service/gpu/metal_kernels/moe_argsort.h"
@@ -70,24 +71,35 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (kernel_ != nullptr) return absl::OkStatus();
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
   using FC = se::metal::MetalFunctionConstant;
+  const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
 
   // Large R (prefill) routes many rows to each expert, so it pays to sort the
   // rows by expert and use the weight-reuse MLX gather q-GEMM; small R (decode,
   // ~0.5 rows/expert) has no reuse, so the per-row x-caching GEMV is better.
   sorted_path_ = (r_ >= kSortedMinR);
+  if (!is_fp8 && sorted_path_) {
+    return absl::UnimplementedError(
+        "__metal$moe_gemm: the bf16 sorted (prefill, R>=1024) gather GEMM is "
+        "not yet wired; only the per-row GEMV (R<1024) is supported.");
+  }
 
-  // fp8_moe_gemv (decode / small-R path): 6 buffer args (x, w, scale,
-  // expert_id, out) + the packed `constant int4& dims`.
-  {
+  // Decode / small-R path: per-row x-caching GEMV. fp8 takes 6 buffer args
+  // (x, w, scale, expert_id, out) + dims; bf16 takes 5 (no scale).
+  if (is_fp8) {
     TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
                         CompileMetalSourceToMetallibCached(get_fp8_moe_gemv()));
     TF_ASSIGN_OR_RETURN(kernel_, metal_exec->LoadKernelWithConstants(
                                      lib, "fp8_moe_gemv", /*arity=*/6, {}));
+  } else {
+    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
+                        CompileMetalSourceToMetallibCached(get_bf16_moe_gemv()));
+    TF_ASSIGN_OR_RETURN(kernel_, metal_exec->LoadKernelWithConstants(
+                                     lib, "bf16_moe_gemv", /*arity=*/5, {}));
   }
-  // MLX Steel gather q-GEMM (x, w, scale, indices, out, mnk). align_M=false ->
-  // the safe partial-row path (R = tokens*top_k is arbitrary); align_N/K=true
-  // since N,K are multiples of 128 (>= BN=BK=32). Fed expert-sorted rows.
-  {
+  // MLX Steel gather q-GEMM (x, w, scale, indices, out, mnk) for the sorted
+  // (prefill) path. Only the fp8 variant is wired today; bf16 decode (R<1024)
+  // never reaches the sorted path, so skip the compile.
+  if (is_fp8) {
     const FC fc[] = {{200, FC::Kind::kBool, 0},
                      {201, FC::Kind::kBool, 1},
                      {202, FC::Kind::kBool, 1}};
@@ -261,14 +273,17 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   // decode LUT + barriers + short-K reduction). At MoE decode density
   // (~0.5 rows/expert) there is no cross-row weight reuse to exploit, so the
   // sorted gather is not worth its sort+scatter overhead here.
-  se::KernelArgsPackedArray args(/*num_args=*/6);
-  args.add_argument(allocs.GetDeviceAddress(x_));          // 0  x
-  args.add_argument(allocs.GetDeviceAddress(w_));          // 1  w (f8, [E,N,K])
-  args.add_argument(allocs.GetDeviceAddress(scale_));      // 2  scale
-  args.add_argument(allocs.GetDeviceAddress(expert_id_));  // 3  expert_id
-  args.add_argument(allocs.GetDeviceAddress(out_));        // 4  out
-  constexpr int64_t kMoeGemvTN = 8;  // must match fp8_moe_gemv.metal TN
-  args.add_argument(p_dims_);        // 5  dims (int4)
+  const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
+  constexpr int64_t kMoeGemvTN = 8;  // must match {fp8,bf16}_moe_gemv.metal TN
+  se::KernelArgsPackedArray args(/*num_args=*/is_fp8 ? 6 : 5);
+  args.add_argument(allocs.GetDeviceAddress(x_));  // 0  x
+  args.add_argument(allocs.GetDeviceAddress(w_));  // 1  w ([E,N,K])
+  if (is_fp8) {
+    args.add_argument(allocs.GetDeviceAddress(scale_));  // 2  scale (fp8 only)
+  }
+  args.add_argument(allocs.GetDeviceAddress(expert_id_));  // expert_id
+  args.add_argument(allocs.GetDeviceAddress(out_));        // out
+  args.add_argument(p_dims_);                              // dims (int4)
   return kernel_->Launch(
       se::ThreadDim(256, 1, 1),
       se::BlockDim(static_cast<uint64_t>((n_ + kMoeGemvTN - 1) / kMoeGemvTN),
@@ -277,13 +292,16 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
 }
 
 Thunk::BufferUses MetalMoeGemvThunk::buffer_uses() const {
-  return {
+  Thunk::BufferUses uses = {
       BufferUse::Read(x_, x_shape_),
       BufferUse::Read(w_, w_shape_),
-      BufferUse::Read(scale_, scale_shape_),
-      BufferUse::Read(expert_id_, expert_id_shape_),
-      BufferUse::Write(out_, out_shape_),
   };
+  if (w_shape_.element_type() == F8E4M3FN) {
+    uses.push_back(BufferUse::Read(scale_, scale_shape_));  // fp8 only
+  }
+  uses.push_back(BufferUse::Read(expert_id_, expert_id_shape_));
+  uses.push_back(BufferUse::Write(out_, out_shape_));
+  return uses;
 }
 
 absl::StatusOr<ThunkProto> MetalMoeGemvThunk::ToProto() const {

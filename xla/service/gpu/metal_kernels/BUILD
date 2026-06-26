@@ -126,6 +126,15 @@ embed_files(
     cpp_namespace = "xla::gpu",
 )
 
+# --- bf16 (un-quantized) twin of fp8_moe_gemv for fp8-free MoE (e.g. LFM2) -----
+# Generates get_bf16_moe_gemv(). Same grouped per-expert GEMV, bf16 weights, no
+# block scales.
+embed_files(
+    name = "bf16_moe_gemv",
+    srcs = ["custom/bf16_moe_gemv.metal"],
+    cpp_namespace = "xla::gpu",
+)
+
 # --- Custom counting-sort (group routed rows by expert) for sorted MoE prefill -
 # Generates get_moe_argsort(). Single-threadgroup counting sort that groups the
 # R routed rows by expert id so the MLX gather q-GEMM's per-tile run-walk reuses
