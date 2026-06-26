@@ -252,8 +252,17 @@ std::optional<int64_t> TopkRewriter::SortIsInTopK(HloInstruction* inst) {
   for (HloInstruction* user : sort->users()) {
     const HloInstruction* slice = user;
     if (sort->operand_count() == 2) {
-      if (user->opcode() != HloOpcode::kGetTupleElement ||
-          user->user_count() != 1) {
+      if (user->opcode() != HloOpcode::kGetTupleElement) {
+        supported = false;
+        break;
+      }
+      // A sort output with no consumers (e.g. a top-k that only uses the
+      // indices, like an MoE router that gathers scores separately) shouldn't
+      // block the rewrite.
+      if (user->user_count() == 0) {
+        continue;
+      }
+      if (user->user_count() != 1) {
         supported = false;
         break;
       }

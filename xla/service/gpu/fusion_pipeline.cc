@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/service/cpu_gpu_shape_verifier.h"
 #include "xla/service/gpu/alias_info.h"
+#include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_cse.h"
@@ -52,8 +53,14 @@ HloPassPipeline FusionPipeline(
     mlir::MLIRContext* mlir_context) {
   HloPassPipeline fusion("fusion");
   // We try to split variadic ops with many parameters into several such ops
-  // to avoid exceeding the parameter space.
-  fusion.AddPass<VariadicOpSplitter>();
+  // to avoid exceeding the parameter space. Metal's buffer argument table holds
+  // only 31 slots, so cap concatenate fan-in to the per-fusion buffer budget
+  // there (one slot reserved for the output buffer) instead of the generic 128.
+  int64_t max_concat_operands = 128;
+  if (gpu_device_info.gpu_compute_capability().IsMetal()) {
+    max_concat_operands = MaxOperandsAndOutputsPerFusion(gpu_device_info) - 1;
+  }
+  fusion.AddPass<VariadicOpSplitter>(max_concat_operands);
   HloVerifierOpts opts =
       HloVerifierOpts().MakeLayoutSensitive().WithInstructionCanChangeLayout(
           LayoutAssignment::InstructionCanChangeLayout);

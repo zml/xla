@@ -1677,6 +1677,7 @@ cc_library(
         "//xla/backends/gpu/transforms:ragged_dot_fusion_rewriter",
         "//xla/backends/gpu/transforms:sort_iota_fusion",
         "//xla/backends/gpu/transforms:variadic_op_splitter",
+        ":gpu_fusible",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/hlo/pass:hlo_pass_pipeline",

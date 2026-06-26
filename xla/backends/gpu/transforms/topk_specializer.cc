@@ -101,6 +101,11 @@ absl::StatusOr<HloInstruction*> SmallBufferOptimization(
     // bit_ceil(k) in {1,2,4,8,16,32,64}, so it handles k up to 64 (the shared
     // CustomCall TopK path used by other backends is still capped at 16).
     max_k = 64;
+    // The radix-select kernel handles small inputs too, so drop the 1024-element
+    // floor the shared CustomCall path needs. Without this, a small top-k such as
+    // an MoE router selecting a few experts (e.g. n=32, k=4) falls back to a
+    // generic sort, which the Metal sort emitter can't lower to valid AIR.
+    min_n = 1;
   }
 
   if (k > max_k) {

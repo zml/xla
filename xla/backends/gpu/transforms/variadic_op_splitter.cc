@@ -36,14 +36,10 @@ namespace xla {
 namespace gpu {
 
 namespace {
-// The parameter space on the GPU device is limited. We pick an arbitrary low
-// constant here to try to prevent exceeding this parameter space. For a proper
-// fix, we would have to take into account which parameters share a buffer, and
-// how big these buffers are.
-constexpr int32_t kMaxParameters = 128;
 
 absl::StatusOr<bool> SplitConcatenate(HloInstruction* concat,
-                                      HloComputation* comp) {
+                                      HloComputation* comp,
+                                      int64_t max_parameters) {
   auto operands = concat->operands();
   std::vector<HloInstruction*> operands_to_split(operands.begin(),
                                                  operands.end());
@@ -51,14 +47,14 @@ absl::StatusOr<bool> SplitConcatenate(HloInstruction* concat,
     std::vector<HloInstruction*> new_operands;
     absl::Span<HloInstruction*> operands_span(operands_to_split);
     for (int64_t offset = 0; offset < operands_to_split.size();
-         offset += kMaxParameters) {
+         offset += max_parameters) {
       // Check if there is a remainder of operands that does not completely fill
-      // one "batch" of exactly 'kMaxParameters' operands. If there are only
-      // less than 'kMaxParameters' operands left, then we still put them into a
+      // one "batch" of exactly 'max_parameters' operands. If there are only
+      // less than 'max_parameters' operands left, then we still put them into a
       // concat together. Otherwise, we spare them for another round so that
       // they can be put together into a concat with some of the newly created
       // concats.
-      if (offset > 0 && offset + kMaxParameters > operands_to_split.size()) {
+      if (offset > 0 && offset + max_parameters > operands_to_split.size()) {
         new_operands.insert(new_operands.end(),
                             operands_to_split.begin() + offset,
                             operands_to_split.end());
@@ -66,7 +62,7 @@ absl::StatusOr<bool> SplitConcatenate(HloInstruction* concat,
         Shape new_shape = concat->shape();
         int64_t concat_dimension_size = 0;
         for (int64_t i = 0;
-             i < kMaxParameters && offset + i < operands_to_split.size(); ++i) {
+             i < max_parameters && offset + i < operands_to_split.size(); ++i) {
           concat_dimension_size +=
               operands_to_split[i + offset]->shape().dimensions(
                   concat->concatenate_dimension());
@@ -74,7 +70,7 @@ absl::StatusOr<bool> SplitConcatenate(HloInstruction* concat,
         new_shape.set_dimensions(concat->concatenate_dimension(),
                                  concat_dimension_size);
         auto new_concat = comp->AddInstruction(concat->CloneWithNewOperands(
-            new_shape, operands_span.subspan(offset, kMaxParameters)));
+            new_shape, operands_span.subspan(offset, max_parameters)));
         new_operands.push_back(new_concat);
       }
     }
@@ -84,11 +80,12 @@ absl::StatusOr<bool> SplitConcatenate(HloInstruction* concat,
   return true;
 }
 
-std::vector<HloInstruction*> GetRelevantVariadicOps(HloComputation* comp) {
+std::vector<HloInstruction*> GetRelevantVariadicOps(HloComputation* comp,
+                                                    int64_t max_parameters) {
   std::vector<HloInstruction*> ops;
   for (HloInstruction* instr : comp->instructions()) {
     if (HloPredicateIsOp<HloOpcode::kConcatenate>(instr) &&
-        instr->operand_count() > kMaxParameters) {
+        instr->operand_count() > max_parameters) {
       ops.push_back(instr);
     }
   }
@@ -103,9 +100,9 @@ absl::StatusOr<bool> VariadicOpSplitter::RunImpl(
   bool changed = false;
   for (HloComputation* comp :
        module->MakeNonfusionComputations(execution_threads)) {
-    for (HloInstruction* op : GetRelevantVariadicOps(comp)) {
+    for (HloInstruction* op : GetRelevantVariadicOps(comp, max_parameters_)) {
       // TODO(b/112613927): Handle also other ops than concatenate.
-      ASSIGN_OR_RETURN(bool result, SplitConcatenate(op, comp));
+      ASSIGN_OR_RETURN(bool result, SplitConcatenate(op, comp, max_parameters_));
       changed |= result;
     }
   }
