@@ -936,6 +936,7 @@ void MetalKprofReport() {
   };
   static std::mutex mu;
   static std::unordered_map<std::string, Agg> agg;
+  static std::vector<std::pair<uint64_t, uint64_t>> intervals;  // (start,end) ns
   static int commits = 0;
   static uint64_t total_ns = 0;
 
@@ -950,8 +951,34 @@ void MetalKprofReport() {
     a.ns += d;
     a.count += 1;
     total_ns += d;
+    intervals.push_back({ev.start_ns, ev.end_ns});  // for the timeline analysis
   }
   if (++commits < report_every) return;
+  // Timeline analysis: merge the dispatch [start,end] intervals to get the GPU
+  // BUSY-union (wall time the GPU is doing >=1 thing) vs the total SPAN and the
+  // sum of durations. concurrency = sum_dur/busy tells serial(~1) vs overlapped;
+  // busy/span tells how much of the window the GPU is actually working. The
+  // critical path is bounded below by busy-union, so that is the real target.
+  double span_ms = 0, busy_ms = 0, concurrency = 0;
+  if (!intervals.empty()) {
+    std::sort(intervals.begin(), intervals.end());
+    uint64_t min_s = intervals.front().first, max_e = 0, busy = 0;
+    uint64_t cur_s = intervals.front().first, cur_e = intervals.front().second;
+    for (const auto& iv : intervals) {
+      max_e = std::max(max_e, iv.second);
+      if (iv.first <= cur_e) {
+        cur_e = std::max(cur_e, iv.second);
+      } else {
+        busy += cur_e - cur_s;
+        cur_s = iv.first;
+        cur_e = iv.second;
+      }
+    }
+    busy += cur_e - cur_s;
+    span_ms = (max_e - min_s) / 1.0e6;
+    busy_ms = busy / 1.0e6;
+    concurrency = busy ? static_cast<double>(total_ns) / busy : 0.0;
+  }
   std::vector<std::pair<std::string, Agg>> rows(agg.begin(), agg.end());
   std::sort(rows.begin(), rows.end(),
             [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
@@ -961,12 +988,18 @@ void MetalKprofReport() {
             << " commits (total GPU " << (total_ns / 1.0e6) << " ms, "
             << total_count << " dispatches, " << MetalProfilingDroppedCount()
             << " dropped) ===";
+  LOG(INFO) << "  TIMELINE: span=" << span_ms << " ms  busy-union=" << busy_ms
+            << " ms (" << (span_ms ? 100.0 * busy_ms / span_ms : 0.0)
+            << "% of span)  sum_dur=" << (total_ns / 1.0e6)
+            << " ms  concurrency=" << concurrency
+            << "x (1.0=fully serial; >1=overlap). critical path >= busy-union.";
   for (const auto& [name, a] : rows) {
     LOG(INFO) << "  " << (a.ns / 1.0e6) << " ms  "
               << (total_ns ? 100.0 * a.ns / total_ns : 0.0) << "%  n=" << a.count
               << "  " << name;
   }
   agg.clear();
+  intervals.clear();
   commits = 0;
   total_ns = 0;
 }
