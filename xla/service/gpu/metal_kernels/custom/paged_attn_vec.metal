@@ -16,6 +16,7 @@ typedef struct {
     int32_t max_blocks;  // block-table row stride (entries per sequence)
     int32_t num_seqs;    // cu_seqlens_q has num_seqs+1 entries
     float   scale;
+    int32_t sliding_window;  // sliding-window size; < 0 = global (full causal)
 } fa_vec_paged_args;
 
 constant int32_t FC_nsg [[function_constant(450)]];  // simdgroups (KV split)
@@ -30,7 +31,12 @@ typedef float   s_t;
 typedef float4  s4_t;
 typedef float4  o4_t;
 
-kernel void fa_vec_paged(
+// Templated on the head dims so the same verified body specializes at
+// DK=DV=128 (Llama-shaped) and the large Gemma dims 256/512. Everything scales
+// off DK/DV (DK4=DK/4, PK=PAD2(DK,128), the o4_t lo[DV4/NL] register tile, and
+// the shmem layout) — only these two were constants. Kernel entry points below.
+template <short DK, short DV>
+static void fa_vec_paged_impl(
         constant fa_vec_paged_args & args,
         device const char * q,
         device const char * k_cache,
@@ -39,12 +45,10 @@ kernel void fa_vec_paged(
         device const int  * seq_lens,
         device const int  * cu_seqlens_q,
         device       char * dst,
-        threadgroup  half * shmem_f16 [[threadgroup(0)]],
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    constexpr short DK  = 128;
-    constexpr short DV  = 128;
+        threadgroup  half * shmem_f16,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
     constexpr short NE  = 1;
     constexpr short C   = 32;
 
@@ -87,6 +91,12 @@ kernel void fa_vec_paged(
     // Causal: this row sees its prefix-context plus the chunk rows up to itself
     // (context_len = kv_total - query_len, same semantics as the tiled kernel).
     const int kv_len     = kv_total - query_len + q_pos + 1;
+    // Sliding window: this row attends only [kv_lo, kv_len). Matches the tiled
+    // kernel's `kv_pos < q_abs_pos+1-window` mask (q_abs_pos = kv_len-1 here).
+    // Global layers pass sliding_window < 0 -> kv_lo = 0 (full causal prefix).
+    const int kv_lo      = (args.sliding_window < 0)
+                               ? 0
+                               : max(0, kv_len - args.sliding_window);
 
     device const int * pt = block_tables + (uint64_t)seq_idx*(uint)args.max_blocks;
 
@@ -142,14 +152,20 @@ kernel void fa_vec_paged(
         const short tx = tiisg%NL;
         const short ty = tiisg/NL;
 
-        for (int ic0 = sgitg; ; ic0 += NSG) {
+        // Start at the first KV tile that overlaps the window [kv_lo, kv_len);
+        // tiles fully below kv_lo are skipped (the sliding-window win at long
+        // context). Global layers have kv_lo=0 -> ic0 starts at sgitg as before.
+        const int ic0_lo = kv_lo / C;
+        for (int ic0 = ic0_lo + sgitg; ; ic0 += NSG) {
             const int ic = ic0*C;
             if (ic >= kv_len) {
                 break;
             }
 
-            // mask the (possibly partial) last block
-            sm[tiisg] = (ic + tiisg < kv_len) ? (half) 0.0h : (half) (-MAXHALF);
+            // mask positions outside the window [kv_lo, kv_len) (causal upper +
+            // sliding lower bound)
+            sm[tiisg] = (ic + tiisg < kv_len && ic + tiisg >= kv_lo)
+                            ? (half) 0.0h : (half) (-MAXHALF);
 
             // Q*K^T  (PAGED: per-position pointer through the block table; the
             // tail clamp keeps masked lanes on a valid page)
@@ -279,3 +295,28 @@ kernel void fa_vec_paged(
 #undef BS
 #undef PS
 }
+
+// Kernel entry points (same implicit buffer order as the original single kernel,
+// so the thunk binds args=0, q=1, k=2, v=3, block_tables=4, seq_lens=5,
+// cu_seqlens_q=6, dst=7, shmem=threadgroup(0)). Pick by head_dim in the thunk.
+#define FA_VEC_PAGED_KERNEL(NAME, DK_, DV_)                                      \
+kernel void NAME(                                                               \
+        constant fa_vec_paged_args & args,                                     \
+        device const char * q,                                                 \
+        device const char * k_cache,                                           \
+        device const char * v_cache,                                           \
+        device const int  * block_tables,                                      \
+        device const int  * seq_lens,                                          \
+        device const int  * cu_seqlens_q,                                      \
+        device       char * dst,                                               \
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],                      \
+        uint3   tgpig[[threadgroup_position_in_grid]],                         \
+        ushort  tiisg[[thread_index_in_simdgroup]],                            \
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {                     \
+    fa_vec_paged_impl<DK_, DV_>(args, q, k_cache, v_cache, block_tables,        \
+                                seq_lens, cu_seqlens_q, dst, shmem_f16,         \
+                                tgpig, tiisg, sgitg);                          \
+}
+FA_VEC_PAGED_KERNEL(fa_vec_paged,       128, 128)  // backward-compatible name
+FA_VEC_PAGED_KERNEL(fa_vec_paged_hd256, 256, 256)  // Gemma sliding layers
+FA_VEC_PAGED_KERNEL(fa_vec_paged_hd512, 512, 512)  // Gemma global layers

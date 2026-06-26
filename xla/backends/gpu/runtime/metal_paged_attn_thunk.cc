@@ -101,6 +101,7 @@ struct FaVecPagedKArgs {
   int32_t max_blocks;
   int32_t num_seqs;
   float scale;
+  int32_t sliding_window;  // < 0 = global (full causal)
 };
 
 absl::StatusOr<const char*> DtypeName(PrimitiveType t) {
@@ -186,17 +187,21 @@ void MetalPagedAttnThunk::Prewarm(se::StreamExecutor* executor,
       }
     }
   }
-  // Decode vector kernel (when it qualifies): warm ALL THREE nsg variants.
-  if (head_dim == 128 && dtype == BF16) {
+  // Decode vector kernel (when it qualifies): warm ALL THREE nsg variants for
+  // the head_dim's specialization (hd128 / Gemma hd256 / Gemma hd512).
+  if ((head_dim == 128 || head_dim == 256 || head_dim == 512) && dtype == BF16) {
     auto vec_lib = CompileMetalSourceToMetallibCached(get_paged_attn_vec());
     if (vec_lib.ok()) {
       using FC = se::metal::MetalFunctionConstant;
+      const char* vec_name = head_dim == 512   ? "fa_vec_paged_hd512"
+                             : head_dim == 256 ? "fa_vec_paged_hd256"
+                                               : "fa_vec_paged";
       for (int nsg : kVecNsgVals) {
         const FC fc[] = {{450, FC::Kind::kInt, nsg},
                          {451, FC::Kind::kInt, block_size},
                          {452, FC::Kind::kInt, num_kv_heads * head_dim}};
         metal_exec
-            ->LoadKernelWithConstants(*vec_lib, "fa_vec_paged", /*arity=*/8, fc)
+            ->LoadKernelWithConstants(*vec_lib, vec_name, /*arity=*/8, fc)
             .IgnoreError();
       }
     }
@@ -290,9 +295,14 @@ absl::Status MetalPagedAttnThunk::EnsureVecVariant(
   const FC fc[] = {{450, FC::Kind::kInt, nsg},
                    {451, FC::Kind::kInt, block_size_},
                    {452, FC::Kind::kInt, num_kv_heads_ * head_dim_}};
+  // The vec kernel is specialized per head_dim (DK=DV template); Gemma's global
+  // layers are hd512, its sliding layers hd256, everything else hd128.
+  const char* vec_name = head_dim_ == 512   ? "fa_vec_paged_hd512"
+                         : head_dim_ == 256 ? "fa_vec_paged_hd256"
+                                            : "fa_vec_paged";
   TF_ASSIGN_OR_RETURN(vec_kernel_by_nsg_[idx],
                       metal_exec->LoadKernelWithConstants(
-                          vec_lib_, "fa_vec_paged", /*arity=*/8, fc));
+                          vec_lib_, vec_name, /*arity=*/8, fc));
   vec_smem_by_nsg_[idx] = PagedFaVecSmem(head_dim_, nsg);
   return absl::OkStatus();
 }
@@ -312,6 +322,7 @@ absl::Status MetalPagedAttnThunk::EnsureVecDecode(
   a.max_blocks = static_cast<int32_t>(max_num_blocks_per_seq_);
   a.num_seqs = static_cast<int32_t>(num_seqs_);
   a.scale = scale_;
+  a.sliding_window = static_cast<int32_t>(sliding_window_);
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_vec_args_, &a, sizeof(a)));
   return absl::OkStatus();
 }
@@ -336,14 +347,17 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
     // vector kernel is bf16/hd128-specialized and applies scale but NOT
     // softcapping / sliding-window masking; anything else stays on the tiled
     // kernel, which handles all of them correctly, just slower.
-    // TODO: extend fa_vec_paged with sliding-window masking (Mistral/Gemma
-    // decode) and an hd=256 variant (Gemma-shaped decode).
-    // The vector kernel encodes causality in its KV-loop bound (kv_len =
-    // kv_total - query_len + q_pos + 1) and has no bidirectional path, so a
-    // non-causal thunk always uses the tiled kernel (which honors IS_CAUSAL).
+    // The vec kernel is now specialized at hd 128/256/512 (DK=DV template) AND
+    // masks the sliding window ([kv_lo, kv_len) with kv_lo = kv_len - window),
+    // so BOTH Gemma's GLOBAL layers (hd512, sliding_window<0) and its SLIDING
+    // layers (hd256, sliding_window>=0) get the fast KV-split decode instead of
+    // the tiled kernel's 1-2 simdgroup serial scan. Softcapping is still
+    // tiled-only (the vec kernel applies scale but not softcap), so Gemma (no
+    // attn softcap) qualifies. The vector kernel encodes causality in its KV-loop
+    // bound and has no bidirectional path, so a non-causal thunk stays on tiled.
     use_vec_decode_ = is_causal_ && total_q_tokens_ == num_seqs_ &&
-                      head_dim_ == 128 && element_type_ == BF16 &&
-                      softcapping_ == 0.0f && sliding_window_ < 0;
+                      (head_dim_ == 128 || head_dim_ == 256 || head_dim_ == 512) &&
+                      element_type_ == BF16 && softcapping_ == 0.0f;
     if (use_vec_decode_) {
       TF_RETURN_IF_ERROR(EnsureVecDecode(executor));
     } else {
@@ -370,8 +384,10 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
   // over-parallelizes slightly. Matches CUDA's static-grid dispatch.
   if (use_vec_decode_) {
     const int64_t kv_capacity = max_num_blocks_per_seq_ * block_size_;
-    const int idx =
-        kv_capacity <= 1024 ? 0 : (kv_capacity <= 2048 ? 1 : 2);
+    int idx = kv_capacity <= 1024 ? 0 : (kv_capacity <= 2048 ? 1 : 2);
+    // hd512's vec shmem is (3*512+128)*nsg*2 B: nsg=16 -> 53 KB, over the 32 KB
+    // threadgroup limit. Cap hd512 at nsg=8 (26.6 KB). hd128/256 fit at all nsg.
+    if (head_dim_ == 512 && idx > 1) idx = 1;
     TF_RETURN_IF_ERROR(EnsureVecVariant(executor, idx));
     se::KernelArgsPackedArray args(/*num_args=*/8);
     args.add_argument(p_vec_args_);                            // 0 args
