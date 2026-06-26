@@ -3347,3 +3347,176 @@ kernel void fp8_gather_qmm_rhs(
   fp_gather_qmm_rhs_impl<bfloat, 128, 8, BM, BN, BK, WM, WN, transpose>(
       x, w, scale, indices, y, R, N, K, Xs, Ws, tid, sg, sl);
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// bf16 (un-quantized) MoE gather variant: bf16 twin of fp_gather_qmm_rhs_impl
+// with no block scales. The weight loader is the plain bf16 mlx::steel
+// BlockLoader (the W-tile analogue of the X loader); the sort/gather/store
+// machinery is identical.
+///////////////////////////////////////////////////////////////////////////////
+template <typename T, int BM, int BN, int BK, int WM, int WN, bool transpose>
+METAL_FUNC void bf16_gather_mm_rhs_impl(
+    const device T* x,
+    const device T* w,
+    const device uint32_t* indices,
+    device T* y,
+    const int M,
+    const int N,
+    const int K,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::BlockMMA<
+      T, T, BM, BN, BK, WM, WN, false, transpose, BK_padded,
+      transpose ? BK_padded : BN_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = mlx::steel::BlockLoader<
+      T,
+      transpose ? BN : BK,
+      transpose ? BK : BN,
+      transpose ? BK_padded : BN_padded,
+      transpose,
+      WM * WN * SIMD_SIZE>;
+
+  const int K_it = K / BK;
+  const size_t stride_w = transpose ? size_t(N) * K : size_t(K) * N;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const size_t y_row_long = size_t(y_row);
+  const size_t y_col_long = size_t(y_col);
+
+  const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
+  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+
+  const int k_remain = K - K_it * BK;
+  const short2 tile_x = short2(k_remain, tgp_bm);
+  const short2 tile_w =
+      transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+  auto wl = (const device T*)w;
+  x += y_row_long * K;
+  y += y_row_long * N + y_col_long;
+  wl += transpose ? y_col_long * K : y_col;
+
+  uint32_t index;
+  short offset;
+  uint32_t index_next = indices[y_row];
+  short offset_next = 0;
+  int n = 0;
+  while (n < tgp_bm) {
+    n++;
+    offset = offset_next;
+    index = index_next;
+    offset_next = tgp_bm;
+    for (; n < tgp_bm; n++) {
+      if (indices[y_row + n] != index) {
+        offset_next = n;
+        index_next = indices[y_row + n];
+        break;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+    thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+    thread loader_w_t loader_w(
+        wl + index * stride_w, transpose ? K : N, Ws, simd_group_id,
+        simd_lane_id);
+
+    if (align_M && align_N) {
+      gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+      if (!align_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+      }
+      if (offset_next - offset == BM) {
+        mma_op.store_result(y, N);
+      } else {
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
+      }
+    } else {
+      if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
+        gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        if (offset_next - offset == BM) {
+          mma_op.store_result(y, N);
+        } else {
+          mma_op.store_result_slice(
+              y, N, short2(0, offset), short2(BN, offset_next));
+        }
+      } else if (align_N || tgp_bn == BN) {
+        gemm_loop_unaligned<false, true, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
+      } else if (align_M || tgp_bm == BM) {
+        gemm_loop_unaligned<true, false, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
+      } else {
+        gemm_loop_unaligned<false, false, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
+      }
+    }
+  }
+}
+
+// bf16 MoE gather q-GEMM: out[r,n] = sum_k x[r,k] * w[indices[r], n, k] (bf16).
+//   x:       bfloat [R, K]    row-major
+//   w:       bfloat [E, N, K] flat row-major
+//   indices: uint32 [R]       expert index per output row (rows sorted by expert)
+//   y:       bfloat [R, N]    row-major
+//   mnk = {R, N, K}.  Tiles BM=16, BN=32, BK=32, WM=1, WN=2 (=> 64 threads).
+kernel void bf16_gather_mm_rhs(
+    device const bfloat* x [[buffer(0)]],
+    device const bfloat* w [[buffer(1)]],
+    device const uint* indices [[buffer(2)]],
+    device bfloat* y [[buffer(3)]],
+    constant int3& mnk [[buffer(4)]],  // {R, N, K}
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sl [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 16;
+  constexpr int BN = 32;
+  constexpr int BK = 32;
+  constexpr int WM = 1;
+  constexpr int WN = 2;
+  constexpr bool transpose = true;
+  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
+  constexpr int BN_padded = (BN + 16 / sizeof(bfloat));
+
+  threadgroup bfloat Xs[BM * BK_padded];
+  threadgroup bfloat Ws[transpose ? BN * BK_padded : BK * BN_padded];
+
+  const int R = mnk.x;
+  const int N = mnk.y;
+  const int K = mnk.z;
+
+  bf16_gather_mm_rhs_impl<bfloat, BM, BN, BK, WM, WN, transpose>(
+      x, w, indices, y, R, N, K, Xs, Ws, tid, sg, sl);
+}

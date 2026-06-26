@@ -77,11 +77,6 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   // rows by expert and use the weight-reuse MLX gather q-GEMM; small R (decode,
   // ~0.5 rows/expert) has no reuse, so the per-row x-caching GEMV is better.
   sorted_path_ = (r_ >= kSortedMinR);
-  if (!is_fp8 && sorted_path_) {
-    return absl::UnimplementedError(
-        "__metal$moe_gemm: the bf16 sorted (prefill, R>=1024) gather GEMM is "
-        "not yet wired; only the per-row GEMV (R<1024) is supported.");
-  }
 
   // Decode / small-R path: per-row x-caching GEMV. fp8 takes 6 buffer args
   // (x, w, scale, expert_id, out) + dims; bf16 takes 5 (no scale).
@@ -96,19 +91,26 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
     TF_ASSIGN_OR_RETURN(kernel_, metal_exec->LoadKernelWithConstants(
                                      lib, "bf16_moe_gemv", /*arity=*/5, {}));
   }
-  // MLX Steel gather q-GEMM (x, w, scale, indices, out, mnk) for the sorted
-  // (prefill) path. Only the fp8 variant is wired today; bf16 decode (R<1024)
-  // never reaches the sorted path, so skip the compile.
-  if (is_fp8) {
+  // MLX Steel gather q-GEMM for the sorted (prefill, R>=1024) path: fp8 takes
+  // (x, w, scale, indices, out, mnk); bf16 drops scale. align_M=false -> the
+  // safe partial-row path (R = tokens*top_k is arbitrary); align_N/K=true since
+  // N,K are multiples of 128 (>= BN=BK=32). Skip the compile for decode (R<1024).
+  if (sorted_path_) {
     const FC fc[] = {{200, FC::Kind::kBool, 0},
                      {201, FC::Kind::kBool, 1},
                      {202, FC::Kind::kBool, 1}};
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
         CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
-    TF_ASSIGN_OR_RETURN(kernel_steel_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_gather_qmm_rhs", /*arity=*/6, fc));
+    if (is_fp8) {
+      TF_ASSIGN_OR_RETURN(kernel_steel_,
+                          metal_exec->LoadKernelWithConstants(
+                              lib, "fp8_gather_qmm_rhs", /*arity=*/6, fc));
+    } else {
+      TF_ASSIGN_OR_RETURN(kernel_steel_,
+                          metal_exec->LoadKernelWithConstants(
+                              lib, "bf16_gather_mm_rhs", /*arity=*/5, fc));
+    }
   }
 
   // fp8_moe_gemv dims {R, K, N, K/128} (int4).
@@ -238,11 +240,15 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
         se::BlockDim((kcols + 63) / 64, static_cast<uint64_t>(r_), 1), stream,
         a_gx));
 
-    // 3. Gather q-GEMM on the sorted rows -> out_sorted (BM=16, BN=32).
-    se::KernelArgsPackedArray a_mm(/*num_args=*/6);
+    // 3. Gather q-GEMM on the sorted rows -> out_sorted (BM=16, BN=32). fp8
+    //    carries a scale operand; bf16 does not.
+    const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
+    se::KernelArgsPackedArray a_mm(/*num_args=*/is_fp8 ? 6 : 5);
     a_mm.add_argument(p_x_sorted_);
     a_mm.add_argument(allocs.GetDeviceAddress(w_));
-    a_mm.add_argument(allocs.GetDeviceAddress(scale_));
+    if (is_fp8) {
+      a_mm.add_argument(allocs.GetDeviceAddress(scale_));
+    }
     a_mm.add_argument(p_idx_sorted_);
     a_mm.add_argument(p_out_sorted_);
     a_mm.add_argument(p_dims_steel_);
