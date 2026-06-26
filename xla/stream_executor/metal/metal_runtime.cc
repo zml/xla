@@ -865,10 +865,16 @@ void MetalProfilingResolveStep(void* /*device*/) {
     for (const auto& p : g_prof_pending) {
       uint64_t st = r[p.start_idx].timestamp;
       uint64_t en = r[p.start_idx + 1].timestamp;
-      if (st == MTLCounterErrorValue || en == MTLCounterErrorValue || en <= st) {
+      // Drop only true counter errors. A degenerate en<=st happens for tiny
+      // sub-resolution dispatches (decode norms / router ops); keep them with a
+      // clamped 0-duration so they still COUNT (the dispatch-count signal is the
+      // whole point for an overhead-bound decode), instead of silently dropping
+      // exactly the small ops we are hunting.
+      if (st == MTLCounterErrorValue || en == MTLCounterErrorValue) {
         ++g_prof_dropped;
         continue;
       }
+      if (en < st) en = st;  // clamp; 0-duration event still counted
       MetalProfileEvent ev;
       ev.name = p.name;
       ev.details = p.details;
@@ -949,8 +955,12 @@ void MetalKprofReport() {
   std::vector<std::pair<std::string, Agg>> rows(agg.begin(), agg.end());
   std::sort(rows.begin(), rows.end(),
             [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+  uint64_t total_count = 0;
+  for (const auto& [name, a] : rows) total_count += a.count;
   LOG(INFO) << "=== METAL_KPROF: GPU time by kernel over " << commits
-            << " commits (total GPU " << (total_ns / 1.0e6) << " ms) ===";
+            << " commits (total GPU " << (total_ns / 1.0e6) << " ms, "
+            << total_count << " dispatches, " << MetalProfilingDroppedCount()
+            << " dropped) ===";
   for (const auto& [name, a] : rows) {
     LOG(INFO) << "  " << (a.ns / 1.0e6) << " ms  "
               << (total_ns ? 100.0 * a.ns / total_ns : 0.0) << "%  n=" << a.count
