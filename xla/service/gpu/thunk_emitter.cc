@@ -2045,15 +2045,15 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
 
   // The GPU bucket/radix-select MetalTopKThunk is the SOLE Metal TopK path — the
   // shared single-pass kernel (one threadgroup over the whole vocab) is gone. It
-  // handles everything the TopkSpecializer emits (k<=32, n>=1024, bf16/f16/f32, any
+  // handles everything the TopkSpecializer emits (k<=64, n>=1, bf16/f16/f32, any
   // batch): histogram the top bits of the sortable key -> threshold -> gather ->
   // exact select on the full key, identical Descending top-K, k-independent. Fail
   // LOUDLY on anything outside that instead of silently degrading. (The shared
   // GetTopKKernel path below is reached on NON-Metal backends only.)
   if (platform_name() == "METAL") {
-    TF_RET_CHECK(k <= 32)
-        << "Metal TopK: k=" << k << " > 32 — the radix select kernels template k in "
-           "{1,2,4,8,16,32}; the TopkSpecializer should have capped k at 32.";
+    TF_RET_CHECK(k <= 64)
+        << "Metal TopK: k=" << k << " > 64 — the radix select kernels template k in "
+           "{1,2,4,8,16,32,64}; the TopkSpecializer should have capped k at 64.";
     TF_RET_CHECK(dtype == BF16 || dtype == F16 || dtype == F32)
         << "Metal TopK: dtype " << PrimitiveType_Name(dtype)
         << " unsupported — the radix sortable-bit transform handles bf16/f16/f32.";

@@ -93,7 +93,7 @@ kernel void NAME(device const uint* cok [[buffer(0)]], device const uint* cix [[
     atomic_store_explicit(cg, 0u, memory_order_relaxed); atomic_store_explicit(ce, 0u, memory_order_relaxed); } }
 SEL(radix_sel16_k1, 1, ushort, u16_from_okey32) SEL(radix_sel16_k2, 2, ushort, u16_from_okey32)
 SEL(radix_sel16_k4, 4, ushort, u16_from_okey32) SEL(radix_sel16_k8, 8, ushort, u16_from_okey32) SEL(radix_sel16_k16, 16, ushort, u16_from_okey32)
-SEL(radix_sel16_k32, 32, ushort, u16_from_okey32)
+SEL(radix_sel16_k32, 32, ushort, u16_from_okey32) SEL(radix_sel16_k64, 64, ushort, u16_from_okey32)
 SEL(radix_sel32_k1, 1, uint, u32_from_okey32) SEL(radix_sel32_k2, 2, uint, u32_from_okey32)
 SEL(radix_sel32_k4, 4, uint, u32_from_okey32) SEL(radix_sel32_k8, 8, uint, u32_from_okey32) SEL(radix_sel32_k16, 16, uint, u32_from_okey32)
-SEL(radix_sel32_k32, 32, uint, u32_from_okey32)
+SEL(radix_sel32_k32, 32, uint, u32_from_okey32) SEL(radix_sel32_k64, 64, uint, u32_from_okey32)

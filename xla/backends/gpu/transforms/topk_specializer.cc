@@ -98,9 +98,9 @@ absl::StatusOr<HloInstruction*> SmallBufferOptimization(
     }
   } else if (is_metal) {
     // Metal's bucket/radix-select TopK templates the select kernel on
-    // bit_ceil(k) in {1,2,4,8,16,32}, so it handles k up to 32 (the shared
+    // bit_ceil(k) in {1,2,4,8,16,32,64}, so it handles k up to 64 (the shared
     // CustomCall TopK path used by other backends is still capped at 16).
-    max_k = 32;
+    max_k = 64;
   }
 
   if (k > max_k) {

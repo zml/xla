@@ -59,8 +59,12 @@ struct ArgsHost {
   uint32_t pad;
 };
 
+constexpr int64_t kMaxMetalTopK = 64;
+
 int64_t RoundK(int64_t k) {
-  return std::min<int64_t>(std::max<int64_t>(absl::bit_ceil(static_cast<uint64_t>(k)), 1), 32);
+  return std::min<int64_t>(
+      std::max<int64_t>(absl::bit_ceil(static_cast<uint64_t>(k)), 1),
+      kMaxMetalTopK);
 }
 
 }  // namespace
@@ -101,6 +105,10 @@ void MetalTopKThunk::Prewarm(se::StreamExecutor* executor, PrimitiveType dtype,
 }
 
 absl::Status MetalTopKThunk::Ensure(se::StreamExecutor* executor) {
+  if (k_ > kMaxMetalTopK) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Metal TopK radix: k=", k_, " > ", kMaxMetalTopK));
+  }
   if (executor_ == executor && hist_.opaque() != nullptr) return absl::OkStatus();
   executor_ = executor;
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);

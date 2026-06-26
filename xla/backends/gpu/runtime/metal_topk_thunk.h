@@ -82,7 +82,7 @@ class MetalTopKThunk : public Thunk {
   const int64_t batch_;
   const int64_t n_;
   const int64_t k_;
-  const int64_t k_rounded_;  // bit_ceil(k) in {1,2,4,8,16,32} -> select template
+  const int64_t k_rounded_;  // bit_ceil(k) in {1,2,4,8,16,32,64} -> select template
 
   // Candidate-list cap per row. Real logits put only a handful of elements in the
   // threshold's top-16 bucket; 16384 is far beyond that. (A pathological >16384-way
