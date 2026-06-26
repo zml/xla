@@ -93,12 +93,17 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   }
   // MLX Steel gather q-GEMM for the sorted (prefill, R>=1024) path: fp8 takes
   // (x, w, scale, indices, out, mnk); bf16 drops scale. align_M=false -> the
-  // safe partial-row path (R = tokens*top_k is arbitrary); align_N/K=true since
-  // N,K are multiples of 128 (>= BN=BK=32). Skip the compile for decode (R<1024).
+  // safe partial-row path (R = tokens*top_k is arbitrary). The steel tile is
+  // BN=BK=32, so align_N/K is only valid when N,K are multiples of 32 (Gemma4's
+  // K=704 and N=2816/1408 all are). Set them from the real dims so a future
+  // non-32 shape takes the bounds-checked path instead of silently corrupting.
+  // Skip the compile for decode (R<1024).
   if (sorted_path_) {
+    const int32_t align_n = (n_ % 32 == 0) ? 1 : 0;
+    const int32_t align_k = (k_ % 32 == 0) ? 1 : 0;
     const FC fc[] = {{200, FC::Kind::kBool, 0},
-                     {201, FC::Kind::kBool, 1},
-                     {202, FC::Kind::kBool, 1}};
+                     {201, FC::Kind::kBool, align_n},
+                     {202, FC::Kind::kBool, align_k}};
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
         CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));

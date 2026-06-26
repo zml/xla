@@ -1317,9 +1317,15 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     return absl::UnimplementedError(
         "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
   }
-  if (k % 128 != 0 || n % 128 != 0) {
-    return absl::UnimplementedError(
-        "metal MoE GEMV: N and K must be multiples of the 128 block size.");
+  // fp8 needs the 128x128 block-scale alignment; bf16 only needs the bfloat4
+  // vectorized loads (K,N multiples of 4 — Gemma4-A4B's K=704 qualifies). The
+  // decode GEMV bounds-checks N and the partial K tile; the steel prefill picks
+  // its align_N/K function constants from the real dims (see the thunk).
+  const int64_t block = is_fp8 ? 128 : 4;
+  if (k % block != 0 || n % block != 0) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metal MoE GEMV: N and K must be multiples of ", block,
+        is_fp8 ? " (fp8 block-scale)." : " (bf16 vectorized load)."));
   }
   const PrimitiveType expected_w = is_fp8 ? F8E4M3FN : BF16;
   if (w_shape.element_type() != expected_w) {

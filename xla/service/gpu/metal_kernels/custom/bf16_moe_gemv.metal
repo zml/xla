@@ -49,16 +49,25 @@ kernel void bf16_moe_gemv(
     // columns), then each simdgroup's 32 lanes cover the 128-wide tile (4 k
     // each, vectorized). All threads cross the barriers uniformly; only the
     // math/store are guarded by `active`.
+    //
+    // K need NOT be a multiple of BK=128 (e.g. Gemma4-A4B's down projection has
+    // K=704). The last tile may be partial; guard both the x load and the
+    // weight read so neither reads past row K (the weight read would otherwise
+    // spill into the next output column, or past the buffer for the last one).
+    // Only requirement: K % 4 == 0 (the bfloat4-vectorized read). Lanes past the
+    // tail simply contribute nothing.
     float acc = 0.0f;
     for (int kt = 0; kt < K; kt += BK) {
-        if (tid < BK) Xs[tid] = xrow[kt + tid];
+        if (tid < BK) Xs[tid] = (kt + int(tid) < K) ? xrow[kt + tid] : bfloat(0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
             const int k = int(lane) * 4;           // 32 lanes * 4 = 128 = BK
-            bfloat4 wv = *(const device bfloat4 *)(wrow + kt + k);
-            bfloat4 xv = *(const threadgroup bfloat4 *)(Xs + k);
-            acc += float(xv.x) * float(wv.x) + float(xv.y) * float(wv.y) +
-                   float(xv.z) * float(wv.z) + float(xv.w) * float(wv.w);
+            if (kt + k < K) {                      // skip lanes past row K
+                bfloat4 wv = *(const device bfloat4 *)(wrow + kt + k);
+                bfloat4 xv = *(const threadgroup bfloat4 *)(Xs + k);
+                acc += float(xv.x) * float(wv.x) + float(xv.y) * float(wv.y) +
+                       float(xv.z) * float(wv.z) + float(xv.w) * float(wv.w);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
