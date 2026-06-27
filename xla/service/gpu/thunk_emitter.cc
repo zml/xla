@@ -905,9 +905,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFlashAttnThunk(
   // TODO: port head_dim!=128 (Gemma-shaped hd=256) and unaligned-seqlen
   // variants of the prefill kernel; until then such models must use the paged
   // path, whose tiled kernel covers hd 64/96/128/256/512.
-  if (q_len > 1 && (hd != 128 || seqlen % 64 != 0)) {
+  if (q_len > 1 && ((hd != 128 && hd != 64) || seqlen % 64 != 0)) {
     return absl::UnimplementedError(
-        "zml$flash_attn: prefill (q_len>1) needs head_dim==128 and "
+        "zml$flash_attn: prefill (q_len>1) needs head_dim 64 or 128 and "
         "seqlen%64==0.");
   }
   const int64_t n_groups = n_q / n_kv;

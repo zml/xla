@@ -64,7 +64,12 @@ kernel void fa_ext(
     typedef half4               o4_t;
     typedef simdgroup_half8x8   o8x8_t;
 
-    constexpr short DK = 128, DV = 128;
+    // Head dim is substituted at compile time (__DK__/__DV__) so one kernel
+    // source serves every head size the thunk admits (e.g. LFM2's 64, Llama's
+    // 128). All the tile counts below derive from DK/DV; the only places that
+    // also need DV>=128 were the two DV4/NW accumulator loops, now written
+    // strided so they cover any DV (DV4 < NW just means fewer active lanes).
+    constexpr short DK = __DK__, DV = __DV__;
     constexpr short Q = 8, C = 64, NSG = 4;
 #define NS10 (FC_ns10)
 #define NS20 (FC_ns20)
@@ -203,8 +208,11 @@ kernel void fa_ext(
 
                 ss2[j*SH/2 + tiisg] = vs2;
 
-                FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {  // = 1
-                    so4[j*PV4 + ii*NW + tiisg] *= ms;
+                // Rescale this query's running output by the online-softmax
+                // factor. Strided over DV4 so it covers any head dim: DV4 >= NW
+                // (hd>=128) loops; DV4 < NW (hd=64 -> DV4=16) just uses 16 lanes.
+                for (short i = tiisg; i < DV4; i += NW) {
+                    so4[j*PV4 + i] *= ms;
                 }
             }
 
@@ -269,8 +277,9 @@ kernel void fa_ext(
 
         const float scale = S[jj] == 0.0f ? 0.0f : 1.0f/S[jj];
 
-        FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {  // = 1
-            const short i = ii*NW + tiisg;
+        // Strided over DV4 so the store covers any head dim (see the rescale loop
+        // above): hd=64 writes its 16 float4s on 16 lanes, hd>=128 loops.
+        for (short i = tiisg; i < DV4; i += NW) {
             dst4[i] = (bfloat4) ((float4) so4[j*PV4 + i]*scale);
         }
     }

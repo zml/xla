@@ -280,7 +280,7 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
         const int64_t kv_pos_stride = pos_major ? n_kv * hd : hd;
         if (fa_seen.insert({is_prefill, kv_pos_stride}).second) {
           MetalFlashAttnThunk::PrewarmPipeline(stream_exec, is_prefill,
-                                               kv_pos_stride, seqlen);
+                                               kv_pos_stride, seqlen, hd);
         }
       } else if (target == "zml$paged_attn") {
         if (instr->operand_count() != 6) continue;

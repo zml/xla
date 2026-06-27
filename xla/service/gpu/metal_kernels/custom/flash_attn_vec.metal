@@ -53,8 +53,8 @@ kernel void fa_vec(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    constexpr short DK  = 128;
-    constexpr short DV  = 128;
+    constexpr short DK  = __DK__;
+    constexpr short DV  = __DV__;
     constexpr short NE  = 1;
     constexpr short C   = 32;
 
@@ -82,6 +82,13 @@ kernel void fa_vec(
 
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short NL  = NW/NE;
+    // float4 chunks per lane, rounded UP so head dims with DK4/DV4 < NL (e.g. hd=64
+    // -> DK4=16 < NL=32) still run the loop on the active lanes instead of flooring
+    // to zero. Excess lanes read zero-padded Q (-> dot contributes 0) and write
+    // to unstored output slots, so no guard is needed. hd=128: ceil == DK4/NL == 1
+    // (identical codegen).
+    constexpr short DK4C = (DK4 + NL - 1)/NL;
+    constexpr short DV4C = (DV4 + NL - 1)/NL;
     constexpr short SH  = 4*C;
 
     threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
@@ -120,7 +127,7 @@ kernel void fa_vec(
         }
     }
 
-    for (short i = 0; i < DV4/NL; ++i) {
+    for (short i = 0; i < DV4C; ++i) {
         so4[i*NL] = (o4_t) 0.0f;
     }
 
@@ -162,7 +169,7 @@ kernel void fa_vec(
                 qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DK4C; ++ii) {
                         mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                     }
                     mqk[cc] = simd_sum(mqk[cc]);
@@ -188,7 +195,7 @@ kernel void fa_vec(
                 ss[tiisg] = vs;
 
                 if ((DV4/NL % NW == 0) || ty == 0) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         so4[ii*NL] *= ms;
                     }
                 }
@@ -198,8 +205,8 @@ kernel void fa_vec(
 
             // O = O + (Q*K^T)*V
             {
-                o4_t lo[DV4/NL];
-                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                o4_t lo[DV4C];
+                FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                     lo[ii] = 0.0f;
                 }
 
@@ -210,13 +217,13 @@ kernel void fa_vec(
                 const auto sst = ss + ty;
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         lo[ii] += o4_t(float4(pv4[cc*NE*NS20/4 + ii*NL])*float4(sst[cc*NE]));
                     }
                 }
 
                 if ((DV4/NL % NW == 0) || ty == 0) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         so4[ii*NL] += lo[ii];
                     }
                 }
@@ -317,8 +324,8 @@ kernel void fa_vec_hc(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-    constexpr short DK  = 128;
-    constexpr short DV  = 128;
+    constexpr short DK  = __DK__;
+    constexpr short DV  = __DV__;
     constexpr short NE  = 1;
     constexpr short C   = 32;
 
@@ -345,6 +352,13 @@ kernel void fa_vec_hc(
     constexpr short PV4 = PV/4;
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short NL  = NW/NE;
+    // float4 chunks per lane, rounded UP so head dims with DK4/DV4 < NL (e.g. hd=64
+    // -> DK4=16 < NL=32) still run the loop on the active lanes instead of flooring
+    // to zero. Excess lanes read zero-padded Q (-> dot contributes 0) and write
+    // to unstored output slots, so no guard is needed. hd=128: ceil == DK4/NL == 1
+    // (identical codegen).
+    constexpr short DK4C = (DK4 + NL - 1)/NL;
+    constexpr short DV4C = (DV4 + NL - 1)/NL;
     constexpr short SH  = 4*C;
 
     // Per-simdgroup regions (each simdgroup is a distinct query head).
@@ -377,7 +391,7 @@ kernel void fa_vec_hc(
         }
     }
 
-    for (short i = 0; i < DV4/NL; ++i) {
+    for (short i = 0; i < DV4C; ++i) {
         so4[i*NL] = (o4_t) 0.0f;
     }
 
@@ -418,7 +432,7 @@ kernel void fa_vec_hc(
                 qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DK4C; ++ii) {
                         mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                     }
                     mqk[cc] = simd_sum(mqk[cc]);
@@ -444,7 +458,7 @@ kernel void fa_vec_hc(
                 ss[tiisg] = vs;
 
                 if ((DV4/NL % NW == 0) || ty == 0) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         so4[ii*NL] *= ms;
                     }
                 }
@@ -454,8 +468,8 @@ kernel void fa_vec_hc(
 
             // O = O + (Q*K^T)*V
             {
-                o4_t lo[DV4/NL];
-                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                o4_t lo[DV4C];
+                FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                     lo[ii] = 0.0f;
                 }
 
@@ -466,13 +480,13 @@ kernel void fa_vec_hc(
                 const auto sst = ss + ty;
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         lo[ii] += o4_t(float4(pv4[cc*NE*NS20/4 + ii*NL])*float4(sst[cc*NE]));
                     }
                 }
 
                 if ((DV4/NL % NW == 0) || ty == 0) {
-                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FOR_UNROLL (short ii = 0; ii < DV4C; ++ii) {
                         so4[ii*NL] += lo[ii];
                     }
                 }

@@ -91,7 +91,7 @@ class MetalFlashAttnThunk : public Thunk {
   // are swallowed (the thunk rebuilds at execute).
   static void PrewarmPipeline(stream_executor::StreamExecutor* executor,
                               bool is_prefill, int64_t kv_pos_stride,
-                              int64_t seqlen);
+                              int64_t seqlen, int64_t head_dim);
 
  private:
   // Lazily compile + cache the fa_vec pipeline variants (from favec_lib_) the
@@ -148,8 +148,6 @@ class MetalFlashAttnThunk : public Thunk {
   const bool tok_host_coherent_;
 
   absl::Mutex mu_;
-  // Serial fallback kernel (used when head_dim != 128 / dtype unsupported).
-  std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
 
   // KV-parallel fast path: the specialized fa_vec (+ fa_vec_reduce for nwg=32).
@@ -189,6 +187,8 @@ class MetalFlashAttnThunk : public Thunk {
   // per-execute nsg ramp and no host token read — the kernel derives the 2D
   // causal mask on-device from tok[0] + the query-row index.
   bool use_prefill_ ABSL_GUARDED_BY(mu_) = false;
+  // The simdgroup-matrix fa_ext kernel is the sole prefill kernel; it covers any
+  // head_dim % 16 == 0 (one compiled specialization per hd via PrefillSubs).
   std::vector<uint8_t> prefill_lib_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> fa_prefill_ ABSL_GUARDED_BY(mu_);
   size_t prefill_smem_ ABSL_GUARDED_BY(mu_) = 0;

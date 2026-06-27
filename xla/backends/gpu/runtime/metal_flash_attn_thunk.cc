@@ -109,28 +109,48 @@ MetalFlashAttnThunk::MetalFlashAttnThunk(
       has_num_tokens_(num_tokens.allocation() != nullptr),
       tok_host_coherent_(tok_host_coherent) {}
 
+// The prefill kernel source (flash_attn_prefill.metal) bakes the head dim at
+// compile time via __DK__/__DV__, so one source serves every admitted head size
+// (LFM2's 64, Llama's 128). One specialization is compiled+cached per head dim.
+static std::vector<std::pair<std::string, std::string>> HeadDimSubs(int64_t hd) {
+  return {{"__DK__", absl::StrCat(hd)}, {"__DV__", absl::StrCat(hd)}};
+}
+// Threadgroup-memory bytes the prefill kernel needs: it lays out
+// Q*(DK + 2*PAD2(DV,64) + 2*SH) halves with Q=8, SH=2*C=128, DK=DV=hd — i.e.
+// 8*(hd + 2*PAD2(hd,64) + 256)*2 bytes. hd=128 -> 10240 (the old constant),
+// hd=64 -> 7168. Under the 32KB threadgroup ceiling for any real head dim.
+static size_t PrefillSmem(int64_t hd) {
+  const int64_t pv = ((hd + 63) / 64) * 64;  // PAD2(hd, 64)
+  return static_cast<size_t>(8 * (hd + 2 * pv + 256) * 2);
+}
+
 void MetalFlashAttnThunk::PrewarmPipeline(se::StreamExecutor* executor,
                                          bool is_prefill, int64_t kv_pos_stride,
-                                         int64_t seqlen) {
+                                         int64_t seqlen, int64_t head_dim) {
   // Best-effort. Compile + cache the metallib, then create the PSO(s) via the
   // compile-time executor (discarded — it warms Apple's driver pipeline cache, so
   // the thunk's first-execute LoadKernelWithConstants is a cache hit). FC values
   // must match what the thunk will request (see EnsurePrefill / EnsureFaVecMain).
-  auto lib = CompileMetalSourceToMetallibCached(is_prefill ? get_flash_attn_prefill() : get_flash_attn_vec());
+  auto lib = is_prefill ? CompileMetalSourceToMetallibCached(
+                              get_flash_attn_prefill(), HeadDimSubs(head_dim))
+                        : CompileMetalSourceToMetallibCached(get_flash_attn_vec(),
+                                                             HeadDimSubs(head_dim));
   if (!lib.ok()) return;
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
   using FC = se::metal::MetalFunctionConstant;
   if (is_prefill) {
-    // Warm both fa_ext variants: with the on-GPU row clamp (FC_tokclamp=1, the
-    // num_tokens buffer at index 7, arity 8 — the prefill-with-num_tokens path) and
-    // without (arity 7 — the legacy no-num_tokens path). We don't know has_num_tokens
-    // here, so warming both keeps either first execute a pipeline-cache hit.
+    // fa_ext (simdgroup-matrix) serves every supported head_dim (hd%16==0), one
+    // compiled specialization per hd. Warm both clamp variants (FC_tokclamp=1 with
+    // num_tokens at buffer 7, arity 8; and arity 7 without) since has_num_tokens is
+    // unknown here, so either first execute is a pipeline-cache hit.
+    const char* prefill_kernel = "fa_ext";
     for (int clamp = 0; clamp <= 1; ++clamp) {
       const FC fc[] = {{430, FC::Kind::kInt, kv_pos_stride},
                        {431, FC::Kind::kInt, kv_pos_stride},
                        {432, FC::Kind::kBool, clamp}};
       metal_exec
-          ->LoadKernelWithConstants(*lib, "fa_ext", /*arity=*/clamp ? 8 : 7, fc)
+          ->LoadKernelWithConstants(*lib, prefill_kernel, /*arity=*/clamp ? 8 : 7,
+                                    fc)
           .IgnoreError();
     }
     return;
@@ -230,12 +250,18 @@ absl::Status MetalFlashAttnThunk::EnsurePrefill(se::StreamExecutor* executor) {
   // Both the metallib and the PSO are normally already warm here (prewarmed at
   // HLO-compile time by MetalGpuCompiler::RunHloPasses → PrewarmPipeline); these
   // calls then hit the process metallib cache + Apple's driver pipeline cache.
-  TF_ASSIGN_OR_RETURN(prefill_lib_, CompileMetalSourceToMetallibCached(get_flash_attn_prefill()));
+  TF_ASSIGN_OR_RETURN(prefill_lib_, CompileMetalSourceToMetallibCached(
+                                        get_flash_attn_prefill(), HeadDimSubs(HD)));
   using FC = se::metal::MetalFunctionConstant;
+  // The simdgroup-matrix fa_ext kernel handles any head_dim that is a multiple of
+  // 16 (its Q·Kᵀ matmul pairs 8×8 tiles; the V/rescale/store loops are strided so
+  // hd<128 just uses fewer lanes). One compiled specialization per hd (DK/DV baked
+  // via HeadDimSubs), so hd=128 codegen is unchanged. The sole prefill kernel.
   // FC_tokclamp (432) gates the on-GPU row clamp: when num_tokens is present the
   // kernel takes it at buffer(7) (arity 8) and early-returns Q-row blocks past the
   // real prompt length, so the host dispatches the full grid with no host-side
   // device read (the GDN-prefill race class). Without num_tokens: legacy full grid.
+  // FC_ns10/FC_ns20 (430/431) carry the KV position stride.
   const FC fc[] = {{430, FC::Kind::kInt, kv_pos_stride},
                    {431, FC::Kind::kInt, kv_pos_stride},
                    {432, FC::Kind::kBool, has_num_tokens_ ? 1 : 0}};
@@ -243,7 +269,7 @@ absl::Status MetalFlashAttnThunk::EnsurePrefill(se::StreamExecutor* executor) {
                       metal_exec->LoadKernelWithConstants(
                           prefill_lib_, "fa_ext",
                           /*arity=*/has_num_tokens_ ? 8 : 7, fc));
-  prefill_smem_ = 10240;  // FATTN_SMEM(nsg=4) for hd128: 8*(128+2*128+2*128)*2
+  prefill_smem_ = PrefillSmem(HD);  // hd128 -> 10240, hd64 -> 7168
 
   if (!kv_full_cache_ && zero_layer_.opaque() == nullptr) {
     zero_layer_ = executor->Allocate(sizeof(uint32_t), 0);
@@ -302,7 +328,6 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
 
   absl::MutexLock lock(&mu_);
   if (executor_ != executor) {
-    kernel_ = nullptr;
     for (auto& k : fa_main_by_nsg_) k = nullptr;
     fa_main_hc_ = nullptr;
     fa_reduce_ = nullptr;
@@ -311,10 +336,19 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
     const int64_t q_len = q_shape_.dimensions(1);
     // q_len>1 = prefill (the simdgroup-matrix kernel_flash_attn_ext, gated on
     // seqlen%64==0 so no kvpad pre-pass is needed). q_len==1 = decode (fa_vec).
-    use_prefill_ = (q_len > 1 && head_dim_ == 128 && seqlen_ % 64 == 0 &&
+    // PREFILL: the fa_ext simdgroup-matrix kernel handles any head_dim % 16 == 0
+    // (it pairs 8×8 tiles; DK/DV baked per-hd via HeadDimSubs, so hd=128 codegen is
+    // unchanged). Covers 64 (LFM2), 128 (Llama), 256 (Gemma). One kernel, no serial
+    // prefill fallback.
+    use_prefill_ = (q_len > 1 && head_dim_ % 16 == 0 && seqlen_ % 64 == 0 &&
                     q_shape_.element_type() == BF16 &&
                     out_shape_.element_type() == BF16);
-    use_fa_vec_ = (q_len == 1 && head_dim_ == 128 && seqlen_ % 32 == 0 &&
+    // DECODE: the ggml vec kernel (fa_vec, + nwg KV-splitting + reduce) handles any
+    // head_dim % 16 == 0. Its per-lane float4 loops are rounded up (DK4C/DV4C in the
+    // kernel) so heads with DK4/DV4 < NW run on the active lanes (hd=64 -> 16 lanes,
+    // zero-padded Q makes the rest contribute 0); hd=128 codegen is unchanged. DK/DV
+    // baked per-hd via HeadDimSubs. The sole decode kernel, no serial fallback.
+    use_fa_vec_ = (q_len == 1 && head_dim_ % 16 == 0 && seqlen_ % 32 == 0 &&
                    q_shape_.element_type() == BF16 &&
                    out_shape_.element_type() == BF16);
 
@@ -322,16 +356,14 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
       TF_RETURN_IF_ERROR(EnsurePrefill(executor));
       executor_ = executor;
     } else if (!use_fa_vec_) {
-      TF_ASSIGN_OR_RETURN(
-          std::vector<uint8_t> metallib,
-          CompileMetalSourceToMetallib(get_flash_attn_serial(),
-                               {{"__N_GROUPS__", absl::StrCat(n_groups_)},
-                                {"__SEQLEN__", absl::StrCat(seqlen_)},
-                                {"__HD__", absl::StrCat(head_dim_)}}));
-      auto spec = se::KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
-          std::move(metallib), "flash_attn_vec", /*arity=*/5);
-      TF_ASSIGN_OR_RETURN(kernel_, executor->LoadKernel(spec));
-      executor_ = executor;
+      // Neither the matrix prefill (q_len>1) nor the vec decode (q_len==1) admitted
+      // this shape — both require head_dim % 16 == 0, bf16 q/out, and seqlen aligned
+      // (prefill %64, decode %32). Fail loudly instead of silently producing garbage.
+      return absl::UnimplementedError(absl::StrCat(
+          "Metal flash-attention: unsupported shape (head_dim=", head_dim_,
+          ", seqlen=", seqlen_, ", q_len=", q_shape_.dimensions(1),
+          ", q_dtype=", static_cast<int>(q_shape_.element_type()),
+          "). Need head_dim%16==0, bf16, seqlen%64==0 (prefill) / %32==0 (decode)."));
     } else {
       // K/V cache feed layout: head-major [n_kv,S,hd] (operand {2,1,0}) vs
       // position-major [S,n_kv,hd] (operand {2,0,1}, the cache-native slice — the
@@ -346,7 +378,8 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
       // EnsureFaVec*). Build only the nsg=4 nwg=1 variant now, so a small-context
       // decode pays the same single-PSO first-token cost as before — no startup
       // regression — while larger contexts amortize a variant's one-time build.
-      TF_ASSIGN_OR_RETURN(favec_lib_, CompileMetalSourceToMetallibCached(get_flash_attn_vec()));
+      TF_ASSIGN_OR_RETURN(favec_lib_, CompileMetalSourceToMetallibCached(
+                                          get_flash_attn_vec(), HeadDimSubs(head_dim_)));
       TF_RETURN_IF_ERROR(EnsureFaVecMain(executor, /*idx=*/2));  // kNsgVals[2]=4
 
       if (!kv_full_cache_) {
@@ -411,27 +444,18 @@ absl::Status MetalFlashAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
       args.add_argument(allocs.GetDeviceAddress(num_tokens_));  // buffer(7)
     }
     args.add_shared_bytes(prefill_smem_);
+    // fa_ext: 4 simdgroups per Q-row block of 8, grid = ceil(q_len/8) x heads x
+    // batch. Honors the on-GPU num_tokens row clamp (FC_tokclamp).
     return fa_prefill_->Launch(se::ThreadDim(32, 4, 1),
                                se::BlockDim((q_len + 7) / 8, NQH, 1), stream, args);
   }
 
+  // Unreachable for valid shapes: an unsupported shape (neither use_prefill_ nor
+  // use_fa_vec_) already returned UnimplementedError from the setup block above.
   if (!use_fa_vec_) {
-    // The serial fallback is single-query; a prefill (q_len>1) that didn't qualify
-    // for the matrix kernel is unsupported (loud, never silently wrong).
-    if (q_shape_.dimensions(1) != 1) {
-      return absl::UnimplementedError(
-          "Metal FA: prefill (q_len>1) needs head_dim==128, bf16 q/out, "
-          "seqlen%64==0.");
-    }
-    se::KernelArgsPackedArray kernel_args(/*num_args=*/5);
-    kernel_args.add_argument(allocs.GetDeviceAddress(q_));
-    kernel_args.add_argument(allocs.GetDeviceAddress(k_));
-    kernel_args.add_argument(allocs.GetDeviceAddress(v_));
-    kernel_args.add_argument(allocs.GetDeviceAddress(tok_));
-    kernel_args.add_argument(allocs.GetDeviceAddress(out_));
-    return kernel_->Launch(se::ThreadDim(32, 1, 1),
-                           se::BlockDim(n_groups_, n_kv_, 1), stream,
-                           kernel_args);
+    return absl::UnimplementedError(
+        "Metal flash-attention: unsupported shape (need head_dim%16==0, bf16, "
+        "aligned seqlen).");
   }
 
   // LIVE KV length, to size the variant for this step's context (the HC gate + the

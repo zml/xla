@@ -53,12 +53,12 @@ embed_files(
 )
 
 # --- Custom flash-attention kernels (adapted from llama.cpp) ----------------
-# Generates get_flash_attn_serial(), get_flash_attn_vec(), get_flash_attn_prefill().
+# Generates get_flash_attn_prefill() (fa_ext) and get_flash_attn_vec() (fa_vec +
+# fa_vec_hc + fa_vec_reduce). Both cover any head_dim % 16 == 0 via __DK__/__DV__.
 embed_files(
     name = "flash_attn_kernels",
     srcs = [
         "custom/flash_attn_prefill.metal",
-        "custom/flash_attn_serial.metal",
         "custom/flash_attn_vec.metal",
     ],
     cpp_namespace = "xla::gpu",
