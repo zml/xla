@@ -2697,6 +2697,7 @@ cc_library(
         "//xla/service:computation_placer",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:stream",
+        "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base",

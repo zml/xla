@@ -75,6 +75,9 @@ class CollectivePermuteThunk : public CollectiveThunk {
     return connected_components_enabled_;
   }
 
+  absl::Status Prepare(const PrepareParams& params) override;
+  absl::Status ExecuteOnStream(const ExecuteParams& params) override;
+
   static absl::StatusOr<std::unique_ptr<CollectivePermuteThunk>> FromProto(
       ThunkInfo thunk_info, const CollectivePermuteThunkProto& thunk_proto,
       absl::Span<const BufferAllocation> buffer_allocations);
@@ -96,6 +99,12 @@ class CollectivePermuteThunk : public CollectiveThunk {
                              Communicator& comm) override;
 
  private:
+  bool UsesLocalSyclPeerAccessPath(se::StreamExecutor* executor,
+                                   const GpuCliqueKey& clique_key) const;
+  absl::Status RunPeerAccessCollective(const ExecuteParams& params,
+                                       const GpuCliqueKey& clique_key,
+                                       se::Stream& stream);
+
   const P2PConfig config_;
   bool connected_components_enabled_ = false;
 };
