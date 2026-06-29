@@ -15,13 +15,16 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 
+#include <algorithm>
 #include <cassert>
-#include <iostream>
+#include <string>
 
 #include "absl/base/call_once.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/logging.h"
+#include "xla/tsl/platform/status_macros.h"
 
 namespace stream_executor::sycl {
 
@@ -408,22 +411,16 @@ absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<::sycl::event> SyclGetRecentEventFromStream(
+absl::StatusOr<::sycl::event> SyclSubmitBarrierEvent(
     ::sycl::queue* stream_handle) {
   try {
-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20240000
-    // Zero overhead: Does not submit a barrier or enqueue work.
-    std::optional<::sycl::event> event =
-        stream_handle->ext_oneapi_get_last_event();
-    if (event.has_value()) {
-      return event.value();
-    }
-#endif
+    // Record a fresh marker event. A barrier is an explicit SYCL command whose
+    // event denotes completion of all prior work in this in-order queue.
     return stream_handle->ext_oneapi_submit_barrier();
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(absl::StrCat(
-        "SyclGetRecentEventFromStream: Failed to get event from stream: ",
-        e.what(), ", file = ", __FILE__, ", line = ", __LINE__));
+        "SyclSubmitBarrierEvent: Failed to submit barrier event: ", e.what(),
+        ", file = ", __FILE__, ", line = ", __LINE__));
   }
 }
 

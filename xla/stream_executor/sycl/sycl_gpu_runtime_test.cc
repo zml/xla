@@ -221,7 +221,7 @@ TEST_F(SyclGpuRuntimeTest, TestGetTimerProperties) {
   EXPECT_GT(timer_props.timestamp_mask, 0);
 }
 
-TEST_F(SyclGpuRuntimeTest, TestSyclGetRecentEventFromStream) {
+TEST_F(SyclGpuRuntimeTest, TestSyclSubmitBarrierEvent) {
   constexpr int kCount = 10;
   TF_ASSERT_OK_AND_ASSIGN(
       StreamPtr stream_handle,
@@ -237,7 +237,7 @@ TEST_F(SyclGpuRuntimeTest, TestSyclGetRecentEventFromStream) {
   TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
 
   ASSERT_OK_AND_ASSIGN(::sycl::event event,
-                       SyclGetRecentEventFromStream(stream_handle.get()));
+                       SyclSubmitBarrierEvent(stream_handle.get()));
 
   // Expect the event to be in a valid state. The command_execution_status
   // should not be "unknown".

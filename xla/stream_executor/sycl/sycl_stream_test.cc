@@ -392,7 +392,7 @@ TEST_F(SyclStreamTest, RecordEvent) {
 
   ::sycl::event default_event = event.GetEvent();
   EXPECT_THAT(stream1->RecordEvent(&event), absl_testing::IsOk());
-  // RecordEvent must update the event to reflect stream1's most recent work.
+  // RecordEvent must update the event to a marker for stream1's prior work.
   EXPECT_NE(event.GetEvent(), default_event);
 
   EXPECT_THAT(stream2->WaitFor(&event), absl_testing::IsOk());

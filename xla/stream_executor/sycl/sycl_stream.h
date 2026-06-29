@@ -31,13 +31,12 @@ namespace stream_executor::sycl {
 class SyclStream : public StreamCommon {
  public:
   // Makes the current stream wait until all operations enqueued in the other
-  // stream up to its most recently recorded event have completed.
+  // stream up to its latest recorded marker have completed.
   absl::Status WaitFor(Stream* other) override;
 
-  // Records the most recent event on the current stream into the given Event
-  // object. This typically marks the point up to which work has been enqueued
-  // on the stream. This allows other streams or operations to synchronize with
-  // this point in the stream's execution.
+  // Records a marker event for work currently enqueued on the stream into the
+  // given Event object. This allows other streams or operations to synchronize
+  // with this point in the stream's execution.
   absl::Status RecordEvent(Event* event) override;
 
   // Blocks execution on the current stream until the given event is completed.
@@ -107,11 +106,8 @@ class SyclStream : public StreamCommon {
         completed_event_(std::move(completed_event)),
         stream_handle_(std::move(stream_handle)) {}
 
-  // Updates 'completed_event_' to the most recent event available on the
-  // current stream. This allows other streams or events to synchronize with
-  // this point.
-  // NOTE: This does *not* record a new event; it only copies the most recent
-  // event. Actual event recording will be implemented in the future.
+  // Records a marker for all work currently enqueued on this stream and stores
+  // it in 'completed_event_' so other streams can synchronize with this point.
   absl::Status RecordCompletedEvent();
 
   // Launches a SYCL kernel on the current stream with the specified thread,
@@ -126,8 +122,9 @@ class SyclStream : public StreamCommon {
   // The Executor to which this stream is bound.
   StreamExecutor* executor_;
 
-  // The most recent event recorded on this stream, representing the completion
-  // of all operations enqueued up to that point.
+  // Event storage reused for the latest barrier marker recorded on this stream.
+  // The marker represents completion of all operations enqueued up to that
+  // point.
   SyclEvent completed_event_;
 
   // The underlying SYCL stream (queue).

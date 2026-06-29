@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/strings/ascii.h"
 #include "xla/stream_executor/sycl/sycl_status.h"
 #include "xla/tsl/platform/statusor.h"
@@ -159,10 +160,10 @@ absl::StatusOr<SyclTimerProperties> SyclGetTimerProperties(int device_ordinal);
 absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle)
     ABSL_ATTRIBUTE_NONNULL(1);
 
-// Returns a SYCL event marking the most recent operation on the given stream.
-// If the stream has no prior work, submits a barrier and returns its event.
-absl::StatusOr<::sycl::event> SyclGetRecentEventFromStream(
-    ::sycl::queue* stream_handle) ABSL_ATTRIBUTE_NONNULL(1);
+// Submits a SYCL barrier and returns its event. The event marks completion of
+// all prior work on the given in-order stream.
+absl::StatusOr<::sycl::event> SyclSubmitBarrierEvent(::sycl::queue* stream_handle)
+    ABSL_ATTRIBUTE_NONNULL(1);
 
 // NOTE: Similar to standard memcpy, all SYCL memcpy functions work
 // only when the source and destination buffers do not overlap. Add support for
