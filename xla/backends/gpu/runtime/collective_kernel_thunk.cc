@@ -93,25 +93,6 @@ absl::StatusOr<se::DeviceAddressHandle> AllocateMemory(
   return local_buffer_alloc;
 };
 
-absl::StatusOr<int> GetLocalDeviceId(
-    const GlobalDeviceId& global_device_id,
-    const CollectiveParams& collective_params) {
-  // If the global device id map is not provided, then we can assume that
-  // execution is local.
-  if (!collective_params.global_device_id_map) {
-    return global_device_id.value();
-  }
-
-  for (const auto& local_device : *collective_params.global_device_id_map) {
-    if (local_device.second == global_device_id) {
-      return local_device.first.value();
-    }
-  }
-  return absl::NotFoundError(
-      absl::StrFormat("Global device id %d not found in global device id map.",
-                      global_device_id.value()));
-}
-
 struct PtrFormatter {
   void operator()(std::string* out, const void* ptr) const {
     absl::StrAppend(out, absl::StrFormat("%p", ptr));
@@ -170,8 +151,9 @@ absl::StatusOr<bool> CollectiveKernelThunk::IsSupported(
   }
   RETURN_IF_ERROR(status);
   for (const GlobalDeviceId& device : clique_key.devices()) {
-    ASSIGN_OR_RETURN(const int peer_device_id,
-                     GetLocalDeviceId(device, collective_params));
+    ASSIGN_OR_RETURN(LocalDeviceId peer_local_device_id,
+                     GetLocalDeviceId(collective_params, device));
+    const int peer_device_id = peer_local_device_id.value();
     if (!executor.CanEnablePeerAccessTo(peer_device_id)) {
       XLA_VLOG_DEVICE(3, executor.device_ordinal())
           << "Peer access is not supported with device " << peer_device_id;

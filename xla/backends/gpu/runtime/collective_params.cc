@@ -22,7 +22,9 @@ limitations under the License.
 #include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -60,6 +62,31 @@ static absl::StatusOr<GlobalDeviceId> GetGlobalDeviceId(
   }
 
   return it->second;
+}
+
+absl::StatusOr<LocalDeviceId> GetLocalDeviceId(
+    const CollectiveParams& params, GlobalDeviceId global_device_id) {
+  // No local -> global mapping was provided; assume the identity mapping.
+  if (!params.global_device_id_map) {
+    if (params.local_device_count > 0 &&
+        global_device_id.value() >= params.local_device_count) {
+      return absl::OutOfRangeError(absl::StrFormat(
+          "Global device id %d is outside local device count %d and no global "
+          "device id map was provided",
+          global_device_id.value(), params.local_device_count));
+    }
+    return LocalDeviceId(global_device_id.value());
+  }
+
+  for (const auto& [local_id, mapped_global_id] :
+       *params.global_device_id_map) {
+    if (mapped_global_id == global_device_id) {
+      return local_id;
+    }
+  }
+
+  return NotFound("No local device ordinal found for global device id: %d",
+                  global_device_id.value());
 }
 
 static GpuCollectives* ResolveCollectives(

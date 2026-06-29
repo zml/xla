@@ -89,6 +89,11 @@ struct CollectiveParams {
       int local_device_count, bool collective_use_minimal_resource);
 };
 
+// Returns the local device id for a global device id. If no global device id
+// map is provided, assumes the identity mapping used by local-only executions.
+absl::StatusOr<LocalDeviceId> GetLocalDeviceId(
+    const CollectiveParams& params, GlobalDeviceId global_device_id);
+
 }  // namespace xla::gpu
 
 #endif  // XLA_BACKENDS_GPU_RUNTIME_COLLECTIVE_PARAMS_H_
