@@ -150,6 +150,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/integrations:device_mem_allocator",
         "//xla/stream_executor/integrations:tf_allocator_adapter",
+        "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/concurrency:async_value",
         "//xla/tsl/concurrency:ref_count",
         "//xla/tsl/distributed_runtime/coordination:coordination_service",

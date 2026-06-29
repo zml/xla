@@ -115,6 +115,7 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
+#include "xla/stream_executor/sycl/sycl_platform_id.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -1278,6 +1279,19 @@ absl::StatusOr<std::shared_ptr<tsl::Allocator>> CreateCudaAsyncAllocator(
 
 #endif  // defined(GOOGLE_CUDA) && CUDA_VERSION >= 11020
 
+// Returns whether LocalDeviceState should route completion callbacks through a
+// callback stream for this executor.
+bool ShouldUseCallbackStream(se::StreamExecutor* executor) {
+  if (executor->GetPlatform()->id() == stream_executor::sycl::kSyclPlatformId) {
+    // SYCL host callbacks already wait for a recorded stream event. Routing them
+    // through a separate callback stream adds a cross-queue barrier to every PJRT
+    // buffer definition callback and can leave host-to-device transfers waiting
+    // indefinitely on Intel GPUs.
+    return false;
+  }
+  return true;
+}
+
 // Builds a LocalDeviceState for each GPU present.
 absl::StatusOr<std::map<int, std::unique_ptr<LocalDeviceState>>>
 BuildLocalDeviceStates(LocalClient* xla_client, bool schedule_async,
@@ -1290,8 +1304,9 @@ BuildLocalDeviceStates(LocalClient* xla_client, bool schedule_async,
         std::make_unique<LocalDeviceState>(
             executor, xla_client, LocalDeviceState::kComputeSynchronized,
             max_inflight_computations, /*allow_event_reuse=*/true,
-            /*use_callback_stream=*/true, /*device_ordinal=*/-1,
-            /*stream_options=*/std::nullopt, schedule_async));
+            /*use_callback_stream=*/ShouldUseCallbackStream(executor),
+            /*device_ordinal=*/-1, /*stream_options=*/std::nullopt,
+            schedule_async));
   }
   return std::move(addressable_devices);
 }
