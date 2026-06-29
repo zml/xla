@@ -137,6 +137,7 @@ limitations under the License.
 #include "xla/pjrt/semaphore.h"
 #include "xla/pjrt/staging_buffer.h"
 #include "xla/pjrt/stream_executor_executable.h"
+#include "xla/pjrt/stream_executor_host_to_device.h"
 #include "xla/pjrt/stream_executor_pjrt_abi_version.h"
 #include "xla/pjrt/thread_pool_async_work_runner.h"
 #include "xla/pjrt/tracked_device_buffer.h"
@@ -844,11 +845,13 @@ PjRtStreamExecutorClient::LinearizeHostBufferInto(
               }
             }
           }
-          CHECK_OK(local_device->host_to_device_stream()->Memcpy(
-              &device_memory, staging_buffer.get(), packed_size));
+          CHECK_OK(SubmitStreamExecutorHostToDeviceCopy(
+              local_device->host_to_device_stream(), &device_memory,
+              staging_buffer.get(), packed_size));
         } else {
-          CHECK_OK(local_device->host_to_device_stream()->Memcpy(
-              &device_memory, data, packed_size));
+          CHECK_OK(SubmitStreamExecutorHostToDeviceCopy(
+              local_device->host_to_device_stream(), &device_memory, data,
+              packed_size));
         }
 
         CHECK_OK(AddDestinationBufferSynchronization(
@@ -1434,6 +1437,27 @@ class StreamExecutorCopyToDeviceStream : public CopyToDeviceStream {
 
     current_bytes_ += chunk.size();
     bool complete = IsCompleteLocked();
+
+    if (IsSyclStreamExecutor(stream_->parent())) {
+      auto copied = SubmitStreamExecutorHostToDeviceCopy(
+          stream_, &dst, chunk.data(), chunk.size());
+      if (!copied.ok()) {
+        done_.SetError(copied);
+        return Future<>(done_.GetError());
+      }
+
+      if (complete) {
+        auto recorded = stream_->RecordEvent(done_.get().get());
+        if (!recorded.ok()) {
+          done_.SetError(recorded);
+          return Future<>(done_.GetError());
+        }
+        done_.SetStateConcrete();
+      }
+
+      return Future<>(absl::OkStatus());
+    }
+
     lock.Release();
 
     auto copied = stream_->Memcpy(&dst, chunk.data(), chunk.size());

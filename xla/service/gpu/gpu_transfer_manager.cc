@@ -303,6 +303,16 @@ absl::Status GpuTransferManager::TransferBufferToDevice(
   VLOG(5) << "Transfer buffer to device: size="
           << tsl::strings::HumanReadableNumBytes(size);
 
+  if (stream->parent()->GetPlatform()->id() ==
+      stream_executor::sycl::kSyclPlatformId) {
+    // The generic staging path below relies on stream-ordered host callbacks
+    // to populate host memory before the H2D copy. SYCL callback ordering is
+    // fragile for these transfers, so issue a blocking H2D copy from the
+    // already-linearized host buffer instead.
+    RETURN_IF_ERROR(stream->BlockHostUntilDone());
+    return stream->parent()->SynchronousMemcpyH2D(source, size, destination);
+  }
+
   ASSIGN_OR_RETURN(auto staging_buffer,
                    GetOrCreateStagingBuffer(stream->parent()));
 

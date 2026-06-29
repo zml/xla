@@ -850,11 +850,13 @@ cc_library(
     srcs = [
         "pjrt_stream_executor_client.cc",
         "se_raw_buffer.cc",
+        "stream_executor_host_to_device.cc",
         "tracked_device_buffer.cc",
     ],
     hdrs = [
         "pjrt_stream_executor_client.h",
         "se_raw_buffer.h",
+        "stream_executor_host_to_device.h",
         "tracked_device_buffer.h",
     ],
     visibility = internal_visibility(["//xla:friends"]),
@@ -920,6 +922,8 @@ cc_library(
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_address_allocator",
         "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/stream_executor/abi:executable_abi_version",
         "//xla/tsl/concurrency:async_value",
         "//xla/tsl/concurrency:ref_count",

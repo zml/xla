@@ -45,6 +45,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_stream_executor_client.h"
 #include "xla/pjrt/raw_buffer.h"
+#include "xla/pjrt/stream_executor_host_to_device.h"
 #include "xla/pjrt/tracked_device_buffer.h"
 #include "xla/primitive_util.h"
 #include "xla/service/generic_transfer_manager.h"
@@ -120,15 +121,23 @@ PjRtStreamExecutorRawBuffer::CopyRawHostToDeviceAndReturnEvent(
       return;
     }
 
+    absl::Status slice_status = buf->ValidateSlice(offset, transfer_size);
+    if (!slice_status.ok()) {
+      client->SetEventAsError(device_event, slice_status);
+      return;
+    }
     se::DeviceAddressBase sub_buffer = buf->device_buffer_->mem();
-    if (transfer_size < sub_buffer.size()) {
+    if (offset != 0 ||
+        static_cast<size_t>(transfer_size) != sub_buffer.size()) {
       sub_buffer = sub_buffer.GetByteSlice(offset, transfer_size);
     }
     std::shared_ptr<void> staging_buffer;
-    auto status = [&]() -> absl::Status {
+    auto submit_transfer = [&]() -> absl::Status {
       RETURN_IF_ERROR(client->WaitForAllocation(stream, *buf));
+      bool stage_transfer =
+          client->ShouldStageHostTransfers(src, transfer_size);
       if (transfer_size > 0) {
-        if (client->ShouldStageHostToDeviceTransfers(src, transfer_size)) {
+        if (stage_transfer) {
           if (client->GetHostMemoryAllocator() == nullptr) {
             return absl::InvalidArgumentError(
                 "host_memory_allocator should be initialized for "
@@ -139,19 +148,25 @@ PjRtStreamExecutorRawBuffer::CopyRawHostToDeviceAndReturnEvent(
           alloc_opts.local_device_id = local_device->local_device_id();
           staging_buffer = client->GetHostMemoryAllocator()->Allocate(
               transfer_size, alloc_opts);
-          auto copy_to_staging_buffer = [src, transfer_size,
-                                         staging_buffer]() mutable {
+          if (IsSyclStreamExecutor(local_device->executor())) {
             std::memcpy(staging_buffer.get(), src, transfer_size);
-          };
-          RETURN_IF_ERROR(stream->DoHostCallback(copy_to_staging_buffer));
-          RETURN_IF_ERROR(
-              stream->Memcpy(&sub_buffer, staging_buffer.get(), transfer_size));
+          } else {
+            auto copy_to_staging_buffer = [src, transfer_size,
+                                           staging_buffer]() mutable {
+              std::memcpy(staging_buffer.get(), src, transfer_size);
+            };
+            RETURN_IF_ERROR(stream->DoHostCallback(copy_to_staging_buffer));
+          }
+          RETURN_IF_ERROR(SubmitStreamExecutorHostToDeviceCopy(
+              stream, &sub_buffer, staging_buffer.get(), transfer_size));
         } else {
-          RETURN_IF_ERROR(stream->Memcpy(&sub_buffer, src, transfer_size));
+          RETURN_IF_ERROR(SubmitStreamExecutorHostToDeviceCopy(
+              stream, &sub_buffer, src, transfer_size));
         }
       }
       return absl::OkStatus();
-    }();
+    };
+    auto status = submit_transfer();
     if (status.ok()) {
       status = client->AllocateAndRecordEvent(
           device_event, local_device, stream,
@@ -175,7 +190,14 @@ absl::StatusOr<PjRtDeviceEventRef>
 PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
     void* dst, int64_t offset, int64_t transfer_size,
     PjRtDeviceEventRefVector dependencies) {
-  se::Stream* stream = local_device_->GetDeviceToHostStream();
+  // On SYCL/Level Zero, raw D2H readbacks through a separate D2H stream can
+  // fail to observe the buffer definition/upload ordering recorded on the PJRT
+  // H2D stream and return stale data. Use the H2D stream as the conservative
+  // ordered raw-transfer stream for SYCL; other backends keep the rotating D2H
+  // streams for concurrency.
+  se::Stream* stream = IsSyclStreamExecutor(local_device_->executor())
+                           ? local_device_->host_to_device_stream()
+                           : local_device_->GetDeviceToHostStream();
   auto device_event =
       BufferSequencingEvent::Create(client_->async_work_runner());
   device_event.AndThen([device_buffer = device_buffer_]() {});
@@ -190,15 +212,21 @@ PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
       return;
     }
 
+    absl::Status slice_status = buf->ValidateSlice(offset, transfer_size);
+    if (!slice_status.ok()) {
+      client->SetEventAsError(device_event, slice_status);
+      return;
+    }
     se::DeviceAddressBase sub_buffer = buf->device_buffer_->mem();
-    if (transfer_size < sub_buffer.size()) {
+    if (offset != 0 ||
+        static_cast<size_t>(transfer_size) != sub_buffer.size()) {
       sub_buffer = sub_buffer.GetByteSlice(offset, transfer_size);
     }
     std::shared_ptr<void> staging_buffer;
     auto status = [&]() -> absl::Status {
       RETURN_IF_ERROR(client->WaitForAllocation(stream, *buf));
       if (transfer_size > 0) {
-        if (client->ShouldStageHostToDeviceTransfers(dst, transfer_size)) {
+        if (client->ShouldStageHostTransfers(dst, transfer_size)) {
           if (client->GetHostMemoryAllocator() == nullptr) {
             return absl::InvalidArgumentError(
                 "host_memory_allocator should be initialized for "
@@ -215,7 +243,7 @@ PjRtStreamExecutorRawBuffer::CopyRawDeviceToHostAndReturnEvent(
                                            staging_buffer]() mutable {
             std::memcpy(dst, staging_buffer.get(), transfer_size);
           };
-          // TODO(parkers): This failing maybe consitutes a race.
+          // Keep the final host copy ordered after the D2H staging copy.
           RETURN_IF_ERROR(stream->DoHostCallback(copy_from_staging_buffer));
         } else {
           RETURN_IF_ERROR(stream->Memcpy(dst, sub_buffer, transfer_size));
@@ -261,7 +289,10 @@ ShapedBuffer PjRtStreamExecutorRawBuffer::AsShapedBuffer(
 absl::Status PjRtStreamExecutorRawBuffer::ValidateSlice(int64_t offset,
                                                         int64_t slice_size) {
   size_t buffer_size = GetOnDeviceSizeInBytes();
-  if (offset < 0 || offset > buffer_size || buffer_size - offset < slice_size) {
+  if (offset < 0 || slice_size < 0 ||
+      static_cast<size_t>(offset) > buffer_size ||
+      buffer_size - static_cast<size_t>(offset) <
+          static_cast<size_t>(slice_size)) {
     return InvalidArgument(
         "Invalid slicing of buffer size %lld with "
         "invalid offset %lld, slice size %lld",
