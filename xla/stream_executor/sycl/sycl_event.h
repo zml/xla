@@ -49,6 +49,9 @@ class SyclEvent : public Event {
   // Returns the underlying SYCL event. Not thread-safe.
   ::sycl::event GetEvent() const { return event_; }
 
+  // Blocks the host until this event completes.
+  absl::Status Wait();
+
   // Sets the underlying SYCL event. Not thread-safe.
   void SetEvent(const ::sycl::event& event) { event_ = event; }
 

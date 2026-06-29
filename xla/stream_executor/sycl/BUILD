@@ -186,6 +186,7 @@ sycl_library(
         "//xla/stream_executor:stream_common",
         "//xla/tsl/platform:logging",
         "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
     ],

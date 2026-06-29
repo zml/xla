@@ -17,6 +17,10 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -111,39 +115,55 @@ absl::Status LaunchSyclKernel(
             << "; using packed argument count " << num_args;
   }
 
-  stream_handle->submit([&](::sycl::handler& cgh) {
-    for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
-      if (arg_ptrs[arg_index] == nullptr) {
-        LOG(ERROR) << "LaunchSyclKernel: kernel argument " << arg_index
-                   << " is null, cannot set kernel argument.";
-        return;
+  try {
+    stream_handle->submit([&](::sycl::handler& cgh) {
+      for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
+        if (arg_ptrs[arg_index] == nullptr) {
+          LOG(ERROR) << "LaunchSyclKernel: kernel argument " << arg_index
+                     << " is null, cannot set kernel argument.";
+          return;
+        }
+        VLOG(2) << "Setting kernel argument " << arg_index
+                << " at address: " << arg_ptrs[arg_index];
+        cgh.set_arg(arg_index, arg_ptrs[arg_index]);
       }
-      VLOG(2) << "Setting kernel argument " << arg_index
-              << " at address: " << arg_ptrs[arg_index];
-      cgh.set_arg(arg_index, arg_ptrs[arg_index]);
-    }
 
-    if (num_args == 0) {
-      VLOG(2)
-          << "LaunchSyclKernel: No kernel arguments to set; launching kernel.";
-    }
-    if (shared_mem_bytes > 0) {
-      using shared_mem_t = ::sycl::local_accessor<int8_t, 1>;
-      shared_mem_t local_buffer(shared_mem_bytes, cgh);
-      VLOG(2) << "Setting shared memory argument " << num_args
-              << " with " << shared_mem_bytes << " bytes.";
-      cgh.set_arg(num_args, local_buffer);
-    }
-    for (size_t arg_index =
-             num_args + (shared_mem_bytes > 0 ? size_t{1} : size_t{0});
-         arg_index < reflected_total_args; ++arg_index) {
-      void* scratch_arg = nullptr;
-      VLOG(2) << "Setting trailing scratch argument " << arg_index
-              << " to null.";
-      cgh.set_arg(arg_index, scratch_arg);
-    }
-    cgh.parallel_for(nd_range, *function);
-  });
+      if (num_args == 0) {
+        VLOG(2) << "LaunchSyclKernel: No kernel arguments to set; launching "
+                   "kernel.";
+      }
+      const size_t local_arg_index = shared_mem_bytes > 0
+                                         ? reflected_total_args - 1
+                                         : reflected_total_args;
+      for (size_t arg_index = num_args; arg_index < local_arg_index;
+           ++arg_index) {
+        void* scratch_arg = nullptr;
+        VLOG(2) << "Setting trailing scratch argument " << arg_index
+                << " to null.";
+        cgh.set_arg(arg_index, scratch_arg);
+      }
+      if (shared_mem_bytes > 0) {
+        using shared_mem_t = ::sycl::local_accessor<int8_t, 1>;
+        shared_mem_t local_buffer(shared_mem_bytes, cgh);
+        VLOG(2) << "Setting shared memory argument " << local_arg_index
+                << " with " << shared_mem_bytes << " bytes.";
+        cgh.set_arg(local_arg_index, local_buffer);
+      }
+      cgh.parallel_for(nd_range, *function);
+    });
+  } catch (const ::sycl::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("LaunchSyclKernel: failed to submit kernel '",
+                     kernel_name, "': ", e.what()));
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("LaunchSyclKernel: failed to submit kernel '",
+                     kernel_name, "': ", e.what()));
+  } catch (...) {
+    return absl::InternalError(
+        absl::StrCat("LaunchSyclKernel: failed to submit kernel '",
+                     kernel_name, "': unknown exception"));
+  }
   return absl::OkStatus();
 }
 
@@ -260,39 +280,34 @@ absl::Status SyclStream::Memcpy(DeviceAddressBase* gpu_dst,
 
 absl::Status SyclStream::DoHostCallbackWithStatus(
     absl::AnyInvocable<absl::Status() &&> callback) {
-  // Heap-allocate and wrap the callback to ensure its lifetime for async
-  // execution.
-  auto callback_ptr =
-      new absl::AnyInvocable<void() &&>([cb = std::move(callback)]() mutable {
-        absl::Status status = std::move(cb)();
-        if (!status.ok()) {
-          LOG(WARNING) << "Host callback failed: " << status;
-        }
-      });
-  // Cast to void* to simplify lambda capture for SYCL host task.
-  auto callback_ptr_void = reinterpret_cast<void*>(callback_ptr);
+  return DoHostCallbackWithStatus(std::move(callback), /*error_cb=*/nullptr);
+}
 
-  // Lambda invokes and deletes the callback.
-  auto callback_function = std::function<void()>([callback_ptr_void]() {
-    auto* callback_ptr =
-        reinterpret_cast<absl::AnyInvocable<void() &&>*>(callback_ptr_void);
-    std::move (*callback_ptr)();
-    delete callback_ptr;
-  });
+absl::Status SyclStream::DoHostCallbackWithStatus(
+    absl::AnyInvocable<absl::Status() &&> callback,
+    absl::AnyInvocable<void(absl::Status) &&> error_cb) {
+  ASSIGN_OR_RETURN(SyclEvent event, SyclEvent::Create(executor_));
+  RETURN_IF_ERROR(RecordEvent(&event));
 
-  // Enqueue the host callback for asynchronous execution.
-  stream_handle_->submit([&](::sycl::handler& cgh) {
-    cgh.host_task(std::move(callback_function));
-  });
+  CallbackTask task;
+  task.event = std::make_unique<SyclEvent>(std::move(event));
+  task.callback = std::move(callback);
+  task.error_cb = std::move(error_cb);
 
-  // Callback successfully enqueued. Since it is executed asynchronously,
-  // return OK status even if the callback itself may fail.
+  {
+    std::lock_guard<std::mutex> lock(callback_mu_);
+    if (callback_thread_shutdown_) {
+      return absl::FailedPreconditionError(
+          "DoHostCallbackWithStatus called while SYCL stream is shutting down");
+    }
+    callback_tasks_.push_back(std::move(task));
+  }
+  callback_cv_.notify_one();
   return absl::OkStatus();
 }
 
 absl::Status SyclStream::BlockHostUntilDone() {
-  stream_handle_->wait();
-  return absl::OkStatus();
+  return SyclStreamSynchronize(stream_handle_.get());
 }
 
 absl::StatusOr<std::unique_ptr<SyclStream>> SyclStream::Create(
@@ -328,6 +343,15 @@ absl::StatusOr<std::unique_ptr<SyclStream>> SyclStream::Create(
 }
 
 SyclStream::~SyclStream() {
+  {
+    std::lock_guard<std::mutex> lock(callback_mu_);
+    callback_thread_shutdown_ = true;
+  }
+  callback_cv_.notify_one();
+  if (callback_thread_.joinable()) {
+    callback_thread_.join();
+  }
+
   // Wait for all pending operations to complete before destroying the stream.
   BlockHostUntilDone().IgnoreError();
 
@@ -350,6 +374,39 @@ SyclStream::~SyclStream() {
 
 absl::Status SyclStream::RecordCompletedEvent() {
   return RecordEvent(&completed_event_);
+}
+
+void SyclStream::CallbackWorkLoop() {
+  while (true) {
+    CallbackTask task;
+    {
+      std::unique_lock<std::mutex> lock(callback_mu_);
+      callback_cv_.wait(lock, [this] {
+        return callback_thread_shutdown_ || !callback_tasks_.empty();
+      });
+      if (callback_thread_shutdown_ && callback_tasks_.empty()) {
+        return;
+      }
+      task = std::move(callback_tasks_.front());
+      callback_tasks_.pop_front();
+    }
+    RunCallbackTask(std::move(task));
+  }
+}
+
+void SyclStream::RunCallbackTask(CallbackTask task) {
+  absl::Status status = task.event->Wait();
+  if (status.ok()) {
+    status = std::move(task.callback)();
+  }
+
+  if (!status.ok()) {
+    if (task.error_cb) {
+      std::move(task.error_cb)(status);
+    } else {
+      LOG(WARNING) << "Host callback failed: " << status;
+    }
+  }
 }
 
 absl::Status SyclStream::LaunchKernel(
