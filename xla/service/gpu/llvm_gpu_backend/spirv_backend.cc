@@ -200,6 +200,23 @@ void MaterializeWorkgroupSlm(llvm::Module* module) {
   llvm::ConstantPointerNull* null_slm = llvm::ConstantPointerNull::get(
       llvm::PointerType::get(context, /*AddressSpace=*/3));
   null_slm->replaceAllUsesWith(slm);
+  for (llvm::Function& func : *module) {
+    for (llvm::BasicBlock& block : func) {
+      for (llvm::Instruction& instr : block) {
+        for (llvm::Use& operand : instr.operands()) {
+          auto* null_ptr =
+              llvm::dyn_cast<llvm::ConstantPointerNull>(operand.get());
+          auto* ptr_type = null_ptr == nullptr
+                               ? nullptr
+                               : llvm::dyn_cast<llvm::PointerType>(
+                                     null_ptr->getType());
+          if (ptr_type != nullptr && ptr_type->getAddressSpace() == 3) {
+            operand.set(slm);
+          }
+        }
+      }
+    }
+  }
   VLOG(2) << "Materialized " << shared_mem_bytes
           << " bytes of SPIR-V Workgroup SLM.";
 }
