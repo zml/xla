@@ -223,6 +223,12 @@ class CommonAsyncHostToDeviceTransferManager
     DCHECK_LT(buffer_index, undispatched_buffer_refs_.size());
     PjRtRawBufferRef& undispatched_buffer_ref =
         undispatched_buffer_refs_[buffer_index];
+    if (!terminal_errors_[buffer_index].ok()) {
+      return FailedPrecondition(
+          "TransferLiteralToBuffer requested for buffer index %d after an "
+          "earlier async transfer failure: %s",
+          buffer_index, terminal_errors_[buffer_index].ToString());
+    }
     if (!undispatched_buffer_ref) {
       return InvalidArgument(
           "TransferLiteralToBuffer requested for buffer index %d which has "
@@ -287,6 +293,11 @@ class CommonAsyncHostToDeviceTransferManager
         --buffer_transfers_in_flight_[buffer_index];
         CHECK_GT(remaining_buffer_count_, 0);
         --remaining_buffer_count_;
+        auto state = transfer_event.async_value()->state();
+        if (state == tsl::AsyncValue::State::kError) {
+          RecordBufferErrorLocked(buffer_index,
+                                  transfer_event.async_value()->GetError());
+        }
         swap(definition_event, definition_events_[buffer_index]);
       }
 
@@ -325,6 +336,12 @@ class CommonAsyncHostToDeviceTransferManager
       bool is_last_transfer, absl::AnyInvocable<void() &&> on_done) override {
     absl::ReleasableMutexLock l(mu_);
     DCHECK_LT(buffer_index, undispatched_buffer_refs_.size());
+    if (!terminal_errors_[buffer_index].ok()) {
+      return FailedPrecondition(
+          "TransferRawDataToSubBuffer requested for buffer index %d after an "
+          "earlier async transfer failure: %s",
+          buffer_index, terminal_errors_[buffer_index].ToString());
+    }
     PjRtRawBufferRef undispatched_buffer_ref;
     // Drop reference to the buffer if this is the last transfer.
     if (is_last_transfer) {
@@ -339,7 +356,12 @@ class CommonAsyncHostToDeviceTransferManager
           "already been fully transferred",
           buffer_index);
     }
-    CHECK(definition_events_[buffer_index]);
+    if (!definition_events_[buffer_index]) {
+      return FailedPrecondition(
+          "TransferRawDataToSubBuffer requested for buffer index %d after its "
+          "definition event was already resolved",
+          buffer_index);
+    }
     std::string op_name = "TransferRawDataToSubBuffer";
     std::string region_type = "";
     if (debug_info_.has_value()) {
@@ -402,6 +424,11 @@ class CommonAsyncHostToDeviceTransferManager
         CHECK_GT(buffer_transfers_in_flight_[buffer_index], 0);
         --buffer_transfers_in_flight_[buffer_index];
         auto& definition_event_ref = definition_events_[buffer_index];
+        auto state = transfer_event.async_value()->state();
+        if (state == tsl::AsyncValue::State::kError) {
+          RecordBufferErrorLocked(buffer_index,
+                                  transfer_event.async_value()->GetError());
+        }
         if (buffer_transfers_in_flight_[buffer_index] == 0 &&
             !undispatched_buffer_refs_[buffer_index]) {
           CHECK_GT(remaining_buffer_count_, 0);
@@ -412,7 +439,6 @@ class CommonAsyncHostToDeviceTransferManager
         if (definition_event_ref) {
           // If this is not the last completed transfer, then we need to set the
           // error while holding the lock to avoid a race.
-          auto state = transfer_event.async_value()->state();
           if (state == tsl::AsyncValue::State::kError) {
             definition_event_ref.SetError(
                 transfer_event.async_value()->GetError());
@@ -448,6 +474,7 @@ class CommonAsyncHostToDeviceTransferManager
     absl::MutexLock l(mu_);
     // For a given buffer_index, SetBufferError can't be called twice, or
     // called after the last transfer has been enqueued.
+    terminal_errors_[buffer_index] = error;
     auto definition_event = std::move(definition_events_[buffer_index]);
     CHECK(definition_event);
     definition_event.SetError(error);
@@ -495,6 +522,13 @@ class CommonAsyncHostToDeviceTransferManager
     ::tsl::AsyncValueRef<bool> event_;
   };
 
+  void RecordBufferErrorLocked(int buffer_index, const absl::Status& error)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    if (terminal_errors_[buffer_index].ok()) {
+      terminal_errors_[buffer_index] = error;
+    }
+  }
+
   CommonAsyncHostToDeviceTransferManager(
       absl::InlinedVector<std::unique_ptr<PjRtBuffer>, 4> buffers,
       absl::InlinedVector<PjRtRawBufferRef, 4> raw_buffers,
@@ -518,6 +552,7 @@ class CommonAsyncHostToDeviceTransferManager
         memory_space_(memory_space) {
     DCHECK_EQ(memory_space_->devices().size(), 1);
     buffer_transfers_in_flight_.resize(undispatched_buffer_refs_.size(), 0);
+    terminal_errors_.resize(undispatched_buffer_refs_.size());
   }
 
   std::optional<std::string> debug_info_;
@@ -544,6 +579,9 @@ class CommonAsyncHostToDeviceTransferManager
   // Number of transfers in flight for each buffer. Used to determine when the
   // last transfer has completed, in case the completions arrive out of order.
   absl::InlinedVector<int, 4> buffer_transfers_in_flight_ ABSL_GUARDED_BY(mu_);
+  // First terminal error observed for each buffer. Used to reject later
+  // multi-chunk transfer calls cleanly after an async transfer failed.
+  absl::InlinedVector<absl::Status, 4> terminal_errors_ ABSL_GUARDED_BY(mu_);
   // Per buffer definition event. It is made available once the buffer is ready
   // (either because the transfer for that buffer completed, or because an error
   // was recorded for that buffer).

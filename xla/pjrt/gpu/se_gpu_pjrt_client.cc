@@ -169,6 +169,28 @@ static bool IsMemorySpaceKind(const PjRtMemorySpace* memory_space) {
   return memory_space->kind_id() == MemorySpaceKind::kKindId;
 }
 
+absl::StatusOr<gpu::GpuCollectives*> GetDefaultGpuCollectives() {
+  TF_ASSIGN_OR_RETURN(Collectives * collectives,
+                      CollectivesRegistry::Default("gpu"));
+  auto* gpu_collectives = dynamic_cast<gpu::GpuCollectives*>(collectives);
+  if (gpu_collectives == nullptr) {
+    return Internal(
+        "Default GPU collectives implementation must be GpuCollectives");
+  }
+  return gpu_collectives;
+}
+
+absl::StatusOr<gpu::GpuCommunicator*> GetGpuCommunicator(Communicator* comm) {
+  if (comm == nullptr) {
+    return Internal("GPU clique returned a null communicator");
+  }
+  auto* gpu_comm = dynamic_cast<gpu::GpuCommunicator*>(comm);
+  if (gpu_comm == nullptr) {
+    return Internal("GPU clique communicator must be GpuCommunicator");
+  }
+  return gpu_comm;
+}
+
 absl::Status RunCallbackOnStream(
     se::Stream* stream, AsyncWorkRunner* async_work_runner,
     absl::AnyInvocable<void() &&> callback,
@@ -406,9 +428,25 @@ namespace {
 
 // Get the local device state for a given PjRtDevice.
 absl::StatusOr<LocalDeviceState*> GetLocalDeviceState(PjRtDevice* device) {
-  PjRtStreamExecutorDevice* pjrt_se_device =
-      tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+  auto* pjrt_se_device = dynamic_cast<PjRtStreamExecutorDevice*>(device);
+  if (pjrt_se_device == nullptr) {
+    return InvalidArgument(
+        "Cross-host transfer requires a PjRtStreamExecutorDevice");
+  }
   return pjrt_se_device->GetLocalDeviceState();
+}
+
+absl::StatusOr<PjRtStreamExecutorRawBuffer*> GetStreamExecutorRawBuffer(
+    const PjRtRawBufferRef& raw_buffer) {
+  if (raw_buffer == nullptr) {
+    return InvalidArgument("Cross-host transfer requires a non-null raw buffer");
+  }
+  auto* se_raw_buffer = raw_buffer->down_cast<PjRtStreamExecutorRawBuffer>();
+  if (se_raw_buffer == nullptr) {
+    return InvalidArgument(
+        "Cross-host transfer requires a PjRtStreamExecutorRawBuffer");
+  }
+  return se_raw_buffer;
 }
 
 // Creates a communicator for a cross-host transfer; used by the original
@@ -439,7 +477,11 @@ absl::StatusOr<std::unique_ptr<Communicator>> CreateTransferCommunicator(
   ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Communicator>> communicators,
                    gpu_collectives->CreateCommunicators(clique_key, clique_ids,
                                                         ranks, config));
-  CHECK_EQ(communicators.size(), 1);
+  if (communicators.size() != 1) {
+    return Internal(
+        "Expected one cross-host transfer communicator but got %d",
+        communicators.size());
+  }
 
   return std::move(communicators[0]);
 }
@@ -550,9 +592,9 @@ absl::StatusOr<AcquiredCliqueAndCommunicator> AcquireCliqueAndCommunicator(
         "acquired GPU clique.");
   }
 
-  return AcquiredCliqueAndCommunicator{
-      std::move(clique),
-      absl::down_cast<gpu::GpuCommunicator*>(*maybe_communicator)};
+  TF_ASSIGN_OR_RETURN(gpu::GpuCommunicator * gpu_communicator,
+                      GetGpuCommunicator(*maybe_communicator));
+  return AcquiredCliqueAndCommunicator{std::move(clique), gpu_communicator};
 }
 
 // Create a `PreparedTransfer` object bundling together state needed to perform
@@ -729,8 +771,7 @@ StreamExecutorGpuClient::CrossHostTransferBuffers(
     // Get the local_device_state and use it to schedule transfers. Fail
     // transfers early if we cannot get the local_device_state.
     absl::StatusOr<LocalDeviceState*> local_device_state =
-        tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
-            ->GetLocalDeviceState();
+        GetLocalDeviceState(device);
     if (!local_device_state.ok()) {
       SetEventAsError(transfer_event, local_device_state.status());
       continue;
@@ -817,9 +858,10 @@ void StreamExecutorGpuClient::ScheduleTransfersOnLocalDevice(
          se::Stream* stream) -> absl::Status {
     for (PreparedTransfer& prepared_transfer : prepared_transfers) {
       // Launch the transfer.
-      auto mem = prepared_transfer.raw_buffer_
-                     ->down_cast<PjRtStreamExecutorRawBuffer>()
-                     ->device_buffer();
+      TF_ASSIGN_OR_RETURN(PjRtStreamExecutorRawBuffer * se_raw_buffer,
+                          GetStreamExecutorRawBuffer(
+                              prepared_transfer.raw_buffer_));
+      auto mem = se_raw_buffer->device_buffer();
 
       // We always set `peer` to RankId(1) if we are the sender, and RankId(0)
       // if we are the receiver. This is because `PrepareTransfer()` always
@@ -933,8 +975,7 @@ StreamExecutorGpuClient::PrepareReceiveBuffer(PjRtDevice* device, Shape shape) {
                                      /*retry_on_oom=*/true,
                                      /*allocate_after=*/{}));
   ASSIGN_OR_RETURN(LocalDeviceState * local_device,
-                   tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
-                       ->GetLocalDeviceState());
+                   GetLocalDeviceState(device));
 
   se::Stream* stream = local_device->GetDeviceToDeviceStream();
 
@@ -958,19 +999,14 @@ void StreamExecutorGpuClient::ScheduleRemoteSend(
     Future<std::string> serialized_descriptor,
     PjRtBuffer::RemoteSendCallback on_done) {
   // Get the default GpuCollectives instance.
-  absl::StatusOr<Collectives*> collectives =
-      CollectivesRegistry::Default("gpu");
-  if (!collectives.ok()) {
-    on_done(collectives.status(), /*sends_were_enqueued=*/false);
-  }
-  gpu::GpuCollectives* gpu_collectives =
-      absl::down_cast<gpu::GpuCollectives*>(*collectives);
-  if (gpu_collectives == nullptr) {
-    auto error = absl::InternalError("Failed to get GPU collectives");
-    on_done(error, /*sends_were_enqueued=*/false);
-    usage_event_promise.SetError(error);
+  absl::StatusOr<gpu::GpuCollectives*> gpu_collectives_or =
+      GetDefaultGpuCollectives();
+  if (!gpu_collectives_or.ok()) {
+    on_done(gpu_collectives_or.status(), /*sends_were_enqueued=*/false);
+    usage_event_promise.SetError(gpu_collectives_or.status());
     return;
   }
+  gpu::GpuCollectives* gpu_collectives = *gpu_collectives_or;
 
   BufferSequencingEventRef usage_event =
       BufferSequencingEvent::Create(this->async_work_runner());
@@ -988,6 +1024,7 @@ void StreamExecutorGpuClient::ScheduleRemoteSend(
           on_done(serialized_descriptor.status(),
                   /*sends_were_enqueued=*/false);
           SetEventAsError(usage_event, serialized_descriptor.status());
+          return;
         }
         PjRtDeviceEventSpan definition_events_span(definition_events);
         ExecuteWhenReady(
@@ -1000,8 +1037,9 @@ void StreamExecutorGpuClient::ScheduleRemoteSend(
                  *std::move(serialized_descriptor)]() mutable {
               auto status = [&]() -> absl::Status {
                 RETURN_IF_ERROR(GetErrors(definition_events));
-                auto* se_raw_buffer =
-                    raw_buffer->down_cast<PjRtStreamExecutorRawBuffer>();
+                TF_ASSIGN_OR_RETURN(
+                    PjRtStreamExecutorRawBuffer * se_raw_buffer,
+                    GetStreamExecutorRawBuffer(raw_buffer));
                 auto* local_device = se_raw_buffer->local_device();
                 auto* stream = local_device->GetDeviceToDeviceStream();
                 auto mem = se_raw_buffer->device_buffer();
@@ -1053,13 +1091,8 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
   Shape shape = shapes[0];
 
   // Get the default GpuCollectives instance.
-  ASSIGN_OR_RETURN(Collectives * collectives,
-                   CollectivesRegistry::Default("gpu"));
-  gpu::GpuCollectives* gpu_collectives =
-      absl::down_cast<gpu::GpuCollectives*>(collectives);
-  if (gpu_collectives == nullptr) {
-    return absl::InternalError("Failed to get GPU collectives");
-  }
+  TF_ASSIGN_OR_RETURN(gpu::GpuCollectives * gpu_collectives,
+                      GetDefaultGpuCollectives());
 
   ASSIGN_OR_RETURN(
       StreamExecutorGpuClient::PrepareReceiveBufferResult receive_prep_result,
@@ -1078,8 +1111,9 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
       // Create a CliqueId.
       ASSIGN_OR_RETURN(CliqueId clique_id,
                        gpu_collectives->CreateUniqueCliqueId());
-      auto mem =
-          raw_buffer->down_cast<PjRtStreamExecutorRawBuffer>()->device_buffer();
+      TF_ASSIGN_OR_RETURN(PjRtStreamExecutorRawBuffer * se_raw_buffer,
+                          GetStreamExecutorRawBuffer(raw_buffer));
+      auto mem = se_raw_buffer->device_buffer();
 
       // Notify the caller with the CliqueId. They will send the id to the
       // sender.
@@ -1743,14 +1777,8 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
   gpu_executable_run_options->set_gpu_global_device_ids(
       std::move(gpu_device_ids));
 
-  ASSIGN_OR_RETURN(xla::Collectives * collectives,
-                   xla::CollectivesRegistry::Default("gpu"));
-  xla::gpu::GpuCollectives* gpu_collectives =
-      absl::down_cast<xla::gpu::GpuCollectives*>(collectives);
-
-  if (gpu_collectives == nullptr) {
-    return absl::InternalError("Failed to get GPU collectives");
-  }
+  TF_ASSIGN_OR_RETURN(xla::gpu::GpuCollectives * gpu_collectives,
+                      GetDefaultGpuCollectives());
 
   size_t num_processes = global_topology.processes().size();
   if (gpu_collectives->IsImplemented()) {

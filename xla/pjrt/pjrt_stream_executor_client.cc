@@ -1939,7 +1939,7 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
       }
     }
 
-    VLOG(1) << "Start calling RunAsync for "
+    VLOG(2) << "Start calling RunAsync for "
             << executable->executable()->module().name()
             << ", device=" << device->DebugString()
             << ", run_id=" << run_options.run_id().ToInt();
@@ -1984,12 +1984,22 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
       }
     }
 
-    VLOG(1) << "Finish calling RunAsync for "
-            << executable->executable()->module().name()
-            << ", device=" << device->DebugString()
-            << ", run_id=" << run_options.run_id().ToInt()
-            << ", replica=" << replica << ", partition=" << partition
-            << ", completed, ok=" << result_buffer_or_status.ok();
+    if (result_buffer_or_status.ok()) {
+      VLOG(2) << "Finish calling RunAsync for "
+              << executable->executable()->module().name()
+              << ", device=" << device->DebugString()
+              << ", run_id=" << run_options.run_id().ToInt()
+              << ", replica=" << replica << ", partition=" << partition
+              << ", completed, ok=true";
+    } else {
+      VLOG(1) << "Finish calling RunAsync for "
+              << executable->executable()->module().name()
+              << ", device=" << device->DebugString()
+              << ", run_id=" << run_options.run_id().ToInt()
+              << ", replica=" << replica << ", partition=" << partition
+              << ", completed, ok=false, status="
+              << result_buffer_or_status.status();
+    }
 
     // Add a callback on the stream to record the elapsed device time of the
     // executable execution.
@@ -2022,21 +2032,20 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
       }
     }
 
-    if (client->platform_name() == OneapiName() &&
-        result_buffer_or_status.ok()) {
+    if (client->platform_id() == OneapiId() && result_buffer_or_status.ok()) {
       // oneAPI/Level Zero currently needs host-side synchronization here to
       // make PJRT buffer readiness match the async execute contract.
-      VLOG(1) << "Start oneAPI stream synchronization for "
+      VLOG(2) << "Start oneAPI stream synchronization for "
               << executable->executable()->module().name()
               << ", device=" << device->DebugString()
               << ", run_id=" << run_options.run_id().ToInt();
       absl::Status status = device_state->compute_stream()->BlockHostUntilDone();
-      VLOG(1) << "Finish oneAPI stream synchronization for "
-              << executable->executable()->module().name()
-              << ", device=" << device->DebugString()
-              << ", run_id=" << run_options.run_id().ToInt()
-              << ", ok=" << status.ok();
       if (!status.ok()) {
+        VLOG(1) << "oneAPI stream synchronization failed for "
+                << executable->executable()->module().name()
+                << ", device=" << device->DebugString()
+                << ", run_id=" << run_options.run_id().ToInt()
+                << ", status=" << status;
         result_buffer_or_status = status;
       }
     }

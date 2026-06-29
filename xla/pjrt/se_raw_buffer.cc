@@ -406,7 +406,7 @@ void PjRtStreamExecutorRawBuffer::CopyTo(
                 staging_buffer.get(), 0,
                 dst_raw_buffer->GetOnDeviceSizeInBytes());
             if (!h2d_event.ok()) {
-              definition_event_promise.SetError(*error);
+              definition_event_promise.SetError(h2d_event.status());
             } else {
               (*h2d_event).AndThen([staging_buffer]() {});
               definition_event_promise.Set(*std::move(h2d_event));
