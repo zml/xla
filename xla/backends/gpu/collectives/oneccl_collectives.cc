@@ -29,7 +29,6 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "absl/base/casts.h"
 #include "absl/base/call_once.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
@@ -95,6 +94,15 @@ constexpr char kCclLocalRank[] = "CCL_LOCAL_RANK";
 constexpr char kCclAtlTransport[] = "CCL_ATL_TRANSPORT";
 constexpr char kCclAtlShm[] = "CCL_ATL_SHM";
 constexpr char kFiProvider[] = "FI_PROVIDER";
+
+absl::StatusOr<const GpuCliqueKey*> GetOnecclGpuCliqueKey(
+    const CliqueKey& key) {
+  auto* gpu_key = dynamic_cast<const GpuCliqueKey*>(&key);
+  if (gpu_key == nullptr) {
+    return InvalidArgument("oneCCL requires GPU clique keys");
+  }
+  return gpu_key;
+}
 
 struct OnecclEnvDefault {
   const char* name;
@@ -235,6 +243,19 @@ bool VisibleDevicesAreMultiGpuIntelDevices() {
   return AreMultiGpuIntelDevices(devices);
 }
 
+bool StreamExecutorsAreMultiGpuIntelDevices(
+    absl::Span<se::StreamExecutor* const> stream_executors) {
+  std::vector<::sycl::device> devices;
+  devices.reserve(stream_executors.size());
+  for (se::StreamExecutor* stream_executor : stream_executors) {
+    auto* sycl_executor =
+        dynamic_cast<stream_executor::sycl::SyclExecutor*>(stream_executor);
+    if (sycl_executor == nullptr) return false;
+    devices.push_back(sycl_executor->GetDevice());
+  }
+  return AreMultiGpuIntelDevices(devices);
+}
+
 void SetOnecclIntelGpuCollectiveEnvDefaultsIfNeeded(
     bool is_multi_gpu_intel) {
   // On tested multi-GPU Intel SYCL configurations, oneCCL's default BF16
@@ -279,6 +300,21 @@ void SetOnecclSingleProcessBootstrapEnvDefaults() {
       "bootstrap environment for single-process oneCCL execution");
 }
 
+absl::StatusOr<CliqueIds> GetOnecclSingleProcessCliqueIds(
+    const CliqueKey& key) {
+  TF_ASSIGN_OR_RETURN(const GpuCliqueKey* gpu_key,
+                      GetOnecclGpuCliqueKey(key));
+  if (!gpu_key->is_local()) {
+    return Internal(
+        "single-process oneCCL topology cannot create clique ids for "
+        "non-local GPU clique %v",
+        key);
+  }
+
+  SetOnecclSingleProcessBootstrapEnvDefaults();
+  return CliqueIds();
+}
+
 absl::Status EnsureOnecclInitialized() {
   try {
     absl::call_once(ccl_init_once, InitOnecclOnce);
@@ -307,10 +343,8 @@ class OnecclIdStore {
 
   absl::StatusOr<CliqueIds> GetCliqueIds(
       const CliqueKey& key, OnecclCollectives& oneccl_collectives) {
-    auto* gpu_key = absl::down_cast<const GpuCliqueKey*>(&key);
-    if (gpu_key == nullptr) {
-      return InvalidArgument("Expected GPU clique key");
-    }
+    TF_ASSIGN_OR_RETURN(const GpuCliqueKey* gpu_key,
+                        GetOnecclGpuCliqueKey(key));
 
     {
       absl::MutexLock lock(mu_);
@@ -449,22 +483,87 @@ absl::StatusOr<T> OnecclValue(absl::string_view expr, F&& fn) {
   }
 }
 
-absl::StatusOr<ccl::library_version> GetLinkedOnecclVersion() {
+absl::StatusOr<ccl::library_version> GetOnecclLibraryVersion() {
   return OnecclValue<ccl::library_version>(
       "ccl::get_library_version", [] { return ccl::get_library_version(); });
 }
 
 std::string FormatOnecclVersion(const ccl::library_version& version) {
-  if (version.full != nullptr) {
-    return version.full;
+  std::string numeric =
+      absl::StrFormat("%u.%u.%u", version.major, version.minor,
+                      version.update);
+  std::string formatted = numeric;
+  auto append_field = [&](absl::string_view name, const char* value) {
+    if (value != nullptr && value[0] != '\0') {
+      absl::StrAppend(&formatted, " ", name, "=", value);
+    }
+  };
+
+  append_field("status", version.product_status);
+  append_field("build", version.build_date);
+
+  std::string backend = static_cast<std::string>(version.cl_backend_name);
+  if (!backend.empty()) {
+    absl::StrAppend(&formatted, " backend=", backend);
   }
-  return absl::StrFormat("%d.%d.%d", version.major, version.minor,
-                         version.update);
+
+  if (version.full != nullptr && version.full[0] != '\0') {
+    absl::string_view full(version.full);
+    absl::string_view status(version.product_status != nullptr
+                                 ? version.product_status
+                                 : "");
+    if (full != status && full != numeric) {
+      absl::StrAppend(&formatted, " full=", full);
+    }
+  }
+  return formatted;
 }
 
 std::string CompiledOnecclVersion() {
   return absl::StrFormat("%d.%d.%d", CCL_MAJOR_VERSION, CCL_MINOR_VERSION,
                          CCL_UPDATE_VERSION);
+}
+
+struct OnecclDeviceContext {
+  ccl::device device;
+  ccl::context context;
+};
+
+struct OnecclCommunicatorCreationSetup {
+  std::vector<se::StreamExecutor*> stream_executors;
+  std::shared_ptr<CancellationToken> cancel;
+};
+
+absl::StatusOr<OnecclDeviceContext> CreateOnecclDeviceContext(
+    se::StreamExecutor* stream_executor) {
+  auto* sycl_executor =
+      dynamic_cast<stream_executor::sycl::SyclExecutor*>(stream_executor);
+  if (sycl_executor == nullptr) {
+    return InvalidArgument(
+        "oneCCL communicator creation requires SYCL executors");
+  }
+
+  ::sycl::device sycl_device = sycl_executor->GetDevice();
+  ASSIGN_OR_RETURN(ccl::device ccl_device,
+                   OnecclValue<ccl::device>("ccl::create_device", [&] {
+                     return ccl::create_device(std::move(sycl_device));
+                   }));
+  ASSIGN_OR_RETURN(::sycl::context sycl_context, sycl_executor->GetContext());
+  ASSIGN_OR_RETURN(ccl::context ccl_context,
+                   OnecclValue<ccl::context>("ccl::create_context", [&] {
+                     return ccl::create_context(std::move(sycl_context));
+                   }));
+  return OnecclDeviceContext{std::move(ccl_device), std::move(ccl_context)};
+}
+
+absl::StatusOr<ccl::communicator> CreateOnecclCommunicator(
+    int num_devices, RankId rank, ccl::device& device, ccl::context& context,
+    const std::shared_ptr<ccl::kvs_interface>& kvs,
+    const ccl::comm_attr& comm_attr) {
+  return OnecclValue<ccl::communicator>("ccl::create_communicatorExt", [&] {
+    return ccl::create_communicatorExt(num_devices, rank.value(), device,
+                                       context, kvs, comm_attr);
+  });
 }
 
 std::string KvsAddressToString(const ccl::kvs::address_type& address) {
@@ -477,9 +576,36 @@ absl::StatusOr<std::unique_ptr<Communicator>> Cast(
   return std::unique_ptr<Communicator>(comm.release());
 }
 
-int32_t DeviceOrdinal(const OnecclCollectives::DeviceRank& rank) {
-  auto* device = absl::down_cast<const GpuCollectives::Device*>(rank.device);
-  return device->stream_executor()->device_ordinal();
+absl::StatusOr<std::unique_ptr<Communicator>> CreateOnecclCommunicatorForRank(
+    se::StreamExecutor* stream_executor, int num_devices, RankId rank,
+    const std::shared_ptr<ccl::kvs_interface>& kvs,
+    const ccl::comm_attr& comm_attr,
+    const std::shared_ptr<CancellationToken>& cancel) {
+  int32_t device_ordinal = stream_executor->device_ordinal();
+  auto activation = stream_executor->Activate();
+
+  ASSIGN_OR_RETURN(OnecclDeviceContext device_context,
+                   CreateOnecclDeviceContext(stream_executor));
+
+  absl::StatusOr<ccl::communicator> ccl_comm = CreateOnecclCommunicator(
+      num_devices, rank, device_context.device, device_context.context, kvs,
+      comm_attr);
+  if (!ccl_comm.ok()) {
+    LOG(ERROR) << absl::StreamFormat(
+        "[%d] [rank=%v] Failed to create oneCCL communicator: %s",
+        device_ordinal, rank, ccl_comm.status().ToString());
+    return absl::StatusOr<std::unique_ptr<Communicator>>(ccl_comm.status());
+  }
+
+  absl::StatusOr<std::unique_ptr<OnecclCommunicator>> comm =
+      OnecclCommunicator::Create(stream_executor, std::move(*ccl_comm), kvs,
+                                 cancel);
+  if (!comm.ok()) {
+    LOG(ERROR) << absl::StreamFormat(
+        "[%d] [rank=%v] Failed to wrap oneCCL communicator: %s",
+        device_ordinal, rank, comm.status().ToString());
+  }
+  return Cast(std::move(comm));
 }
 
 std::string DeviceOrdinalsToString(
@@ -497,23 +623,153 @@ std::string DeviceRanksToString(
   });
 }
 
-const OnecclCommunicator* CastOneccl(const Communicator* comm) {
-  auto* oneccl_communicator =
-      absl::down_cast<const OnecclCommunicator*>(comm);
-  CHECK(oneccl_communicator != nullptr) << "Unsupported XLA communicator";
+std::string RankIdsToString(absl::Span<const RankId> ranks) {
+  return absl::StrJoin(ranks, ",", [](std::string* str, RankId rank) {
+    absl::StrAppend(str, rank.value());
+  });
+}
+
+absl::StatusOr<const OnecclCommunicator*> CastOneccl(const Communicator* comm) {
+  if (comm == nullptr) {
+    return InvalidArgument("oneCCL split communicator cannot be null");
+  }
+  const auto* oneccl_communicator =
+      dynamic_cast<const OnecclCommunicator*>(comm);
+  if (oneccl_communicator == nullptr) {
+    return InvalidArgument(
+        "oneCCL split requires oneCCL communicators, got a different "
+        "communicator implementation");
+  }
   return oneccl_communicator;
+}
+
+absl::StatusOr<std::unique_ptr<Communicator>>
+CreateSplitOnecclCommunicatorForRank(
+    se::StreamExecutor* stream_executor, const Communicator* comm,
+    RankId rank, RankId key, int32_t color, bool split_share,
+    const std::shared_ptr<CancellationToken>& cancel) {
+  int32_t device_ordinal = stream_executor->device_ordinal();
+  ASSIGN_OR_RETURN(const OnecclCommunicator* oneccl_comm, CastOneccl(comm));
+
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        absl::StrFormat("[%v] [rank=%v] onecclCommSplit", device_ordinal,
+                        rank),
+        {{"color", color}, {"key", key}});
+  });
+
+  absl::Time split_start = absl::Now();
+  VLOG(2) << absl::StreamFormat(
+      "[%d] [rank=%v] Split oneCCL communicator %p with color %d and key %v",
+      device_ordinal, rank, static_cast<const void*>(comm), color, key);
+
+  absl::StatusOr<ccl::communicator> split_comm =
+      oneccl_comm->Split(color, key.value(), split_share);
+  if (!split_comm.ok()) {
+    LOG(ERROR) << absl::StreamFormat(
+        "[%d] [rank=%v] Failed to split oneCCL communicator: %s",
+        device_ordinal, rank, split_comm.status().ToString());
+    return absl::StatusOr<std::unique_ptr<Communicator>>(split_comm.status());
+  }
+
+  absl::Time split_done = absl::Now();
+  VLOG(2) << absl::StreamFormat(
+      "[%d] [rank=%v] Split oneCCL communicator %p with color %d and key %v "
+      "in %v",
+      device_ordinal, rank, static_cast<const void*>(comm), color, key,
+      split_done - split_start);
+
+  absl::StatusOr<std::unique_ptr<OnecclCommunicator>> split_oneccl_comm =
+      OnecclCommunicator::Create(stream_executor, std::move(*split_comm),
+                                 oneccl_comm->kvs(), cancel);
+  if (!split_oneccl_comm.ok()) {
+    LOG(ERROR) << absl::StreamFormat(
+        "[%d] [rank=%v] Failed to split oneCCL communicator: %s",
+        device_ordinal, rank, split_oneccl_comm.status().ToString());
+  }
+  return Cast(std::move(split_oneccl_comm));
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
+CreateOnecclCommunicatorsForRanks(
+    absl::Span<se::StreamExecutor* const> stream_executors, int num_devices,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks,
+    const std::shared_ptr<ccl::kvs_interface>& kvs,
+    const ccl::comm_attr& comm_attr,
+    const std::shared_ptr<CancellationToken>& cancel) {
+  if (stream_executors.size() != ranks.size()) {
+    return InvalidArgument(
+        "oneCCL communicator creation got %d stream executors for %d ranks",
+        static_cast<int64_t>(stream_executors.size()),
+        static_cast<int64_t>(ranks.size()));
+  }
+
+  tsl::thread::ThreadPool pool(tsl::Env::Default(), "CreateOnecclComms",
+                               ranks.size());
+
+  std::vector<Future<std::unique_ptr<Communicator>>> futures(ranks.size());
+  for (size_t i = 0; i < ranks.size(); ++i) {
+    futures[i] = MakeFutureOn(*pool.AsExecutor(), [&, i]()
+        -> absl::StatusOr<std::unique_ptr<Communicator>> {
+      return CreateOnecclCommunicatorForRank(
+          stream_executors[i], num_devices, ranks[i].rank, kvs, comm_attr,
+          cancel);
+    });
+  }
+
+  return JoinFutures(absl::MakeSpan(futures)).Await();
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
+SplitOnecclCommunicatorsForRanks(
+    absl::Span<const Communicator* const> comms,
+    absl::Span<se::StreamExecutor* const> stream_executors,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks, int32_t color,
+    absl::Span<const RankId> keys, bool split_share,
+    const std::shared_ptr<CancellationToken>& cancel) {
+  if (stream_executors.size() != comms.size()) {
+    return InvalidArgument(
+        "oneCCL communicator split got %d stream executors for %d "
+        "communicators",
+        static_cast<int64_t>(stream_executors.size()),
+        static_cast<int64_t>(comms.size()));
+  }
+  if (ranks.size() != comms.size()) {
+    return InvalidArgument(
+        "oneCCL communicator split got %d ranks for %d communicators",
+        static_cast<int64_t>(ranks.size()), static_cast<int64_t>(comms.size()));
+  }
+  if (keys.size() != comms.size()) {
+    return InvalidArgument(
+        "oneCCL communicator split got %d keys for %d communicators",
+        static_cast<int64_t>(keys.size()), static_cast<int64_t>(comms.size()));
+  }
+
+  tsl::thread::ThreadPool pool(tsl::Env::Default(), "SplitOnecclComms",
+                               comms.size());
+
+  std::vector<Future<std::unique_ptr<Communicator>>> futures(comms.size());
+  for (size_t i = 0; i < comms.size(); ++i) {
+    futures[i] = MakeFutureOn(*pool.AsExecutor(), [&, i] {
+      return CreateSplitOnecclCommunicatorForRank(
+          stream_executors[i], comms[i], ranks[i].rank, keys[i], color,
+          split_share, cancel);
+    });
+  }
+
+  return JoinFutures(absl::MakeSpan(futures)).Await();
 }
 
 absl::StatusOr<ccl::comm_attr> AsOnecclCommAttr(
     const GpuCollectives::Config& config) {
   if (config.max_nchannels > 0) {
-    VLOG(1) << "Maximum number of oneCCL CTAs requested, but the C++ API does "
+    VLOG(2) << "Maximum number of oneCCL CTAs requested, but the C++ API does "
                "not expose an equivalent communicator attribute: "
             << config.max_nchannels;
   }
 
   if (config.use_minimal_resource) {
-    VLOG(1) << "oneCCL minimal-resource communicator mode requested, but the "
+    VLOG(2) << "oneCCL minimal-resource communicator mode requested, but the "
                "C++ API does not expose an equivalent control.";
   }
 
@@ -528,11 +784,134 @@ absl::StatusOr<std::vector<se::StreamExecutor*>> GetStreamExecutors(
     absl::Span<const OnecclCollectives::DeviceRank> ranks) {
   std::vector<se::StreamExecutor*> stream_executors(ranks.size());
   for (size_t i = 0; i < ranks.size(); ++i) {
-    auto* device = absl::down_cast<GpuCollectives::Device*>(ranks[i].device);
-    TF_RET_CHECK(device) << "Device must be GpuCollectives::Device";
+    auto* device = dynamic_cast<GpuCollectives::Device*>(ranks[i].device);
+    if (device == nullptr) {
+      return InvalidArgument(
+          "oneCCL communicator creation requires GpuCollectives::Device");
+    }
     stream_executors[i] = device->stream_executor();
   }
   return stream_executors;
+}
+
+absl::Status ValidateCreateCommunicatorInputs(
+    const GpuCliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks) {
+  if (ranks.empty()) {
+    return InvalidArgument("oneCCL communicator creation requires ranks");
+  }
+  if (ranks.size() != clique_key.num_local_participants()) {
+    return InvalidArgument(
+        "oneCCL communicator creation got %d local ranks for a clique with %d "
+        "local participants",
+        ranks.size(), clique_key.num_local_participants());
+  }
+  if (clique_ids.has_value() && clique_ids->size() > 1) {
+    return Unimplemented(
+        "oneCCL C++ KVS bootstrap uses one address per communicator set; "
+        "expected exactly one CliqueId but got %d",
+        clique_ids->size());
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCreateCommunicatorConfig(
+    const GpuCollectives::Config& gpu_config) {
+  if (!gpu_config.blocking_communicators && !gpu_config.async_execution) {
+    return FailedPrecondition(
+        "GpuCollectives::Config blocking_communicators is false, but "
+        "async_execution is false. Non-blocking communicators require "
+        "asynchronous execution.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<const GpuCollectives::Config*> GetGpuCollectivesConfig(
+    const Collectives::Config& config) {
+  auto* gpu_config = dynamic_cast<const GpuCollectives::Config*>(&config);
+  if (gpu_config == nullptr) {
+    return InvalidArgument(
+        "oneCCL communicator requires GpuCollectives::Config");
+  }
+  return gpu_config;
+}
+
+absl::Status ValidateSplitCommunicatorInputs(
+    absl::Span<const Communicator* const> comms, absl::Span<const RankId> keys,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks) {
+  if (keys.size() != comms.size()) {
+    return InvalidArgument(
+        "Comms and keys must have the same size, but %d != %d", comms.size(),
+        keys.size());
+  }
+  if (ranks.size() != comms.size()) {
+    return InvalidArgument(
+        "Comms and ranks must have the same size, but %d != %d", comms.size(),
+        ranks.size());
+  }
+  return absl::OkStatus();
+}
+
+std::string FormatCliqueIdsForLog(const std::optional<CliqueIds>& clique_ids) {
+  if (!clique_ids.has_value() || clique_ids->data().empty()) {
+    return "no clique id";
+  }
+  return absl::StrFormat("size(id)=%zu; fingerprint(id)=%v",
+                         clique_ids->size(), clique_ids->fingerprint());
+}
+
+absl::Status LogOnecclCommunicatorInitialization(
+    const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks) {
+  ASSIGN_OR_RETURN(ccl::library_version oneccl_version,
+                   GetOnecclLibraryVersion());
+  VLOG(1) << absl::StreamFormat(
+      "[%s] [ranks=%s] Initialize oneCCL (compiled with %s, runtime reports "
+      "%s) communicators for %d local devices (out of %d global devices); %s",
+      DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks),
+      CompiledOnecclVersion(), FormatOnecclVersion(oneccl_version),
+      ranks.size(), clique_key.num_devices(), FormatCliqueIdsForLog(clique_ids));
+  return absl::OkStatus();
+}
+
+std::shared_ptr<CancellationToken> GetOrCreateCancellationToken(
+    std::shared_ptr<CancellationToken> cancel) {
+  if (cancel != nullptr) return cancel;
+  return std::make_shared<CancellationToken>();
+}
+
+absl::Status CheckOnecclCommunicatorNotCancelled(
+    const std::shared_ptr<CancellationToken>& cancel, absl::string_view action) {
+  if (cancel->IsCancelled()) {
+    return FailedPrecondition("oneCCL communicator %s cancelled", action);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<OnecclCommunicatorCreationSetup>
+PrepareOnecclCommunicatorCreation(
+    const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+    absl::Span<const OnecclCollectives::DeviceRank> ranks,
+    const Collectives::Config& config,
+    std::shared_ptr<CancellationToken> cancel) {
+  ASSIGN_OR_RETURN(std::vector<se::StreamExecutor*> stream_executors,
+                   GetStreamExecutors(ranks));
+  SetOnecclIntelGpuCollectiveEnvDefaultsIfNeeded(
+      StreamExecutorsAreMultiGpuIntelDevices(stream_executors));
+
+  TF_RETURN_IF_ERROR(EnsureOnecclInitialized());
+  TF_RETURN_IF_ERROR(
+      LogOnecclCommunicatorInitialization(clique_key, clique_ids, ranks));
+
+  ASSIGN_OR_RETURN(const GpuCollectives::Config* gpu_config,
+                   GetGpuCollectivesConfig(config));
+  TF_RETURN_IF_ERROR(ValidateCreateCommunicatorConfig(*gpu_config));
+
+  cancel = GetOrCreateCancellationToken(std::move(cancel));
+  TF_RETURN_IF_ERROR(CheckOnecclCommunicatorNotCancelled(cancel, "creation"));
+
+  return OnecclCommunicatorCreationSetup{std::move(stream_executors),
+                                         std::move(cancel)};
 }
 
 }  // namespace
@@ -554,96 +933,91 @@ absl::StatusOr<CliqueId> OnecclCollectives::CreateUniqueCliqueId() const {
   return CliqueId(absl::string_view(id));
 }
 
+absl::StatusOr<CliqueIds> OnecclCollectives::CreateCliqueIds(
+    const CliqueKey& clique_key) const {
+  return GetOnecclSingleProcessCliqueIds(clique_key);
+}
+
+absl::StatusOr<std::shared_ptr<ccl::kvs_interface>>
+OnecclCollectives::GetOrCreateKvs(
+    const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+    absl::Span<const DeviceRank> ranks, bool all_local_clique) const {
+  if (all_local_clique) {
+    auto kvs = std::make_shared<InMemoryOnecclKvs>();
+    VLOG(2) << absl::StreamFormat(
+        "[%s] [ranks=%s] Using in-memory oneCCL KVS for all-local clique; "
+        "kvs_id=%d",
+        DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks),
+        kvs->get_id());
+    return kvs;
+  }
+
+  if (!clique_ids.has_value() || clique_ids->data().empty()) {
+    return InvalidArgument(
+        "oneCCL communicator creation requires a CliqueId for non-all-local "
+        "cliques; got %d local ranks out of %d global ranks",
+        ranks.size(), clique_key.num_devices());
+  }
+
+  const CliqueId& clique_id = clique_ids->at(0);
+  if (clique_id.size() != ccl::kvs::address_max_size) {
+    return Internal("oneCCL KVS CliqueId size mismatch: %d vs %d",
+                    clique_id.size(), ccl::kvs::address_max_size);
+  }
+
+  std::string id(clique_id.data().begin(), clique_id.data().end());
+  {
+    absl::MutexLock lock(mu_);
+    auto it = kvs_cache_.find(id);
+    if (it != kvs_cache_.end()) {
+      VLOG(2) << absl::StreamFormat(
+          "[%s] [ranks=%s] Reusing cached oneCCL KVS; kvs_id=%d; "
+          "fingerprint(id)=%v",
+          DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks),
+          it->second->get_id(), clique_ids->fingerprint());
+      return std::static_pointer_cast<ccl::kvs_interface>(it->second);
+    }
+  }
+
+  ccl::kvs::address_type address;
+  std::copy(clique_id.data().begin(), clique_id.data().end(),
+            address.begin());
+  ASSIGN_OR_RETURN(std::shared_ptr<ccl::kvs> kvs,
+                   OnecclValue<std::shared_ptr<ccl::kvs>>(
+                       "ccl::create_kvs",
+                       [&] { return ccl::create_kvs(address); }));
+  VLOG(2) << absl::StreamFormat(
+      "[%s] [ranks=%s] Created oneCCL KVS from clique id; kvs_id=%d; "
+      "fingerprint(id)=%v",
+      DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks), kvs->get_id(),
+      clique_ids->fingerprint());
+  return std::static_pointer_cast<ccl::kvs_interface>(kvs);
+}
+
 absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
 OnecclCollectives::CreateCommunicatorsWithCancel(
     const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
     absl::Span<const DeviceRank> ranks, const Collectives::Config& config,
     std::shared_ptr<CancellationToken> cancel) {
-  if (ranks.empty()) {
-    return InvalidArgument("oneCCL communicator creation requires ranks");
-  }
-  if (ranks.size() == clique_key.num_devices()) {
+  ASSIGN_OR_RETURN(const GpuCliqueKey* gpu_clique_key,
+                   GetOnecclGpuCliqueKey(clique_key));
+  TF_RETURN_IF_ERROR(
+      ValidateCreateCommunicatorInputs(*gpu_clique_key, clique_ids, ranks));
+  const bool all_local_clique = gpu_clique_key->is_local();
+  if (all_local_clique) {
     SetOnecclSingleProcessBootstrapEnvDefaults();
   }
 
-  TF_RETURN_IF_ERROR(EnsureOnecclInitialized());
-
-  if (clique_ids.has_value() && clique_ids->size() > 1) {
-    return Unimplemented(
-        "oneCCL C++ KVS bootstrap uses one address per communicator set; "
-        "expected exactly one CliqueId but got %d",
-        clique_ids->size());
-  }
-
-  ASSIGN_OR_RETURN(ccl::library_version oneccl_version,
-                   GetLinkedOnecclVersion());
-  std::string clique_id_log =
-      clique_ids.has_value()
-          ? absl::StrFormat("size(id)=%zu; fingerprint(id)=%v",
-                            clique_ids->size(), clique_ids->fingerprint())
-          : "no clique id";
-  VLOG(1) << absl::StreamFormat(
-      "[%s] [ranks=%s] Initialize oneCCL (compiled with %s, linked with %s) "
-      "communicators for %d local devices (out of %d global devices); %s",
-      DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks),
-      CompiledOnecclVersion(), FormatOnecclVersion(oneccl_version),
-      ranks.size(), clique_key.num_devices(), clique_id_log);
-
-  const auto& gpu_config =
-      absl::down_cast<const GpuCollectives::Config&>(config);
-  if (!gpu_config.blocking_communicators && !gpu_config.async_execution) {
-    return FailedPrecondition(
-        "GpuCollectives::Config blocking_communicators is false, but "
-        "async_execution is false. Non-blocking communicators require "
-        "asynchronous execution.");
-  }
-  if (cancel == nullptr) {
-    cancel = std::make_shared<CancellationToken>();
-  }
-  if (cancel->IsCancelled()) {
-    return FailedPrecondition("oneCCL communicator creation cancelled");
-  }
-
-  ASSIGN_OR_RETURN(auto stream_executors, GetStreamExecutors(ranks));
-
-  auto get_or_create_kvs =
-      [&]() -> absl::StatusOr<std::shared_ptr<ccl::kvs_interface>> {
-    if (ranks.size() == clique_key.num_devices()) {
-      return std::make_shared<InMemoryOnecclKvs>();
-    }
-
-    if (!clique_ids.has_value() || clique_ids->data().empty()) {
-      return std::make_shared<InMemoryOnecclKvs>();
-    }
-
-    const CliqueId& clique_id = clique_ids->at(0);
-    if (clique_id.size() != ccl::kvs::address_max_size) {
-      return Internal("oneCCL KVS CliqueId size mismatch: %d vs %d",
-                      clique_id.size(), ccl::kvs::address_max_size);
-    }
-
-    std::string id(clique_id.data().begin(), clique_id.data().end());
-    {
-      absl::MutexLock lock(mu_);
-      auto it = kvs_cache_.find(id);
-      if (it != kvs_cache_.end()) {
-        return std::static_pointer_cast<ccl::kvs_interface>(it->second);
-      }
-    }
-
-    ccl::kvs::address_type address;
-    std::copy(clique_id.data().begin(), clique_id.data().end(),
-              address.begin());
-    ASSIGN_OR_RETURN(std::shared_ptr<ccl::kvs> kvs,
-                     OnecclValue<std::shared_ptr<ccl::kvs>>(
-                         "ccl::create_kvs",
-                         [&] { return ccl::create_kvs(address); }));
-    return std::static_pointer_cast<ccl::kvs_interface>(kvs);
-  };
-
+  ASSIGN_OR_RETURN(OnecclCommunicatorCreationSetup setup,
+                   PrepareOnecclCommunicatorCreation(
+                       clique_key, clique_ids, ranks, config,
+                       std::move(cancel)));
   ASSIGN_OR_RETURN(std::shared_ptr<ccl::kvs_interface> kvs,
-                   get_or_create_kvs());
-  ASSIGN_OR_RETURN(ccl::comm_attr comm_attr, AsOnecclCommAttr(gpu_config));
+                   GetOrCreateKvs(clique_key, clique_ids, ranks,
+                                  all_local_clique));
+  ASSIGN_OR_RETURN(const GpuCollectives::Config* gpu_config,
+                   GetGpuCollectivesConfig(config));
+  ASSIGN_OR_RETURN(ccl::comm_attr comm_attr, AsOnecclCommAttr(*gpu_config));
 
   absl::Time init_start = absl::Now();
   tsl::profiler::TraceMe trace([&] {
@@ -654,70 +1028,13 @@ OnecclCollectives::CreateCommunicatorsWithCancel(
          {"num_global_ranks", clique_key.num_devices()}});
   });
 
-  tsl::thread::ThreadPool pool(tsl::Env::Default(), "CreateOnecclComms",
-                               ranks.size());
-
-  std::vector<Future<std::unique_ptr<Communicator>>> futures(ranks.size());
-  for (size_t i = 0; i < ranks.size(); ++i) {
-    futures[i] = MakeFutureOn(*pool.AsExecutor(), [&, i]()
-        -> absl::StatusOr<std::unique_ptr<Communicator>> {
-      int32_t device_ordinal = DeviceOrdinal(ranks[i]);
-      RankId rank = ranks[i].rank;
-      auto activation = stream_executors[i]->Activate();
-
-      auto* sycl_executor =
-          dynamic_cast<stream_executor::sycl::SyclExecutor*>(
-              stream_executors[i]);
-      TF_RET_CHECK(sycl_executor != nullptr)
-          << "oneCCL communicator creation requires SYCL executors";
-
-      ::sycl::device sycl_device = sycl_executor->GetDevice();
-      ASSIGN_OR_RETURN(ccl::device ccl_device,
-                       OnecclValue<ccl::device>("ccl::create_device", [&] {
-                         return ccl::create_device(std::move(sycl_device));
-                       }));
-      ASSIGN_OR_RETURN(::sycl::context sycl_context,
-                       sycl_executor->GetContext());
-      ASSIGN_OR_RETURN(ccl::context ccl_context,
-                       OnecclValue<ccl::context>("ccl::create_context", [&] {
-                         return ccl::create_context(std::move(sycl_context));
-                       }));
-
-      VLOG(1) << absl::StreamFormat(
-          "[%d] [rank=%v] Created oneCCL device/context for global size %d",
-          device_ordinal, rank, clique_key.num_devices());
-
-      absl::StatusOr<ccl::communicator> ccl_comm =
-          OnecclValue<ccl::communicator>("ccl::create_communicatorExt", [&] {
-            return ccl::create_communicatorExt(
-                static_cast<int>(clique_key.num_devices()), rank.value(),
-                ccl_device, ccl_context, kvs, comm_attr);
-          });
-      if (!ccl_comm.ok()) {
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] [rank=%v] Failed to create oneCCL communicator: %s",
-            device_ordinal, rank, ccl_comm.status().ToString());
-        return absl::StatusOr<std::unique_ptr<Communicator>>(
-            ccl_comm.status());
-      }
-
-      absl::StatusOr<std::unique_ptr<OnecclCommunicator>> comm =
-          OnecclCommunicator::Create(stream_executors[i], std::move(*ccl_comm),
-                                     kvs, cancel);
-      if (!comm.ok()) {
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] [rank=%v] Failed to wrap oneCCL communicator: %s",
-            device_ordinal, rank, comm.status().ToString());
-      }
-      return Cast(std::move(comm));
-    });
-  }
-
   ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Communicator>> communicators,
-                   JoinFutures(absl::MakeSpan(futures)).Await());
-  if (cancel->IsCancelled()) {
-    return FailedPrecondition("oneCCL communicator creation cancelled");
-  }
+                   CreateOnecclCommunicatorsForRanks(
+                       setup.stream_executors,
+                       static_cast<int>(clique_key.num_devices()), ranks,
+                       kvs, comm_attr, setup.cancel));
+  TF_RETURN_IF_ERROR(
+      CheckOnecclCommunicatorNotCancelled(setup.cancel, "creation"));
 
   absl::Time init_done = absl::Now();
   VLOG(1) << absl::StreamFormat(
@@ -725,7 +1042,7 @@ OnecclCollectives::CreateCommunicatorsWithCancel(
       DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks),
       communicators.size(), init_done - init_start);
 
-  return communicators;
+  return std::move(communicators);
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
@@ -734,88 +1051,26 @@ OnecclCollectives::SplitCommunicatorsWithCancel(
     absl::Span<const RankId> keys, const Collectives::Config& config,
     absl::Span<const DeviceRank> ranks,
     std::shared_ptr<CancellationToken> cancel) {
-  auto rank_formatter = [](std::string* str, RankId rank) {
-    absl::StrAppend(str, rank.value());
-  };
+  TF_RETURN_IF_ERROR(ValidateSplitCommunicatorInputs(comms, keys, ranks));
+  cancel = GetOrCreateCancellationToken(std::move(cancel));
+  TF_RETURN_IF_ERROR(CheckOnecclCommunicatorNotCancelled(cancel, "split"));
 
   VLOG(1) << absl::StreamFormat(
       "[%s] [ranks=%s] Split %d oneCCL communicators using color %d "
       "and keys [%s]",
       DeviceOrdinalsToString(ranks), DeviceRanksToString(ranks), comms.size(),
-      color, absl::StrJoin(keys, ",", rank_formatter));
-
-  if (keys.size() != comms.size()) {
-    return InvalidArgument(
-        "Comms and keys must have the same size, but %d != %d", comms.size(),
-        keys.size());
-  }
+      color, RankIdsToString(keys));
 
   ASSIGN_OR_RETURN(auto stream_executors, GetStreamExecutors(ranks));
-  const auto& gpu_config =
-      absl::down_cast<const GpuCollectives::Config&>(config);
+  ASSIGN_OR_RETURN(const GpuCollectives::Config* gpu_config,
+                   GetGpuCollectivesConfig(config));
 
-  auto make_comm = [&](int i) -> absl::StatusOr<ccl::communicator> {
-    int32_t device_ordinal = DeviceOrdinal(ranks[i]);
-    RankId rank = ranks[i].rank;
-    RankId key = keys[i];
-
-    tsl::profiler::TraceMe trace([&] {
-      return tsl::profiler::TraceMeEncode(
-          absl::StrFormat("[%v] [rank=%v] onecclCommSplit", device_ordinal,
-                          rank),
-          {{"color", color}, {"key", key}});
-    });
-
-    absl::Time split_start = absl::Now();
-    VLOG(1) << absl::StreamFormat(
-        "[%d] [rank=%v] Split oneCCL communicator %p with color %d "
-        "and key %v",
-        device_ordinal, rank, static_cast<const void*>(comms[i]), color, key);
-
-    ASSIGN_OR_RETURN(ccl::communicator split_comm,
-                     CastOneccl(comms[i])->Split(color, key.value(),
-                                                 gpu_config.split_share));
-
-    absl::Time split_done = absl::Now();
-    VLOG(1) << absl::StreamFormat(
-        "[%d] [rank=%v] Split oneCCL communicator %p with color %d "
-        "and key %v in %v",
-        device_ordinal, rank, static_cast<const void*>(comms[i]), color, key,
-        split_done - split_start);
-
-    return split_comm;
-  };
-
-  tsl::thread::ThreadPool pool(tsl::Env::Default(), "SplitOnecclComms",
-                               comms.size());
-
-  std::vector<Future<std::unique_ptr<Communicator>>> futures(comms.size());
-  for (size_t i = 0; i < comms.size(); ++i) {
-    futures[i] = MakeFutureOn(*pool.AsExecutor(), [&, i] {
-      absl::StatusOr<ccl::communicator> split_comm = make_comm(i);
-      if (!split_comm.ok()) {
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] [rank=%v] Failed to split oneCCL communicator: %s",
-            DeviceOrdinal(ranks[i]), ranks[i].rank,
-            split_comm.status().ToString());
-        return absl::StatusOr<std::unique_ptr<Communicator>>(
-            split_comm.status());
-      }
-
-      absl::StatusOr<std::unique_ptr<OnecclCommunicator>> comm =
-          OnecclCommunicator::Create(
-              stream_executors[i], std::move(*split_comm),
-              CastOneccl(comms[i])->kvs(), cancel);
-      if (!comm.ok()) {
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] [rank=%v] Failed to split oneCCL communicator: %s",
-            DeviceOrdinal(ranks[i]), ranks[i].rank, comm.status().ToString());
-      }
-      return Cast(std::move(comm));
-    });
-  }
-
-  return JoinFutures(absl::MakeSpan(futures)).Await();
+  ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Communicator>> split_comms,
+                   SplitOnecclCommunicatorsForRanks(
+                       comms, stream_executors, ranks, color, keys,
+                       gpu_config->split_share, cancel));
+  TF_RETURN_IF_ERROR(CheckOnecclCommunicatorNotCancelled(cancel, "split"));
+  return split_comms;
 }
 
 absl::StatusOr<std::unique_ptr<Communicator>>

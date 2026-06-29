@@ -43,6 +43,9 @@ class OnecclCollectives : public GpuCollectives {
 
   absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final;
 
+  absl::StatusOr<CliqueIds> CreateCliqueIds(
+      const CliqueKey& clique_key) const;
+
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
   CreateCommunicators(const CliqueKey& clique_key,
                       const std::optional<CliqueIds>& clique_ids,
@@ -83,6 +86,10 @@ class OnecclCollectives : public GpuCollectives {
       const Topology& topology) final;
 
  private:
+  absl::StatusOr<std::shared_ptr<ccl::kvs_interface>> GetOrCreateKvs(
+      const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
+      absl::Span<const DeviceRank> ranks, bool all_local_clique) const;
+
   mutable absl::Mutex mu_;
   mutable absl::flat_hash_map<std::string, std::shared_ptr<ccl::kvs>>
       kvs_cache_ ABSL_GUARDED_BY(mu_);
