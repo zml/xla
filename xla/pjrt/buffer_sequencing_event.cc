@@ -55,16 +55,16 @@ uint64_t BufferSequencingEvent::sequence_number() const {
   return event_->event.sequence_number();
 }
 
-void BufferSequencingEvent::WaitForEventOnStream(se::Stream* stream) {
+absl::Status BufferSequencingEvent::WaitForEventOnStream(se::Stream* stream) {
   // We cannot wait for an event until ThenRecordEvent has been called; on GPU
   // newly created events are deemed to have already happened past.
   tsl::BlockUntilReady(event_);
 
-  if (event_.IsError()) {
-    return;
+  if (const auto* error = event_.GetErrorIfPresent()) {
+    return *error;
   }
   if (event_->definition_stream == stream) {
-    return;
+    return absl::OkStatus();
   }
 
   absl::MutexLock lock(mu_);
@@ -73,13 +73,17 @@ void BufferSequencingEvent::WaitForEventOnStream(se::Stream* stream) {
   if (std::find(streams_defined_on_.begin(), streams_defined_on_.end(),
                 stream) != streams_defined_on_.end()) {
     // stream is in streams_defined_on_; it doesn't need to be waited on.
-    return;
+    return absl::OkStatus();
   }
 
   if (event_->event.event()) {
-    stream->WaitFor(event_->event.event()).IgnoreError();
+    absl::Status status = stream->WaitFor(event_->event.event());
+    if (!status.ok()) {
+      return status;
+    }
   }
   streams_defined_on_.push_back(stream);
+  return absl::OkStatus();
 }
 
 void BufferSequencingEvent::AddErrorContext(absl::string_view key,

@@ -643,7 +643,7 @@ absl::Status WaitForDeviceEventRefsOnStream(
           "WaitForDeviceEventRefsOnStream assumes that all input "
           "PjRtDeviceEventRefs are backed by BufferSequencingEventRefs.");
     }
-    event_ref->WaitForEventOnStream(stream);
+    RETURN_IF_ERROR(event_ref->WaitForEventOnStream(stream));
     if (auto* status = event_ref.value()->GetErrorIfPresent();
         status != nullptr) {
       return *status;

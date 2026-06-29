@@ -99,7 +99,7 @@ class BufferSequencingEvent : tsl::AsyncPayload::KeepOnError {
   // defined on 'stream'. Does nothing if the event is already known to have
   // occurred by the tail of 'stream'. If SetSequencingEvent has not yet been
   // called, blocks the calling thread until the event has been recorded.
-  void WaitForEventOnStream(se::Stream* stream);
+  absl::Status WaitForEventOnStream(se::Stream* stream);
 
   // Adds a key-value pair to add additional information on error.
   // Error contexts should be added before the events are started to avoid race

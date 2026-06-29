@@ -473,9 +473,9 @@ absl::Status AddDestinationBufferSynchronization(
 // buffer was copied to a device and then never used there. In that case we get
 // a new stream and use it to hold onto a reference to the buffer until the
 // events are complete.
-void MaybeWaitForEventOnStream(const BufferSequencingEventRef& event,
-                               LocalDeviceState* local_device_state,
-                               se::Stream*& stream) {
+absl::Status MaybeWaitForEventOnStream(
+    const BufferSequencingEventRef& event,
+    LocalDeviceState* local_device_state, se::Stream*& stream) {
   if (!event->IsPredeterminedErrorOrDefinedOn(
           local_device_state->compute_stream()) &&
       !event->IsComplete()) {
@@ -485,8 +485,9 @@ void MaybeWaitForEventOnStream(const BufferSequencingEventRef& event,
     VLOG(2) << "Waiting for event: " << &*event
             << "; is_predetermined_error: " << event->IsPredeterminedError()
             << "; on stream: " << stream;
-    event->WaitForEventOnStream(stream);
+    return event->WaitForEventOnStream(stream);
   }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -665,7 +666,7 @@ absl::Status PjRtStreamExecutorClient::WaitForAllocation(
                    cpp_buf->device_buffer()->GetDefinitionEvent(
                        async_work_runner(), /*nullptr_if_past=*/true));
   if (event) {
-    event->WaitForEventOnStream(stream);
+    RETURN_IF_ERROR(event->WaitForEventOnStream(stream));
   }
   return absl::OkStatus();
 }
@@ -1858,7 +1859,11 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
             predetermined_error = ev->GetDefinedStatus();
           }
         }
-        ev->WaitForEventOnStream(device_state->compute_stream());
+        absl::Status wait_status =
+            ev->WaitForEventOnStream(device_state->compute_stream());
+        if (!wait_status.ok() && predetermined_error.ok()) {
+          predetermined_error = wait_status;
+        }
       } else if (event) {
         xla::BlockUntilReady(event);
         if (auto error = event.GetErrorIfPresent()) {
@@ -1872,7 +1877,11 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
     for (size_t i = 0; i < control_deps.size(); ++i) {
       const auto& event = control_deps[i];
       if (auto ev = event.down_cast<BufferSequencingEvent>()) {
-        ev->WaitForEventOnStream(device_state->compute_stream());
+        absl::Status wait_status =
+            ev->WaitForEventOnStream(device_state->compute_stream());
+        if (!wait_status.ok() && predetermined_error.ok()) {
+          predetermined_error = wait_status;
+        }
       } else if (event) {
         xla::BlockUntilReady(event);
       }

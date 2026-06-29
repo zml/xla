@@ -451,7 +451,7 @@ void PjRtStreamExecutorRawBuffer::IntraClientCopyToWithDependencies(
       for (size_t i = 0; i < dependencies.size(); ++i) {
         const auto& dep = dependencies[i];
         if (auto event_ref = dep.down_cast<BufferSequencingEvent>()) {
-          event_ref->WaitForEventOnStream(stream);
+          RETURN_IF_ERROR(event_ref->WaitForEventOnStream(stream));
         } else {
           xla::BlockUntilReady(dep);
         }
