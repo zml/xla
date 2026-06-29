@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <level_zero/ze_api.h>
 
+#include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 #include "xla/tsl/platform/status_macros.h"
 
 constexpr int kMsecInSec = 1000;
@@ -25,7 +27,7 @@ namespace stream_executor::sycl {
 
 namespace {
 
-absl::StatusOr<float> GetEventElapsedTime(StreamExecutor* executor,
+absl::StatusOr<float> GetEventElapsedTime(int device_ordinal,
                                           const ::sycl::event& start,
                                           const ::sycl::event& stop) {
   // Get the native Level Zero event handles.
@@ -51,12 +53,10 @@ absl::StatusOr<float> GetEventElapsedTime(StreamExecutor* executor,
         "GetEventElapsedTime: Failed to query kernel timestamps for events");
   }
 
-  // Get the frequency and mask for the device to convert timestamps to
-  // milliseconds.
-  // We assume that all SYCL devices have the same frequency and mask, so
-  // we use kDefaultDeviceOrdinal.
+  // Get the frequency and mask for this stream's device to convert timestamps
+  // to milliseconds.
   ASSIGN_OR_RETURN(SyclTimerProperties timer_props,
-                   SyclGetTimerProperties(kDefaultDeviceOrdinal));
+                   SyclGetTimerProperties(device_ordinal));
 
   const uint64_t kernel_start_time = start_timestamp.global.kernelStart;
   const uint64_t kernel_end_time = end_timestamp.global.kernelEnd;
@@ -92,7 +92,8 @@ absl::StatusOr<absl::Duration> SyclTimer::GetElapsedDuration() {
   }
   RETURN_IF_ERROR(stream_->RecordEvent(&stop_event_));
   ASSIGN_OR_RETURN(float elapsed_milliseconds,
-                   GetEventElapsedTime(executor_, start_event_.GetEvent(),
+                   GetEventElapsedTime(stream_->parent()->device_ordinal(),
+                                       start_event_.GetEvent(),
                                        stop_event_.GetEvent()));
   is_timer_stopped_ = true;
   return absl::Milliseconds(elapsed_milliseconds);
