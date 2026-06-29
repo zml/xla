@@ -65,10 +65,6 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
-bool IsSyclExecutor(se::StreamExecutor* executor) {
-  return executor != nullptr && executor->GetPlatform()->Name() == "SYCL";
-}
-
 // Data exchanged between ranks during RunCollective memcpy path via
 // GpuCliqueRendezvous. Each rank creates one of these and all ranks
 // receive the full set after the rendezvous completes.
@@ -137,10 +133,7 @@ absl::Status CollectivePermuteThunk::PrepareCollective(
     }
   }
 
-  // Prefer local peer copies for SYCL collective-permute: oneCCL send/recv can
-  // leave Level Zero queues in a bad state for this P2P pattern.
-  if ((use_peer_memory() || IsSyclExecutor(params.executor)) &&
-      clique_key.is_local()) {
+  if (use_peer_memory() && clique_key.is_local()) {
     // Request peer memory exchange for destination buffers so that senders
     // can look up the target's destination address via FindPeerAddress.
     for (const Buffer& buffer : buffers()) {
@@ -321,9 +314,7 @@ absl::Status CollectivePermuteThunk::RunCollective(
   }
 
   // Peer-access mode: use D2D memcpy with event-based synchronization.
-  // Prefer local peer copies for SYCL collective-permute instead of oneCCL P2P.
-  if ((use_peer_memory() || IsSyclExecutor(stream.parent())) &&
-      clique_key.is_local()) {
+  if (use_peer_memory() && clique_key.is_local()) {
     ASSIGN_OR_RETURN(
         bool use_p2p_memcpy,
         params.collective_cliques->peer_access_enabled(clique_key));
@@ -425,9 +416,6 @@ static absl::Status RunPeerAccessPermute(
   if (!rank.has_value()) {
     return Internal("Device %v not found in clique key %v", gid, clique_key);
   }
-  // SYCL cross-device event barriers can stall, so use host synchronization at
-  // the peer-copy protocol boundaries for SYCL.
-  const bool use_host_sync = IsSyclExecutor(stream.parent());
 
   // Get EventPool from own StreamExecutor.
   auto* pool =
@@ -437,9 +425,6 @@ static absl::Status RunPeerAccessPermute(
   // prior work on this rank's buffers is complete.
   ASSIGN_OR_RETURN(EventPool::Event ready, pool->GetOrCreateEvent());
   RETURN_IF_ERROR(stream.RecordEvent(ready->get()));
-  if (use_host_sync) {
-    RETURN_IF_ERROR(stream.BlockHostUntilDone());
-  }
 
   // Create promise/future pair for the "done" event that the sender will
   // set after completing the memcpy.
@@ -458,9 +443,7 @@ static absl::Status RunPeerAccessPermute(
     // Wait for target's stream to be ready before writing to its buffers.
     ASSIGN_OR_RETURN(const Events& target_events,
                      rendezvous->at<Events>(target));
-    if (!use_host_sync) {
-      RETURN_IF_ERROR(stream.WaitFor(target_events.ready->get()));
-    }
+    RETURN_IF_ERROR(stream.WaitFor(target_events.ready->get()));
 
     // Perform D2D copies from our source to target's destination.
     for (const auto& buf : device_buffers) {
@@ -477,11 +460,7 @@ static absl::Status RunPeerAccessPermute(
     // Record a "done" event and fulfill the promise so the target knows
     // the copy is complete.
     ASSIGN_OR_RETURN(EventPool::Event done, pool->GetOrCreateEvent());
-    if (use_host_sync) {
-      RETURN_IF_ERROR(stream.BlockHostUntilDone());
-    } else {
-      RETURN_IF_ERROR(stream.RecordEvent(done->get()));
-    }
+    RETURN_IF_ERROR(stream.RecordEvent(done->get()));
     done_promise.Set(std::move(done));
   } else {
     // Not a sender — fulfill promise with a dummy event.
@@ -507,9 +486,7 @@ static absl::Status RunPeerAccessPermute(
     const absl::StatusOr<EventPool::Event>& done_result =
         source_events.done.Await();
     if (!done_result.ok()) return done_result.status();
-    if (!use_host_sync) {
-      RETURN_IF_ERROR(stream.WaitFor((*done_result)->get()));
-    }
+    RETURN_IF_ERROR(stream.WaitFor((*done_result)->get()));
   }
 
   return absl::OkStatus();
