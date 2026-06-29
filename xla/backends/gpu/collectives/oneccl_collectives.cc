@@ -21,6 +21,7 @@ limitations under the License.
 #include <cstdlib>
 #include <exception>
 #include <functional>
+#include <level_zero/ze_api.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,6 +35,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -62,6 +64,7 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/sycl/sycl_executor.h"
+#include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/threadpool.h"
@@ -78,31 +81,202 @@ absl::Status OnecclExceptionStatus(absl::string_view expr,
                                    absl::string_view message);
 
 absl::once_flag ccl_init_once;
+absl::Mutex ccl_env_mu;
 
-void SetOnecclEnvDefault(const char* name, const char* value) {
-  if (std::getenv(name) != nullptr) return;
-  if (::setenv(name, value, /*overwrite=*/0) != 0) {
-    LOG(WARNING) << "Failed to set oneCCL default " << name << "=" << value;
+constexpr uint32_t kIntelPciVendorId = 0x8086;
+
+constexpr char kCclSyclAllgathervLlThreshold[] =
+    "CCL_SYCL_ALLGATHERV_LL_THRESHOLD";
+constexpr char kCclSyclAllreduceSimpleThreshold[] =
+    "CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD";
+constexpr char kCclProcessLauncher[] = "CCL_PROCESS_LAUNCHER";
+constexpr char kCclLocalSize[] = "CCL_LOCAL_SIZE";
+constexpr char kCclLocalRank[] = "CCL_LOCAL_RANK";
+constexpr char kCclAtlTransport[] = "CCL_ATL_TRANSPORT";
+constexpr char kCclAtlShm[] = "CCL_ATL_SHM";
+constexpr char kFiProvider[] = "FI_PROVIDER";
+
+struct OnecclEnvDefault {
+  const char* name;
+  const char* value;
+};
+
+struct OnecclEnvValue {
+  std::string name;
+  std::string value;
+};
+
+struct OnecclEnvDefaultingResult {
+  std::vector<OnecclEnvDefault> defaulted;
+  std::vector<OnecclEnvValue> preset;
+};
+
+bool SetOnecclEnvDefaultIfUnset(const OnecclEnvDefault& env_default,
+                                OnecclEnvDefaultingResult& result) {
+  const char* preset_value = std::getenv(env_default.name);
+  if (preset_value != nullptr) {
+    result.preset.push_back({env_default.name, preset_value});
+    return false;
+  }
+  if (::setenv(env_default.name, env_default.value, /*overwrite=*/0) != 0) {
+    LOG(WARNING) << "Failed to set oneCCL default " << env_default.name << "="
+                 << env_default.value;
+    return false;
+  }
+  result.defaulted.push_back(env_default);
+  return true;
+}
+
+OnecclEnvDefaultingResult SetOnecclEnvDefaultGroupIfUnset(
+    absl::Span<const OnecclEnvDefault> defaults) {
+  // The process environment is global. Serialize the getenv/setenv pair so
+  // racing communicator creations cannot observe a partially defaulted policy.
+  // If the caller configured any variable in the group, leave the entire group
+  // to the caller instead of mixing explicit values with XLA defaults.
+  absl::MutexLock lock(&ccl_env_mu);
+  OnecclEnvDefaultingResult result;
+  for (const OnecclEnvDefault& env_default : defaults) {
+    const char* preset_value = std::getenv(env_default.name);
+    if (preset_value != nullptr) {
+      result.preset.push_back({env_default.name, preset_value});
+    }
+  }
+  if (!result.preset.empty()) {
+    return result;
+  }
+  for (const OnecclEnvDefault& env_default : defaults) {
+    SetOnecclEnvDefaultIfUnset(env_default, result);
+  }
+  return result;
+}
+
+std::string FormatOnecclEnvDefaults(
+    absl::Span<const OnecclEnvDefault> values) {
+  return absl::StrJoin(
+      values, " ", [](std::string* out, const OnecclEnvDefault& value) {
+        absl::StrAppend(out, value.name, "=", value.value);
+      });
+}
+
+std::string FormatOnecclEnvValues(absl::Span<const OnecclEnvValue> values) {
+  return absl::StrJoin(values, " ",
+                       [](std::string* out, const OnecclEnvValue& value) {
+                         absl::StrAppend(out, value.name, "=", value.value);
+                       });
+}
+
+void SetAndLogOnecclEnvDefaultGroupIfUnset(
+    absl::Span<const OnecclEnvDefault> defaults,
+    absl::string_view description) {
+  OnecclEnvDefaultingResult result =
+      SetOnecclEnvDefaultGroupIfUnset(defaults);
+  if (!result.defaulted.empty()) {
+    VLOG(1) << "Defaulting oneCCL " << description << ": "
+            << FormatOnecclEnvDefaults(result.defaulted);
+  }
+  if (result.defaulted.empty() && !result.preset.empty() &&
+      result.preset.size() != defaults.size()) {
+    LOG(WARNING) << "Not defaulting oneCCL " << description
+                 << " because the environment already sets "
+                 << FormatOnecclEnvValues(result.preset)
+                 << "; leaving the remaining group values unset";
   }
 }
 
+bool IsIntelGpuDevice(const ::sycl::device& device) {
+  try {
+    if (!device.is_gpu()) return false;
+    ze_device_handle_t lz_device =
+        ::sycl::get_native<::sycl::backend::ext_oneapi_level_zero>(device);
+    ze_device_properties_t props{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    ze_result_t status = zeDeviceGetProperties(lz_device, &props);
+    if (status != ZE_RESULT_SUCCESS) {
+      VLOG(1) << "Failed to query Level Zero device properties for oneCCL "
+                 "defaults: "
+              << status;
+      return false;
+    }
+    return props.type == ZE_DEVICE_TYPE_GPU &&
+           props.vendorId == kIntelPciVendorId;
+  } catch (const ::sycl::exception& e) {
+    VLOG(1) << "Failed to query SYCL/Level Zero device info for oneCCL "
+               "defaults: "
+            << e.what();
+    return false;
+  }
+}
+
+bool AreMultiGpuIntelDevices(absl::Span<const ::sycl::device> devices) {
+  if (devices.size() < 2) return false;
+  return absl::c_all_of(devices, IsIntelGpuDevice);
+}
+
+bool VisibleDevicesAreMultiGpuIntelDevices() {
+  absl::StatusOr<int> device_count =
+      stream_executor::sycl::SyclDevicePool::GetDeviceCount();
+  if (!device_count.ok()) {
+    VLOG(1) << "Failed to query SYCL device count for oneCCL defaults: "
+            << device_count.status();
+    return false;
+  }
+
+  std::vector<::sycl::device> devices;
+  devices.reserve(*device_count);
+  for (int ordinal = 0; ordinal < *device_count; ++ordinal) {
+    absl::StatusOr<::sycl::device> device =
+        stream_executor::sycl::SyclDevicePool::GetDevice(ordinal);
+    if (!device.ok()) {
+      VLOG(1) << "Failed to query SYCL device " << ordinal
+              << " for oneCCL defaults: " << device.status();
+      return false;
+    }
+    devices.push_back(std::move(*device));
+  }
+  return AreMultiGpuIntelDevices(devices);
+}
+
+void SetOnecclIntelGpuCollectiveEnvDefaultsIfNeeded(
+    bool is_multi_gpu_intel) {
+  // On tested multi-GPU Intel SYCL configurations, oneCCL's default BF16
+  // allgatherv path can route through kernels whose returned events do not
+  // reliably complete. Prefer conservative SYCL-kernel thresholds unless the
+  // caller explicitly configures the collective environment.
+  if (!is_multi_gpu_intel) return;
+
+  static constexpr OnecclEnvDefault kIntelGpuCollectiveEnvDefaults[] = {
+      {kCclSyclAllgathervLlThreshold, "1073741824"},   // 1 GiB.
+      {kCclSyclAllreduceSimpleThreshold, "33554432"},  // 32 MiB.
+  };
+  SetAndLogOnecclEnvDefaultGroupIfUnset(
+      kIntelGpuCollectiveEnvDefaults,
+      "collective environment for multi-GPU Intel SYCL devices");
+}
+
 void InitOnecclOnce() {
-  // On Arc B-series, oneCCL's large SYCL kernels can reset the device in the
-  // one-thread-per-rank configuration. Prefer oneCCL's PCIe/LL P2P path unless
-  // the caller explicitly overrides these thresholds.
-  SetOnecclEnvDefault("CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD", "1073741824");
-  SetOnecclEnvDefault("CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD", "33554432");
+  // ccl::init can run before communicator ranks are available, for example
+  // when creating a distributed clique id. In that case, use the visible SYCL
+  // device pool as a conservative fallback.
+  SetOnecclIntelGpuCollectiveEnvDefaultsIfNeeded(
+      VisibleDevicesAreMultiGpuIntelDevices());
   ccl::init();
 }
 
-void SetOnecclAllLocalEnvDefaults() {
-  // Single-process, all-local GPU cliques do not run under MPI or another
-  // launcher, so tell oneCCL to bootstrap with a single local process unless
-  // the caller has explicitly configured a launcher/topology.
-  SetOnecclEnvDefault("CCL_PROCESS_LAUNCHER", "none");
-  SetOnecclEnvDefault("CCL_LOCAL_SIZE", "1");
-  SetOnecclEnvDefault("CCL_LOCAL_RANK", "0");
-  SetOnecclEnvDefault("CCL_ATL_TRANSPORT", "ofi");
+void SetOnecclSingleProcessBootstrapEnvDefaults() {
+  // Single-process GPU executions do not run under MPI or another launcher.
+  // CCL_LOCAL_SIZE and CCL_LOCAL_RANK describe launcher processes, not local
+  // GPU ranks, so a many-GPU all-local clique still uses one process/rank here.
+  // Respect any explicit bootstrap environment already supplied by the caller.
+  static constexpr OnecclEnvDefault kSingleProcessBootstrapEnvDefaults[] = {
+      {kCclProcessLauncher, "none"},
+      {kCclLocalSize, "1"},
+      {kCclLocalRank, "0"},
+      {kCclAtlTransport, "ofi"},
+      {kCclAtlShm, "1"},
+      {kFiProvider, "shm"},
+  };
+  SetAndLogOnecclEnvDefaultGroupIfUnset(
+      kSingleProcessBootstrapEnvDefaults,
+      "bootstrap environment for single-process oneCCL execution");
 }
 
 absl::Status EnsureOnecclInitialized() {
@@ -389,7 +563,7 @@ OnecclCollectives::CreateCommunicatorsWithCancel(
     return InvalidArgument("oneCCL communicator creation requires ranks");
   }
   if (ranks.size() == clique_key.num_devices()) {
-    SetOnecclAllLocalEnvDefaults();
+    SetOnecclSingleProcessBootstrapEnvDefaults();
   }
 
   TF_RETURN_IF_ERROR(EnsureOnecclInitialized());
@@ -663,7 +837,7 @@ absl::Status OnecclCollectives::Deallocate(void* location) {
 absl::StatusOr<GpuCollectives::CliqueIdCallback>
 OnecclCollectives::InitializeTopology(const Topology& topology) {
   if (topology.num_processes == 1) {
-    SetOnecclAllLocalEnvDefaults();
+    SetOnecclSingleProcessBootstrapEnvDefaults();
     return nullptr;
   }
 
