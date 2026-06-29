@@ -39,8 +39,6 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "xla/tsl/concurrency/executor.h"
-#include "xla/tsl/platform/env.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
@@ -50,8 +48,7 @@ class OnecclCommunicator final : public GpuCommunicator {
   static absl::StatusOr<std::unique_ptr<OnecclCommunicator>> Create(
       se::StreamExecutor* stream_executor, ccl::communicator comm,
       std::shared_ptr<ccl::kvs_interface> kvs,
-      std::shared_ptr<CancellationToken> cancel,
-      tsl::Env& env = *tsl::Env::Default());
+      std::shared_ptr<CancellationToken> cancel);
 
   ~OnecclCommunicator() final;
 
@@ -183,12 +180,12 @@ class OnecclCommunicator final : public GpuCommunicator {
   OnecclCommunicator(se::StreamExecutor* stream_executor,
                      ccl::communicator comm,
                      std::shared_ptr<ccl::kvs_interface> kvs,
-                     std::unique_ptr<tsl::Executor> executor,
                      std::shared_ptr<CancellationToken> cancel);
 
-  absl::Status GroupStart();
-  absl::Status GroupEnd();
   absl::Status CheckReady() const;
+  absl::Status LaunchOnStream(
+      const Executor& executor,
+      absl::AnyInvocable<absl::Status(const ccl::stream&) &&> launch) const;
   Future<> Execute(absl::AnyInvocable<absl::Status() &&> f) const;
 
   template <typename T>
@@ -207,10 +204,8 @@ class OnecclCommunicator final : public GpuCommunicator {
   se::StreamExecutor* stream_executor_;
   std::unique_ptr<ccl::communicator> comm_;
   std::shared_ptr<ccl::kvs_interface> kvs_;
-  std::unique_ptr<tsl::Executor> executor_;
   std::shared_ptr<CancellationToken> cancel_;
   bool aborted_ = false;
-  int64_t group_nesting_level_ = 0;
 };
 
 }  // namespace xla::gpu

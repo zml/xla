@@ -24,7 +24,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/base/casts.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
@@ -44,7 +43,6 @@ limitations under the License.
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
 #include "xla/backends/gpu/collectives/oneccl_registered_memory.h"
 #include "xla/backends/gpu/collectives/oneccl_symmetric_memory.h"
-#include "xla/backends/gpu/collectives/single_threaded_executor.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/core/collectives/reduction_kind.h"
 #include "xla/core/collectives/registered_memory.h"
@@ -61,8 +59,13 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
-se::Stream* ToStream(const Communicator::Executor& executor) {
-  return absl::down_cast<const GpuCollectives::Executor&>(executor).stream();
+absl::StatusOr<se::Stream*> ToStream(
+    const Communicator::Executor& executor) {
+  auto* gpu_executor = dynamic_cast<const GpuCollectives::Executor*>(&executor);
+  if (gpu_executor == nullptr) {
+    return InvalidArgument("oneCCL collective requires a GPU executor");
+  }
+  return gpu_executor->stream();
 }
 
 absl::Status OnecclExceptionStatus(absl::string_view expr,
@@ -71,10 +74,11 @@ absl::Status OnecclExceptionStatus(absl::string_view expr,
       absl::StrFormat("oneCCL call failed: %s: %s", expr, message));
 }
 
-absl::Status OnecclCall(absl::string_view expr,
-                        absl::AnyInvocable<void() &&> fn) {
+absl::Status WaitForOnecclEvent(absl::string_view expr, ccl::event event) {
   try {
-    std::move(fn)();
+    // XLA marks the collective complete only after oneCCL's returned event is
+    // complete, so downstream stream synchronization sees the collective work.
+    event.wait();
     return absl::OkStatus();
   } catch (const ccl::exception& e) {
     return OnecclExceptionStatus(expr, e.what());
@@ -98,8 +102,15 @@ absl::StatusOr<T> OnecclValue(absl::string_view expr, F&& fn) {
   }
 }
 
+absl::Status LaunchOnecclAndWait(absl::string_view expr,
+                                 absl::AnyInvocable<ccl::event() &&> launch) {
+  ASSIGN_OR_RETURN(ccl::event event,
+                   OnecclValue<ccl::event>(expr, std::move(launch)));
+  return WaitForOnecclEvent(expr, std::move(event));
+}
+
 absl::Status VerifyStreamExecutor(se::Stream* stream,
-                                  se::StreamExecutor* stream_executor) {
+                                   se::StreamExecutor* stream_executor) {
   if (stream == nullptr) {
     return InvalidArgument("oneCCL collective requires a non-null stream");
   }
@@ -222,24 +233,17 @@ std::optional<se::DeviceAddressBase> IsContiguous(
 OnecclCommunicator::OnecclCommunicator(
     se::StreamExecutor* stream_executor, ccl::communicator comm,
     std::shared_ptr<ccl::kvs_interface> kvs,
-    std::unique_ptr<tsl::Executor> executor,
     std::shared_ptr<CancellationToken> cancel)
     : stream_executor_(stream_executor),
       comm_(std::make_unique<ccl::communicator>(std::move(comm))),
       kvs_(std::move(kvs)),
-      executor_(std::move(executor)),
-      cancel_(std::move(cancel)) {
-  VLOG(1) << absl::StreamFormat("[%d] Created oneCCL communicator %s",
-                                stream_executor_->device_ordinal(),
-                                ToString());
-}
+      cancel_(std::move(cancel)) {}
 
 absl::StatusOr<std::unique_ptr<OnecclCommunicator>>
 OnecclCommunicator::Create(se::StreamExecutor* stream_executor,
                            ccl::communicator comm,
                            std::shared_ptr<ccl::kvs_interface> kvs,
-                           std::shared_ptr<CancellationToken> cancel,
-                           tsl::Env& env) {
+                           std::shared_ptr<CancellationToken> cancel) {
   if (cancel == nullptr) {
     cancel = std::make_shared<CancellationToken>();
   }
@@ -247,10 +251,8 @@ OnecclCommunicator::Create(se::StreamExecutor* stream_executor,
     return FailedPrecondition("oneCCL communicator creation cancelled");
   }
 
-  auto executor = std::make_unique<SingleThreadedExecutor>(env);
   return absl::WrapUnique(new OnecclCommunicator(
-      stream_executor, std::move(comm), std::move(kvs), std::move(executor),
-      std::move(cancel)));
+      stream_executor, std::move(comm), std::move(kvs), std::move(cancel)));
 }
 
 OnecclCommunicator::~OnecclCommunicator() {
@@ -259,7 +261,7 @@ OnecclCommunicator::~OnecclCommunicator() {
                             return absl::OkStatus();
                           }
                           auto activation = stream_executor_->Activate();
-                          VLOG(1) << "Destroy oneCCL communicator: "
+                          VLOG(2) << "Destroy oneCCL communicator: "
                                   << ToString();
                           comm_.reset();
                           return absl::OkStatus();
@@ -304,13 +306,11 @@ absl::Status OnecclCommunicator::HealthCheck() const {
 
 absl::Status OnecclCommunicator::Barrier(const Executor& executor) {
   return ExecuteAwait([this, &executor]() -> absl::Status {
-    RETURN_IF_ERROR(CheckReady());
-    se::Stream* stream = ToStream(executor);
-    RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-    ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-    auto activation = stream_executor_->Activate();
-    return OnecclCall("ccl::barrier",
-                      [&] { ccl::barrier(comm(), ccl_stream); });
+    return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+      return LaunchOnecclAndWait("ccl::barrier", [&] {
+        return ccl::barrier(comm(), ccl_stream);
+      });
+    });
   });
 }
 
@@ -361,50 +361,17 @@ OnecclCommunicator::CreateSymmetricMemory(se::DeviceAddressBase addr) {
       });
 }
 
-absl::Status OnecclCommunicator::GroupStart() {
-  RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ == 0) {
-    auto activation = stream_executor_->Activate();
-    RETURN_IF_ERROR(
-        OnecclCall("ccl::group_start", [] { ccl::group_start(); }));
-  }
-  ++group_nesting_level_;
-  return absl::OkStatus();
-}
-
-absl::Status OnecclCommunicator::GroupEnd() {
-  RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ <= 0) {
-    return FailedPrecondition("oneCCL group end without a matching group start");
-  }
-  if (--group_nesting_level_ == 0) {
-    auto activation = stream_executor_->Activate();
-    RETURN_IF_ERROR(OnecclCall("ccl::group_end", [] { ccl::group_end(); }));
-  }
-  return absl::OkStatus();
-}
-
 Future<> OnecclCommunicator::GroupExecute(
     absl::AnyInvocable<absl::Status() &&> group) {
-  return Execute([group = std::move(group), this]() mutable -> absl::Status {
-    RETURN_IF_ERROR(GroupStart());
-    absl::Status status = std::move(group)();
-    absl::Status group_status = GroupEnd();
-    if (!status.ok()) {
-      return status;
-    }
-    return group_status;
-  });
+  // oneCCL group_end() only guarantees that grouped operations have been
+  // enqueued, and ccl::event::wait() is not supported for collectives issued
+  // inside the group API. Execute the body directly so each launched collective
+  // can wait its returned event before XLA observes completion.
+  return Execute(std::move(group));
 }
 
 Future<> OnecclCommunicator::GroupExecuteCounted(
-    absl::AnyInvocable<absl::Status() &&> group, int64_t num_collectives) {
-  // oneCCL groups batch >1 collective. For a single ccl::allreduce (decode
-  // case) the wrapper is pure host overhead: a lone collective is already
-  // complete. Issue bare; keep groups for num_collectives > 1.
-  if (num_collectives == 1) {
-    return Execute(std::move(group));
-  }
+    absl::AnyInvocable<absl::Status() &&> group, int64_t) {
   return GroupExecute(std::move(group));
 }
 
@@ -414,7 +381,7 @@ Future<> OnecclCommunicator::AllReduce(se::DeviceAddressBase send_buffer,
                                        ReductionKind reduction_kind,
                                        const Executor& executor) {
   return Execute([send_buffer, recv_buffer, dtype, count, reduction_kind,
-                  &executor, this]() -> absl::Status {
+                  executor, this]() -> absl::Status {
     return LaunchAllReduce(send_buffer, recv_buffer, dtype, count,
                            reduction_kind, executor);
   });
@@ -425,7 +392,7 @@ Future<> OnecclCommunicator::Broadcast(se::DeviceAddressBase send_buffer,
                                        PrimitiveType dtype, size_t count,
                                        RankId root,
                                        const Executor& executor) {
-  return Execute([send_buffer, recv_buffer, dtype, count, root, &executor,
+  return Execute([send_buffer, recv_buffer, dtype, count, root, executor,
                   this]() -> absl::Status {
     return LaunchBroadcast(send_buffer, recv_buffer, dtype, count, root,
                            executor);
@@ -438,7 +405,7 @@ Future<> OnecclCommunicator::ReduceScatter(se::DeviceAddressBase send_buffer,
                                            ReductionKind reduction_kind,
                                            const Executor& executor) {
   return Execute([send_buffer, recv_buffer, dtype, count, reduction_kind,
-                  &executor, this]() -> absl::Status {
+                  executor, this]() -> absl::Status {
     return LaunchReduceScatter(send_buffer, recv_buffer, dtype, count,
                                reduction_kind, executor);
   });
@@ -448,7 +415,7 @@ Future<> OnecclCommunicator::AllGather(se::DeviceAddressBase send_buffer,
                                        se::DeviceAddressBase recv_buffer,
                                        PrimitiveType dtype, size_t count,
                                        const Executor& executor) {
-  return Execute([send_buffer, recv_buffer, dtype, count, &executor,
+  return Execute([send_buffer, recv_buffer, dtype, count, executor,
                   this]() -> absl::Status {
     return LaunchAllGather(send_buffer, recv_buffer, dtype, count, executor);
   });
@@ -460,7 +427,7 @@ Future<> OnecclCommunicator::AllToAll(
     PrimitiveType dtype, size_t count, const Executor& executor) {
   return Execute([send_buffers = std::move(send_buffers),
                   recv_buffers = std::move(recv_buffers), dtype, count,
-                  &executor, this]() mutable -> absl::Status {
+                  executor, this]() mutable -> absl::Status {
     return LaunchAllToAll(std::move(send_buffers), std::move(recv_buffers),
                           dtype, count, executor);
   });
@@ -474,7 +441,7 @@ Future<> OnecclCommunicator::CollectivePermute(
                                          target_ranks.end());
   return Execute([send_buffer, recv_buffer, dtype, count, source_rank,
                   owned_target_ranks = std::move(owned_target_ranks),
-                  &executor, this]() -> absl::Status {
+                  executor, this]() -> absl::Status {
     return LaunchCollectivePermute(send_buffer, recv_buffer, dtype, count,
                                    source_rank, owned_target_ranks, executor);
   });
@@ -483,7 +450,7 @@ Future<> OnecclCommunicator::CollectivePermute(
 Future<> OnecclCommunicator::Send(se::DeviceAddressBase send_buffer,
                                   PrimitiveType dtype, size_t count,
                                   RankId peer, const Executor& executor) {
-  return Execute([send_buffer, dtype, count, peer, &executor,
+  return Execute([send_buffer, dtype, count, peer, executor,
                   this]() -> absl::Status {
     return LaunchSend(send_buffer, dtype, count, peer, executor);
   });
@@ -492,7 +459,7 @@ Future<> OnecclCommunicator::Send(se::DeviceAddressBase send_buffer,
 Future<> OnecclCommunicator::Recv(se::DeviceAddressBase recv_buffer,
                                   PrimitiveType dtype, size_t count,
                                   RankId peer, const Executor& executor) {
-  return Execute([recv_buffer, dtype, count, peer, &executor,
+  return Execute([recv_buffer, dtype, count, peer, executor,
                   this]() -> absl::Status {
     return LaunchRecv(recv_buffer, dtype, count, peer, executor);
   });
@@ -525,32 +492,27 @@ absl::Status OnecclCommunicator::LaunchAllReduce(
     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
     PrimitiveType dtype, size_t count, ReductionKind reduction_kind,
     const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::allreduce", [&] {
-    ccl::allreduce(send_buffer.opaque(), recv_buffer.opaque(),
-                   ToOnecclCount(dtype, count), ccl_dtype,
-                   ToOnecclReduction(reduction_kind), comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::allreduce", [&] {
+      return ccl::allreduce(send_buffer.opaque(), recv_buffer.opaque(),
+                            ToOnecclCount(dtype, count), ccl_dtype,
+                            ToOnecclReduction(reduction_kind), comm(),
+                            ccl_stream);
+    });
   });
 }
 
 absl::Status OnecclCommunicator::LaunchBroadcast(
     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
     PrimitiveType dtype, size_t count, RankId root, const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::broadcast", [&] {
-    ccl::broadcast(send_buffer.opaque(), recv_buffer.opaque(),
-                   ToOnecclCount(dtype, count), ccl_dtype, root.value(),
-                   comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::broadcast", [&] {
+      return ccl::broadcast(send_buffer.opaque(), recv_buffer.opaque(),
+                            ToOnecclCount(dtype, count), ccl_dtype,
+                            root.value(), comm(), ccl_stream);
+    });
   });
 }
 
@@ -558,31 +520,27 @@ absl::Status OnecclCommunicator::LaunchReduceScatter(
     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
     PrimitiveType dtype, size_t count, ReductionKind reduction_kind,
     const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::reduce_scatter", [&] {
-    ccl::reduce_scatter(send_buffer.opaque(), recv_buffer.opaque(),
-                        ToOnecclCount(dtype, count), ccl_dtype,
-                        ToOnecclReduction(reduction_kind), comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::reduce_scatter", [&] {
+      return ccl::reduce_scatter(send_buffer.opaque(), recv_buffer.opaque(),
+                                 ToOnecclCount(dtype, count), ccl_dtype,
+                                 ToOnecclReduction(reduction_kind), comm(),
+                                 ccl_stream);
+    });
   });
 }
 
 absl::Status OnecclCommunicator::LaunchAllGather(
     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
     PrimitiveType dtype, size_t count, const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::allgather", [&] {
-    ccl::allgather(send_buffer.opaque(), recv_buffer.opaque(),
-                   ToOnecclCount(dtype, count), ccl_dtype, comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::allgather", [&] {
+      return ccl::allgather(send_buffer.opaque(), recv_buffer.opaque(),
+                            ToOnecclCount(dtype, count), ccl_dtype, comm(),
+                            ccl_stream);
+    });
   });
 }
 
@@ -597,44 +555,43 @@ absl::Status OnecclCommunicator::LaunchAllToAll(
         send_buffers.size(), recv_buffers.size());
   }
 
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    size_t num_ranks = comm_->size();
+    if (send_buffers.size() != num_ranks) {
+      return InvalidArgument(
+          "Number of send buffers must match number of ranks: %d != %d",
+          send_buffers.size(), num_ranks);
+    }
 
-  size_t num_ranks = comm_->size();
-  if (send_buffers.size() != num_ranks) {
-    return InvalidArgument(
-        "Number of send buffers must match number of ranks: %d != %d",
-        send_buffers.size(), num_ranks);
-  }
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
 
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    std::optional<se::DeviceAddressBase> send_contiguous =
+        IsContiguous(send_buffers);
+    std::optional<se::DeviceAddressBase> recv_contiguous =
+        IsContiguous(recv_buffers);
+    if (send_contiguous.has_value() && recv_contiguous.has_value()) {
+      return LaunchOnecclAndWait("ccl::alltoall", [&] {
+        return ccl::alltoall(send_contiguous->opaque(),
+                             recv_contiguous->opaque(),
+                             ToOnecclCount(dtype, count), ccl_dtype, comm(),
+                             ccl_stream);
+      });
+    }
 
-  std::optional<se::DeviceAddressBase> send_contiguous =
-      IsContiguous(send_buffers);
-  std::optional<se::DeviceAddressBase> recv_contiguous =
-      IsContiguous(recv_buffers);
-  if (send_contiguous.has_value() && recv_contiguous.has_value()) {
-    return OnecclCall("ccl::alltoall", [&] {
-      ccl::alltoall(send_contiguous->opaque(), recv_contiguous->opaque(),
-                    ToOnecclCount(dtype, count), ccl_dtype, comm(),
-                    ccl_stream);
+    ccl::vector_class<void*> send_ptrs;
+    ccl::vector_class<void*> recv_ptrs;
+    send_ptrs.reserve(send_buffers.size());
+    recv_ptrs.reserve(recv_buffers.size());
+    for (size_t i = 0; i < send_buffers.size(); ++i) {
+      send_ptrs.push_back(send_buffers[i].opaque());
+      recv_ptrs.push_back(recv_buffers[i].opaque());
+    }
+
+    return LaunchOnecclAndWait("ccl::alltoall", [&] {
+      return ccl::alltoall(send_ptrs, recv_ptrs,
+                           ToOnecclCount(dtype, count), ccl_dtype, comm(),
+                           ccl_stream);
     });
-  }
-
-  ccl::vector_class<void*> send_ptrs;
-  ccl::vector_class<void*> recv_ptrs;
-  send_ptrs.reserve(send_buffers.size());
-  recv_ptrs.reserve(recv_buffers.size());
-  for (size_t i = 0; i < send_buffers.size(); ++i) {
-    send_ptrs.push_back(send_buffers[i].opaque());
-    recv_ptrs.push_back(recv_buffers[i].opaque());
-  }
-
-  return OnecclCall("ccl::alltoall", [&] {
-    ccl::alltoall(send_ptrs, recv_ptrs, ToOnecclCount(dtype, count), ccl_dtype,
-                  comm(), ccl_stream);
   });
 }
 
@@ -647,57 +604,63 @@ absl::Status OnecclCommunicator::LaunchCollectivePermute(
     return absl::OkStatus();
   }
 
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
 
-  RETURN_IF_ERROR(GroupStart());
-  if (source_rank.has_value()) {
-    RETURN_IF_ERROR(OnecclCall("ccl::recv", [&] {
-      ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-                source_rank->value(), comm(), ccl_stream);
-    }));
-  }
+    std::vector<ccl::event> events;
+    events.reserve((source_rank.has_value() ? 1 : 0) + target_ranks.size());
 
-  for (RankId target_rank : target_ranks) {
-    RETURN_IF_ERROR(OnecclCall("ccl::send", [&] {
-      ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-                target_rank.value(), comm(), ccl_stream);
-    }));
-  }
-  RETURN_IF_ERROR(GroupEnd());
-  return absl::OkStatus();
+    if (source_rank.has_value()) {
+      ASSIGN_OR_RETURN(
+          ccl::event event, OnecclValue<ccl::event>("ccl::recv", [&] {
+            return ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count),
+                             ccl_dtype, source_rank->value(), comm(),
+                             ccl_stream);
+          }));
+      events.push_back(std::move(event));
+    }
+
+    for (RankId target_rank : target_ranks) {
+      ASSIGN_OR_RETURN(ccl::event event,
+                       OnecclValue<ccl::event>("ccl::send", [&] {
+                         return ccl::send(
+                             send_buffer.opaque(), ToOnecclCount(dtype, count),
+                             ccl_dtype, target_rank.value(), comm(),
+                             ccl_stream);
+                       }));
+      events.push_back(std::move(event));
+    }
+
+    for (ccl::event& event : events) {
+      RETURN_IF_ERROR(
+          WaitForOnecclEvent("ccl::collective_permute event",
+                             std::move(event)));
+    }
+    return absl::OkStatus();
+  });
 }
 
 absl::Status OnecclCommunicator::LaunchSend(
     se::DeviceAddressBase send_buffer, PrimitiveType dtype, size_t count,
     RankId peer, const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::send", [&] {
-    ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-              peer.value(), comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::send", [&] {
+      return ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count),
+                       ccl_dtype, peer.value(), comm(), ccl_stream);
+    });
   });
 }
 
 absl::Status OnecclCommunicator::LaunchRecv(
     se::DeviceAddressBase recv_buffer, PrimitiveType dtype, size_t count,
     RankId peer, const Executor& executor) {
-  RETURN_IF_ERROR(CheckReady());
-  se::Stream* stream = ToStream(executor);
-  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
-  auto activation = stream_executor_->Activate();
-  ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
-  return OnecclCall("ccl::recv", [&] {
-    ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-              peer.value(), comm(), ccl_stream);
+  return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+    ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+    return LaunchOnecclAndWait("ccl::recv", [&] {
+      return ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count),
+                       ccl_dtype, peer.value(), comm(), ccl_stream);
+    });
   });
 }
 
@@ -716,6 +679,17 @@ absl::StatusOr<ccl::communicator> OnecclCommunicator::Split(
 
 std::string OnecclCommunicator::ToString() const {
   return absl::StrFormat("OnecclCommunicator(comm=%p)", comm_.get());
+}
+
+absl::Status OnecclCommunicator::LaunchOnStream(
+    const Executor& executor,
+    absl::AnyInvocable<absl::Status(const ccl::stream&) &&> launch) const {
+  RETURN_IF_ERROR(CheckReady());
+  ASSIGN_OR_RETURN(se::Stream* stream, ToStream(executor));
+  RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
+  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
+  auto activation = stream_executor_->Activate();
+  return std::move(launch)(ccl_stream);
 }
 
 Future<> OnecclCommunicator::Execute(
