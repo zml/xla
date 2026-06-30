@@ -19,7 +19,6 @@ limitations under the License.
 #include <cstdint>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <utility>
 
 #include "absl/strings/str_cat.h"
@@ -29,6 +28,24 @@ limitations under the License.
 namespace stream_executor::sycl {
 
 namespace {
+
+struct HostCallbackTask {
+  absl::AnyInvocable<absl::Status() &&> callback;
+  absl::AnyInvocable<void(absl::Status) &&> error_cb;
+};
+
+void RunHostCallbackTask(std::shared_ptr<HostCallbackTask> task) {
+  absl::Status status = std::move(task->callback)();
+  if (status.ok()) {
+    return;
+  }
+
+  if (task->error_cb) {
+    std::move(task->error_cb)(status);
+  } else {
+    LOG(WARNING) << "Host callback failed: " << status;
+  }
+}
 
 absl::Status LaunchSyclKernel(
     StreamExecutor* executor, absl::string_view kernel_name,
@@ -286,23 +303,36 @@ absl::Status SyclStream::DoHostCallbackWithStatus(
 absl::Status SyclStream::DoHostCallbackWithStatus(
     absl::AnyInvocable<absl::Status() &&> callback,
     absl::AnyInvocable<void(absl::Status) &&> error_cb) {
-  ASSIGN_OR_RETURN(SyclEvent event, SyclEvent::Create(executor_));
-  RETURN_IF_ERROR(RecordEvent(&event));
-
-  CallbackTask task;
-  task.event = std::make_unique<SyclEvent>(std::move(event));
-  task.callback = std::move(callback);
-  task.error_cb = std::move(error_cb);
-
-  {
-    std::lock_guard<std::mutex> lock(callback_mu_);
-    if (callback_thread_shutdown_) {
-      return absl::FailedPreconditionError(
-          "DoHostCallbackWithStatus called while SYCL stream is shutting down");
+  auto task = std::make_shared<HostCallbackTask>();
+  task->callback = std::move(callback);
+  task->error_cb = std::move(error_cb);
+  try {
+    stream_handle_->submit([task](::sycl::handler& cgh) {
+      cgh.host_task([task]() { RunHostCallbackTask(task); });
+    });
+  } catch (const ::sycl::exception& e) {
+    absl::Status status = absl::InternalError(absl::StrCat(
+        "DoHostCallbackWithStatus: failed to submit host task: ", e.what()));
+    if (task->error_cb) {
+      std::move(task->error_cb)(status);
     }
-    callback_tasks_.push_back(std::move(task));
+    return status;
+  } catch (const std::exception& e) {
+    absl::Status status = absl::InternalError(absl::StrCat(
+        "DoHostCallbackWithStatus: failed to submit host task: ", e.what()));
+    if (task->error_cb) {
+      std::move(task->error_cb)(status);
+    }
+    return status;
+  } catch (...) {
+    absl::Status status = absl::InternalError(
+        "DoHostCallbackWithStatus: failed to submit host task: unknown "
+        "exception");
+    if (task->error_cb) {
+      std::move(task->error_cb)(status);
+    }
+    return status;
   }
-  callback_cv_.notify_one();
   return absl::OkStatus();
 }
 
@@ -343,15 +373,6 @@ absl::StatusOr<std::unique_ptr<SyclStream>> SyclStream::Create(
 }
 
 SyclStream::~SyclStream() {
-  {
-    std::lock_guard<std::mutex> lock(callback_mu_);
-    callback_thread_shutdown_ = true;
-  }
-  callback_cv_.notify_one();
-  if (callback_thread_.joinable()) {
-    callback_thread_.join();
-  }
-
   // Wait for all pending operations to complete before destroying the stream.
   BlockHostUntilDone().IgnoreError();
 
@@ -374,39 +395,6 @@ SyclStream::~SyclStream() {
 
 absl::Status SyclStream::RecordCompletedEvent() {
   return RecordEvent(&completed_event_);
-}
-
-void SyclStream::CallbackWorkLoop() {
-  while (true) {
-    CallbackTask task;
-    {
-      std::unique_lock<std::mutex> lock(callback_mu_);
-      callback_cv_.wait(lock, [this] {
-        return callback_thread_shutdown_ || !callback_tasks_.empty();
-      });
-      if (callback_thread_shutdown_ && callback_tasks_.empty()) {
-        return;
-      }
-      task = std::move(callback_tasks_.front());
-      callback_tasks_.pop_front();
-    }
-    RunCallbackTask(std::move(task));
-  }
-}
-
-void SyclStream::RunCallbackTask(CallbackTask task) {
-  absl::Status status = task.event->Wait();
-  if (status.ok()) {
-    status = std::move(task.callback)();
-  }
-
-  if (!status.ok()) {
-    if (task.error_cb) {
-      std::move(task.error_cb)(status);
-    } else {
-      LOG(WARNING) << "Host callback failed: " << status;
-    }
-  }
 }
 
 absl::Status SyclStream::LaunchKernel(

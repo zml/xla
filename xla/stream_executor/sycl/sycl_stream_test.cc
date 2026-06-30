@@ -27,6 +27,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/runtime/custom_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
@@ -227,6 +228,37 @@ TEST_F(SyclStreamTest, DoHostCallbackAndBlockHostUntilDone) {
 
   EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
   EXPECT_TRUE(callback_called);
+}
+
+TEST_F(SyclStreamTest, DoHostCallbackBlocksLaterStreamWork) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<SyclStream> stream,
+                          SyclStream::Create(&executor_.value(),
+                                             /*enable_multiple_streams=*/false,
+                                             /*priority=*/std::nullopt));
+
+  DeviceAddress<uint32_t> device_buffer =
+      executor_->AllocateArray<uint32_t>(1, 0);
+  uint32_t host_value = 0;
+  uint32_t copied_value = 0;
+  absl::Notification callback_started;
+  absl::Notification release_callback;
+
+  EXPECT_THAT(stream->DoHostCallback([&]() {
+                callback_started.Notify();
+                release_callback.WaitForNotification();
+                host_value = 0xDEADBEEF;
+              }),
+              absl_testing::IsOk());
+  EXPECT_THAT(stream->Memcpy(&device_buffer, &host_value, sizeof(host_value)),
+              absl_testing::IsOk());
+  EXPECT_THAT(stream->Memcpy(&copied_value, device_buffer, sizeof(copied_value)),
+              absl_testing::IsOk());
+
+  callback_started.WaitForNotification();
+  release_callback.Notify();
+  EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
+  EXPECT_EQ(copied_value, 0xDEADBEEF);
+  executor_->Deallocate(&device_buffer);
 }
 
 TEST_F(SyclStreamTest, LaunchKernel) {

@@ -16,12 +16,10 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_SYCL_SYCL_STREAM_H_
 #define XLA_STREAM_EXECUTOR_SYCL_SYCL_STREAM_H_
 
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <memory>
-#include <mutex>
-#include <thread>
+#include <optional>
+#include <variant>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
@@ -109,27 +107,17 @@ class SyclStream : public StreamCommon {
   ::sycl::queue* stream_handle() const { return stream_handle_.get(); }
 
  private:
-  struct CallbackTask {
-    std::unique_ptr<SyclEvent> event;
-    absl::AnyInvocable<absl::Status() &&> callback;
-    absl::AnyInvocable<void(absl::Status) &&> error_cb;
-  };
-
   SyclStream(StreamExecutor* executor, SyclEvent completed_event,
              std::optional<std::variant<StreamPriority, int>> priority,
              StreamPtr stream_handle)
       : StreamCommon(executor, priority),
         executor_(executor),
         completed_event_(std::move(completed_event)),
-        stream_handle_(std::move(stream_handle)),
-        callback_thread_([this] { CallbackWorkLoop(); }) {}
+        stream_handle_(std::move(stream_handle)) {}
 
   // Records a marker for all work currently enqueued on this stream and stores
   // it in 'completed_event_' so other streams can synchronize with this point.
   absl::Status RecordCompletedEvent();
-
-  void CallbackWorkLoop();
-  void RunCallbackTask(CallbackTask task);
 
   // Launches a SYCL kernel on the current stream with the specified thread,
   // block, and optional cluster dimensions, kernel function, name, arguments,
@@ -150,12 +138,6 @@ class SyclStream : public StreamCommon {
 
   // The underlying SYCL stream (queue).
   StreamPtr stream_handle_;
-
-  std::mutex callback_mu_;
-  std::condition_variable callback_cv_;
-  std::deque<CallbackTask> callback_tasks_;
-  bool callback_thread_shutdown_ = false;
-  std::thread callback_thread_;
 };
 
 }  // namespace stream_executor::sycl
