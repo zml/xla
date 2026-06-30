@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 #include "absl/base/call_once.h"
 #include "absl/synchronization/mutex.h"
@@ -158,10 +159,20 @@ absl::Status SyclDevicePool::InitDevicePool() {
   return init_status;
 }
 
-absl::StatusOr<::sycl::context> SyclDevicePool::GetDeviceContext() {
+absl::StatusOr<::sycl::context> SyclDevicePool::GetDeviceContext(
+    int device_ordinal) {
   RETURN_IF_ERROR(SyclDevicePool::InitDevicePool());
-  static ::sycl::context device_context(device_pool_);
-  return device_context;
+  RETURN_IF_ERROR(
+      IsValidDeviceOrdinal(device_ordinal, "SyclDevicePool::GetDeviceContext"));
+  static const std::vector<::sycl::context> device_contexts = [] {
+    std::vector<::sycl::context> contexts;
+    contexts.reserve(device_pool_.size());
+    for (const ::sycl::device& device : device_pool_) {
+      contexts.emplace_back(device);
+    }
+    return contexts;
+  }();
+  return device_contexts[device_ordinal];
 }
 
 absl::StatusOr<int> SyclDevicePool::GetDeviceCount() {
@@ -220,7 +231,7 @@ absl::StatusOr<StreamPool*> SyclStreamPool::InitStreamPool(int device_ordinal) {
   ASSIGN_OR_RETURN(::sycl::device sycl_device,
                    SyclDevicePool::GetDevice(device_ordinal));
   ASSIGN_OR_RETURN(::sycl::context sycl_context,
-                   SyclDevicePool::GetDeviceContext());
+                   SyclDevicePool::GetDeviceContext(device_ordinal));
 
   VLOG(2) << "Creating new stream pool for device ordinal " << device_ordinal;
   absl::MutexLock write_lock(&stream_pool_mu_);
@@ -281,7 +292,7 @@ absl::StatusOr<StreamPtr> SyclStreamPool::GetOrCreateStream(
   ASSIGN_OR_RETURN(::sycl::device sycl_device,
                    SyclDevicePool::GetDevice(device_ordinal));
   ASSIGN_OR_RETURN(::sycl::context sycl_context,
-                   SyclDevicePool::GetDeviceContext());
+                   SyclDevicePool::GetDeviceContext(device_ordinal));
   stream_pool->push_back(std::make_shared<::sycl::queue>(
       sycl_context, sycl_device, SyclAsyncHandler, prop_list));
   return stream_pool->back();

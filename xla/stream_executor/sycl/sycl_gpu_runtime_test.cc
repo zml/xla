@@ -124,13 +124,26 @@ TEST_F(SyclGpuRuntimeTest, GetDeviceOrdinal) {
 }
 
 TEST_F(SyclGpuRuntimeTest, TestStaticDeviceContext) {
-  // Verify that GetDeviceContext returns the same context instance on multiple
-  // calls.
+  // Verify that GetDeviceContext returns the same per-device context instance
+  // on multiple calls.
   TF_ASSERT_OK_AND_ASSIGN(::sycl::context saved_sycl_context,
-                          SyclDevicePool::GetDeviceContext());
+                          SyclDevicePool::GetDeviceContext(
+                              kDefaultDeviceOrdinal));
   TF_ASSERT_OK_AND_ASSIGN(::sycl::context current_sycl_context,
-                          SyclDevicePool::GetDeviceContext());
+                          SyclDevicePool::GetDeviceContext(
+                              kDefaultDeviceOrdinal));
   EXPECT_EQ(saved_sycl_context, current_sycl_context);
+}
+
+TEST_F(SyclGpuRuntimeTest, TestDeviceContextsArePerOrdinal) {
+  if (sycl_devices_.size() < 2) {
+    GTEST_SKIP() << "Need at least two SYCL devices.";
+  }
+  TF_ASSERT_OK_AND_ASSIGN(::sycl::context first_context,
+                          SyclDevicePool::GetDeviceContext(0));
+  TF_ASSERT_OK_AND_ASSIGN(::sycl::context second_context,
+                          SyclDevicePool::GetDeviceContext(1));
+  EXPECT_NE(first_context, second_context);
 }
 
 TEST_F(SyclGpuRuntimeTest, TestDefaultStreamSynchronize) {
