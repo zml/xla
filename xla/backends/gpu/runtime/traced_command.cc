@@ -81,16 +81,23 @@ TracedCommand::RecordTracedCommand(
     VLOG(5) << "Record traced command " << nested_cmd
             << " into parent command buffer: " << command_buffer
             << " (CreateChildCommand)";
-    return command_buffer->CreateChildCommand(*nested_cmd,
-                                              create->dependencies);
+    ASSIGN_OR_RETURN(
+        const se::CommandBuffer::Command* command,
+        command_buffer->CreateChildCommand(*nested_cmd, create->dependencies));
+    traced_cmd->SetRecordedChild(command, nested_cmd);
+    return command;
   }
 
   if (auto* update = std::get_if<RecordUpdate>(&record_action)) {
     VLOG(5) << "Record traced command " << nested_cmd
             << " into parent command buffer: " << command_buffer
             << " (UpdateChildCommand)";
+    if (traced_cmd->RecordedChildIsCurrent(update->command, nested_cmd)) {
+      return update->command;
+    }
     RETURN_IF_ERROR(
         command_buffer->UpdateChildCommand(update->command, *nested_cmd));
+    traced_cmd->SetRecordedChild(update->command, nested_cmd);
     return update->command;
   }
 
