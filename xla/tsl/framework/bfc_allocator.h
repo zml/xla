@@ -588,7 +588,8 @@ class BFCAllocator : public Allocator {
   // Try to add a new memory region that can satisfy an allocation of
   // 'rounded_bytes' bytes.  Returns true on success and false on
   // failure.
-  bool Extend(size_t alignment, size_t rounded_bytes)
+  bool Extend(size_t alignment, size_t rounded_bytes,
+              AllocationEnd allocation_end)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Deallocate free regions to give back the memory to suballocator, so that

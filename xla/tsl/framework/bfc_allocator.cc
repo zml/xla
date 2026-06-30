@@ -166,7 +166,8 @@ const BFCAllocator::Chunk* BFCAllocator::ChunkFromHandle(ChunkHandle h) const {
   return &(chunks_[h]);
 }
 
-bool BFCAllocator::Extend(size_t alignment, size_t rounded_bytes) {
+bool BFCAllocator::Extend(size_t alignment, size_t rounded_bytes,
+                          AllocationEnd allocation_end) {
   size_t available_bytes = memory_limit_ - *stats_.pool_bytes;
   // Rounds available_bytes down to the nearest multiple of kMinAllocationSize.
   available_bytes = (available_bytes / kMinAllocationSize) * kMinAllocationSize;
@@ -243,7 +244,13 @@ bool BFCAllocator::Extend(size_t alignment, size_t rounded_bytes) {
   c->prev = kInvalidChunkHandle;
   c->next = kInvalidChunkHandle;
   c->freed_at_count = 0;
-  c->tag = free_chunk_tag_;
+  // In spatial mode, only the first region owns the central gap. Later
+  // discontiguous regions are owned by the end that forced the extension.
+  c->tag =
+      free_chunk_tag_ == ChunkTag::kCentralGap &&
+              central_gap_ != kInvalidChunkHandle
+          ? ChunkTagOf(allocation_end)
+          : free_chunk_tag_;
   c->allocation_annotation.reset();
 
   region_manager_.set_handle(c->ptr, h);
@@ -544,7 +551,7 @@ void* BFCAllocator::AllocateRawInternal(size_t alignment, size_t num_bytes,
   }
 
   // Try to extend
-  if (Extend(alignment, rounded_bytes)) {
+  if (Extend(alignment, rounded_bytes, allocation_end)) {
     ptr = FindChunkPtr(bin_num, rounded_bytes, num_bytes, alignment,
                        freed_before, allocation_end);
     if (ptr != nullptr) {
@@ -573,7 +580,7 @@ void* BFCAllocator::AllocateRawInternal(size_t alignment, size_t num_bytes,
   // try deallocating free regions so that suballocator can combine them with
   // the unallocated bytes and form a larger region.
   if (DeallocateFreeRegions(rounded_bytes) &&
-      Extend(alignment, rounded_bytes)) {
+      Extend(alignment, rounded_bytes, allocation_end)) {
     ptr = FindChunkPtr(bin_num, rounded_bytes, num_bytes, alignment,
                        freed_before, allocation_end);
     if (ptr != nullptr) {
@@ -1083,14 +1090,28 @@ void BFCAllocator::ReturnBoundaryChunkToGap(BFCAllocator::ChunkHandle h) {
   CHECK(!c->in_use());  // Crash OK
   if (ABSL_PREDICT_TRUE(c->tag == ChunkTag::kLower)) {
     ChunkHandle n = c->next;
-    if (n == kInvalidChunkHandle ||
-        ChunkFromHandle(n)->tag != ChunkTag::kLower) {
+    const bool touches_central_gap = n != kInvalidChunkHandle &&
+                                     n == central_gap_ &&
+                                     ChunkFromHandle(n)->tag ==
+                                         ChunkTag::kCentralGap;
+    const bool creates_first_gap =
+        central_gap_ == kInvalidChunkHandle &&
+        (n == kInvalidChunkHandle ||
+         ChunkFromHandle(n)->tag != ChunkTag::kLower);
+    if (touches_central_gap || creates_first_gap) {
       c->tag = ChunkTag::kCentralGap;
     }
   } else if (ABSL_PREDICT_FALSE(c->tag == ChunkTag::kUpper)) {
     ChunkHandle p = c->prev;
-    if (p == kInvalidChunkHandle ||
-        ChunkFromHandle(p)->tag != ChunkTag::kUpper) {
+    const bool touches_central_gap = p != kInvalidChunkHandle &&
+                                     p == central_gap_ &&
+                                     ChunkFromHandle(p)->tag ==
+                                         ChunkTag::kCentralGap;
+    const bool creates_first_gap =
+        central_gap_ == kInvalidChunkHandle &&
+        (p == kInvalidChunkHandle ||
+         ChunkFromHandle(p)->tag != ChunkTag::kUpper);
+    if (touches_central_gap || creates_first_gap) {
       c->tag = ChunkTag::kCentralGap;
     }
   }

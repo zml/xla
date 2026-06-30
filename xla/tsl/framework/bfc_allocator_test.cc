@@ -70,11 +70,19 @@ class FakeSubAllocator : public SubAllocator {
   static constexpr uintptr_t kBase = uintptr_t{1} << 40;
 
   explicit FakeSubAllocator(
-      std::optional<size_t> hardcoded_alignment = std::nullopt)
-      : SubAllocator({}, {}), hardcoded_alignment_(hardcoded_alignment) {}
+      std::optional<size_t> hardcoded_alignment = std::nullopt,
+      std::optional<size_t> max_allocation_bytes = std::nullopt)
+      : SubAllocator({}, {}),
+        hardcoded_alignment_(hardcoded_alignment),
+        max_allocation_bytes_(max_allocation_bytes) {}
 
   void* Alloc(size_t alignment, size_t num_bytes,
               size_t* bytes_received) override {
+    if (max_allocation_bytes_.has_value() &&
+        num_bytes > *max_allocation_bytes_) {
+      *bytes_received = 0;
+      return nullptr;
+    }
     const size_t effective_alignment = hardcoded_alignment_.value_or(alignment);
     uintptr_t aligned =
         (next_ + (effective_alignment - 1)) & ~(effective_alignment - 1);
@@ -89,6 +97,7 @@ class FakeSubAllocator : public SubAllocator {
 
  private:
   std::optional<size_t> hardcoded_alignment_;
+  std::optional<size_t> max_allocation_bytes_;
   uintptr_t next_ = kBase;
 };
 
@@ -551,6 +560,32 @@ TEST(BFCAllocatorTest, SpatialReusesOwnHoles) {
   alloc.DeallocateRaw(upper0);
   alloc.DeallocateRaw(lower_reuse);
   alloc.DeallocateRaw(lower_guard);
+  alloc.DeallocateRaw(lower0);
+}
+
+TEST(BFCAllocatorTest, SpatialBackpedaledGrowthUsesEndpointTags) {
+  BFCAllocator::Options opts;
+  opts.allow_growth = false;
+  opts.enable_spatial_partitioning = true;
+  BFCAllocator alloc(std::make_unique<FakeSubAllocator>(
+                         /*hardcoded_alignment=*/std::nullopt,
+                         /*max_allocation_bytes=*/1024),
+                     /*total_memory=*/4096, /*name=*/"spatial", opts);
+
+  // The suballocator refuses the full fixed-size preallocation, so BFC
+  // backpedals to a smaller first region. Later extensions must not create
+  // additional central gaps; they should be owned by the requesting end.
+  void* lower0 = alloc.AllocateRaw(kAlignment, 768);
+  ASSERT_NE(lower0, nullptr);
+
+  void* lower1 = alloc.AllocateRaw(kAlignment, 768);
+  ASSERT_NE(lower1, nullptr);
+
+  void* upper0 = alloc.AllocateRaw(kAlignment, 768, *kUpper);
+  ASSERT_NE(upper0, nullptr);
+
+  alloc.DeallocateRaw(upper0);
+  alloc.DeallocateRaw(lower1);
   alloc.DeallocateRaw(lower0);
 }
 

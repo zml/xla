@@ -58,7 +58,11 @@ class DeviceMemAllocator : public tsl::SubAllocator {
       DeviceAddressBase result = stream_exec_->Allocate(num_bytes);
       ptr = result.opaque();
       *bytes_received = result.size();
-      VisitAlloc(ptr, device_id_.value(), *bytes_received);
+      if (ptr == nullptr) {
+        *bytes_received = 0;
+      } else {
+        VisitAlloc(ptr, device_id_.value(), *bytes_received);
+      }
     }
     return ptr;
   }

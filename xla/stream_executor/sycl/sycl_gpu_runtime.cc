@@ -17,9 +17,11 @@ limitations under the License.
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <string>
 
 #include "absl/base/call_once.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/tsl/platform/errors.h"
@@ -161,10 +163,27 @@ absl::Status SyclDevicePool::InitDevicePool() {
   return init_status;
 }
 
-absl::StatusOr<::sycl::context> SyclDevicePool::GetDeviceContext() {
+absl::StatusOr<::sycl::context> SyclDevicePool::GetDeviceContext(
+    int device_ordinal) {
   RETURN_IF_ERROR(SyclDevicePool::InitDevicePool());
-  static ::sycl::context device_context(device_pool_);
-  return device_context;
+  RETURN_IF_ERROR(
+      IsValidDeviceOrdinal(device_ordinal, "SyclDevicePool::GetDeviceContext"));
+
+  static absl::Mutex contexts_mu(absl::kConstInit);
+  static auto* contexts =
+      new absl::flat_hash_map<int, std::unique_ptr<::sycl::context>>();
+
+  absl::MutexLock lock(&contexts_mu);
+  auto it = contexts->find(device_ordinal);
+  if (it == contexts->end()) {
+    // Keep USM allocations scoped to one physical device. A multi-device
+    // Level Zero context can make independent GPU BFC arenas compete in the
+    // same context-level allocation budget.
+    auto context =
+        std::make_unique<::sycl::context>(device_pool_[device_ordinal]);
+    it = contexts->emplace(device_ordinal, std::move(context)).first;
+  }
+  return *it->second;
 }
 
 absl::StatusOr<int> SyclDevicePool::GetDeviceCount() {
@@ -223,7 +242,7 @@ absl::StatusOr<StreamPool*> SyclStreamPool::InitStreamPool(int device_ordinal) {
   ASSIGN_OR_RETURN(::sycl::device sycl_device,
                    SyclDevicePool::GetDevice(device_ordinal));
   ASSIGN_OR_RETURN(::sycl::context sycl_context,
-                   SyclDevicePool::GetDeviceContext());
+                   SyclDevicePool::GetDeviceContext(device_ordinal));
 
   VLOG(2) << "Creating new stream pool for device ordinal " << device_ordinal;
   absl::MutexLock write_lock(&stream_pool_mu_);
@@ -292,7 +311,7 @@ absl::StatusOr<StreamPtr> SyclStreamPool::GetOrCreateStream(
   ASSIGN_OR_RETURN(::sycl::device sycl_device,
                    SyclDevicePool::GetDevice(device_ordinal));
   ASSIGN_OR_RETURN(::sycl::context sycl_context,
-                   SyclDevicePool::GetDeviceContext());
+                   SyclDevicePool::GetDeviceContext(device_ordinal));
   stream_pool->push_back(std::make_shared<::sycl::queue>(
       sycl_context, sycl_device, SyclAsyncHandler, prop_list));
   return stream_pool->back();
@@ -635,7 +654,6 @@ absl::Status SyclMemfillDeviceAsync(::sycl::queue* stream_handle,
   return MemfillDevice(stream_handle, dst_device, value, count, /*async=*/true);
 }
 
-// TODO(intel-tf): Need OOM checks for all SYCL memory allocation functions.
 absl::StatusOr<void*> SyclMallocDevice(int device_ordinal, size_t byte_count) {
   if (byte_count == 0) {
     VLOG(2) << "SyclMallocDevice: Attempting to allocate zero bytes, "
@@ -649,6 +667,12 @@ absl::StatusOr<void*> SyclMallocDevice(int device_ordinal, size_t byte_count) {
     // Use the default stream to allocate memory
     void* ptr = ::sycl::aligned_alloc_device(/*alignment=*/64, byte_count,
                                              *stream_handle);
+    if (ptr == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "SyclMallocDevice: Failed to allocate ", byte_count,
+          " bytes of device memory for device ordinal ", device_ordinal,
+          ": SYCL returned nullptr."));
+    }
     return ptr;
   } catch (const std::exception& e) {
     return absl::InternalError(absl::StrCat(
@@ -670,6 +694,12 @@ absl::StatusOr<void*> SyclMallocHost(int device_ordinal, size_t byte_count) {
     // Use the default stream to allocate memory
     void* ptr = ::sycl::aligned_alloc_host(/*alignment=*/64, byte_count,
                                            *stream_handle);
+    if (ptr == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "SyclMallocHost: Failed to allocate ", byte_count,
+          " bytes of host memory for device ordinal ", device_ordinal,
+          ": SYCL returned nullptr."));
+    }
     return ptr;
   } catch (const std::exception& e) {
     return absl::InternalError(absl::StrCat(
@@ -691,6 +721,12 @@ absl::StatusOr<void*> SyclMallocShared(int device_ordinal, size_t byte_count) {
     // Use the default stream to allocate memory
     void* ptr = ::sycl::aligned_alloc_shared(/*alignment=*/64, byte_count,
                                              *stream_handle);
+    if (ptr == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "SyclMallocShared: Failed to allocate ", byte_count,
+          " bytes of shared memory for device ordinal ", device_ordinal,
+          ": SYCL returned nullptr."));
+    }
     return ptr;
   } catch (const std::exception& e) {
     return absl::InternalError(absl::StrCat(

@@ -46,14 +46,14 @@ using DevicePool = std::vector<::sycl::device>;
 // utility.
 class SyclDevicePool {
  public:
-  // Returns a static thread-safe SYCL context associated with the device pool.
+  // Returns a static thread-safe SYCL context associated with one device.
   // The context is initialized on the first call and remains valid for the
-  // lifetime of the process, ensuring all callers share the same context.
+  // lifetime of the process.
   //
   // This function assumes that the device pool is not modified after
   // initialization. If this assumption is violated, the context may become
   // invalid.
-  static absl::StatusOr<::sycl::context> GetDeviceContext();
+  static absl::StatusOr<::sycl::context> GetDeviceContext(int device_ordinal);
 
   // Returns the number of devices in the pool.
   static absl::StatusOr<int> GetDeviceCount();

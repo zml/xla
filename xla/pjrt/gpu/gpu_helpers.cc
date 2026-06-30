@@ -52,7 +52,16 @@ limitations under the License.
 
 namespace xla {
 
-static size_t RoundUpGpuMemoryLimit(size_t allocator_memory) {
+static size_t RoundGpuMemoryLimit(size_t allocator_memory,
+                                  absl::string_view platform_name) {
+  // SYCL device allocations report the requested size back to BFC, and Intel
+  // GPUs can report a global memory size that is not a 2MiB multiple. Rounding
+  // that limit up can make a preallocated BFC arena larger than the device can
+  // actually allocate.
+  if (platform_name == "SYCL") {
+    return allocator_memory;
+  }
+
   // GPU device allocations can be rounded up by backend allocation granularity.
   // BFC accounts the allocator-reported size as usable pool memory, so round
   // the limit too to keep memory stats consistent and avoid pool_bytes
@@ -152,7 +161,8 @@ absl::StatusOr<std::shared_ptr<tsl::BFCAllocator>> CreateBFCAllocator(
     allocator_memory = gpu_system_memory_size.value();
   }
 
-  allocator_memory = RoundUpGpuMemoryLimit(allocator_memory);
+  allocator_memory =
+      RoundGpuMemoryLimit(allocator_memory, executor->GetPlatform()->Name());
 
   const std::string allocator_memory_str =
       absl::StrCat(tsl::strings::HumanReadableNumBytes(allocator_memory), " (",
@@ -196,7 +206,8 @@ absl::StatusOr<std::unique_ptr<tsl::BFCAllocator>> CreateCollectiveBFCAllocator(
   bool preallocate = collective_memory_size != 0;
   size_t allocator_memory =
       preallocate ? collective_memory_size : total_memory * memory_fraction;
-  allocator_memory = RoundUpGpuMemoryLimit(allocator_memory);
+  allocator_memory =
+      RoundGpuMemoryLimit(allocator_memory, executor->GetPlatform()->Name());
 
   if (preallocate) {
     LOG(INFO) << "XLA backend allocating " << allocator_memory
