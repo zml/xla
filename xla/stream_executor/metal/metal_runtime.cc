@@ -486,7 +486,8 @@ static absl::Status EncodeComputeInto(
     id<MTLCommandBuffer> command_buffer, void* pipeline, void* function,
     bool use_argument_buffer, absl::Span<const MetalKernelArgument> arguments,
     absl::string_view name, const ThreadDim& thread_dims,
-    const BlockDim& block_dims, int64_t shmem_bytes = 0) {
+    const BlockDim& block_dims, int64_t shmem_bytes = 0,
+    void* indirect_grid_buffer = nullptr, uint64_t indirect_grid_offset = 0) {
   // Defensive launch guard. maxTotalThreadsPerThreadgroup is PER-PIPELINE (a
   // register-heavy kernel can report < the device's nominal 1024) and
   // maxThreadgroupMemoryLength is the device's threadgroup-memory budget;
@@ -622,10 +623,24 @@ static absl::Status EncodeComputeInto(
   }
   MTLSize threads_per_threadgroup =
       MTLSizeMake(thread_dims.x, thread_dims.y, thread_dims.z);
-  MTLSize threadgroups =
-      MTLSizeMake(block_dims.x, block_dims.y, block_dims.z);
-  [encoder dispatchThreadgroups:threadgroups
-          threadsPerThreadgroup:threads_per_threadgroup];
+  if (indirect_grid_buffer != nullptr) {
+    // Indirect dispatch: the threadgroups-per-grid count lives in a device
+    // buffer (a {gx,gy,gz} uint3 the GPU computed this step), so a kernel can
+    // shrink its own launch to the runtime-active work without a host read.
+    // Used by the MoE prefill steel GEMM to launch only ceil(R_active/16)
+    // route-tiles instead of the baked ceil(r_/16); block_dims above is only the
+    // KPROF label's max bound. threadsPerThreadgroup stays host-fixed.
+    [encoder
+        dispatchThreadgroupsWithIndirectBuffer:Obj<id<MTLBuffer>>(
+                                                   indirect_grid_buffer)
+                          indirectBufferOffset:indirect_grid_offset
+                         threadsPerThreadgroup:threads_per_threadgroup];
+  } else {
+    MTLSize threadgroups =
+        MTLSizeMake(block_dims.x, block_dims.y, block_dims.z);
+    [encoder dispatchThreadgroups:threadgroups
+            threadsPerThreadgroup:threads_per_threadgroup];
+  }
   if (!shared_encoder) [encoder endEncoding];
   return absl::OkStatus();
 }
@@ -642,7 +657,9 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
                           void* function, bool use_argument_buffer,
                           absl::Span<const MetalKernelArgument> arguments,
                           absl::string_view name, const ThreadDim& thread_dims,
-                          const BlockDim& block_dims, int64_t shmem_bytes) {
+                          const BlockDim& block_dims, int64_t shmem_bytes,
+                          void* indirect_grid_buffer,
+                          uint64_t indirect_grid_offset) {
   if (batch_command_buffer == nullptr) {
     return absl::InternalError("Metal EncodeKernel: null batch command buffer.");
   }
@@ -651,8 +668,8 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
   id<MTLCommandBuffer> cb =
       Obj<MPSCommandBuffer*>(batch_command_buffer).commandBuffer;
   return EncodeComputeInto(cb, pipeline, function, use_argument_buffer,
-                           arguments, name, thread_dims, block_dims,
-                           shmem_bytes);
+                           arguments, name, thread_dims, block_dims, shmem_bytes,
+                           indirect_grid_buffer, indirect_grid_offset);
 }
 
 absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
@@ -909,12 +926,27 @@ uint64_t MetalProfilingDroppedCount() {
 // GPU time aggregated by kernel name. Profiling forces a per-dispatch encoder
 // plus a per-commit waitUntilCompleted, so it SERIALIZES and slows the run --
 // this is a measurement mode, never the production fast path.
+// METAL_DFLASH_KPROF=1 is a MoE/DFlash-focused variant of METAL_KPROF: it turns
+// the same profiler on, but KEEPS the " grid=..." suffix in the per-kernel key
+// (instead of folding all grids of a kernel into one row). For the MoE prefill /
+// DFlash-verify kernels that means the steel GEMM's grid.y (= ceil(r_/16)) and the
+// gather/scatter/argsort grids show up directly, so the operator reads the baked
+// route count r_ -- and thus the padding multiplier r_/(valid_tokens*top_k) -- off
+// the report without recompiling. Implies MetalKprofWanted().
+static bool MetalKprofKeepGrid() {
+  static const bool on = [] {
+    const char* e = std::getenv("METAL_DFLASH_KPROF");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+
 static bool MetalKprofWanted() {
   static const bool on = [] {
     const char* e = std::getenv("METAL_KPROF");
     return e != nullptr && e[0] != '\0' && e[0] != '0';
   }();
-  return on;
+  return on || MetalKprofKeepGrid();
 }
 
 void MetalKprofMaybeStart() {
@@ -945,7 +977,7 @@ void MetalKprofReport() {
   for (const auto& ev : evs) {
     std::string key = ev.name;
     auto pos = key.find(" grid=");
-    if (pos != std::string::npos) key.resize(pos);
+    if (pos != std::string::npos && !MetalKprofKeepGrid()) key.resize(pos);
     Agg& a = agg[key];
     const uint64_t d = ev.end_ns - ev.start_ns;
     a.ns += d;

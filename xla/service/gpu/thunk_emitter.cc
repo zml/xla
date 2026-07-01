@@ -1422,11 +1422,77 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
       BufferAllocation::Slice out,
       GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
 
+  // PREFILL PADDING CLAMP source (mirrors the dense-GEMM clamp in
+  // EmitMetalGemmThunk above): the MoE call's R = padded_tokens*top_k, but only
+  // the real-prompt routes carry meaningful rows (routes are token-major, so the
+  // padding is a contiguous suffix). Find this exe's prefill attention num_tokens
+  // scalar (the same real-prompt-length device value the GEMMs clamp off) and
+  // recover top_k = R / compiled_tokens, so the thunk clamps the sort/gather/
+  // steel/scatter to R_active = num_tokens*top_k. A decode exe (attention q_len==1
+  // / total_q==num_seqs, no num_tokens operand) matches nothing -> top_k stays 0
+  // -> the thunk runs unclamped (decode is not padded).
+  BufferAllocation::Slice moe_num_tokens;
+  Shape moe_num_tokens_shape;
+  int64_t compiled_tokens = 0;
+  for (const HloInstruction* i : instr->parent()->instructions()) {
+    if (i->opcode() != HloOpcode::kCustomCall) continue;
+    const auto* fa = Cast<HloCustomCallInstruction>(i);
+    if (fa->custom_call_target() != "zml$flash_attn") continue;
+    const Shape& fq = fa->operand(0)->shape();
+    if (fq.dimensions().size() != 3 || fq.dimensions(1) <= 1) continue;  // decode
+    const bool fc = fa->operand(1)->shape().dimensions().size() == 4;
+    const int fbase = fc ? 5 : 4;  // q,k,v,tok[,layer]
+    if (fa->operand_count() != fbase + 1) continue;  // no num_tokens operand
+    TF_ASSIGN_OR_RETURN(moe_num_tokens,
+                        GetAllocationSliceForHlo(fa->operand(fbase), {}));
+    moe_num_tokens_shape = fa->operand(fbase)->shape();
+    compiled_tokens = fq.dimensions(1);
+    break;
+  }
+  if (compiled_tokens == 0) {
+    // Paged prefill (llmd chunked prefill): real token count is the last element
+    // of query_start_len[num_seqs] (operand 5 of a prefill zml$paged_attn).
+    for (const HloInstruction* i : instr->parent()->instructions()) {
+      if (i->opcode() != HloOpcode::kCustomCall) continue;
+      const auto* pa = Cast<HloCustomCallInstruction>(i);
+      if (pa->custom_call_target() != "zml$paged_attn") continue;
+      if (pa->operand_count() != 6) continue;
+      const Shape& pq = pa->operand(0)->shape();  // [total_q, heads, hd]
+      const Shape& bt = pa->operand(3)->shape();  // [num_seqs, max_blocks]
+      if (pq.dimensions().size() != 3 || bt.dimensions().size() != 2) continue;
+      const int64_t total_q = pq.dimensions(0);
+      const int64_t num_seqs = bt.dimensions(0);
+      if (total_q <= num_seqs) continue;  // decode module
+      const Shape& qsl_shape = pa->operand(5)->shape();
+      if (qsl_shape.dimensions().size() != 1 ||
+          qsl_shape.dimensions(0) != num_seqs + 1 ||
+          ShapeUtil::ByteSizeOfPrimitiveType(qsl_shape.element_type()) != 4) {
+        continue;
+      }
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice qsl,
+                          GetAllocationSliceForHlo(pa->operand(5), {}));
+      moe_num_tokens = BufferAllocation::Slice(
+          qsl.allocation(), qsl.offset() + num_seqs * 4, 4);
+      moe_num_tokens_shape = ShapeUtil::MakeShape(S32, {});
+      compiled_tokens = total_q;
+      break;
+    }
+  }
+  // top_k must evenly divide R (token-major routes) and be in a sane range; else
+  // leave it 0 so the thunk skips the clamp (the slice's presence + top_k>0 gate
+  // has_num_tokens_).
+  int64_t moe_top_k = 0;
+  if (compiled_tokens > 0 && r % compiled_tokens == 0) {
+    const int64_t tk = r / compiled_tokens;
+    if (tk >= 1 && tk <= 256) moe_top_k = tk;
+  }
+  if (moe_top_k == 0) moe_num_tokens = BufferAllocation::Slice();
+
   auto thunk = std::make_unique<MetalMoeGemvThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
-      out, out_shape, r, k, n);
+      out, out_shape, r, k, n, moe_num_tokens, moe_num_tokens_shape, moe_top_k);
   return GetThunkSequence(std::move(thunk));
 }
 

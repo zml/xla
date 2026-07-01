@@ -64,11 +64,16 @@ class MetalStream : public StreamCommon {
 
   Stream::PlatformSpecificHandle platform_specific_handle() const override;
 
+  // indirect_grid_device_ptr (optional): a device pointer to a {gx,gy,gz} uint3
+  // threadgroups-per-grid count; when non-null the kernel is dispatched INDIRECTLY
+  // off it (block_dims becomes just the KPROF label bound). Resolved to its
+  // backing MTLBuffer + offset here, like any device argument.
   absl::Status LaunchMetalKernel(
       const ThreadDim& thread_dims, const BlockDim& block_dims,
       const std::optional<ClusterDim>& cluster_dims, void* pipeline,
       void* function, bool use_argument_buffer, absl::string_view name,
-      void** args, int64_t shmem_bytes, bool use_pdl);
+      void** args, int64_t shmem_bytes, bool use_pdl,
+      void* indirect_grid_device_ptr = nullptr);
 
   // Force-commits this stream's OPEN command buffer iff it carries the awaited
   // signal `value` (encoded but not yet committed). Called by

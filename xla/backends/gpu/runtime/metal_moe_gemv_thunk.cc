@@ -35,6 +35,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/metal/metal_executor.h"
+#include "xla/stream_executor/metal/metal_kernel.h"
 #include "xla/stream_executor/metal/metal_runtime.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -51,7 +52,8 @@ MetalMoeGemvThunk::MetalMoeGemvThunk(
     BufferAllocation::Slice w, Shape w_shape, BufferAllocation::Slice scale,
     Shape scale_shape, BufferAllocation::Slice expert_id, Shape expert_id_shape,
     BufferAllocation::Slice out, Shape out_shape, int64_t r, int64_t k,
-    int64_t n)
+    int64_t n, BufferAllocation::Slice num_tokens, Shape num_tokens_shape,
+    int64_t top_k)
     : Thunk(Kind::kCustomCall, std::move(thunk_info)),
       x_(x),
       w_(w),
@@ -65,7 +67,11 @@ MetalMoeGemvThunk::MetalMoeGemvThunk(
       out_shape_(std::move(out_shape)),
       r_(r),
       k_(k),
-      n_(n) {}
+      n_(n),
+      num_tokens_(num_tokens),
+      num_tokens_shape_(std::move(num_tokens_shape)),
+      top_k_(top_k),
+      has_num_tokens_(num_tokens.allocation() != nullptr && top_k > 0) {}
 
 absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (kernel_ != nullptr) return absl::OkStatus();
@@ -107,14 +113,16 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
         CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
+    // +1 arity for the device num_tokens pointer used by the prefill padding
+    // clamp (fp8: x,w,scale,indices,y,mnk,num_tokens; bf16 drops scale).
     if (is_fp8) {
       TF_ASSIGN_OR_RETURN(kernel_steel_,
                           metal_exec->LoadKernelWithConstants(
-                              lib, "fp8_gather_qmm_rhs", /*arity=*/6, fc));
+                              lib, "fp8_gather_qmm_rhs", /*arity=*/7, fc));
     } else {
       TF_ASSIGN_OR_RETURN(kernel_steel_,
                           metal_exec->LoadKernelWithConstants(
-                              lib, "bf16_gather_mm_rhs", /*arity=*/5, fc));
+                              lib, "bf16_gather_mm_rhs", /*arity=*/6, fc));
     }
   }
 
@@ -129,10 +137,16 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   }
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_dims_, dims, sizeof(dims)));
 
-  // fp8_gather_qmm_rhs dims {R, N, K} as a 16-byte int3 (Metal int3 is
-  // 16-byte aligned; the 4th word is padding).
+  // The route-axis clamp factor the sorted kernels multiply num_tokens by to get
+  // R_active. With a real num_tokens scalar it is top_k (routes are token-major,
+  // R = padded_tokens*top_k); with the fallback scalar (= r_) it is 1, so
+  // R_active = r_ and nothing is clamped (old behavior).
+  const int32_t top_k_eff = has_num_tokens_ ? static_cast<int32_t>(top_k_) : 1;
+
+  // fp8_gather_qmm_rhs / bf16_gather_mm_rhs dims {R, N, K, top_k} as a 16-byte
+  // int4 (was an int3 + padding word; the 4th word now carries top_k).
   const int32_t mnk[4] = {static_cast<int32_t>(r_), static_cast<int32_t>(n_),
-                          static_cast<int32_t>(k_), 0};
+                          static_cast<int32_t>(k_), top_k_eff};
   p_dims_steel_ = executor->Allocate(sizeof(mnk), 0);
   if (p_dims_steel_.opaque() == nullptr) {
     return absl::ResourceExhaustedError(
@@ -150,20 +164,26 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
         "__metal$moe_gemm$f8: moe_argsort supports <= 256 experts.");
   }
   {
+    // arity 5: +1 for the device num_tokens pointer (prefill padding clamp).
     TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
                         CompileMetalSourceToMetallibCached(get_moe_argsort()));
     TF_ASSIGN_OR_RETURN(kernel_argsort_, metal_exec->LoadKernelWithConstants(
-                                             lib, "moe_argsort", /*arity=*/4,
+                                             lib, "moe_argsort", /*arity=*/5,
                                              {}));
+    // Same lib carries moe_steel_grid (computes the steel GEMM's indirect grid).
+    TF_ASSIGN_OR_RETURN(kernel_steel_grid_,
+                        metal_exec->LoadKernelWithConstants(
+                            lib, "moe_steel_grid", /*arity=*/3, {}));
   }
   {
+    // arity 5: +1 for the device num_tokens pointer (prefill padding clamp).
     TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
                         CompileMetalSourceToMetallibCached(get_permute_rows()));
     TF_ASSIGN_OR_RETURN(kernel_gather_, metal_exec->LoadKernelWithConstants(
-                                            lib, "gather_rows", /*arity=*/4,
+                                            lib, "gather_rows", /*arity=*/5,
                                             {}));
     TF_ASSIGN_OR_RETURN(kernel_scatter_, metal_exec->LoadKernelWithConstants(
-                                             lib, "scatter_rows", /*arity=*/4,
+                                             lib, "scatter_rows", /*arity=*/5,
                                              {}));
   }
 
@@ -183,10 +203,12 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   TF_RETURN_IF_ERROR(
       alloc(&p_out_sorted_, r_ * n_ * sizeof(uint16_t), "out_sorted"));
 
-  // int2 dims for the helper kernels (16-byte alloc; kernels read the first 2).
+  // int3 dims {R, *, top_k} for the helper kernels (16-byte alloc; the argsort /
+  // gather / scatter kernels read the first 3 -- slot 2 is the route-axis clamp
+  // factor top_k, same as the steel mnk.w above).
   auto stage_dims = [&](se::DeviceAddressBase* p, int32_t a,
                         int32_t b) -> absl::Status {
-    const int32_t d[4] = {a, b, 0, 0};
+    const int32_t d[4] = {a, b, top_k_eff, 0};
     *p = executor->Allocate(sizeof(d), 0);
     if (p->opaque() == nullptr) {
       return absl::ResourceExhaustedError("__metal$moe_gemm$f8: dims alloc.");
@@ -198,6 +220,43 @@ absl::Status MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
       stage_dims(&p_gx_dims_, static_cast<int32_t>(r_), static_cast<int32_t>(k_)));
   TF_RETURN_IF_ERROR(stage_dims(&p_gout_dims_, static_cast<int32_t>(r_),
                                 static_cast<int32_t>(n_)));
+
+  // Always stage a fallback num_tokens scalar = r_ (R_active = min(r_, r_*tk) =
+  // r_, i.e. no clamp). It is bound whenever the real num_tokens is absent
+  // (decode / no prefill attention), so the clamp kernels always have a buffer
+  // to read.
+  {
+    const int32_t nt = static_cast<int32_t>(r_);
+    p_num_tokens_fallback_ = executor->Allocate(sizeof(nt), 0);
+    if (p_num_tokens_fallback_.opaque() == nullptr) {
+      return absl::ResourceExhaustedError(
+          "__metal$moe_gemm$f8: num_tokens fallback alloc failed.");
+    }
+    TF_RETURN_IF_ERROR(
+        executor->SynchronousMemcpy(&p_num_tokens_fallback_, &nt, sizeof(nt)));
+  }
+
+  // Steel GEMM indirect-dispatch grid: p_steel_grid_ holds the {gx,gy,gz} uint3
+  // moe_steel_grid writes each step (gx = N-tiles fixed, gy = ceil(R_active/16));
+  // p_steel_grid_args_ = {R, n_tiles, top_k, BM} (BM=16, BN=32 per the steel
+  // launch). With the fallback num_tokens (= r_) this resolves to the full grid,
+  // so it is a no-op when nothing is clamped.
+  constexpr int32_t kBM = 16, kBN = 32;
+  const int32_t steel_args[4] = {static_cast<int32_t>(r_),
+                                 static_cast<int32_t>((n_ + kBN - 1) / kBN),
+                                 top_k_eff, kBM};
+  p_steel_grid_args_ = executor->Allocate(sizeof(steel_args), 0);
+  if (p_steel_grid_args_.opaque() == nullptr) {
+    return absl::ResourceExhaustedError(
+        "__metal$moe_gemm$f8: steel grid args alloc failed.");
+  }
+  TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_steel_grid_args_, steel_args,
+                                                 sizeof(steel_args)));
+  p_steel_grid_ = executor->Allocate(4 * sizeof(uint32_t), 0);  // {gx,gy,gz,pad}
+  if (p_steel_grid_.opaque() == nullptr) {
+    return absl::ResourceExhaustedError(
+        "__metal$moe_gemm$f8: steel grid buffer alloc failed.");
+  }
 
   return absl::OkStatus();
 }
@@ -214,6 +273,7 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
     kernel_argsort_ = nullptr;
     kernel_gather_ = nullptr;
     kernel_scatter_ = nullptr;
+    kernel_steel_grid_ = nullptr;
     TF_RETURN_IF_ERROR(EnsureLoaded(executor));
     executor_ = executor;
   }
@@ -223,22 +283,32 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   // Each kernel is enqueued on the same stream, so the writes of step N are
   // visible to step N+1 (no explicit barriers needed).
   if (sorted_path_) {
+    // The device num_tokens scalar every clamp kernel reads: the real prompt
+    // length when this exe's prefill attention carries it, else the staged
+    // fallback (= r_ -> R_active == r_, no clamp). The grids stay sized by the
+    // baked r_; the kernels themselves skip the padded suffix.
+    const bool clamp = has_num_tokens_;
+    const se::DeviceAddressBase nt =
+        clamp ? allocs.GetDeviceAddress(num_tokens_) : p_num_tokens_fallback_;
+
     // 1. Counting-sort the expert ids -> order (sorted pos -> orig row) and the
     //    grouped ids idx_sorted (single threadgroup, 256 threads).
-    se::KernelArgsPackedArray a_sort(/*num_args=*/4);
+    se::KernelArgsPackedArray a_sort(/*num_args=*/5);
     a_sort.add_argument(allocs.GetDeviceAddress(expert_id_));
     a_sort.add_argument(p_order_);
     a_sort.add_argument(p_idx_sorted_);
     a_sort.add_argument(p_argsort_dims_);
+    a_sort.add_argument(nt);
     TF_RETURN_IF_ERROR(kernel_argsort_->Launch(
         se::ThreadDim(256, 1, 1), se::BlockDim(1, 1, 1), stream, a_sort));
 
     // 2. Gather x rows into expert-sorted order: x_sorted[pos] = x[order[pos]].
-    se::KernelArgsPackedArray a_gx(/*num_args=*/4);
+    se::KernelArgsPackedArray a_gx(/*num_args=*/5);
     a_gx.add_argument(allocs.GetDeviceAddress(x_));
     a_gx.add_argument(p_order_);
     a_gx.add_argument(p_x_sorted_);
     a_gx.add_argument(p_gx_dims_);
+    a_gx.add_argument(nt);
     const uint64_t kcols = (static_cast<uint64_t>(k_) + 3) / 4;
     TF_RETURN_IF_ERROR(kernel_gather_->Launch(
         se::ThreadDim(64, 1, 1),
@@ -248,7 +318,7 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
     // 3. Gather q-GEMM on the sorted rows -> out_sorted (BM=16, BN=32). fp8
     //    carries a scale operand; bf16 does not.
     const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
-    se::KernelArgsPackedArray a_mm(/*num_args=*/is_fp8 ? 6 : 5);
+    se::KernelArgsPackedArray a_mm(/*num_args=*/is_fp8 ? 7 : 6);
     a_mm.add_argument(p_x_sorted_);
     a_mm.add_argument(allocs.GetDeviceAddress(w_));
     if (is_fp8) {
@@ -257,19 +327,35 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
     a_mm.add_argument(p_idx_sorted_);
     a_mm.add_argument(p_out_sorted_);
     a_mm.add_argument(p_dims_steel_);
+    a_mm.add_argument(nt);
     constexpr int64_t kBM = 16, kBN = 32;
-    TF_RETURN_IF_ERROR(kernel_steel_->Launch(
+
+    // Compute the steel GEMM's active grid {n_tiles, ceil(R_active/16), 1} into
+    // p_steel_grid_ (1 thread), then dispatch the GEMM INDIRECTLY off it so only
+    // the real-route tiles launch -- the per-tile early-out alone still pays the
+    // launch cost of every padded tile, which dominates a short-prompt prefill.
+    // Same-stream ordering makes the grid write visible to the indirect read.
+    se::KernelArgsPackedArray a_grid(/*num_args=*/3);
+    a_grid.add_argument(nt);
+    a_grid.add_argument(p_steel_grid_args_);
+    a_grid.add_argument(p_steel_grid_);
+    TF_RETURN_IF_ERROR(kernel_steel_grid_->Launch(
+        se::ThreadDim(1, 1, 1), se::BlockDim(1, 1, 1), stream, a_grid));
+
+    auto* steel_metal = static_cast<se::metal::MetalKernel*>(kernel_steel_.get());
+    TF_RETURN_IF_ERROR(steel_metal->LaunchIndirect(
         se::ThreadDim(32, 2, 1),
         se::BlockDim(static_cast<uint64_t>((n_ + kBN - 1) / kBN),
                      static_cast<uint64_t>((r_ + kBM - 1) / kBM), 1),
-        stream, a_mm));
+        p_steel_grid_.opaque(), stream, a_mm));
 
     // 4. Scatter out_sorted back to original row order: out[order[pos]] = ...
-    se::KernelArgsPackedArray a_sc(/*num_args=*/4);
+    se::KernelArgsPackedArray a_sc(/*num_args=*/5);
     a_sc.add_argument(p_out_sorted_);
     a_sc.add_argument(p_order_);
     a_sc.add_argument(allocs.GetDeviceAddress(out_));
     a_sc.add_argument(p_gout_dims_);
+    a_sc.add_argument(nt);
     const uint64_t ncols = (static_cast<uint64_t>(n_) + 3) / 4;
     return kernel_scatter_->Launch(
         se::ThreadDim(64, 1, 1),
@@ -311,6 +397,9 @@ Thunk::BufferUses MetalMoeGemvThunk::buffer_uses() const {
     uses.push_back(BufferUse::Read(scale_, scale_shape_));  // fp8 only
   }
   uses.push_back(BufferUse::Read(expert_id_, expert_id_shape_));
+  if (has_num_tokens_) {
+    uses.push_back(BufferUse::Read(num_tokens_, num_tokens_shape_));
+  }
   uses.push_back(BufferUse::Write(out_, out_shape_));
   return uses;
 }

@@ -102,11 +102,17 @@ absl::StatusOr<void*> NewComputePipeline(void* device, void* function);
 void* NewBatchCommandBuffer(void* command_queue);
 // Encodes one compute kernel into the open command buffer's current underlying
 // MTLCommandBuffer (a fresh compute encoder per call). Does NOT commit.
+// indirect_grid_buffer (optional): a device MTLBuffer holding a {gx,gy,gz} uint3
+// threadgroups-per-grid count for an INDIRECT dispatch (the GPU computed it this
+// step). When null, dispatches block_dims directly. Lets a kernel shrink its own
+// launch to the runtime-active work with no host read (MoE prefill steel GEMM).
 absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
                           void* function, bool use_argument_buffer,
                           absl::Span<const MetalKernelArgument> arguments,
                           absl::string_view name, const ThreadDim& thread_dims,
-                          const BlockDim& block_dims, int64_t shmem_bytes);
+                          const BlockDim& block_dims, int64_t shmem_bytes,
+                          void* indirect_grid_buffer = nullptr,
+                          uint64_t indirect_grid_offset = 0);
 // Encodes a device-to-device blit copy (MTLBlitCommandEncoder copyFromBuffer:..)
 // into the open command buffer — no commit, no host drain. Metal hazard-tracks
 // the buffers, so the copy is ordered after prior writes / before later reads in

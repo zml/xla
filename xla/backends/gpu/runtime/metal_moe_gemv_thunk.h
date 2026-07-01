@@ -60,7 +60,9 @@ class MetalMoeGemvThunk : public Thunk {
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice expert_id, Shape expert_id_shape,
                     BufferAllocation::Slice out, Shape out_shape, int64_t r,
-                    int64_t k, int64_t n);
+                    int64_t k, int64_t n,
+                    BufferAllocation::Slice num_tokens, Shape num_tokens_shape,
+                    int64_t top_k);
 
   MetalMoeGemvThunk(const MetalMoeGemvThunk&) = delete;
   MetalMoeGemvThunk& operator=(const MetalMoeGemvThunk&) = delete;
@@ -79,6 +81,17 @@ class MetalMoeGemvThunk : public Thunk {
   const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_;
   const int64_t r_, k_, n_;
+  // Prefill padding clamp (sorted path only): num_tokens_ is the real prompt
+  // length (a device scalar from this exe's prefill attention), top_k_ maps a
+  // route index to its token (R_active = num_tokens*top_k, routes token-major).
+  // The sorted argsort/gather/steel/scatter kernels read num_tokens_ and skip the
+  // padded route suffix. When absent (has_num_tokens_ == false: decode, or a
+  // prefill whose attention carries no num_tokens) a fallback scalar = r_ with
+  // top_k 1 is staged so R_active == r_ (no clamp), preserving old behavior.
+  const BufferAllocation::Slice num_tokens_;
+  const Shape num_tokens_shape_;
+  const int64_t top_k_;
+  const bool has_num_tokens_;
 
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
@@ -97,6 +110,14 @@ class MetalMoeGemvThunk : public Thunk {
   std::unique_ptr<stream_executor::Kernel> kernel_argsort_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_gather_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_scatter_ ABSL_GUARDED_BY(mu_);
+  // Computes the steel GEMM's indirect-dispatch grid (ceil(R_active/BM) active
+  // route-tiles) into p_steel_grid_ each step, so the GEMM launches only the
+  // real-route tiles instead of the full padded ceil(r_/BM). p_steel_grid_args_
+  // is the {R, n_tiles, top_k, BM} int4 it reads.
+  std::unique_ptr<stream_executor::Kernel> kernel_steel_grid_
+      ABSL_GUARDED_BY(mu_);
+  stream_executor::DeviceAddressBase p_steel_grid_ ABSL_GUARDED_BY(mu_);
+  stream_executor::DeviceAddressBase p_steel_grid_args_ ABSL_GUARDED_BY(mu_);
 
   // Packed {R, K, N, K/128} int4, bound as fp8_moe_gemv's `constant int4& dims`
   // (buffer 5); p_dims_steel_ is the {R, N, K} int3 fp8_gather_qmm_rhs wants.
@@ -112,6 +133,9 @@ class MetalMoeGemvThunk : public Thunk {
   stream_executor::DeviceAddressBase p_argsort_dims_ ABSL_GUARDED_BY(mu_);
   stream_executor::DeviceAddressBase p_gx_dims_ ABSL_GUARDED_BY(mu_);
   stream_executor::DeviceAddressBase p_gout_dims_ ABSL_GUARDED_BY(mu_);
+  // Fallback num_tokens scalar (= r_) staged only when has_num_tokens_ is false,
+  // so the clamp kernels always have a num_tokens buffer to bind (R_active = r_).
+  stream_executor::DeviceAddressBase p_num_tokens_fallback_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace gpu

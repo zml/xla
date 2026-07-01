@@ -3324,7 +3324,8 @@ kernel void fp8_gather_qmm_rhs(
     device const bfloat* scale [[buffer(2)]],
     device const uint* indices [[buffer(3)]],
     device bfloat* y [[buffer(4)]],
-    constant int3& mnk [[buffer(5)]],  // {R, N, K}
+    constant int4& mnk [[buffer(5)]],  // {R, N, K, top_k}
+    device const int* num_tokens [[buffer(6)]],  // [1] real prompt length
     uint3 tid [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
@@ -3340,7 +3341,8 @@ kernel void fp8_gather_qmm_rhs(
   threadgroup bfloat Xs[BM * BK_padded];
   threadgroup bfloat Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
-  const int R = mnk.x;
+  // PREFILL PADDING CLAMP: see bf16_gather_mm_rhs -- pass R_active as the impl's M.
+  const int R = min(mnk.x, num_tokens[0] * mnk.w);  // R_active
   const int N = mnk.y;
   const int K = mnk.z;
 
@@ -3497,7 +3499,8 @@ kernel void bf16_gather_mm_rhs(
     device const bfloat* w [[buffer(1)]],
     device const uint* indices [[buffer(2)]],
     device bfloat* y [[buffer(3)]],
-    constant int3& mnk [[buffer(4)]],  // {R, N, K}
+    constant int4& mnk [[buffer(4)]],  // {R, N, K, top_k}
+    device const int* num_tokens [[buffer(5)]],  // [1] real prompt length
     uint3 tid [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
@@ -3513,7 +3516,14 @@ kernel void bf16_gather_mm_rhs(
   threadgroup bfloat Xs[BM * BK_padded];
   threadgroup bfloat Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
-  const int R = mnk.x;
+  // PREFILL PADDING CLAMP: pass the real route count R_active = num_tokens*top_k
+  // (a device scalar) as the impl's M, NOT the baked padded R. The grid is still
+  // launched at ceil(R/BM), but a padded BM-tile (y_row >= R_active) then sees
+  // tgp_bm = min(BM, R_active - y_row) <= 0, so its while-loop body never runs --
+  // no weight load, no store, no out-of-bounds read of the stale idx_sorted tail
+  // (the lone read indices[y_row] stays inside the R-sized buffer). When there is
+  // nothing to clamp the thunk passes num_tokens=R, top_k=1 -> R_active=R.
+  const int R = min(mnk.x, num_tokens[0] * mnk.w);  // R_active
   const int N = mnk.y;
   const int K = mnk.z;
 

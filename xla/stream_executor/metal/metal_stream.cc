@@ -515,13 +515,30 @@ absl::Status MetalStream::LaunchMetalKernel(
     const ThreadDim& thread_dims, const BlockDim& block_dims,
     const std::optional<ClusterDim>& cluster_dims, void* pipeline,
     void* function, bool use_argument_buffer, absl::string_view name,
-    void** args, int64_t shmem_bytes, bool use_pdl) {
+    void** args, int64_t shmem_bytes, bool use_pdl,
+    void* indirect_grid_device_ptr) {
   if (cluster_dims.has_value()) {
     return absl::UnimplementedError("Metal cluster launches are not supported.");
   }
   if (use_pdl) {
     return absl::UnimplementedError(
         "Metal programmatic dependent launch is not supported.");
+  }
+
+  // Resolve the optional indirect-grid device pointer to its backing MTLBuffer +
+  // byte offset (same resolution path as the kernel arguments below).
+  void* indirect_grid_buffer = nullptr;
+  uint64_t indirect_grid_offset = 0;
+  if (indirect_grid_device_ptr != nullptr) {
+    auto allocation = executor_->ResolveAllocation(indirect_grid_device_ptr);
+    if (!allocation.ok()) {
+      return absl::InternalError(
+          "Metal indirect dispatch: could not resolve grid buffer allocation.");
+    }
+    indirect_grid_buffer = allocation->buffer;
+    indirect_grid_offset = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(indirect_grid_device_ptr) -
+        reinterpret_cast<uintptr_t>(allocation->contents));
   }
 
   std::vector<MetalKernelArgument> arguments;
@@ -550,7 +567,8 @@ absl::Status MetalStream::LaunchMetalKernel(
   EnsureOpenCommandBuffer();
   return metal::EncodeKernel(command_buffer_, pipeline, function,
                              use_argument_buffer, arguments, name, thread_dims,
-                             block_dims, shmem_bytes);
+                             block_dims, shmem_bytes, indirect_grid_buffer,
+                             indirect_grid_offset);
 }
 
 void MetalStream::EnsureOpenCommandBuffer() {
