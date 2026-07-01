@@ -48,6 +48,7 @@ static void fa_vec_paged_impl(
         device       char * dst,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
+        uint3   tgpg,
         ushort  tiisg,
         ushort  sgitg) {
     constexpr short NE  = 1;
@@ -65,13 +66,37 @@ static void fa_vec_paged_impl(
     constexpr short DK4 = DK/4;
     constexpr short DV4 = DV/4;
 
-    // PADDING row (beyond the real tokens of this step): write zeros, done.
+    // STATIC row count (= total_q_tokens * num_heads). The split-K partial /
+    // reduce must agree on where the S/M region begins; the reduce uses the
+    // host's static args.nrows, so the partial pass must too. cu_seqlens_q[
+    // num_seqs] is the DYNAMIC active-token count (< total_q_tokens whenever the
+    // batch is partly padded), which would place the S/M region at the wrong
+    // offset -> garbage. tgpg[2] is the grid's z extent = total_q_tokens.
+    const int64_t nrows_static = (int64_t)tgpg[2]*(uint)args.num_heads;
+
+    // PADDING row (beyond the real tokens of this step): write the softmax
+    // identity, done. NWG==1 writes bf16 zeros to the output; NWG>1 (split-K)
+    // writes THIS workgroup's f32 partial as O=0, S=0, M=-inf so the reduce
+    // yields 0. (A bf16 zero-write into the f32 partial scratch would alias a
+    // real row's partials and corrupt them.)
     if (r >= cu_seqlens_q[args.num_seqs]) {
         if (sgitg == 0) {
             const int64_t rid = (int64_t)r*(uint)args.num_heads + iq2;
-            device bfloat4 * dst4 = (device bfloat4 *) dst;
-            for (short i = tiisg; i < DV4; i += N_SIMDWIDTH) {
-                dst4[rid*DV4 + i] = (bfloat4) float4(0.0f);
+            if (NWG == 1) {
+                device bfloat4 * dst4 = (device bfloat4 *) dst;
+                for (short i = tiisg; i < DV4; i += N_SIMDWIDTH) {
+                    dst4[rid*DV4 + i] = (bfloat4) float4(0.0f);
+                }
+            } else {
+                device float4 * dst4 = (device float4 *) dst;
+                device float  * dst1 = (device float  *) dst + nrows_static*DV*NWG;
+                for (short i = tiisg; i < DV4; i += N_SIMDWIDTH) {
+                    dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) 0.0f;
+                }
+                if (tiisg == 0) {
+                    dst1[rid*(2*NWG) + 2*iwg + 0] = 0.0f;
+                    dst1[rid*(2*NWG) + 2*iwg + 1] = -FLT_MAX/2;
+                }
             }
         }
         return;
@@ -301,10 +326,9 @@ static void fa_vec_paged_impl(
                 dst4[rid*DV4 + i] = (bfloat4) ((float4) so4[i]*S);
             }
         } else {
-            const int64_t nrows =
-                (int64_t)cu_seqlens_q[args.num_seqs] * (uint)args.num_heads;
+            // STATIC nrows (must match the reduce's args.nrows); see above.
             device float4 * dst4 = (device float4 *) dst;
-            device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
+            device float  * dst1 = (device float  *) dst + nrows_static*DV*NWG;
             for (short i = tiisg; i < DV4; i += NW) {
                 dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i];
             }
@@ -336,11 +360,12 @@ kernel void NAME(                                                               
         device       char * dst,                                               \
         threadgroup  half * shmem_f16 [[threadgroup(0)]],                      \
         uint3   tgpig[[threadgroup_position_in_grid]],                         \
+        uint3   tgpg[[threadgroups_per_grid]],                                 \
         ushort  tiisg[[thread_index_in_simdgroup]],                            \
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {                     \
     fa_vec_paged_impl<DK_, DV_>(args, q, k_cache, v_cache, block_tables,        \
                                 seq_lens, cu_seqlens_q, dst, shmem_f16,         \
-                                tgpig, tiisg, sgitg);                          \
+                                tgpig, tgpg, tiisg, sgitg);                     \
 }
 FA_VEC_PAGED_KERNEL(fa_vec_paged,       128, 128)  // backward-compatible name
 FA_VEC_PAGED_KERNEL(fa_vec_paged_hd256, 256, 256)  // Gemma sliding layers
