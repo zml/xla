@@ -167,10 +167,12 @@ kernel void fa_ext(
                     k8x8_t mk[2];
                     q8x8_t mq[2];
                     for (short i = 0; i < DK8/2; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
                         simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
                         simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
                         simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
+                        simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
                         simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
                     }
