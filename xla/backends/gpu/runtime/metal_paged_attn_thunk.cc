@@ -197,11 +197,35 @@ void MetalPagedAttnThunk::Prewarm(se::StreamExecutor* executor,
                              : head_dim == 256 ? "fa_vec_paged_hd256"
                                                : "fa_vec_paged";
       for (int nsg : kVecNsgVals) {
+        // FC 453 (nwg=1) MUST match EnsureVecVariant's single-pass load or the
+        // PSO key differs and this warm misses Apple's pipeline cache (the vec
+        // kernel references FC_nwg since the split-K commit).
         const FC fc[] = {{450, FC::Kind::kInt, nsg},
                          {451, FC::Kind::kInt, block_size},
-                         {452, FC::Kind::kInt, num_kv_heads * head_dim}};
+                         {452, FC::Kind::kInt, num_kv_heads * head_dim},
+                         {453, FC::Kind::kInt, 1}};
         metal_exec
             ->LoadKernelWithConstants(*vec_lib, vec_name, /*arity=*/8, fc)
+            .IgnoreError();
+      }
+      // hd512 global layers at long context take the split-K path (EnsureVec-
+      // Decode): warm its partial pass (nsg=8, nwg=kSplitKNwg) + the reduce
+      // (FC 453=nwg, 454=head_dim), which EnsureVecDecode loads but Prewarm
+      // otherwise never warms -> cold first global-layer decode.
+      if (head_dim == 512) {
+        const FC pfc[] = {{450, FC::Kind::kInt, 8},
+                          {451, FC::Kind::kInt, block_size},
+                          {452, FC::Kind::kInt, num_kv_heads * head_dim},
+                          {453, FC::Kind::kInt, kSplitKNwg}};
+        metal_exec
+            ->LoadKernelWithConstants(*vec_lib, "fa_vec_paged_hd512",
+                                      /*arity=*/8, pfc)
+            .IgnoreError();
+        const FC rfc[] = {{453, FC::Kind::kInt, kSplitKNwg},
+                          {454, FC::Kind::kInt, static_cast<int>(head_dim)}};
+        metal_exec
+            ->LoadKernelWithConstants(*vec_lib, "fa_vec_paged_reduce",
+                                      /*arity=*/3, rfc)
             .IgnoreError();
       }
     }
