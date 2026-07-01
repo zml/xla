@@ -651,16 +651,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
     const HloCustomCallInstruction* instr) {
   // metalBLAS works in row-major terms (op(A)=M×K, op(B)=K×N), so derive the
   // GEMM geometry from the custom call's operands + dot dimension numbers the
-  // same way the legacy Metal matmul matcher (AnalyzeMatmulShapes) does. For
-  // anything metalBLAS doesn't wire yet (batched, >1 contracting dim,
-  // non-row-major, or transposed operands -> the 6-tuple m5_gemm, TODO), fall
-  // back to a plain GemmThunk: there is no BLAS on Metal, so it fails LOUD at
-  // runtime ("Failed to initialize BLAS support") rather than producing a wrong
-  // result (D9). This path goes away once m5_gemm (NT) is wired.
+  // same way the legacy Metal matmul matcher (AnalyzeMatmulShapes) does. The
+  // mpp_tensor kernel handles EVERY rank-2 f32/f16/bf16 dot: any dense input
+  // layout, any transpose combo, and both output layouts (dim0-major direct;
+  // {0,1} column-major via the transposed-swap below). So fall_back fires only
+  // for dots it genuinely can't do: a non-f32/f16/bf16 dtype, or a batched /
+  // >1-contracting-dim / non-rank-2 dot (those hit the checks below before any
+  // kernel selection). It fails LOUD rather than producing a wrong result (D9).
   auto fall_back = [&]() -> absl::StatusOr<ThunkSequence> {
     return absl::UnimplementedError(
-        "Metal GEMM: this dot shape is not wired to metalBLAS and Metal has no "
-        "cuBLAS fallback (legacy EmitGemmThunk was removed upstream).");
+        "Metal GEMM: unsupported dot (non-f32/f16/bf16, batched, >1 contracting "
+        "dim, or non-rank-2) — not wired to metalBLAS.");
   };
 
   TF_ASSIGN_OR_RETURN(const auto gpu_config,
@@ -691,17 +692,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
       out_shape.dimensions().size() != 2) {
     return fall_back();
   }
-  // metalBLAS treats each input as a physically contiguous 2-D buffer and picks
-  // its TRANS flag / leading dim from the physical layout, so the inputs only
-  // need to be dense + untiled (both {1,0} and {0,1} qualify) -- NOT dim0-major.
-  // The OUTPUT must stay dim0-major: the kernel writes op(C)=M×N row-major
-  // (ldc=N) and cannot honor a transposed result layout.
+  // Every operand must be a dense, untiled rank-2 buffer (both {1,0} and {0,1}
+  // qualify). metalBLAS reads each as a physically contiguous 2-D buffer and
+  // derives its TRANS flag / leading dim from the physical layout, so any dense
+  // layout is fine (the {0,1} output is handled by the transposed-swap below). A
+  // tiled/exotic layout goes to fall_back — mpp_tensor doesn't model it.
   auto dense_rank2 = [](const Shape& s) {
     return s.has_layout() && s.layout().tiles().empty() &&
            s.layout().minor_to_major().size() == 2;
   };
   if (!dense_rank2(lhs_shape) || !dense_rank2(rhs_shape) ||
-      !LayoutUtil::IsMonotonicWithDim0Major(out_shape.layout())) {
+      !dense_rank2(out_shape)) {
     return fall_back();
   }
 
@@ -801,6 +802,43 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice c,
                       GetAllocationSliceForHlo(instr, out_index));
 
+  // COLUMN-MAJOR ({0,1}) OUTPUT: the only rank-2 shape mpp_tensor can't take (it
+  // writes op(C)=M×N row-major, ldc=N). But [M,N]{0,1} is byte-identical to
+  // [N,M]{1,0}, so compute the TRANSPOSE Cᵀ=[N,M] with the SAME kernel and hand
+  // the bytes back as the {0,1} output — no new kernel, native bf16. Cᵀ =
+  // op(B)ᵀ·op(A)ᵀ: swap the operands (new lhs = B, new rhs = A → M'=N, N'=M) and
+  // re-derive the trans flags with lhs<->rhs / lc<->rc swapped (same physical-
+  // layout rule as above). metalBLAS writes [N,M] row-major into c; XLA reads c
+  // as {0,1} [M,N]. {1,0} and {0,1} are the only rank-2 dense output layouts, so
+  // this + the direct path cover every dot that reaches here.
+  //
+  // NOTE: in practice XLA NORMALIZES every dot output to {1,0} (it folds a
+  // transpose-of-dot into an operand-swap at the HLO level itself), so this
+  // branch is not expected to fire on real graphs — verified: transpose(A·B) and
+  // a (A·B)·E chain both emit {1,0}-output __metal$gemms. It is kept purely for
+  // correctness/defense (a future XLA layout-pass change, or an op that pins a
+  // {0,1} operand layout): the alternative was fall_back = a hard crash. Cheap
+  // and provably correct, so total coverage beats a latent Unimplemented.
+  int64_t gm = M, gn = N;
+  bool gtrans_a = trans_a, gtrans_b = trans_b;
+  BufferAllocation::Slice ga = a, gb = b;
+  Shape g_lhs_shape = lhs_shape, g_rhs_shape = rhs_shape;
+  if (!LayoutUtil::IsMonotonicWithDim0Major(out_shape.layout())) {
+    gm = N;
+    gn = M;
+    ga = b;
+    gb = a;
+    g_lhs_shape = rhs_shape;
+    g_rhs_shape = lhs_shape;
+    gtrans_a = (rhs_shape.layout().minor_to_major(0) != rc);  // op(A')=[N,K], K=rc
+    gtrans_b = (lhs_shape.layout().minor_to_major(0) == lc);  // op(B')=[K,M], K=lc
+    // The swapped shape is not a per-layer token-axis GEMM (those are dim0-major);
+    // drop any clamp match so the row-clamp arg isn't wrongly bound.
+    prefill_token_axis = false;
+    num_tokens = BufferAllocation::Slice();
+    num_tokens_shape = Shape();
+  }
+
   // Kernel-family ladder, most specialized first; each rung returns
   // Unimplemented outside its regime and the next one takes over.
   //   1. MLX steel split-K — thin-M batched-decode x@Wᵀ (2<=M<=16, f16/bf16,
@@ -808,30 +846,32 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
   //      (16.7-103us vs gemv_bt's 25-147 on the llmd shapes).
   //   2. metalBLAS GEMV (gemv_t / gemv_bt) — M==1 decode/lm_head + the thin-M
   //      shapes split-K declines.
-  //   3. mpp_tensor GEMM — everything else. b is the rhs (matrix B); its slice
-  //      offset feeds the GEMV VEC-load alignment clamp.
+  //   3. mpp_tensor GEMM — everything else, and never declines for f32/f16/bf16
+  //      (any transpose combo), so no rank-2 float dot falls through. gb is the
+  //      rhs (matrix B); its slice offset feeds the GEMV VEC-load alignment clamp.
   absl::StatusOr<MetalGemmLaunch> launch =
       prefill_token_axis
           ? absl::StatusOr<MetalGemmLaunch>(
                 absl::UnimplementedError("prefill: tensor path"))
-          : CompileMetalblasSplitk(M, N, K, trans_a, trans_b, dtype);
+          : CompileMetalblasSplitk(gm, gn, K, gtrans_a, gtrans_b, dtype);
   if (absl::IsUnimplemented(launch.status())) {
-    launch = CompileMetalblasGemv(M, N, K, trans_a, trans_b, dtype, b.offset());
+    launch =
+        CompileMetalblasGemv(gm, gn, K, gtrans_a, gtrans_b, dtype, gb.offset());
   }
   if (absl::IsUnimplemented(launch.status())) {
-    launch = CompileMetalblasGemm(M, N, K, trans_a, trans_b, dtype,
+    launch = CompileMetalblasGemm(gm, gn, K, gtrans_a, gtrans_b, dtype,
                                   prefill_token_axis);
   }
   if (absl::IsUnimplemented(launch.status())) {
-    return fall_back();  // e.g. transposed operands -> 6-tuple m5_gemm (TODO).
+    return fall_back();  // unreachable for f32/f16/bf16 (mpp_tensor never declines).
   }
   TF_RETURN_IF_ERROR(launch.status());
 
   auto thunk = std::make_unique<MetalGemmThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      std::move(*launch), a, lhs_shape, b, rhs_shape, c, out_shape, num_tokens,
-      num_tokens_shape);
+      std::move(*launch), ga, g_lhs_shape, gb, g_rhs_shape, c, out_shape,
+      num_tokens, num_tokens_shape);
   return GetThunkSequence(std::move(thunk));
 }
 
