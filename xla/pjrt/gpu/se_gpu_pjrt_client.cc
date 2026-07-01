@@ -279,6 +279,10 @@ StreamExecutorGpuClient::StreamExecutorGpuClient(
                       GetAttrsForDevices(addressable_devices()),
                       GetTargetConfigForDevices(addressable_devices()));
   }
+  // Metal uses unified memory, so a separate pinned-host memory space is
+  // redundant (and its executor can't actually pin host memory). Skip it there
+  // so each device advertises a single memory space.
+  const bool create_pinned_host_memory_space = platform_id() != MetalId();
   const int basePinnedId = device_count();
   for (auto* device : addressable_devices()) {
     // Use the device id to construct a globally unique memory space id. We do
@@ -289,11 +293,13 @@ StreamExecutorGpuClient::StreamExecutorGpuClient(
     tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)->AttachMemorySpace(
         memory_space.get(), /*is_default=*/true);
     owned_memory_spaces_.push_back(std::move(memory_space));
-    auto pinned =
-        std::make_unique<PinnedHostMemorySpace>(basePinnedId + id, device);
-    tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)->AttachMemorySpace(
-        pinned.get());
-    owned_memory_spaces_.push_back(std::move(pinned));
+    if (create_pinned_host_memory_space) {
+      auto pinned =
+          std::make_unique<PinnedHostMemorySpace>(basePinnedId + id, device);
+      tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
+          ->AttachMemorySpace(pinned.get());
+      owned_memory_spaces_.push_back(std::move(pinned));
+    }
   }
   for (const std::unique_ptr<PjRtMemorySpace>& memory_space :
        owned_memory_spaces_) {
