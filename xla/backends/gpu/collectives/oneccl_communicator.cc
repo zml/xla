@@ -380,8 +380,11 @@ Future<> OnecclCommunicator::AllReduce(se::DeviceAddressBase send_buffer,
                                        PrimitiveType dtype, size_t count,
                                        ReductionKind reduction_kind,
                                        const Executor& executor) {
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
   return Execute([send_buffer, recv_buffer, dtype, count, reduction_kind,
-                  executor, this]() -> absl::Status {
+                  stream = *stream, this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchAllReduce(send_buffer, recv_buffer, dtype, count,
                            reduction_kind, executor);
   });
@@ -392,8 +395,11 @@ Future<> OnecclCommunicator::Broadcast(se::DeviceAddressBase send_buffer,
                                        PrimitiveType dtype, size_t count,
                                        RankId root,
                                        const Executor& executor) {
-  return Execute([send_buffer, recv_buffer, dtype, count, root, executor,
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
+  return Execute([send_buffer, recv_buffer, dtype, count, root, stream = *stream,
                   this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchBroadcast(send_buffer, recv_buffer, dtype, count, root,
                            executor);
   });
@@ -404,8 +410,11 @@ Future<> OnecclCommunicator::ReduceScatter(se::DeviceAddressBase send_buffer,
                                            PrimitiveType dtype, size_t count,
                                            ReductionKind reduction_kind,
                                            const Executor& executor) {
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
   return Execute([send_buffer, recv_buffer, dtype, count, reduction_kind,
-                  executor, this]() -> absl::Status {
+                  stream = *stream, this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchReduceScatter(send_buffer, recv_buffer, dtype, count,
                                reduction_kind, executor);
   });
@@ -415,8 +424,11 @@ Future<> OnecclCommunicator::AllGather(se::DeviceAddressBase send_buffer,
                                        se::DeviceAddressBase recv_buffer,
                                        PrimitiveType dtype, size_t count,
                                        const Executor& executor) {
-  return Execute([send_buffer, recv_buffer, dtype, count, executor,
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
+  return Execute([send_buffer, recv_buffer, dtype, count, stream = *stream,
                   this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchAllGather(send_buffer, recv_buffer, dtype, count, executor);
   });
 }
@@ -425,9 +437,12 @@ Future<> OnecclCommunicator::AllToAll(
     absl::InlinedVector<se::DeviceAddressBase, 4> send_buffers,
     absl::InlinedVector<se::DeviceAddressBase, 4> recv_buffers,
     PrimitiveType dtype, size_t count, const Executor& executor) {
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
   return Execute([send_buffers = std::move(send_buffers),
                   recv_buffers = std::move(recv_buffers), dtype, count,
-                  executor, this]() mutable -> absl::Status {
+                  stream = *stream, this]() mutable -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchAllToAll(std::move(send_buffers), std::move(recv_buffers),
                           dtype, count, executor);
   });
@@ -437,11 +452,14 @@ Future<> OnecclCommunicator::CollectivePermute(
     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
     PrimitiveType dtype, size_t count, std::optional<RankId> source_rank,
     absl::Span<const RankId> target_ranks, const Executor& executor) {
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
   std::vector<RankId> owned_target_ranks(target_ranks.begin(),
                                          target_ranks.end());
   return Execute([send_buffer, recv_buffer, dtype, count, source_rank,
                   owned_target_ranks = std::move(owned_target_ranks),
-                  executor, this]() -> absl::Status {
+                  stream = *stream, this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchCollectivePermute(send_buffer, recv_buffer, dtype, count,
                                    source_rank, owned_target_ranks, executor);
   });
@@ -450,8 +468,11 @@ Future<> OnecclCommunicator::CollectivePermute(
 Future<> OnecclCommunicator::Send(se::DeviceAddressBase send_buffer,
                                   PrimitiveType dtype, size_t count,
                                   RankId peer, const Executor& executor) {
-  return Execute([send_buffer, dtype, count, peer, executor,
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
+  return Execute([send_buffer, dtype, count, peer, stream = *stream,
                   this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchSend(send_buffer, dtype, count, peer, executor);
   });
 }
@@ -459,8 +480,11 @@ Future<> OnecclCommunicator::Send(se::DeviceAddressBase send_buffer,
 Future<> OnecclCommunicator::Recv(se::DeviceAddressBase recv_buffer,
                                   PrimitiveType dtype, size_t count,
                                   RankId peer, const Executor& executor) {
-  return Execute([recv_buffer, dtype, count, peer, executor,
+  absl::StatusOr<se::Stream*> stream = ToStream(executor);
+  if (!stream.ok()) return Future<>(stream.status());
+  return Execute([recv_buffer, dtype, count, peer, stream = *stream,
                   this]() -> absl::Status {
+    GpuCollectives::Executor executor(stream);
     return LaunchRecv(recv_buffer, dtype, count, peer, executor);
   });
 }
