@@ -122,8 +122,10 @@ kernel void mpp_tensor_gemm(
     // GPU-side prefill row clamp: skip any M-tile entirely past the real prompt
     // length. Tiles straddling num_tokens still run (their valid rows feed the
     // causal output); for a full prompt num_tokens>=M so no tile is skipped
-    // (byte-identical to the unclamped path).
-    if (m_off >= *mb_numtok) return;
+    // (byte-identical to the unclamped path). num_tokens<=0 is the "unset" sentinel
+    // (a caller that didn't wire the real length) -> DO NOT clamp; compute every
+    // tile. Without this guard a 0 default would skip ALL tiles (m_off>=0 always).
+    if (*mb_numtok > 0 && m_off >= *mb_numtok) return;
 #endif
 
 #if STATIC_SLICE
