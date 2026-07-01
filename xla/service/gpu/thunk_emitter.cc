@@ -691,8 +691,16 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
       out_shape.dimensions().size() != 2) {
     return fall_back();
   }
-  if (!LayoutUtil::IsMonotonicWithDim0Major(lhs_shape.layout()) ||
-      !LayoutUtil::IsMonotonicWithDim0Major(rhs_shape.layout()) ||
+  // metalBLAS treats each input as a physically contiguous 2-D buffer and picks
+  // its TRANS flag / leading dim from the physical layout, so the inputs only
+  // need to be dense + untiled (both {1,0} and {0,1} qualify) -- NOT dim0-major.
+  // The OUTPUT must stay dim0-major: the kernel writes op(C)=M×N row-major
+  // (ldc=N) and cannot honor a transposed result layout.
+  auto dense_rank2 = [](const Shape& s) {
+    return s.has_layout() && s.layout().tiles().empty() &&
+           s.layout().minor_to_major().size() == 2;
+  };
+  if (!dense_rank2(lhs_shape) || !dense_rank2(rhs_shape) ||
       !LayoutUtil::IsMonotonicWithDim0Major(out_shape.layout())) {
     return fall_back();
   }
@@ -707,11 +715,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
       out_shape.dimensions(1) != N) {
     return fall_back();
   }
-  // op(A) must be M×K: transpose lhs iff its contracting dim is the first dim
-  // (stored [K,M]). op(B) must be K×N: transpose rhs iff its contracting dim is
-  // the second dim (stored [N,K]).
-  const bool trans_a = (lc == 0);
-  const bool trans_b = (rc == 1);
+  // op(A) must be M×K, op(B) must be K×N. metalBLAS's TRANS flag says whether
+  // the contiguous buffer is [M,K]/[K,N] (op = itself, lda/ldb = the row width)
+  // or its transpose. Derive it from the PHYSICAL layout (which logical dim is
+  // minor/contiguous), not the logical dim order: op(A) wants K contiguous
+  // (trans_a iff K is NOT the minor dim); op(B) wants N contiguous (trans_b iff
+  // the contracting dim K IS the minor dim). For the usual row-major {1,0}
+  // operands this reduces to (lc==0)/(rc==1); it also accepts the {0,1} bitcast
+  // XLA hands the lm_head lhs -- physically the [M,K] normed hidden -- which the
+  // old dim0-major-only check rejected (LFM2 and any tied-embedding lm_head).
+  const bool trans_a = (lhs_shape.layout().minor_to_major(0) != lc);
+  const bool trans_b = (rhs_shape.layout().minor_to_major(0) == rc);
 
   // PREFILL token-axis clamp: if this computation contains a prefill (q_len>1)
   // zml$flash_attn carrying a num_tokens operand, and this GEMM's M equals that
