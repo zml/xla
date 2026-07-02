@@ -34,6 +34,8 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "oneapi/ccl.hpp"
 #include "sycl/sycl.hpp"
@@ -74,10 +76,19 @@ absl::Status OnecclExceptionStatus(absl::string_view expr,
       absl::StrFormat("oneCCL call failed: %s: %s", expr, message));
 }
 
-absl::Status WaitForOnecclEvent(absl::string_view expr, ccl::event event) {
+absl::Status WaitForOnecclEvent(
+    absl::string_view expr, ccl::event event,
+    const std::shared_ptr<CancellationToken>& cancel) {
   try {
     // XLA marks the collective complete only after oneCCL's returned event is
     // complete, so downstream stream synchronization sees the collective work.
+    while (!event.test()) {
+      if (cancel != nullptr && cancel->IsCancelled()) {
+        return absl::CancelledError(
+            absl::StrFormat("oneCCL wait cancelled: %s", expr));
+      }
+      absl::SleepFor(absl::Milliseconds(10));
+    }
     event.wait();
     return absl::OkStatus();
   } catch (const ccl::exception& e) {
@@ -103,10 +114,12 @@ absl::StatusOr<T> OnecclValue(absl::string_view expr, F&& fn) {
 }
 
 absl::Status LaunchOnecclAndWait(absl::string_view expr,
-                                 absl::AnyInvocable<ccl::event() &&> launch) {
+                                 absl::AnyInvocable<ccl::event() &&> launch,
+                                 const std::shared_ptr<CancellationToken>&
+                                     cancel) {
   ASSIGN_OR_RETURN(ccl::event event,
                    OnecclValue<ccl::event>(expr, std::move(launch)));
-  return WaitForOnecclEvent(expr, std::move(event));
+  return WaitForOnecclEvent(expr, std::move(event), cancel);
 }
 
 absl::Status VerifyStreamExecutor(se::Stream* stream,
@@ -311,10 +324,52 @@ OnecclCommunicator::Create(se::StreamExecutor* stream_executor,
       stream_executor, std::move(comm), std::move(kvs), std::move(cancel)));
 }
 
+OnecclCommunicator::ScopedOperation::~ScopedOperation() {
+  if (communicator_ != nullptr) communicator_->FinishOperation();
+}
+
+absl::StatusOr<OnecclCommunicator::ScopedOperation>
+OnecclCommunicator::StartOperation() const {
+  absl::MutexLock lock(mu_);
+  if (cancel_->IsCancelled() || aborted_) {
+    return FailedPrecondition("OnecclCommunicator aborted");
+  }
+  if (poisoned_) {
+    return FailedPrecondition("OnecclCommunicator is poisoned");
+  }
+  if (comm_ == nullptr) {
+    return FailedPrecondition("OnecclCommunicator has no underlying comm");
+  }
+  ++in_flight_operations_;
+  return ScopedOperation(this);
+}
+
+void OnecclCommunicator::FinishOperation() const {
+  absl::MutexLock lock(mu_);
+  CHECK_GT(in_flight_operations_, 0);
+  --in_flight_operations_;
+}
+
+void OnecclCommunicator::Poison() const {
+  absl::MutexLock lock(mu_);
+  poisoned_ = true;
+}
+
 OnecclCommunicator::~OnecclCommunicator() {
   absl::Status status = Execute([this]() -> absl::Status {
-                          if (comm_ == nullptr || aborted_) {
-                            return absl::OkStatus();
+                          {
+                            absl::MutexLock lock(mu_);
+                            if (comm_ == nullptr) {
+                              return absl::OkStatus();
+                            }
+                            if (poisoned_ || in_flight_operations_ != 0) {
+                              VLOG(1)
+                                  << "Quarantine oneCCL communicator during "
+                                     "destruction: "
+                                  << ToString();
+                              comm_.release();
+                              return absl::OkStatus();
+                            }
                           }
                           auto activation = stream_executor_->Activate();
                           VLOG(2) << "Destroy oneCCL communicator: "
@@ -328,9 +383,11 @@ OnecclCommunicator::~OnecclCommunicator() {
 }
 
 absl::Status OnecclCommunicator::CheckReady() const {
+  absl::MutexLock lock(mu_);
   if (cancel_->IsCancelled() || aborted_) {
     return FailedPrecondition("OnecclCommunicator aborted");
   }
+  if (poisoned_) return FailedPrecondition("OnecclCommunicator is poisoned");
   if (comm_ == nullptr) {
     return FailedPrecondition("OnecclCommunicator has no underlying comm");
   }
@@ -339,16 +396,14 @@ absl::Status OnecclCommunicator::CheckReady() const {
 
 absl::Status OnecclCommunicator::Abort() {
   cancel_->Cancel();
-
-  return ExecuteAwait([this]() -> absl::Status {
-    if (comm_ == nullptr || aborted_) {
-      return FailedPrecondition("OnecclCommunicator already aborted");
-    }
-
-    auto activation = stream_executor_->Activate();
-    VLOG(1) << "Abort oneCCL communicator: " << ToString();
-    comm_.reset();
+  {
+    absl::MutexLock lock(mu_);
+    if (aborted_) return absl::OkStatus();
     aborted_ = true;
+    if (in_flight_operations_ != 0) poisoned_ = true;
+  }
+  return ExecuteAwait([this]() -> absl::Status {
+    VLOG(1) << "Abort oneCCL communicator: " << ToString();
     return absl::OkStatus();
   });
 }
@@ -365,7 +420,7 @@ absl::Status OnecclCommunicator::Barrier(const Executor& executor) {
     return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
       return LaunchOnecclAndWait("ccl::barrier", [&] {
         return ccl::barrier(comm(), ccl_stream);
-      });
+      }, cancel_);
     });
   });
 }
@@ -579,7 +634,7 @@ absl::Status OnecclCommunicator::LaunchAllReduce(
                             ToOnecclCount(dtype, count), ccl_dtype,
                             ToOnecclReduction(reduction_kind), comm(),
                             ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -592,7 +647,7 @@ absl::Status OnecclCommunicator::LaunchBroadcast(
       return ccl::broadcast(send_buffer.opaque(), recv_buffer.opaque(),
                             ToOnecclCount(dtype, count), ccl_dtype,
                             root.value(), comm(), ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -607,7 +662,7 @@ absl::Status OnecclCommunicator::LaunchReduceScatter(
                                  ToOnecclCount(dtype, count), ccl_dtype,
                                  ToOnecclReduction(reduction_kind), comm(),
                                  ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -620,7 +675,7 @@ absl::Status OnecclCommunicator::LaunchAllGather(
       return ccl::allgather(send_buffer.opaque(), recv_buffer.opaque(),
                             ToOnecclCount(dtype, count), ccl_dtype, comm(),
                             ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -655,7 +710,7 @@ absl::Status OnecclCommunicator::LaunchAllToAll(
                              recv_contiguous->opaque(),
                              ToOnecclCount(dtype, count), ccl_dtype, comm(),
                              ccl_stream);
-      });
+      }, cancel_);
     }
 
     ccl::vector_class<void*> send_ptrs;
@@ -671,7 +726,7 @@ absl::Status OnecclCommunicator::LaunchAllToAll(
       return ccl::alltoall(send_ptrs, recv_ptrs,
                            ToOnecclCount(dtype, count), ccl_dtype, comm(),
                            ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -714,7 +769,7 @@ absl::Status OnecclCommunicator::LaunchCollectivePermute(
     for (ccl::event& event : events) {
       RETURN_IF_ERROR(
           WaitForOnecclEvent("ccl::collective_permute event",
-                             std::move(event)));
+                             std::move(event), cancel_));
     }
     return absl::OkStatus();
   });
@@ -728,7 +783,7 @@ absl::Status OnecclCommunicator::LaunchSend(
     return LaunchOnecclAndWait("ccl::send", [&] {
       return ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count),
                        ccl_dtype, peer.value(), comm(), ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -740,7 +795,7 @@ absl::Status OnecclCommunicator::LaunchRecv(
     return LaunchOnecclAndWait("ccl::recv", [&] {
       return ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count),
                        ccl_dtype, peer.value(), comm(), ccl_stream);
-    });
+    }, cancel_);
   });
 }
 
@@ -749,11 +804,17 @@ absl::StatusOr<ccl::communicator> OnecclCommunicator::Split(
   return ExecuteAwait<ccl::communicator>(
       [this, color, key, split_external_use]
       () -> absl::StatusOr<ccl::communicator> {
+        ASSIGN_OR_RETURN(ScopedOperation operation, StartOperation());
         auto activation = stream_executor_->Activate();
-        RETURN_IF_ERROR(CheckReady());
-        return OnecclValue<ccl::communicator>("ccl::communicator::split", [&] {
+        absl::StatusOr<ccl::communicator> split =
+            OnecclValue<ccl::communicator>("ccl::communicator::split", [&] {
           return comm_->split(color, key, split_external_use);
         });
+        if (!split.ok()) {
+          cancel_->Cancel();
+          Poison();
+        }
+        return split;
       });
 }
 
@@ -764,14 +825,19 @@ std::string OnecclCommunicator::ToString() const {
 absl::Status OnecclCommunicator::LaunchOnStream(
     const Executor& executor,
     absl::AnyInvocable<absl::Status(const ccl::stream&) &&> launch) const {
-  RETURN_IF_ERROR(CheckReady());
+  ASSIGN_OR_RETURN(ScopedOperation operation, StartOperation());
   ASSIGN_OR_RETURN(se::Stream* stream, ToStream(executor));
   RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
   ASSIGN_OR_RETURN(::sycl::queue* queue, ToSyclQueue(stream));
   RETURN_IF_ERROR(VerifySyclQueueIdentity(queue, stream_executor_));
   ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream, queue));
   auto activation = stream_executor_->Activate();
-  return std::move(launch)(ccl_stream);
+  absl::Status status = std::move(launch)(ccl_stream);
+  if (!status.ok()) {
+    cancel_->Cancel();
+    Poison();
+  }
+  return status;
 }
 
 Future<> OnecclCommunicator::Execute(

@@ -88,7 +88,8 @@ class OnecclCollectives : public GpuCollectives {
  private:
   absl::StatusOr<std::shared_ptr<ccl::kvs_interface>> GetOrCreateKvs(
       const CliqueKey& clique_key, const std::optional<CliqueIds>& clique_ids,
-      absl::Span<const DeviceRank> ranks, bool all_local_clique) const;
+      absl::Span<const DeviceRank> ranks, bool all_local_clique,
+      std::shared_ptr<CancellationToken> cancel) const;
 
   mutable absl::Mutex mu_;
   mutable absl::flat_hash_map<std::string, std::shared_ptr<ccl::kvs>>

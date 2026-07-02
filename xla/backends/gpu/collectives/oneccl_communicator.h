@@ -21,11 +21,13 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "oneapi/ccl.hpp"
 #include "xla/backends/gpu/collectives/cancellation_token.h"
@@ -201,11 +203,33 @@ class OnecclCommunicator final : public GpuCommunicator {
     return Execute<T>(std::move(f)).Await();
   }
 
+  class ScopedOperation {
+   public:
+    explicit ScopedOperation(const OnecclCommunicator* communicator)
+        : communicator_(communicator) {}
+    ScopedOperation(ScopedOperation&& other)
+        : communicator_(std::exchange(other.communicator_, nullptr)) {}
+    ScopedOperation& operator=(ScopedOperation&&) = delete;
+    ScopedOperation(const ScopedOperation&) = delete;
+    ScopedOperation& operator=(const ScopedOperation&) = delete;
+    ~ScopedOperation();
+
+   private:
+    const OnecclCommunicator* communicator_;
+  };
+
+  absl::StatusOr<ScopedOperation> StartOperation() const;
+  void FinishOperation() const;
+  void Poison() const;
+
   se::StreamExecutor* stream_executor_;
   std::unique_ptr<ccl::communicator> comm_;
   std::shared_ptr<ccl::kvs_interface> kvs_;
   std::shared_ptr<CancellationToken> cancel_;
-  bool aborted_ = false;
+  mutable absl::Mutex mu_;
+  mutable bool aborted_ ABSL_GUARDED_BY(mu_) = false;
+  mutable bool poisoned_ ABSL_GUARDED_BY(mu_) = false;
+  mutable int64_t in_flight_operations_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
 }  // namespace xla::gpu
