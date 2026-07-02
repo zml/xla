@@ -17,9 +17,14 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include <cstdint>
+#include <memory>
+
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 
@@ -46,30 +51,31 @@ class SyclEventTest : public ::testing::Test {
 TEST_F(SyclEventTest, CreateEvent) {
   TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
 
-  ::sycl::event sycl_event = event.GetEvent();
-
-  // Expect the event to be complete immediately after creation
-  // since it has no dependencies.
+  EXPECT_FALSE(event.IsRecorded());
+  EXPECT_THAT(event.GetRecordedEvent(),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  // Unrecorded events are treated as complete to preserve StreamExecutor
+  // compatibility.
   EXPECT_EQ(event.PollForStatus(), Event::Status::kComplete);
+  EXPECT_THAT(event.Synchronize(), absl_testing::IsOk());
 }
 
 TEST_F(SyclEventTest, MoveEvent) {
   TF_ASSERT_OK_AND_ASSIGN(SyclEvent orig_sycl_event,
                           SyclEvent::Create(executor_));
 
-  // Make a copy of the event wrapper handle to check after move.
-  ::sycl::event orig_event = orig_sycl_event.GetEvent();
-
   // Move the event to a new SyclEvent instance.
   SyclEvent moved_sycl_event = std::move(orig_sycl_event);
 
-  // The moved event should still be valid.
-  ::sycl::event moved_event = moved_sycl_event.GetEvent();
-  EXPECT_EQ(moved_event, orig_event);
+  EXPECT_FALSE(moved_sycl_event.IsRecorded());
+  EXPECT_EQ(moved_sycl_event.PollForStatus(), Event::Status::kComplete);
 }
 
 TEST_F(SyclEventTest, WaitReturnsStoredAsyncError) {
   TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor_->CreateStream());
+  TF_ASSERT_OK(stream->RecordEvent(&event));
   SyclRecordAsyncErrorForTesting(
       kDefaultDeviceOrdinal,
       absl::InternalError("injected async event failure"));
@@ -82,6 +88,9 @@ TEST_F(SyclEventTest, WaitReturnsStoredAsyncError) {
 
 TEST_F(SyclEventTest, SynchronizeReturnsStoredAsyncError) {
   TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor_->CreateStream());
+  TF_ASSERT_OK(stream->RecordEvent(&event));
   Event* base_event = &event;
   SyclRecordAsyncErrorForTesting(
       kDefaultDeviceOrdinal,
@@ -91,6 +100,26 @@ TEST_F(SyclEventTest, SynchronizeReturnsStoredAsyncError) {
               absl_testing::StatusIs(
                   absl::StatusCode::kInternal,
                   ::testing::HasSubstr("injected async base event failure")));
+}
+
+TEST_F(SyclEventTest, ExternalStreamNullIsRejected) {
+  TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+
+  EXPECT_THAT(event.WaitForEventOnExternalStream(0),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_F(SyclEventTest, ExternalStreamSameContextSucceeds) {
+  TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor_->CreateStream());
+  TF_ASSERT_OK(stream->RecordEvent(&event));
+
+  auto handle = stream->platform_specific_handle();
+  ASSERT_NE(handle.stream, nullptr);
+  EXPECT_THAT(event.WaitForEventOnExternalStream(
+                  reinterpret_cast<std::intptr_t>(handle.stream)),
+              absl_testing::IsOk());
 }
 
 }  // namespace

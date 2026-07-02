@@ -207,23 +207,21 @@ absl::Status LaunchSyclKernel(
 absl::Status SyclStream::WaitFor(Stream* other) {
   SyclStream* other_stream = static_cast<SyclStream*>(other);
   RETURN_IF_ERROR(other_stream->RecordCompletedEvent());
-  return SyclEvent::WaitStreamOnEvent(
-      executor_, stream_handle_.get(),
-      other_stream->completed_event_.GetEvent());
+  return SyclEvent::WaitStreamOnEvent(executor_, stream_handle_.get(),
+                                      other_stream->completed_event_);
 }
 
 absl::Status SyclStream::RecordEvent(Event* event) {
   ASSIGN_OR_RETURN(::sycl::event barrier_event,
                    SyclSubmitBarrierEvent(stream_handle_.get()));
   // Update the event to a barrier that marks completion of prior stream work.
-  static_cast<SyclEvent*>(event)->SetEvent(barrier_event);
-  return absl::OkStatus();
+  return static_cast<SyclEvent*>(event)->SetRecordedEvent(
+      barrier_event, stream_handle_.get(), /*is_barrier_marker=*/true);
 }
 
 absl::Status SyclStream::WaitFor(Event* event) {
-  return SyclEvent::WaitStreamOnEvent(
-      executor_, stream_handle_.get(),
-      static_cast<SyclEvent*>(event)->GetEvent());
+  return SyclEvent::WaitStreamOnEvent(executor_, stream_handle_.get(),
+                                      *static_cast<SyclEvent*>(event));
 }
 
 absl::Status SyclStream::Memset32(DeviceAddressBase* location, uint32_t pattern,

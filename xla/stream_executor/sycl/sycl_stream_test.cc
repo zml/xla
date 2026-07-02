@@ -422,10 +422,11 @@ TEST_F(SyclStreamTest, RecordEvent) {
   EXPECT_THAT(stream1->Memset32(&device_buffer, 0xDEADBEEF, kBufferSizeBytes),
               absl_testing::IsOk());
 
-  ::sycl::event default_event = event.GetEvent();
+  EXPECT_FALSE(event.IsRecorded());
   EXPECT_THAT(stream1->RecordEvent(&event), absl_testing::IsOk());
   // RecordEvent must update the event to a marker for stream1's prior work.
-  EXPECT_NE(event.GetEvent(), default_event);
+  EXPECT_TRUE(event.IsRecorded());
+  EXPECT_THAT(event.GetRecordedEvent(), absl_testing::IsOk());
 
   EXPECT_THAT(stream2->WaitFor(&event), absl_testing::IsOk());
 

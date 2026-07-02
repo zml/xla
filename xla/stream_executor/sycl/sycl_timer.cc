@@ -91,10 +91,11 @@ absl::StatusOr<absl::Duration> SyclTimer::GetElapsedDuration() {
     return absl::FailedPreconditionError("Measuring inactive timer");
   }
   RETURN_IF_ERROR(stream_->RecordEvent(&stop_event_));
+  ASSIGN_OR_RETURN(::sycl::event start_event, start_event_.GetRecordedEvent());
+  ASSIGN_OR_RETURN(::sycl::event stop_event, stop_event_.GetRecordedEvent());
   ASSIGN_OR_RETURN(float elapsed_milliseconds,
                    GetEventElapsedTime(stream_->parent()->device_ordinal(),
-                                       start_event_.GetEvent(),
-                                       stop_event_.GetEvent()));
+                                       start_event, stop_event));
   is_timer_stopped_ = true;
   return absl::Milliseconds(elapsed_milliseconds);
 }

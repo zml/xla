@@ -18,6 +18,10 @@ limitations under the License.
 
 #include <sycl/sycl.hpp>
 
+#include <cstdint>
+#include <optional>
+
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -37,17 +41,20 @@ class SyclEvent : public Event {
   // TODO(intel-tf): Remove unused executor parameter.
   static absl::Status WaitStreamOnEvent(StreamExecutor* executor,
                                         ::sycl::queue* stream_handle,
-                                        const ::sycl::event& event);
+                                        const SyclEvent& event);
 
   // Waits for the event to complete on an external stream.
   absl::Status WaitForEventOnExternalStream(std::intptr_t stream) override;
 
-  // Creates a SyclEvent instance and initializes it with a default
-  // constructed ::sycl::event that has no dependencies and associated commands.
+  // Creates an unrecorded SyclEvent instance. Unrecorded events poll complete
+  // and waits on them are no-ops to preserve StreamExecutor compatibility.
   static absl::StatusOr<SyclEvent> Create(StreamExecutor* executor);
 
-  // Returns the underlying SYCL event. Not thread-safe.
-  ::sycl::event GetEvent() const { return event_; }
+  // Returns the recorded underlying SYCL event, or an error if this event has
+  // not been recorded yet. Not thread-safe.
+  absl::StatusOr<::sycl::event> GetRecordedEvent() const;
+
+  bool IsRecorded() const { return event_.has_value(); }
 
   // Blocks the host until this event completes.
   absl::Status Wait();
@@ -55,8 +62,11 @@ class SyclEvent : public Event {
   // Blocks the host until this event completes.
   absl::Status Synchronize() override { return Wait(); }
 
-  // Sets the underlying SYCL event. Not thread-safe.
-  void SetEvent(const ::sycl::event& event) { event_ = event; }
+  // Sets the underlying SYCL event and records the queue provenance used for
+  // future waits. Not thread-safe.
+  absl::Status SetRecordedEvent(const ::sycl::event& event,
+                                const ::sycl::queue* queue,
+                                bool is_barrier_marker);
 
   // We don't need a destructor for ::sycl::event since it is handled by the
   // SYCL runtime.
@@ -69,16 +79,25 @@ class SyclEvent : public Event {
   SyclEvent& operator=(SyclEvent&& other) noexcept;
 
  private:
-  explicit SyclEvent(StreamExecutor* executor, const ::sycl::event& event)
-      : executor_(executor), event_(event) {}
+  struct RecordedEventMetadata {
+    StreamExecutor* executor;
+    int device_ordinal;
+    std::uintptr_t queue_identity;
+    ::sycl::context context;
+    ::sycl::device device;
+    ::sycl::backend backend;
+    bool is_barrier_marker;
+  };
+
+  explicit SyclEvent(StreamExecutor* executor) : executor_(executor) {}
 
   // The Executor used to which this object and ::sycl::event are bound.
   StreamExecutor* executor_;
 
-  // The underlying SYCL event.
-  // TODO(intel-tf): Use std::optional<::sycl::event> to represent an
-  // unrecorded event.
-  ::sycl::event event_;
+  // The underlying SYCL event. Empty means this StreamExecutor event has never
+  // been recorded.
+  std::optional<::sycl::event> event_;
+  std::optional<RecordedEventMetadata> metadata_;
 };
 
 }  // namespace stream_executor::sycl

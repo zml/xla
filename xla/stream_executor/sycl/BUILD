@@ -396,11 +396,12 @@ sycl_library(
         "oneapi-only",
     ],
     deps = [
+        ":sycl_gpu_runtime",
         "//xla/stream_executor:event",
         "//xla/stream_executor:stream_executor_h",
-        ":sycl_gpu_runtime",
-        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -417,6 +418,7 @@ xla_test(
         ":sycl_gpu_runtime",
         ":sycl_platform_id",
         "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest_main",

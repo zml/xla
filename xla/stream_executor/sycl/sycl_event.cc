@@ -15,10 +15,11 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_event.h"
 
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "absl/base/casts.h"
 #include "absl/strings/str_cat.h"
 #include "absl/status/statusor.h"
 #include "xla/stream_executor/event.h"
@@ -28,9 +29,13 @@ limitations under the License.
 namespace stream_executor::sycl {
 
 Event::Status SyclEvent::PollForStatus() {
+  if (!event_.has_value()) {
+    return Event::Status::kComplete;
+  }
+
   try {
     auto event_status =
-        event_.get_info<::sycl::info::event::command_execution_status>();
+        event_->get_info<::sycl::info::event::command_execution_status>();
     switch (event_status) {
       case ::sycl::info::event_command_status::submitted: {
         VLOG(2)
@@ -62,16 +67,58 @@ Event::Status SyclEvent::PollForStatus() {
 
 absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
                                           ::sycl::queue* stream_handle,
-                                          const ::sycl::event& event) {
+                                          const SyclEvent& event) {
   // No need to call executor->Activate() since the SYCL context need not
   // be activated explicitly.
   if (stream_handle == nullptr) {
     return absl::InternalError(
         "WaitStreamOnEvent: Stream handle is not initialized.");
   }
+  if (!event.event_.has_value()) {
+    return absl::OkStatus();
+  }
+  if (!event.metadata_.has_value()) {
+    return absl::InternalError(
+        "WaitStreamOnEvent: Recorded event is missing metadata.");
+  }
+
+  const RecordedEventMetadata& metadata = *event.metadata_;
+  try {
+    if (stream_handle->get_backend() != metadata.backend) {
+      return absl::InvalidArgumentError(
+          "WaitStreamOnEvent: Target stream backend does not match recorded "
+          "event backend.");
+    }
+
+    ::sycl::context target_context = stream_handle->get_context();
+    if (target_context != metadata.context) {
+      return absl::InvalidArgumentError(
+          "WaitStreamOnEvent: Target stream context does not match recorded "
+          "event context.");
+    }
+
+    ::sycl::device target_device = stream_handle->get_device();
+    if (target_device != metadata.device) {
+      return absl::UnimplementedError(
+          "WaitStreamOnEvent: Cross-device SYCL event waits are not enabled.");
+    }
+
+    if (executor != nullptr &&
+        executor->device_ordinal() != metadata.device_ordinal) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "WaitStreamOnEvent: Target executor ordinal ",
+          executor->device_ordinal(), " does not match recorded event ordinal ",
+          metadata.device_ordinal, "."));
+    }
+  } catch (const ::sycl::exception& e) {
+    return absl::InternalError(
+        "WaitStreamOnEvent: Failed to validate target stream before waiting: " +
+        std::string(e.what()));
+  }
+
   try {
     auto event_status =
-        event.get_info<::sycl::info::event::command_execution_status>();
+        event.event_->get_info<::sycl::info::event::command_execution_status>();
     if (event_status == ::sycl::info::event_command_status::complete) {
       VLOG(2) << "Event is already complete; no need to wait.";
       return absl::OkStatus();
@@ -82,7 +129,8 @@ absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
         std::string(e.what()));
   }
   try {
-    stream_handle->ext_oneapi_submit_barrier(std::vector<::sycl::event>{event});
+    stream_handle->ext_oneapi_submit_barrier(
+        std::vector<::sycl::event>{*event.event_});
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(
         "WaitStreamOnEvent: Failed to submit event barrier: " +
@@ -92,12 +140,19 @@ absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
 }
 
 absl::Status SyclEvent::WaitForEventOnExternalStream(std::intptr_t stream) {
-  ::sycl::queue* queue_ptr = absl::bit_cast<::sycl::queue*>(stream);
-  return WaitStreamOnEvent(executor_, queue_ptr, event_);
+  if (stream == 0) {
+    return absl::InvalidArgumentError(
+        "WaitForEventOnExternalStream: external stream is null.");
+  }
+  auto* queue_ptr = reinterpret_cast<::sycl::queue*>(stream);
+  return WaitStreamOnEvent(executor_, queue_ptr, *this);
 }
 
 absl::Status SyclEvent::Wait() {
-  return SyclEventSynchronize(event_, executor_->device_ordinal(),
+  if (!event_.has_value()) {
+    return absl::OkStatus();
+  }
+  return SyclEventSynchronize(*event_, executor_->device_ordinal(),
                               "SyclEvent::Wait");
 }
 
@@ -105,8 +160,7 @@ absl::StatusOr<SyclEvent> SyclEvent::Create(StreamExecutor* executor) {
   // SYCL reports synchronous (host-side) errors via exceptions, so we catch
   // them and return an error status.
   try {
-    // Initialize with a default-constructed ::sycl::event.
-    return SyclEvent(executor, ::sycl::event());
+    return SyclEvent(executor);
   } catch (const ::sycl::exception& e) {
     LOG(ERROR) << "SYCL exception while creating event: " << e.what()
                << " (error code: " << e.code() << ")";
@@ -115,8 +169,46 @@ absl::StatusOr<SyclEvent> SyclEvent::Create(StreamExecutor* executor) {
   }
 }
 
+absl::StatusOr<::sycl::event> SyclEvent::GetRecordedEvent() const {
+  if (!event_.has_value()) {
+    return absl::FailedPreconditionError(
+        "SyclEvent::GetRecordedEvent: event has not been recorded.");
+  }
+  return *event_;
+}
+
+absl::Status SyclEvent::SetRecordedEvent(const ::sycl::event& event,
+                                         const ::sycl::queue* queue,
+                                         bool is_barrier_marker) {
+  if (queue == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclEvent::SetRecordedEvent: queue is null.");
+  }
+
+  try {
+    metadata_ = RecordedEventMetadata{
+        executor_,
+        executor_->device_ordinal(),
+        reinterpret_cast<std::uintptr_t>(queue),
+        queue->get_context(),
+        queue->get_device(),
+        queue->get_backend(),
+        is_barrier_marker,
+    };
+    event_ = event;
+    return absl::OkStatus();
+  } catch (const ::sycl::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("SyclEvent::SetRecordedEvent: failed to record event "
+                     "metadata: ",
+                     e.what()));
+  }
+}
+
 SyclEvent::SyclEvent(SyclEvent&& other) noexcept
-    : executor_(other.executor_), event_(other.event_) {
+    : executor_(other.executor_),
+      event_(std::move(other.event_)),
+      metadata_(std::move(other.metadata_)) {
   other.executor_ = nullptr;
 }
 
@@ -125,7 +217,8 @@ SyclEvent& SyclEvent::operator=(SyclEvent&& other) noexcept {
     return *this;
   }
   executor_ = other.executor_;
-  event_ = other.event_;
+  event_ = std::move(other.event_);
+  metadata_ = std::move(other.metadata_);
   other.executor_ = nullptr;
   return *this;
 }
