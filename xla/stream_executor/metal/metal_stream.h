@@ -94,9 +94,8 @@ class MetalStream : public StreamCommon {
   void EnsureOpenCommandBuffer();
   // Commits the open command buffer WITHOUT waiting — submits batched GPU work so
   // its signals / PJRT definition events can fire and (eventually) complete — and
-  // advances the signal bookkeeping. No-op when nothing is open. Does NOT touch the
-  // adaptive-K / executes_this_token_ state. Called by FlushBatchedWork at the token
-  // boundary.
+  // advances the signal bookkeeping. No-op when nothing is open. Called by
+  // FlushBatchedWork at the token boundary.
   void CommitOpenBufferNoWait();
 
   MetalExecutor* executor_;
@@ -107,7 +106,7 @@ class MetalStream : public StreamCommon {
   // The most recent shared-event value this stream has signaled (0 = none yet).
   // RecordEvent's else branch (command_buffer_ == nullptr) is reached when this
   // execute has no open buffer of its own to signal into — e.g. the previous
-  // batch already committed at an adaptive-K / token boundary, or the execute
+  // batch already committed at a self-clocked / token boundary, or the execute
   // encoded no GPU work. Such an event still lets a consumer order against this
   // stream's work by referencing the highest value already signaled (committed or
   // pending), not 0. (PJRT coalesces all sibling outputs of one execute onto a
@@ -117,32 +116,32 @@ class MetalStream : public StreamCommon {
   // Highest shared-event value ENCODED into the current OPEN command buffer but
   // not yet committed (0 when no open buffer / nothing signaled into it). Lets
   // FlushOpenBufferIfCarrying tell whether the open buffer carries a given
-  // awaited value. Nonzero once RecordEvent defers commits (commit_every_ > 1).
+  // awaited value. Nonzero while RecordEvent has signals batched in the open
+  // buffer (deferred commits).
   uint64_t pending_signal_high_ = 0;
   // Partial command-buffer batching. The GPU pays a ~0.1ms scheduling + cross-cb
   // shared-event gap BETWEEN command buffers; with ~30 executes/token that is
-  // ~18% GPU idle. Keeping the command buffer OPEN across K executes (RecordEvent
+  // ~18% GPU idle. Keeping the command buffer OPEN across executes (RecordEvent
   // signals but does not commit; same-stream consumers order in-buffer by program
-  // order, see WaitFor) amortizes that gap over K executes — like CUDA's single
-  // stream. But the sweet spot is per-MODEL: amortization peaks where it balances
-  // lost host/GPU overlap (K=8 for 3B's ~30-execute token, i.e. ~4 commits/token);
-  // a model with far fewer executes/token would over-batch at a fixed 8. So the
-  // portable knob is commits-PER-TOKEN, and K is derived per token (adaptive_k_).
+  // order, see WaitFor) amortizes that gap over the batch — like CUDA's single
+  // stream. The commit cadence is SELF-CLOCKING, not a tuned K: RecordEvent
+  // commits the open buffer iff the GPU has drained all of this stream's
+  // previously committed work (shared-event signaledValue >=
+  // last_signaled_value_), i.e. exactly when the pipeline would otherwise go
+  // dry — Nagle's algorithm applied to command buffers. On GPU-bound stretches
+  // the test stays false, so buffers grow and the gap amortizes maximally; on
+  // host-bound stretches it commits every execute, and the gaps hide behind
+  // host encoding. Steady state converges to batches whose encode time matches
+  // the previous batch's GPU time — balanced host/GPU pipelining, derived per
+  // model/machine instead of tuned (the former adaptive-K commits-per-token
+  // constants approximated exactly this balance point).
   //
-  // commit_every_ is the CEILING on the adaptive K (default 8, tuned to the 3B
-  // decode peak); K=1 reproduces the per-execute baseline exactly.
-  int commit_every_ = 8;
-  // Target voluntary commits per decode token (default 4 → K≈8 on 3B). The real,
-  // model-portable cadence constant.
-  int target_commits_per_token_ = 4;
-  // Commit-eligible executes (signals) since the last token boundary
-  // (FlushBatchedWork = the logits readback). Recomputes adaptive_k_ each token.
-  int executes_this_token_ = 0;
-  // Current per-token commit threshold: clamp(round(executes_per_token /
-  // target_commits_per_token_), 1, commit_every_). Initialized to the ceiling in
-  // the constructor; recomputed at every token boundary, so it auto-scales to the
-  // model with no fixed K. K=1 (ceiling) still reproduces the baseline bit-for-bit.
-  int adaptive_k_ = 8;
+  // kMaxSignalsPerBuffer is a structural SAFETY bound, not a cadence knob (the
+  // dry test above decides cadence): it caps encoded-command growth in one open
+  // buffer when the GPU stays busy for a long stretch (e.g. large prefill
+  // executes). Balanced decode commits far below it.
+  static constexpr int kMaxSignalsPerBuffer = 64;
+  // Commit-eligible executes (signals) encoded into the current open buffer.
   int signals_since_commit_ = 0;
   // Highest shared-event value already encoded as a GPU WAIT into the current
   // OPEN command buffer. A later consumer in the SAME buffer needing

@@ -61,9 +61,6 @@ MetalStream::MetalStream(
     std::optional<std::variant<StreamPriority, int>> priority)
     : StreamCommon(executor, priority), executor_(executor) {
   executor_->RegisterStream(this);
-  // Start at the commit-cadence ceiling; the first token boundary recomputes the
-  // adaptive per-token threshold for this model (see adaptive_k_).
-  adaptive_k_ = commit_every_;
 }
 
 MetalStream::~MetalStream() {
@@ -88,7 +85,7 @@ absl::Status MetalStream::WaitFor(Stream* other) {
 // === Env-gated decode batching diagnostics (METAL_KPROF=1) =================
 // Counts, per decode token, how the cross-execute sync resolves: commits and
 // which WaitFor branch each consumer hit. Logged + reset at the token boundary
-// (FlushBatchedWork). Pinpoints why the adaptive-K batch commits collapse to
+// (FlushBatchedWork). Pinpoints why the self-clocked batch commits collapse to
 // one-per-execute on a given model. Single-host-thread stream model -> plain
 // ints. Zero overhead unless METAL_KPROF is set.
 namespace {
@@ -100,8 +97,10 @@ bool BatchDbgEnabled() {
   return on;
 }
 struct BatchDbg {
+  int executes = 0;       // signal-carrying executes this token
   int commits = 0;        // command buffers committed this token
-  int re_commit = 0;      // RecordEvent adaptive-K commits
+  int dry_commit = 0;     // RecordEvent GPU-went-dry (self-clocked) commits
+  int cap_commit = 0;     // RecordEvent kMaxSignalsPerBuffer safety-cap commits
   int foic_commit = 0;    // FlushOpenBufferIfCarrying (cross-stream) commits
   int nowait_commit = 0;  // CommitOpenBufferNoWait commits (token-boundary etc.)
   int w_inbuf = 0;        // WaitFor case1 in-buffer elide
@@ -121,10 +120,11 @@ absl::Status MetalStream::RecordEvent(Event* event) {
   // Encode a GPU-side signal at the END of this execute's work (after all
   // kernels) so a dependent execute can order on it WITHOUT a host block. The
   // event is value-backed (MetalEvent polls the shared-event value), so it does
-  // NOT need a committed command buffer — we can keep the buffer OPEN and commit
-  // only every `commit_every_` executes (partial batching). Same-stream
-  // consumers order in-buffer by program order (WaitFor's in-buffer fast path);
-  // cross-stream/cross-batch consumers force-commit via CommitOpenBufferThrough.
+  // NOT need a committed command buffer — we can keep the buffer OPEN and defer
+  // the commit to the self-clocked batch boundary below (partial batching).
+  // Same-stream consumers order in-buffer by program order (WaitFor's in-buffer
+  // fast path); cross-stream/cross-batch consumers force-commit via
+  // CommitOpenBufferThrough.
   if (command_buffer_ != nullptr) {
     const uint64_t value = executor_->NextEventValue();
     metal::EncodeSignalSharedEvent(command_buffer_, executor_->shared_event(),
@@ -133,12 +133,23 @@ absl::Status MetalStream::RecordEvent(Event* event) {
     metal_event->SetCommandBuffer(nullptr);
     metal_event->SetSignal(executor_->shared_event(), value,
                            &FlushProducerThunk, executor_);
-    // Commit at the batch boundary: starts this batch's GPU work and bounds the
-    // open buffer to ~adaptive_k_ executes (the per-token, model-derived
-    // threshold). Releasing the committed cb is safe — the event is value-backed,
-    // not cb-backed.
-    ++executes_this_token_;  // for the next token-boundary recompute.
-    if (++signals_since_commit_ >= adaptive_k_) {
+    // Self-clocking commit (event-driven, no tuned cadence): commit the open
+    // buffer iff the GPU has drained everything this stream previously
+    // committed (shared-event signaledValue crossed the last committed signal)
+    // — i.e. exactly when the pipeline would otherwise go dry. While committed
+    // work is still running the buffer keeps batching, so each buffer
+    // accumulates for about as long as its predecessor executes: balanced
+    // host/GPU pipelining with the cross-cb gap amortized over the batch (see
+    // metal_stream.h for the two extremes). The signal cap only bounds
+    // encoded-command growth when the GPU stays busy for a long stretch.
+    // Releasing the committed cb is safe — the event is value-backed, not
+    // cb-backed.
+    if (BatchDbgEnabled()) ++g_bdbg.executes;
+    ++signals_since_commit_;
+    const bool gpu_dry =
+        metal::SharedEventSignaledValue(executor_->shared_event()) >=
+        last_signaled_value_;
+    if (gpu_dry || signals_since_commit_ >= kMaxSignalsPerBuffer) {
       void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
       ReleaseObject(command_buffer_);
       command_buffer_ = nullptr;
@@ -147,10 +158,13 @@ absl::Status MetalStream::RecordEvent(Event* event) {
       pending_signal_high_ = 0;
       signals_since_commit_ = 0;
       waited_value_high_ = 0;
-      if (BatchDbgEnabled()) { ++g_bdbg.commits; ++g_bdbg.re_commit; }
+      if (BatchDbgEnabled()) {
+        ++g_bdbg.commits;
+        ++(gpu_dry ? g_bdbg.dry_commit : g_bdbg.cap_commit);
+      }
     }
   } else {
-    // No open command buffer: the batch already committed at an adaptive-K /
+    // No open command buffer: the batch already committed at a self-clocked /
     // token boundary, or this execute encoded no GPU work of its own. Point at
     // the highest value this stream has signaled (committed or pending) so a
     // consumer still orders against that work. 0 only before the first signal
@@ -175,7 +189,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     // kernels will be encoded into the SAME buffer AFTER the signal, so the
     // single-queue program order already orders consumer-after-producer. No
     // commit and no GPU wait needed — this is what removes the per-execute
-    // command-buffer transition gap when commit_every_ > 1. (Decode has no
+    // command-buffer transition gap while commits are deferred. (Decode has no
     // mid-execute command-buffer splits — D2D copies are in-buffer blits, no
     // MPSGraph splits — so the whole open batch is one ordered segment.)
     if (metal_event->shared_event() == executor_->shared_event() &&
@@ -381,9 +395,11 @@ absl::Status MetalStream::DoHostCallbackWithStatus(
   // executes. The value is the signal RecordEvent encoded for this execute:
   // pending (still in the open buffer) or the last committed one. The listener
   // fires when the GPU crosses that value, which happens once the carrying buffer
-  // commits — guaranteed within commit_every_ executes by the RecordEvent batch
-  // commit, or sooner by a cross-stream readback / BlockHostUntilDone force-
-  // commit (CommitOpenBufferThrough) — so it is never starved. Single serial
+  // commits — guaranteed by RecordEvent's self-clocked commit (committed work
+  // drains in finite time, after which the next signal commits; the per-buffer
+  // signal cap bounds the batch meanwhile), or sooner by a cross-stream readback
+  // / BlockHostUntilDone force-commit (CommitOpenBufferThrough) — so it is never
+  // starved. Single serial
   // listener queue ⇒ callbacks run in value (== completion) order, exactly-once.
   void* shared_event = executor_->shared_event();
   void* listener = executor_->shared_event_listener();
@@ -428,7 +444,7 @@ absl::Status MetalStream::BlockHostUntilDone() {
   // does not clear it), where WaitFor's in-buffer fast path (value <=
   // pending_signal_high_) could skip a cross-buffer wait for a signal that was
   // never encoded into that buffer; a stale signals_since_commit_ skews the
-  // adaptive commit cadence. The work is committed + about to be waited, so
+  // per-buffer signal cap. The work is committed + about to be waited, so
   // advancing last_signaled_value_ to it is correct.
   if (pending_signal_high_ != 0) last_signaled_value_ = pending_signal_high_;
   pending_signal_high_ = 0;
@@ -443,31 +459,25 @@ absl::Status MetalStream::BlockHostUntilDone() {
 
 absl::Status MetalStream::FlushBatchedWork() {
   // A host transfer (D2H readback) is a synchronization point. With deferred
-  // commits (commit_every_ > 1) the open command buffer may carry the execute
+  // commits the open command buffer may carry the execute
   // whose output is being read; its PJRT definition event (SetStateConcrete,
   // driven by the shared-event listener registered in DoHostCallback) fires
   // only once that buffer commits. Commit it now — WITHOUT waiting — so the
   // listener can fire and the host transfer's wait on the definition event
   // resolves; the transfer itself then waits for completion. This is the MLX
   // model: batch across executes, but flush the open buffer at a sync point.
-  // No-op when nothing is open (already committed / nothing batched), which is
-  // always at commit_every_ == 1 — so the K=1 baseline is unchanged.
+  // No-op when nothing is open (already committed / nothing batched).
   // Single-host-thread stream-op model (like the rest of this class): in decode
   // the readback runs on the same thread that issued the executes, after the
-  // last one, so command_buffer_ is stable here.
-  //
-  // This D2H readback is the per-token boundary: recompute the adaptive commit
-  // threshold from the executes-per-token THIS model just ran, so K auto-scales
-  // (no fixed per-model constant). Round to ~target_commits_per_token_ commits,
-  // clamp to [1, commit_every_ ceiling]. Done unconditionally (before the
-  // open-buffer check) — the boundary stands even if the tail already committed.
-  // ONLY here: a cross-stream FlushOpenBufferIfCarrying is not a token boundary.
+  // last one, so command_buffer_ is stable here. No cadence state to recompute
+  // — the commit cadence is self-clocked off GPU progress in RecordEvent.
   if (BatchDbgEnabled()) {
     static int tok = 0;
     if ((tok++ % 32) == 0) {
-      LOG(INFO) << "METAL_KPROF batch/token: executes=" << executes_this_token_
-                << " adaptive_k=" << adaptive_k_ << " commits=" << g_bdbg.commits
-                << " (re=" << g_bdbg.re_commit << " foic=" << g_bdbg.foic_commit
+      LOG(INFO) << "METAL_KPROF batch/token: executes=" << g_bdbg.executes
+                << " commits=" << g_bdbg.commits
+                << " (dry=" << g_bdbg.dry_commit << " cap=" << g_bdbg.cap_commit
+                << " foic=" << g_bdbg.foic_commit
                 << " nowait=" << g_bdbg.nowait_commit << ")"
                 << " | WaitFor inbuf=" << g_bdbg.w_inbuf
                 << " signaled=" << g_bdbg.w_signaled
@@ -476,29 +486,20 @@ absl::Status MetalStream::FlushBatchedWork() {
     }
     g_bdbg = BatchDbg{};
   }
-  if (executes_this_token_ > 0) {
-    const int t = target_commits_per_token_;
-    int k = (executes_this_token_ + t / 2) / t;  // round(executes / target)
-    if (k < 1) k = 1;
-    if (k > commit_every_) k = commit_every_;
-    adaptive_k_ = k;
-    executes_this_token_ = 0;
-  }
   CommitOpenBufferNoWait();
   return absl::OkStatus();
 }
 
 absl::Status MetalStream::CommitBatchedWorkNoWait() {
-  // Commit the open buffer WITHOUT waiting and WITHOUT recomputing the adaptive
-  // commit cadence — this is NOT a decode token boundary (FlushBatchedWork is).
-  // Used by the PJRT execute path when a host-awaited completion future is
-  // requested (returned futures): such an isolated execute may have no following
-  // execute to reach the adaptive-K commit and no D2H readback to flush, so its
-  // open command buffer (carrying the shared-event signal the definition-event
-  // listener waits on) would never commit, the listener would never fire, and
-  // the host await would deadlock. Committing here fires the listener. Because
-  // it leaves executes_this_token_ / adaptive_k_ untouched, it is safe even when
-  // interleaved mid-token with batched decode executes on this same stream.
+  // Commit the open buffer WITHOUT waiting. Used by the PJRT execute path when
+  // a host-awaited completion future is requested (returned futures): such an
+  // isolated execute may have no following execute to reach a self-clocked
+  // commit and no D2H readback to flush, so its open command buffer (carrying
+  // the shared-event signal the definition-event listener waits on) would never
+  // commit, the listener would never fire, and the host await would deadlock.
+  // Committing here fires the listener. It only flushes (there is no cadence
+  // state to skew), so it is safe even when interleaved mid-token with batched
+  // decode executes on this same stream.
   CommitOpenBufferNoWait();
   return absl::OkStatus();
 }

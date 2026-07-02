@@ -766,8 +766,8 @@ void CommitBatchCommandBufferWithCompletion(
     }];
     [mpscb commit];
     // Profiling resolve funnel: this completion variant is the commit path the
-    // BlockHostUntilDone batch drain uses (metal_stream.cc), and with adaptive_k
-    // batching it is the DOMINANT prefill commit — so resolve here too, else the
+    // BlockHostUntilDone batch drain uses (metal_stream.cc), and with deferred-
+    // commit batching it is the DOMINANT prefill commit — so resolve here too, else the
     // GPU-timestamp samples attached to this buffer's encoders are never read
     // back. Opt-in only (MetalProfilingEnabled() == false on the normal fast
     // path), so the serializing wait never touches production runs. The
