@@ -122,6 +122,16 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
 absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
                             uint64_t dst_offset, void* src_buffer,
                             uint64_t src_offset, uint64_t size);
+// Encodes a buffer fill (MTLBlitCommandEncoder fillBuffer:range:value:) into
+// the open command buffer — no commit, no host drain. Same fence chaining as
+// EncodeBlitCopy (wait before / update after), so the fill is ordered after
+// prior encoders' accesses and before later encoders' reads; cross-execute
+// consumers order via the stream's shared-event signal. Replaces the MemZero
+// host memset whose BlockHostUntilDone drained the whole queue once per layer
+// during tiled prefill (28 drains/request on Llama-3B). `value` fills every
+// byte in [offset, offset+size).
+absl::Status EncodeBlitFill(void* batch_command_buffer, void* buffer,
+                            uint64_t offset, uint64_t size, uint8_t value);
 // Commits the open command buffer and returns its final committed underlying
 // MTLCommandBuffer (retained, +1) to wait on / record in an event. (MPSGraph may
 // split via commitAndContinue; waiting the last segment drains all prior by queue

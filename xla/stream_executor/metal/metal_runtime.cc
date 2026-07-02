@@ -695,6 +695,25 @@ absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
   return absl::OkStatus();
 }
 
+absl::Status EncodeBlitFill(void* batch_command_buffer, void* buffer,
+                            uint64_t offset, uint64_t size, uint8_t value) {
+  if (batch_command_buffer == nullptr || buffer == nullptr) {
+    return absl::InternalError("Metal EncodeBlitFill: null buffer.");
+  }
+  if (size == 0) return absl::OkStatus();
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb =
+        Obj<MPSCommandBuffer*>(batch_command_buffer).commandBuffer;
+    FlushConcurrentEncoder(cb);  // end open compute encoder pre-blit
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit fillBuffer:Obj<id<MTLBuffer>>(buffer)
+               range:NSMakeRange(offset, size)
+               value:value];
+    [blit endEncoding];
+  }
+  return absl::OkStatus();
+}
+
 // Env-gated standalone KPROF reporter (defined below; forward-declared so the
 // commit funnels can drive it without the xprof tracer being attached).
 void MetalKprofMaybeStart();

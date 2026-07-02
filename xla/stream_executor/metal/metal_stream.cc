@@ -240,10 +240,27 @@ absl::Status MetalStream::WaitFor(Event* event) {
 
 absl::Status MetalStream::Memset32(DeviceAddressBase* location,
                                    uint32_t pattern, uint64_t size) {
-  TF_RETURN_IF_ERROR(BlockHostUntilDone());
+  if (size == 0) return absl::OkStatus();
   if (size % sizeof(uint32_t) != 0) {
     return absl::InvalidArgumentError("Metal Memset32 size is not 4-byte aligned.");
   }
+  // Byte-uniform patterns (0x00000000, 0xFFFFFFFF, ...) can use the async GPU
+  // fill (fillBuffer is byte-granular) — same no-drain path as MemZero. Other
+  // patterns keep the drain + host loop (not seen on any hot path).
+  const uint8_t b = static_cast<uint8_t>(pattern & 0xff);
+  const bool byte_uniform = pattern == (static_cast<uint32_t>(b) * 0x01010101u);
+  if (byte_uniform) {
+    auto alloc = executor_->ResolveAllocation(location->opaque());
+    if (alloc.ok()) {
+      const uint64_t offset =
+          reinterpret_cast<const char*>(location->opaque()) -
+          reinterpret_cast<const char*>(alloc->contents);
+      EnsureOpenCommandBuffer();
+      return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
+                                   b);
+    }
+  }
+  TF_RETURN_IF_ERROR(BlockHostUntilDone());
   auto* values = static_cast<uint32_t*>(location->opaque());
   for (uint64_t i = 0; i < size / sizeof(uint32_t); ++i) {
     values[i] = pattern;
@@ -252,6 +269,26 @@ absl::Status MetalStream::Memset32(DeviceAddressBase* location,
 }
 
 absl::Status MetalStream::MemZero(DeviceAddressBase* location, uint64_t size) {
+  if (size == 0) return absl::OkStatus();
+  // Encode an async GPU fill into the open command buffer instead of draining
+  // the queue + a host memset. The drain serialized tiled prefill layer-by-layer
+  // — paged-attn's per-layer output MemZero fired 28x/request on Llama-3B, each
+  // waiting the whole queue (~54 ms/request host-block, and no host run-ahead
+  // between prefill layers). The fill is encoded into the buffer like
+  // EncodeBlitCopy (the open compute encoder is ended, then the blit runs as its
+  // own encoder — ordered after prior encoders' accesses, before later reads);
+  // cross-execute consumers order via the stream's shared-event signal.
+  // Falls back to drain + host memset when the pointer isn't a resolvable
+  // Metal allocation (also keeps the value host-coherent for host readers).
+  auto alloc = executor_->ResolveAllocation(location->opaque());
+  if (alloc.ok()) {
+    const uint64_t offset =
+        reinterpret_cast<const char*>(location->opaque()) -
+        reinterpret_cast<const char*>(alloc->contents);
+    EnsureOpenCommandBuffer();
+    return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
+                                 /*value=*/0);
+  }
   TF_RETURN_IF_ERROR(BlockHostUntilDone());
   std::memset(location->opaque(), 0, size);
   return absl::OkStatus();

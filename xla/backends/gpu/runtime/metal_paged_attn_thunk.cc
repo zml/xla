@@ -500,8 +500,10 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
   // blow up to NaN within a couple layers and (via tiled GEMM row mixing) corrupt
   // real tokens too (garbage "!" output from the 2nd request on). Zero the output
   // up front so padding rows are deterministically 0, matching the first-request
-  // behavior. (MetalStream::MemZero drains then memsets the unified buffer, so the
-  // subsequent kernel write is correctly ordered after it.)
+  // behavior. (MetalStream::MemZero encodes an async GPU fill into the open
+  // command buffer, fence-ordered before this kernel's encoder — no queue
+  // drain; it used to drain + host-memset, which serialized tiled prefill
+  // layer-by-layer, ~28 full-queue drains per request.)
   se::DeviceAddressBase out_addr = allocs.GetDeviceAddress(out_);
   TF_RETURN_IF_ERROR(stream->MemZero(&out_addr, out_addr.size()));
 
