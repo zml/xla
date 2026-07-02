@@ -23,8 +23,11 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/autotune_results.pb.h"
 #include "xla/backends/autotuner/autotuner_cache_interface.h"
@@ -36,8 +39,31 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tsl/platform/fingerprint.h"
 
 namespace xla {
+
+// Per-fingerprint entry that serializes concurrent tuning requests for the
+// same HLO across ConfigAssigner instances sharing the same map.
+struct InFlightEntry {
+  enum class State { CREATED, TUNING, FINISHED, ERROR };
+
+  absl::Mutex mu;
+  State state ABSL_GUARDED_BY(mu) = State::CREATED;
+  absl::CondVar cond_var;
+};
+
+// Map from HLO fingerprint to in-flight tuning state. Shared across
+// ConfigAssigner instances to deduplicate concurrent tuning of the same HLO.
+struct InFlightTuningMap {
+  absl::Mutex mu;
+  absl::flat_hash_map<tsl::Fprint128, std::shared_ptr<InFlightEntry>,
+                      tsl::Fprint128Hasher>
+      entries ABSL_GUARDED_BY(mu);
+
+  // Returns the process-global singleton instance.
+  static std::shared_ptr<InFlightTuningMap> Global();
+};
 
 // ConfigAssigner is responsible for assigning a config to requested HLO
 // instructions. The configs could be cached, default, first-supported, or
@@ -73,7 +99,8 @@ class ConfigAssigner {
       std::unique_ptr<AutotunerCacheInterface> absl_nonnull
       optimal_config_cache,
       std::unique_ptr<CodegenOrchestrator> absl_nonnull orchestrator,
-      std::unique_ptr<Profiler> absl_nullable profiler);
+      std::unique_ptr<Profiler> absl_nullable profiler,
+      std::shared_ptr<InFlightTuningMap> in_flight_tuning = nullptr);
 
   // Online module-level entry point.
   absl::Status AssignConfigs(HloModule* module,
@@ -93,11 +120,13 @@ class ConfigAssigner {
   ConfigAssigner(Options options,
                  std::unique_ptr<AutotunerCacheInterface> absl_nonnull cache,
                  std::unique_ptr<CodegenOrchestrator> absl_nonnull orchestrator,
-                 std::unique_ptr<ConfigRunner> absl_nullable config_runner)
+                 std::unique_ptr<ConfigRunner> absl_nullable config_runner,
+                 std::shared_ptr<InFlightTuningMap> in_flight_tuning)
       : options_(options),
         optimal_config_cache_(std::move(cache)),
         orchestrator_(std::move(orchestrator)),
-        config_runner_(std::move(config_runner)) {}
+        config_runner_(std::move(config_runner)),
+        in_flight_tuning_(std::move(in_flight_tuning)) {}
 
   using InstructionGroup = std::vector<HloInstruction*>;
 
@@ -141,6 +170,7 @@ class ConfigAssigner {
   std::unique_ptr<AutotunerCacheInterface> absl_nonnull optimal_config_cache_;
   std::unique_ptr<CodegenOrchestrator> absl_nonnull orchestrator_;
   std::unique_ptr<ConfigRunner> absl_nullable config_runner_;
+  std::shared_ptr<InFlightTuningMap> in_flight_tuning_;
   AutotuningLogs logs_;
   int dump_counter_ = 0;
 };
