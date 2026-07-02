@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -375,6 +376,13 @@ class GpuExecutable : public Executable {
   }();
 
   int64_t debug_buffer_assignment_show_max_;
+
+  // Set of executors this executable has been run on. Used in the destructor
+  // to take reader locks on GetGpuMutex, preventing cuModuleUnload from racing
+  // with the DelayKernel used during autotuning profiling.
+  absl::Mutex executors_mutex_;
+  absl::flat_hash_set<se::StreamExecutor*> executors_
+      ABSL_GUARDED_BY(executors_mutex_);
 
   // Cache previous memory allocations for current module, this is used to help
   // identify if user's model have unstable pointers by turning on VLOG(5).
