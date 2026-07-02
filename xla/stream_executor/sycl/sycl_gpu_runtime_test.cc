@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 
+#include <algorithm>
+#include <vector>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
@@ -70,7 +73,7 @@ class SyclGpuRuntimeTest : public ::testing::Test {
 
   absl::StatusOr<void*> AllocateAndInitDeviceBuffer(
       int count, int value, int device_ordinal = kDefaultDeviceOrdinal) {
-    ASSIGN_OR_RETURN(void* buf, AllocateDeviceBuffer(count));
+    ASSIGN_OR_RETURN(void* buf, AllocateDeviceBuffer(count, device_ordinal));
     RETURN_IF_ERROR(SyclMemfillDevice(device_ordinal, buf, value, count));
     if (buf == nullptr) {
       return absl::InternalError(
@@ -514,6 +517,52 @@ TEST_F(SyclGpuRuntimeTest, TestMemcopyHostToDeviceAsync) {
   FreeAndNullify(dst_device);
 }
 
+TEST_F(SyclGpuRuntimeTest, TestMemcopyDeviceToHostAsyncPageableHostStaging) {
+  constexpr int kCount = 10;
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetOrCreateStream(kDefaultDeviceOrdinal,
+                                        /*enable_multiple_streams=*/false));
+  ASSERT_NE(stream_handle, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(void* src_device,
+                          AllocateAndInitDeviceBuffer(kCount, 0xDEADBEEF));
+  std::vector<int> dst_host(kCount, 0);
+
+  TF_ASSERT_OK(SyclMemcpyDeviceToHostAsync(stream_handle.get(), dst_host.data(),
+                                           src_device, sizeof(int) * kCount));
+  VerifyIntBuffer(dst_host.data(), kCount, 0);
+
+  TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
+  VerifyIntBuffer(dst_host.data(), kCount, 0xDEADBEEF);
+
+  FreeAndNullify(src_device);
+}
+
+TEST_F(SyclGpuRuntimeTest, TestMemcopyHostToDeviceAsyncPageableHostStaging) {
+  constexpr int kCount = 10;
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetOrCreateStream(kDefaultDeviceOrdinal,
+                                        /*enable_multiple_streams=*/false));
+  ASSERT_NE(stream_handle, nullptr);
+
+  std::vector<int> src_host(kCount, 0xDEADC0DE);
+  TF_ASSERT_OK_AND_ASSIGN(void* dst_device, AllocateDeviceBuffer(kCount));
+
+  TF_ASSERT_OK(SyclMemcpyHostToDeviceAsync(stream_handle.get(), dst_device,
+                                           src_host.data(),
+                                           sizeof(int) * kCount));
+  std::fill(src_host.begin(), src_host.end(), 0);
+  TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
+
+  TF_ASSERT_OK(SyclMemcpyDeviceToHost(kDefaultDeviceOrdinal, src_host.data(),
+                                      dst_device, sizeof(int) * kCount));
+  VerifyIntBuffer(src_host.data(), kCount, 0xDEADC0DE);
+
+  FreeAndNullify(dst_device);
+}
+
 TEST_F(SyclGpuRuntimeTest, TestMemsetDevice) {
   constexpr int kCount = 10;
   TF_ASSERT_OK_AND_ASSIGN(
@@ -631,7 +680,7 @@ TEST_F(SyclGpuRuntimeTest, TestMemfillDeviceAsync_Negative) {
       absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-TEST_F(SyclGpuRuntimeTest, TestMultiDeviceAllocationAndSyncCopy) {
+TEST_F(SyclGpuRuntimeTest, CrossOrdinalSyncD2DCopyRejectsCrossContextPointer) {
   // Skip if less than 2 devices are available.
   if (sycl_devices_.size() < 2) {
     GTEST_SKIP() << "Not enough SYCL devices available for this test.";
@@ -647,26 +696,18 @@ TEST_F(SyclGpuRuntimeTest, TestMultiDeviceAllocationAndSyncCopy) {
   TF_ASSERT_OK_AND_ASSIGN(void* device1_buf,
                           AllocateDeviceBuffer(kCount, kDevice1));
 
-  // Try to copy from device 0 to device 1. It should work since cross-device
-  // memcpy is supported.
-  TF_ASSERT_OK(SyclMemcpyDeviceToDevice(kDevice0, device1_buf, device0_buf,
-                                        sizeof(int) * kCount));
-
-  // Verify the copy by reading back to host.
-  TF_ASSERT_OK_AND_ASSIGN(void* host_buf, AllocateHostBuffer(kCount));
-
-  TF_ASSERT_OK(SyclMemcpyDeviceToHost(kDevice1, host_buf, device1_buf,
-                                      sizeof(int) * kCount));
-
-  VerifyIntBuffer(host_buf, kCount, 0x1234ABCD);
+  EXPECT_THAT(SyclMemcpyDeviceToDevice(kDevice0, device1_buf, device0_buf,
+                                       sizeof(int) * kCount),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     ::testing::HasSubstr(
+                                         "different per-ordinal context")));
 
   // Free the buffers.
   FreeAndNullify(device0_buf, kDevice0);
   FreeAndNullify(device1_buf, kDevice1);
-  FreeAndNullify(host_buf, kDefaultDeviceOrdinal);
 }
 
-TEST_F(SyclGpuRuntimeTest, TestMultiDeviceAllocationAndAsyncCopy) {
+TEST_F(SyclGpuRuntimeTest, CrossOrdinalAsyncD2DCopyRejectsCrossContextPointer) {
   if (sycl_devices_.size() < 2) {
     GTEST_SKIP() << "Not enough SYCL devices available for this test.";
   }
@@ -689,25 +730,16 @@ TEST_F(SyclGpuRuntimeTest, TestMultiDeviceAllocationAndAsyncCopy) {
   TF_ASSERT_OK_AND_ASSIGN(void* device1_buf,
                           AllocateDeviceBuffer(kCount, kDevice1));
 
-  // Copy from device-0 to device-1 using stream-0.
-  TF_ASSERT_OK(SyclMemcpyDeviceToDeviceAsync(
-      stream0.get(), device1_buf, device0_buf, sizeof(int) * kCount));
-
-  // Synchronize the stream to ensure the copy is complete.
-  TF_ASSERT_OK(SyclStreamSynchronize(stream0.get()));
-
-  // Verify the copy by copying back to host.
-  TF_ASSERT_OK_AND_ASSIGN(void* host_buf, AllocateHostBuffer(kCount));
-
-  TF_ASSERT_OK(SyclMemcpyDeviceToHost(kDevice1, host_buf, device1_buf,
-                                      sizeof(int) * kCount));
-
-  VerifyIntBuffer(host_buf, kCount, 0xDEADBEEF);
+  EXPECT_THAT(SyclMemcpyDeviceToDeviceAsync(
+                  stream0.get(), device1_buf, device0_buf,
+                  sizeof(int) * kCount),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                                     ::testing::HasSubstr(
+                                         "different per-ordinal context")));
 
   // Free the buffers.
   FreeAndNullify(device0_buf, kDevice0);
   FreeAndNullify(device1_buf, kDevice1);
-  FreeAndNullify(host_buf, kDefaultDeviceOrdinal);
 }
 
 TEST_F(SyclGpuRuntimeTest, TestMallocAll_Positive) {

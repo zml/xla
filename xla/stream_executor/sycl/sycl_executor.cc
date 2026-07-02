@@ -836,6 +836,11 @@ absl::Status SyclExecutor::SynchronousMemcpy(void* host_dst,
                                   AsSyclDevicePtr(gpu_src), size);
 }
 
+absl::StatusOr<MemorySpace> SyclExecutor::GetPointerMemorySpace(
+    const void* ptr) {
+  return SyclGetPointerMemorySpace(device_ordinal(), ptr);
+}
+
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 SyclExecutor::CreateDeviceDescription(int device_ordinal) {
   return CreateOneApiDeviceDescription(device_ordinal);

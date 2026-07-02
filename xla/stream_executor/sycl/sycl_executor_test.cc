@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/kernel_spec.h"
+#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 #include "xla/tsl/platform/status_matchers.h"
@@ -182,6 +183,105 @@ TEST_F(SyclExecutorTest, CreateCollectiveMemoryAllocatorWorks) {
   EXPECT_NE(allocation->opaque(), nullptr);
   EXPECT_EQ(allocation->size(), kMemoryAllocationSize);
   allocation.reset();
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceWorksWithUnifiedMemory) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<MemoryAllocator> allocator,
+      executor->CreateMemoryAllocator(MemoryType::kUnified));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<MemoryAllocation> allocation,
+                          allocator->Allocate(kMemoryAllocationSize));
+
+  EXPECT_THAT(executor->GetPointerMemorySpace(allocation->opaque()),
+              IsOkAndHolds(MemorySpace::kUnified));
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceWorksWithHostMemory) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<MemoryAllocation> allocation,
+                          executor->HostMemoryAllocate(kMemoryAllocationSize));
+
+  EXPECT_THAT(executor->GetPointerMemorySpace(allocation->opaque()),
+              IsOkAndHolds(MemorySpace::kHost));
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceWorksWithDeviceMemory) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+  DeviceMemoryBase allocation =
+      executor->Allocate(kMemoryAllocationSize,
+                         static_cast<int64_t>(MemorySpace::kDevice));
+  ASSERT_NE(allocation.opaque(), nullptr);
+
+  EXPECT_THAT(executor->GetPointerMemorySpace(allocation.opaque()),
+              IsOkAndHolds(MemorySpace::kDevice));
+
+  executor->Deallocate(&allocation);
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceClassifiesCollectiveAsDevice) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+  DeviceMemoryBase allocation =
+      executor->Allocate(kMemoryAllocationSize,
+                         static_cast<int64_t>(MemorySpace::kCollective));
+  ASSERT_NE(allocation.opaque(), nullptr);
+
+  EXPECT_THAT(executor->GetPointerMemorySpace(allocation.opaque()),
+              IsOkAndHolds(MemorySpace::kDevice));
+
+  executor->Deallocate(&allocation);
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceRejectsUnknownAndNullPointers) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+  int pageable_host_value = 0;
+
+  EXPECT_THAT(executor->GetPointerMemorySpace(&pageable_host_value),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(executor->GetPointerMemorySpace(nullptr),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_F(SyclExecutorTest, GetPointerMemorySpaceRejectsCrossContextPointer) {
+  TF_ASSERT_OK_AND_ASSIGN(Platform * platform,
+                          stream_executor::PlatformManager::PlatformWithId(
+                              stream_executor::sycl::kSyclPlatformId));
+  if (platform->VisibleDeviceCount() < 2) {
+    GTEST_SKIP() << "Need at least two SYCL devices.";
+  }
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor0,
+                          platform->ExecutorForDevice(0));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor1,
+                          platform->ExecutorForDevice(1));
+  DeviceMemoryBase allocation =
+      executor0->Allocate(kMemoryAllocationSize,
+                          static_cast<int64_t>(MemorySpace::kDevice));
+  ASSERT_NE(allocation.opaque(), nullptr);
+
+  EXPECT_THAT(executor1->GetPointerMemorySpace(allocation.opaque()),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  executor0->Deallocate(&allocation);
 }
 
 TEST_F(SyclExecutorTest, CreateUnsupportedMemoryAllocatorsFail) {

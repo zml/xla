@@ -17,8 +17,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/tsl/platform/errors.h"
@@ -151,6 +154,199 @@ absl::Status WaitForQueueAndDrain(::sycl::queue* stream_handle,
   return MergeStatuses(wait_status, DrainAsyncErrors(device_ordinal, source));
 }
 
+const char* UsmAllocName(::sycl::usm::alloc alloc_type) {
+  switch (alloc_type) {
+    case ::sycl::usm::alloc::host:
+      return "host";
+    case ::sycl::usm::alloc::device:
+      return "device";
+    case ::sycl::usm::alloc::shared:
+      return "shared";
+    case ::sycl::usm::alloc::unknown:
+      return "unknown";
+  }
+}
+
+absl::StatusOr<::sycl::usm::alloc> GetPointerTypeInContext(
+    const void* ptr, const ::sycl::context& context, absl::string_view source) {
+  try {
+    return ::sycl::get_pointer_type(ptr, context);
+  } catch (const ::sycl::exception& e) {
+    return SyclExceptionStatus(source, e);
+  }
+}
+
+absl::StatusOr<MemorySpace> MemorySpaceFromUsmAlloc(
+    ::sycl::usm::alloc alloc_type, absl::string_view source) {
+  switch (alloc_type) {
+    case ::sycl::usm::alloc::device:
+      return MemorySpace::kDevice;
+    case ::sycl::usm::alloc::shared:
+      return MemorySpace::kUnified;
+    case ::sycl::usm::alloc::host:
+      return MemorySpace::kHost;
+    case ::sycl::usm::alloc::unknown:
+      return absl::InvalidArgumentError(
+          absl::StrCat(source, ": pointer is not a USM allocation in this "
+                               "SYCL context"));
+  }
+}
+
+struct UsmAllocationOwner {
+  int device_ordinal;
+  ::sycl::usm::alloc alloc_type;
+};
+
+absl::StatusOr<std::optional<UsmAllocationOwner>> FindUsmAllocationOwner(
+    const void* ptr, absl::string_view source) {
+  ASSIGN_OR_RETURN(int device_count, SyclDevicePool::GetDeviceCount());
+  for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+    ASSIGN_OR_RETURN(::sycl::context context,
+                     SyclDevicePool::GetDeviceContext(ordinal));
+    ASSIGN_OR_RETURN(::sycl::usm::alloc alloc_type,
+                     GetPointerTypeInContext(ptr, context, source));
+    if (alloc_type != ::sycl::usm::alloc::unknown) {
+      return UsmAllocationOwner{ordinal, alloc_type};
+    }
+  }
+  return std::nullopt;
+}
+
+absl::Status UnknownUsmPointerError(const void* ptr, absl::string_view arg_name,
+                                    absl::string_view source) {
+  ASSIGN_OR_RETURN(std::optional<UsmAllocationOwner> owner,
+                   FindUsmAllocationOwner(ptr, source));
+  if (owner.has_value()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        source, ": ", arg_name, " pointer ", absl::StrFormat("%p", ptr),
+        " is ", UsmAllocName(owner->alloc_type),
+        " USM allocated in device ordinal ", owner->device_ordinal,
+        "'s SYCL context, but this copy is submitted to a different "
+        "per-ordinal context"));
+  }
+  return absl::InvalidArgumentError(absl::StrCat(
+      source, ": ", arg_name, " pointer ", absl::StrFormat("%p", ptr),
+      " is not a known SYCL USM allocation"));
+}
+
+absl::Status ValidateQueueDevicePointer(::sycl::queue* stream_handle,
+                                        const void* ptr,
+                                        absl::string_view arg_name,
+                                        absl::string_view source) {
+  ASSIGN_OR_RETURN(::sycl::usm::alloc alloc_type,
+                   GetPointerTypeInContext(ptr, stream_handle->get_context(),
+                                           source));
+  if (alloc_type == ::sycl::usm::alloc::unknown) {
+    return UnknownUsmPointerError(ptr, arg_name, source);
+  }
+  if (alloc_type == ::sycl::usm::alloc::host) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        source, ": ", arg_name, " pointer ", absl::StrFormat("%p", ptr),
+        " is host USM, but device or shared USM is required"));
+  }
+
+  try {
+    ::sycl::device queue_device = stream_handle->get_device();
+    ::sycl::device pointer_device =
+        ::sycl::get_pointer_device(ptr, stream_handle->get_context());
+    if (pointer_device == queue_device) {
+      return absl::OkStatus();
+    }
+    if (queue_device.ext_oneapi_can_access_peer(
+            pointer_device,
+            ::sycl::ext::oneapi::peer_access::access_supported)) {
+      return absl::OkStatus();
+    }
+    ASSIGN_OR_RETURN(int queue_ordinal,
+                     SyclDevicePool::GetDeviceOrdinal(queue_device));
+    ASSIGN_OR_RETURN(int pointer_ordinal,
+                     SyclDevicePool::GetDeviceOrdinal(pointer_device));
+    return absl::FailedPreconditionError(absl::StrCat(
+        source, ": ", arg_name, " pointer ", absl::StrFormat("%p", ptr),
+        " belongs to device ordinal ", pointer_ordinal,
+        ", but queue device ordinal ", queue_ordinal,
+        " cannot access it as peer memory"));
+  } catch (const ::sycl::exception& e) {
+    return SyclExceptionStatus(source, e);
+  }
+}
+
+absl::StatusOr<bool> IsHostAccessibleInQueueContext(
+    ::sycl::queue* stream_handle, const void* ptr, absl::string_view source) {
+  ASSIGN_OR_RETURN(::sycl::usm::alloc alloc_type,
+                   GetPointerTypeInContext(ptr, stream_handle->get_context(),
+                                           source));
+  switch (alloc_type) {
+    case ::sycl::usm::alloc::host:
+    case ::sycl::usm::alloc::shared:
+      return true;
+    case ::sycl::usm::alloc::unknown:
+      return false;
+    case ::sycl::usm::alloc::device:
+      return absl::InvalidArgumentError(absl::StrCat(
+          source, ": host pointer argument is device USM"));
+  }
+}
+
+absl::Status EnqueueStagedHostToDevice(::sycl::queue* stream_handle,
+                                       void* dst_device,
+                                       const void* src_host,
+                                       size_t byte_count) {
+  void* staging = nullptr;
+  try {
+    staging = ::sycl::aligned_alloc_host(/*alignment=*/64, byte_count,
+                                         *stream_handle);
+    if (staging == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "MemcpyHostToDevice: failed to allocate ", byte_count,
+          " bytes of host USM staging memory"));
+    }
+    std::memcpy(staging, src_host, byte_count);
+    stream_handle->memcpy(dst_device, staging, byte_count);
+    ::sycl::context context = stream_handle->get_context();
+    stream_handle->submit([staging, context](::sycl::handler& cgh) {
+      cgh.host_task([staging, context]() { ::sycl::free(staging, context); });
+    });
+    return absl::OkStatus();
+  } catch (const ::sycl::exception& e) {
+    if (staging != nullptr) {
+      ::sycl::free(staging, stream_handle->get_context());
+    }
+    return SyclExceptionStatus("MemcpyHostToDevice", e);
+  }
+}
+
+absl::Status EnqueueStagedDeviceToHost(::sycl::queue* stream_handle,
+                                       void* dst_host,
+                                       const void* src_device,
+                                       size_t byte_count) {
+  void* staging = nullptr;
+  try {
+    staging = ::sycl::aligned_alloc_host(/*alignment=*/64, byte_count,
+                                         *stream_handle);
+    if (staging == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "MemcpyDeviceToHost: failed to allocate ", byte_count,
+          " bytes of host USM staging memory"));
+    }
+    stream_handle->memcpy(staging, src_device, byte_count);
+    ::sycl::context context = stream_handle->get_context();
+    stream_handle->submit(
+        [staging, dst_host, byte_count, context](::sycl::handler& cgh) {
+          cgh.host_task([staging, dst_host, byte_count, context]() {
+            std::memcpy(dst_host, staging, byte_count);
+            ::sycl::free(staging, context);
+          });
+        });
+    return absl::OkStatus();
+  } catch (const ::sycl::exception& e) {
+    if (staging != nullptr) {
+      ::sycl::free(staging, stream_handle->get_context());
+    }
+    return SyclExceptionStatus("MemcpyDeviceToHost", e);
+  }
+}
+
 absl::Status IsValidDeviceOrdinal(int device_ordinal,
                                   const absl::string_view& function_name) {
   ASSIGN_OR_RETURN(int device_count, SyclDevicePool::GetDeviceCount());
@@ -164,6 +360,17 @@ absl::Status IsValidDeviceOrdinal(int device_ordinal,
 absl::Status MemcpyDeviceToHost(::sycl::queue* stream_handle, void* dst_host,
                                 const void* src_device, size_t byte_count,
                                 bool async = false) {
+  RETURN_IF_ERROR(ValidateQueueDevicePointer(
+      stream_handle, src_device, "source", "MemcpyDeviceToHost"));
+  if (async) {
+    ASSIGN_OR_RETURN(bool dst_is_host_usm,
+                     IsHostAccessibleInQueueContext(
+                         stream_handle, dst_host, "MemcpyDeviceToHost"));
+    if (!dst_is_host_usm) {
+      return EnqueueStagedDeviceToHost(stream_handle, dst_host, src_device,
+                                       byte_count);
+    }
+  }
   try {
     ::sycl::event event =
         stream_handle->memcpy(dst_host, src_device, byte_count);
@@ -185,6 +392,17 @@ absl::Status MemcpyDeviceToHost(::sycl::queue* stream_handle, void* dst_host,
 absl::Status MemcpyHostToDevice(::sycl::queue* stream_handle, void* dst_device,
                                 const void* src_host, size_t byte_count,
                                 bool async = false) {
+  RETURN_IF_ERROR(ValidateQueueDevicePointer(
+      stream_handle, dst_device, "destination", "MemcpyHostToDevice"));
+  if (async) {
+    ASSIGN_OR_RETURN(bool src_is_host_usm,
+                     IsHostAccessibleInQueueContext(
+                         stream_handle, src_host, "MemcpyHostToDevice"));
+    if (!src_is_host_usm) {
+      return EnqueueStagedHostToDevice(stream_handle, dst_device, src_host,
+                                       byte_count);
+    }
+  }
   try {
     ::sycl::event event =
         stream_handle->memcpy(dst_device, src_host, byte_count);
@@ -206,6 +424,10 @@ absl::Status MemcpyHostToDevice(::sycl::queue* stream_handle, void* dst_device,
 absl::Status MemcpyDeviceToDevice(::sycl::queue* stream_handle,
                                   void* dst_device, const void* src_device,
                                   size_t byte_count, bool async = false) {
+  RETURN_IF_ERROR(ValidateQueueDevicePointer(
+      stream_handle, dst_device, "destination", "MemcpyDeviceToDevice"));
+  RETURN_IF_ERROR(ValidateQueueDevicePointer(
+      stream_handle, src_device, "source", "MemcpyDeviceToDevice"));
   try {
     ::sycl::event event =
         stream_handle->memcpy(dst_device, src_device, byte_count);
@@ -578,6 +800,22 @@ absl::Status SyclEventSynchronize(::sycl::event event, int device_ordinal,
 
 void SyclRecordAsyncErrorForTesting(int device_ordinal, absl::Status status) {
   RecordAsyncError(device_ordinal, std::move(status));
+}
+
+absl::StatusOr<MemorySpace> SyclGetPointerMemorySpace(int device_ordinal,
+                                                      const void* ptr) {
+  if (ptr == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclGetPointerMemorySpace: pointer is null");
+  }
+  RETURN_IF_ERROR(
+      IsValidDeviceOrdinal(device_ordinal, "SyclGetPointerMemorySpace"));
+  ASSIGN_OR_RETURN(::sycl::context context,
+                   SyclDevicePool::GetDeviceContext(device_ordinal));
+  ASSIGN_OR_RETURN(
+      ::sycl::usm::alloc alloc_type,
+      GetPointerTypeInContext(ptr, context, "SyclGetPointerMemorySpace"));
+  return MemorySpaceFromUsmAlloc(alloc_type, "SyclGetPointerMemorySpace");
 }
 
 absl::StatusOr<::sycl::event> SyclSubmitBarrierEvent(

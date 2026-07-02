@@ -27,9 +27,11 @@ limitations under the License.
 #include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/strings/ascii.h"
+#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/sycl/sycl_status.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -170,6 +172,11 @@ absl::Status SyclEventSynchronize(::sycl::event event, int device_ordinal,
 // Records an async SYCL error for deterministic tests of status-returning wait
 // paths.
 void SyclRecordAsyncErrorForTesting(int device_ordinal, absl::Status status);
+
+// Returns the memory space for a pointer allocated in the SYCL context owned by
+// `device_ordinal`.
+absl::StatusOr<MemorySpace> SyclGetPointerMemorySpace(int device_ordinal,
+                                                      const void* ptr);
 
 // Submits a SYCL barrier and returns its event. The event marks completion of
 // all prior work on the given in-order stream.

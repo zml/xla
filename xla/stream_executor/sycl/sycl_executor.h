@@ -109,7 +109,11 @@ class SyclExecutor : public gpu::GpuExecutor {
                                  const DeviceMemoryBase& gpu_src,
                                  uint64_t size) override;
 
-  // TODO(intel-tf): Implement GetPointerMemorySpace for SYCL.
+  // Returns the memory space of the given pointer in this executor's SYCL
+  // context.
+  absl::StatusOr<MemorySpace> GetPointerMemorySpace(
+      const void* ptr) override;
+
   // Returns the Stream for the given raw GPU stream pointer, or nullptr if
   // not found.
   Stream* FindAllocatedStream(void* gpu_stream) override {
