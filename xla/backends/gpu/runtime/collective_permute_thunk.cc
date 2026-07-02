@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <numeric>
@@ -58,6 +59,7 @@ limitations under the License.
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/computation_placer.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/sycl/sycl_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -79,6 +81,140 @@ struct Events {
   Future<EventPool::Event> done;
 };
 
+enum class PeerCopySyncProtocol {
+  kDeviceEventBarrier,
+  kHostEventWait,
+  kQueueDrain,
+};
+
+bool IsSyclExecutor(se::StreamExecutor* executor) {
+  return executor != nullptr &&
+         executor->GetPlatform()->id() == se::sycl::kSyclPlatformId;
+}
+
+bool UsesLocalSyclPeerAccessPath(se::StreamExecutor* executor,
+                                 const GpuCliqueKey& clique_key,
+                                 bool use_symmetric_memory) {
+  return IsSyclExecutor(executor) && clique_key.is_local() &&
+         !use_symmetric_memory;
+}
+
+PeerCopySyncProtocol GetPeerCopySyncProtocol(se::Stream& stream) {
+  if (!IsSyclExecutor(stream.parent())) {
+    return PeerCopySyncProtocol::kDeviceEventBarrier;
+  }
+
+  const char* mode = std::getenv("XLA_SYCL_COLLECTIVE_PERMUTE_SYNC_PROTOCOL");
+  if (mode == nullptr || std::string(mode) == "host_event_wait") {
+    return PeerCopySyncProtocol::kHostEventWait;
+  }
+  if (std::string(mode) == "queue_drain") {
+    return PeerCopySyncProtocol::kQueueDrain;
+  }
+  if (std::string(mode) == "device_event_barrier") {
+    return PeerCopySyncProtocol::kDeviceEventBarrier;
+  }
+
+  LOG(WARNING)
+      << "Unknown XLA_SYCL_COLLECTIVE_PERMUTE_SYNC_PROTOCOL value: " << mode
+      << "; using host_event_wait";
+  return PeerCopySyncProtocol::kHostEventWait;
+}
+
+absl::string_view PeerCopySyncProtocolName(PeerCopySyncProtocol protocol) {
+  switch (protocol) {
+    case PeerCopySyncProtocol::kDeviceEventBarrier:
+      return "device_event_barrier";
+    case PeerCopySyncProtocol::kHostEventWait:
+      return "host_event_wait";
+    case PeerCopySyncProtocol::kQueueDrain:
+      return "queue_drain";
+  }
+  return "unknown";
+}
+
+absl::Status WaitForRecordedEventOnHost(EventPool::Event& event,
+                                        absl::string_view label) {
+  absl::Status status = event->get()->Synchronize();
+  if (!status.ok()) {
+    return absl::Status(
+        status.code(),
+        absl::StrFormat("%s failed: %s", label, status.ToString()));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status CompleteLocalProtocolEvent(se::Stream& stream,
+                                        EventPool::Event& event,
+                                        PeerCopySyncProtocol protocol,
+                                        absl::string_view label) {
+  switch (protocol) {
+    case PeerCopySyncProtocol::kDeviceEventBarrier:
+      return absl::OkStatus();
+    case PeerCopySyncProtocol::kHostEventWait:
+      return WaitForRecordedEventOnHost(event, label);
+    case PeerCopySyncProtocol::kQueueDrain:
+      return stream.BlockHostUntilDone();
+  }
+}
+
+absl::Status RequestPeerAccessBuffersForLocalCopy(
+    CollectiveMemoryRequests& mem_requests, const GpuCliqueKey& clique_key,
+    absl::Span<const CollectiveThunk::Buffer> buffers) {
+  for (const CollectiveThunk::Buffer& buffer : buffers) {
+    RETURN_IF_ERROR(mem_requests.RequestPeerAllocation(
+        clique_key, buffer.source_buffer.slice.index()));
+    RETURN_IF_ERROR(mem_requests.RequestPeerAllocation(
+        clique_key, buffer.destination_buffer.slice.index()));
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<se::StreamExecutor*> ExecutorForLocalRank(
+    const CollectiveParams& collective_params, se::StreamExecutor* executor,
+    const GpuCliqueKey& clique_key, RankId rank) {
+  if (rank.value() < 0 || rank.value() >= clique_key.devices().size()) {
+    return InvalidArgument("Rank %d is outside clique %v", rank.value(),
+                           clique_key);
+  }
+  GlobalDeviceId global_device_id = clique_key.devices()[rank.value()];
+  ASSIGN_OR_RETURN(LocalDeviceId local_device_id,
+                   GetLocalDeviceId(collective_params, global_device_id));
+  auto* platform = const_cast<se::Platform*>(executor->GetPlatform());
+  return platform->ExecutorForDevice(local_device_id.value());
+}
+
+absl::Status EnablePeerAccessForLocalSyclPeerCopy(
+    const P2PConfig::SourceTargetRanks& source_target, se::Stream& stream,
+    const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
+    RankId current_rank) {
+  se::StreamExecutor* executor = stream.parent();
+  std::vector<RankId> peers;
+  if (source_target.source && *source_target.source != current_rank) {
+    peers.push_back(*source_target.source);
+  }
+  if (source_target.target && *source_target.target != current_rank) {
+    peers.push_back(*source_target.target);
+  }
+
+  for (RankId peer : peers) {
+    ASSIGN_OR_RETURN(se::StreamExecutor * peer_executor,
+                     ExecutorForLocalRank(*params.collective_params, executor,
+                                          clique_key, peer));
+    if (!executor->CanEnablePeerAccessTo(peer_executor)) {
+      return FailedPrecondition(
+          "SYCL local collective-permute peer-copy path requires peer access "
+          "from device ordinal %d to peer rank %d (device ordinal %d), but "
+          "peer access is not supported for clique %v",
+          executor->device_ordinal(), peer.value(),
+          peer_executor->device_ordinal(), clique_key);
+    }
+    RETURN_IF_ERROR(executor->EnablePeerAccessTo(peer_executor));
+  }
+
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 static absl::Status RunPeerAccessPermute(
@@ -91,6 +227,11 @@ static absl::Status RunOneSidedPermute(
     const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
     Communicator& comm);
+
+static absl::Status RunLocalSyclPeerAccessPermute(
+    const P2PConfig::SourceTargetRanks& source_target,
+    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params);
 
 CollectivePermuteThunk::CollectivePermuteThunk(
     ThunkInfo thunk_info, const HloCollectivePermuteInstruction* instr,
@@ -116,6 +257,12 @@ absl::Status CollectivePermuteThunk::PrepareCollective(
     const PrepareParams& params, const GpuCliqueKey& clique_key) {
   CollectiveMemoryRequests& mem_requests = *params.collective_memory_requests;
 
+  if (UsesLocalSyclPeerAccessPath(params.executor, clique_key,
+                                  use_symmetric_memory())) {
+    return RequestPeerAccessBuffersForLocalCopy(mem_requests, clique_key,
+                                                buffers());
+  }
+
   if (use_symmetric_memory() && clique_key.is_local()) {
     // Request symmetric memory for both source and destination buffers.
     // One-sided Put requires both send and receive buffers to be registered
@@ -136,10 +283,9 @@ absl::Status CollectivePermuteThunk::PrepareCollective(
   if (use_peer_memory() && clique_key.is_local()) {
     // Request peer memory exchange for destination buffers so that senders
     // can look up the target's destination address via FindPeerAddress.
-    for (const Buffer& buffer : buffers()) {
-      RETURN_IF_ERROR(mem_requests.RequestPeerAllocation(
-          clique_key, buffer.destination_buffer.slice.index()));
-    }
+    RETURN_IF_ERROR(
+        RequestPeerAccessBuffersForLocalCopy(mem_requests, clique_key,
+                                             buffers()));
   }
 
   return absl::OkStatus();
@@ -276,6 +422,82 @@ absl::StatusOr<ThunkProto> CollectivePermuteThunk::ToProto() const {
                                                      sorted_pairs.end());
 
   return proto;
+}
+
+absl::Status CollectivePermuteThunk::Prepare(const PrepareParams& params) {
+  TF_RET_CHECK(params.collective_params &&
+               params.collective_params->device_assn)
+      << "Collective parameters and device assignment are required for "
+         "collective thunk execution";
+
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetCollectiveGpuCliqueKey(*params.collective_params,
+                                             config_.config,
+                                             communication_id()));
+  if (!UsesLocalSyclPeerAccessPath(params.executor, clique_key,
+                                   use_symmetric_memory())) {
+    return CollectiveThunk::Prepare(params);
+  }
+
+  return RequestPeerAccessBuffersForLocalCopy(
+      *params.collective_memory_requests, clique_key, buffers());
+}
+
+absl::Status CollectivePermuteThunk::ExecuteOnStream(
+    const ExecuteParams& params) {
+  XLA_VLOG_DEVICE(1, params.stream->parent()->device_ordinal())
+      << absl::StreamFormat("Starting %v.", kind());
+
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetCollectiveGpuCliqueKey(*params.collective_params,
+                                             config_.config,
+                                             communication_id()));
+  if (!UsesLocalSyclPeerAccessPath(params.stream->parent(), clique_key,
+                                   use_symmetric_memory())) {
+    return CollectiveThunk::ExecuteOnStream(params);
+  }
+
+  ASSIGN_OR_RETURN(
+      std::vector<DeviceBufferPair> device_buffers,
+      ConvertToDeviceBuffers(params.buffer_allocations,
+                             std::vector<CollectiveThunk::Buffer>(buffers()),
+                             config_.config.operand_element_type));
+  ASSIGN_OR_RETURN(int64_t current_id,
+                   GetCollectiveCurrentId(params.collective_params, config_));
+  const P2PConfig::SourceTargetMapEntry source_target =
+      P2PConfig::GetSourceTarget(config_.id_to_source_target, current_id);
+  ASSIGN_OR_RETURN(
+      P2PConfig::SourceTargetRanks source_target_ranks,
+      RemapSourceTargetToCliqueRanks(
+          source_target, clique_key, *params.collective_params->device_assn,
+          config_.config.group_mode,
+          params.collective_params->global_device_id));
+
+  XLA_VLOG_DEVICE(3, params.stream->parent()->device_ordinal())
+      << "CollectivePermute: using local SYCL peer-access mode (SYCL D2D "
+         "copy)";
+  return RunLocalSyclPeerAccessPermute(source_target_ranks, device_buffers,
+                                       *params.stream, clique_key, params);
+}
+
+absl::StatusOr<const se::CommandBuffer::Command*>
+CollectivePermuteThunk::Record(const ExecuteParams& execute_params,
+                               const RecordParams& record_params,
+                               RecordAction record_action,
+                               se::CommandBuffer* command_buffer) {
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetCollectiveGpuCliqueKey(*execute_params.collective_params,
+                                             config_.config,
+                                             communication_id()));
+  if (UsesLocalSyclPeerAccessPath(execute_params.stream->parent(), clique_key,
+                                  use_symmetric_memory())) {
+    return Unimplemented(
+        "Recording local SYCL collective-permute peer-copy into command "
+        "buffers is not supported yet");
+  }
+
+  return CollectiveThunk::Record(execute_params, record_params, record_action,
+                                 command_buffer);
 }
 
 absl::Status CollectivePermuteThunk::RunCollective(
@@ -420,11 +642,18 @@ static absl::Status RunPeerAccessPermute(
   // Get EventPool from own StreamExecutor.
   auto* pool =
       stream.parent()->GetOrConstructResource<EventPool>(stream.parent());
+  PeerCopySyncProtocol protocol = GetPeerCopySyncProtocol(stream);
+  XLA_VLOG_DEVICE(3, stream.parent()->device_ordinal())
+      << "CollectivePermute peer-copy sync protocol: "
+      << PeerCopySyncProtocolName(protocol) << "; clique=" << clique_key
+      << "; rank=" << rank->value();
 
   // Borrow a "ready" event and record it on our stream to signal that all
   // prior work on this rank's buffers is complete.
   ASSIGN_OR_RETURN(EventPool::Event ready, pool->GetOrCreateEvent());
   RETURN_IF_ERROR(stream.RecordEvent(ready->get()));
+  RETURN_IF_ERROR(CompleteLocalProtocolEvent(
+      stream, ready, protocol, "collective-permute ready event wait"));
 
   // Create promise/future pair for the "done" event that the sender will
   // set after completing the memcpy.
@@ -443,7 +672,9 @@ static absl::Status RunPeerAccessPermute(
     // Wait for target's stream to be ready before writing to its buffers.
     ASSIGN_OR_RETURN(const Events& target_events,
                      rendezvous->at<Events>(target));
-    RETURN_IF_ERROR(stream.WaitFor(target_events.ready->get()));
+    if (protocol == PeerCopySyncProtocol::kDeviceEventBarrier) {
+      RETURN_IF_ERROR(stream.WaitFor(target_events.ready->get()));
+    }
 
     // Perform D2D copies from our source to target's destination.
     for (const auto& buf : device_buffers) {
@@ -461,6 +692,8 @@ static absl::Status RunPeerAccessPermute(
     // the copy is complete.
     ASSIGN_OR_RETURN(EventPool::Event done, pool->GetOrCreateEvent());
     RETURN_IF_ERROR(stream.RecordEvent(done->get()));
+    RETURN_IF_ERROR(CompleteLocalProtocolEvent(
+        stream, done, protocol, "collective-permute done event wait"));
     done_promise.Set(std::move(done));
   } else {
     // Not a sender — fulfill promise with a dummy event.
@@ -486,10 +719,28 @@ static absl::Status RunPeerAccessPermute(
     const absl::StatusOr<EventPool::Event>& done_result =
         source_events.done.Await();
     if (!done_result.ok()) return done_result.status();
-    RETURN_IF_ERROR(stream.WaitFor((*done_result)->get()));
+    if (protocol == PeerCopySyncProtocol::kDeviceEventBarrier) {
+      RETURN_IF_ERROR(stream.WaitFor((*done_result)->get()));
+    }
   }
 
   return absl::OkStatus();
+}
+
+static absl::Status RunLocalSyclPeerAccessPermute(
+    const P2PConfig::SourceTargetRanks& source_target,
+    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params) {
+  GlobalDeviceId gid = params.collective_params->global_device_id;
+  std::optional<RankId> rank = clique_key.rank(gid);
+  if (!rank.has_value()) {
+    return Internal("Device %v not found in clique key %v", gid, clique_key);
+  }
+
+  RETURN_IF_ERROR(EnablePeerAccessForLocalSyclPeerCopy(
+      source_target, stream, clique_key, params, *rank));
+  return RunPeerAccessPermute(source_target, device_buffers, stream, clique_key,
+                              params);
 }
 
 // Performs a collective permute using one-sided Put + Signal operations.

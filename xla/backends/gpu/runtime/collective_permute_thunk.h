@@ -75,6 +75,12 @@ class CollectivePermuteThunk : public CollectiveThunk {
     return connected_components_enabled_;
   }
 
+  absl::Status Prepare(const PrepareParams& params) override;
+  absl::Status ExecuteOnStream(const ExecuteParams& params) override;
+  absl::StatusOr<const se::CommandBuffer::Command*> Record(
+      const ExecuteParams& execute_params, const RecordParams& record_params,
+      RecordAction record_action, se::CommandBuffer* command_buffer) override;
+
   static absl::StatusOr<std::unique_ptr<CollectivePermuteThunk>> FromProto(
       ThunkInfo thunk_info, const CollectivePermuteThunkProto& thunk_proto,
       absl::Span<const BufferAllocation> buffer_allocations);
