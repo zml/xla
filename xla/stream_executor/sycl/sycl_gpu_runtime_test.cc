@@ -563,6 +563,49 @@ TEST_F(SyclGpuRuntimeTest, TestMemcopyHostToDeviceAsyncPageableHostStaging) {
   FreeAndNullify(dst_device);
 }
 
+TEST_F(SyclGpuRuntimeTest, TestMemcopyHostToPinnedHostAsync) {
+  constexpr int kCount = 10;
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetOrCreateStream(kDefaultDeviceOrdinal,
+                                        /*enable_multiple_streams=*/false));
+  ASSERT_NE(stream_handle, nullptr);
+
+  std::vector<int> src_host(kCount, 0x1234ABCD);
+  TF_ASSERT_OK_AND_ASSIGN(void* dst_host_usm, AllocateHostBuffer(kCount));
+
+  TF_ASSERT_OK(SyclMemcpyHostToDeviceAsync(stream_handle.get(), dst_host_usm,
+                                           src_host.data(),
+                                           sizeof(int) * kCount));
+  TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
+
+  VerifyIntBuffer(dst_host_usm, kCount, 0x1234ABCD);
+
+  FreeAndNullify(dst_host_usm);
+}
+
+TEST_F(SyclGpuRuntimeTest, TestMemcopyPinnedHostToHostAsync) {
+  constexpr int kCount = 10;
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetOrCreateStream(kDefaultDeviceOrdinal,
+                                        /*enable_multiple_streams=*/false));
+  ASSERT_NE(stream_handle, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(void* src_host_usm,
+                          AllocateAndInitHostBuffer(kCount, 0x5678ABCD));
+  std::vector<int> dst_host(kCount, 0);
+
+  TF_ASSERT_OK(SyclMemcpyDeviceToHostAsync(stream_handle.get(), dst_host.data(),
+                                           src_host_usm,
+                                           sizeof(int) * kCount));
+  TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
+
+  VerifyIntBuffer(dst_host.data(), kCount, 0x5678ABCD);
+
+  FreeAndNullify(src_host_usm);
+}
+
 TEST_F(SyclGpuRuntimeTest, TestMemsetDevice) {
   constexpr int kCount = 10;
   TF_ASSERT_OK_AND_ASSIGN(

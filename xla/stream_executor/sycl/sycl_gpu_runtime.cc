@@ -232,7 +232,8 @@ absl::Status UnknownUsmPointerError(const void* ptr, absl::string_view arg_name,
 absl::Status ValidateQueueDevicePointer(::sycl::queue* stream_handle,
                                         const void* ptr,
                                         absl::string_view arg_name,
-                                        absl::string_view source) {
+                                        absl::string_view source,
+                                        bool allow_host_usm = false) {
   ASSIGN_OR_RETURN(::sycl::usm::alloc alloc_type,
                    GetPointerTypeInContext(ptr, stream_handle->get_context(),
                                            source));
@@ -240,6 +241,9 @@ absl::Status ValidateQueueDevicePointer(::sycl::queue* stream_handle,
     return UnknownUsmPointerError(ptr, arg_name, source);
   }
   if (alloc_type == ::sycl::usm::alloc::host) {
+    if (allow_host_usm) {
+      return absl::OkStatus();
+    }
     return absl::InvalidArgumentError(absl::StrCat(
         source, ": ", arg_name, " pointer ", absl::StrFormat("%p", ptr),
         " is host USM, but device or shared USM is required"));
@@ -361,7 +365,8 @@ absl::Status MemcpyDeviceToHost(::sycl::queue* stream_handle, void* dst_host,
                                 const void* src_device, size_t byte_count,
                                 bool async = false) {
   RETURN_IF_ERROR(ValidateQueueDevicePointer(
-      stream_handle, src_device, "source", "MemcpyDeviceToHost"));
+      stream_handle, src_device, "source", "MemcpyDeviceToHost",
+      /*allow_host_usm=*/true));
   if (async) {
     ASSIGN_OR_RETURN(bool dst_is_host_usm,
                      IsHostAccessibleInQueueContext(
@@ -393,7 +398,8 @@ absl::Status MemcpyHostToDevice(::sycl::queue* stream_handle, void* dst_device,
                                 const void* src_host, size_t byte_count,
                                 bool async = false) {
   RETURN_IF_ERROR(ValidateQueueDevicePointer(
-      stream_handle, dst_device, "destination", "MemcpyHostToDevice"));
+      stream_handle, dst_device, "destination", "MemcpyHostToDevice",
+      /*allow_host_usm=*/true));
   if (async) {
     ASSIGN_OR_RETURN(bool src_is_host_usm,
                      IsHostAccessibleInQueueContext(
