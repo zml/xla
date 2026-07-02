@@ -874,10 +874,7 @@ bool GpuLayoutAssignment::InstructionCanChangeLayoutInstance(
     const HloInstruction* instruction) {
   // The TopK custom call cannot handle the case if the operand has a different
   // layout.
-  const HloCustomCallInstruction* custom_call =
-      DynCast<HloCustomCallInstruction>(instruction);
-  if (custom_call != nullptr &&
-      custom_call->custom_call_target() == kTopKCustomCallTarget) {
+  if (IsCustomCallToTopK(*instruction)) {
     return false;
   }
 
