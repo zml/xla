@@ -83,6 +83,17 @@ Thunk::BufferUses SelectKThunk::buffer_uses() const {
   uses.push_back(BufferUse::Read(
       args_[0], ShapeUtil::MakeShape(dtype_, {batch_size_, num_elements_})));
 
+  if (payload_indices_) {
+    uses.push_back(BufferUse::Read(
+        args_[1],
+        ShapeUtil::MakeShape(PrimitiveType::S32, {batch_size_, num_elements_})));
+    uses.push_back(BufferUse::Write(
+        args_[2], ShapeUtil::MakeShape(dtype_, {batch_size_, k_})));
+    uses.push_back(BufferUse::Write(
+        args_[3], ShapeUtil::MakeShape(PrimitiveType::S32, {batch_size_, k_})));
+    return uses;
+  }
+
   uses.push_back(BufferUse::Write(
       args_[1], ShapeUtil::MakeShape(dtype_, {batch_size_, k_})));
 

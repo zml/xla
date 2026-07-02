@@ -374,8 +374,14 @@ TopKCustomCall CreateTopKCustomCall(HloSortInstruction* sort, const int64_t k,
   if (payload_indices) {
     operands.push_back(payload);
   }
+  const absl::string_view custom_call_target =
+      payload_indices ? kTopKWithPayloadCustomCallTarget : "TopK";
+  const CustomCallApiVersion api_version =
+      payload_indices ? CustomCallApiVersion::API_VERSION_TYPED_FFI
+                      : CustomCallApiVersion::API_VERSION_ORIGINAL;
   HloInstruction* topk = sort->AddInstruction(HloInstruction::CreateCustomCall(
-      topk_shape, {input}, sort->to_apply(), "TopK"));
+      topk_shape, operands, sort->to_apply(), custom_call_target, /*opaque=*/"",
+      api_version));
   topk->set_raw_backend_config_string(absl::StrFormat(
       "{is_stable = %s}", sort->is_stable() ? "true" : "false"));
   HloInstruction* value_gte =
