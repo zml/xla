@@ -24,7 +24,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
@@ -52,6 +51,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/sycl/sycl_executor.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -123,33 +123,89 @@ absl::Status VerifyStreamExecutor(se::Stream* stream,
   return absl::OkStatus();
 }
 
-absl::StatusOr<ccl::stream> ToOnecclStream(se::Stream* stream) {
+absl::StatusOr<::sycl::queue*> ToSyclQueue(se::Stream* stream) {
   void* handle = stream->platform_specific_handle().stream;
   if (handle == nullptr) {
     return InvalidArgument("oneCCL collective requires a SYCL queue stream");
   }
+  return static_cast<::sycl::queue*>(handle);
+}
 
-  auto* queue = static_cast<::sycl::queue*>(handle);
-  struct StreamStore {
-    absl::Mutex mu;
-    absl::flat_hash_map<::sycl::queue*, std::shared_ptr<ccl::stream>> streams
-        ABSL_GUARDED_BY(mu);
-  };
-  static auto* store = new StreamStore;
-
-  absl::MutexLock lock(&store->mu);
-  auto it = store->streams.find(queue);
-  if (it != store->streams.end()) {
-    return *it->second;
+absl::Status VerifySyclQueueIdentity(
+    ::sycl::queue* queue, se::StreamExecutor* stream_executor) {
+  auto* sycl_executor =
+      dynamic_cast<::stream_executor::sycl::SyclExecutor*>(stream_executor);
+  if (sycl_executor == nullptr) {
+    return InvalidArgument("oneCCL collective requires a SYCL executor");
   }
 
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream,
-                   OnecclValue<ccl::stream>(
-                       "ccl::create_stream",
-                       [&] { return ccl::create_stream(*queue); }));
-  auto shared_stream = std::make_shared<ccl::stream>(std::move(ccl_stream));
-  store->streams.emplace(queue, shared_stream);
-  return *shared_stream;
+  try {
+    if (!queue->has_property<::sycl::property::queue::in_order>()) {
+      return InvalidArgument(
+          "oneCCL collective requires an in-order SYCL queue");
+    }
+
+    ::sycl::device queue_device = queue->get_device();
+    ::sycl::device executor_device = sycl_executor->GetDevice();
+    if (queue_device != executor_device) {
+      return InvalidArgument(
+          "oneCCL communicator for device %d cannot launch on a SYCL queue "
+          "for a different device",
+          stream_executor->device_ordinal());
+    }
+
+    ::sycl::context queue_context = queue->get_context();
+    ASSIGN_OR_RETURN(::sycl::context executor_context,
+                     sycl_executor->GetContext());
+    if (queue_context != executor_context) {
+      return InvalidArgument(
+          "oneCCL communicator for device %d cannot launch on a SYCL queue "
+          "with a different context",
+          stream_executor->device_ordinal());
+    }
+  } catch (const ::sycl::exception& e) {
+    return absl::InternalError(absl::StrFormat(
+        "SYCL queue identity check failed for oneCCL launch: %s", e.what()));
+  } catch (const std::exception& e) {
+    return absl::InternalError(absl::StrFormat(
+        "SYCL queue identity check failed for oneCCL launch: %s", e.what()));
+  } catch (...) {
+    return absl::InternalError(
+        "SYCL queue identity check failed for oneCCL launch: unknown "
+        "exception");
+  }
+
+  return absl::OkStatus();
+}
+
+class OnecclStreamCache : public se::Stream::Resource {
+ public:
+  absl::StatusOr<ccl::stream> Get(::sycl::queue* queue) {
+    absl::MutexLock lock(&mu_);
+    if (ccl_stream_.has_value() && queue_ == queue) {
+      return *ccl_stream_;
+    }
+
+    ASSIGN_OR_RETURN(ccl::stream ccl_stream,
+                     OnecclValue<ccl::stream>(
+                         "ccl::create_stream",
+                         [&] { return ccl::create_stream(*queue); }));
+    queue_ = queue;
+    ccl_stream_.emplace(std::move(ccl_stream));
+    return *ccl_stream_;
+  }
+
+ private:
+  absl::Mutex mu_;
+  ::sycl::queue* queue_ ABSL_GUARDED_BY(mu_) = nullptr;
+  std::optional<ccl::stream> ccl_stream_ ABSL_GUARDED_BY(mu_);
+};
+
+absl::StatusOr<ccl::stream> ToOnecclStream(se::Stream* stream,
+                                           ::sycl::queue* queue) {
+  OnecclStreamCache* cache =
+      stream->GetOrConstructResource<OnecclStreamCache>();
+  return cache->Get(queue);
 }
 
 size_t ToOnecclCount(PrimitiveType dtype, size_t count) {
@@ -711,7 +767,9 @@ absl::Status OnecclCommunicator::LaunchOnStream(
   RETURN_IF_ERROR(CheckReady());
   ASSIGN_OR_RETURN(se::Stream* stream, ToStream(executor));
   RETURN_IF_ERROR(VerifyStreamExecutor(stream, stream_executor_));
-  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
+  ASSIGN_OR_RETURN(::sycl::queue* queue, ToSyclQueue(stream));
+  RETURN_IF_ERROR(VerifySyclQueueIdentity(queue, stream_executor_));
+  ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream, queue));
   auto activation = stream_executor_->Activate();
   return std::move(launch)(ccl_stream);
 }
