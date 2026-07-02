@@ -140,6 +140,13 @@ class MetalPagedAttnThunk : public Thunk {
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
+  // Zeros the OUTPUT padding rows the tiled prefill kernel leaves unwritten (it
+  // early-returns for padding query-blocks). Replaces the full-buffer MemZero:
+  // writes ONLY rows [cu_seqlens_q[num_seqs], total_q_tokens), stays in the
+  // concurrent compute encoder, runs concurrently with the attention kernel
+  // (disjoint row ranges). Tiled path only; the vec-decode path writes every
+  // output row unconditionally. See metal_paged_attn_thunk.cc.
+  std::unique_ptr<stream_executor::Kernel> zero_kernel_ ABSL_GUARDED_BY(mu_);
   size_t shmem_bytes_ ABSL_GUARDED_BY(mu_) = 0;
   int bq_ ABSL_GUARDED_BY(mu_) = 0;
   int num_threads_ ABSL_GUARDED_BY(mu_) = 0;

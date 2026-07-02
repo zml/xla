@@ -65,6 +65,56 @@ using namespace metal;
 typedef bfloat bfloat16_t;
 )PRE";
 
+// Zeros the OUTPUT padding rows the tiled paged-attention prefill kernel leaves
+// UNWRITTEN. That kernel early-returns for padding query-blocks (q_pos_start >=
+// query_len), so output rows past the last real token — global positions
+// [cu_seqlens_q[num_seqs], total_q_tokens) — retain whatever stale activations
+// were in the buffer; propagated through o_proj/MLP they blow up to NaN and (via
+// GEMM row-mixing) corrupt real tokens. This used to be a full-buffer MemZero
+// (host drain + memset, then an async blit fill). Zeroing in a compute kernel
+// instead: (1) writes ONLY the padding rows, not the whole activation buffer
+// re-written every prefill layer; (2) stays in the concurrent compute encoder
+// (no blit -> no per-layer encoder break); (3) runs concurrently with the
+// attention kernel, which writes the DISJOINT real-row range [0, real_total).
+//
+// Grid: (total_q_tokens, 1, 1) threadgroups, one per output token row. A real
+// row (idx < real_total) returns immediately; only padding rows are written.
+// real_total = cu_seqlens_q[num_seqs] is read ON-DEVICE — in llmd continuous
+// batching cu_seqlens_q can be GPU-produced, so a host deref would race the
+// producer (the same reason the tiled kernel resolves seq lengths on-device).
+constexpr const char* kZeroPaddingSrc = R"ZP(
+#include <metal_stdlib>
+using namespace metal;
+typedef bfloat bfloat16_t;
+
+template <typename T>
+[[kernel]] void zero_padding_rows(
+    device T *out                       [[buffer(0)]],
+    device const int *cu_seqlens_q      [[buffer(1)]],
+    const constant int &num_seqs        [[buffer(2)]],
+    const constant int &row_stride      [[buffer(3)]],  // num_heads * head_size
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 tpt [[thread_position_in_threadgroup]],
+    uint3 ntg [[threads_per_threadgroup]])
+{
+  const int row = int(tgp.x);
+  if (row < cu_seqlens_q[num_seqs]) return;  // real token: attn kernel writes it
+  device T *dst = out + size_t(row) * size_t(row_stride);
+  for (int i = int(tpt.x); i < row_stride; i += int(ntg.x)) {
+    dst[i] = T(0);
+  }
+}
+
+template [[host_name("zero_padding_rows_bfloat16_t")]]
+[[kernel]] void zero_padding_rows<bfloat16_t>(
+    device bfloat16_t*, device const int*, const constant int&,
+    const constant int&, uint3, uint3, uint3);
+template [[host_name("zero_padding_rows_half")]]
+[[kernel]] void zero_padding_rows<half>(
+    device half*, device const int*, const constant int&,
+    const constant int&, uint3, uint3, uint3);
+)ZP";
+
 // FATTN_SMEM(nsg) (half elements -> bytes), same as the FA thunk's helper.
 size_t PagedFaVecSmem(int64_t head_dim, int nsg) {
   auto pad = [](int64_t x, int64_t n) { return ((x + n - 1) / n) * n; };
@@ -186,6 +236,15 @@ void MetalPagedAttnThunk::Prewarm(se::StreamExecutor* executor,
             .IgnoreError();
       }
     }
+    // Output padding-zero kernel PSO (paired with the tiled prefill path).
+    auto zlib = CompileMetalSourceToMetallibCached(kZeroPaddingSrc);
+    if (zlib.ok()) {
+      metal_exec
+          ->LoadKernelWithConstants(
+              *zlib, absl::StrCat("zero_padding_rows_", *dt), /*arity=*/4,
+              absl::Span<const se::metal::MetalFunctionConstant>())
+          .IgnoreError();
+    }
   }
   // Decode vector kernel (when it qualifies): warm ALL THREE nsg variants for
   // the head_dim's specialization (hd128 / Gemma hd256 / Gemma hd512).
@@ -261,6 +320,17 @@ absl::Status MetalPagedAttnThunk::EnsureLoaded(se::StreamExecutor* executor) {
   const FC fc[] = {{460, FC::Kind::kInt, is_causal_ ? 1 : 0}};
   TF_ASSIGN_OR_RETURN(
       kernel_, metal_exec->LoadKernelWithConstants(lib, name, /*arity=*/22, fc));
+
+  // Output padding-zero kernel (replaces the pre-attention full-buffer MemZero).
+  // Own tiny metallib (keeps the vendored tiled source verbatim); 4 buffers, no
+  // function constants. Name suffix matches the tiled kernel's dtype token.
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> zlib,
+                      CompileMetalSourceToMetallibCached(kZeroPaddingSrc));
+  TF_ASSIGN_OR_RETURN(
+      zero_kernel_,
+      metal_exec->LoadKernelWithConstants(
+          zlib, absl::StrCat("zero_padding_rows_", dt), /*arity=*/4,
+          absl::Span<const FC>()));
 
   // smem = (BQ + 2*TILE_KV) * (HEAD_SIZE + SMEM_PAD) * sizeof(T); SMEM_PAD =
   // 16/sizeof(T) = 8 elems for fp16/bf16. (pagedattention_tiled.metal:189-192.)
@@ -498,14 +568,25 @@ absl::Status MetalPagedAttnThunk::ExecuteOnStream(const ExecuteParams& params) {
   // that buffer is fresh-zero, but on later requests it holds stale activations
   // that — propagated through the transformer's residual stream and o_proj/MLP —
   // blow up to NaN within a couple layers and (via tiled GEMM row mixing) corrupt
-  // real tokens too (garbage "!" output from the 2nd request on). Zero the output
-  // up front so padding rows are deterministically 0, matching the first-request
-  // behavior. (MetalStream::MemZero encodes an async GPU fill into the open
-  // command buffer, fence-ordered before this kernel's encoder — no queue
-  // drain; it used to drain + host-memset, which serialized tiled prefill
-  // layer-by-layer, ~28 full-queue drains per request.)
+  // real tokens too (garbage "!" output from the 2nd request on).
+  //
+  // Zero the padding rows with zero_kernel_ (writes ONLY rows
+  // [cu_seqlens_q[num_seqs], total_q_tokens); attention writes the disjoint
+  // [0, real_total)) instead of a full-buffer MemZero. It stays in the
+  // concurrent compute encoder (no blit -> no per-layer encoder break) and
+  // doesn't re-write the whole activation buffer every layer. Dispatched BEFORE
+  // the attention kernel; both write disjoint rows, so no barrier is needed
+  // between them, and the downstream o_proj barrier orders both. EnsureLoaded
+  // loaded zero_kernel_ (checked above via TF_RETURN_IF_ERROR), so it is set.
   se::DeviceAddressBase out_addr = allocs.GetDeviceAddress(out_);
-  TF_RETURN_IF_ERROR(stream->MemZero(&out_addr, out_addr.size()));
+  se::KernelArgsPackedArray za(/*num_args=*/4);
+  za.add_argument(out_addr);                                  // 0 out
+  za.add_argument(allocs.GetDeviceAddress(query_start_len_));  // 1 cu_seqlens_q
+  za.add_argument(p_num_seqs_);                               // 2 num_seqs
+  za.add_argument(p_q_stride_);                               // 3 row_stride
+  TF_RETURN_IF_ERROR(zero_kernel_->Launch(
+      se::ThreadDim(256, 1, 1), se::BlockDim(total_q_tokens_, 1, 1), stream,
+      za));
 
   se::KernelArgsPackedArray args(/*num_args=*/22);
   args.add_argument(dummy_);                              // 0  (unused)
