@@ -439,6 +439,15 @@ HostExecuteStartThunk::HostExecuteStartThunk(
 
 std::string HostExecuteStartThunk::ToString(int indent) const { return ""; }
 
+Thunk::BufferUses HostExecuteStartThunk::buffer_uses() const {
+  BufferUses buffer_uses;
+  buffer_uses.reserve(args_.size());
+  for (const SliceAndShape& arg : args_) {
+    buffer_uses.push_back(BufferUse::Read(arg.slice, arg.shape));
+  }
+  return buffer_uses;
+}
+
 absl::StatusOr<ThunkProto> HostExecuteStartThunk::ToProto() const {
   ThunkProto proto;
   *proto.mutable_thunk_info() = thunk_info().ToProto();
@@ -628,13 +637,24 @@ HostExecuteStartThunk::GetAsyncEventsUniqueId() const {
 
 HostExecuteDoneThunk::HostExecuteDoneThunk(
     Thunk::ThunkInfo thunk_info,
+    absl::InlinedVector<HostExecuteStartThunk::SliceAndShape, 4> results,
     std::shared_ptr<HostExecuteAsyncEvents> async_events)
     : HostAsyncThunk(Thunk::Kind::kHostExecuteDone, std::move(thunk_info)),
+      results_(std::move(results)),
       async_events_(std::move(async_events)) {
   CHECK(async_events_) << "async_events must not be null";
 }
 
 std::string HostExecuteDoneThunk::ToString(int indent) const { return ""; }
+
+Thunk::BufferUses HostExecuteDoneThunk::buffer_uses() const {
+  BufferUses buffer_uses;
+  buffer_uses.reserve(results_.size());
+  for (const HostExecuteStartThunk::SliceAndShape& result : results_) {
+    buffer_uses.push_back(BufferUse::Write(result.slice, result.shape));
+  }
+  return buffer_uses;
+}
 
 absl::StatusOr<ThunkProto> HostExecuteDoneThunk::ToProto() const {
   ThunkProto proto;
@@ -649,6 +669,12 @@ absl::StatusOr<ThunkProto> HostExecuteDoneThunk::ToProto() const {
 
   host_execute_done_thunk_proto->set_async_events_unique_id(
       async_events_unique_id.value().value());
+  for (const HostExecuteStartThunk::SliceAndShape& result : results_) {
+    ShapedSliceProto* result_proto =
+        host_execute_done_thunk_proto->add_results();
+    TF_ASSIGN_OR_RETURN(*result_proto->mutable_slice(), result.slice.ToProto());
+    *result_proto->mutable_shape() = result.shape.ToProto();
+  }
 
   return proto;
 }
@@ -658,13 +684,23 @@ HostExecuteDoneThunk::FromProto(
     ThunkInfo thunk_info, const HostExecuteDoneThunkProto& proto,
     absl::Span<const BufferAllocation> buffer_allocations,
     HostExecuteAsyncEventsMap& async_events_map) {
+  absl::InlinedVector<HostExecuteStartThunk::SliceAndShape, 4> results;
+  results.reserve(proto.results_size());
+  for (const ShapedSliceProto& result_proto : proto.results()) {
+    TF_ASSIGN_OR_RETURN(auto slice,
+                        BufferAllocation::Slice::FromProto(result_proto.slice(),
+                                                           buffer_allocations));
+    TF_ASSIGN_OR_RETURN(auto shape, Shape::FromProto(result_proto.shape()));
+    results.push_back({slice, shape});
+  }
+
   // If async_events_map already contains an entry for the given unique id,
   // that means that the pairing start thunk is already serialized and we reuse
   // the id to connect them. Otherwise, create a new entry.
   auto [async_event_it, _] = async_events_map.try_emplace(
       AsyncEventsUniqueId(proto.async_events_unique_id()),
       std::make_shared<HostExecuteAsyncEvents>());
-  return std::make_unique<HostExecuteDoneThunk>(thunk_info,
+  return std::make_unique<HostExecuteDoneThunk>(thunk_info, std::move(results),
                                                 async_event_it->second);
 }
 
