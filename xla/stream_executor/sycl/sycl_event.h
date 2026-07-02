@@ -52,6 +52,9 @@ class SyclEvent : public Event {
   // Blocks the host until this event completes.
   absl::Status Wait();
 
+  // Blocks the host until this event completes.
+  absl::Status Synchronize() override { return Wait(); }
+
   // Sets the underlying SYCL event. Not thread-safe.
   void SetEvent(const ::sycl::event& event) { event_ = event; }
 

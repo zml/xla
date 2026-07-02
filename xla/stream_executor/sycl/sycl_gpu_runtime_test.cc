@@ -14,7 +14,9 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -152,6 +154,42 @@ TEST_F(SyclGpuRuntimeTest, TestDefaultStreamSynchronize) {
       SyclStreamPool::GetDefaultStream(kDefaultDeviceOrdinal));
   ASSERT_NE(stream_handle, nullptr);
   TF_ASSERT_OK(SyclStreamPool::SynchronizeStreamPool(kDefaultDeviceOrdinal));
+}
+
+TEST_F(SyclGpuRuntimeTest, StreamSynchronizeReturnsStoredAsyncError) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetDefaultStream(kDefaultDeviceOrdinal));
+  ASSERT_NE(stream_handle, nullptr);
+
+  SyclRecordAsyncErrorForTesting(
+      kDefaultDeviceOrdinal,
+      absl::InternalError("injected async stream failure"));
+
+  EXPECT_THAT(SyclStreamSynchronize(stream_handle.get()),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInternal,
+                  ::testing::HasSubstr("injected async stream failure")));
+  EXPECT_THAT(SyclStreamSynchronize(stream_handle.get()),
+              absl_testing::IsOk());
+}
+
+TEST_F(SyclGpuRuntimeTest, StreamPoolSynchronizeReturnsStoredAsyncError) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      StreamPtr stream_handle,
+      SyclStreamPool::GetDefaultStream(kDefaultDeviceOrdinal));
+  ASSERT_NE(stream_handle, nullptr);
+
+  SyclRecordAsyncErrorForTesting(
+      kDefaultDeviceOrdinal,
+      absl::InternalError("injected async pool failure"));
+
+  EXPECT_THAT(SyclStreamPool::SynchronizeStreamPool(kDefaultDeviceOrdinal),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInternal,
+                  ::testing::HasSubstr("injected async pool failure")));
+  EXPECT_THAT(SyclStreamPool::SynchronizeStreamPool(kDefaultDeviceOrdinal),
+              absl_testing::IsOk());
 }
 
 TEST_F(SyclGpuRuntimeTest, TestCreateStreamSynchronize) {

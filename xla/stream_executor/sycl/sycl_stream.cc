@@ -374,7 +374,12 @@ absl::StatusOr<std::unique_ptr<SyclStream>> SyclStream::Create(
 
 SyclStream::~SyclStream() {
   // Wait for all pending operations to complete before destroying the stream.
-  BlockHostUntilDone().IgnoreError();
+  absl::Status block_status = BlockHostUntilDone();
+  if (!block_status.ok()) {
+    LOG(FATAL) << "Failed to synchronize stream " << stream_handle_.get()
+               << " for device " << executor_->device_ordinal()
+               << " before destruction: " << block_status;
+  }
 
   // Remove this stream from the executor's list of allocated streams.
   executor_->DeallocateStream(this);

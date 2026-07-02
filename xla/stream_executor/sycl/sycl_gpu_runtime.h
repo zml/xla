@@ -26,6 +26,8 @@ limitations under the License.
 
 #include "absl/base/attributes.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/strings/ascii.h"
 #include "xla/stream_executor/sycl/sycl_status.h"
@@ -159,6 +161,15 @@ absl::StatusOr<SyclTimerProperties> SyclGetTimerProperties(int device_ordinal);
 // tasks are complete.
 absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle)
     ABSL_ATTRIBUTE_NONNULL(1);
+
+// Blocks until `event` completes, then drains any async SYCL errors recorded
+// for `device_ordinal`.
+absl::Status SyclEventSynchronize(::sycl::event event, int device_ordinal,
+                                  absl::string_view source);
+
+// Records an async SYCL error for deterministic tests of status-returning wait
+// paths.
+void SyclRecordAsyncErrorForTesting(int device_ordinal, absl::Status status);
 
 // Submits a SYCL barrier and returns its event. The event marks completion of
 // all prior work on the given in-order stream.

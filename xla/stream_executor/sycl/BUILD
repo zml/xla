@@ -398,6 +398,7 @@ sycl_library(
     deps = [
         "//xla/stream_executor:event",
         "//xla/stream_executor:stream_executor_h",
+        ":sycl_gpu_runtime",
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/status:statusor",
     ],
@@ -413,8 +414,11 @@ xla_test(
     ],
     deps = [
         ":sycl_event",
+        ":sycl_gpu_runtime",
         ":sycl_platform_id",
         "//xla/stream_executor:platform_manager",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -482,6 +486,7 @@ sycl_library(
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
     ],
@@ -500,6 +505,7 @@ xla_test(
         "//xla/tsl/lib/core:status_test_util",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest_main",
     ],

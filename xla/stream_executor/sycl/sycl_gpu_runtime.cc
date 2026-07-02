@@ -17,12 +17,16 @@ limitations under the License.
 
 #include <algorithm>
 #include <cassert>
+#include <exception>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "absl/base/call_once.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/logging.h"
@@ -31,6 +35,121 @@ limitations under the License.
 namespace stream_executor::sycl {
 
 namespace {
+
+absl::Mutex async_error_mu(absl::kConstInit);
+auto* async_errors ABSL_GUARDED_BY(async_error_mu) =
+    new absl::flat_hash_map<int, std::vector<absl::Status>>();
+
+absl::Status MergeStatuses(absl::Status primary, absl::Status secondary) {
+  if (primary.ok()) {
+    return secondary;
+  }
+  if (secondary.ok()) {
+    return primary;
+  }
+  return absl::Status(primary.code(),
+                      absl::StrCat(primary.message(), "; additionally: ",
+                                   secondary.message()));
+}
+
+absl::Status SyclExceptionStatus(absl::string_view source,
+                                 const ::sycl::exception& e) {
+  return absl::InternalError(absl::StrCat(
+      source, ": SYCL exception: ", e.what(), " (code ", e.code().value(),
+      ", category ", e.code().category().name(), ")"));
+}
+
+void RecordAsyncError(int device_ordinal, absl::Status status) {
+  if (status.ok()) {
+    return;
+  }
+  LOG(ERROR) << status;
+  absl::MutexLock lock(&async_error_mu);
+  (*async_errors)[device_ordinal].push_back(std::move(status));
+}
+
+void RecordAsyncException(int device_ordinal, absl::string_view source,
+                          const ::sycl::exception& e) {
+  RecordAsyncError(
+      device_ordinal,
+      absl::InternalError(absl::StrCat(
+          source, ": async SYCL exception on device ordinal ", device_ordinal,
+          ": ", e.what(), " (code ", e.code().value(), ", category ",
+          e.code().category().name(), ")")));
+}
+
+::sycl::async_handler MakeSyclAsyncHandler(int device_ordinal,
+                                           absl::string_view source) {
+  std::string source_string(source);
+  return [device_ordinal, source_string](::sycl::exception_list ex_list) {
+    for (const auto& e : ex_list) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const ::sycl::exception& e) {
+        RecordAsyncException(device_ordinal, source_string, e);
+      } catch (const std::exception& e) {
+        RecordAsyncError(
+            device_ordinal,
+            absl::InternalError(absl::StrCat(
+                source_string, ": async non-SYCL exception on device ordinal ",
+                device_ordinal, ": ", e.what())));
+      } catch (...) {
+        RecordAsyncError(device_ordinal,
+                         absl::InternalError(absl::StrCat(
+                             source_string,
+                             ": async unknown exception on device ordinal ",
+                             device_ordinal)));
+      }
+    }
+  };
+}
+
+absl::Status DrainAsyncErrors(int device_ordinal, absl::string_view consumer) {
+  std::vector<absl::Status> errors;
+  {
+    absl::MutexLock lock(&async_error_mu);
+    auto it = async_errors->find(device_ordinal);
+    if (it == async_errors->end() || it->second.empty()) {
+      return absl::OkStatus();
+    }
+    errors = std::move(it->second);
+    async_errors->erase(it);
+  }
+
+  std::string message =
+      absl::StrCat(consumer, ": observed ", errors.size(),
+                   " async SYCL error", errors.size() == 1 ? "" : "s",
+                   " for device ordinal ", device_ordinal, ": ",
+                   errors.front().message());
+  if (errors.size() > 1) {
+    absl::StrAppend(&message, " (", errors.size() - 1,
+                    " additional async SYCL error",
+                    errors.size() == 2 ? "" : "s", " omitted)");
+  }
+  return absl::Status(errors.front().code(), message);
+}
+
+absl::StatusOr<int> GetDeviceOrdinalForQueue(::sycl::queue* stream_handle,
+                                             absl::string_view function_name) {
+  try {
+    return SyclDevicePool::GetDeviceOrdinal(stream_handle->get_device());
+  } catch (const ::sycl::exception& e) {
+    return SyclExceptionStatus(function_name, e);
+  }
+}
+
+absl::Status WaitForQueueAndDrain(::sycl::queue* stream_handle,
+                                  absl::string_view source) {
+  ASSIGN_OR_RETURN(int device_ordinal,
+                   GetDeviceOrdinalForQueue(stream_handle, source));
+  absl::Status wait_status = absl::OkStatus();
+  try {
+    stream_handle->wait_and_throw();
+  } catch (const ::sycl::exception& e) {
+    wait_status = SyclExceptionStatus(source, e);
+  }
+  return MergeStatuses(wait_status, DrainAsyncErrors(device_ordinal, source));
+}
 
 absl::Status IsValidDeviceOrdinal(int device_ordinal,
                                   const absl::string_view& function_name) {
@@ -49,7 +168,11 @@ absl::Status MemcpyDeviceToHost(::sycl::queue* stream_handle, void* dst_host,
     ::sycl::event event =
         stream_handle->memcpy(dst_host, src_device, byte_count);
     if (!async) {
-      event.wait();
+      ASSIGN_OR_RETURN(int device_ordinal,
+                       GetDeviceOrdinalForQueue(stream_handle,
+                                                "MemcpyDeviceToHost"));
+      RETURN_IF_ERROR(SyclEventSynchronize(event, device_ordinal,
+                                           "MemcpyDeviceToHost"));
     }
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(
@@ -66,7 +189,11 @@ absl::Status MemcpyHostToDevice(::sycl::queue* stream_handle, void* dst_device,
     ::sycl::event event =
         stream_handle->memcpy(dst_device, src_host, byte_count);
     if (!async) {
-      event.wait();
+      ASSIGN_OR_RETURN(int device_ordinal,
+                       GetDeviceOrdinalForQueue(stream_handle,
+                                                "MemcpyHostToDevice"));
+      RETURN_IF_ERROR(SyclEventSynchronize(event, device_ordinal,
+                                           "MemcpyHostToDevice"));
     }
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(
@@ -83,7 +210,11 @@ absl::Status MemcpyDeviceToDevice(::sycl::queue* stream_handle,
     ::sycl::event event =
         stream_handle->memcpy(dst_device, src_device, byte_count);
     if (!async) {
-      event.wait();
+      ASSIGN_OR_RETURN(int device_ordinal,
+                       GetDeviceOrdinalForQueue(stream_handle,
+                                                "MemcpyDeviceToDevice"));
+      RETURN_IF_ERROR(SyclEventSynchronize(event, device_ordinal,
+                                           "MemcpyDeviceToDevice"));
     }
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(
@@ -100,7 +231,11 @@ absl::Status MemsetDevice(::sycl::queue* stream_handle, void* dst_device,
     ::sycl::event event =
         stream_handle->memset(dst_device, value, count * sizeof(uint8_t));
     if (!async) {
-      event.wait();
+      ASSIGN_OR_RETURN(int device_ordinal,
+                       GetDeviceOrdinalForQueue(stream_handle,
+                                                "MemsetDevice"));
+      RETURN_IF_ERROR(
+          SyclEventSynchronize(event, device_ordinal, "MemsetDevice"));
     }
   } catch (const ::sycl::exception& e) {
     return absl::InternalError("MemsetDevice failed: " + std::string(e.what()) +
@@ -115,7 +250,11 @@ absl::Status MemfillDevice(::sycl::queue* stream_handle, void* dst_device,
   try {
     ::sycl::event event = stream_handle->fill(dst_device, value, count);
     if (!async) {
-      event.wait();
+      ASSIGN_OR_RETURN(int device_ordinal,
+                       GetDeviceOrdinalForQueue(stream_handle,
+                                                "MemfillDevice"));
+      RETURN_IF_ERROR(
+          SyclEventSynchronize(event, device_ordinal, "MemfillDevice"));
     }
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(
@@ -180,7 +319,9 @@ absl::StatusOr<::sycl::context> SyclDevicePool::GetDeviceContext(
     // Level Zero context can make independent GPU BFC arenas compete in the
     // same context-level allocation budget.
     auto context =
-        std::make_unique<::sycl::context>(device_pool_[device_ordinal]);
+        std::make_unique<::sycl::context>(
+            device_pool_[device_ordinal],
+            MakeSyclAsyncHandler(device_ordinal, "SYCL context"));
     it = contexts->emplace(device_ordinal, std::move(context)).first;
   }
   return *it->second;
@@ -213,17 +354,6 @@ absl::StatusOr<::sycl::device> SyclDevicePool::GetDevice(int device_ordinal) {
 StreamPoolMap SyclStreamPool::stream_pool_map_;
 absl::Mutex SyclStreamPool::stream_pool_mu_(absl::kConstInit);
 
-void SyclAsyncHandler(::sycl::exception_list ex_list) {
-  for (auto& e : ex_list) {
-    try {
-      std::rethrow_exception(e);
-    } catch (::sycl::exception& e) {
-      LOG(ERROR) << "SYCL exception: " << e.what() << ", file = " << __FILE__
-                 << ", line = " << __LINE__ << ".";
-    }
-  }
-}
-
 absl::StatusOr<StreamPool*> SyclStreamPool::InitStreamPool(int device_ordinal) {
   {
     absl::ReaderMutexLock read_lock(&stream_pool_mu_);
@@ -255,7 +385,8 @@ absl::StatusOr<StreamPool*> SyclStreamPool::InitStreamPool(int device_ordinal) {
   }
 
   StreamPool stream_pool = {std::make_shared<::sycl::queue>(
-      sycl_context, sycl_device, SyclAsyncHandler, prop_list)};
+      sycl_context, sycl_device,
+      MakeSyclAsyncHandler(device_ordinal, "SYCL queue"), prop_list)};
 
   // Use assignment (not insert) to update the stream pool if it was
   // previously destroyed.
@@ -313,7 +444,8 @@ absl::StatusOr<StreamPtr> SyclStreamPool::GetOrCreateStream(
   ASSIGN_OR_RETURN(::sycl::context sycl_context,
                    SyclDevicePool::GetDeviceContext(device_ordinal));
   stream_pool->push_back(std::make_shared<::sycl::queue>(
-      sycl_context, sycl_device, SyclAsyncHandler, prop_list));
+      sycl_context, sycl_device,
+      MakeSyclAsyncHandler(device_ordinal, "SYCL queue"), prop_list));
   return stream_pool->back();
 }
 
@@ -330,10 +462,14 @@ absl::Status SyclStreamPool::SynchronizeStreamPool(int device_ordinal) {
                      device_ordinal,
                      ". The pool may have been destroyed by another thread."));
   }
+  absl::Status status = absl::OkStatus();
   for (auto& stream : *stream_pool) {
-    stream->wait();
+    status = MergeStatuses(std::move(status),
+                           WaitForQueueAndDrain(
+                               stream.get(),
+                               "SyclStreamPool::SynchronizeStreamPool"));
   }
-  return absl::OkStatus();
+  return status;
 }
 
 absl::Status SyclStreamPool::DestroyStream(int device_ordinal,
@@ -361,6 +497,8 @@ absl::Status SyclStreamPool::DestroyStream(int device_ordinal,
         "SyclStreamPool::DestroyStream: Stream handle for device ordinal ",
         device_ordinal, " not found in the pool."));
   }
+  RETURN_IF_ERROR(WaitForQueueAndDrain(stream_handle.get(),
+                                       "SyclStreamPool::DestroyStream"));
   // Remove the stream from the pool and reset the handle.
   // The stream pool remains, but may become empty.
   stream_pool->erase(it);
@@ -375,7 +513,11 @@ void SyclStreamPool::Reset() {
   for (auto& [device_ordinal, stream_pool] : stream_pool_map_) {
     for (auto& stream_handle : stream_pool) {
       if (stream_handle) {
-        stream_handle->wait();
+        absl::Status status =
+            WaitForQueueAndDrain(stream_handle.get(), "SyclStreamPool::Reset");
+        if (!status.ok()) {
+          LOG(FATAL) << status;
+        }
         stream_handle.reset();
       }
     }
@@ -420,14 +562,22 @@ absl::StatusOr<SyclTimerProperties> SyclGetTimerProperties(int device_ordinal) {
 }
 
 absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle) {
+  return WaitForQueueAndDrain(stream_handle, "SyclStreamSynchronize");
+}
+
+absl::Status SyclEventSynchronize(::sycl::event event, int device_ordinal,
+                                  absl::string_view source) {
+  absl::Status wait_status = absl::OkStatus();
   try {
-    stream_handle->wait();
+    event.wait_and_throw();
   } catch (const ::sycl::exception& e) {
-    return absl::InternalError(absl::StrCat(
-        "SyclStreamSynchronize: Failed to synchronize stream: ", e.what(),
-        ", file = ", __FILE__, ", line = ", __LINE__));
+    wait_status = SyclExceptionStatus(source, e);
   }
-  return absl::OkStatus();
+  return MergeStatuses(wait_status, DrainAsyncErrors(device_ordinal, source));
+}
+
+void SyclRecordAsyncErrorForTesting(int device_ordinal, absl::Status status) {
+  RecordAsyncError(device_ordinal, std::move(status));
 }
 
 absl::StatusOr<::sycl::event> SyclSubmitBarrierEvent(

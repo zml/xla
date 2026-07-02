@@ -15,8 +15,12 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_event.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 
 namespace stream_executor::sycl {
@@ -62,6 +66,31 @@ TEST_F(SyclEventTest, MoveEvent) {
   // The moved event should still be valid.
   ::sycl::event moved_event = moved_sycl_event.GetEvent();
   EXPECT_EQ(moved_event, orig_event);
+}
+
+TEST_F(SyclEventTest, WaitReturnsStoredAsyncError) {
+  TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+  SyclRecordAsyncErrorForTesting(
+      kDefaultDeviceOrdinal,
+      absl::InternalError("injected async event failure"));
+
+  EXPECT_THAT(event.Wait(),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInternal,
+                  ::testing::HasSubstr("injected async event failure")));
+}
+
+TEST_F(SyclEventTest, SynchronizeReturnsStoredAsyncError) {
+  TF_ASSERT_OK_AND_ASSIGN(SyclEvent event, SyclEvent::Create(executor_));
+  Event* base_event = &event;
+  SyclRecordAsyncErrorForTesting(
+      kDefaultDeviceOrdinal,
+      absl::InternalError("injected async base event failure"));
+
+  EXPECT_THAT(base_event->Synchronize(),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInternal,
+                  ::testing::HasSubstr("injected async base event failure")));
 }
 
 }  // namespace

@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/status/statusor.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/sycl/sycl_gpu_runtime.h"
 #include "xla/tsl/platform/logging.h"
 
 namespace stream_executor::sycl {
@@ -96,13 +97,8 @@ absl::Status SyclEvent::WaitForEventOnExternalStream(std::intptr_t stream) {
 }
 
 absl::Status SyclEvent::Wait() {
-  try {
-    event_.wait_and_throw();
-  } catch (const ::sycl::exception& e) {
-    return absl::InternalError(
-        absl::StrCat("Failed to wait for SYCL event: ", e.what()));
-  }
-  return absl::OkStatus();
+  return SyclEventSynchronize(event_, executor_->device_ordinal(),
+                              "SyclEvent::Wait");
 }
 
 absl::StatusOr<SyclEvent> SyclEvent::Create(StreamExecutor* executor) {
