@@ -99,6 +99,10 @@ absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
 
     ::sycl::device target_device = stream_handle->get_device();
     if (target_device != metadata.device) {
+      // Cross-stream ordering is materialized with a SYCL event barrier only
+      // when both streams belong to the same device/context. Cross-device
+      // collective protocols need higher-level host/device rendezvous instead
+      // of relying on a SYCL event wait between devices.
       return absl::UnimplementedError(
           "WaitStreamOnEvent: Cross-device SYCL event waits are not enabled.");
     }
@@ -129,6 +133,8 @@ absl::Status SyclEvent::WaitStreamOnEvent(StreamExecutor* executor,
         std::string(e.what()));
   }
   try {
+    // Queue a barrier dependent on the recorded event, making subsequent work
+    // on stream_handle wait for the producer stream's marker.
     stream_handle->ext_oneapi_submit_barrier(
         std::vector<::sycl::event>{*event.event_});
   } catch (const ::sycl::exception& e) {

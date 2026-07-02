@@ -37,15 +37,19 @@ namespace stream_executor::sycl {
 class SyclStream : public StreamCommon {
  public:
   // Makes the current stream wait until all operations enqueued in the other
-  // stream up to its latest recorded marker have completed.
+  // stream up to its latest recorded marker have completed. This is the
+  // same-device cross-stream ordering primitive used around operations, such as
+  // oneCCL collectives, that launch on a non-default communication stream.
   absl::Status WaitFor(Stream* other) override;
 
   // Records a marker event for work currently enqueued on the stream into the
   // given Event object. This allows other streams or operations to synchronize
-  // with this point in the stream's execution.
+  // with this point in the stream's execution. On SYCL this marker is a queue
+  // barrier event, so a later WaitFor(event) sees all prior work in order.
   absl::Status RecordEvent(Event* event) override;
 
   // Blocks execution on the current stream until the given event is completed.
+  // Cross-device SYCL event waits are rejected by SyclEvent::WaitStreamOnEvent.
   absl::Status WaitFor(Event* event) override;
 
   // Enqueues an asynchronous operation to set the specified device memory

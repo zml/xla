@@ -80,8 +80,15 @@ absl::Status WaitForOnecclEvent(
     absl::string_view expr, ccl::event event,
     const std::shared_ptr<CancellationToken>& cancel) {
   try {
-    // XLA marks the collective complete only after oneCCL's returned event is
-    // complete, so downstream stream synchronization sees the collective work.
+    // This is the oneCCL completion boundary for XLA's current synchronous
+    // integration. The returned Future is ready only after event.wait()
+    // succeeds, so callers never observe enqueue-only completion.
+    //
+    // Same-stream producer/consumer ordering comes from XLA's in-order SYCL
+    // queue and oneCCL's front barrier on that queue. Cross-stream ordering is
+    // not implicit in oneCCL: callers that launch on a communication stream
+    // must use StreamExecutor events/waits to connect producer and consumer
+    // streams before and after the oneCCL call.
     while (!event.test()) {
       if (cancel != nullptr && cancel->IsCancelled()) {
         return absl::CancelledError(
@@ -119,6 +126,9 @@ absl::Status LaunchOnecclAndWait(absl::string_view expr,
                                      cancel) {
   ASSIGN_OR_RETURN(ccl::event event,
                    OnecclValue<ccl::event>(expr, std::move(launch)));
+  // Preserve host-visible device completion. Future async oneCCL integration
+  // must plumb a native device event through StreamExecutor instead of
+  // returning a completed Future at launch time.
   return WaitForOnecclEvent(expr, std::move(event), cancel);
 }
 
@@ -418,6 +428,9 @@ absl::Status OnecclCommunicator::HealthCheck() const {
 absl::Status OnecclCommunicator::Barrier(const Executor& executor) {
   return ExecuteAwait([this, &executor]() -> absl::Status {
     return LaunchOnStream(executor, [&](const ccl::stream& ccl_stream) {
+      // This is a oneCCL communicator operation and is not a replacement for
+      // BarrierAfterExecutable(), which first blocks the module stream and then
+      // performs the host rendezvous used at executable boundaries.
       return LaunchOnecclAndWait("ccl::barrier", [&] {
         return ccl::barrier(comm(), ccl_stream);
       }, cancel_);
@@ -832,6 +845,9 @@ absl::Status OnecclCommunicator::LaunchOnStream(
   RETURN_IF_ERROR(VerifySyclQueueIdentity(queue, stream_executor_));
   ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream, queue));
   auto activation = stream_executor_->Activate();
+  // Launch on the caller-provided XLA stream's in-order SYCL queue. oneCCL is
+  // not given cross-stream dependency vectors here; StreamExecutor RecordEvent
+  // and WaitFor calls must materialize any ordering with other streams.
   absl::Status status = std::move(launch)(ccl_stream);
   if (!status.ok()) {
     cancel_->Cancel();
@@ -842,12 +858,15 @@ absl::Status OnecclCommunicator::LaunchOnStream(
 
 Future<> OnecclCommunicator::Execute(
     absl::AnyInvocable<absl::Status() &&> f) const {
+  // All oneCCL launch paths above synchronously wait their returned ccl::event
+  // before this ready Future is constructed.
   return Future<>(std::move(f)());
 }
 
 template <typename T>
 Future<T> OnecclCommunicator::Execute(
     absl::AnyInvocable<absl::StatusOr<T>() &&> f) const {
+  // Keep typed helper calls synchronous for the same reason as Execute().
   return Future<T>(std::move(f)());
 }
 

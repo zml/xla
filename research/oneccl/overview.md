@@ -161,6 +161,19 @@ performance, cleanup, and future feature work.
 6. Preserve the current oneCCL completion boundary and make cross-stream
    ordering explicit.
 
+   Status: fixed by this change.
+
+   The implementation now documents the synchronous oneCCL completion contract
+   at the launch and Future-construction points: XLA returns a ready Future only
+   after the returned `ccl::event` has been waited. It also makes explicit that
+   same-stream ordering relies on the in-order SYCL queue and oneCCL front
+   barrier, while cross-stream producer/consumer dependencies must be expressed
+   with StreamExecutor `RecordEvent()`/`WaitFor()` barriers. The SYCL event path
+   documents the same-device event-barrier contract and continues to reject
+   cross-device SYCL event waits. `BarrierAfterExecutable()` is documented as a
+   stronger module-exit stream completion and host rendezvous boundary than a
+   communicator barrier.
+
    For the current integration, `ccl::event::wait()` is the completion
    boundary, and `OnecclCommunicator::Execute()` should keep returning an
    already-completed `Future` only after the wait succeeds. Same-stream ordering

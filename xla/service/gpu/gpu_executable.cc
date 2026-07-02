@@ -961,6 +961,9 @@ absl::Status BarrierAfterExecutable(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions* absl_nullable debug_options, se::Stream& stream,
     const size_t num_participants) {
+  // This is a module-exit stream completion boundary followed by a host
+  // rendezvous. Communicator-level barriers, including oneCCL barrier
+  // operations, do not replace this stream BlockHostUntilDone().
   RETURN_IF_ERROR(stream.BlockHostUntilDone());
 
   XLA_VLOG_DEVICE(1, run_options.device_ordinal()) << absl::StreamFormat(
