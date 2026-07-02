@@ -90,7 +90,7 @@ AllReduceConfig GetAllReduceConfigInst(
 }
 
 absl::Status RunAllReduce(ReductionKind reduction_kind,
-                          std::vector<DeviceBufferPair>& buffers,
+                          DeviceBufferPairs& buffers,
                           se::Stream& stream, Communicator& comm,
                           bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();
@@ -163,9 +163,8 @@ absl::Status AllReduceThunk::Prepare(const PrepareParams& params) {
 
 absl::Status AllReduceThunk::Initialize(const InitializeParams& params) {
   RETURN_IF_ERROR(CollectiveThunk::Initialize(params));
-  ASSIGN_OR_RETURN(
-      GpuCliqueKey clique_key,
-      GetCollectiveGpuCliqueKey(*params.collective_params, config()));
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetOrCreateCliqueKey(*params.collective_params));
   if (collective_kernel_thunk_ != nullptr) {
     ASSIGN_OR_RETURN(
         bool use_collective_kernel,
@@ -182,7 +181,7 @@ absl::Status AllReduceThunk::RunCollective(const ExecuteParams& params,
                                            const GpuCliqueKey& clique_key,
                                            se::Stream& stream,
                                            Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
 
@@ -348,7 +347,7 @@ absl::Status ReduceScatterThunk::RunCollective(const ExecuteParams& params,
                                                const GpuCliqueKey& clique_key,
                                                se::Stream& stream,
                                                Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
   return RunReduceScatter(config_.reduction_kind, device_buffers, stream, comm,
@@ -356,7 +355,7 @@ absl::Status ReduceScatterThunk::RunCollective(const ExecuteParams& params,
 }
 
 absl::Status RunReduceScatter(ReductionKind reduction_kind,
-                              std::vector<DeviceBufferPair>& buffers,
+                              DeviceBufferPairs& buffers,
                               se::Stream& stream, Communicator& comm,
                               bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();

@@ -111,12 +111,12 @@ class AllToAllThunk : public CollectiveThunk {
 };
 
 absl::Status RunAllToAll(bool has_split_dimension,
-                         std::vector<DeviceBufferPair>& buffers,
+                         DeviceBufferPairs& buffers,
                          se::Stream& stream, Communicator& comm,
                          bool use_symmetric_buffer = false);
 
 absl::Status RunMemCpyAllToAll(bool has_split_dimension,
-                               std::vector<DeviceBufferPair>& buffers,
+                               DeviceBufferPairs& buffers,
                                se::Stream& stream, Communicator& comm,
                                uint64_t receive_pointer_map[],
                                const GpuCliqueKey& clique_key, RankId rank,

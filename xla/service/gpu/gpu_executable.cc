@@ -487,6 +487,10 @@ GpuExecutable::GpuExecutable(
                                                std::move(proto));
   }
   set_module_stats(std::move(module_stats));
+  if (has_module()) {
+    collective_use_minimal_resource_ =
+        ShouldCollectiveUseMinimalResource(module());
+  }
 
   DebugOptions::CommandBufferUpdateMode update_mode =
       has_module()
@@ -1367,8 +1371,8 @@ absl::Status GpuExecutable::ExecuteThunks(
 
   bool collective_use_minimal_resource = false;
   if (has_module()) {
-    ASSIGN_OR_RETURN(collective_use_minimal_resource,
-                     ShouldCollectiveUseMinimalResource(module()));
+    TF_ASSIGN_OR_RETURN(collective_use_minimal_resource,
+                        collective_use_minimal_resource_);
   }
   RETURN_IF_ERROR(ExecuteThunksImpl(
       has_module() ? &module_config().debug_options() : nullptr, module_name_,

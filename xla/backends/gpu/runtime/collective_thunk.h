@@ -24,10 +24,13 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/call_once.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/runtime/collective_clique_requests.h"
@@ -180,6 +183,13 @@ class CollectiveThunk : public Command {
     return absl::OkStatus();
   }
 
+  // Returns the clique key for this collective, cached across executions.
+  // The device assignment is owned by PjRtExecutable and replica groups are
+  // baked into the thunk, so this avoids rebuilding identical keys on every
+  // collective launch.
+  absl::StatusOr<GpuCliqueKey> GetOrCreateCliqueKey(
+      const CollectiveParams& params) const;
+
   // Run collective operation on a given stream.
   //
   // A collective thunk is normally an independent operation in a sense that
@@ -219,6 +229,26 @@ class CollectiveThunk : public Command {
       const ExecuteParams& params,
       absl::FunctionRef<absl::Status(const GpuCliqueKey&, Communicator&)> fn);
 
+  struct CliqueKeyCacheKey {
+    GlobalDeviceId global_device_id;
+    const DeviceAssignment* device_assn;
+    const CollectiveParams::GlobalDeviceIdMap* global_device_id_map;
+    const absl::flat_hash_map<GlobalDeviceId, IncarnationId>* incarnations;
+
+    bool operator==(const CliqueKeyCacheKey& other) const {
+      return global_device_id == other.global_device_id &&
+             device_assn == other.device_assn &&
+             global_device_id_map == other.global_device_id_map &&
+             incarnations == other.incarnations;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const CliqueKeyCacheKey& key) {
+      return H::combine(std::move(h), key.global_device_id, key.device_assn,
+                        key.global_device_id_map, key.incarnations);
+    }
+  };
+
   const std::vector<Buffer> buffers_;
   // Before and after a first call to this particular instance of a collective
   // thunk we do a round of rendezvous to make sure that all participants are
@@ -237,6 +267,10 @@ class CollectiveThunk : public Command {
   // time. Device groups are the same for all devices, so computed once.
   absl::once_flag device_groups_once_;
   absl::StatusOr<std::vector<std::vector<GlobalDeviceId>>> device_groups_;
+
+  mutable absl::Mutex clique_key_cache_mutex_;
+  mutable absl::flat_hash_map<CliqueKeyCacheKey, GpuCliqueKey>
+      clique_key_cache_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -289,7 +323,10 @@ struct DeviceBufferPair {
   int64_t destination_memory_space;
 };
 
-absl::StatusOr<std::vector<DeviceBufferPair>> ConvertToDeviceBuffers(
+// Buffers on one device for a collective operation
+using DeviceBufferPairs = absl::InlinedVector<DeviceBufferPair, 4>;
+
+absl::StatusOr<DeviceBufferPairs> ConvertToDeviceBuffers(
     const BufferAllocations* buffer_allocations,
     const std::vector<CollectiveThunk::Buffer>& buffers,
     const std::vector<PrimitiveType>& element_types);

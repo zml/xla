@@ -83,7 +83,7 @@ class AllGatherThunk : public CollectiveThunk {
   const AllGatherConfig config_;
 };
 
-absl::Status RunAllGather(std::vector<DeviceBufferPair>& buffers,
+absl::Status RunAllGather(DeviceBufferPairs& buffers,
                           se::Stream& stream, Communicator& comm,
                           bool use_symmetric_buffer = false);
 
