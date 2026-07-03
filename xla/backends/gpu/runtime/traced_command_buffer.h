@@ -17,9 +17,13 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_RUNTIME_TRACED_COMMAND_BUFFER_H_
 
 #include <cstdint>
+#include <list>
 #include <memory>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -55,16 +59,44 @@ class TracedCommandBuffer : public CommandState {
       se::Stream* stream, absl::FunctionRef<absl::Status(se::Stream*)> trace,
       se::StreamPriority priority = se::StreamPriority::Default);
 
+  bool RecordedChildIsCurrent(const se::CommandBuffer::Command* command,
+                              se::CommandBuffer* nested) const;
+  void SetRecordedChild(const se::CommandBuffer::Command* command,
+                        se::CommandBuffer* nested);
+
  private:
   std::vector<BufferAllocation::Index> allocs_indices_;
 
+  struct AddressKey {
+    absl::InlinedVector<se::DeviceAddressBase, 32> allocs;
+
+    bool operator==(const AddressKey& other) const {
+      return allocs == other.allocs;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const AddressKey& key) {
+      h = H::combine(std::move(h), key.allocs.size());
+      for (const se::DeviceAddressBase& alloc : key.allocs) {
+        h = H::combine(std::move(h), alloc);
+      }
+      return h;
+    }
+  };
+
   struct Entry {
-    std::vector<se::DeviceAddressBase> recorded_allocs;
+    AddressKey key;
     std::unique_ptr<se::CommandBuffer> command_buffer;
   };
+
+  using EntryList = std::list<Entry>;
+
   const Command* trace_cmd_;
-  int64_t capacity_;
-  std::vector<Entry> entries_;
+  size_t capacity_;
+  EntryList entries_;
+  absl::flat_hash_map<AddressKey, EntryList::iterator> entries_by_key_;
+  absl::flat_hash_map<const se::CommandBuffer::Command*, se::CommandBuffer*>
+      recorded_children_;
 };
 
 }  // namespace xla::gpu
