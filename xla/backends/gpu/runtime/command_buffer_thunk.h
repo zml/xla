@@ -100,7 +100,7 @@ class CommandBufferThunk : public Thunk {
     // buffer allocations passed in `params`. Returns buffer allocations that
     // changed since the last update. Returned buffer allocations are sorted by
     // the buffer allocation index.
-    std::vector<BufferAllocation::Index> UpdateBufferAllocations(
+    Command::UpdatedAllocations UpdateBufferAllocations(
         const CommandExecutor& commands, const Thunk::ExecuteParams& params)
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
 

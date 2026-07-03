@@ -98,20 +98,18 @@ CommandBufferThunk::CommandBufferThunk(
   TrackCommandBuffers(state_);
 }
 
-std::vector<BufferAllocation::Index>
+Command::UpdatedAllocations
 CommandBufferThunk::ExecutorCommandBuffer::UpdateBufferAllocations(
     const CommandExecutor& commands, const Thunk::ExecuteParams& params) {
-  std::vector<BufferAllocation::Index> updated_allocs;
+  Command::UpdatedAllocations updated_allocs;
   const BufferAllocations* allocs = params.buffer_allocations;
 
-  // We check only allocations referenced by commands in a cmd sequence, and
-  // leave every other entry default initialized (nullptr device memory).
   for (BufferAllocation::Index index : commands.allocs_indices()) {
     se::DeviceAddressBase alloc = allocs->GetDeviceAddress(index);
-
+    // recorded_allocs is mapping from buffer allocation index to the device
+    // memory
     if (recorded_allocs.size() <= index) {
       recorded_allocs.resize(index + 1);
-      updated_allocs.push_back(index);
     }
 
     if (!recorded_allocs[index].IsSameAs(alloc)) {
@@ -285,8 +283,6 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
     return absl::OkStatus();
   }
 
-  auto updated_allocs = cmd_buffer->UpdateBufferAllocations(commands_, params);
-
   // Determine whether to (re-)record the command buffer and whether this is a
   // first-time initialization recording (VA remapping path).
   bool is_first_record =
@@ -295,6 +291,9 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
   bool has_commands_requiring_update =
       command_buffer_update_mode_ != DebugOptions::NEVER_UPDATE &&
       commands_.requires_update_on_execute();
+
+  auto updated_allocs = cmd_buffer->UpdateBufferAllocations(commands_, params);
+
   bool needs_update =
       (command_buffer_update_mode_ == DebugOptions::ALWAYS_UPDATE ||
        command_buffer_update_mode_ == DebugOptions::CAPTURE_CMD_NEVER_UPDATE) &&

@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -315,6 +314,18 @@ CommandExecutor::CommandExecutor(
     cmd_allocs_indices_.emplace_back(cmd_allocs_indices.begin(),
                                      cmd_allocs_indices.end());
   }
+
+  // Create a mapping from buffer allocation index to the list of command
+  // indices if alloc_indices is not empty At update time if alloc is updated,
+  // alloc_to_cmds_ used to find the cmds associated
+  if (!allocs_indices_.empty()) {
+    alloc_to_cmds_.resize(allocs_indices_.back() + 1);
+    for (CommandId id = 0; id < cmd_allocs_indices_.size(); ++id) {
+      for (BufferAllocation::Index index : cmd_allocs_indices_[id]) {
+        alloc_to_cmds_[index].push_back(id);
+      }
+    }
+  }
 }
 
 absl::Status CommandExecutor::Prepare(const Thunk::PrepareParams& params) {
@@ -555,10 +566,28 @@ absl::Status CommandExecutor::RecordUpdate(
     return absl::OkStatus();
   }
 
+  // Get executor state for this command buffer and record id
+  auto* state = command_buffer->GetOrConstructResource<CommandExecutorsState>();
+  CommandExecutorsState::Key state_key = std::make_pair(this, record_id);
+  RecordedCommands& recorded_commands = state->recorded_commands[state_key];
+
+  std::vector<uint8_t>* command_update_marks = nullptr;
+  if (record_params.updated_allocs) {
+    std::vector<uint8_t>& marks = state->command_update_marks[state_key];
+    marks.assign(commands_.size(), 0);
+    for (BufferAllocation::Index index : *record_params.updated_allocs) {
+      if (index >= alloc_to_cmds_.size()) {
+        continue;
+      }
+      for (CommandId command_id : alloc_to_cmds_[index]) {
+        marks[command_id] = 1;
+      }
+    }
+    command_update_marks = &marks;
+  }
+
   // Check if command `id` has to be updated based on the buffer allocations
-  // that changed since the last call to `Record`. We keep intersection vector
-  // outside of a lambda to avoid repeated heap allocations on every call.
-  std::vector<BufferAllocation::Index> alloc_intersection;
+  // that changed since the last call to `Record`.
   auto skip_command_update = [&](CommandId id) {
     // If we don't know what allocations changed since the last call to
     // `Record` we must always update the command.
@@ -598,24 +627,9 @@ absl::Status CommandExecutor::RecordUpdate(
       return false;
     }
 
-    DCHECK(absl::c_is_sorted(*record_params.updated_allocs))
-        << "Updated allocs must be sorted: "
-        << absl::StrJoin(*record_params.updated_allocs, ", ");
-
-    DCHECK(absl::c_is_sorted(cmd_allocs_indices_[id]))
-        << "Command allocs must be sorted: "
-        << absl::StrJoin(cmd_allocs_indices_[id], ", ");
-
-    alloc_intersection.clear();
-    absl::c_set_intersection(cmd_allocs_indices_[id],
-                             *record_params.updated_allocs,
-                             std::back_inserter(alloc_intersection));
-    return alloc_intersection.empty();
+    // Uses the
+    return command_update_marks != nullptr && !(*command_update_marks)[id];
   };
-
-  auto* state = command_buffer->GetOrConstructResource<CommandExecutorsState>();
-  RecordedCommands& recorded_commands =
-      state->recorded_commands[std::make_pair(this, record_id)];
 
   // Check this this executor was correctly recorded into the command buffer.
   if (recorded_commands.size() != commands_.size()) {
@@ -632,7 +646,6 @@ absl::Status CommandExecutor::RecordUpdate(
 
     std::optional<tsl::profiler::ScopedAnnotation> annotation =
         GetKernelAnnotation(command->profile_annotation());
-
     // Skip updating collective commands if mock collectives are enabled.
     if (execute_params.mock_collectives && command->IsCollective()) {
       continue;
