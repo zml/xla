@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_RUNTIME_COMMAND_H_
 #define XLA_BACKENDS_GPU_RUNTIME_COMMAND_H_
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -93,6 +94,8 @@ class Command : public Thunk {
   }
 
  public:
+  using UpdatedAllocations = absl::InlinedVector<BufferAllocation::Index, 32>;
+
   // Parameters for recording commands into the command buffer.
   struct RecordParams {
     // An external state manager that gives efficient access to per-device state
@@ -102,7 +105,7 @@ class Command : public Thunk {
     // Buffer allocations that changed since the last call to `Record`. Buffer
     // allocation indices are sorted. CommandExecutor and individual commands
     // rely on this information to skip unnecessary updates.
-    std::optional<std::vector<BufferAllocation::Index>> updated_allocs;
+    std::optional<UpdatedAllocations> updated_allocs;
 
     // A flag indicating whether we record commands at command buffer thunk
     // initialization time.

@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -317,6 +316,18 @@ CommandExecutor::CommandExecutor(
     cmd_allocs_indices_.emplace_back(cmd_allocs_indices.begin(),
                                      cmd_allocs_indices.end());
   }
+
+  // Create a mapping from buffer allocation index to the list of command
+  // indices if alloc_indices is not empty At update time if alloc is updated,
+  // alloc_to_cmds_ used to find the cmds associated
+  if (!allocs_indices_.empty()) {
+    alloc_to_cmds_.resize(allocs_indices_.back() + 1);
+    for (CommandId id = 0; id < cmd_allocs_indices_.size(); ++id) {
+      for (BufferAllocation::Index index : cmd_allocs_indices_[id]) {
+        alloc_to_cmds_[index].push_back(id);
+      }
+    }
+  }
 }
 
 absl::Status CommandExecutor::Prepare(const Thunk::PrepareParams& params) {
@@ -568,9 +579,7 @@ absl::Status CommandExecutor::RecordUpdate(
   }
 
   // Check if command `id` has to be updated based on the buffer allocations
-  // that changed since the last call to `Record`. We keep intersection vector
-  // outside of a lambda to avoid repeated heap allocations on every call.
-  std::vector<BufferAllocation::Index> alloc_intersection;
+  // that changed since the last call to `Record`.
   auto skip_command_update = [&](CommandId id) {
     // If we don't know what allocations changed since the last call to
     // `Record` we must always update the command.
