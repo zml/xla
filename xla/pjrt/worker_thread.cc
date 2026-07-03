@@ -15,7 +15,11 @@ limitations under the License.
 
 #include "xla/pjrt/worker_thread.h"
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "absl/functional/any_invocable.h"
@@ -25,6 +29,17 @@ limitations under the License.
 #include "xla/tsl/platform/env.h"
 
 namespace xla {
+namespace {
+
+void CpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
+}  // namespace
 
 WorkerThread::WorkerThread(tsl::Env* env, const std::string& name)
     : WorkerThread(env, tsl::ThreadOptions(), name) {}
@@ -58,7 +73,13 @@ bool WorkerThread::WorkAvailable() { return !work_queue_.empty(); }
 void WorkerThread::WorkLoop() {
   absl::MutexLock lock(mu_);
   while (true) {
-    mu_.Await(absl::Condition(this, &WorkerThread::WorkAvailable));
+    while (!WorkAvailable()) {
+      mu_.unlock();
+      for (int i = 0; i < 256; ++i) {
+        CpuRelax();
+      }
+      mu_.lock();
+    }
     {
       // We must be careful to call fn's dtor when the lock is unlocked.
       absl::AnyInvocable<void() &&> fn = std::move(work_queue_.front());

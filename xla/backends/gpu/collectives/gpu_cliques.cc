@@ -864,7 +864,7 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   }
 
   CliqueCacheKey cache_key(collectives, clique_key);
-  if (enable_steady_state_fast_path && !split_from) {
+  if (enable_steady_state_fast_path) {
     ProcessGpuCliques& state = GetProcessGpuCliques();
     absl::MutexLock lock(state.mu);
 
@@ -883,10 +883,6 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
       }
     }
 
-    state.steady_state_locks.erase(cache_key);
-  } else if (split_from) {
-    ProcessGpuCliques& state = GetProcessGpuCliques();
-    absl::MutexLock lock(state.mu);
     state.steady_state_locks.erase(cache_key);
   }
 
@@ -1004,7 +1000,7 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   if (*clique) {
     VLOG(3) << absl::StrFormat("[%d] [rank=%v] Acquired existing clique %v",
                                device->device_ordinal(), rank, clique_key);
-    if (enable_steady_state_fast_path && !split_from) {
+    if (enable_steady_state_fast_path) {
       ProcessGpuCliques& state = GetProcessGpuCliques();
       absl::MutexLock lock(state.mu);
       state.steady_state_locks[cache_key] = clique;
@@ -1026,9 +1022,16 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   config.use_minimal_resource = use_minimal_resource;
   // Split from the already acquired clique.
   if (split_from) {
-    return InitializeGpuClique(collectives, device, run_id, clique_key,
-                               split_from, num_local_participants, rank,
-                               config);
+    ASSIGN_OR_RETURN(std::shared_ptr<LockableGpuClique::Lock> initialized,
+                     InitializeGpuClique(collectives, device, run_id, clique_key,
+                                         split_from, num_local_participants, rank,
+                                         config));
+    if (enable_steady_state_fast_path && *initialized) {
+      ProcessGpuCliques& state = GetProcessGpuCliques();
+      absl::MutexLock lock(state.mu);
+      state.steady_state_locks[cache_key] = initialized;
+    }
+    return initialized;
   }
 
   // If we can't split any of the acquired cliques, create a new one.

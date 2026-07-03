@@ -1872,7 +1872,12 @@ CommonPjRtLoadedExecutable::Execute(
                   options,
                   /*host_callback_idx=*/i);
               // Wait for prepare to finish on all cores.
-              if (client()->supports_two_phase_launch()) {
+              // Experimental steady-state inference path: avoid the per-device
+              // prepare barrier that otherwise shows up as a futex between
+              // small XLA module launches. This assumes Prepare does not fail.
+              static constexpr bool kSkipTwoPhaseLaunchPrepareBarrier = true;
+              if (client()->supports_two_phase_launch() &&
+                  !kSkipTwoPhaseLaunchPrepareBarrier) {
                 absl::MutexLock lock(mu);
                 preparing--;
                 auto done_preparing = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu) {
