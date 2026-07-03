@@ -169,7 +169,7 @@ absl::Status AllToAllThunk::Initialize(const InitializeParams& params) {
         clique_key.rank(params.collective_params->global_device_id);
     size_t chunk_element_count = buffers()[0].element_count / num_ranks;
     ASSIGN_OR_RETURN(
-        std::vector<DeviceBufferPair> device_buffers,
+        DeviceBufferPairs device_buffers,
         ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                config_.config.operand_element_type));
     if (config_.has_split_dimension) {
@@ -225,7 +225,7 @@ absl::Status AllToAllThunk::RunCollective(const ExecuteParams& params,
                                           const GpuCliqueKey& clique_key,
                                           se::Stream& stream,
                                           Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
 
@@ -300,8 +300,7 @@ absl::StatusOr<ThunkProto> AllToAllThunk::ToProto() const {
   return proto;
 }
 
-absl::Status RunAllToAll(bool has_split_dimension,
-                         std::vector<DeviceBufferPair>& buffers,
+absl::Status RunAllToAll(bool has_split_dimension, DeviceBufferPairs& buffers,
                          se::Stream& stream, Communicator& comm,
                          bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();
@@ -392,8 +391,8 @@ absl::Status SyncProgress(absl::string_view name,
 }
 
 absl::Status RunMemCpyAllToAll(bool has_split_dimension,
-                               std::vector<DeviceBufferPair>& buffers,
-                               se::Stream& stream, Communicator& comm,
+                               DeviceBufferPairs& buffers, se::Stream& stream,
+                               Communicator& comm,
                                uint64_t receive_pointer_map[],
                                const GpuCliqueKey& clique_key, RankId rank,
                                se::Event* event,

@@ -130,7 +130,7 @@ absl::StatusOr<ThunkProto> CollectiveBroadcastThunk::ToProto() const {
 absl::Status CollectiveBroadcastThunk::RunCollective(
     const ExecuteParams& params, const GpuCliqueKey& clique_key,
     se::Stream& stream, Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.operand_element_type));
   CollectiveBroadcastMetadata* cb_metadata = nullptr;
@@ -143,7 +143,7 @@ absl::Status CollectiveBroadcastThunk::RunCollective(
                                             cb_metadata);
 }
 
-absl::Status RunCollectiveBroadcast(std::vector<DeviceBufferPair>& buffers,
+absl::Status RunCollectiveBroadcast(DeviceBufferPairs& buffers,
                                     se::Stream& stream, Communicator& comm,
                                     CollectiveBroadcastMetadata* cb_metadata,
                                     bool has_dynamic_root) {

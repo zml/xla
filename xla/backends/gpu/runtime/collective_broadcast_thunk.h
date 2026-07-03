@@ -90,7 +90,7 @@ class CollectiveBroadcastThunk : public CollectiveThunk {
   bool has_dynamic_root_;
 };
 
-absl::Status RunCollectiveBroadcast(std::vector<DeviceBufferPair>& buffers,
+absl::Status RunCollectiveBroadcast(DeviceBufferPairs& buffers,
                                     se::Stream& stream, Communicator& comm,
                                     CollectiveBroadcastMetadata* cb_metadata,
                                     bool has_dynamic_root = false);
