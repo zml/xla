@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_thunk.pb.h"
 #include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/thunk.h"
+#include "xla/backends/gpu/runtime/traced_command_buffer.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/debug_options_flags.h"
@@ -423,30 +424,43 @@ absl::Status CollectiveThunk::ExecuteOnStream(const ExecuteParams& params) {
 absl::StatusOr<const se::CommandBuffer::Command*> CollectiveThunk::Record(
     const ExecuteParams& execute_params, const RecordParams& record_params,
     RecordAction record_action, se::CommandBuffer* command_buffer) {
-  std::unique_ptr<se::CommandBuffer> nested_cmd;
-  RETURN_IF_ERROR(RunWithCommAndRendezvous(
-      execute_params,
-      [&](const GpuCliqueKey& clique_key, Communicator& comm) -> absl::Status {
-        ASSIGN_OR_RETURN(nested_cmd,
-                         se::TraceCommandBufferFactory::Create(
-                             execute_params.stream->parent(),
-                             execute_params.command_buffer_trace_stream,
-                             [&](se::Stream* stream) {
-                               return RunCollective(execute_params, clique_key,
-                                                    *stream, comm);
-                             }));
-        return absl::OkStatus();
-      }));
+  auto traced_cmd = record_params.state.GetOrCreate<TracedCommandBuffer>(
+      this, command_buffer, [&] {
+        const auto& debug_options = xla::GetDebugOptionsFromFlags();
+        return std::make_unique<TracedCommandBuffer>(
+            this, buffer_uses(),
+            debug_options.xla_cmd_buffer_trace_cache_size());
+      });
 
-  RETURN_IF_ERROR(nested_cmd->SetPriority(se::StreamPriority::Highest));
+  ASSIGN_OR_RETURN(
+      se::CommandBuffer * nested_cmd,
+      traced_cmd->GetOrTraceCommandBuffer(
+          execute_params.buffer_allocations, execute_params.stream->parent(),
+          execute_params.command_buffer_trace_stream,
+          [&](se::Stream* stream) {
+            return RunWithCommAndRendezvous(
+                execute_params,
+                [&](const GpuCliqueKey& clique_key, Communicator& comm) {
+                  return RunCollective(execute_params, clique_key, *stream,
+                                       comm);
+                });
+          },
+          se::StreamPriority::Highest));
 
   if (auto* create = std::get_if<RecordCreate>(&record_action)) {
-    return command_buffer->CreateChildCommand(*nested_cmd,
-                                              create->dependencies);
+    TF_ASSIGN_OR_RETURN(
+        const se::CommandBuffer::Command* command,
+        command_buffer->CreateChildCommand(*nested_cmd, create->dependencies));
+    traced_cmd->SetRecordedChild(command, nested_cmd);
+    return command;
   }
   if (auto* update = std::get_if<RecordUpdate>(&record_action)) {
-    RETURN_IF_ERROR(
-        command_buffer->UpdateChildCommand(update->command, *nested_cmd));
+    if (traced_cmd->RecordedChildIsCurrent(update->command, nested_cmd)) {
+      return update->command;
+    }
+    RETURN_IF_ERROR(command_buffer->UpdateChildCommand(update->command,
+                                                       *nested_cmd));
+    traced_cmd->SetRecordedChild(update->command, nested_cmd);
     return update->command;
   }
   return Internal("Invalid record action");
