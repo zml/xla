@@ -775,6 +775,7 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
                    AcquireCollectiveMemory(
                        collective_params, collective_cliques,
                        collective_memory_requests, collective_memory_cache));
+  bool requires_initialization_rendezvous = false;
   {  // Initialize thunks using prepared resources before execution.
     Thunk::InitializeParams initialize_params{
         executor,
@@ -787,18 +788,18 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
         &collective_memory,
         run_options->run_options().ffi_execution_context(),
         run_options->local_device_count(),
-        &execution_scoped_state};
+        &execution_scoped_state,
+        &requires_initialization_rendezvous};
 
     tsl::profiler::TraceMe trace_initialize("Thunks::Initialize");
     RETURN_IF_ERROR(thunk_executor.Initialize(initialize_params));
   }
 
-  // Join a round of rendezvous after thunk initialization. We do this only in
-  // presence of newly acquired collective cliques which means that we have
-  // collective operations and clique initialization is famous for introducing
-  // deadlocks if we try to execute it concurrently with other potentially
-  // memory-allocating operations.
-  if (!collective_cliques.empty()) {
+  // Join a round of rendezvous after thunk initialization if it instantiated
+  // on-device control state. This keeps CUDA graph initialization ordered with
+  // respect to collective execution, while avoiding the rendezvous on steady
+  // state executions that only reuse already initialized state.
+  if (requires_initialization_rendezvous && !collective_cliques.empty()) {
     RETURN_IF_ERROR(RendezvousAfterInitialization(*run_options, debug_options));
   }
 

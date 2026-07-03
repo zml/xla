@@ -155,35 +155,19 @@ class CommandExecutor {
   size_t size() const { return commands_.size(); }
 
   bool requires_update_on_initialize() const {
-    bool requires_update_on_initialize = false;
-    commands_.Walk([&](const Command* command) {
-      requires_update_on_initialize |= command->requires_update_on_initialize();
-    });
-    return requires_update_on_initialize;
+    return requires_update_on_initialize_;
   }
 
   bool requires_warmup() const {
-    bool requires_warmup = false;
-    commands_.Walk([&](const Command* command) {
-      requires_warmup |= command->requires_warmup();
-    });
-    return requires_warmup;
+    return requires_warmup_;
   }
 
   bool requires_update_on_execute() const {
-    bool requires_update_on_execute = false;
-    commands_.Walk([&](const Command* command) {
-      requires_update_on_execute |= command->requires_update_on_execute();
-    });
-    return requires_update_on_execute;
+    return requires_update_on_execute_;
   }
 
   bool support_loop_unroll() const {
-    bool support_loop_unroll = true;
-    commands_.Walk([&](const Command* command) {
-      support_loop_unroll &= command->support_loop_unroll();
-    });
-    return support_loop_unroll;
+    return support_loop_unroll_;
   }
 
   // Renders the execution graph using default renderer. Returns url of the
@@ -268,6 +252,11 @@ class CommandExecutor {
 
   // A mapping from buffer allocation index to command ids that reference it.
   std::vector<std::vector<CommandId>> alloc_to_cmds_;
+
+  bool requires_update_on_initialize_ = false;
+  bool requires_warmup_ = false;
+  bool requires_update_on_execute_ = false;
+  bool support_loop_unroll_ = true;
 
   // Per-command extra resource uses passed at construction time (e.g.
   // control-dependency tokens from the emitter). Stored so that

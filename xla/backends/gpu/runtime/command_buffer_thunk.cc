@@ -216,6 +216,10 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
           se::CommandBuffer::State::kCreate ||
       (command_buffer_update_mode_ != DebugOptions::NEVER_UPDATE &&
        commands_.requires_update_on_initialize())) {
+    if (params.requires_initialization_rendezvous != nullptr) {
+      *params.requires_initialization_rendezvous = true;
+    }
+
     VLOG(3) << "Initialize command buffer on device #"
             << params.executor->device_ordinal()
             << " by recoding command buffer cmd sequence"

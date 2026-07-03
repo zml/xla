@@ -264,6 +264,11 @@ class Thunk {
 
     // Execution scoped state shared between prepare, initialize and execute.
     ExecutionScopedState* execution_scoped_state = nullptr;
+
+    // Set by thunks when initialization instantiated or updated on-device
+    // control state that must be observed by all local participants before
+    // execution starts.
+    bool* requires_initialization_rendezvous = nullptr;
   };
 
   //===--------------------------------------------------------------------===//
