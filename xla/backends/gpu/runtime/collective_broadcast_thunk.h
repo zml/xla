@@ -78,7 +78,7 @@ class CollectiveBroadcastThunk : public CollectiveThunk {
   const CollectiveConfig config_;
 };
 
-absl::Status RunCollectiveBroadcast(std::vector<DeviceBufferPair>& buffers,
+absl::Status RunCollectiveBroadcast(DeviceBufferPairs& buffers,
                                     se::Stream& stream, Communicator& comm);
 
 }  // namespace xla::gpu

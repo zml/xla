@@ -87,9 +87,8 @@ AllReduceConfig GetAllReduceConfigInst(
 }
 
 absl::Status RunAllReduce(ReductionKind reduction_kind,
-                          std::vector<DeviceBufferPair>& buffers,
-                          se::Stream& stream, Communicator& comm,
-                          bool use_symmetric_buffer) {
+                          DeviceBufferPairs& buffers, se::Stream& stream,
+                          Communicator& comm, bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();
   XLA_VLOG_DEVICE(3, device_ordinal) << "Performing all-reduce";
   auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
@@ -143,7 +142,7 @@ absl::Status AllReduceThunk::RunCollective(const ExecuteParams& params,
                                            const GpuCliqueKey& clique_key,
                                            se::Stream& stream,
                                            Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
 
@@ -261,7 +260,7 @@ absl::Status ReduceScatterThunk::RunCollective(const ExecuteParams& params,
                                                const GpuCliqueKey& clique_key,
                                                se::Stream& stream,
                                                Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
   return RunReduceScatter(config_.reduction_kind, device_buffers, stream, comm,
@@ -269,9 +268,8 @@ absl::Status ReduceScatterThunk::RunCollective(const ExecuteParams& params,
 }
 
 absl::Status RunReduceScatter(ReductionKind reduction_kind,
-                              std::vector<DeviceBufferPair>& buffers,
-                              se::Stream& stream, Communicator& comm,
-                              bool use_symmetric_buffer) {
+                              DeviceBufferPairs& buffers, se::Stream& stream,
+                              Communicator& comm, bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();
   XLA_VLOG_DEVICE(3, device_ordinal) << "Performing reduce-scatter";
 

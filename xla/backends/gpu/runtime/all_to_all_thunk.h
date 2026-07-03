@@ -110,14 +110,13 @@ class AllToAllThunk : public CollectiveThunk {
       ABSL_GUARDED_BY(events_mutex_);
 };
 
-absl::Status RunAllToAll(bool has_split_dimension,
-                         std::vector<DeviceBufferPair>& buffers,
+absl::Status RunAllToAll(bool has_split_dimension, DeviceBufferPairs& buffers,
                          se::Stream& stream, Communicator& comm,
                          bool use_symmetric_buffer = false);
 
 absl::Status RunMemCpyAllToAll(bool has_split_dimension,
-                               std::vector<DeviceBufferPair>& buffers,
-                               se::Stream& stream, Communicator& comm,
+                               DeviceBufferPairs& buffers, se::Stream& stream,
+                               Communicator& comm,
                                uint64_t receive_pointer_map[],
                                const GpuCliqueKey& clique_key, RankId rank,
                                se::Event* event,

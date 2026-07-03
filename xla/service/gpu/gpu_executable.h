@@ -374,6 +374,11 @@ class GpuExecutable : public Executable {
     return ModuleAnnotations(module_name_);
   }();
 
+  // Cached result of scanning the HLO module for synchronous/asynchronous
+  // collective size heuristics. The module is immutable after construction,
+  // so this does not need to be recomputed for every execution.
+  absl::StatusOr<bool> collective_use_minimal_resource_ = false;
+
   int64_t debug_buffer_assignment_show_max_;
 
   // Cache previous memory allocations for current module, this is used to help

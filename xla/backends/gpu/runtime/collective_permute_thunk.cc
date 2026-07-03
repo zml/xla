@@ -84,12 +84,12 @@ struct Events {
 
 static absl::Status RunPeerAccessPermute(
     const P2PConfig::SourceTargetRanks& source_target,
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params);
 
 static absl::Status RunOneSidedPermute(
     const P2PConfig::SourceTargetRanks& source_target,
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
     Communicator& comm);
 
@@ -282,7 +282,7 @@ absl::Status CollectivePermuteThunk::RunCollective(
   int device_ordinal = stream.parent()->device_ordinal();
 
   ASSIGN_OR_RETURN(
-      std::vector<DeviceBufferPair> device_buffers,
+      DeviceBufferPairs device_buffers,
       ConvertToDeviceBuffers(params.buffer_allocations,
                              std::vector<CollectiveThunk::Buffer>(buffers()),
                              config_.config.operand_element_type));
@@ -333,7 +333,7 @@ absl::Status CollectivePermuteThunk::RunCollective(
 }
 
 absl::Status RunCollectivePermute(P2PConfig::SourceTargetRanks source_target,
-                                  const std::vector<DeviceBufferPair>& buffers,
+                                  const DeviceBufferPairs& buffers,
                                   se::Stream& stream, Communicator& comm,
                                   absl::string_view device_string,
                                   int64_t current_id,
@@ -407,7 +407,7 @@ absl::Status RunCollectivePermute(P2PConfig::SourceTargetRanks source_target,
 // RequestPeerAllocation in PrepareCollective).
 static absl::Status RunPeerAccessPermute(
     const P2PConfig::SourceTargetRanks& source_target,
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params) {
   GlobalDeviceId gid = params.collective_params->global_device_id;
   std::optional<RankId> rank = clique_key.rank(gid);
@@ -504,7 +504,7 @@ static absl::Status RunPeerAccessPermute(
 // NCCL's cumulative signal counter ensures correct ordering across invocations.
 static absl::Status RunOneSidedPermute(
     const P2PConfig::SourceTargetRanks& source_target,
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
     Communicator& comm) {
   int device_ordinal = stream.parent()->device_ordinal();

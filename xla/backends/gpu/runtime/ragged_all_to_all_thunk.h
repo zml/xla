@@ -236,7 +236,7 @@ RendezvousResources(int device_ordinal, RankId rank,
 //    destination offsets will be written.
 absl::Status RunRaggedAllToAll(
     int64_t ragged_row_element_size, int64_t num_total_updates,
-    const std::vector<DeviceBufferPair>& original_buffers, se::Stream& stream,
+    const DeviceBufferPairs& original_buffers, se::Stream& stream,
     Communicator& comm, absl::Span<int64_t* const> ragged_metadata_allocs,
     const se::DeviceAddressBase& output_offsets_device_buffer,
     CollectiveThunk::CollectivesMode collectives_mode,

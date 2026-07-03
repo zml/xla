@@ -71,7 +71,7 @@ class DirectAllReduceThunk : public AllReduceReduceScatterThunkBase {
                              const GpuCliqueKey& /*clique_key*/,
                              se::Stream& stream, Communicator& comm) override {
     ASSIGN_OR_RETURN(
-        std::vector<DeviceBufferPair> device_buffers,
+        DeviceBufferPairs device_buffers,
         ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                config_.config.operand_element_type));
     return RunAllReduce(config_.reduction_kind, device_buffers, stream, comm,

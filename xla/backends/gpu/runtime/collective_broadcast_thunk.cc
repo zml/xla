@@ -110,13 +110,13 @@ absl::StatusOr<ThunkProto> CollectiveBroadcastThunk::ToProto() const {
 absl::Status CollectiveBroadcastThunk::RunCollective(
     const ExecuteParams& params, const GpuCliqueKey& clique_key,
     se::Stream& stream, Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.operand_element_type));
   return ::xla::gpu::RunCollectiveBroadcast(device_buffers, stream, comm);
 }
 
-absl::Status RunCollectiveBroadcast(std::vector<DeviceBufferPair>& buffers,
+absl::Status RunCollectiveBroadcast(DeviceBufferPairs& buffers,
                                     se::Stream& stream, Communicator& comm) {
   auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
   Future<> future = gpu_comm->GroupExecute([&]() -> absl::Status {

@@ -101,7 +101,7 @@ class CollectivePermuteThunk : public CollectiveThunk {
 };
 
 absl::Status RunCollectivePermute(P2PConfig::SourceTargetRanks source_target,
-                                  const std::vector<DeviceBufferPair>& buffers,
+                                  const DeviceBufferPairs& buffers,
                                   se::Stream& stream, Communicator& comm,
                                   absl::string_view device_string,
                                   int64_t current_id,

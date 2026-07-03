@@ -502,7 +502,7 @@ absl::StatusOr<RaggedAllToAllStreamState*> RaggedAllToAllThunk::InitializeOnce(
         state->barrier_signal_value->address()));
 
     ASSIGN_OR_RETURN(
-        std::vector<DeviceBufferPair> device_buffers,
+        DeviceBufferPairs device_buffers,
         ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                config_.config.operand_element_type));
   }
@@ -544,7 +544,7 @@ absl::Status RaggedAllToAllThunk::Initialize(const InitializeParams& params) {
   } else if (is_local(params.local_device_count)) {
     // Rendezvous - Exchange output pointers and barrier signal buffers.
     ASSIGN_OR_RETURN(
-        std::vector<DeviceBufferPair> device_buffers,
+        DeviceBufferPairs device_buffers,
         ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                config_.config.operand_element_type));
 
@@ -637,7 +637,7 @@ absl::StatusOr<const se::CommandBuffer::Command*> RaggedAllToAllThunk::Record(
       << "Failed to get or create RaggedAllToAllCommandState";
 
   ASSIGN_OR_RETURN(
-      std::vector<DeviceBufferPair> device_buffers,
+      DeviceBufferPairs device_buffers,
       ConvertToDeviceBuffers(execute_params.buffer_allocations, buffers(),
                              config_.config.operand_element_type));
 
@@ -754,7 +754,7 @@ absl::Status RaggedAllToAllThunk::RunCollective(const ExecuteParams& params,
                                                 const GpuCliqueKey& clique_key,
                                                 se::Stream& stream,
                                                 Communicator& comm) {
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
 
@@ -892,7 +892,7 @@ absl::Status RaggedAllToAllThunk::PrepareCollective(
 
 absl::Status RunRaggedAllToAll(
     int64_t ragged_row_element_size, int64_t num_total_updates,
-    const std::vector<DeviceBufferPair>& original_buffers, se::Stream& stream,
+    const DeviceBufferPairs& original_buffers, se::Stream& stream,
     Communicator& comm, absl::Span<int64_t* const> ragged_metadata_allocs,
     const se::DeviceAddressBase& output_offsets_device_buffer,
     CollectiveThunk::CollectivesMode collectives_mode,
@@ -915,7 +915,7 @@ absl::Status RunRaggedAllToAll(
         ragged_row_element_size, num_total_updates, rank);
   }
 
-  std::vector<DeviceBufferPair> buffers = original_buffers;
+  DeviceBufferPairs buffers = original_buffers;
 
   int64_t num_updates_per_replica = num_total_updates / num_ranks;
 
