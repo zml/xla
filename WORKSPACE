@@ -1,6 +1,41 @@
 # buildifier: disable=load-on-top
 workspace(name = "xla")
 
+new_local_repository(
+    name = "local_hrx_runtime",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "libamdhip64_so",
+    srcs = ["libhrx/src/binding/hip/libamdhip64.so"],
+)
+
+genrule(
+    name = "libamdhip64_so_7_copy",
+    srcs = ["libhrx/src/binding/hip/libamdhip64.so"],
+    outs = ["libamdhip64.so.7"],
+    cmd = "cp $< $@",
+)
+
+filegroup(
+    name = "libamdhip64_so_7",
+    srcs = [":libamdhip64_so_7_copy"],
+)
+
+filegroup(
+    name = "libhrx_so",
+    srcs = ["libhrx/src/libhrx/libhrx.so"],
+)
+
+exports_files([
+    "libhrx/src/binding/hip/libamdhip64.so",
+    "libhrx/src/libhrx/libhrx.so",
+])
+""",
+    path = "/home/hugo/hrx-system/bazel-bin",
+)
+
 # Initialize the XLA repository and all dependencies.
 #
 # The cascade of load() statements and xla_workspace?() calls works around the
@@ -18,6 +53,7 @@ xla_workspace3()
 
 # Initialize hermetic C++
 load("@rules_ml_toolchain//cc/deps:cc_toolchain_deps.bzl", "cc_toolchain_deps")
+load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 
 cc_toolchain_deps()
 
@@ -32,6 +68,28 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_rocm")
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64_cuda")
+
+HERMETIC_CC_TOOLCHAIN_VERSION = "v3.1.1"
+
+tf_http_archive(
+    name = "hermetic_cc_toolchain",
+    sha256 = "907745bf91555f77e8234c0b953371e6cac5ba715d1cf12ff641496dd1bce9d1",
+    urls = [
+        "https://mirror.bazel.build/github.com/uber/hermetic_cc_toolchain/releases/download/{0}/hermetic_cc_toolchain-{0}.tar.gz".format(HERMETIC_CC_TOOLCHAIN_VERSION),
+        "https://github.com/uber/hermetic_cc_toolchain/releases/download/{0}/hermetic_cc_toolchain-{0}.tar.gz".format(HERMETIC_CC_TOOLCHAIN_VERSION),
+    ],
+)
+
+load("@hermetic_cc_toolchain//toolchain:defs.bzl", zig_toolchains = "toolchains")
+
+# Plain zig_toolchains() will pick reasonable defaults. See
+# toolchain/defs.bzl:toolchains on how to change the Zig SDK version and
+# download URL.
+zig_toolchains()
+
+register_toolchains(
+    "@zig_sdk//toolchain:linux_amd64_gnu.2.31",
+)
 
 # Initialize hermetic Python
 load("//third_party/py:python_init_rules.bzl", "python_init_rules")

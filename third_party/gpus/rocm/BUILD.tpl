@@ -145,13 +145,14 @@ alias(
 
 rocm_lib_import(
     name = "hip_runtime",
-    data = glob(
-        [
-            "%{rocm_root}/lib/libamdhip64.so*",
-            "%{rocm_root}/lib/librocm_kpack.so*",
-        ],
-    ),
-    interface_library = "%{rocm_root}/lib/libamdhip64.so",
+    data = [
+        "@local_hrx_runtime//:libamdhip64_so",
+        "@local_hrx_runtime//:libamdhip64_so_7",
+        "@local_hrx_runtime//:libhrx_so",
+    ] + glob([
+        "%{rocm_root}/lib/librocm_kpack.so*",
+    ]),
+    interface_library = "@local_hrx_runtime//:libamdhip64_so_7",
     deps = [
         ":amd_comgr_libs",
         ":hiprtc_libs",
