@@ -214,6 +214,29 @@ void PromoteEntryBuffersToDevice(mlir::ModuleOp module_op) {
         }
       }
     });
+    // (3) Propagate addrspace(1) across builtin.unrealized_conversion_cast whose
+    // ptr result is addrspace(0) but whose single-input cast chain roots at an
+    // addrspace(1) value (a promoted entry buffer). The sub-byte atomic store
+    // reaches its byte via ptr(1)->tensor<i4>->tensor<i8>->ptr(0) casts (the
+    // middle element-type reinterpret blocks the plain canonicalizer round-trip
+    // fold); leaving the final ptr at addrspace(0) both defeats
+    // reconcile-unrealized-casts (mismatched ptr endpoints -> the cast survives
+    // to LLVM translation) and points the atomic at private memory. Retyping the
+    // ptr result to addrspace(1) lets rule (1) promote the dependent GEP/atomic
+    // chain and lets reconcile close the round trip.
+    module_op.walk([&](mlir::UnrealizedConversionCastOp ucc) {
+      if (ucc.getNumResults() != 1 || ucc.getInputs().size() != 1) return;
+      if (addr_space_of(ucc.getResult(0).getType()) != 0) return;
+      mlir::Value v = ucc.getInputs()[0];
+      while (auto def = v.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (def.getInputs().size() != 1) return;
+        v = def.getInputs()[0];
+      }
+      if (addr_space_of(v.getType()) == 1) {
+        ucc.getResult(0).setType(ptr1);
+        changed = true;
+      }
+    });
   }
 }
 
@@ -390,6 +413,81 @@ void RewriteMathToAir(mlir::ModuleOp module_op) {
       }
     });
     for (mlir::Operation* op : to_erase) op->erase();
+  });
+}
+
+// Metal/AIR: Apple's AIR has no native LLVM `cmpxchg`/`atomicrmw` — device
+// atomics are call-based builtins (air.atomic.global.*), the exact form the
+// Apple metal frontend emits for MSL `atomic_*_explicit` (verified by compiling
+// a device atomic_compare_exchange_weak_explicit: it lowers to
+//   i32 @air.atomic.global.cmpxchg.weak.i32(
+//       i32 addrspace(1)* ptr, i32* expected, i32 desired,
+//       i32 success_order, i32 failure_order, i32 scope, i1 weak)
+// returning the value found in memory). The emitter's rewriteAsAtomicCAS
+// (lower_tensors.cc) hand-produces a raw `llvm.cmpxchg` for the sub-byte / small
+// atomic store CAS loop, which air-as/AGX reject. Rewrite each such cmpxchg to
+// the air call: stash `cmp` in a per-function alloca, call the builtin with
+// relaxed orders (0) + device scope (2) + weak=true, then rebuild the
+// {old, success} struct its users read (success = old == cmp). Runs after
+// FixupAirPointerAddrSpaces so the device pointer is already addrspace(1).
+// TODO: `llvm.atomicrmw` / atomic `llvm.load`/`llvm.store` (scatter-add, xchg)
+// are not lowered here yet — add air.atomic.global.<op>.<signedness>.<ty> when a
+// Metal path first emits them.
+void RewriteAtomicsToAir(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto i32 = mlir::IntegerType::get(ctx, 32);
+  auto i1 = mlir::IntegerType::get(ctx, 1);
+  auto ptr0 = mlir::LLVM::LLVMPointerType::get(ctx, 0);
+  auto ptr1 = mlir::LLVM::LLVMPointerType::get(ctx, 1);
+  auto get_decl = [&]() -> mlir::LLVM::LLVMFuncOp {
+    llvm::StringRef name = "air.atomic.global.cmpxchg.weak.i32";
+    if (auto f = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) return f;
+    mlir::OpBuilder b = mlir::OpBuilder::atBlockBegin(module_op.getBody());
+    auto fty = mlir::LLVM::LLVMFunctionType::get(
+        i32, {ptr1, ptr0, i32, i32, i32, i32, i1}, /*isVarArg=*/false);
+    return b.create<mlir::LLVM::LLVMFuncOp>(module_op.getLoc(), name, fty);
+  };
+  // Runs before the func/arith->LLVM conversion, so functions are still
+  // func::FuncOp (like the other imperative Metal rewrites); the CAS loop is
+  // already cf/llvm (SCFToControlFlow ran) with the cmpxchg as an llvm op.
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (fn.getBody().empty()) return;
+    llvm::SmallVector<mlir::LLVM::AtomicCmpXchgOp> ops;
+    fn.walk([&](mlir::LLVM::AtomicCmpXchgOp op) { ops.push_back(op); });
+    if (ops.empty()) return;
+    // One private slot per function, hoisted to the entry block so a CAS retry
+    // loop does not grow the stack. Each CAS stores its own `cmp` before calling.
+    mlir::OpBuilder eb = mlir::OpBuilder::atBlockBegin(&fn.getBody().front());
+    mlir::Value one = eb.create<mlir::LLVM::ConstantOp>(fn.getLoc(), i32,
+                                                        eb.getI32IntegerAttr(1));
+    mlir::Value expected_slot = eb.create<mlir::LLVM::AllocaOp>(
+        fn.getLoc(), ptr0, i32, one, /*alignment=*/4);
+    mlir::LLVM::LLVMFuncOp decl = get_decl();
+    for (auto op : ops) {
+      mlir::OpBuilder b(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value cmp = op.getCmp();
+      auto c0 = b.create<mlir::LLVM::ConstantOp>(loc, i32, b.getI32IntegerAttr(0));
+      auto c2 = b.create<mlir::LLVM::ConstantOp>(loc, i32, b.getI32IntegerAttr(2));
+      auto weak =
+          b.create<mlir::LLVM::ConstantOp>(loc, i1, b.getIntegerAttr(i1, 1));
+      b.create<mlir::LLVM::StoreOp>(loc, cmp, expected_slot);
+      auto call = b.create<mlir::LLVM::CallOp>(
+          loc, decl,
+          mlir::ValueRange{op.getPtr(), expected_slot, op.getVal(), c0, c0, c2,
+                           weak});
+      mlir::Value old = call.getResult();
+      mlir::Value success = b.create<mlir::LLVM::ICmpOp>(
+          loc, mlir::LLVM::ICmpPredicate::eq, old, cmp);
+      mlir::Type struct_ty = op.getResult().getType();
+      mlir::Value s = b.create<mlir::LLVM::UndefOp>(loc, struct_ty);
+      s = b.create<mlir::LLVM::InsertValueOp>(loc, s, old,
+                                              llvm::ArrayRef<int64_t>{0});
+      s = b.create<mlir::LLVM::InsertValueOp>(loc, s, success,
+                                              llvm::ArrayRef<int64_t>{1});
+      op.getResult().replaceAllUsesWith(s);
+      op.erase();
+    }
   });
 }
 
@@ -577,6 +675,7 @@ class LowerToLLVMGPUPass
           RewriteGpuWarpOpsToAir(module_op);
           RewriteMathToAir(module_op);
           FixupAirPointerAddrSpaces(module_op);
+          RewriteAtomicsToAir(module_op);
         }
       } else {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);

@@ -286,16 +286,21 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
       return rewriter.notifyMatchFailure(op, "not a vectorizable loop");
     }
 
-    // Disable vectorization for sub-byte types (4/2-bit) on Intel GPUs. These
-    // types are packed (e.g., 2 int4s per byte) and are currently not
-    // supported in the LLVM SPIR-V backend as vector load operations.
+    // Disable vectorization for sub-byte types (4/2-bit) on Intel and Metal.
+    // These types are packed (e.g. 2 int4s per byte); a vector LOAD materializes
+    // an <N x iW> value, which the LLVM SPIR-V backend (Intel) does not support
+    // and which the Apple GPU shader compiler (Metal/AIR) crashes on at pipeline
+    // creation. A vector load can't be packed away like the store (the consumer
+    // needs the vector), so fall back to scalar tensor.extract (load i8 + shift +
+    // trunc, no sub-byte vector). Sub-byte vector STORES stay vectorized on Metal
+    // (RewriteTransferWrite packs them to a single i8 store — see lower_tensors).
     auto element_type = vector_type.getElementType();
-    if (device_spec_.IsIntelGpu() && element_type.isIntOrFloat()) {
+    if ((device_spec_.IsIntelGpu() || device_spec_.IsMetal()) &&
+        element_type.isIntOrFloat()) {
       int bit_width = element_type.getIntOrFloatBitWidth();
       if (bit_width == 2 || bit_width == 4) {
         return rewriter.notifyMatchFailure(
-            op,
-            "sub-byte types are not supported for vector loads on Intel GPU");
+            op, "sub-byte types are not supported for vector loads on this GPU");
       }
     }
 
