@@ -196,6 +196,12 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitMetalKvWriteThunk(
       const HloCustomCallInstruction* hlo);
 
+  // Backend-generated "metal$sort" (RewriteSortToMetalThunk): a generic Sort
+  // routed to the native MLX merge sort (the legacy LLVM bitonic emitter emits
+  // NVVM that air-as cannot assemble).
+  absl::StatusOr<ThunkSequence> EmitMetalSortThunk(
+      const HloCustomCallInstruction* hlo);
+
   // zml's Gated DeltaNet recurrence "zml$gdn": the vendored vllm-metal
   // recurrent delta-rule linear-attention kernel (Qwen3-Next hybrid models).
   absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(

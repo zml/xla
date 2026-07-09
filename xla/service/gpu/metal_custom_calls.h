@@ -98,6 +98,23 @@ inline bool IsMetalMoeGemmBf16(const HloInstruction& hlo) {
          hlo.custom_call_target() == kMetalMoeGemmCallTarget;
 }
 
+// A native keyed stable sort on Apple Metal. Generic Sort has no lowerable Metal
+// path -- the legacy LLVM bitonic emitter produces NVVM intrinsics that air-as
+// cannot assemble -- so RewriteSortToMetalThunk rewrites a stablehlo Sort that
+// sorts by ONE float key (bf16/f16/f32) along the minor-most axis, carrying iota
+// index operands, into this call:
+//   {values[rows, n]} -> (sorted_values[rows, n], sorted_indices[rows, n] s32)
+// The permuted indices reproduce every iota result of the original Sort (all
+// iota operands are arange along the sort axis). `opaque` is "desc" (descending)
+// or "asc". ThunkEmitter routes it to MetalSortThunk (the vendored MLX merge
+// sort). Stable: ties keep index-ascending order == XLA is_stable.
+inline constexpr absl::string_view kMetalSortCallTarget = "metal$sort";
+
+inline bool IsMetalSort(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kMetalSortCallTarget;
+}
+
 }  // namespace gpu
 }  // namespace xla
 

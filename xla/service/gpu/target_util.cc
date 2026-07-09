@@ -467,12 +467,28 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
                std::function<llvm::CallInst*(llvm::IRBuilderBase*)>>
       llvm_intrinsic_or_function;
   llvm::Triple target_triple = llvm::Triple(module->getTargetTriple());
-  if (target_triple.isNVPTX() || IsMetalAir(target_triple)) {
+  if (target_triple.isNVPTX()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.nvptx_intrinsic_or_function;
   } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.amdgpu_intrinsic_or_function;
   } else if (target_triple.isSPIROrSPIRV()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.spir_intrinsic_or_function;
+  } else if (IsMetalAir(target_triple)) {
+    // Apple AIR has NO callable thread/block-id or barrier intrinsic (thread
+    // position is a kernel ARGUMENT, injected by the MLIR->AIR path's
+    // InjectAirThreadPositions). air64 was previously folded into the NVPTX arm,
+    // which silently emitted llvm.nvvm.* that air-as cannot assemble. The MLIR
+    // emitter path never reaches this function; the only callers are the legacy
+    // LLVM emitters (Sort -- now routed to metal$sort by RewriteSortToMetalThunk
+    // -- plus PadToStatic/SliceToDynamic, which static-shaped Metal programs do
+    // not emit). Reaching here means a legacy op slipped through: fail loudly and
+    // located rather than emit NVVM into AIR.
+    LOG(FATAL) << "Metal (air64) reached the legacy LLVM target-intrinsic path "
+                  "(intrinsic id "
+               << static_cast<int>(intrinsic_id)
+               << "); this op must be routed to a native Metal thunk (e.g. "
+                  "metal$sort) or lowered through the MLIR emitter -- refusing "
+                  "to emit NVVM into AIR.";
   } else {
     LOG(FATAL) << "Invalid triple " << target_triple.str();
   }

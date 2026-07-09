@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/metal_gpu_compiler.h"
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -40,7 +41,10 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_flash_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
+#include "xla/backends/gpu/runtime/metal_sort_thunk.h"
 #include "xla/backends/gpu/runtime/metal_topk_thunk.h"
+#include "xla/comparison_util.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
@@ -254,6 +258,7 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
   absl::flat_hash_set<std::tuple<int, int64_t, int64_t, int64_t>> paged_seen;
   absl::flat_hash_set<std::tuple<int64_t, int64_t, int64_t>> kvw_seen;
   absl::flat_hash_set<std::pair<int, int64_t>> topk_seen;
+  absl::flat_hash_set<std::pair<int, bool>> sort_seen;
   for (const HloComputation* comp : module->computations()) {
     for (const HloInstruction* instr : comp->instructions()) {
       if (instr->opcode() != HloOpcode::kCustomCall) continue;
@@ -317,6 +322,15 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
         const int64_t k = vals.dimensions(vals.dimensions().size() - 1);
         if (topk_seen.insert({dt, k}).second) {
           MetalTopKThunk::Prewarm(stream_exec, data.element_type(), k);
+        }
+      } else if (target == "metal$sort") {
+        if (instr->operand_count() != 1) continue;
+        const Shape& v = instr->operand(0)->shape();
+        const int dt = static_cast<int>(v.element_type());
+        const bool desc =
+            Cast<HloCustomCallInstruction>(instr)->opaque() == "desc";
+        if (sort_seen.insert({dt, desc}).second) {
+          MetalSortThunk::Prewarm(stream_exec, v.element_type(), desc);
         }
       }
     }
@@ -693,6 +707,191 @@ absl::StatusOr<bool> RewriteKvCacheWrites(HloModule* module) {
   return changed;
 }
 
+// A generic Sort on Metal is emitted only by the legacy LLVM bitonic emitter,
+// which cannot lower to valid AIR (it emits NVVM thread/block-id intrinsics via
+// target_util). RewriteSortToMetalThunk rewrites the ONE sort shape ZML and the
+// models emit -- a stable sort by a single FLOAT key along the minor-most
+// (contiguous) axis, carrying iota index operands -- into the native metal$sort
+// custom call (MLX merge sort). Anything else is left for the target_util
+// invariant guard to reject loudly (no ZML/model path emits it).
+//
+// Every iota operand's sorted result is the sort's index permutation, which is
+// exactly metal$sort's second output -- so all iota results map to output 1.
+bool IsMetalSortKeyType(PrimitiveType t) {
+  return t == BF16 || t == F16 || t == F32 || t == S32 || t == S16 || t == S8 ||
+         t == U32 || t == U16 || t == U8;
+}
+
+struct SortMatch {
+  HloInstruction* value_input;  // external key tensor
+  int64_t kidx;                 // which sort operand is the key
+  int64_t sort_dim;             // logical axis being sorted
+  bool descending;
+};
+
+std::optional<SortMatch> MatchMetalSort(HloInstruction* container) {
+  const HloSortInstruction* sort = nullptr;
+  bool fused = false;
+  if (container->opcode() == HloOpcode::kSort) {
+    sort = Cast<HloSortInstruction>(container);
+  } else if (container->opcode() == HloOpcode::kFusion &&
+             container->fused_expression_root()->opcode() == HloOpcode::kSort) {
+    sort = Cast<HloSortInstruction>(container->fused_expression_root());
+    fused = true;
+  } else {
+    return std::nullopt;
+  }
+  // Find the primary key compare in the comparator: Compare(param 2i, param
+  // 2i+1) on a FLOAT operand. This survives StableSortExpander, which rewrites
+  // the root to Select(Eq(orig, reversed_clone), iota_tiebreak, orig) -- the
+  // canonical `orig` compare (lhs param even, rhs = lhs+1) is still present,
+  // while the reversed clone (lhs odd) and the int iota tie-break are skipped.
+  // The NaN-select "numpy" form and multi-key comparators find no such compare
+  // and are left for the target_util guard.
+  const HloComputation* comp = sort->called_computations().front();
+  int64_t kidx = -1;
+  bool descending = false;
+  for (const HloInstruction* instr : comp->instructions()) {
+    if (instr->opcode() != HloOpcode::kCompare) continue;
+    const HloInstruction* l = instr->operand(0);
+    const HloInstruction* r = instr->operand(1);
+    if (l->opcode() != HloOpcode::kParameter ||
+        r->opcode() != HloOpcode::kParameter) {
+      continue;
+    }
+    const int64_t pl = l->parameter_number(), pr = r->parameter_number();
+    if (pl % 2 != 0 || pr != pl + 1) continue;  // canonical (non-reversed) pair
+    const PrimitiveType cet = sort->operand(pl / 2)->shape().element_type();
+    if (!IsMetalSortKeyType(cet)) continue;  // not the (float/int) key compare
+    kidx = pl / 2;
+    descending = instr->comparison_direction() == ComparisonDirection::kGt ||
+                 instr->comparison_direction() == ComparisonDirection::kGe;
+    break;
+  }
+  if (kidx < 0) return std::nullopt;
+
+  const Shape& kshape = sort->operand(kidx)->shape();
+  const int64_t rank = kshape.dimensions().size();
+  if (rank < 1) return std::nullopt;
+  // GPU layout assignment forces sorts to the default row-major layout, so the
+  // key is contiguous along its minor-most axis. A non-minor sort axis is handled
+  // by the rewrite with a transpose to/from minor.
+  if (kshape.has_layout() &&
+      !LayoutUtil::IsMonotonicWithDim0Major(kshape.layout())) {
+    return std::nullopt;
+  }
+  // Every non-key operand must be an iota along the sort axis (arange).
+  for (int64_t i = 0; i < sort->operand_count(); ++i) {
+    if (i == kidx) continue;
+    const HloInstruction* op = sort->operand(i);
+    if (op->opcode() != HloOpcode::kIota ||
+        Cast<HloIotaInstruction>(op)->iota_dimension() != sort->sort_dimension()) {
+      return std::nullopt;
+    }
+  }
+  HloInstruction* value_input = nullptr;
+  if (fused) {
+    const HloInstruction* kp = sort->operand(kidx);
+    if (kp->opcode() != HloOpcode::kParameter) return std::nullopt;
+    value_input = container->mutable_operand(kp->parameter_number());
+  } else {
+    value_input = container->mutable_operand(kidx);
+  }
+  return SortMatch{value_input, kidx, sort->sort_dimension(), descending};
+}
+
+absl::StatusOr<bool> RewriteSortToMetalThunk(HloModule* module) {
+  bool changed = false;
+  for (HloComputation* computation : module->MakeNonfusionComputations()) {
+    std::vector<HloInstruction*> containers;
+    for (HloInstruction* instr : computation->instructions()) {
+      if (instr->opcode() == HloOpcode::kSort ||
+          (instr->opcode() == HloOpcode::kFusion &&
+           instr->fused_expression_root()->opcode() == HloOpcode::kSort)) {
+        containers.push_back(instr);
+      }
+    }
+    for (HloInstruction* container : containers) {
+      std::optional<SortMatch> m = MatchMetalSort(container);
+      if (!m.has_value()) continue;
+      const Shape kshape = m->value_input->shape();
+      const Shape idx_shape = ShapeUtil::ChangeElementType(kshape, S32);
+      const int64_t rank = kshape.dimensions().size();
+      const char* opaque = m->descending ? "desc" : "asc";
+      VLOG(1) << "Metal: rewriting Sort " << container->name()
+              << " -> metal$sort (" << opaque << ", dim " << m->sort_dim << ")";
+      // metal$sort sorts the minor-most (contiguous) axis. sorted values ->
+      // svals, permuted indices -> sidxs, both in the original shape/layout.
+      HloInstruction* svals = nullptr;
+      HloInstruction* sidxs = nullptr;
+      if (m->sort_dim == rank - 1) {
+        HloInstruction* cc =
+            computation->AddInstruction(HloInstruction::CreateCustomCall(
+                ShapeUtil::MakeTupleShape({kshape, idx_shape}), {m->value_input},
+                kMetalSortCallTarget, opaque));
+        svals = computation->AddInstruction(
+            HloInstruction::CreateGetTupleElement(kshape, cc, 0));
+        sidxs = computation->AddInstruction(
+            HloInstruction::CreateGetTupleElement(idx_shape, cc, 1));
+      } else {
+        // Non-minor sort axis: transpose it to last, sort, transpose back
+        // (Metal transposes lower through the MLIR emitter). perm moves sort_dim
+        // to last; inv_perm brings it back.
+        std::vector<int64_t> perm;
+        std::vector<int64_t> inv_perm(rank);
+        for (int64_t i = 0; i < rank; ++i) {
+          if (i != m->sort_dim) perm.push_back(i);
+        }
+        perm.push_back(m->sort_dim);
+        std::vector<int64_t> tdims;
+        for (int64_t p : perm) tdims.push_back(kshape.dimensions(p));
+        for (int64_t i = 0; i < rank; ++i) inv_perm[perm[i]] = i;
+        const Shape vt_shape = ShapeUtil::MakeShape(kshape.element_type(), tdims);
+        const Shape vt_idx = ShapeUtil::ChangeElementType(vt_shape, S32);
+        HloInstruction* vt = computation->AddInstruction(
+            HloInstruction::CreateTranspose(vt_shape, m->value_input, perm));
+        HloInstruction* cc =
+            computation->AddInstruction(HloInstruction::CreateCustomCall(
+                ShapeUtil::MakeTupleShape({vt_shape, vt_idx}), {vt},
+                kMetalSortCallTarget, opaque));
+        HloInstruction* svt = computation->AddInstruction(
+            HloInstruction::CreateGetTupleElement(vt_shape, cc, 0));
+        HloInstruction* sit = computation->AddInstruction(
+            HloInstruction::CreateGetTupleElement(vt_idx, cc, 1));
+        svals = computation->AddInstruction(
+            HloInstruction::CreateTranspose(kshape, svt, inv_perm));
+        sidxs = computation->AddInstruction(
+            HloInstruction::CreateTranspose(idx_shape, sit, inv_perm));
+      }
+      if (!container->shape().IsTuple()) {
+        // Single-operand value sort: the result is just the sorted values.
+        TF_RETURN_IF_ERROR(computation->ReplaceInstruction(container, svals));
+      } else {
+        // Multi-output sort: key result -> sorted values; every iota result ->
+        // the index permutation (converted to that result's int dtype).
+        std::vector<HloInstruction*> elems(
+            container->shape().tuple_shapes().size());
+        for (int64_t i = 0; i < static_cast<int64_t>(elems.size()); ++i) {
+          if (i == m->kidx) {
+            elems[i] = svals;
+          } else if (container->shape().tuple_shapes(i).element_type() == S32) {
+            elems[i] = sidxs;
+          } else {
+            elems[i] = computation->AddInstruction(HloInstruction::CreateConvert(
+                container->shape().tuple_shapes(i), sidxs));
+          }
+        }
+        HloInstruction* new_tuple =
+            computation->AddInstruction(HloInstruction::CreateTuple(elems));
+        TF_RETURN_IF_ERROR(computation->ReplaceInstruction(container, new_tuple));
+      }
+      changed = true;
+    }
+  }
+  if (changed) TF_RETURN_IF_ERROR(HloDCE().Run(module).status());
+  return changed;
+}
+
 }  // namespace
 
 MetalGpuCompiler::MetalGpuCompiler()
@@ -731,6 +930,14 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   {
     HloModuleConfig cfg = module->config();
     cfg.mutable_debug_options().set_xla_gpu_dot_merger_threshold_mb(0);
+    // Disable the CUB radix-sort rewrite on Metal. SortRewriter runs before any
+    // Metal hook; with no cuda_compute_capability() it falls to the
+    // "Product(dims) > 16384" branch and rewrites a large sort (e.g. a
+    // full-vocab logits sort, V=262144) into an `xla.gpu.ext.cub_sort_*` custom
+    // call that has NO Metal backing. Keeping it off means every sort stays a
+    // plain kSort, which RewriteSortToMetalThunk routes to the native metal$sort
+    // kernel (and the legacy nvvm-emitting bitonic emitter is never reached).
+    cfg.mutable_debug_options().set_xla_gpu_enable_cub_radix_sort(false);
     module->set_config(std::move(cfg));
   }
   TF_ASSIGN_OR_RETURN(
@@ -741,6 +948,9 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   // before RunBackend so copy insertion / buffer assignment see the custom
   // call's output aliasing.
   TF_RETURN_IF_ERROR(RewriteKvCacheWrites(optimized.get()).status());
+  // Route every generic Sort to the native metal$sort kernel before the base
+  // thunk emitter would hand it to the legacy nvvm-emitting bitonic emitter.
+  TF_RETURN_IF_ERROR(RewriteSortToMetalThunk(optimized.get()).status());
   // Now every custom call's final form/layout is fixed and we still have a live
   // executor: precompile each lazily-JIT'd Metal pipeline so the first execute
   // is warm (flash-attn, paged-attn incl. all nsg decode variants, kv-write,

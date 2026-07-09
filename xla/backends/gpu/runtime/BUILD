@@ -5581,6 +5581,35 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_sort_thunk",
+    srcs = ["metal_sort_thunk.cc"],
+    hdrs = ["metal_sort_thunk.h"],
+    tags = ["gpu"],
+    deps = [
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/service/gpu:metal_air_toolchain",
+        "//xla/service/gpu/metal_kernels:metalblas_shaders",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_executor",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_library(
     name = "metal_topk_thunk",
     srcs = ["metal_topk_thunk.cc"],
     hdrs = ["metal_topk_thunk.h"],

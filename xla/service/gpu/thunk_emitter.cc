@@ -163,6 +163,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_print_thunk.h"
+#include "xla/backends/gpu/runtime/metal_sort_thunk.h"
 #include "xla/backends/gpu/runtime/metal_topk_thunk.h"
 #include "xla/service/gpu/metalblas_gemm.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
@@ -1533,6 +1534,40 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalKvWriteThunk(
       v_cache, instr->operand(2)->shape(), v_new, instr->operand(3)->shape(),
       slot, instr->operand(4)->shape(), pos, instr->operand(5)->shape(), freq,
       instr->operand(6)->shape(), num_slots, kv_heads, head_dim);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalSortThunk(
+    const HloCustomCallInstruction* instr) {
+  // ABI (RewriteSortToMetalThunk): operand 0 = values[..., n] (bf16/f16/f32),
+  // sorted along the minor-most axis; result = tuple(sorted_values[..., n],
+  // sorted_indices[..., n] s32). opaque = "desc" | "asc".
+  TF_RET_CHECK(instr->operand_count() == 1);
+  TF_RET_CHECK(instr->shape().IsTuple() &&
+               instr->shape().tuple_shapes().size() == 2);
+  const Shape& vshape = instr->operand(0)->shape();
+  const PrimitiveType dtype = vshape.element_type();
+  TF_RET_CHECK(dtype == BF16 || dtype == F16 || dtype == F32 || dtype == S32 ||
+               dtype == S16 || dtype == S8 || dtype == U32 || dtype == U16 ||
+               dtype == U8);
+  const int64_t rank = vshape.dimensions().size();
+  TF_RET_CHECK(rank >= 1);
+  const int64_t n = vshape.dimensions(rank - 1);
+  int64_t rows = 1;
+  for (int64_t i = 0; i + 1 < rank; ++i) rows *= vshape.dimensions(i);
+  const bool descending = instr->opaque() == "desc";
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice data,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out_vals,
+                      GetAllocationSliceForHlo(instr, {0}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out_idxs,
+                      GetAllocationSliceForHlo(instr, {1}));
+
+  auto thunk = std::make_unique<MetalSortThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      data, out_vals, out_idxs, dtype, rows, n, descending);
   return GetThunkSequence(std::move(thunk));
 }
 
@@ -3775,6 +3810,12 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   // the 6-kernel slice/pred/select/DUS cluster.
   if (custom_call->custom_call_target() == "metal$kv_write") {
     return EmitMetalKvWriteThunk(custom_call);
+  }
+  // Backend-generated (RewriteSortToMetalThunk in metal_gpu_compiler.cc): a
+  // generic Sort on Metal, routed to the native MLX merge sort (the legacy LLVM
+  // bitonic emitter can't lower to valid AIR).
+  if (IsMetalSort(*hlo)) {
+    return EmitMetalSortThunk(custom_call);
   }
   // zml's Gated DeltaNet recurrence -> "zml$gdn": the recurrent delta-rule
   // linear-attention kernel for Qwen3-Next style hybrid models (the Triton GDN
