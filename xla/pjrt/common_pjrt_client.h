@@ -551,6 +551,36 @@ class CommonPjRtLoadedExecutable : public PjRtLoadedExecutable {
       std::optional<std::vector<tsl::Future<void>>>& returned_futures)
       const override;
 
+  struct ExecuteChainArgument {
+    enum class Kind {
+      kBuffer,
+      kOutput,
+    };
+
+    Kind kind;
+    PjRtBuffer* buffer = nullptr;
+    int output_step = -1;
+    int output_index = -1;
+  };
+
+  struct ExecuteChainStep {
+    const CommonPjRtLoadedExecutable* executable = nullptr;
+    // Per addressable device, then per argument.
+    std::vector<std::vector<ExecuteChainArgument>> arguments;
+    // Per output. False keeps the buffer internal to the chain.
+    std::vector<bool> returned_outputs;
+  };
+
+  struct ExecuteChainResult {
+    // Per step, then per addressable device, then per output.
+    std::vector<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>> outputs;
+    std::optional<std::vector<tsl::Future<void>>> futures;
+  };
+
+  static absl::StatusOr<ExecuteChainResult> ExecuteChain(
+      absl::Span<const ExecuteChainStep> steps, const ExecuteOptions& options,
+      bool fill_futures);
+
   using PjRtLoadedExecutable::ExecuteSharded;
   absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>> ExecuteSharded(
       absl::Span<PjRtBuffer* const> argument_handles, PjRtDevice* device,

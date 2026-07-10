@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/pjrt/common_pjrt_client.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -1769,6 +1770,469 @@ CommonPjRtLoadedExecutable::ExecutePortable(
                                                fill_future, device));
   returned_future = std::move(result.future);
   return std::move(result.buffers);
+}
+
+absl::StatusOr<CommonPjRtLoadedExecutable::ExecuteChainResult>
+CommonPjRtLoadedExecutable::ExecuteChain(
+    absl::Span<const ExecuteChainStep> steps, const ExecuteOptions& options,
+    bool fill_futures) {
+  if (steps.empty()) {
+    return InvalidArgument("ExecuteChain requires at least one step.");
+  }
+  if (steps[0].executable == nullptr) {
+    return InvalidArgument("ExecuteChain step 0 has a null executable.");
+  }
+
+  const CommonPjRtLoadedExecutable* first_executable = steps[0].executable;
+  CommonPjRtClient* client = first_executable->client();
+  const int num_addressable_devices =
+      first_executable->addressable_devices_.size();
+  RunId chain_run_id = options.launch_id != 0 ? RunId(options.launch_id)
+                                              : RunId::CreateUniqueId();
+
+  VLOG(1) << absl::StreamFormat(
+      "CommonPjRtLoadedExecutable::ExecuteChain: run_id=%d, steps=%d",
+      chain_run_id.ToInt(), steps.size());
+
+  if (!client->allows_execute_recursion() && ThisThreadIsInsideHostCallback()) {
+    return InvalidArgument("ExecuteChain() called from inside host callback.");
+  }
+  if (!options.send_callbacks.empty() || !options.recv_callbacks.empty() ||
+      !options.hlo_output_callbacks.empty()) {
+    return Unimplemented(
+        "ExecuteChain does not support host transfer or HLO output callbacks.");
+  }
+
+  RETURN_IF_ERROR(ValidateHostTransferCallbacks(
+      options.send_callbacks, options.recv_callbacks, num_addressable_devices));
+
+  for (int step_index = 0; step_index < steps.size(); ++step_index) {
+    const ExecuteChainStep& step = steps[step_index];
+    if (step.executable == nullptr) {
+      return InvalidArgument("ExecuteChain step %d has a null executable.",
+                             step_index);
+    }
+    if (step.executable->client() != client) {
+      return InvalidArgument(
+          "ExecuteChain step %d uses a different PJRT client.", step_index);
+    }
+    if (step.executable->addressable_devices_.size() !=
+        num_addressable_devices) {
+      return InvalidArgument(
+          "ExecuteChain step %d has %d addressable devices, expected %d.",
+          step_index, step.executable->addressable_devices_.size(),
+          num_addressable_devices);
+    }
+    if (step.arguments.size() != num_addressable_devices) {
+      return InvalidArgument(
+          "ExecuteChain step %d has %d per-device argument lists, expected %d.",
+          step_index, step.arguments.size(), num_addressable_devices);
+    }
+    for (int device_index = 0; device_index < num_addressable_devices;
+         ++device_index) {
+      if (step.executable->addressable_devices_[device_index] !=
+          first_executable->addressable_devices_[device_index]) {
+        return InvalidArgument(
+            "ExecuteChain step %d device %d does not match step 0.",
+            step_index, device_index);
+      }
+      const LogicalDeviceIds& step_logical_id =
+          step.executable->addressable_device_logical_ids_[device_index];
+      const LogicalDeviceIds& first_logical_id =
+          first_executable->addressable_device_logical_ids_[device_index];
+      if (step_logical_id.replica != first_logical_id.replica ||
+          step_logical_id.partition != first_logical_id.partition) {
+        return InvalidArgument(
+            "ExecuteChain step %d device %d logical ids do not match step 0.",
+            step_index, device_index);
+      }
+    }
+  }
+
+  std::vector<std::vector<int>> output_last_use(steps.size());
+  for (int step_index = 0; step_index < steps.size(); ++step_index) {
+    output_last_use[step_index].assign(steps[step_index].returned_outputs.size(),
+                                       -1);
+  }
+  for (int consumer_step = 0; consumer_step < steps.size(); ++consumer_step) {
+    for (int device_index = 0; device_index < num_addressable_devices;
+         ++device_index) {
+      const std::vector<ExecuteChainArgument>& arguments =
+          steps[consumer_step].arguments[device_index];
+      for (int arg_index = 0; arg_index < arguments.size(); ++arg_index) {
+        const ExecuteChainArgument& argument = arguments[arg_index];
+        if (argument.kind != ExecuteChainArgument::Kind::kOutput) {
+          continue;
+        }
+        if (argument.output_step < 0 ||
+            argument.output_step >= consumer_step) {
+          return InvalidArgument(
+              "ExecuteChain step %d argument %d on device %d refers to "
+              "invalid output step %d.",
+              consumer_step, arg_index, device_index, argument.output_step);
+        }
+        if (argument.output_index < 0 ||
+            argument.output_index >=
+                steps[argument.output_step].returned_outputs.size()) {
+          return InvalidArgument(
+              "ExecuteChain step %d argument %d on device %d refers to "
+              "invalid output index %d from step %d.",
+              consumer_step, arg_index, device_index, argument.output_index,
+              argument.output_step);
+        }
+        output_last_use[argument.output_step][argument.output_index] =
+            std::max(output_last_use[argument.output_step]
+                                    [argument.output_index],
+                     consumer_step);
+      }
+    }
+  }
+
+  std::vector<RunId> step_run_ids;
+  step_run_ids.reserve(steps.size());
+  // GPU executable rendezvous are keyed by RunId. A chain can pipeline host
+  // enqueue across modules, so each module needs its own RunId to avoid
+  // cross-module rendezvous aliasing.
+  step_run_ids.push_back(chain_run_id);
+  for (int step_index = 1; step_index < steps.size(); ++step_index) {
+    step_run_ids.push_back(RunId::CreateUniqueId());
+  }
+
+  tsl::profiler::TraceMeProducer producer(
+      [&] {
+        return tsl::profiler::TraceMeEncode(
+            "CommonPjRtLoadedExecutable::ExecuteChain",
+            {{"run_id", chain_run_id.ToInt()},
+             {"steps", steps.size()},
+             {"num_addressable_devices", num_addressable_devices}});
+      },
+      tsl::profiler::ContextType::kPjRt, chain_run_id.ToInt());
+
+  ExecuteChainResult chain_result;
+  chain_result.outputs.resize(steps.size());
+  for (int step_index = 0; step_index < steps.size(); ++step_index) {
+    chain_result.outputs[step_index].resize(num_addressable_devices);
+  }
+  if (fill_futures) {
+    chain_result.futures.emplace();
+  }
+
+  auto resolve_arguments =
+      [&](int step_index,
+          int device_index) -> absl::StatusOr<std::vector<PjRtBuffer*>> {
+    const std::vector<ExecuteChainArgument>& argument_refs =
+        steps[step_index].arguments[device_index];
+    std::vector<PjRtBuffer*> arguments;
+    arguments.reserve(argument_refs.size());
+    for (int arg_index = 0; arg_index < argument_refs.size(); ++arg_index) {
+      const ExecuteChainArgument& argument = argument_refs[arg_index];
+      switch (argument.kind) {
+        case ExecuteChainArgument::Kind::kBuffer:
+          if (argument.buffer == nullptr) {
+            return InvalidArgument(
+                "ExecuteChain step %d argument %d on device %d is a null "
+                "buffer.",
+                step_index, arg_index, device_index);
+          }
+          arguments.push_back(argument.buffer);
+          break;
+        case ExecuteChainArgument::Kind::kOutput:
+          if (argument.output_step < 0 ||
+              argument.output_step >= step_index) {
+            return InvalidArgument(
+                "ExecuteChain step %d argument %d on device %d refers to "
+                "invalid output step %d.",
+                step_index, arg_index, device_index, argument.output_step);
+          }
+          if (argument.output_index < 0 ||
+              argument.output_index >=
+                  chain_result.outputs[argument.output_step][device_index]
+                      .size()) {
+            return InvalidArgument(
+                "ExecuteChain step %d argument %d on device %d refers to "
+                "invalid output index %d from step %d.",
+                step_index, arg_index, device_index, argument.output_index,
+                argument.output_step);
+          }
+          if (chain_result.outputs[argument.output_step][device_index]
+                  [argument.output_index] == nullptr) {
+            return InvalidArgument(
+                "ExecuteChain step %d argument %d on device %d refers to an "
+                "unavailable output %d from step %d.",
+                step_index, arg_index, device_index, argument.output_index,
+                argument.output_step);
+          }
+          arguments.push_back(
+              chain_result.outputs[argument.output_step][device_index]
+                                  [argument.output_index]
+                                      .get());
+          break;
+      }
+    }
+    return arguments;
+  };
+
+  auto validate_output_count = [&](int step_index, int device_index,
+                                   int output_count) -> absl::Status {
+    if (output_count != steps[step_index].returned_outputs.size()) {
+      return InvalidArgument(
+          "ExecuteChain step %d (%s) produced %d outputs on device %d, but "
+          "the chain descriptor expected %d.",
+          step_index, steps[step_index].executable->name(), output_count,
+          device_index, steps[step_index].returned_outputs.size());
+    }
+    return absl::OkStatus();
+  };
+
+  auto release_internal_outputs_after_step = [&](int completed_step,
+                                                 int device_index) {
+    for (int source_step = 0; source_step <= completed_step; ++source_step) {
+      for (int output_index = 0;
+           output_index < output_last_use[source_step].size();
+           ++output_index) {
+        if (steps[source_step].returned_outputs[output_index]) {
+          continue;
+        }
+        if (output_last_use[source_step][output_index] > completed_step) {
+          continue;
+        }
+        if (output_index <
+            chain_result.outputs[source_step][device_index].size()) {
+          chain_result.outputs[source_step][device_index][output_index].reset();
+        }
+      }
+    }
+  };
+
+  if (num_addressable_devices == 1) {
+    for (int step_index = 0; step_index < steps.size(); ++step_index) {
+      const CommonPjRtLoadedExecutable* executable =
+          steps[step_index].executable;
+      const int replica =
+          executable->addressable_device_logical_ids_[0].replica;
+      const int partition =
+          executable->addressable_device_logical_ids_[0].partition;
+
+      TF_ASSIGN_OR_RETURN(std::vector<PjRtBuffer*> arguments,
+                          resolve_arguments(step_index, /*device_index=*/0));
+      std::optional<ExecuteLaunchArgs> launch_args;
+      RETURN_IF_ERROR(executable->ExecutePrepareWithOomRetries(
+          launch_args, arguments, step_run_ids[step_index], replica, partition,
+          options,
+          /*host_callback_idx=*/0));
+      TF_ASSIGN_OR_RETURN(
+          Result result,
+          executable->ExecuteLaunch(
+              *launch_args, fill_futures && step_index == steps.size() - 1));
+      RETURN_IF_ERROR(validate_output_count(step_index, /*device_index=*/0,
+                                            result.buffers.size()));
+      chain_result.outputs[step_index][0] = std::move(result.buffers);
+      if (fill_futures && step_index == steps.size() - 1) {
+        chain_result.futures->push_back(*std::move(result.future));
+      }
+      release_internal_outputs_after_step(step_index, /*device_index=*/0);
+    }
+    return chain_result;
+  }
+
+  if (!client->supports_two_phase_launch()) {
+    return Unimplemented(
+        "ExecuteChain with multiple addressable devices requires two-phase "
+        "launch support.");
+  }
+
+  struct StepState {
+    int preparing;
+    int failed = 0;
+    absl::Status first_failure_status = absl::OkStatus();
+  };
+
+  absl::Mutex mu;
+  int active ABSL_GUARDED_BY(mu) = num_addressable_devices;
+  bool chain_failed ABSL_GUARDED_BY(mu) = false;
+  absl::Status first_chain_failure ABSL_GUARDED_BY(mu) = absl::OkStatus();
+  std::vector<StepState> step_states;
+  step_states.reserve(steps.size());
+  for (int step_index = 0; step_index < steps.size(); ++step_index) {
+    step_states.push_back(StepState{/*preparing=*/num_addressable_devices});
+  }
+  std::vector<absl::Status> device_statuses(num_addressable_devices,
+                                            absl::OkStatus());
+  std::vector<std::optional<tsl::Future<void>>> final_futures(
+      num_addressable_devices);
+
+  auto record_failure = [&](StepState& step_state,
+                            const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu) {
+    if (step_state.failed == 0) {
+      step_state.first_failure_status = status;
+    }
+    ++step_state.failed;
+    if (!chain_failed) {
+      chain_failed = true;
+      first_chain_failure = status;
+    }
+  };
+
+  {
+    absl::MutexLock gang_schedule(client->gang_scheduler());
+    auto context_id = producer.GetContextId();
+    for (int device_index = 0; device_index < num_addressable_devices;
+         ++device_index) {
+      PjRtDevice* device = first_executable->addressable_devices_[device_index];
+      client->LaunchOnDevice(device, [&, context_id, device_index, device] {
+        tsl::profiler::TraceMeConsumer consumer(
+            [&] {
+              return tsl::profiler::TraceMeEncode(
+                  absl::StrFormat(
+                      "[%d] CommonPjRtLoadedExecutable::ExecuteChain",
+                      device_index),
+                  {{"global_device_id", device->global_device_id()}});
+            },
+            tsl::profiler::ContextType::kPjRt, context_id);
+
+        absl::Status worker_status = absl::OkStatus();
+        for (int step_index = 0; step_index < steps.size(); ++step_index) {
+          {
+            absl::MutexLock lock(mu);
+            if (chain_failed) {
+              worker_status = first_chain_failure;
+              break;
+            }
+          }
+
+          const CommonPjRtLoadedExecutable* executable =
+              steps[step_index].executable;
+          const int replica =
+              executable->addressable_device_logical_ids_[device_index].replica;
+          const int partition =
+              executable->addressable_device_logical_ids_[device_index]
+                  .partition;
+          StepState& step_state = step_states[step_index];
+
+          absl::Status prepare_status;
+          std::optional<ExecuteLaunchArgs> launch_args;
+          auto arguments_or = resolve_arguments(step_index, device_index);
+          if (!arguments_or.ok()) {
+            prepare_status = AppendStatus(
+                arguments_or.status(),
+                absl::StrFormat("while resolving arguments for chain step %d "
+                                "(%s), replica %d, partition %d.",
+                                step_index, executable->name(), replica,
+                                partition));
+          } else {
+            prepare_status = executable->ExecutePrepareWithOomRetries(
+                launch_args, *arguments_or, step_run_ids[step_index], replica,
+                partition, options, /*host_callback_idx=*/device_index);
+            if (!prepare_status.ok()) {
+              prepare_status = AppendStatus(
+                  prepare_status,
+                  absl::StrFormat("while preparing chain step %d (%s), "
+                                  "replica %d, partition %d.",
+                                  step_index, executable->name(), replica,
+                                  partition));
+            }
+          }
+
+          {
+            absl::MutexLock lock(mu);
+            --step_state.preparing;
+            if (!prepare_status.ok()) {
+              record_failure(step_state, prepare_status);
+            }
+            auto done_preparing = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu) {
+              return step_state.preparing == 0 || chain_failed;
+            };
+            mu.Await(absl::Condition(&done_preparing));
+            if (chain_failed) {
+              worker_status = first_chain_failure;
+              break;
+            }
+            if (step_state.failed > 0) {
+              worker_status = step_state.first_failure_status;
+              break;
+            }
+          }
+
+          absl::Status launch_status;
+          auto launched =
+              executable->ExecuteLaunch(*launch_args,
+                                        fill_futures &&
+                                            step_index == steps.size() - 1);
+          if (!launched.ok()) {
+            launch_status = AppendStatus(
+                launched.status(),
+                absl::StrFormat("while launching chain step %d (%s), replica "
+                                "%d, partition %d.",
+                                step_index, executable->name(), replica,
+                                partition));
+          } else {
+            launch_status = validate_output_count(
+                step_index, device_index, launched->buffers.size());
+            if (!launch_status.ok()) {
+              launch_status = AppendStatus(
+                  launch_status,
+                  absl::StrFormat("while launching chain step %d (%s), "
+                                  "replica %d, partition %d.",
+                                  step_index, executable->name(), replica,
+                                  partition));
+            } else {
+              chain_result.outputs[step_index][device_index] =
+                  std::move(launched->buffers);
+              if (fill_futures && step_index == steps.size() - 1) {
+                final_futures[device_index] = *std::move(launched->future);
+              }
+            }
+          }
+
+          if (!launch_status.ok()) {
+            absl::MutexLock lock(mu);
+            record_failure(step_state, launch_status);
+            worker_status = first_chain_failure;
+            break;
+          }
+
+          release_internal_outputs_after_step(step_index, device_index);
+        }
+
+        absl::MutexLock lock(mu);
+        device_statuses[device_index] = worker_status;
+        --active;
+      });
+    }
+  }
+
+  {
+    tsl::profiler::TraceMe trace_wait(
+        "Wait for ExecuteChain LaunchOnDevice completion");
+    auto done = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu) { return active == 0; };
+    absl::MutexLock lock(mu);
+    mu.Await(absl::Condition(&done));
+  }
+
+  for (const absl::Status& status : device_statuses) {
+    if (!status.ok()) {
+      if (absl::IsResourceExhausted(status)) {
+        client->CallOomHandlers();
+      }
+      return status;
+    }
+  }
+
+  if (fill_futures) {
+    chain_result.futures->reserve(num_addressable_devices);
+    for (int device_index = 0; device_index < num_addressable_devices;
+         ++device_index) {
+      if (!final_futures[device_index].has_value()) {
+        return Internal(
+            "ExecuteChain did not produce a completion future for device %d.",
+            device_index);
+      }
+      chain_result.futures->push_back(std::move(*final_futures[device_index]));
+    }
+  }
+
+  return chain_result;
 }
 
 absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>>

@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -36,15 +37,18 @@ limitations under the License.
 #include "xla/client/local_client.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/ffi.h"
+#include "xla/pjrt/common_pjrt_client.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_abi_version_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_custom_partitioner_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_execute_chain_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_ffi_internal.h"
 #include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
 #include "xla/pjrt/c/pjrt_c_api_layouts_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_memory_descriptions_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_multi_slice_internal_types.h"
 #include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_shardings_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_status_utils.h"
@@ -91,6 +95,255 @@ namespace gpu_plugin {
 #endif
 
 const PJRT_Api* GetGpuPjrtApi();
+
+namespace {
+
+absl::Status ConvertExecuteChainOptions(PJRT_ExecuteOptions* c_options,
+                                        xla::ExecuteOptions* options,
+                                        std::shared_ptr<xla::ExecuteContext>*
+                                            execute_context) {
+  if (c_options == nullptr) {
+    return absl::InvalidArgumentError(
+        "PJRT_LoadedExecutable_ExecuteChain requires non-null options.");
+  }
+  absl::Status struct_size_status = ActualStructSizeIsGreaterOrEqual(
+      "PJRT_ExecuteOptions",
+      PJRT_STRUCT_SIZE(PJRT_ExecuteOptions, incarnation_ids),
+      c_options->struct_size);
+  if (!struct_size_status.ok()) {
+    return struct_size_status;
+  }
+
+  if (c_options->num_send_ops > 0 || c_options->num_recv_ops > 0) {
+    return absl::UnimplementedError(
+        "PJRT_LoadedExecutable_ExecuteChain does not support send/recv "
+        "callbacks.");
+  }
+  if (c_options->struct_size >=
+          PJRT_STRUCT_SIZE(PJRT_ExecuteOptions,
+                           num_hlo_output_callbacks) &&
+      c_options->num_hlo_output_callbacks > 0) {
+    return absl::UnimplementedError(
+        "PJRT_LoadedExecutable_ExecuteChain does not support HLO output "
+        "callbacks.");
+  }
+
+  options->launch_id = c_options->launch_id;
+  if (c_options->call_location) {
+    options->call_location = std::string(c_options->call_location);
+  }
+  if (c_options->context) {
+    *execute_context = c_options->context->execute_context;
+  }
+  options->context = execute_context->get();
+  options->multi_slice_config = nullptr;
+  if (c_options->struct_size >= PJRT_ExecuteOptions_STRUCT_SIZE &&
+      c_options->multi_slice_config != nullptr) {
+    options->multi_slice_config = c_options->multi_slice_config->config.get();
+  }
+  options->use_major_to_minor_data_layout_for_callbacks = true;
+  if (c_options->struct_size >=
+      PJRT_STRUCT_SIZE(PJRT_ExecuteOptions,
+                       use_major_to_minor_data_layout_for_callbacks)) {
+    options->use_major_to_minor_data_layout_for_callbacks =
+        c_options->use_major_to_minor_data_layout_for_callbacks;
+  }
+  for (int i = 0; i < c_options->num_non_donatable_input_indices; ++i) {
+    options->non_donatable_input_indices.insert(
+        c_options->non_donatable_input_indices[i]);
+  }
+  for (size_t i = 0; i < c_options->num_tasks; ++i) {
+    options->incarnations.insert(
+        {c_options->task_ids[i],
+         xla::IncarnationId(c_options->incarnation_ids[i])});
+  }
+  return absl::OkStatus();
+}
+
+absl::Status CheckExecuteChainIndex(size_t value, absl::string_view name) {
+  if (value > std::numeric_limits<int>::max()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("%s is too large for ExecuteChain.", name));
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+PJRT_Error* PJRT_LoadedExecutable_ExecuteChain(
+    PJRT_LoadedExecutable_ExecuteChain_Args* args) {
+  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "PJRT_LoadedExecutable_ExecuteChain_Args",
+      PJRT_LoadedExecutable_ExecuteChain_Args_STRUCT_SIZE, args->struct_size));
+
+  xla::ExecuteOptions options;
+  std::shared_ptr<xla::ExecuteContext> execute_context;
+  PJRT_RETURN_IF_ERROR(
+      ConvertExecuteChainOptions(args->options, &options, &execute_context));
+
+  if (args->num_steps == 0) {
+    return StatusToPjRtError(absl::InvalidArgumentError(
+        "PJRT_LoadedExecutable_ExecuteChain requires at least one step."));
+  }
+  if (args->steps == nullptr) {
+    return StatusToPjRtError(absl::InvalidArgumentError(
+        "PJRT_LoadedExecutable_ExecuteChain requires non-null steps."));
+  }
+  if (args->num_devices == 0) {
+    return StatusToPjRtError(absl::InvalidArgumentError(
+        "PJRT_LoadedExecutable_ExecuteChain requires at least one device."));
+  }
+  PJRT_RETURN_IF_ERROR(CheckExecuteChainIndex(args->num_steps, "num_steps"));
+  PJRT_RETURN_IF_ERROR(CheckExecuteChainIndex(args->num_devices, "num_devices"));
+
+  std::vector<xla::CommonPjRtLoadedExecutable::ExecuteChainStep> chain_steps;
+  chain_steps.reserve(args->num_steps);
+  for (size_t step_index = 0; step_index < args->num_steps; ++step_index) {
+    PJRT_ExecuteChain_Step* c_step = &args->steps[step_index];
+    PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+        "PJRT_ExecuteChain_Step", PJRT_ExecuteChain_Step_STRUCT_SIZE,
+        c_step->struct_size));
+    if (c_step->executable == nullptr) {
+      return StatusToPjRtError(absl::InvalidArgumentError(
+          absl::StrFormat("ExecuteChain step %d has a null executable.",
+                          step_index)));
+    }
+    const auto* executable =
+        dynamic_cast<const xla::CommonPjRtLoadedExecutable*>(
+            c_step->executable->get());
+    if (executable == nullptr) {
+      return StatusToPjRtError(absl::UnimplementedError(
+          absl::StrFormat("ExecuteChain step %d is not a common PJRT loaded "
+                          "executable.",
+                          step_index)));
+    }
+    if (c_step->num_args > 0 && c_step->argument_refs == nullptr) {
+      return StatusToPjRtError(absl::InvalidArgumentError(absl::StrFormat(
+          "ExecuteChain step %d has null argument_refs.", step_index)));
+    }
+    if (c_step->num_outputs > 0 && c_step->returned_outputs == nullptr) {
+      return StatusToPjRtError(absl::InvalidArgumentError(absl::StrFormat(
+          "ExecuteChain step %d has null returned_outputs.", step_index)));
+    }
+    PJRT_RETURN_IF_ERROR(CheckExecuteChainIndex(c_step->num_args, "num_args"));
+    PJRT_RETURN_IF_ERROR(
+        CheckExecuteChainIndex(c_step->num_outputs, "num_outputs"));
+
+    xla::CommonPjRtLoadedExecutable::ExecuteChainStep step;
+    step.executable = executable;
+    step.arguments.resize(args->num_devices);
+    for (size_t device_index = 0; device_index < args->num_devices;
+         ++device_index) {
+      step.arguments[device_index].reserve(c_step->num_args);
+      for (size_t arg_index = 0; arg_index < c_step->num_args; ++arg_index) {
+        PJRT_ExecuteChain_Input* c_input =
+            &c_step
+                 ->argument_refs[device_index * c_step->num_args + arg_index];
+        PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+            "PJRT_ExecuteChain_Input", PJRT_ExecuteChain_Input_STRUCT_SIZE,
+            c_input->struct_size));
+
+        xla::CommonPjRtLoadedExecutable::ExecuteChainArgument argument;
+        switch (c_input->kind) {
+          case PJRT_ExecuteChain_InputKind_Buffer:
+            if (c_input->buffer == nullptr) {
+              return StatusToPjRtError(absl::InvalidArgumentError(
+                  absl::StrFormat("ExecuteChain step %d argument %d on device "
+                                  "%d is a null buffer.",
+                                  step_index, arg_index, device_index)));
+            }
+            argument.kind = xla::CommonPjRtLoadedExecutable::
+                ExecuteChainArgument::Kind::kBuffer;
+            argument.buffer = c_input->buffer->buffer.get();
+            break;
+          case PJRT_ExecuteChain_InputKind_Output:
+            PJRT_RETURN_IF_ERROR(
+                CheckExecuteChainIndex(c_input->output_step, "output_step"));
+            PJRT_RETURN_IF_ERROR(
+                CheckExecuteChainIndex(c_input->output_index, "output_index"));
+            argument.kind = xla::CommonPjRtLoadedExecutable::
+                ExecuteChainArgument::Kind::kOutput;
+            argument.output_step = static_cast<int>(c_input->output_step);
+            argument.output_index = static_cast<int>(c_input->output_index);
+            break;
+          default:
+            return StatusToPjRtError(absl::InvalidArgumentError(
+                absl::StrFormat("ExecuteChain step %d argument %d on device %d "
+                                "has invalid input kind %d.",
+                                step_index, arg_index, device_index,
+                                c_input->kind)));
+        }
+        step.arguments[device_index].push_back(argument);
+      }
+    }
+    step.returned_outputs.assign(c_step->returned_outputs,
+                                 c_step->returned_outputs + c_step->num_outputs);
+    chain_steps.push_back(std::move(step));
+  }
+
+  const bool fill_futures =
+      args->device_complete_events != nullptr || execute_context != nullptr;
+  PJRT_ASSIGN_OR_RETURN(
+      xla::CommonPjRtLoadedExecutable::ExecuteChainResult result,
+      xla::CommonPjRtLoadedExecutable::ExecuteChain(chain_steps, options,
+                                                    fill_futures));
+
+  for (size_t step_index = 0; step_index < args->num_steps; ++step_index) {
+    PJRT_ExecuteChain_Step* c_step = &args->steps[step_index];
+    for (size_t output_index = 0; output_index < c_step->num_outputs;
+         ++output_index) {
+      if (!c_step->returned_outputs[output_index]) {
+        continue;
+      }
+      if (c_step->output_lists == nullptr) {
+        return StatusToPjRtError(absl::InvalidArgumentError(absl::StrFormat(
+            "ExecuteChain step %d returns output %d but output_lists is null.",
+            step_index, output_index)));
+      }
+      for (size_t device_index = 0; device_index < args->num_devices;
+           ++device_index) {
+        if (c_step->output_lists[device_index] == nullptr) {
+          return StatusToPjRtError(absl::InvalidArgumentError(absl::StrFormat(
+              "ExecuteChain step %d output list for device %d is null.",
+              step_index, device_index)));
+        }
+        if (step_index >= result.outputs.size() ||
+            device_index >= result.outputs[step_index].size() ||
+            output_index >= result.outputs[step_index][device_index].size() ||
+            result.outputs[step_index][device_index][output_index] == nullptr) {
+          return StatusToPjRtError(absl::InternalError(absl::StrFormat(
+              "ExecuteChain step %d output %d for device %d was not produced.",
+              step_index, output_index, device_index)));
+        }
+        c_step->output_lists[device_index][output_index] = new PJRT_Buffer{
+            std::move(result.outputs[step_index][device_index][output_index]),
+            c_step->executable->client};
+      }
+    }
+  }
+
+  if (fill_futures) {
+    if (!result.futures.has_value() ||
+        result.futures->size() != args->num_devices) {
+      return StatusToPjRtError(absl::InternalError(
+          "ExecuteChain did not return the expected completion futures."));
+    }
+    if (execute_context != nullptr) {
+      for (xla::Future<>& future : *result.futures) {
+        future.OnReady([execute_context](absl::Status status) {});
+      }
+    }
+    if (args->device_complete_events != nullptr) {
+      for (size_t device_index = 0; device_index < args->num_devices;
+           ++device_index) {
+        args->device_complete_events[device_index] =
+            new PJRT_Event{std::move((*result.futures)[device_index])};
+      }
+    }
+  }
+
+  return nullptr;
+}
 
 PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -599,11 +852,20 @@ const PJRT_Api* GetGpuPjrtApi() {
   static PJRT_AbiVersion_Extension abi_version_extension =
       pjrt::CreateGpuAbiVersionExtension(&xla_transform_extension.base);
 
+  static PJRT_ExecuteChain_Extension execute_chain_extension{
+      PJRT_Extension_Base{
+          /*struct_size=*/PJRT_ExecuteChain_Extension_STRUCT_SIZE,
+          /*type=*/PJRT_Extension_Type::PJRT_Extension_Type_ExecuteChain,
+          /*next=*/&abi_version_extension.base,
+      },
+      /*execute_chain=*/PJRT_LoadedExecutable_ExecuteChain,
+  };
+
   static const PJRT_Api pjrt_api = pjrt::CreatePjrtApi(
       pjrt::gpu_plugin::PJRT_Client_Create,
       pjrt::gpu_plugin::PJRT_ExecuteContext_Create,
       pjrt::gpu_plugin::PJRT_GpuDeviceTopology_Create,
-      pjrt::PJRT_Plugin_Initialize_NoOp, &abi_version_extension.base,
+      pjrt::PJRT_Plugin_Initialize_NoOp, &execute_chain_extension.base,
       pjrt::gpu_plugin::PJRT_Plugin_Attributes_Gpu);
 
   return &pjrt_api;

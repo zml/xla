@@ -283,6 +283,15 @@ cc_library(
 )
 
 cc_library(
+    name = "pjrt_c_api_execute_chain_extension_hdrs",
+    hdrs = ["pjrt_c_api_execute_chain_extension.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":pjrt_c_api_hdrs",
+    ],
+)
+
+cc_library(
     name = "pjrt_c_api_gpu_extension_hdrs",
     hdrs = ["pjrt_c_api_gpu_extension.h"],
     visibility = ["//visibility:public"],
@@ -643,6 +652,7 @@ cc_library(
     deps = [
         ":pjrt_c_api_abi_version_extension_hdrs",
         ":pjrt_c_api_custom_partitioner_extension_hdrs",
+        ":pjrt_c_api_execute_chain_extension_hdrs",
         ":pjrt_c_api_ffi_extension_hdrs",
         ":pjrt_c_api_ffi_internal",
         ":pjrt_c_api_gpu_extension_hdrs",
@@ -650,6 +660,7 @@ cc_library(
         ":pjrt_c_api_helpers",
         ":pjrt_c_api_layouts_extension_hdrs",
         ":pjrt_c_api_memory_descriptions_extension_hdrs",
+        ":pjrt_c_api_multi_slice_internal_types",
         ":pjrt_c_api_profiler_extension_hdrs",
         ":pjrt_c_api_shardings_extension_hdrs",
         ":pjrt_c_api_status_utils",
@@ -670,6 +681,7 @@ cc_library(
         "//xla/ffi:ffi_api",
         "//xla/ffi/api:c_api",
         "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:common_pjrt_client",
         "//xla/pjrt:pjrt_common",
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt:pjrt_device_description",
