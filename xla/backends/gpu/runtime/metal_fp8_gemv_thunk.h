@@ -32,33 +32,26 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// The FP8 arm of the __metal$gemm custom call on the Metal backend: a fused FP8
-// (block-scaled) GEMV / thin GEMM (`custom/fp8_gemv.metal`) used for decode.
-// GemmRewriter (TryRewriteMetalBlockScaledGemv) reroutes a decode-shaped dot
-// over a block-scaled f8e4m3fn weight to a 3-operand {x, w, scale} __metal$gemm,
-// which EmitMetalGemmThunk dispatches here by weight element type.
+// FP8 arm of zml$scaled_matmul on Metal: fused weight-only GEMV / thin GEMM for
+// f8e4m3fn weights with bf16 scales. NVFP4 lives in MetalNvfp4MatmulThunk;
+// MX (e8m0) lives in MetalMxMatmulThunk.
 //
-// Qwen3.6-FP8 stores the big projections as f8e4m3fn weights with companion
-// 128x128 bf16 block scales. In the graph the model dequantizes
-// (`w.convert(bf16) * scale`) before `dot`, which for M==1 decode the Metal
-// backend lowers to a generic `input_reduce_fusion` running at ~30% of memory
-// bandwidth. This kernel instead reads the 1-byte weight directly and
-// dequantizes inline, so a decode matmul touches DRAM ~once over the f8 weight.
+// Scale layouts:
+//   * 128-block:  scale bf16[N/128, K/128]
+//   * per-channel: scale bf16[N, 1]
 //
-// One threadgroup (256 threads) per (n, b) output element reduces over K.
-//
-// Operand contract (positional):
-//   0 x      bf16     [B, K]          (row-major; K is the contraction dim)
-//   1 w      f8e4m3fn [N, K]          (row-major)
-//   2 scale  bf16     [N/128, K/128]
-//   -> 0 out bf16     [B, N]
+// Operand contract:
+//   0 x      bf16     [B, K]
+//   1 w      f8e4m3fn [N, K]
+//   2 scale  bf16     [N/128, K/128] or [N, 1]
+//   -> out   bf16     [B, N]
 class MetalFp8GemvThunk : public Thunk {
  public:
   MetalFp8GemvThunk(ThunkInfo thunk_info, BufferAllocation::Slice x,
                     Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice out, Shape out_shape, int64_t b,
-                    int64_t k, int64_t n);
+                    int64_t k, int64_t n, bool per_channel);
 
   MetalFp8GemvThunk(const MetalFp8GemvThunk&) = delete;
   MetalFp8GemvThunk& operator=(const MetalFp8GemvThunk&) = delete;
@@ -68,29 +61,26 @@ class MetalFp8GemvThunk : public Thunk {
   BufferUses buffer_uses() const override;
 
  private:
-  // Lazily, on the first execute for a given executor: compile the embedded
-  // metallib (process-cached), load the kernel, and stage the packed
-  // (B, K, N, K/128) dims into a small device buffer. Must hold mu_.
   absl::Status EnsureLoaded(stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   const BufferAllocation::Slice x_, w_, scale_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, out_shape_;
   const int64_t b_, k_, n_;
+  const bool per_channel_;
 
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
-  // b==1: the per-row GEMV (optimal single-stream). b>1: the MLX Steel
-  // simdgroup_matrix tiled q-GEMM (kernel_steel_), which reads each f8 weight
-  // byte once and reuses it across both rows and columns -- the per-row GEMV's
-  // DRAM traffic scales with batch and collapses at b=16. (kernel_tiled_ was an
-  // intermediate 1D tile that only reused across rows; kept loaded for A/B.)
+  // b==1: per-row GEMV. b>1: Steel tiled q-GEMM (BM=16 small M, BM=64 prefill).
+  // per_channel_: fp8_gemv_pc / pc qmm variants.
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_tiled_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_steel64_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm64_ ABSL_GUARDED_BY(mu_);
 
-  // Packed {B, K, N, K/128} int4, bound as the kernel's `constant int4& dims`
-  // arg (buffer 4), allocated once per executor.
   stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
 };
 

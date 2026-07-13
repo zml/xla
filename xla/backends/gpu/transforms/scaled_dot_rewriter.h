@@ -22,14 +22,28 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla {
 namespace gpu {
 
-// This pass rewrites ScaledDot instructions into a sequence of other HLO
-// instructions, including Convert, Broadcast, Reshape, Multiply, and Dot.
+// Lowers kScaledDot when the Triton path is not used
+// (xla_gpu_experimental_scaled_dot_with_triton == false).
+//
+// For each scaled-dot:
+//   1. Try a backend-fused custom call via TryFusedScaledMatmul (platform
+//      switch: Metal emits zml$scaled_matmul for supported weight-only layouts;
+//      other backends currently return null).
+//   2. Else expand to Convert/Broadcast/Reshape/Multiply + Dot (generic
+//      dequant fallback).
+//
+// Shared layout predicates (MX group-32, NVFP4, 128-block, per-channel) live
+// in the .cc; only the emit target is platform-specific.
 class ScaledDotRewriter : public HloModulePass {
  public:
+  explicit ScaledDotRewriter(se::GpuComputeCapability gpu_version = {})
+      : gpu_version_(gpu_version) {}
+
   absl::string_view name() const override { return "scaled-dot-rewriter"; }
 
   absl::StatusOr<bool> RewriteComputation(HloComputation* computation);
@@ -38,6 +52,9 @@ class ScaledDotRewriter : public HloModulePass {
   absl::StatusOr<bool> RunImpl(
       HloModule* module,
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+
+ private:
+  se::GpuComputeCapability gpu_version_;
 };
 
 }  // namespace gpu

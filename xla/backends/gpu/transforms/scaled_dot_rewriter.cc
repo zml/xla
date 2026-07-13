@@ -32,7 +32,10 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/layout_util.h"
+#include "xla/literal.h"
 #include "xla/primitive_util.h"
+#include "xla/service/gpu/metal_custom_calls.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
@@ -161,6 +164,134 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
           operand->shape(), HloOpcode::kMultiply, operand, broadcasted_scale));
   return dequantized;
 }
+
+// === Weight-only fused scaled matmul: shared layout predicates + platform emit ===
+
+// True if `s` is the identity (all-ones) scale of an unquantized activation:
+// rank-0, or a bf16 all-ones dense constant with every dim == 1 (ZML weight-only
+// form). Used by backends that fuse only when the act side has no real scale.
+bool IsIdentityScale(const HloInstruction* s) {
+  if (s->shape().element_type() != BF16) return false;
+  for (int64_t d : s->shape().dimensions()) {
+    if (d != 1) return false;
+  }
+  if (s->shape().dimensions().empty()) return true;  // rank-0 pass-through
+  return s->opcode() == HloOpcode::kConstant && s->literal().IsAllFloat(1.0);
+}
+
+// MX group-32: f8e4m3fn/f4e2m1 weight [N,K] + f8e8m0 scale [N,K/32], K minor.
+bool IsMxGroup32Weight(const HloInstruction* w, const HloInstruction* s,
+                       int64_t c) {
+  const PrimitiveType wt = w->shape().element_type();
+  if (wt != F8E4M3FN && wt != F4E2M1FN) return false;
+  if (s->shape().element_type() != F8E8M0FNU) return false;
+  if (w->shape().dimensions().size() != 2 ||
+      s->shape().dimensions().size() != 2) {
+    return false;
+  }
+  if (c != 1) return false;  // K minor
+  const int64_t n = w->shape().dimensions(0), k = w->shape().dimensions(1);
+  if (s->shape().dimensions(0) != n) return false;
+  const int64_t sc = s->shape().dimensions(1);
+  return sc != 0 && k == sc * 32;
+}
+
+// 128x128 block scales: f8e4m3fn weight [N,K] + bf16 scale [N/128,K/128]
+// (vLLM weight_scale_inv). N and K multiples of 128.
+bool IsBlock128Bf16Weight(const HloInstruction* w, const HloInstruction* s,
+                          int64_t c) {
+  if (w->shape().element_type() != F8E4M3FN) return false;
+  if (s->shape().element_type() != BF16) return false;
+  if (w->shape().dimensions().size() != 2 ||
+      s->shape().dimensions().size() != 2) {
+    return false;
+  }
+  if (c != 1) return false;  // K minor
+  const int64_t n = w->shape().dimensions(0), k = w->shape().dimensions(1);
+  if (n % 128 != 0 || k % 128 != 0) return false;
+  return s->shape().dimensions(0) == n / 128 &&
+         s->shape().dimensions(1) == k / 128;
+}
+
+// Per-channel: f8e4m3fn weight [N,K] + bf16 scale [N,1], K minor.
+bool IsPerChannelWeight(const HloInstruction* w, const HloInstruction* s,
+                        int64_t c) {
+  if (w->shape().element_type() != F8E4M3FN) return false;
+  if (s->shape().element_type() != BF16) return false;
+  if (w->shape().dimensions().size() != 2 ||
+      s->shape().dimensions().size() != 2) {
+    return false;
+  }
+  if (c != 1) return false;
+  return s->shape().dimensions(0) == w->shape().dimensions(0) &&
+         s->shape().dimensions(1) == 1;
+}
+
+// NVFP4: f4e2m1 weight [N,K] + e4m3 group-16 scale [N,K/16], K minor.
+// Caller typically pre-scales x by 1/global; kernel sees raw e4m3 scales.
+bool IsNvfp4Weight(const HloInstruction* w, const HloInstruction* s,
+                   int64_t c) {
+  if (w->shape().element_type() != F4E2M1FN) return false;
+  if (s->shape().element_type() != F8E4M3FN) return false;
+  if (w->shape().dimensions().size() != 2 ||
+      s->shape().dimensions().size() != 2) {
+    return false;
+  }
+  if (c != 1) return false;  // K minor
+  const int64_t n = w->shape().dimensions(0), k = w->shape().dimensions(1);
+  if (s->shape().dimensions(0) != n) return false;
+  const int64_t sk = s->shape().dimensions(1);
+  return sk != 0 && k == sk * 16;
+}
+
+// Weight-only layout common to fused backends: bf16[M,K] x quant[N,K] -> bf16[M,N],
+// K minor on both, identity lhs scale, one of the supported weight/scale layouts.
+bool IsWeightOnlyFusableScaledDot(const HloScaledDotInstruction* dot) {
+  const DotDimensionNumbers& dn = dot->dot_dimension_numbers();
+  if (dn.lhs_batch_dimensions_size() != 0 ||
+      dn.rhs_batch_dimensions_size() != 0 ||
+      dn.lhs_contracting_dimensions_size() != 1 ||
+      dn.rhs_contracting_dimensions_size() != 1) {
+    return false;
+  }
+  if (dot->shape().element_type() != BF16) return false;
+  const HloInstruction* x = dot->operand(0);
+  const HloInstruction* w = dot->operand(1);
+  const HloInstruction* xs = dot->operand(2);
+  const HloInstruction* ws = dot->operand(3);
+  if (x->shape().dimensions().size() != 2 ||
+      x->shape().element_type() != BF16 ||
+      dn.lhs_contracting_dimensions(0) != 1 || !IsIdentityScale(xs)) {
+    return false;
+  }
+  const int64_t rhs_c = dn.rhs_contracting_dimensions(0);
+  return IsMxGroup32Weight(w, ws, rhs_c) || IsBlock128Bf16Weight(w, ws, rhs_c) ||
+         IsPerChannelWeight(w, ws, rhs_c) || IsNvfp4Weight(w, ws, rhs_c);
+}
+
+// Metal: emit zml$scaled_matmul {x, w, w_scale}; ThunkEmitter dispatches scheme.
+absl::StatusOr<HloInstruction*> TryEmitMetalScaledMatmul(
+    HloComputation* comp, HloScaledDotInstruction* dot) {
+  if (!IsWeightOnlyFusableScaledDot(dot)) return nullptr;
+  return comp->AddInstruction(HloInstruction::CreateCustomCall(
+      dot->shape(),
+      {dot->mutable_operand(0), dot->mutable_operand(1),
+       dot->mutable_operand(3)},
+      std::string(kMetalScaledMatmulCallTarget)));
+}
+
+// Backend switch: try a fused custom call for this platform. Returns nullptr to
+// fall through to generic dequant+Dot. CUDA/ROCm typically keep kScaledDot for
+// Triton (this pass is skipped when the Triton flag is on); fill arms as needed.
+absl::StatusOr<HloInstruction*> TryFusedScaledMatmul(
+    HloComputation* comp, HloScaledDotInstruction* dot,
+    const se::GpuComputeCapability& gpu_version) {
+  if (gpu_version.IsMetal()) {
+    return TryEmitMetalScaledMatmul(comp, dot);
+  }
+  // CUDA / ROCm / other: no fused custom-call arm in this pass yet.
+  return nullptr;
+}
 }  // namespace
 
 absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
@@ -172,6 +303,13 @@ absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
     }
     changed = true;
     HloScaledDotInstruction* dot = Cast<HloScaledDotInstruction>(instruction);
+    ASSIGN_OR_RETURN(HloInstruction * fused,
+                     TryFusedScaledMatmul(computation, dot, gpu_version_));
+    if (fused != nullptr) {
+      RETURN_IF_ERROR(dot->ReplaceAllUsesWith(fused));
+      RETURN_IF_ERROR(computation->RemoveInstruction(dot));
+      continue;  // fused; skip generic dequant lowering
+    }
     ASSIGN_OR_RETURN(HloInstruction * lhs, Dequantize(dot, 0, 2, "LHS"));
     ASSIGN_OR_RETURN(HloInstruction * rhs, Dequantize(dot, 1, 3, "RHS"));
 

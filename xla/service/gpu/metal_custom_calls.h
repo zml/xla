@@ -35,38 +35,27 @@ namespace gpu {
 // routes it to MetalGemmThunk.
 inline constexpr absl::string_view kMetalGemmCallTarget = "__metal$gemm";
 
-// A fused block-scaled FP8 GEMV on Apple Metal (no cuBLASLt FP8 on Metal), peer
-// to CUDA's __cublas$lt$matmul$f8. GemmRewriter emits this for a decode-shaped
-// dot over an f8e4m3fn weight + bf16 128-block scales; the call carries
-// {x, w_f8, scale} and ThunkEmitter routes it to MetalFp8GemvThunk.
-inline constexpr absl::string_view kMetalGemmF8CallTarget = "__metal$gemm$f8";
+// Weight-only scaled matmul on Apple Metal: single custom-call target for every
+// fused dequant×GEMM scheme the Metal branch of ScaledDotRewriter supports.
+// Produced from a weight-only kScaledDot (itself from the xla.scaled_dot
+// composite). Common operands:
+//   {x[M,K] bf16, w[N,K] quant, scale[...]} -> out[M,N] bf16
+// ThunkEmitter dispatches by weight/scale dtypes and layout:
+//   - MX (e8m0 group-32, f8/f4 or legacy u32/u8 pack) -> MetalMxMatmulThunk
+//   - NVFP4 (f4 + e4m3 group-16) -> MetalNvfp4MatmulThunk
+//   - FP8 128-block / per-channel bf16 scales -> MetalFp8GemvThunk
+inline constexpr absl::string_view kMetalScaledMatmulCallTarget =
+    "zml$scaled_matmul";
 
-// Maps a block-scaled quantized weight element type to its Metal fused-GEMV
-// custom-call target, or "" if the type has no Metal kernel. The single
-// per-format extension point the GemmRewriter matcher keys off: add a case here
-// (plus a kMetalGemm<F>CallTarget constant, an IsMetal<F>Gemm predicate, and a
-// decode kernel/thunk) when adding a new quantized weight family such as MXFP4.
-inline absl::string_view MetalBlockScaledGemmTarget(PrimitiveType weight_type) {
-  switch (weight_type) {
-    case F8E4M3FN:
-      return kMetalGemmF8CallTarget;
-    default:
-      return absl::string_view();
-  }
+inline bool IsMetalScaledMatmul(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kMetalScaledMatmulCallTarget;
 }
 
 // Matrix multiplication that runs via the Metal/metalBLAS GEMM thunk.
 inline bool IsMetalGemm(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&
          hlo.custom_call_target() == kMetalGemmCallTarget;
-}
-
-// Fused block-scaled FP8 GEMV routed to MetalFp8GemvThunk (peer to CUDA's
-// IsCublasLtMatmulF8). A distinct target from IsMetalGemm so the two never
-// share an ABI.
-inline bool IsMetalFp8Gemm(const HloInstruction& hlo) {
-  return hlo.opcode() == HloOpcode::kCustomCall &&
-         hlo.custom_call_target() == kMetalGemmF8CallTarget;
 }
 
 // A grouped block-scaled FP8 GEMV for mixture-of-experts on Apple Metal. Unlike

@@ -234,8 +234,12 @@ INSTANTIATE_TEST_SUITE_P(
             /*rhs_scale_const_val=*/1.0f,
             /*expected_rewrite=*/false,
         },
+        // A bf16/f32 scale on an fp8 operand is a valid vLLM / compressed-tensors
+        // format (block & per-channel scales are fp32, sometimes stored bf16); the
+        // floor dequantizes it. Here the lhs also carries a bf16 block scale
+        // (W8A8-style, both operands quantized) -- the floor dequantizes both.
         TestCase{
-            /*test_name=*/"Mixed_Type_Fail_BF16_Scale_With_FP8_Op",
+            /*test_name=*/"FP8_BF16_Block_Scale_Valid",
             /*lhs_type=*/"f8e4m3fn",
             /*rhs_type=*/"f8e4m3fn",
             /*lhs_scale_type=*/"bf16",
@@ -244,20 +248,49 @@ INSTANTIATE_TEST_SUITE_P(
             /*rhs_scale_shape=*/"3,8,128",
             /*lhs_scale_const_val=*/std::nullopt,
             /*rhs_scale_const_val=*/std::nullopt,
-            /*expected_rewrite=*/false,
+            /*expected_rewrite=*/true,
         },
+        // Any block factor now lifts to the floor (the group-32 gate is gone):
+        // 256/16 = 16 is not a multiple of 32 but still divides cleanly.
         TestCase{
-            /*test_name=*/"FP8_ScaleFactor_16",
+            /*test_name=*/"FP8_ScaleFactor_16_NonMX",
             /*lhs_type=*/"f8e4m3fn",
             /*rhs_type=*/"f8e4m3fn",
             /*lhs_scale_type=*/"f8e8m0fnu",
             /*rhs_scale_type=*/"f8e8m0fnu",
-            /*lhs_scale_shape=*/"3,128,16",  // 256 / 16 = 16 (not divisible by
-                                             // 32)
+            /*lhs_scale_shape=*/"3,128,16",  // 256 / 16 = 16 (non-multiple of 32)
             /*rhs_scale_shape=*/"3,8,128",
             /*lhs_scale_const_val=*/std::nullopt,
             /*rhs_scale_const_val=*/std::nullopt,
-            /*expected_rewrite=*/false,
+            /*expected_rewrite=*/true,
+        },
+        // vLLM 128x128 block FP8: native f8e4m3fn weight + f32 [., K/128, N/128]
+        // scale (here [3,2,1] over [3,256,128]); activation is the bf16 identity.
+        TestCase{
+            /*test_name=*/"FP8_Weight_128Block_F32",
+            /*lhs_type=*/"bf16",
+            /*rhs_type=*/"f8e4m3fn",
+            /*lhs_scale_type=*/"bf16",
+            /*rhs_scale_type=*/"f32",
+            /*lhs_scale_shape=*/"1,1,1",
+            /*rhs_scale_shape=*/"3,2,1",
+            /*lhs_scale_const_val=*/1.0f,
+            /*rhs_scale_const_val=*/std::nullopt,
+            /*expected_rewrite=*/true,
+        },
+        // Per-channel FP8 (RedHatAI *-FP8-Dynamic): f8e4m3fn weight + f32 [., 1, N]
+        // scale (one per output channel, broadcast across K); bf16 identity act.
+        TestCase{
+            /*test_name=*/"FP8_Weight_PerChannel_F32",
+            /*lhs_type=*/"bf16",
+            /*rhs_type=*/"f8e4m3fn",
+            /*lhs_scale_type=*/"bf16",
+            /*rhs_scale_type=*/"f32",
+            /*lhs_scale_shape=*/"1,1,1",
+            /*rhs_scale_shape=*/"3,1,128",
+            /*lhs_scale_const_val=*/1.0f,
+            /*rhs_scale_const_val=*/std::nullopt,
+            /*expected_rewrite=*/true,
         },
         TestCase{
             /*test_name=*/"FP8_ScaleFactor_64",

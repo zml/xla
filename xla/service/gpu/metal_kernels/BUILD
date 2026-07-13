@@ -88,21 +88,27 @@ embed_files(
     cpp_namespace = "xla::gpu",
 )
 
-# --- Custom fused FP8 (block-scaled) GEMV decode kernel ----------------------
+# --- Dense block-scaled FP8 decode GEMV (M==1) -------------------------------
 # Generates get_fp8_gemv(). Reads f8e4m3fn weights + 128x128 bf16 block scales
-# inline so decode matmuls touch DRAM once over the 1-byte weight, instead of
-# the generic reduce-fusion that the f8->bf16 dequant prologue otherwise forces.
+# and dequantizes inline (one DRAM pass over the 1-byte weight).
 embed_files(
     name = "fp8_gemv",
     srcs = ["custom/fp8_gemv.metal"],
     cpp_namespace = "xla::gpu",
 )
 
+# --- Dense per-channel FP8 decode GEMV (M==1) --------------------------------
+# Generates get_fp8_gemv_pc(). Same as fp8_gemv but scale is one bf16 per
+# output channel [N,1] (factors out of the K reduction).
+embed_files(
+    name = "fp8_gemv_pc",
+    srcs = ["custom/fp8_gemv_pc.metal"],
+    cpp_namespace = "xla::gpu",
+)
+
 # --- Tiled block-scaled FP8 thin GEMM for batched decode (M = batch > 1) ------
 # Generates get_fp8_gemm_tiled(). Same block-scaled f8 decode as fp8_gemv, but
-# reuses each weight byte across all M rows (threadgroup weight tile) instead of
-# re-reading the weight once per row -- removes the M-x DRAM-traffic blowup that
-# makes the per-row fp8_gemv collapse at batch>1.
+# reuses each weight byte across all M rows (threadgroup weight tile).
 embed_files(
     name = "fp8_gemm_tiled",
     srcs = ["custom/fp8_gemm_tiled.metal"],

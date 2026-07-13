@@ -145,30 +145,38 @@ absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
     const HloInstruction* lhs_scale = call->operand(2);
     const HloInstruction* rhs_scale = call->operand(3);
 
-    int64_t lhs_contracting_dim =
-        dot_dimension_numbers.lhs_contracting_dimensions(0);
-    int64_t rhs_contracting_dim =
-        dot_dimension_numbers.rhs_contracting_dimensions(0);
-
     auto is_supported = [&](const HloInstruction* operand,
-                            const HloInstruction* scale,
-                            int64_t contracting_dim) {
+                            const HloInstruction* scale) {
       auto op_type = operand->shape().element_type();
       auto scale_type = scale->shape().element_type();
-      if ((op_type == F8E4M3FN || op_type == F8E5M2 || op_type == F4E2M1FN) &&
-          scale_type == F8E8M0FNU) {
-        if (contracting_dim >= scale->shape().dimensions().size()) {
+      if (op_type == F8E4M3FN || op_type == F8E5M2 || op_type == F4E2M1FN) {
+        if (scale_type != F8E8M0FNU && scale_type != F8E4M3FN &&
+            scale_type != BF16 && scale_type != F32) {
           return false;
         }
-        int64_t operand_dim_size = operand->shape().dimensions(contracting_dim);
-        int64_t scale_dim_size = scale->shape().dimensions(contracting_dim);
-
-        if (scale_dim_size == 0 || operand_dim_size % scale_dim_size != 0) {
+	
+        // scalar
+        if (scale->shape().dimensions().empty()) {
+          return true;
+        }
+	
+        if (scale->shape().dimensions().size() !=
+            operand->shape().dimensions().size()) {
           return false;
         }
-        int64_t scale_factor = operand_dim_size / scale_dim_size;
-        return scale_factor % 32 == 0;
+	
+        // basically checks if every scale divides its operand
+        for (int64_t d = 0; d < operand->shape().dimensions().size(); ++d) {
+          int64_t o = operand->shape().dimensions(d);
+          int64_t s = scale->shape().dimensions(d);
+          if (s == 0 || o % s != 0) {
+            return false;
+          }
+        }
+	
+        return true;
       }
+      
       if (op_type == BF16 && scale_type == BF16) {
         if (scale->shape().dimensions().size() !=
             operand->shape().dimensions().size()) {
@@ -187,8 +195,7 @@ absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
       return false;
     };
 
-    if (!is_supported(lhs, lhs_scale, lhs_contracting_dim) ||
-        !is_supported(rhs, rhs_scale, rhs_contracting_dim)) {
+    if (!is_supported(lhs, lhs_scale) || !is_supported(rhs, rhs_scale)) {
       continue;
     }
 

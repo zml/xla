@@ -3272,8 +3272,324 @@ METAL_FUNC void fp_gather_qmm_rhs_impl(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
+//
+// Unlike the DeepSeek Fp8BlockLoader above (128x128 bf16 block scale), this is
+// MLX's ORIGINAL fp_quantized path: a per-(output-row, 32-element-K-group) E8M0
+// (uint8) scale and an E4M3 (mxfp8) / E2M1 (mxfp4) weight. The dequant helpers
+// and QuantizedBlockLoader / mxfp_qmm_t_impl are copied verbatim from MLX's
+// fp8.h / fp4.h / fp_quantized.h (only K/N/M made by-value so the entry can pass
+// them from the dims int4), reusing the same Steel BlockMMA / BlockLoader core.
+///////////////////////////////////////////////////////////////////////////////
+
+// fp8.h / fp4.h value+scale decodes (verbatim, MLX numerics).
+struct mlx_fp8_e4m3 {
+  operator float() {
+    uint16_t v = (bits & 127) << 7;
+    half converted = as_type<half>(v);
+    converted *= 256.0;
+    auto sign = bits & 128;
+    return static_cast<float>(sign ? -converted : converted);
+  }
+  operator bfloat() { return static_cast<bfloat>(this->operator float()); }
+  uint8_t bits;
+};
+struct mlx_fp8_e8m0 {
+  operator float() {
+    uint32_t out = (bits == 0 ? 0x400000 : (static_cast<uint16_t>(bits) << 23));
+    return as_type<float>(out);
+  }
+  operator bfloat() { return static_cast<bfloat>(this->operator float()); }
+  uint8_t bits;
+};
+struct mlx_fp4_e2m1 {
+  operator float() {
+    half converted = as_type<half>(ushort((bits & 7) << 9));
+    converted *= 16384.0;
+    return static_cast<float>(bits & 8 ? -converted : converted);
+  }
+  operator bfloat() { return static_cast<bfloat>(this->operator float()); }
+  uint8_t bits;
+};
+
+template <typename T, int group_size>
+static inline T dequantize_scale_mx(uint8_t s) {
+  if (group_size == 16) {
+    return T(*(thread mlx_fp8_e4m3*)(&s));
+  } else {
+    return T(*(thread mlx_fp8_e8m0*)(&s));
+  }
+}
+
+template <int bits, typename U = float>
+struct DequantizeMx {
+  U operator()(uint8_t x) {
+    if (bits == 8) {
+      return U(*(thread mlx_fp8_e4m3*)(&x));
+    } else {
+      return U(*(thread mlx_fp4_e2m1*)(&x));
+    }
+  }
+};
+
+template <typename U, int bits>
+inline void dequantize_mx(uint8_t w, U scale, threadgroup U* w_local) {
+  if (bits == 4) {
+    w_local[0] = scale * DequantizeMx<4, U>{}(w);
+    w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
+  } else {
+    w_local[0] = scale * DequantizeMx<8, U>{}(w);
+  }
+}
+
+// MLX QuantizedBlockLoader (verbatim) — 1-D per-(row, K-group) E8M0 scales.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    short group_size,
+    short bits>
+struct QuantizedBlockLoader {
+  MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short group_steps = group_size < BCOLS ? 1 : group_size / BCOLS;
+  MLX_MTL_CONST short scale_step = group_size < BCOLS ? BCOLS / group_size : 1;
+
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const int group_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device uint8_t* scales;
+
+  QuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device uint8_t* scales_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id,
+      ushort simd_lane_id)
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED * bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        group_step_cnt(0),
+        group_stride(BROWS * src_ld / group_size),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(
+            scales_ + bi * src_ld / group_size +
+            (bj * pack_factor) / group_size) {}
+
+  void load_unsafe() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    T scale = dequantize_scale_mx<T, group_size>(*scales);
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_mx<T, bits>(src[i * bytes_per_pack], scale, dst + i * pack_factor);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    T scale = dequantize_scale_mx<T, group_size>(*scales);
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_mx<T, bits>(src[i * bytes_per_pack], scale, dst + i * pack_factor);
+    }
+  }
+
+  void next() {
+    src += tile_stride;
+    if (reduction_dim == 1) {
+      if (group_steps > 1) {
+        group_step_cnt++;
+        if (group_step_cnt == group_steps) {
+          group_step_cnt = 0;
+          scales++;
+        }
+      } else {
+        scales += scale_step;
+      }
+    } else {
+      scales += group_stride;
+    }
+  }
+};
+
+// mxfp_qmm_t_impl — MLX fp_qmm_t_impl (verbatim; K/N/M/K_eff by-value).
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 16,
+    const int BK = 32,
+    const int BN = 64>
+METAL_FUNC void mxfp_qmm_t_impl(
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const int K,
+    const int N,
+    const int M,
+    const int K_eff,
+    uint3 tid,
+    uint lid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  (void)lid;
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<8, bits>();
+  constexpr int bytes_per_pack = get_bytes_per_pack();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;  // 1-D per-row E8M0 scale base
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y, N);
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Concrete kernel entry points
 ///////////////////////////////////////////////////////////////////////////////
+
+// MXFP8/MXFP4 dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims}
+// ABI. w is uint32-packed (cast to bytes), scales uint8 E8M0 [N, K/32]. Tiles
+// BM=16, BK=32, BN=64 (WM=WN=2 => 128 threads). aligned_N=false so partial N
+// tiles are handled; grid = (ceil(N/64), ceil(M/16), 1), tg = (32, 2, 2).
+#define MXFP_QMM_T_ENTRY(NAME, GS, BITS)                                     \
+  kernel void NAME(                                                          \
+      device const bfloat* x [[buffer(0)]],                                 \
+      device const uint32_t* w [[buffer(1)]],                               \
+      device const uchar* scales [[buffer(2)]],                             \
+      device bfloat* y [[buffer(3)]],                                       \
+      constant int4& dims [[buffer(4)]],                                    \
+      uint3 tid [[threadgroup_position_in_grid]],                           \
+      uint lid [[thread_index_in_threadgroup]],                             \
+      uint sg [[simdgroup_index_in_threadgroup]],                           \
+      uint sl [[thread_index_in_simdgroup]]) {                              \
+    constexpr int BM = 16, BK = 32, BN = 64;                                \
+    constexpr int BK_padded = (BK + 16 / sizeof(bfloat));                   \
+    threadgroup bfloat Xs[BM * BK_padded];                                  \
+    threadgroup bfloat Ws[BN * BK_padded];                                  \
+    mxfp_qmm_t_impl<bfloat, GS, BITS, false, BM, BK, BN>(                    \
+        w, scales, x, y, Xs, Ws, dims.y, dims.z, dims.x, dims.y, tid, lid,  \
+        sg, sl);                                                            \
+  }
+
+MXFP_QMM_T_ENTRY(mxfp8_qmm_t, 32, 8)
+MXFP_QMM_T_ENTRY(mxfp4_qmm_t, 32, 4)
 
 // Dense tiled q-GEMM: out[m,n] = sum_k x[m,k] * dequant(w[n,k]).
 //   x:     bfloat [M, K]          row-major
@@ -3306,6 +3622,279 @@ kernel void fp8_qmm_t(
   const int N = dims.z;
 
   fp_qmm_t_impl<bfloat, 128, 8, true, BM, BK, BN>(
+      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+}
+
+// Prefill-tuned variant of fp8_qmm_t: BM=64 (more rows per threadgroup) for
+// large-M (prefill) matmuls -- the best BM in {16,32,64,128} for M~256 (A/B'd:
+// ~1.3x over BM=16 and over the dequant floor). Same 128x128-block f8 dequant,
+// BN=64, WM=WN=2 (128 threads); only the M-tile grows. Grid BlockDim over
+// ceil(M/BM). Small-M batched decode stays on the BM=16 fp8_qmm_t.
+kernel void fp8_qmm_t_bm64(
+    device const bfloat* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device bfloat* y [[buffer(3)]],
+    constant int4& dims [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sl [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 64;
+  constexpr int BK = 32;
+  constexpr int BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
+  threadgroup bfloat Xs[BM * BK_padded];
+  threadgroup bfloat Ws[BN * BK_padded];
+  const int M = dims.x;
+  const int K = dims.y;
+  const int N = dims.z;
+  fp_qmm_t_impl<bfloat, 128, 8, true, BM, BK, BN>(
+      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+}
+
+// PerChannelFp8BlockLoader — per-OUTPUT-CHANNEL (compressed-tensors) analogue of
+// Fp8BlockLoader. The scale is bf16 [N, 1] (one per output row n), CONSTANT across
+// K -- it factors out of the K reduction. So each thread's scale is scales[bi] (its
+// output column within the [BN, BK] weight tile), read once and applied to every
+// decoded byte, and next() never advances it. The impl bases `scales` at the tile's
+// N column (y_col); this loader adds the thread's row bi. reduction_dim is always 1.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size>
+struct PerChannelFp8BlockLoader {
+  MLX_MTL_CONST short pack_factor = 1;
+  MLX_MTL_CONST short bytes_per_pack = 1;
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+
+  const int src_ld;
+  const int tile_stride;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uchar* src;
+  const device T* scales;  // one bf16 per output row n; points at scales[bi]
+
+  PerChannelFp8BlockLoader(
+      const device uchar* src_,
+      const device T* scales_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED * bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(scales_ + bi) {}  // per-row scale (constant across K)
+
+  void load_unsafe() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    T scale = *scales;
+    for (int i = 0; i < n_reads; i++) {
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+    T scale = *scales;
+    for (int i = 0; i < n_reads; i++) {
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+    }
+  }
+
+  // Per-channel scale is constant across K: only the weight source advances.
+  void next() { src += tile_stride; }
+};
+
+// fp_qmm_t_pc_impl — per-channel twin of fp_qmm_t_impl: same tiled q-GEMM but with
+// the PerChannelFp8BlockLoader (bf16 [N,1] scale, applied per output column) and
+// the scale base at y_col (not the 2-D block index).
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 16,
+    const int BK = 32,
+    const int BN = 64>
+METAL_FUNC void fp_qmm_t_pc_impl(
+    const device uchar* w,
+    const device T* scales,
+    const device T* x,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const int K,
+    const int N,
+    const int M,
+    const int K_eff,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+  (void)lid;
+  (void)group_size;
+  (void)bits;
+
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t =
+      PerChannelFp8BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uchar*)w;
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * static_cast<int64_t>(K);
+  scales += y_col;  // per-channel scale base: the tile's N column
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  const short num_els = min(BM, M - y_row);
+  const short num_outs = min(BN, N - y_col);
+  loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  if (num_els < BM) {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_safe(short2(BK, num_els));
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  } else {
+    if (!aligned_N && num_outs < BN) {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_safe(short2(BK, num_outs));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    } else {
+      for (int k = 0; k < K_eff; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_x.load_unsafe();
+        loader_w.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        loader_x.next();
+        loader_w.next();
+      }
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (num_els < BM || num_outs < BN) {
+    mma_op.store_result_safe(y, N, short2(num_outs, num_els));
+  } else {
+    mma_op.store_result(y, N);
+  }
+}
+
+// Per-channel dense q-GEMM entries (bf16[M,K] . f8e4m3fn[N,K] with bf16 [N,1]
+// scale -> bf16[M,N]). Small-M (batched decode) BM=16, large-M (prefill) BM=64.
+kernel void fp8_qmm_t_pc(
+    device const bfloat* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device bfloat* y [[buffer(3)]],
+    constant int4& dims [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sl [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 16;
+  constexpr int BK = 32;
+  constexpr int BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
+  threadgroup bfloat Xs[BM * BK_padded];
+  threadgroup bfloat Ws[BN * BK_padded];
+  const int M = dims.x;
+  const int K = dims.y;
+  const int N = dims.z;
+  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
+      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+}
+
+kernel void fp8_qmm_t_pc_bm64(
+    device const bfloat* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device bfloat* y [[buffer(3)]],
+    constant int4& dims [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sl [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 64;
+  constexpr int BK = 32;
+  constexpr int BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
+  threadgroup bfloat Xs[BM * BK_padded];
+  threadgroup bfloat Ws[BN * BK_padded];
+  const int M = dims.x;
+  const int K = dims.y;
+  const int N = dims.z;
+  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
       w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 

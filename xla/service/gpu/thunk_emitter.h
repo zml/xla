@@ -207,7 +207,23 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
       const HloCustomCallInstruction* hlo);
 
-  absl::StatusOr<ThunkSequence> EmitFp8GemvThunk(
+  // Weight-only scaled matmul "zml$scaled_matmul". Dispatches by scheme:
+  //   MX → MetalMxMatmulThunk
+  //   NVFP4 → MetalNvfp4MatmulThunk
+  //   FP8 128-block / per-channel → MetalFp8GemvThunk
+  absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // MX arm of zml$scaled_matmul (e8m0 group-32 / legacy u32 pack).
+  absl::StatusOr<ThunkSequence> EmitMetalMxMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // NVFP4 arm of zml$scaled_matmul (f4e2m1 + e4m3 group-16).
+  absl::StatusOr<ThunkSequence> EmitMetalNvfp4MatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // FP8 arm of zml$scaled_matmul (128-block / per-channel bf16 scales).
+  absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
       const HloCustomCallInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
