@@ -89,6 +89,33 @@ limitations under the License.
 
 namespace xla {
 
+namespace {
+
+class SmallEventDeduplicator {
+ public:
+  bool Insert(void* event) {
+    if (large_seen_.has_value()) {
+      return large_seen_->insert(event).second;
+    }
+    if (absl::c_linear_search(small_seen_, event)) {
+      return false;
+    }
+    if (small_seen_.size() < small_seen_.capacity()) {
+      small_seen_.push_back(event);
+      return true;
+    }
+    large_seen_.emplace(small_seen_.begin(), small_seen_.end());
+    small_seen_.clear();
+    return large_seen_->insert(event).second;
+  }
+
+ private:
+  absl::InlinedVector<void*, 4> small_seen_;
+  std::optional<absl::flat_hash_set<void*>> large_seen_;
+};
+
+}  // namespace
+
 void CommonPjRtClient::TrackFuture(PjRtMemorySpace* memory_space,
                                    absl::string_view debug_info,
                                    const Future<>& future) {}
@@ -1100,8 +1127,8 @@ absl::Status CommonPjRtClient::PrepareArguments(
     PjRtDevice* device, int replica, int partition,
     absl::Span<const Shape> parameter_device_shapes, bool& is_error,
     bool allow_fallback_for_donation) {
-  absl::flat_hash_set<void*> extra_deps_seen;
-  absl::flat_hash_set<void*> control_deps_seen;
+  SmallEventDeduplicator extra_deps_seen;
+  SmallEventDeduplicator control_deps_seen;
   if (argument_handles.size() != parameter_device_shapes.size()) {
     return InvalidArgument(
         "Execution supplied %d arguments but compiled program expected %d",
@@ -1114,7 +1141,10 @@ absl::Status CommonPjRtClient::PrepareArguments(
     tsl::profiler::TraceMe t2("Handle inputs");
     // State for `TestBufferDonationClashes`.
     absl::flat_hash_map<const void*, std::pair<bool, int>> donation_clashes;
-    donation_clashes.reserve(argument_handles.size());
+    const bool check_donation_clashes = !donated_params.empty();
+    if (check_donation_clashes) {
+      donation_clashes.reserve(argument_handles.size());
+    }
     // The first element is the argument index of the donated buffer, and the
     // second element is the size in bytes of the donated buffer.
     std::vector<std::pair<int, size_t>> donated_buffer_stats;
@@ -1161,8 +1191,10 @@ absl::Status CommonPjRtClient::PrepareArguments(
             "`ExecuteOptions::non_donatable_input_indices`");
       }
       bool must_donate = donated_param && !donation_denied_at_runtime;
-      RETURN_IF_ERROR(TestBufferDonationClashes(
-          tfrt_buffer, donation_clashes, must_donate, i, replica, partition));
+      if (check_donation_clashes) {
+        RETURN_IF_ERROR(TestBufferDonationClashes(
+            tfrt_buffer, donation_clashes, must_donate, i, replica, partition));
+      }
       if (allow_fallback_for_donation && must_donate) {
         // On CPU, we allow donation to succeed by introducing a copy. This was
         // added when enabling buffer donation on CPU since it turned out that a
@@ -1228,7 +1260,7 @@ absl::Status CommonPjRtClient::PrepareArguments(
               is_error = true;
               ABSL_FALLTHROUGH_INTENDED;
             case PJRT_DeviceEvent_State_Unavailable:
-              if (extra_deps_seen.insert(ev.ptr().ToC().device_event).second) {
+              if (extra_deps_seen.Insert(ev.ptr().ToC().device_event)) {
                 extra_deps.push_back(ev);
               }
               break;
@@ -1253,7 +1285,7 @@ absl::Status CommonPjRtClient::PrepareArguments(
           if (ev.ptr().state() == PJRT_DeviceEvent_State_Ready) {
             continue;
           }
-          if (control_deps_seen.insert(ev.ptr().ToC().device_event).second) {
+          if (control_deps_seen.Insert(ev.ptr().ToC().device_event)) {
             control_deps.push_back(ev);
           }
         }
@@ -1881,8 +1913,10 @@ absl::Status CommonPjRtLoadedExecutable::ExecutePrepare(
   // This also ensures that the returned `execute_event` dominates all inputs'
   // events, and thus output buffer only need to contain `execute_event` as the
   // single definition event.
-  launch_args.extra_deps.reserve(argument_handles.size());
-  launch_args.control_deps.reserve(argument_handles.size());
+  if (argument_handles.size() <= 4) {
+    launch_args.extra_deps.reserve(argument_handles.size());
+    launch_args.control_deps.reserve(argument_handles.size());
+  }
 
   bool is_error = false;
   RETURN_IF_ERROR(CommonPjRtClient::PrepareArguments(
