@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
@@ -71,6 +72,11 @@ class OnecclCommunicator final : public GpuCommunicator {
   }
 
   bool SupportsDeviceComm() const final { return false; }
+
+  // oneCCL's grouped SYCL point-to-point path stores a single receive-buffer
+  // discovery entry per source/destination rank pair. Multiple
+  // CollectivePermute buffers reuse that pair and cannot safely share a group.
+  bool SupportsGroupedCollectivePermute() const final { return false; }
 
   absl::StatusOr<std::unique_ptr<GpuDeviceCommunicator>> CreateDeviceComm(
       const GpuDeviceCommunicator::Requirements& requirements) final;
@@ -186,8 +192,7 @@ class OnecclCommunicator final : public GpuCommunicator {
                      std::unique_ptr<tsl::Executor> executor,
                      std::shared_ptr<CancellationToken> cancel);
 
-  absl::Status GroupStart();
-  absl::Status GroupEnd();
+  absl::Status GroupLaunch(absl::FunctionRef<absl::Status()> group);
   absl::Status CheckReady() const;
   Future<> Execute(absl::AnyInvocable<absl::Status() &&> f) const;
 

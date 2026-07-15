@@ -140,6 +140,10 @@ class GpuCommunicator : public Communicator {
   // Returns true iff communicator supports device-initiated communication.
   virtual bool SupportsDeviceComm() const { return false; }
 
+  // Returns true iff multiple CollectivePermute buffers can be batched into a
+  // single group launch.
+  virtual bool SupportsGroupedCollectivePermute() const { return true; }
+
   // Returns the StreamExecutor (and thus the device) this communicator runs on,
   // or nullptr if not backed by a StreamExecutor.
   virtual stream_executor::StreamExecutor* stream_executor() const {

@@ -360,9 +360,13 @@ absl::Status RunCollectivePermute(P2PConfig::SourceTargetRanks source_target,
     target_ranks.push_back(*source_target.target);
   }
 
+  auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
+
   // GroupStart/End API is needed if we need to dispatch multiple NCCL kernels
-  // for multiple buffers.
-  if (buffers.size() <= 1) {
+  // for multiple buffers. Some backends cannot safely batch multiple point to
+  // point operations for the same rank pair in one group.
+  if (buffers.size() <= 1 ||
+      !gpu_comm->SupportsGroupedCollectivePermute()) {
     for (uint64_t idx = 0; idx < buffers.size(); ++idx) {
       se::DeviceAddressBase src = src_addrs.at(idx);
       se::DeviceAddressBase dst = dest_addrs.at(idx);
@@ -373,7 +377,6 @@ absl::Status RunCollectivePermute(P2PConfig::SourceTargetRanks source_target,
       RETURN_IF_ERROR(future.Await());
     }
   } else {
-    auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
     auto future = gpu_comm->GroupExecute([&]() -> absl::Status {
       for (uint64_t idx = 0; idx < buffers.size(); ++idx) {
         se::DeviceAddressBase src = src_addrs.at(idx);
