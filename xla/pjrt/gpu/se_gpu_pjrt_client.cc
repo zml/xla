@@ -134,7 +134,7 @@ limitations under the License.
 #include "tsl/profiler/lib/traceme.h"
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/pjrt/gpu/gpu_metrics.h"
@@ -148,7 +148,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address_vmm_allocator.h"
 #include "xla/tsl/framework/scoped_allocation_trace.h"
 #include "xla/xla.pb.h"
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA || TENSORFLOW_USE_SYCL
 
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
@@ -306,6 +306,8 @@ absl::string_view StreamExecutorGpuClient::platform_version() const {
   return "rocm " STRINGIFY(TF_ROCM_VERSION);
 #elif GOOGLE_CUDA && defined(CUDART_VERSION)  // cuda
   return "cuda " STRINGIFY(CUDART_VERSION);
+#elif TENSORFLOW_USE_MUSA  // musa
+  return "musa";
 // TODO(intel-tf): Oneapi multiple platform version support
 // will be added in future, for now, oneapi 2026.0 is supported
 #elif TENSORFLOW_USE_SYCL                     // oneapi
@@ -1168,7 +1170,7 @@ StreamExecutorGpuClient::CompileAndLoad(MaybeOwningMlirModule module,
       PjRtStreamExecutorClient::CompileAndLoad(std::move(module), options);
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
   for (const PjRtDevice* device : addressable_devices()) {
     LocalDeviceState* local_device_state =
         tensorflow::down_cast<const PjRtStreamExecutorDevice*>(device)
@@ -1185,7 +1187,7 @@ StreamExecutorGpuClient::CompileAndLoad(MaybeOwningMlirModule module,
       }
     }
   }
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA || TENSORFLOW_USE_SYCL
   return executable;
 }
 
@@ -1196,7 +1198,7 @@ StreamExecutorGpuClient::CompileAndLoad(const XlaComputation& computation,
       PjRtStreamExecutorClient::CompileAndLoad(computation, options);
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
   for (const PjRtDevice* device : addressable_devices()) {
     LocalDeviceState* local_device_state =
         tensorflow::down_cast<const PjRtStreamExecutorDevice*>(device)
@@ -1213,7 +1215,7 @@ StreamExecutorGpuClient::CompileAndLoad(const XlaComputation& computation,
       }
     }
   }
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA || TENSORFLOW_USE_SYCL
   return executable;
 }
 
@@ -1900,6 +1902,8 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
     const GpuClientOptions& options) {
 #if TENSORFLOW_USE_ROCM
   auto pjrt_platform_name = xla::RocmName();
+#elif TENSORFLOW_USE_MUSA
+  auto pjrt_platform_name = xla::MusaName();
 #elif TENSORFLOW_USE_SYCL
   auto pjrt_platform_name = xla::OneapiName();
 #else   // TENSORFLOW_USE_ROCM
@@ -2041,7 +2045,7 @@ StreamExecutorGpuClient::RunAsync(
     ExecutableRunOptions run_options_inp, bool parameter_is_tupled_arguments,
     absl::Span<const Shape> executable_parameter_shapes) {
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
   std::vector<const Shape*> argument_shapes;
   argument_shapes.reserve(flat_arguments.size());
   for (const Shape& arg_shape : executable_parameter_shapes) {
@@ -2236,7 +2240,7 @@ StreamExecutorGpuClient::RunAsync(
   return PjRtStreamExecutorClient::RunAsync(
       exec, device, flat_arguments, results, std::move(run_options_inp),
       parameter_is_tupled_arguments, executable_parameter_shapes);
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA || TENSORFLOW_USE_SYCL
 }
 
 absl::StatusOr<std::unique_ptr<PjRtRuntimeAbiVersion>>

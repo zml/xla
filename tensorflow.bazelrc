@@ -299,6 +299,27 @@ common:rocm_ci_hermetic --repo_env=ROCM_DISTRO_VERSION="rocm_7.13.0_gfx90a"
 common:rocm_ci_hermetic --repo_env=SYSROOT_DIST=linux_glibc_2_31
 common:rocm_ci_hermetic --@local_config_rocm//rocm:rocm_path_type=hermetic
 
+# MUSA: Moore Threads GPU backend.
+common:musa --repo_env TF_NEED_MUSA=1
+common:musa --define=using_musa=true
+common:musa --define=tensorflow_mkldnn_contraction_kernel=0
+common:musa --cxxopt=-std=c++17
+common:musa --host_cxxopt=-std=c++17
+common:musa --@rules_ml_toolchain//common:enable_cuda=False
+common:musa --@rules_ml_toolchain//common:enable_rocm=False
+common:musa --@rules_ml_toolchain//common:enable_sycl=False
+common:musa --@rules_ml_toolchain//common:enable_musa=True
+common:musa --@rules_ml_toolchain//common:enable_hermetic_cc=True
+common:musa --@rules_ml_toolchain//common:enable_hermetic_libraries=True
+common:musa --repo_env=MUSA_PATH
+common:musa --repo_env=MUSA_HOME
+common:musa --repo_env=MUSA_VERSION
+common:musa --repo_env=MUSA_GPU_ARCHS
+common:musa --repo_env=MUSA_DISTRO_URL
+common:musa --repo_env=MUSA_DISTRO_HASH
+common:musa --repo_env=MUSA_DISTRO_STRIP_PREFIX
+common:musa --repo_env=MUSA_DISTRO_ROOT
+
 # This config option is used for SYCL as GPU backend.
 # SYCL Configuration (non-hermetic)
 common:sycl --@rules_ml_toolchain//common:enable_sycl=True

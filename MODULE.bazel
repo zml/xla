@@ -45,9 +45,9 @@ bazel_dep(name = "rules_ml_toolchain")
 # echo "sha256-${HASH}"
 archive_override(
     module_name = "rules_ml_toolchain",
-    integrity = "sha256-axspTL7LmKCLz+WWQUYfcuET2zD6kbRPzEnZgJm1umU=",
-    strip_prefix = "rules_ml_toolchain-b11745590f513ec55b32e2d126073576fde18c71",
-    urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/b11745590f513ec55b32e2d126073576fde18c71.tar.gz"],
+    integrity = "sha256-SEWxJWBfs7Od1c2auXITjoxczj7nYQxr02vduQEDQVs=",
+    strip_prefix = "rules_ml_toolchain-dd8f96029cf7aa6c22186ba3c416e857ff9ae0d1",
+    urls = ["https://github.com/zml/rules_ml_toolchain/archive/dd8f96029cf7aa6c22186ba3c416e857ff9ae0d1.tar.gz"],
 )
 
 # TODO: Upstream the patch?
@@ -242,6 +242,9 @@ use_repo(nccl_redist, "cuda_nccl")
 sycl_configure = use_extension("@rules_ml_toolchain//extensions:sycl_configure.bzl", "sycl_configure_ext")
 use_repo(sycl_configure, "level_zero", "local_config_sycl", "oneapi", "zero_loader")
 
+musa_configure = use_extension("@rules_ml_toolchain//extensions:musa_configure.bzl", "musa_configure_ext")
+use_repo(musa_configure, "local_config_musa")
+
 local_sysroot = use_extension("@rules_ml_toolchain//extensions:local_sysroot_configure.bzl", "local_sysroot_ext")
 use_repo(local_sysroot, "local_sysroot_config")
 
@@ -286,6 +289,8 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64")
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_musa")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 

@@ -2,6 +2,7 @@
 #   GPU-specific components in XLA service implementation.
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
@@ -408,6 +409,22 @@ cc_library(
 )
 
 cc_library(
+    name = "ptx_custom_kernel_emitter_musa",
+    srcs = ["custom_kernel_emitter_musa_stub.cc"],
+    hdrs = ["custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "ptx_custom_kernel_emitter_sycl",
     srcs = ["custom_kernel_emitter_sycl_stub.cc"],
     hdrs = ["custom_kernel_emitter.h"],
@@ -431,6 +448,8 @@ cc_library(
         ":ptx_custom_kernel_emitter_cuda",
     ]) + if_rocm_is_configured([
         ":ptx_custom_kernel_emitter_rocm",
+    ]) + if_musa([
+        ":ptx_custom_kernel_emitter_musa",
     ]) + if_sycl_is_configured([
         ":ptx_custom_kernel_emitter_sycl",
     ]) + [
@@ -822,6 +841,7 @@ cc_library(
         "//xla/stream_executor/abi:executable_abi_version",
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env_time",
@@ -1496,6 +1516,7 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:status_macros",
@@ -3744,6 +3765,59 @@ xla_cc_test(
         "//xla/service:hlo_module_config",
         "//xla/service:latency_hiding_scheduler",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_gpu_compiler",
+    srcs = [
+        "musa_gpu_compiler_registration.cc",
+    ],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_gpu_compiler_impl",
+        "//xla/service:compiler",
+        "//xla/stream_executor/musa:musa_platform_id",
+    ],
+    alwayslink = True,  # Contains compiler registration
+)
+
+cc_library(
+    name = "musa_gpu_compiler_impl",
+    srcs = [
+        "musa_gpu_compiler.cc",
+    ],
+    hdrs = [
+        "musa_gpu_compiler.h",
+    ],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":gpu_compiler",
+        ":target_constants",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/hlo/pass:hlo_pass_pipeline",
+        "//xla/service:compilation_stats",
+        "//xla/service:compiled_module",
+        "//xla/service:compiler",
+        "//xla/service:executable",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:Core",
     ],
 )
 

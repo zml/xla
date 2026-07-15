@@ -33,6 +33,8 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_rocm")
 
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_musa")
+
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64_cuda")
@@ -113,6 +115,13 @@ load(
 )
 
 cuda_configure(name = "local_config_cuda")
+
+load(
+    "@rules_ml_toolchain//gpu/musa:musa_configure.bzl",
+    "musa_configure",
+)
+
+musa_configure(name = "local_config_musa")
 
 load(
     "@rules_ml_toolchain//gpu/nccl:nccl_redist_init_repository.bzl",

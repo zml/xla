@@ -3,7 +3,6 @@
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     _if_cuda_or_rocm = "if_cuda_or_rocm",
-    _if_gpu_is_configured = "if_gpu_is_configured",
 )
 
 def stream_executor_friends():
@@ -23,10 +22,24 @@ def tf_additional_cudnn_plugin_copts():
 
 # Returns whether any GPU backend is configured.
 def if_gpu_is_configured(if_true, if_false = []):
-    return _if_gpu_is_configured(if_true, if_false)
+    return select({
+        "//xla/tsl:is_cuda_enabled": if_true,
+        "@local_config_rocm//rocm:using_hipcc": if_true,
+        "@rules_ml_toolchain//common:is_sycl_enabled": if_true,
+        "@local_config_musa//musa:using_musa": if_true,
+        "//conditions:default": if_false,
+    })
 
 def if_cuda_or_rocm(if_true, if_false = []):
     return _if_cuda_or_rocm(if_true, if_false)
+
+def if_cuda_or_rocm_or_musa(if_true, if_false = []):
+    return select({
+        "//xla/tsl:is_cuda_enabled": if_true,
+        "@local_config_rocm//rocm:using_hipcc": if_true,
+        "@local_config_musa//musa:using_musa": if_true,
+        "//conditions:default": if_false,
+    })
 
 # Helps differentiate targets for sycl build from other gpu build targets
 def if_cuda_or_rocm_is_configured(if_true, if_false = []):

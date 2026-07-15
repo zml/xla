@@ -108,6 +108,10 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/memory_reservation.h"
+#include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -542,6 +546,16 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == se::musa::kMusaPlatformId) {
+    auto cc = main_stream->GetMusaComputeCapability();
+    if (auto* executable_cc = gpu_version_.musa_compute_capability();
+        executable_cc != nullptr && executable_cc->architecture() != "unknown" &&
+        cc.architecture() != "unknown") {
+      TF_RET_CHECK(cc == *executable_cc)
+          << "MUSA architecture mismatch; expected {"
+          << executable_cc->ToString() << "}, but was {" << cc.ToString()
+          << "}";
+    }
   } else {
     return Internal("Unknown platform");
   }

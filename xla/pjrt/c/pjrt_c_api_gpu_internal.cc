@@ -84,6 +84,8 @@ namespace gpu_plugin {
 
 #if TENSORFLOW_USE_ROCM
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ROCM"
+#elif TENSORFLOW_USE_MUSA
+#define PJRT_GPU_PLUGIN_PLATFORM_NAME "MUSA"
 #elif TENSORFLOW_USE_SYCL
 #define PJRT_GPU_PLUGIN_PLATFORM_NAME "ONEAPI"
 #else
@@ -320,6 +322,9 @@ PJRT_Error* PJRT_GpuDeviceTopology_Create(
   if (plugin_platform == "ROCM") {
     platform_id = xla::RocmId();
     platform_name = xla::RocmName();
+  } else if (plugin_platform == "MUSA") {
+    platform_id = xla::MusaId();
+    platform_name = xla::MusaName();
   } else if (plugin_platform == "ONEAPI") {
     platform_id = xla::OneapiId();
     platform_name = xla::OneapiName();

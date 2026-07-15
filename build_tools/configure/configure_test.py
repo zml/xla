@@ -27,6 +27,7 @@ HostCompiler = configure.HostCompiler
 CudaCompiler = configure.CudaCompiler
 RocmCompiler = configure.RocmCompiler
 SyclCompiler = configure.SyclCompiler
+MusaCompiler = configure.MusaCompiler
 OS = configure.OS
 
 _PYTHON_BIN_PATH = "/usr/bin/python3"
@@ -97,6 +98,9 @@ class ConfigureTest(absltest.TestCase):
           line.strip().replace(_GCC_PATH, resolved_gcc_path)
           for line in f.readlines()
       ]
+
+    with (testdata / "musa_clang.bazelrc").open() as f:
+      cls.musa_clang_bazelrc_lines = [line.strip() for line in f.readlines()]
 
   def test_clang_bazelrc(self):
     config = XLAConfigOptions(
@@ -256,6 +260,33 @@ class ConfigureTest(absltest.TestCase):
     )
 
     self.assertEqual(bazelrc_lines, self.nvcc_gcc_bazelrc_lines)
+
+  def test_musa_clang_bazelrc(self):
+    config = XLAConfigOptions(
+        backend=Backend.MUSA,
+        os=OS.LINUX,
+        python_bin_path=_PYTHON_BIN_PATH,
+        host_compiler=HostCompiler.CLANG,
+        compiler_options=list(_COMPILER_OPTIONS),
+        cuda_compiler=CudaCompiler.NVCC,
+        using_nccl=False,
+        rocm_compiler=RocmCompiler.HIPCC,
+        sycl_compiler=SyclCompiler.ICPX,
+        musa_compiler=MusaCompiler.MCC,
+    )
+
+    bazelrc_lines = config.to_bazelrc_lines(
+        DiscoverablePathsAndVersions(
+            clang_path=None,
+            clang_major_version=18,
+            ld_library_path="",
+            musa_path="/usr/local/musa",
+            musa_version="4.2.0",
+            musa_gpu_archs=["mp_21", "mp_22"],
+        )
+    )
+
+    self.assertEqual(bazelrc_lines, self.musa_clang_bazelrc_lines)
 
 
 if __name__ == "__main__":

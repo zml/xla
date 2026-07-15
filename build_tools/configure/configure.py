@@ -198,6 +198,7 @@ class Backend(ArgparseableEnum):
   CPU = enum.auto()
   CUDA = enum.auto()
   ROCM = enum.auto()
+  MUSA = enum.auto()
   SYCL = enum.auto()
 
 
@@ -217,6 +218,10 @@ class RocmCompiler(ArgparseableEnum):
 
 class SyclCompiler(ArgparseableEnum):
   ICPX = enum.auto()
+
+
+class MusaCompiler(ArgparseableEnum):
+  MCC = enum.auto()
 
 
 class OS(ArgparseableEnum):
@@ -250,6 +255,12 @@ class DiscoverablePathsAndVersions:
   local_cuda_path: Optional[str] = None
   local_cudnn_path: Optional[str] = None
   local_nccl_path: Optional[str] = None
+
+  # MUSA specific
+  musa_path: Optional[str] = None
+  musa_home: Optional[str] = None
+  musa_version: Optional[str] = None
+  musa_gpu_archs: Optional[list[str]] = None
 
   def get_relevant_paths_and_versions(self, config: "XLAConfigOptions"):
     """Gets paths and versions as needed by the config.
@@ -316,6 +327,9 @@ class XLAConfigOptions:
   # SYCL specific
   sycl_compiler: SyclCompiler
 
+  # MUSA specific
+  musa_compiler: MusaCompiler = MusaCompiler.MCC
+
   def to_bazelrc_lines(
       self,
       dpav: DiscoverablePathsAndVersions,
@@ -355,10 +369,12 @@ class XLAConfigOptions:
 
     if self.backend == Backend.CPU:
       build_and_test_tag_filters.append("-gpu")
+      build_and_test_tag_filters.append("-musa-only")
 
     elif self.backend == Backend.CUDA:
       build_and_test_tag_filters.append("-rocm-only")
       build_and_test_tag_filters.append("-oneapi-only")
+      build_and_test_tag_filters.append("-musa-only")
 
       compiler_pair = self.cuda_compiler, self.host_compiler
 
@@ -416,6 +432,7 @@ class XLAConfigOptions:
     elif self.backend == Backend.ROCM:
       build_and_test_tag_filters.append("-cuda-only")
       build_and_test_tag_filters.append("-oneapi-only")
+      build_and_test_tag_filters.append("-musa-only")
 
       compiler_pair = self.rocm_compiler, self.host_compiler
 
@@ -427,9 +444,36 @@ class XLAConfigOptions:
         rc.append("build --config rocm")
       else:
         raise NotImplementedError("ROCm clang with host compiler not supported")
+    elif self.backend == Backend.MUSA:
+      build_and_test_tag_filters.append("-cuda-only")
+      build_and_test_tag_filters.append("-rocm-only")
+      build_and_test_tag_filters.append("-oneapi-only")
+
+      compiler_pair = self.musa_compiler, self.host_compiler
+
+      if compiler_pair in (
+          (MusaCompiler.MCC, HostCompiler.CLANG),
+          (MusaCompiler.MCC, HostCompiler.GCC),
+      ):
+        rc.append("build --config musa")
+      else:
+        raise NotImplementedError("MUSA with requested host compiler not supported")
+
+      if dpav.musa_path:
+        rc.append(f"build:musa --repo_env MUSA_PATH={dpav.musa_path}")
+      if dpav.musa_home:
+        rc.append(f"build:musa --repo_env MUSA_HOME={dpav.musa_home}")
+      if dpav.musa_version:
+        rc.append(f"build:musa --repo_env MUSA_VERSION={dpav.musa_version}")
+      if dpav.musa_gpu_archs:
+        rc.append(
+            "build:musa --repo_env MUSA_GPU_ARCHS="
+            f"{','.join(dpav.musa_gpu_archs)}"
+        )
     elif self.backend == Backend.SYCL:
       build_and_test_tag_filters.append("-cuda-only")
       build_and_test_tag_filters.append("-rocm-only")
+      build_and_test_tag_filters.append("-musa-only")
       build_and_test_tag_filters.append("-no-oneapi")
 
       compiler_pair = self.sycl_compiler, self.host_compiler
@@ -512,6 +556,12 @@ def _parse_args():
       default="icpx",
   )
   parser.add_argument(
+      "--musa_compiler",
+      type=MusaCompiler.from_str,
+      choices=list(MusaCompiler),
+      default="mcc",
+  )
+  parser.add_argument(
       "--cuda_compute_capabilities",
       type=comma_separated_list,
       default=None,
@@ -567,6 +617,24 @@ def _parse_args():
           " is set"
       ),
   )
+  parser.add_argument(
+      "--musa_path",
+      help="Optional: Local MUSA SDK dir. Defaults to /usr/local/musa.",
+  )
+  parser.add_argument(
+      "--musa_home",
+      help="Optional: Alternate local MUSA SDK dir.",
+  )
+  parser.add_argument(
+      "--musa_version",
+      help="Optional: MUSA redist version selected by rules_ml_toolchain.",
+  )
+  parser.add_argument(
+      "--musa_gpu_archs",
+      type=comma_separated_list,
+      default=None,
+      help="Optional: Comma-separated MUSA GPU architectures, e.g. mp_21,mp_22.",
+  )
 
   return parser.parse_args()
 
@@ -588,6 +656,7 @@ def main():
       using_nccl=args.nccl,
       rocm_compiler=args.rocm_compiler,
       sycl_compiler=args.sycl_compiler,
+      musa_compiler=args.musa_compiler,
   )
 
   bazelrc_lines = config.to_bazelrc_lines(
@@ -602,6 +671,10 @@ def main():
           local_cuda_path=args.local_cuda_path,
           local_cudnn_path=args.local_cudnn_path,
           local_nccl_path=args.local_nccl_path,
+          musa_path=args.musa_path,
+          musa_home=args.musa_home,
+          musa_version=args.musa_version,
+          musa_gpu_archs=args.musa_gpu_archs,
       )
   )
 

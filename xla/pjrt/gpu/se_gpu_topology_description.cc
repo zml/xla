@@ -287,8 +287,7 @@ StreamExecutorGpuTopologyDescription::ToProto() const {
 absl::StatusOr<std::unique_ptr<StreamExecutorGpuTopologyDescription>>
 StreamExecutorGpuTopologyDescription::FromProto(
     const xla::PjRtTopologyDescriptionProto& proto) {
-  if (proto.platform_id() != xla::CudaId() &&
-      proto.platform_id() != xla::RocmId()) {
+  if (!xla::IsGpuId(proto.platform_id())) {
     return absl::InvalidArgumentError(
         absl::StrCat("The platform_id is not a GPU platform. platform_id: ",
                      proto.platform_id()));

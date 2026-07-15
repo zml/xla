@@ -67,6 +67,10 @@ inline const char* OneapiName() {
   static constexpr char kOneapiName[] = "oneapi";
   return kOneapiName;
 }
+inline const char* MusaName() {
+  static constexpr char kMusaName[] = "musa";
+  return kMusaName;
+}
 // Temporarily keep SyclName() as there are references to it in Tensorflow.
 // TODO(intel-tf): Remove this function once Tensorflow is updated to use
 // OneapiName() instead of SyclName()
@@ -90,6 +94,10 @@ inline PjRtPlatformId RocmId() {
 inline PjRtPlatformId OneapiId() {
   static const PjRtPlatformId kOneapiId = tsl::Fingerprint64(OneapiName());
   return kOneapiId;
+}
+inline PjRtPlatformId MusaId() {
+  static const PjRtPlatformId kMusaId = tsl::Fingerprint64(MusaName());
+  return kMusaId;
 }
 
 // Temporarily keep SyclId() as there are references to it in Jaxlib.
@@ -433,7 +441,7 @@ inline bool IsTpuId(PjRtPlatformId platform_id) {
 // Returns true if it's GPU id.
 inline bool IsGpuId(PjRtPlatformId platform_id) {
   return platform_id == xla::CudaId() || platform_id == xla::RocmId() ||
-         platform_id == xla::SyclId();
+         platform_id == xla::SyclId() || platform_id == xla::MusaId();
 }
 
 // Returns true if it's CPU id.

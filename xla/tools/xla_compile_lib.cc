@@ -63,6 +63,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_description.pb.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -188,6 +189,8 @@ static absl::StatusOr<std::string> CompileGpuExecutable(
       pjrt_platform_id = xla::CudaId();
     } else if (platform_id == stream_executor::rocm::kROCmPlatformId) {
       pjrt_platform_id = xla::RocmId();
+    } else if (platform_id == stream_executor::musa::kMusaPlatformId) {
+      pjrt_platform_id = xla::MusaId();
     } else if (platform_id == stream_executor::sycl::kSyclPlatformId) {
       pjrt_platform_id = xla::SyclId();
     } else {

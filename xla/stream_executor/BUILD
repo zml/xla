@@ -71,6 +71,7 @@ cc_library(
         ":semantic_version",
         "//xla:xla_data_proto_cc",
         "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/musa:musa_compute_capability",
         "//xla/stream_executor/rocm:rocm_compute_capability",
         "//xla/stream_executor/sycl:oneapi_compute_capability",
         "//xla/tsl/lib/math:math_util",
@@ -271,6 +272,7 @@ cc_library(
         ":platform",
         ":stream",
         "//xla/hlo/testlib:test",
+        "//xla/stream_executor/musa:musa_compute_capability",
         "//xla/stream_executor/sycl:oneapi_compute_capability",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
@@ -1464,5 +1466,14 @@ alias(
     actual = "//xla/stream_executor/sycl:all_runtime",
     tags = [
         "gpu",
+    ],
+)
+
+alias(
+    name = "musa_platform",
+    actual = "//xla/stream_executor/musa:all_runtime",
+    tags = [
+        "gpu",
+        "musa-only",
     ],
 )

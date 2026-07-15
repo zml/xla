@@ -88,6 +88,10 @@ class StreamCommon : public Stream {
     return parent()->GetDeviceDescription().oneapi_compute_capability();
   }
 
+  MusaComputeCapability GetMusaComputeCapability() const override {
+    return parent()->GetDeviceDescription().musa_compute_capability();
+  }
+
   // Doesn't do anything interesting by default; GpuStream connects this to NVTX
   const std::string &GetName() const override { return name_; }
   void SetName(std::string name) override { name_ = std::move(name); }

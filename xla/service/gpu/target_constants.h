@@ -69,6 +69,20 @@ inline const char* DataLayout() {
 }
 }  // namespace spir
 
+namespace musa {
+
+inline const char* TargetTriple() {
+  static constexpr char kTargetTriple[] = "musa";
+  return kTargetTriple;
+}
+
+inline const char* DataLayout() {
+  static constexpr char kDataLayout[] = "e-p:64:64-i64:64-n32:64";
+  return kDataLayout;
+}
+
+}  // namespace musa
+
 }  // namespace gpu
 }  // namespace xla
 

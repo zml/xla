@@ -37,6 +37,7 @@ py_test(
         "testdata/cuda_clang_local.bazelrc",
         "testdata/default_cuda_clang.bazelrc",
         "testdata/gcc.bazelrc",
+        "testdata/musa_clang.bazelrc",
         "testdata/nvcc_clang.bazelrc",
         "testdata/nvcc_clang_local.bazelrc",
         "testdata/nvcc_gcc.bazelrc",

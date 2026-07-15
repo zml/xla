@@ -1,9 +1,10 @@
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/pjrt/gpu:package_groups.bzl", "xla_gpu_internal_packages")
-load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm")
+load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_or_musa")
 load("//xla/tests:build_defs.bzl", "xla_test")
 load("//xla/tsl:tsl.bzl", "if_google", "internal_visibility")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
@@ -54,7 +55,9 @@ cc_library(
     name = "se_gpu_pjrt_client",
     srcs = ["se_gpu_pjrt_client.cc"],
     hdrs = ["se_gpu_pjrt_client.h"],
-    defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
+    defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
     ]),
     visibility = internal_visibility(["//xla/pjrt/gpu:legacy_gpu_client_users"]),
@@ -197,13 +200,22 @@ cc_library(
         "@tsl//tsl/profiler/lib:connected_traceme",
         "@tsl//tsl/profiler/lib:nvtx_utils",
         "@tsl//tsl/profiler/lib:traceme",
-    ] + if_cuda_or_rocm([
+    ] + if_cuda_or_rocm_or_musa([
         # keep sorted
         "//xla:debug_options_flags",
         "//xla/service/gpu:gpu_compiler",
         "//xla/service/gpu:gpu_executable",
         "//xla/service/gpu:gpu_executable_buffer_allocator",
         "//xla/service/gpu:stream_executor_util",
+    ]) + if_musa([
+        # keep sorted
+        "@local_config_musa//musa:cuda2musa",
+        "@local_config_musa//musa:mccl",
+        "@local_config_musa//musa:mublas",
+        "@local_config_musa//musa:mudnn",
+        "@local_config_musa//musa:musa_driver",
+        "@local_config_musa//musa:musa_headers",
+        "@local_config_musa//musa:musart",
     ]) + if_cuda([
         # keep sorted
         "//xla/stream_executor/cuda:cuda_compute_capability",
@@ -598,6 +610,26 @@ cc_library(
 )
 
 cc_library(
+    name = "se_gpu_pjrt_compiler_musa_registration",
+    srcs = ["se_gpu_pjrt_compiler_musa_registration.cc"],
+    compatible_with = [],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt/se:stream_executor_platform_id_mapping",
+        "//xla/service/gpu:musa_gpu_compiler",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log:check",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "se_gpu_pjrt_compiler_sycl_registration",
     srcs = ["se_gpu_pjrt_compiler_sycl_registration.cc"],
     compatible_with = [],
@@ -649,6 +681,8 @@ cc_library(
         ":se_gpu_pjrt_compiler_cuda_registration",
     ]) + if_rocm([
         ":se_gpu_pjrt_compiler_rocm_registration",
+    ]) + if_musa([
+        ":se_gpu_pjrt_compiler_musa_registration",
     ]) + if_sycl([
         ":se_gpu_pjrt_compiler_sycl_registration",
     ]),
