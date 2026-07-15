@@ -210,7 +210,6 @@ class OnecclCommunicator final : public GpuCommunicator {
   std::unique_ptr<tsl::Executor> executor_;
   std::shared_ptr<CancellationToken> cancel_;
   bool aborted_ = false;
-  int64_t group_nesting_level_ = 0;
 };
 
 }  // namespace xla::gpu

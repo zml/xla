@@ -61,6 +61,8 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
+static thread_local int64_t oneccl_group_nesting = 0;
+
 se::Stream* ToStream(const Communicator::Executor& executor) {
   return absl::down_cast<const GpuCollectives::Executor&>(executor).stream();
 }
@@ -363,21 +365,21 @@ OnecclCommunicator::CreateSymmetricMemory(se::DeviceAddressBase addr) {
 
 absl::Status OnecclCommunicator::GroupStart() {
   RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ == 0) {
+  if (oneccl_group_nesting == 0) {
     auto activation = stream_executor_->Activate();
     RETURN_IF_ERROR(
         OnecclCall("ccl::group_start", [] { ccl::group_start(); }));
   }
-  ++group_nesting_level_;
+  ++oneccl_group_nesting;
   return absl::OkStatus();
 }
 
 absl::Status OnecclCommunicator::GroupEnd() {
   RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ <= 0) {
+  if (oneccl_group_nesting <= 0) {
     return FailedPrecondition("oneCCL group end without a matching group start");
   }
-  if (--group_nesting_level_ == 0) {
+  if (--oneccl_group_nesting == 0) {
     auto activation = stream_executor_->Activate();
     RETURN_IF_ERROR(OnecclCall("ccl::group_end", [] { ccl::group_end(); }));
   }
