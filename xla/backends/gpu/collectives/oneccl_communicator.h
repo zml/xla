@@ -22,6 +22,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/functional/function_ref.h"
@@ -187,6 +188,8 @@ class OnecclCommunicator final : public GpuCommunicator {
 
   absl::Status GroupLaunch(absl::FunctionRef<absl::Status()> group);
   absl::Status CheckReady() const;
+  absl::StatusOr<se::DeviceAddressBase> GetCollectivePermuteScratchForStream(
+      se::Stream* stream, size_t bytes);
   Future<> Execute(absl::AnyInvocable<absl::Status() &&> f) const;
 
   template <typename T>
@@ -208,6 +211,12 @@ class OnecclCommunicator final : public GpuCommunicator {
   std::unique_ptr<tsl::Executor> executor_;
   std::shared_ptr<CancellationToken> cancel_;
   bool aborted_ = false;
+  struct CollectivePermuteScratch {
+    se::DeviceAddressBase address;
+    size_t bytes = 0;
+  };
+  absl::flat_hash_map<se::Stream*, CollectivePermuteScratch>
+      collective_permute_stream_scratch_;
 };
 
 }  // namespace xla::gpu

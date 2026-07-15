@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -83,6 +84,20 @@ absl::Status OnecclCall(absl::string_view expr,
   } catch (...) {
     return OnecclExceptionStatus(expr, "unknown exception");
   }
+}
+
+bool OnecclCollectivePermuteBypassSyclP2P() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("XLA_ONECCL_COLLECTIVE_PERMUTE_BYPASS_SYCL_P2P");
+    if (value == nullptr) {
+      return false;
+    }
+    absl::string_view v(value);
+    return !(v.empty() || v == "0" || v == "false" || v == "False" ||
+             v == "FALSE");
+  }();
+  return enabled;
 }
 
 template <typename T, typename F>
@@ -255,10 +270,18 @@ OnecclCommunicator::Create(se::StreamExecutor* stream_executor,
 
 OnecclCommunicator::~OnecclCommunicator() {
   absl::Status status = Execute([this]() -> absl::Status {
+                          auto activation = stream_executor_->Activate();
+                          for (auto& scratch_entry :
+                               collective_permute_stream_scratch_) {
+                            auto& scratch = scratch_entry.second;
+                            if (!scratch.address.is_null()) {
+                              stream_executor_->Deallocate(&scratch.address);
+                            }
+                          }
+                          collective_permute_stream_scratch_.clear();
                           if (comm_ == nullptr || aborted_) {
                             return absl::OkStatus();
                           }
-                          auto activation = stream_executor_->Activate();
                           VLOG(1) << "Destroy oneCCL communicator: "
                                   << ToString();
                           comm_.reset();
@@ -374,6 +397,29 @@ absl::Status OnecclCommunicator::GroupLaunch(
     status = group_status;
   }
   return status;
+}
+
+absl::StatusOr<se::DeviceAddressBase>
+OnecclCommunicator::GetCollectivePermuteScratchForStream(se::Stream* stream,
+                                                         size_t bytes) {
+  CollectivePermuteScratch& scratch =
+      collective_permute_stream_scratch_[stream];
+  if (scratch.bytes >= bytes) {
+    return scratch.address;
+  }
+  if (!scratch.address.is_null()) {
+    stream_executor_->Deallocate(&scratch.address);
+    scratch.bytes = 0;
+  }
+  scratch.address = stream_executor_->Allocate(bytes, /*memory_space=*/0);
+  if (scratch.address.is_null()) {
+    return ResourceExhausted(
+        "Failed to allocate %d per-stream scratch bytes for oneCCL "
+        "collective-permute fallback",
+        static_cast<int64_t>(bytes));
+  }
+  scratch.bytes = bytes;
+  return scratch.address;
 }
 
 Future<> OnecclCommunicator::GroupExecute(
@@ -616,7 +662,8 @@ absl::Status OnecclCommunicator::LaunchCollectivePermute(
     PrimitiveType dtype, size_t count, std::optional<RankId> source_rank,
     absl::Span<const RankId> target_ranks, const Executor& executor) {
   RETURN_IF_ERROR(CheckReady());
-  if (!source_rank.has_value() && target_ranks.empty()) {
+  bool bypass_sycl_p2p = OnecclCollectivePermuteBypassSyclP2P();
+  if (!bypass_sycl_p2p && !source_rank.has_value() && target_ranks.empty()) {
     return absl::OkStatus();
   }
 
@@ -625,6 +672,75 @@ absl::Status OnecclCommunicator::LaunchCollectivePermute(
   ASSIGN_OR_RETURN(ccl::stream ccl_stream, ToOnecclStream(stream));
   auto activation = stream_executor_->Activate();
   ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
+
+  if (bypass_sycl_p2p) {
+    if (count == 0) {
+      return absl::OkStatus();
+    }
+
+    auto* sycl_queue =
+        static_cast<::sycl::queue*>(stream->platform_specific_handle().stream);
+    if (!sycl_queue->is_in_order()) {
+      return FailedPrecondition(
+          "oneCCL collective-permute SYCL P2P bypass requires an in-order "
+          "SYCL queue");
+    }
+
+    int num_ranks = comm().size();
+    if (num_ranks == 1 && !source_rank.has_value() && target_ranks.empty()) {
+      return absl::OkStatus();
+    }
+    if (source_rank.has_value() &&
+        (source_rank->value() < 0 || source_rank->value() >= num_ranks)) {
+      return InvalidArgument("Invalid collective permute source rank: %d",
+                             source_rank->value());
+    }
+
+    size_t per_rank_bytes = count * primitive_util::ByteWidth(dtype);
+    bool single_pair_component =
+        num_ranks == 2 && target_ranks.size() <= 1 &&
+        (source_rank.has_value() != !target_ranks.empty());
+    if (single_pair_component) {
+      int64_t root =
+          source_rank.has_value() ? source_rank->value() : comm().rank();
+      if (root < 0 || root >= num_ranks) {
+        return InvalidArgument(
+            "Invalid collective permute source rank for two-rank broadcast "
+            "fallback: %d",
+            root);
+      }
+      ASSIGN_OR_RETURN(
+          se::DeviceAddressBase scratch,
+          GetCollectivePermuteScratchForStream(stream, per_rank_bytes));
+      void* receive_buffer =
+          source_rank.has_value() ? recv_buffer.opaque() : scratch.opaque();
+      return OnecclCall("ccl::broadcast collective-permute fallback", [&] {
+        ccl::broadcast(send_buffer.opaque(), receive_buffer,
+                       ToOnecclCount(dtype, count), ccl_dtype,
+                       static_cast<int>(root), comm(), ccl_stream);
+      });
+    }
+
+    size_t scratch_bytes = static_cast<size_t>(num_ranks) * per_rank_bytes;
+    ASSIGN_OR_RETURN(
+        se::DeviceAddressBase scratch,
+        GetCollectivePermuteScratchForStream(stream, scratch_bytes));
+    RETURN_IF_ERROR(
+        OnecclCall("ccl::allgather collective-permute fallback", [&] {
+          ccl::allgather(send_buffer.opaque(), scratch.opaque(),
+                         ToOnecclCount(dtype, count), ccl_dtype, comm(),
+                         ccl_stream);
+        }));
+
+    if (source_rank.has_value()) {
+      se::DeviceAddressBase source_slice = scratch.GetByteSlice(
+          static_cast<size_t>(source_rank->value()) * per_rank_bytes,
+          per_rank_bytes);
+      RETURN_IF_ERROR(
+          stream->MemcpyD2D(&recv_buffer, source_slice, per_rank_bytes));
+    }
+    return absl::OkStatus();
+  }
 
   return GroupLaunch([&]() -> absl::Status {
     if (source_rank.has_value()) {
