@@ -339,7 +339,8 @@ absl::Status CollectiveKernelThunk::Prepare(const PrepareParams& params) {
           kXlaAllocatedBufferAlignBytes);
       ASSIGN_OR_RETURN(se::DeviceAddressHandle alloc_handle,
                        AllocateMemory(params.executor, total_bytes,
-                                      absl::StrCat("Scratch ", i)));
+                                      absl::StrCat("Scratch ", i),
+                                      se::MemorySpace::kCollective));
       scratch_allocations.push_back(std::move(alloc_handle));
     }
     per_stream_memory_.emplace(
