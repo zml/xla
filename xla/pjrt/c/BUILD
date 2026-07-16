@@ -752,6 +752,13 @@ xla_cc_binary(
     ]),
 )
 
+# Keep the platform-neutral Bazel label usable while retaining the conventional
+# shared-library filename for the produced artifact.
+alias(
+    name = "pjrt_c_api_gpu_plugin",
+    actual = ":pjrt_c_api_gpu_plugin.so",
+)
+
 cc_library(
     name = "pjrt_c_api_test_base",
     testonly = 1,
