@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/pjrt/local_device_state.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -149,8 +150,22 @@ LocalDeviceState::LocalDeviceState(se::StreamExecutor* executor,
   }
   tsl::ThreadOptions thread_options;
   thread_options.numa_node = executor->numa_node();
+  int64_t execute_worker_spin_us = 0;
+  status = tsl::ReadInt64FromEnvVar("XLA_PJRT_EXECUTE_WORKER_SPIN_US", 0,
+                                  &execute_worker_spin_us);
+  if (!status.ok()) {
+    LOG(ERROR) << "Invalid XLA_PJRT_EXECUTE_WORKER_SPIN_US; adaptive spinning "
+                  "is disabled: "
+               << status;
+    execute_worker_spin_us = 0;
+  } else if (execute_worker_spin_us < 0) {
+    LOG(ERROR) << "XLA_PJRT_EXECUTE_WORKER_SPIN_US must be non-negative; "
+                  "adaptive spinning is disabled";
+    execute_worker_spin_us = 0;
+  }
   execute_thread_ = std::make_unique<WorkerThread>(
-      tsl::Env::Default(), thread_options, "py_xla_execute");
+      tsl::Env::Default(), thread_options, "py_xla_execute",
+      std::chrono::microseconds(execute_worker_spin_us));
   if (schedule_async) {
     async_dispatch_thread_ = std::make_unique<WorkerThread>(
         tsl::Env::Default(), thread_options, "py_xla_dispatch");

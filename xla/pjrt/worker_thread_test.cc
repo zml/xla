@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/pjrt/worker_thread.h"
 
 #include <atomic>
+#include <chrono>
 #include <vector>
 
 #include "absl/synchronization/mutex.h"
@@ -106,6 +107,36 @@ TEST(WorkerThreadTest, ConsecutiveDrainsOnIdleThread) {
 
   thread.Drain();  // First drain on empty queue — must not deadlock.
   thread.Drain();  // Second drain on still-empty queue — must not deadlock.
+}
+
+TEST(WorkerThreadTest, AdaptiveSpinPreservesSequentialScheduling) {
+  WorkerThread thread(tsl::Env::Default(), tsl::ThreadOptions(), "test",
+                      std::chrono::microseconds(250));
+
+  std::atomic<int> counter{0};
+  thread.Schedule(
+      [&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
+  thread.Drain();
+  thread.Schedule(
+      [&counter]() { counter.fetch_add(1, std::memory_order_relaxed); });
+  thread.Drain();
+
+  EXPECT_EQ(counter.load(std::memory_order_relaxed), 2);
+}
+
+TEST(WorkerThreadTest, AdaptiveSpinFallsBackToBlockingWait) {
+  WorkerThread thread(tsl::Env::Default(), tsl::ThreadOptions(), "test",
+                      std::chrono::microseconds(50));
+
+  thread.Schedule([] {});
+  thread.Drain();
+  tsl::Env::Default()->SleepForMicroseconds(1000);
+
+  std::atomic<bool> executed{false};
+  thread.Schedule(
+      [&executed]() { executed.store(true, std::memory_order_relaxed); });
+  thread.Drain();
+  EXPECT_TRUE(executed.load(std::memory_order_relaxed));
 }
 }  // namespace
 }  // namespace xla

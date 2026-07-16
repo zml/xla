@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_PJRT_WORKER_THREAD_H_
 #define XLA_PJRT_WORKER_THREAD_H_
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <queue>
 #include <string>
@@ -36,6 +38,9 @@ class WorkerThread {
   WorkerThread(tsl::Env* env, const std::string& name);
   WorkerThread(tsl::Env* env, const tsl::ThreadOptions& thread_options,
                const std::string& name);
+  WorkerThread(tsl::Env* env, const tsl::ThreadOptions& thread_options,
+               const std::string& name,
+               std::chrono::microseconds idle_spin_duration);
 
   // Blocks until all enqueued closures have completed.
   ~WorkerThread();
@@ -59,11 +64,14 @@ class WorkerThread {
 
  private:
   bool WorkAvailable() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void SpinForWork();
   void WorkLoop();
 
   absl::Mutex mu_;
   std::queue<absl::AnyInvocable<void() &&>> work_queue_ ABSL_GUARDED_BY(mu_);
   bool is_running_ = false;
+  std::atomic<bool> work_available_hint_{false};
+  const std::chrono::microseconds idle_spin_duration_;
 
   std::unique_ptr<tsl::Thread> thread_;
 };

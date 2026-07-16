@@ -15,6 +15,9 @@ limitations under the License.
 
 #include "xla/pjrt/worker_thread.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -27,22 +30,31 @@ limitations under the License.
 namespace xla {
 
 WorkerThread::WorkerThread(tsl::Env* env, const std::string& name)
-    : WorkerThread(env, tsl::ThreadOptions(), name) {}
+    : WorkerThread(env, tsl::ThreadOptions(), name,
+                   std::chrono::microseconds::zero()) {}
 
 WorkerThread::WorkerThread(tsl::Env* env, const tsl::ThreadOptions& options,
-                           const std::string& name) {
+                           const std::string& name)
+    : WorkerThread(env, options, name, std::chrono::microseconds::zero()) {}
+
+WorkerThread::WorkerThread(
+    tsl::Env* env, const tsl::ThreadOptions& options, const std::string& name,
+    std::chrono::microseconds idle_spin_duration)
+    : idle_spin_duration_(idle_spin_duration) {
   thread_.reset(env->StartThread(options, name, [this]() { WorkLoop(); }));
 }
 
 WorkerThread::~WorkerThread() {
   absl::MutexLock lock(mu_);
   work_queue_.push(nullptr);
+  work_available_hint_.store(true, std::memory_order_release);
 }
 
 void WorkerThread::Schedule(absl::AnyInvocable<void() &&> fn) {
   CHECK(fn != nullptr);
   absl::MutexLock lock(mu_);
   work_queue_.push(std::move(fn));
+  work_available_hint_.store(true, std::memory_order_release);
 }
 
 void WorkerThread::Drain() {
@@ -55,14 +67,50 @@ void WorkerThread::Drain() {
 
 bool WorkerThread::WorkAvailable() { return !work_queue_.empty(); }
 
+void WorkerThread::SpinForWork() {
+  if (idle_spin_duration_ <= std::chrono::microseconds::zero()) {
+    return;
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + idle_spin_duration_;
+  uint32_t iterations = 0;
+  while (!work_available_hint_.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    // Reading the clock on every iteration is relatively expensive.
+    if ((++iterations & 63) == 0 &&
+        std::chrono::steady_clock::now() >= deadline) {
+      return;
+    }
+  }
+}
+
 void WorkerThread::WorkLoop() {
   absl::MutexLock lock(mu_);
+  bool has_executed_work = false;
   while (true) {
+    if (has_executed_work &&
+        idle_spin_duration_ > std::chrono::microseconds::zero() &&
+        work_queue_.empty()) {
+      mu_.unlock();
+      SpinForWork();
+      mu_.lock();
+    }
+
+    // Rechecking the queue under mu_ prevents a lost wakeup if work is
+    // scheduled exactly when the adaptive spin expires.
     mu_.Await(absl::Condition(this, &WorkerThread::WorkAvailable));
     {
       // We must be careful to call fn's dtor when the lock is unlocked.
       absl::AnyInvocable<void() &&> fn = std::move(work_queue_.front());
       work_queue_.pop();
+      work_available_hint_.store(!work_queue_.empty(),
+                                 std::memory_order_release);
       if (!fn) {
         return;
       }
@@ -72,6 +120,7 @@ void WorkerThread::WorkLoop() {
     }
     mu_.lock();
     is_running_ = false;
+    has_executed_work = true;
   }
 }
 
