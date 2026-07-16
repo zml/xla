@@ -42,11 +42,13 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/musa/musa_context.h"
 #include "xla/stream_executor/musa/musa_device_description.h"
 #include "xla/stream_executor/musa/musa_device_properties.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_event.h"
+#include "xla/stream_executor/musa/musa_module.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_stream.h"
 #include "xla/stream_executor/musa/musa_version_parser.h"
@@ -128,7 +130,18 @@ absl::Status MusaExecutor::Init() {
   TF_ASSIGN_OR_RETURN(context_, MusaContext::Create(device_ordinal(), driver_));
   std::unique_ptr<ActivateContext> activation = Activate();
   TF_RETURN_IF_ERROR(MusaRuntime::Get()->Init());
-  return MusaRuntime::Get()->SetDevice(device_ordinal());
+  TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal()));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<DeviceDescription> description,
+                      CreateDeviceDescription());
+  const MusaComputeCapability* capability =
+      description->gpu_compute_capability().musa_compute_capability();
+  if (capability == nullptr || capability->architecture().empty()) {
+    return absl::InternalError(
+        "Live MUSA device description has no architecture");
+  }
+  module_cache_ = std::make_unique<MusaModuleCache>(driver_, context_,
+                                                    capability->architecture());
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::unique_ptr<Stream>> MusaExecutor::CreateStream(
@@ -337,8 +350,20 @@ absl::StatusOr<std::unique_ptr<Kernel>> MusaExecutor::LoadKernel(
 
 absl::StatusOr<ModuleHandle> MusaExecutor::LoadModule(
     const MultiModuleLoaderSpec& spec) {
-  return absl::UnimplementedError(
-      "MUSA module loading is not implemented in PJRT GPU v1.");
+  if (module_cache_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "MUSA executor must be initialized before loading a module");
+  }
+  if (!spec.has_musa_mubin_in_memory()) {
+    return absl::InvalidArgumentError(
+        "MUSA module loading requires an explicit MUBIN artifact");
+  }
+  return module_cache_->AcquireModuleHandle(spec.musa_mubin_in_memory());
+}
+
+bool MusaExecutor::UnloadModule(ModuleHandle module_handle) {
+  return module_cache_ != nullptr &&
+         module_cache_->ReleaseModuleHandle(module_handle);
 }
 
 absl::StatusOr<DeviceAddressBase> MusaExecutor::GetSymbol(

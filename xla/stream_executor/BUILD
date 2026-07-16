@@ -178,12 +178,28 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_mubin_spec",
+    hdrs = ["musa_mubin_spec.h"],
+    deps = ["@com_google_absl//absl/types:span"],
+)
+
+cc_library(
     name = "module_spec",
     hdrs = ["module_spec.h"],
     deps = [
+        ":musa_mubin_spec",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "module_spec_test",
+    srcs = ["module_spec_test.cc"],
+    deps = [
+        ":module_spec",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -868,6 +884,7 @@ cc_library(
         ":kernel_args",
         ":kernel_args_packing_spec",
         ":kernel_spec_proto_cc",
+        ":musa_mubin_spec",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/functional:function_ref",

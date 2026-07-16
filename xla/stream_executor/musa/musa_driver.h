@@ -64,6 +64,9 @@ class MusaDriver {
   virtual absl::StatusOr<MUdevice> CurrentDevice();
   virtual absl::Status SynchronizeContext();
 
+  virtual absl::StatusOr<MUmodule> LoadModuleData(const void* image);
+  virtual absl::Status UnloadModule(MUmodule module);
+
  private:
   struct Api;
 

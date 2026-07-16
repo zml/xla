@@ -78,6 +78,20 @@ KernelLoaderSpec KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
                           std::move(kernel_name), arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateMusaMubinInMemorySpec(
+    absl::Span<const uint8_t> mubin_bytes, std::string kernel_name,
+    size_t arity, KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{MusaMubinInMemory{mubin_bytes},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
+KernelLoaderSpec KernelLoaderSpec::CreateOwningMusaMubinInMemorySpec(
+    std::vector<uint8_t> mubin_bytes, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{OwningMusaMubinInMemory{std::move(mubin_bytes)},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
@@ -109,8 +123,13 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
         in_process_symbol()->persistent_name);
   }
 
+  if (has_musa_mubin_in_memory()) {
+    absl::Span<const uint8_t> data = musa_mubin_in_memory()->mubin_bytes;
+    proto.mutable_mubin()->mutable_data()->assign(data.begin(), data.end());
+  }
+
   CHECK(has_cuda_cubin_in_memory() || has_cuda_ptx_in_memory() ||
-        has_in_process_symbol());
+        has_in_process_symbol() || has_musa_mubin_in_memory());
 
   if (std::holds_alternative<KernelArgsPackingSpec>(kernel_args_packing_)) {
     ASSIGN_OR_RETURN(
@@ -165,11 +184,16 @@ absl::StatusOr<KernelLoaderSpec> KernelLoaderSpec::FromProto(
           proto.kernel_name(), proto.arity(), kernel_args_packing);
     }
 
+    case KernelLoaderSpecProto::kMubin: {
+      const std::string& data = proto.mubin().data();
+      return KernelLoaderSpec::CreateOwningMusaMubinInMemorySpec(
+          std::vector<uint8_t>{data.begin(), data.end()}, proto.kernel_name(),
+          proto.arity(), std::move(kernel_args_packing));
+    }
+
     default:
       return absl::InvalidArgumentError(
-          "Invalid KernelLoaderSpecProto. Neither PTX nor CUBIN payload has "
-          "been "
-          "found.");
+          "Invalid KernelLoaderSpecProto. No kernel payload has been found.");
   }
 }
 

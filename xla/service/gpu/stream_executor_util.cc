@@ -61,6 +61,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_metadata.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -394,11 +395,14 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
 
 absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
     std::string kernel_name, uint64_t num_args,
-    absl::Span<const uint8_t> cubin_data, se::StreamExecutor* stream_exec,
+    absl::Span<const uint8_t> binary_data, se::StreamExecutor* stream_exec,
     uint32_t shared_mem_bytes, bool use_pdl) {
   se::KernelLoaderSpec loader_spec =
-      se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
-          cubin_data, std::move(kernel_name), num_args);
+      stream_exec->GetPlatform()->id() == se::musa::kMusaPlatformId
+          ? se::KernelLoaderSpec::CreateMusaMubinInMemorySpec(
+                binary_data, std::move(kernel_name), num_args)
+          : se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
+                binary_data, std::move(kernel_name), num_args);
 
   ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
                    stream_exec->LoadKernel(loader_spec));

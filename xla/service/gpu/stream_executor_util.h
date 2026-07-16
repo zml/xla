@@ -103,13 +103,14 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
     se::StreamExecutor* stream_exec, uint32_t shared_mem_bytes = 0,
     bool use_pdl = false);
 
-// Creates a kernel with a provided name, based from provided CUBIN in
-// cubin_data. The kernel should be executed using the provided executor.
+// Creates a kernel with a provided name from the platform binary in
+// `binary_data`: MUBIN for MUSA, CUBIN for CUDA, and HSACO in the legacy CUBIN
+// slot for ROCm. The kernel should be executed using the provided executor.
 //
-// The canonical storage cubin_data should outlive the lifetime of the kernel.
+// The canonical storage for `binary_data` should outlive the kernel.
 absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
     std::string kernel_name, uint64_t num_args,
-    absl::Span<const uint8_t> cubin_data, se::StreamExecutor* stream_exec,
+    absl::Span<const uint8_t> binary_data, se::StreamExecutor* stream_exec,
     uint32_t shared_mem_bytes = 0, bool use_pdl = false);
 
 // Runs loaded kernel on the stream with the provided arguments.

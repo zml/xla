@@ -760,15 +760,43 @@ cc_library(
 )
 
 cc_library(
+    name = "gpu_module_globals",
+    srcs = ["gpu_module_globals.cc"],
+    hdrs = ["gpu_module_globals.h"],
+    deps = [
+        ":dense_data_intermediate",
+        ":gpu_executable_proto_cc",
+        "//xla:literal",
+        "//xla:util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:module_spec",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:scoped_module_handle",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/tsl/platform:logging",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "gpu_executable",
-    srcs = [
-        "gpu_executable.cc",
-        "gpu_module_globals.cc",
-    ],
-    hdrs = [
-        "gpu_executable.h",
-        "gpu_module_globals.h",
-    ],
+    srcs = ["gpu_executable.cc"],
+    hdrs = ["gpu_executable.h"],
     deps = [
         ":alias_info",
         ":backend_configs_cc",
@@ -777,6 +805,7 @@ cc_library(
         ":gpu_executable_buffer_allocator",
         ":gpu_executable_proto_cc",
         ":gpu_executable_run_options",
+        ":gpu_module_globals",
         ":ir_emission_utils",
         ":stream_executor_util",
         "//xla:executable_run_options",
@@ -955,6 +984,23 @@ xla_cc_test(
         "@riegeli//riegeli/bytes:cfile_reader",
         "@riegeli//riegeli/bytes:string_reader",
         "@tsl//tsl/platform:path",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_module_globals_test",
+    srcs = ["gpu_module_globals_test.cc"],
+    deps = [
+        ":gpu_module_globals",
+        "//xla/stream_executor:mock_platform",
+        "//xla/stream_executor:mock_stream",
+        "//xla/stream_executor:mock_stream_executor",
+        "//xla/stream_executor:module_spec",
+        "//xla/stream_executor:platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/stream_executor/rocm:rocm_platform_id",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -3024,6 +3070,7 @@ cc_library(
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/gpu:gpu_kernel_registry",
         "//xla/stream_executor/gpu:repeat_buffer_kernel",
+        "//xla/stream_executor/musa:musa_platform_id",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/protobuf:dnn_proto_cc",
@@ -3053,6 +3100,13 @@ xla_cc_test(
         ":stream_executor_util",
         "//xla:autotuning_proto_cc",
         "//xla/service:hlo_module_config",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor:mock_platform",
+        "//xla/stream_executor:mock_stream_executor",
+        "//xla/stream_executor:platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/tsl/protobuf:dnn_proto_cc",
         "//xla/tsl/util/proto:proto_utils",
         "@com_google_absl//absl/status",

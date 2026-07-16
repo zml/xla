@@ -27,6 +27,10 @@ message CudaCubinProto {
   bytes data = 1;
 }
 
+message MusaMubinProto {
+  bytes data = 1;
+}
+
 message InProcessSymbolProto {
   string persistent_name = 1;
 }
@@ -36,6 +40,7 @@ message KernelLoaderSpecProto {
     CudaPtxProto ptx = 1;
     CudaCubinProto cubin = 2;
     InProcessSymbolProto in_process_symbol = 6;
+    MusaMubinProto mubin = 7;
   }
 
   int32 arity = 3;

@@ -60,6 +60,9 @@ using MuCtxSetCurrentFn = MUresult(MUSAAPI*)(MUcontext context);
 using MuCtxGetCurrentFn = MUresult(MUSAAPI*)(MUcontext* context);
 using MuCtxGetDeviceFn = MUresult(MUSAAPI*)(MUdevice* device);
 using MuCtxSynchronizeFn = MUresult(MUSAAPI*)();
+using MuModuleLoadDataFn = MUresult(MUSAAPI*)(MUmodule* module,
+                                              const void* image);
+using MuModuleUnloadFn = MUresult(MUSAAPI*)(MUmodule module);
 
 constexpr muuint64_t kProcAddressFlags =
     static_cast<muuint64_t>(MU_GET_PROC_ADDRESS_LEGACY_STREAM);
@@ -134,6 +137,8 @@ struct MusaDriver::Api {
   MuCtxGetCurrentFn context_get_current = nullptr;
   MuCtxGetDeviceFn context_get_device = nullptr;
   MuCtxSynchronizeFn context_synchronize = nullptr;
+  MuModuleLoadDataFn module_load_data = nullptr;
+  MuModuleUnloadFn module_unload = nullptr;
 };
 
 MusaDriver::MusaDriver() : MusaDriver(internal::CreateMusaDriverDsoLoader()) {}
@@ -234,6 +239,10 @@ absl::Status MusaDriver::Initialize() {
                         "muCtxGetDevice");
   MUSA_RESOLVE_REQUIRED(context_synchronize, MuCtxSynchronizeFn,
                         "muCtxSynchronize", "muCtxSynchronize");
+  MUSA_RESOLVE_REQUIRED(module_load_data, MuModuleLoadDataFn,
+                        "muModuleLoadData", "muModuleLoadData");
+  MUSA_RESOLVE_REQUIRED(module_unload, MuModuleUnloadFn, "muModuleUnload",
+                        "muModuleUnload");
 
 #undef MUSA_RESOLVE_REQUIRED
 
@@ -345,6 +354,34 @@ absl::Status MusaDriver::SynchronizeContext() {
   absl::Status status = Init();
   if (!status.ok()) return status;
   return ResultStatus(api_->context_synchronize(), "muCtxSynchronize");
+}
+
+absl::StatusOr<MUmodule> MusaDriver::LoadModuleData(const void* image) {
+  if (image == nullptr) {
+    return absl::InvalidArgumentError(
+        "muModuleLoadData requires a non-null image");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  MUmodule module = nullptr;
+  status =
+      ResultStatus(api_->module_load_data(&module, image), "muModuleLoadData");
+  if (!status.ok()) return status;
+  if (module == nullptr) {
+    return absl::InternalError(
+        "muModuleLoadData returned success with a null module");
+  }
+  return module;
+}
+
+absl::Status MusaDriver::UnloadModule(MUmodule module) {
+  if (module == nullptr) {
+    return absl::InvalidArgumentError(
+        "muModuleUnload requires a non-null module");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  return ResultStatus(api_->module_unload(module), "muModuleUnload");
 }
 
 }  // namespace stream_executor::musa

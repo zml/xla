@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/scoped_module_handle.h"
 #include "xla/stream_executor/stream.h"
@@ -91,16 +92,19 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
 
   se::MultiModuleLoaderSpec module_spec;
   if (!binary_.empty()) {
-    module_spec.AddCudaCubinInMemory(binary_);
+    if (executor->GetPlatform()->id() == se::musa::kMusaPlatformId) {
+      module_spec.AddMusaMubinInMemory(binary_);
+    } else {
+      module_spec.AddCudaCubinInMemory(binary_);
+    }
   }
 
   auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
   se::ModuleHandle module_handle;
-  // The CUDA driver isn't able to load a PTX and a binary which are both empty.
-  // It's okay if we skip loading in this case; if the module isn't loaded, all
-  // symbol lookups will fail, just as they should for an empty module.
-  if (!(executor->GetPlatform()->id() == se::cuda::kCudaPlatformId &&
-        binary_.empty())) {
+  // An empty binary has no module to load on any GPU platform. If the module
+  // isn't loaded, all symbol lookups fail, just as they should for an empty
+  // module.
+  if (!binary_.empty()) {
     ASSIGN_OR_RETURN(module_handle, executor->LoadModule(module_spec));
   }
 

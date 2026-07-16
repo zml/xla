@@ -43,6 +43,7 @@ namespace stream_executor::musa {
 
 class MusaContext;
 class MusaDriver;
+class MusaModuleCache;
 
 class MusaExecutor : public gpu::GpuExecutor {
  public:
@@ -98,6 +99,8 @@ class MusaExecutor : public gpu::GpuExecutor {
   absl::StatusOr<ModuleHandle> LoadModule(
       const MultiModuleLoaderSpec& spec) override;
 
+  bool UnloadModule(ModuleHandle module_handle) override;
+
   absl::StatusOr<DeviceAddressBase> GetSymbol(
       const std::string& symbol_name, ModuleHandle module_handle) override;
 
@@ -108,6 +111,9 @@ class MusaExecutor : public gpu::GpuExecutor {
   // Allocators and RAII allocations may outlive their executor. They retain
   // the primary context needed by their allocation/free callbacks.
   std::shared_ptr<MusaContext> context_;
+  // Declared after context_ so cached modules unload before the primary
+  // context reference is released during executor teardown.
+  std::unique_ptr<MusaModuleCache> module_cache_;
 
   mutable absl::Mutex alive_streams_mu_;
   absl::flat_hash_map<void*, Stream*> alive_streams_

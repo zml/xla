@@ -150,6 +150,118 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_mubin",
+    srcs = ["musa_mubin.cc"],
+    hdrs = ["musa_mubin.h"],
+    deps = [
+        ":musa_target_contract",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_mubin_test",
+    srcs = ["musa_mubin_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mubin",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_module",
+    srcs = ["musa_module.cc"],
+    hdrs = ["musa_module.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_context",
+        ":musa_driver",
+        ":musa_mubin",
+        "//xla/stream_executor:module_spec",
+        "//xla/stream_executor/gpu:scoped_activate_context",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@local_config_musa//musa:musa_headers",
+        "@tsl//tsl/platform:fingerprint",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_module_test",
+    srcs = ["musa_module_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_context",
+        ":musa_driver",
+        ":musa_module",
+        "//xla/stream_executor:module_spec",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+cc_library(
+    name = "musa_kernel",
+    srcs = ["musa_kernel.cc"],
+    hdrs = ["musa_kernel.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_module",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_kernel_test",
+    srcs = ["musa_kernel_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_kernel",
+        "//xla/stream_executor:mock_stream_executor",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+cc_library(
     name = "musa_device_description",
     srcs = ["musa_device_description.cc"],
     hdrs = ["musa_device_description.h"],
@@ -342,11 +454,13 @@ cc_library(
         "XLA_MUSA_TOOLKIT_VERSION=%s" % musa_config().version_number,
     ],
     deps = [
+        ":musa_compute_capability",
         ":musa_context",
         ":musa_device_description",
         ":musa_device_properties",
         ":musa_driver",
         ":musa_event",
+        ":musa_module",
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_stream",
@@ -402,6 +516,22 @@ xla_cc_test(
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_module_smoke_test",
+    srcs = ["musa_module_smoke_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_executor",
+        "//xla/stream_executor:module_spec",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
     ],
 )

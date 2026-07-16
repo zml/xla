@@ -92,6 +92,35 @@ TEST(KernelLoaderSpec, OwningCudaCubin) {
   EXPECT_THAT(spec.kernel_name(), "kernel24");
 }
 
+TEST(KernelLoaderSpec, MusaMubin) {
+  static constexpr std::array<uint8_t, 4> kMubinData = {0x7f, 'E', 'L', 'F'};
+  auto spec = KernelLoaderSpec::CreateMusaMubinInMemorySpec(
+      kMubinData, "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_musa_mubin_in_memory());
+
+  EXPECT_THAT(spec.musa_mubin_in_memory(),
+              Optional(Field(&MusaMubinInMemory::mubin_bytes, kMubinData)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
+TEST(KernelLoaderSpec, OwningMusaMubin) {
+  static constexpr std::array<uint8_t, 4> kMubinData = {0x7f, 'E', 'L', 'F'};
+  auto spec = KernelLoaderSpec::CreateOwningMusaMubinInMemorySpec(
+      std::vector<uint8_t>{kMubinData.begin(), kMubinData.end()}, "kernel24",
+      /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_musa_mubin_in_memory());
+
+  EXPECT_THAT(spec.musa_mubin_in_memory(),
+              Optional(Field(&MusaMubinInMemory::mubin_bytes, kMubinData)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+}
+
 TEST(KernelLoaderSpec, CudaPtx) {
   static constexpr absl::string_view kPtxData = "PTX DEADBEEF";
   auto spec = KernelLoaderSpec::CreateCudaPtxInMemorySpec(kPtxData, "kernel24",
@@ -172,6 +201,40 @@ TEST(KernelLoaderSpec, CubinKernelToProto) {
               )pb")));
 }
 
+TEST(KernelLoaderSpec, MubinProtoRoundTripPreservesEveryByte) {
+  const std::array<uint8_t, 7> kMubin = {0x7f, 'E', 0x00, 'L', 'F', 0x00, 0xff};
+  auto spec = KernelLoaderSpec::CreateMusaMubinInMemorySpec(
+      kMubin, "kernel_name", /*arity=*/42);
+
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpecProto proto, spec.ToProto());
+  EXPECT_EQ(proto.payload_case(), KernelLoaderSpecProto::kMubin);
+  EXPECT_FALSE(proto.has_cubin());
+  EXPECT_EQ(
+      proto.mubin().data(),
+      std::string(reinterpret_cast<const char*>(kMubin.data()), kMubin.size()));
+
+  KernelLoaderSpecProto decoded;
+  ASSERT_TRUE(decoded.ParseFromString(proto.SerializeAsString()));
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpec round_tripped,
+                          KernelLoaderSpec::FromProto(decoded));
+  EXPECT_EQ(round_tripped.kernel_name(), "kernel_name");
+  EXPECT_EQ(round_tripped.arity(), 42);
+  EXPECT_TRUE(round_tripped.has_musa_mubin_in_memory());
+  EXPECT_FALSE(round_tripped.has_cuda_cubin_in_memory());
+  EXPECT_THAT(round_tripped.musa_mubin_in_memory(),
+              Optional(Field(&MusaMubinInMemory::mubin_bytes, kMubin)));
+}
+
+TEST(KernelLoaderSpec, ProtoFieldNumbersAreStable) {
+  EXPECT_EQ(KernelLoaderSpecProto::kPtxFieldNumber, 1);
+  EXPECT_EQ(KernelLoaderSpecProto::kCubinFieldNumber, 2);
+  EXPECT_EQ(KernelLoaderSpecProto::kArityFieldNumber, 3);
+  EXPECT_EQ(KernelLoaderSpecProto::kKernelNameFieldNumber, 4);
+  EXPECT_EQ(KernelLoaderSpecProto::kKernelArgsPackingSpecFieldNumber, 5);
+  EXPECT_EQ(KernelLoaderSpecProto::kInProcessSymbolFieldNumber, 6);
+  EXPECT_EQ(KernelLoaderSpecProto::kMubinFieldNumber, 7);
+}
+
 TEST(KernelLoaderSpec, InProcessSymbolFromProto) {
   auto proto = ParseTextProtoOrDie<KernelLoaderSpecProto>(R"pb(
     in_process_symbol { persistent_name: "persistent_kernel_name" }
@@ -241,10 +304,7 @@ TEST(kernelLoaderSpec, StoresKernelArgsPackingSpec) {
       ParseTextProtoOrDie<KernelArgsPackingSpecProto>(
           R"pb(
             kernel_arguments {
-              relocations {
-                kind: KIND_BITS64_ABSOLUTE
-                argument_index: 0
-              }
+              relocations { kind: KIND_BITS64_ABSOLUTE argument_index: 0 }
             }
             kernel_arguments { data: "\x34\x12\x00\x00" }
           )pb");
@@ -263,10 +323,7 @@ TEST(kernelLoaderSpec, StoresKernelArgsPackingSpec) {
                 arity: 42
                 kernel_args_packing_spec {
                   kernel_arguments {
-                    relocations {
-                      kind: KIND_BITS64_ABSOLUTE
-                      argument_index: 0
-                    }
+                    relocations { kind: KIND_BITS64_ABSOLUTE argument_index: 0 }
                   }
                   kernel_arguments { data: "\x34\x12\x00\x00" }
                 }

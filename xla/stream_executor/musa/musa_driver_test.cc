@@ -98,6 +98,13 @@ struct FakeApiState {
   std::atomic<int> release_calls{0};
   MUresult release_result = MUSA_SUCCESS;
   MUresult set_flags_result = MUSA_SUCCESS;
+  MUmodule module = reinterpret_cast<MUmodule>(0x9876);
+  const void* last_module_image = nullptr;
+  MUmodule last_unloaded_module = nullptr;
+  std::atomic<int> module_load_calls{0};
+  std::atomic<int> module_unload_calls{0};
+  MUresult module_load_result = MUSA_SUCCESS;
+  MUresult module_unload_result = MUSA_SUCCESS;
 
   std::unordered_map<std::string, void*> gpa_symbols;
   bool gpa_success_null = false;
@@ -248,6 +255,19 @@ MUresult MUSAAPI FakeMuCtxGetDevice(MUdevice* device) {
 
 MUresult MUSAAPI FakeMuCtxSynchronize() { return MUSA_SUCCESS; }
 
+MUresult MUSAAPI FakeMuModuleLoadData(MUmodule* module, const void* image) {
+  ++g_state->module_load_calls;
+  g_state->last_module_image = image;
+  *module = g_state->module;
+  return g_state->module_load_result;
+}
+
+MUresult MUSAAPI FakeMuModuleUnload(MUmodule module) {
+  ++g_state->module_unload_calls;
+  g_state->last_unloaded_module = module;
+  return g_state->module_unload_result;
+}
+
 void InstallBootstrap(FakeSymbolLoader& loader) {
   loader.Add("muInit", &FakeMuInit);
   loader.Add("muGetErrorName", &FakeMuGetErrorName);
@@ -266,6 +286,8 @@ void InstallRequiredDlsymSymbols(FakeSymbolLoader& loader) {
   loader.Add("muCtxGetCurrent", &FakeMuCtxGetCurrent);
   loader.Add("muCtxGetDevice", &FakeMuCtxGetDevice);
   loader.Add("muCtxSynchronize", &FakeMuCtxSynchronize);
+  loader.Add("muModuleLoadData", &FakeMuModuleLoadData);
+  loader.Add("muModuleUnload", &FakeMuModuleUnload);
 }
 
 void InstallGpaSymbols(FakeApiState& state) {
@@ -290,6 +312,10 @@ void InstallGpaSymbols(FakeApiState& state) {
       reinterpret_cast<void*>(&FakeMuCtxGetDevice);
   state.gpa_symbols["muCtxSynchronize"] =
       reinterpret_cast<void*>(&FakeMuCtxSynchronize);
+  state.gpa_symbols["muModuleLoadData"] =
+      reinterpret_cast<void*>(&FakeMuModuleLoadData);
+  state.gpa_symbols["muModuleUnload"] =
+      reinterpret_cast<void*>(&FakeMuModuleUnload);
 }
 
 std::unique_ptr<FakeSymbolLoader> CompleteLoader() {
@@ -338,6 +364,13 @@ TEST_F(MusaDriverTest, CompleteTableWithoutGetProcAddress) {
   ASSERT_TRUE(current_device.ok());
   EXPECT_EQ(*current_device, 11);
   EXPECT_TRUE(driver.SynchronizeContext().ok());
+  const uint8_t image[] = {0x7f, 'E', 'L', 'F'};
+  absl::StatusOr<MUmodule> module = driver.LoadModuleData(image);
+  ASSERT_TRUE(module.ok());
+  EXPECT_EQ(*module, state_.module);
+  EXPECT_EQ(state_.last_module_image, image);
+  EXPECT_TRUE(driver.UnloadModule(*module).ok());
+  EXPECT_EQ(state_.last_unloaded_module, state_.module);
   EXPECT_TRUE(driver.ReleasePrimaryContext(10).ok());
   EXPECT_EQ(state_.release_calls, 1);
   EXPECT_EQ(loader_ptr->load_calls, 1);
@@ -446,6 +479,8 @@ TEST_F(MusaDriverTest, EveryMissingRequiredCapabilityIsNamed) {
       {"muCtxGetCurrent", {"muCtxGetCurrent"}},
       {"muCtxGetDevice", {"muCtxGetDevice"}},
       {"muCtxSynchronize", {"muCtxSynchronize"}},
+      {"muModuleLoadData", {"muModuleLoadData"}},
+      {"muModuleUnload", {"muModuleUnload"}},
   };
 
   for (const MissingCapability& capability : capabilities) {
@@ -485,6 +520,41 @@ TEST_F(MusaDriverTest, NullRetainedContextIsRejected) {
   absl::Status status = driver.RetainPrimaryContext(10).status();
   EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
   EXPECT_TRUE(absl::StrContains(status.message(), "null context"));
+}
+
+TEST_F(MusaDriverTest, ModuleOperationsRejectNullInputsAndResults) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_EQ(driver.LoadModuleData(nullptr).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.UnloadModule(nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.module_load_calls, 0);
+  EXPECT_EQ(state_.module_unload_calls, 0);
+
+  const uint8_t image[] = {0x7f, 'E', 'L', 'F'};
+  state_.module = nullptr;
+  absl::Status status = driver.LoadModuleData(image).status();
+  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(status.message(), "null module"));
+  EXPECT_EQ(state_.module_load_calls, 1);
+}
+
+TEST_F(MusaDriverTest, ModuleErrorsUseCanonicalDriverStatus) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+  const uint8_t image[] = {0x7f, 'E', 'L', 'F'};
+
+  state_.module_load_result = MUSA_ERROR_INVALID_IMAGE;
+  absl::Status load = driver.LoadModuleData(image).status();
+  EXPECT_EQ(load.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(absl::StrContains(load.message(), "muModuleLoadData failed"));
+
+  state_.module_unload_result = MUSA_ERROR_INVALID_HANDLE;
+  absl::Status unload = driver.UnloadModule(state_.module);
+  EXPECT_EQ(unload.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(absl::StrContains(unload.message(), "muModuleUnload failed"));
 }
 
 TEST_F(MusaDriverTest, DriverErrorsHaveCanonicalCodeNameAndDescription) {
