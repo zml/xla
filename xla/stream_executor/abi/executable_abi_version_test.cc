@@ -88,6 +88,19 @@ TEST(ExecutableAbiVersionTest, FromDeviceDescriptionOneAPI) {
               EqualsProto(R"pb(platform_name: "SYCL")pb"));
 }
 
+TEST(ExecutableAbiVersionTest, FromDeviceDescriptionVulkan) {
+  DeviceDescription device_description;
+  device_description.set_gpu_compute_capability(
+      GpuComputeCapability(VulkanComputeCapability(1, 2)));
+
+  ASSERT_OK_AND_ASSIGN(
+      ExecutableAbiVersion executable_abi_version,
+      ExecutableAbiVersion::FromDeviceDescription(device_description));
+  EXPECT_THAT(executable_abi_version.platform_name(), "VULKAN");
+  EXPECT_THAT(executable_abi_version.proto(),
+              EqualsProto(R"pb(platform_name: "VULKAN")pb"));
+}
+
 }  // namespace
 
 }  // namespace stream_executor

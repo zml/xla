@@ -38,6 +38,8 @@ bazel_dep(name = "grpc-java", version = "1.75.0", repo_name = "DO_NOT_USE_grpc_j
 
 # TODO: publish an official version of rules_ml_toolchain to BCR
 bazel_dep(name = "rules_ml_toolchain")
+bazel_dep(name = "llvm", version = "0.8.3")
+bazel_dep(name = "xxd", version = "9.1.0917")
 
 # To calculate integrity:
 # wget -O temp_module_archive.tar.gz <archive URL>
@@ -289,6 +291,10 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64_cuda")
+
+register_toolchains(
+    "@llvm//toolchain:all",
+)
 
 ### Other local config repos
 local_clang_configure = use_extension("@rules_ml_toolchain//extensions:local_clang_configure.bzl", "local_clang_configure_ext")

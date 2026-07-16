@@ -41,6 +41,34 @@ limitations under the License.
 
 namespace stream_executor {
 
+class VulkanComputeCapability {
+ public:
+  VulkanComputeCapability() = default;
+  VulkanComputeCapability(uint32_t api_version_major,
+                          uint32_t api_version_minor)
+      : api_version_major_(api_version_major),
+        api_version_minor_(api_version_minor) {}
+  explicit VulkanComputeCapability(const VulkanComputeCapabilityProto& proto)
+      : VulkanComputeCapability(proto.api_version_major(),
+                                proto.api_version_minor()) {}
+
+  uint32_t api_version_major() const { return api_version_major_; }
+  uint32_t api_version_minor() const { return api_version_minor_; }
+
+  std::string ToString() const;
+  VulkanComputeCapabilityProto ToProto() const;
+
+  friend bool operator==(const VulkanComputeCapability& lhs,
+                         const VulkanComputeCapability& rhs) {
+    return lhs.api_version_major_ == rhs.api_version_major_ &&
+           lhs.api_version_minor_ == rhs.api_version_minor_;
+  }
+
+ private:
+  uint32_t api_version_major_ = 1;
+  uint32_t api_version_minor_ = 2;
+};
+
 // Describes the capabilities and performance characteristics of a specific
 // execution unit within a device, such as scalar units (e.g., CUDA Cores) or
 // matrix units (e.g., Tensor Cores).
@@ -105,6 +133,9 @@ class GpuComputeCapability {
   explicit GpuComputeCapability(
       const OneAPIComputeCapability& compute_capability)
       : compute_capability_(compute_capability) {}
+  explicit GpuComputeCapability(
+      const VulkanComputeCapability& compute_capability)
+      : compute_capability_(compute_capability) {}
 
   GpuComputeCapability& operator=(
       const CudaComputeCapability& compute_capability) {
@@ -124,6 +155,12 @@ class GpuComputeCapability {
     return *this;
   }
 
+  GpuComputeCapability& operator=(
+      const VulkanComputeCapability& compute_capability) {
+    compute_capability_ = compute_capability;
+    return *this;
+  }
+
   bool IsCuda() const {
     return std::holds_alternative<CudaComputeCapability>(compute_capability_);
   }
@@ -134,6 +171,11 @@ class GpuComputeCapability {
 
   bool IsOneAPI() const {
     return std::holds_alternative<OneAPIComputeCapability>(compute_capability_);
+  }
+
+  bool IsVulkan() const {
+    return std::holds_alternative<VulkanComputeCapability>(
+        compute_capability_);
   }
 
   const CudaComputeCapability* cuda_compute_capability() const {
@@ -148,6 +190,10 @@ class GpuComputeCapability {
     return std::get_if<OneAPIComputeCapability>(&compute_capability_);
   }
 
+  const VulkanComputeCapability* vulkan_compute_capability() const {
+    return std::get_if<VulkanComputeCapability>(&compute_capability_);
+  }
+
   std::string ToString() const {
     if (auto ptr = cuda_compute_capability()) {
       return ptr->ToString();
@@ -155,7 +201,10 @@ class GpuComputeCapability {
     if (auto ptr = oneapi_compute_capability()) {
       return ptr->ToString();
     }
-    return rocm_compute_capability()->ToString();
+    if (auto ptr = rocm_compute_capability()) {
+      return ptr->ToString();
+    }
+    return vulkan_compute_capability()->ToString();
   }
 
   GpuComputeCapabilityProto ToProto() const;
@@ -175,7 +224,7 @@ class GpuComputeCapability {
 
  private:
   std::variant<CudaComputeCapability, RocmComputeCapability,
-               OneAPIComputeCapability>
+               OneAPIComputeCapability, VulkanComputeCapability>
       compute_capability_;
 };
 
@@ -385,6 +434,7 @@ class DeviceDescription {
   // platform. If a oneAPI compute capability is not available, the generation
   // will be 0 which is invalid.
   OneAPIComputeCapability oneapi_compute_capability() const;
+  VulkanComputeCapability vulkan_compute_capability() const;
 
   const GpuComputeCapability& gpu_compute_capability() const;
 
@@ -572,6 +622,12 @@ class DeviceDescription {
 
   void set_oneapi_compute_capability(uint32_t ip_version) {
     gpu_compute_capability_ = OneAPIComputeCapability(ip_version);
+  }
+
+  void set_vulkan_compute_capability(uint32_t api_version_major,
+                                     uint32_t api_version_minor) {
+    gpu_compute_capability_ =
+        VulkanComputeCapability(api_version_major, api_version_minor);
   }
 
   void set_numa_node(int value) { numa_node_ = value; }

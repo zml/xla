@@ -721,7 +721,8 @@ cc_library(
     alwayslink = 1,
 )
 
-# PJRT GPU plugin. Can be configured to be built for CUDA or ROCM.
+# PJRT GPU plugin. Can be configured to be built for CUDA, ROCM, or SYCL and
+# includes the compiler-only Vulkan backend.
 xla_cc_binary(
     name = "pjrt_c_api_gpu_plugin.so",
     additional_linker_inputs = [
@@ -741,6 +742,7 @@ xla_cc_binary(
     deps = [
         ":pjrt_c_api_gpu",
         "//xla/service:gpu_plugin",
+        "//xla/service/gpu:vulkan_gpu_compiler",
     ] + if_cuda_is_configured([
         "//xla/stream_executor:cuda_platform",
     ]) + if_rocm_is_configured([

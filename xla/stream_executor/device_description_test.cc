@@ -149,6 +149,10 @@ TEST(GpuComputeCapability, ProtoConversion) {
       GpuComputeCapability::FromProto(
           GpuComputeCapability(RocmComputeCapability("gfx908")).ToProto()),
       IsOkAndHolds(GpuComputeCapability(RocmComputeCapability("gfx908"))));
+  EXPECT_THAT(
+      GpuComputeCapability::FromProto(
+          GpuComputeCapability(VulkanComputeCapability(1, 2)).ToProto()),
+      IsOkAndHolds(GpuComputeCapability(VulkanComputeCapability(1, 2))));
 }
 
 TEST(ExecutionUnitDescription, ProtoConversion) {

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -170,6 +171,33 @@ TEST(KernelLoaderSpec, CubinKernelToProto) {
                 kernel_name: "kernel_name"
                 arity: 42
               )pb")));
+}
+
+TEST(KernelLoaderSpec, VulkanSpirvRoundTrip) {
+  std::vector<uint8_t> spirv = {0x03, 0x02, 0x23, 0x07};
+  std::vector<VulkanDescriptorBinding> bindings = {
+      {/*descriptor_set=*/0, /*binding=*/0, /*argument_index=*/0,
+       /*slice_index=*/0, /*read_only=*/true},
+      {/*descriptor_set=*/0, /*binding=*/1, /*argument_index=*/1,
+       /*slice_index=*/0, /*read_only=*/false}};
+  auto spec = KernelLoaderSpec::CreateOwningVulkanSpirvInMemorySpec(
+      spirv, VulkanSpirvProto::VULKAN_1_2, bindings, "kernel_name",
+      /*arity=*/2);
+
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpecProto proto, spec.ToProto());
+  TF_ASSERT_OK_AND_ASSIGN(KernelLoaderSpec round_tripped,
+                          KernelLoaderSpec::FromProto(proto));
+  ASSERT_TRUE(round_tripped.has_vulkan_spirv_in_memory());
+  std::optional<VulkanSpirvInMemory> payload =
+      round_tripped.vulkan_spirv_in_memory();
+  ASSERT_TRUE(payload.has_value());
+  EXPECT_THAT(payload->spirv_bytes, ::testing::ElementsAreArray(spirv));
+  EXPECT_EQ(payload->target_environment, VulkanSpirvProto::VULKAN_1_2);
+  ASSERT_EQ(payload->descriptor_bindings.size(), 2);
+  EXPECT_EQ(payload->descriptor_bindings[0].binding, 0);
+  EXPECT_TRUE(payload->descriptor_bindings[0].read_only);
+  EXPECT_EQ(payload->descriptor_bindings[1].binding, 1);
+  EXPECT_FALSE(payload->descriptor_bindings[1].read_only);
 }
 
 TEST(KernelLoaderSpec, InProcessSymbolFromProto) {

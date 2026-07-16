@@ -273,6 +273,8 @@ absl::Status LinkAndOptimizeModule(
     device_type = xla::codegen::intrinsics::DeviceType::kAmdGpu;
   } else if (gpu_version.IsOneAPI()) {
     device_type = xla::codegen::intrinsics::DeviceType::kIntelGpu;
+  } else if (gpu_version.IsVulkan()) {
+    device_type = xla::codegen::intrinsics::DeviceType::kVulkanGpu;
   } else {
     LOG(FATAL) << "Unsupported GPU type";
   }

@@ -69,6 +69,19 @@ inline const char* DataLayout() {
 }
 }  // namespace spir
 
+namespace vulkan {
+inline const char* TargetTriple() {
+  static constexpr char kTargetTriple[] =
+      "spirv1.5-unknown-vulkan1.2-compute";
+  return kTargetTriple;
+}
+
+inline const char* DataLayout() {
+  static constexpr char kDataLayout[] = "";
+  return kDataLayout;
+}
+}  // namespace vulkan
+
 }  // namespace gpu
 }  // namespace xla
 

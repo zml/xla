@@ -78,6 +78,18 @@ KernelLoaderSpec KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
                           std::move(kernel_name), arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateOwningVulkanSpirvInMemorySpec(
+    std::vector<uint8_t> spirv_bytes,
+    VulkanSpirvProto::TargetEnvironment target_environment,
+    std::vector<VulkanDescriptorBinding> descriptor_bindings,
+    std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{
+      OwningVulkanSpirvInMemory{std::move(spirv_bytes), target_environment,
+                                std::move(descriptor_bindings)},
+      std::move(kernel_name), arity, std::move(kernel_args_packing)};
+}
+
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
@@ -109,8 +121,28 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
         in_process_symbol()->persistent_name);
   }
 
+  if (has_vulkan_spirv_in_memory()) {
+    VulkanSpirvInMemory payload = *vulkan_spirv_in_memory();
+    VulkanSpirvProto* vulkan_proto = proto.mutable_vulkan_spirv();
+    vulkan_proto->mutable_data()->assign(payload.spirv_bytes.begin(),
+                                         payload.spirv_bytes.end());
+    vulkan_proto->set_target_environment(payload.target_environment);
+    for (const VulkanDescriptorBinding& binding :
+         payload.descriptor_bindings) {
+      VulkanSpirvProto::DescriptorBinding* binding_proto =
+          vulkan_proto->add_descriptor_bindings();
+      binding_proto->set_descriptor_set(binding.descriptor_set);
+      binding_proto->set_binding(binding.binding);
+      binding_proto->set_argument_index(binding.argument_index);
+      binding_proto->set_slice_index(binding.slice_index);
+      binding_proto->set_access(
+          binding.read_only ? VulkanSpirvProto::READ_ONLY
+                            : VulkanSpirvProto::READ_WRITE);
+    }
+  }
+
   CHECK(has_cuda_cubin_in_memory() || has_cuda_ptx_in_memory() ||
-        has_in_process_symbol());
+        has_in_process_symbol() || has_vulkan_spirv_in_memory());
 
   if (std::holds_alternative<KernelArgsPackingSpec>(kernel_args_packing_)) {
     ASSIGN_OR_RETURN(
@@ -165,11 +197,37 @@ absl::StatusOr<KernelLoaderSpec> KernelLoaderSpec::FromProto(
           proto.kernel_name(), proto.arity(), kernel_args_packing);
     }
 
+    case KernelLoaderSpecProto::kVulkanSpirv: {
+      const VulkanSpirvProto& vulkan_proto = proto.vulkan_spirv();
+      if (vulkan_proto.target_environment() ==
+          VulkanSpirvProto::TARGET_ENVIRONMENT_UNSPECIFIED) {
+        return absl::InvalidArgumentError(
+            "Vulkan SPIR-V payload has no target environment.");
+      }
+      std::vector<VulkanDescriptorBinding> descriptor_bindings;
+      descriptor_bindings.reserve(vulkan_proto.descriptor_bindings_size());
+      for (const VulkanSpirvProto::DescriptorBinding& binding_proto :
+           vulkan_proto.descriptor_bindings()) {
+        if (binding_proto.access() ==
+            VulkanSpirvProto::DESCRIPTOR_ACCESS_UNSPECIFIED) {
+          return absl::InvalidArgumentError(
+              "Vulkan descriptor binding has no access mode.");
+        }
+        descriptor_bindings.push_back(VulkanDescriptorBinding{
+            binding_proto.descriptor_set(), binding_proto.binding(),
+            binding_proto.argument_index(), binding_proto.slice_index(),
+            binding_proto.access() == VulkanSpirvProto::READ_ONLY});
+      }
+      const std::string& data = vulkan_proto.data();
+      return KernelLoaderSpec::CreateOwningVulkanSpirvInMemorySpec(
+          std::vector<uint8_t>{data.begin(), data.end()},
+          vulkan_proto.target_environment(), std::move(descriptor_bindings),
+          proto.kernel_name(), proto.arity(), std::move(kernel_args_packing));
+    }
+
     default:
       return absl::InvalidArgumentError(
-          "Invalid KernelLoaderSpecProto. Neither PTX nor CUBIN payload has "
-          "been "
-          "found.");
+          "Invalid KernelLoaderSpecProto. No supported payload was found.");
   }
 }
 

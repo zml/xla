@@ -410,14 +410,19 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
   // zero initializers in LLVM IR and are later overwritten when the PTX/CUBIN
   // is loaded.
   bool should_emit_initializer = num_elements <= 1;
-  AppendGlobalConstant(constants_module_.get(), num_elements, element_bytes,
-                       global_name, slice.index(), content,
-                       should_emit_initializer);
+  const bool is_vulkan =
+      llvm::Triple(constants_module_->getTargetTriple()).getOS() ==
+      llvm::Triple::Vulkan;
+  if (!is_vulkan) {
+    AppendGlobalConstant(constants_module_.get(), num_elements, element_bytes,
+                         global_name, slice.index(), content,
+                         should_emit_initializer);
+  }
 
   GpuExecutable::ConstantInfo info;
   info.symbol_name.assign(global_name);
   info.allocation_index = slice.index();
-  if (!should_emit_initializer) {
+  if (is_vulkan || !should_emit_initializer) {
     info.content = content;
   }
 
