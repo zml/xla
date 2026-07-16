@@ -123,7 +123,8 @@ void UnloadLevelZeroModule(SyclContext* context, ze_module_handle_t module) {
 // Loads a SPIR-V binary into a Level Zero module for the given SYCL context
 // and device.
 absl::StatusOr<ze_module_handle_t> LoadLevelZeroModule(
-    SyclContext* context, const char* spirv_binary, const size_t spirv_size) {
+    SyclContext* context, const char* spirv_binary, const size_t spirv_size,
+    absl::string_view load_path) {
   const sycl::context& sycl_context = context->context();
   ASSIGN_OR_RETURN(sycl::device sycl_device,
                    SyclDevicePool::GetDevice(context->device_ordinal()));
@@ -152,10 +153,13 @@ absl::StatusOr<ze_module_handle_t> LoadLevelZeroModule(
       return tsl::profiler::TraceMeEncode(
           "oneAPI::zeModuleCreate_SPIRVToNative",
           {{"device_ordinal", context->device_ordinal()},
+           {"load_path", load_path},
            {"spirv_bytes", spirv_size},
            {"spirv_hash_high64", spirv_fingerprint.high64},
            {"spirv_hash_low64", spirv_fingerprint.low64}});
     });
+    tsl::profiler::TraceMe purpose_trace(
+        [&] { return absl::StrCat("SPIRV-TO-NATIVE: ", load_path); });
     result = zeModuleCreate(lz_context, lz_device, &module_desc, &module,
                             &log_handle);
     trace.AppendMetadata([&] {
@@ -585,7 +589,8 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
   // module.
   if (module == nullptr) {
     ASSIGN_OR_RETURN(module, LoadLevelZeroModule(sycl_context_.get(),
-                                                 spirv_binary, spirv_size));
+                                                 spirv_binary, spirv_size,
+                                                 /*load_path=*/"kernel"));
     // absl::Time load_start = absl::Now();
     // absl::StatusOr<ze_module_handle_t> loaded_module =
     //     LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size);
@@ -1077,7 +1082,8 @@ absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
   // module via UnloadLevelZeroModule to avoid resource leaks.
   ASSIGN_OR_RETURN(
       ze_module_handle_t lz_module_handle,
-      LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size));
+      LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size,
+                          /*load_path=*/"module"));
   // absl::Time load_start = absl::Now();
   // absl::StatusOr<ze_module_handle_t> loaded_module =
   //     LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size);

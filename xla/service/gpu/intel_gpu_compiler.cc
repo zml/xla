@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/service/gpu/intel_gpu_compiler.h"
 
+#include <string>
+
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/service/dump.h"
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
@@ -65,12 +67,18 @@ IntelGpuCompiler::CompileTargetBinary(
     const stream_executor::DeviceDescription& device_description,
     bool relocatable, const HloModule* debug_module,
     std::optional<int> shard_number) {
+  const llvm::StringRef llvm_module_name = llvm_module->getName();
+  const bool is_constants = llvm_module_name.ends_with("_consts");
+  const char* purpose = is_constants ? "constants" : "kernel";
   tsl::profiler::TraceMe spirv_trace([&] {
     return tsl::profiler::TraceMeEncode(
         "SPIRV-GENERATION",
         {{"llvm_module", llvm_module->getName().str()},
+         {"purpose", purpose},
          {"shard", shard_number.value_or(-1)}});
   });
+  tsl::profiler::TraceMe purpose_trace(
+      [&] { return std::string("SPIRV-GENERATION: ") + purpose; });
   ASSIGN_OR_RETURN(auto spirv_str,
                    spirv::CompileToSPIRV(
                        llvm_module, device_description.gpu_compute_capability(),

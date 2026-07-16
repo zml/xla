@@ -28,6 +28,7 @@ xla_cc_binary(
         "//xla/tsl/profiler/convert:trace_events_to_json",
         "//xla/tsl/profiler/convert:xplane_to_trace_events",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@llvm-project//mlir:IR",

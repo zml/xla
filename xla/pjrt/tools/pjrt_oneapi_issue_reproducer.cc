@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
@@ -33,6 +34,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 #include "xla/pjrt/tools/pjrt_oneapi_issue_profiler.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/profiler/lib/traceme.h"
 
 namespace xla {
 namespace {
@@ -55,9 +57,10 @@ double Milliseconds(Clock::time_point start) {
       .count();
 }
 
-double ExecuteAndWait(PjRtLoadedExecutable& executable, PjRtBuffer& input,
-                      PjRtDevice& device,
+double ExecuteAndWait(const char* run_name, PjRtLoadedExecutable& executable,
+                      PjRtBuffer& input, PjRtDevice& device,
                       std::unique_ptr<PjRtBuffer>* output) {
+  tsl::profiler::TraceMe run_trace(run_name);
   std::array<PjRtBuffer*, 1> arguments = {&input};
   const Clock::time_point start = Clock::now();
   auto result =
@@ -91,9 +94,13 @@ int main() {
   CHECK_OK(module);
 
   const Clock::time_point compile_start = Clock::now();
-  auto executable = (*client)->CompileAndLoad(
-      MaybeOwningMlirModule(std::move(context), std::move(*module)),
-      CompileOptions());
+  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> executable;
+  {
+    tsl::profiler::TraceMe generation_trace("GENERATION");
+    executable = (*client)->CompileAndLoad(
+        MaybeOwningMlirModule(std::move(context), std::move(*module)),
+        CompileOptions());
+  }
   CHECK_OK(executable);
   const double compile_ms = Milliseconds(compile_start);
 
@@ -104,10 +111,15 @@ int main() {
   CHECK_OK(input);
 
   std::unique_ptr<PjRtBuffer> output;
-  const double first_execute_ms =
-      ExecuteAndWait(**executable, **input, *device, &output);
-  const double second_execute_ms =
-      ExecuteAndWait(**executable, **input, *device, &output);
+  double first_execute_ms;
+  double second_execute_ms;
+  {
+    tsl::profiler::TraceMe execution_trace("EXECUTION");
+    first_execute_ms =
+        ExecuteAndWait("RUN 1", **executable, **input, *device, &output);
+    second_execute_ms =
+        ExecuteAndWait("RUN 2", **executable, **input, *device, &output);
+  }
 
   auto literal = output->ToLiteral().Await();
   CHECK_OK(literal);
