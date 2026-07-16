@@ -65,6 +65,8 @@ limitations under the License.
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tsl/platform/fingerprint.h"
+#include "tsl/profiler/lib/traceme.h"
+#include "tsl/profiler/lib/traceme_encode.h"
 
 namespace stream_executor::sycl {
 
@@ -142,8 +144,25 @@ absl::StatusOr<ze_module_handle_t> LoadLevelZeroModule(
 
   ze_module_build_log_handle_t log_handle;
   ze_module_handle_t module;
-  ze_result_t result =
-      zeModuleCreate(lz_context, lz_device, &module_desc, &module, &log_handle);
+  const auto spirv_fingerprint = tsl::Fingerprint128(
+      absl::string_view(spirv_binary, spirv_size));
+  ze_result_t result;
+  {
+    tsl::profiler::TraceMe trace([&] {
+      return tsl::profiler::TraceMeEncode(
+          "oneAPI::zeModuleCreate_SPIRVToNative",
+          {{"device_ordinal", context->device_ordinal()},
+           {"spirv_bytes", spirv_size},
+           {"spirv_hash_high64", spirv_fingerprint.high64},
+           {"spirv_hash_low64", spirv_fingerprint.low64}});
+    });
+    result = zeModuleCreate(lz_context, lz_device, &module_desc, &module,
+                            &log_handle);
+    trace.AppendMetadata([&] {
+      return tsl::profiler::TraceMeEncode(
+          {{"ze_result", static_cast<uint32_t>(result)}});
+    });
+  }
   if (result != ZE_RESULT_SUCCESS) {
     // If module creation fails, retrieve the build log and return it
     // as part of the error status.
@@ -223,8 +242,21 @@ absl::StatusOr<std::unique_ptr<sycl::kernel>> GetModuleFunction(
   ze_kernel_desc_t kernel_desc = {ZE_STRUCTURE_TYPE_KERNEL_DESC,
                                   /*pNext=*/nullptr, /*flags=*/0, kernel_name};
   ze_kernel_handle_t lz_kernel;
-  ze_result_t kernel_create_status =
-      zeKernelCreate(module_handle, &kernel_desc, &lz_kernel);
+  ze_result_t kernel_create_status;
+  {
+    tsl::profiler::TraceMe trace([&] {
+      return tsl::profiler::TraceMeEncode(
+          "oneAPI::zeKernelCreate",
+          {{"device_ordinal", context->device_ordinal()},
+           {"kernel_name", kernel_name}});
+    });
+    kernel_create_status =
+        zeKernelCreate(module_handle, &kernel_desc, &lz_kernel);
+    trace.AppendMetadata([&] {
+      return tsl::profiler::TraceMeEncode(
+          {{"ze_result", static_cast<uint32_t>(kernel_create_status)}});
+    });
+  }
   if (kernel_create_status != ZE_RESULT_SUCCESS) {
     return absl::InternalError(absl::StrCat(
         "GetModuleFunction: Failed to create kernel '", kernel_name,
@@ -513,6 +545,15 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
   absl::uint128 fingerprint = FingerprintSpirv(spirv);
   const std::string fingerprint_str = FingerprintToString(fingerprint);
 
+  tsl::profiler::TraceMe load_kernel_trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "oneAPI::SyclExecutor_LoadKernel",
+        {{"device_ordinal", device_ordinal()},
+         {"kernel_name", kernel_name},
+         {"spirv_bytes", spirv_size},
+         {"spirv_hash", fingerprint_str}});
+  });
+
   ModuleHandle module_handle;
   ze_module_handle_t module = nullptr;
 
@@ -532,6 +573,11 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
               << fingerprint_str << " cache miss";
     }
   }
+  const bool module_cache_hit = module != nullptr;
+  load_kernel_trace.AppendMetadata([&] {
+    return tsl::profiler::TraceMeEncode(
+        {{"xla_module_cache_hit", module_cache_hit}});
+  });
 
   // If module is not loaded, load it outside the lock for efficiency.
   // Only the first thread to load the module inserts it into the cache.

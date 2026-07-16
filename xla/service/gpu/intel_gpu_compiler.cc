@@ -20,6 +20,9 @@ limitations under the License.
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
 #include "xla/service/gpu/target_constants.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
+#include "tsl/platform/fingerprint.h"
+#include "tsl/profiler/lib/traceme.h"
+#include "tsl/profiler/lib/traceme_encode.h"
 
 namespace xla {
 namespace gpu {
@@ -62,10 +65,23 @@ IntelGpuCompiler::CompileTargetBinary(
     const stream_executor::DeviceDescription& device_description,
     bool relocatable, const HloModule* debug_module,
     std::optional<int> shard_number) {
+  tsl::profiler::TraceMe spirv_trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "XLA::CompileToSPIRV",
+        {{"llvm_module", llvm_module->getName().str()},
+         {"shard", shard_number.value_or(-1)}});
+  });
   ASSIGN_OR_RETURN(auto spirv_str,
                    spirv::CompileToSPIRV(
                        llvm_module, device_description.gpu_compute_capability(),
                        module_config.debug_options()));
+  const auto spirv_fingerprint = tsl::Fingerprint128(spirv_str);
+  spirv_trace.AppendMetadata([&] {
+    return tsl::profiler::TraceMeEncode(
+        {{"spirv_bytes", spirv_str.size()},
+         {"spirv_hash_high64", spirv_fingerprint.high64},
+         {"spirv_hash_low64", spirv_fingerprint.low64}});
+  });
   if (DumpingEnabledForHloModule(debug_module ? debug_module->name() : "",
                                  module_config.debug_options())) {
     if (debug_module) {

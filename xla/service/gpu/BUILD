@@ -3793,6 +3793,9 @@ cc_library(
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:ir_headers",
+        "@tsl//tsl/platform:fingerprint",
+        "@tsl//tsl/profiler/lib:traceme",
+        "@tsl//tsl/profiler/lib:traceme_encode",
     ],
 )
 

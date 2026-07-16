@@ -21,6 +21,8 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/platform/logging.h"
+#include "tsl/profiler/lib/traceme.h"
+#include "tsl/profiler/lib/traceme_encode.h"
 
 namespace stream_executor::sycl {
 
@@ -111,6 +113,20 @@ absl::Status LaunchSyclKernel(
             << "; using packed argument count " << num_args;
   }
 
+  tsl::profiler::TraceMe enqueue_trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "oneAPI::SyclKernelEnqueue",
+        {{"device_ordinal", executor->device_ordinal()},
+         {"kernel_name", kernel_name},
+         {"argument_count", num_args},
+         {"shared_memory_bytes", shared_mem_bytes},
+         {"global_x", global_range[2]},
+         {"global_y", global_range[1]},
+         {"global_z", global_range[0]},
+         {"local_x", local_range[2]},
+         {"local_y", local_range[1]},
+         {"local_z", local_range[0]}});
+  });
   stream_handle->submit([&](::sycl::handler& cgh) {
     for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
       if (arg_ptrs[arg_index] == nullptr) {
@@ -301,6 +317,11 @@ absl::Status SyclStream::DoHostCallbackWithStatus(
 }
 
 absl::Status SyclStream::BlockHostUntilDone() {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "oneAPI::SyclQueueWait",
+        {{"device_ordinal", executor_->device_ordinal()}});
+  });
   stream_handle_->wait();
   return absl::OkStatus();
 }
