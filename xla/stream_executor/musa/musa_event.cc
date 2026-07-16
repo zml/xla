@@ -16,34 +16,41 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_event.h"
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 
 namespace stream_executor::musa {
 
 Event::Status MusaEvent::PollForStatus() {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   int result = MusaRuntime::Get()->EventQuery(handle_);
-  if (result == 0) {
+  if (result == musaSuccess) {
     return Event::Status::kComplete;
   }
-  return Event::Status::kPending;
+  if (result == musaErrorNotReady) {
+    return Event::Status::kPending;
+  }
+  return Event::Status::kError;
 }
 
 absl::Status MusaEvent::WaitForEventOnExternalStream(std::intptr_t stream) {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->StreamWaitEvent(reinterpret_cast<void*>(stream),
-                                            handle_);
+                                             handle_);
 }
 
 absl::Status MusaEvent::Synchronize() {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->EventSynchronize(handle_);
 }
 
 absl::StatusOr<MusaEvent> MusaEvent::Create(StreamExecutor* executor) {
-  absl::Status status = MusaRuntime::Get()->SetDevice(executor->device_ordinal());
-  if (!status.ok()) return status;
+  std::unique_ptr<ActivateContext> activation = executor->Activate();
   auto event = MusaRuntime::Get()->EventCreate();
   if (!event.ok()) return event.status();
   return MusaEvent(executor, *event);
@@ -51,6 +58,7 @@ absl::StatusOr<MusaEvent> MusaEvent::Create(StreamExecutor* executor) {
 
 MusaEvent::~MusaEvent() {
   if (handle_ != nullptr) {
+    std::unique_ptr<ActivateContext> activation = executor_->Activate();
     (void)MusaRuntime::Get()->EventDestroy(handle_);
     handle_ = nullptr;
   }
@@ -65,6 +73,7 @@ MusaEvent::MusaEvent(MusaEvent&& other)
 MusaEvent& MusaEvent::operator=(MusaEvent&& other) {
   if (this != &other) {
     if (handle_ != nullptr) {
+      std::unique_ptr<ActivateContext> activation = executor_->Activate();
       (void)MusaRuntime::Get()->EventDestroy(handle_);
     }
     executor_ = other.executor_;

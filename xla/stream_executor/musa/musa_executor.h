@@ -41,12 +41,16 @@ limitations under the License.
 
 namespace stream_executor::musa {
 
+class MusaContext;
+class MusaDriver;
+
 class MusaExecutor : public gpu::GpuExecutor {
  public:
-  MusaExecutor(Platform* platform, int device_ordinal)
-      : gpu::GpuExecutor(platform, device_ordinal) {}
+  MusaExecutor(Platform* platform, int device_ordinal);
 
-  ~MusaExecutor() override = default;
+  ~MusaExecutor() override;
+
+  std::unique_ptr<ActivateContext> Activate() override;
 
   absl::Status Init() override;
 
@@ -67,8 +71,7 @@ class MusaExecutor : public gpu::GpuExecutor {
   bool SynchronizeAllActivity() override;
 
   absl::Status SynchronousMemcpy(DeviceAddressBase* device_dst,
-                                 const void* host_src,
-                                 uint64_t size) override;
+                                 const void* host_src, uint64_t size) override;
   absl::Status SynchronousMemcpy(void* host_dst,
                                  const DeviceAddressBase& device_src,
                                  uint64_t size) override;
@@ -101,6 +104,11 @@ class MusaExecutor : public gpu::GpuExecutor {
   Stream* FindAllocatedStream(void* device_stream) override;
 
  private:
+  MusaDriver* driver_;
+  // Allocators and RAII allocations may outlive their executor. They retain
+  // the primary context needed by their allocation/free callbacks.
+  std::shared_ptr<MusaContext> context_;
+
   mutable absl::Mutex alive_streams_mu_;
   absl::flat_hash_map<void*, Stream*> alive_streams_
       ABSL_GUARDED_BY(alive_streams_mu_);

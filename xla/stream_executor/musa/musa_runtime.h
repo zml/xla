@@ -18,14 +18,15 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
+#include <memory>
 
-#include "absl/base/thread_annotations.h"
+#include "absl/base/call_once.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
+#include "absl/strings/string_view.h"
 #include "musa_runtime_api.h"
 #include "xla/stream_executor/musa/musa_device_properties.h"
+#include "xla/stream_executor/musa/musa_dso_loader.h"
 
 namespace stream_executor::musa {
 
@@ -38,6 +39,14 @@ enum class MusaMemcpyKind : int {
 class MusaRuntime {
  public:
   static MusaRuntime* Get();
+
+  // Creates an isolated runtime instance backed by an injectable symbol loader.
+  // Production callers must use Get(); this factory exists for deterministic
+  // loader and concurrency tests and does not alter singleton state.
+  static std::unique_ptr<MusaRuntime> CreateForTesting(
+      std::unique_ptr<internal::MusaSymbolLoader> loader);
+
+  ~MusaRuntime();
 
   absl::Status Init();
   bool IsLoaded();
@@ -70,28 +79,17 @@ class MusaRuntime {
   int EventQuery(void* event);
 
   absl::StatusOr<int> RuntimeVersion();
-  absl::StatusOr<int> DriverVersion();
 
  private:
-  MusaRuntime() = default;
+  struct FunctionTable;
 
-  absl::Status Load() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::Status FailLoad(absl::Status status) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void* Resolve(absl::string_view symbol) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  const char* ErrorString(musaError_t result) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  explicit MusaRuntime(std::unique_ptr<internal::MusaSymbolLoader> loader);
+
+  absl::Status Load() const;
+  absl::Status Initialize() const;
+  const char* ErrorString(musaError_t result) const;
   absl::StatusOr<int> GetDeviceAttribute(int device_ordinal, int attribute,
-                                         absl::string_view name) const
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  template <typename Fn>
-  absl::Status LoadSymbol(Fn& fn, absl::string_view symbol)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  mutable absl::Mutex mu_;
-  std::optional<absl::Status> load_status_ ABSL_GUARDED_BY(mu_);
-  void* handle_ ABSL_GUARDED_BY(mu_) = nullptr;
+                                         absl::string_view name) const;
 
   using MusaGetDeviceCountFn = musaError_t(MUSARTAPI*)(int*);
   using MusaGetDevicePropertiesFn = musaError_t(MUSARTAPI*)(musaDeviceProp*,
@@ -125,36 +123,15 @@ class MusaRuntime {
   using MusaEventSynchronizeFn = musaError_t(MUSARTAPI*)(musaEvent_t);
   using MusaEventQueryFn = musaError_t(MUSARTAPI*)(musaEvent_t);
   using MusaRuntimeGetVersionFn = musaError_t(MUSARTAPI*)(int*);
-  using MusaDriverGetVersionFn = musaError_t(MUSARTAPI*)(int*);
   using MusaGetErrorStringFn = const char*(MUSARTAPI*)(musaError_t);
 
-  MusaGetDeviceCountFn get_device_count_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaGetDevicePropertiesFn get_device_properties_ ABSL_GUARDED_BY(mu_) =
-      nullptr;
-  MusaDeviceGetAttributeFn device_get_attribute_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaDeviceGetPciBusIdFn device_get_pci_bus_id_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaSetDeviceFn set_device_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaDeviceSynchronizeFn device_synchronize_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaMallocFn malloc_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaFreeFn free_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaHostAllocFn host_alloc_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaFreeHostFn free_host_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaMemcpyFn memcpy_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaMemcpyAsyncFn memcpy_async_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaMemsetAsyncFn memset_async_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaMemGetInfoFn mem_get_info_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaStreamCreateFn stream_create_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaStreamDestroyFn stream_destroy_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaStreamSynchronizeFn stream_synchronize_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaStreamWaitEventFn stream_wait_event_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaEventCreateFn event_create_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaEventDestroyFn event_destroy_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaEventRecordFn event_record_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaEventSynchronizeFn event_synchronize_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaEventQueryFn event_query_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaRuntimeGetVersionFn runtime_get_version_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaDriverGetVersionFn driver_get_version_ ABSL_GUARDED_BY(mu_) = nullptr;
-  MusaGetErrorStringFn get_error_string_ ABSL_GUARDED_BY(mu_) = nullptr;
+  // `load_once_` publishes both `load_status_` and the immutable function
+  // table. No loader lock is held while invoking libmusart after
+  // initialization.
+  mutable absl::once_flag load_once_;
+  mutable absl::Status load_status_;
+  mutable std::unique_ptr<const FunctionTable> functions_;
+  std::unique_ptr<internal::MusaSymbolLoader> loader_;
 };
 
 }  // namespace stream_executor::musa

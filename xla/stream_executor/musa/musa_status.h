@@ -18,11 +18,26 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
+#include "musa.h"
 
 namespace stream_executor::musa {
 
 absl::Status ToStatus(int result, absl::string_view expr,
                       absl::string_view error_string = "");
+
+// These are deliberately declared from the documented MUSA ABI instead of
+// using the version-remapped PFN aliases in musaTypedefs.h.
+using MusaDriverGetErrorNameFn = MUresult(MUSAAPI*)(MUresult error,
+                                                    const char** name);
+using MusaDriverGetErrorStringFn = MUresult(MUSAAPI*)(MUresult error,
+                                                      const char** description);
+
+// Converts a low-level MUSA driver result to a canonical status and includes
+// both the vendor error name and description when the DSO provides them.
+absl::Status DriverToStatus(
+    MUresult result, absl::string_view expr,
+    MusaDriverGetErrorNameFn get_error_name = nullptr,
+    MusaDriverGetErrorStringFn get_error_string = nullptr);
 
 }  // namespace stream_executor::musa
 

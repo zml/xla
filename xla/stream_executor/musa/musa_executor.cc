@@ -25,22 +25,27 @@ limitations under the License.
 #include <utility>
 #include <variant>
 
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
+#include "xla/stream_executor/gpu/scoped_activate_context.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_context.h"
 #include "xla/stream_executor/musa/musa_device_description.h"
 #include "xla/stream_executor/musa/musa_device_properties.h"
+#include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_event.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_stream.h"
@@ -84,16 +89,50 @@ void* MallocHost(uint64_t size) {
 
 void FreeHost(void* ptr, uint64_t) { std::free(ptr); }
 
+absl::StatusOr<std::unique_ptr<MemoryAllocation>> AllocateHostMemory(
+    std::shared_ptr<MusaContext> context, uint64_t size) {
+  gpu::ScopedActivateContext activation(context.get());
+  auto ptr = MusaRuntime::Get()->HostAlloc(size);
+  if (ptr.ok()) {
+    return std::make_unique<GenericMemoryAllocation>(
+        *ptr, size, [context = std::move(context)](void* p, uint64_t) {
+          gpu::ScopedActivateContext activation(context.get());
+          absl::Status status = MusaRuntime::Get()->FreeHost(p);
+          if (!status.ok()) {
+            LOG(ERROR) << "Failed to free MUSA host memory: " << status;
+          }
+        });
+  }
+  void* host_ptr = MallocHost(size);
+  if (host_ptr == nullptr) {
+    return absl::ResourceExhaustedError("Failed to allocate host memory.");
+  }
+  return std::make_unique<GenericMemoryAllocation>(host_ptr, size, FreeHost);
+}
+
 }  // namespace
 
+MusaExecutor::MusaExecutor(Platform* platform, int device_ordinal)
+    : gpu::GpuExecutor(platform, device_ordinal),
+      driver_(&MusaDriver::Instance()) {}
+
+MusaExecutor::~MusaExecutor() = default;
+
+std::unique_ptr<ActivateContext> MusaExecutor::Activate() {
+  CHECK(context_ != nullptr) << "MUSA executor has not been initialized";
+  return std::make_unique<gpu::ScopedActivateContext>(context_.get());
+}
+
 absl::Status MusaExecutor::Init() {
+  TF_RETURN_IF_ERROR(driver_->Init());
+  TF_ASSIGN_OR_RETURN(context_, MusaContext::Create(device_ordinal(), driver_));
+  std::unique_ptr<ActivateContext> activation = Activate();
   TF_RETURN_IF_ERROR(MusaRuntime::Get()->Init());
   return MusaRuntime::Get()->SetDevice(device_ordinal());
 }
 
 absl::StatusOr<std::unique_ptr<Stream>> MusaExecutor::CreateStream(
     std::optional<std::variant<StreamPriority, int>> priority) {
-  TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal()));
   TF_ASSIGN_OR_RETURN(std::unique_ptr<MusaStream> stream,
                       MusaStream::Create(this, priority));
   {
@@ -112,6 +151,7 @@ DeviceAddressBase MusaExecutor::Allocate(uint64_t size, int64_t memory_space) {
   if (size == 0) {
     return DeviceAddressBase();
   }
+  std::unique_ptr<ActivateContext> activation = Activate();
   auto ptr = MusaRuntime::Get()->Malloc(size);
   if (!ptr.ok()) {
     LOG(ERROR) << "MUSA allocation failed: " << ptr.status();
@@ -124,6 +164,7 @@ void MusaExecutor::Deallocate(DeviceAddressBase* mem) {
   if (mem == nullptr || mem->is_null()) {
     return;
   }
+  std::unique_ptr<ActivateContext> activation = Activate();
   absl::Status status = MusaRuntime::Get()->Free(mem->opaque());
   if (!status.ok()) {
     LOG(ERROR) << "MUSA free failed: " << status;
@@ -133,17 +174,7 @@ void MusaExecutor::Deallocate(DeviceAddressBase* mem) {
 
 absl::StatusOr<std::unique_ptr<MemoryAllocation>>
 MusaExecutor::HostMemoryAllocate(uint64_t size) {
-  auto ptr = MusaRuntime::Get()->HostAlloc(size);
-  if (ptr.ok()) {
-    return std::make_unique<GenericMemoryAllocation>(
-        *ptr, size,
-        [](void* p, uint64_t) { (void)MusaRuntime::Get()->FreeHost(p); });
-  }
-  void* host_ptr = MallocHost(size);
-  if (host_ptr == nullptr) {
-    return absl::ResourceExhaustedError("Failed to allocate host memory.");
-  }
-  return std::make_unique<GenericMemoryAllocation>(host_ptr, size, FreeHost);
+  return AllocateHostMemory(context_, size);
 }
 
 absl::StatusOr<std::unique_ptr<MemoryAllocator>>
@@ -151,15 +182,19 @@ MusaExecutor::CreateMemoryAllocator(MemorySpace memory_space) {
   switch (memory_space) {
     case MemorySpace::kHost:
       return std::make_unique<GenericMemoryAllocator>(
-          [this](uint64_t size) { return HostMemoryAllocate(size); });
+          [context = context_](uint64_t size) {
+            return AllocateHostMemory(context, size);
+          });
     case MemorySpace::kCollective:
     case MemorySpace::kDevice:
       return std::make_unique<GenericMemoryAllocator>(
-          [](uint64_t size)
+          [context = context_](uint64_t size)
               -> absl::StatusOr<std::unique_ptr<MemoryAllocation>> {
+            gpu::ScopedActivateContext activation(context.get());
             TF_ASSIGN_OR_RETURN(void* ptr, MusaRuntime::Get()->Malloc(size));
             return std::make_unique<GenericMemoryAllocation>(
-                ptr, size, [](void* location, uint64_t) {
+                ptr, size, [context](void* location, uint64_t) {
+                  gpu::ScopedActivateContext activation(context.get());
                   absl::Status status = MusaRuntime::Get()->Free(location);
                   if (!status.ok()) {
                     LOG(ERROR)
@@ -173,18 +208,20 @@ MusaExecutor::CreateMemoryAllocator(MemorySpace memory_space) {
 }
 
 bool MusaExecutor::SynchronizeAllActivity() {
-  return MusaRuntime::Get()->DeviceSynchronize().ok();
+  return context_->Synchronize().ok();
 }
 
 absl::Status MusaExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
                                              const void* host_src,
                                              uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = Activate();
   return MusaRuntime::Get()->Memcpy(device_dst->opaque(), host_src, size,
                                     MusaMemcpyKind::kHostToDevice);
 }
 
 absl::Status MusaExecutor::SynchronousMemcpy(
     void* host_dst, const DeviceAddressBase& device_src, uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = Activate();
   return MusaRuntime::Get()->Memcpy(host_dst, device_src.opaque(), size,
                                     MusaMemcpyKind::kDeviceToHost);
 }
@@ -208,6 +245,7 @@ bool MusaExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {
 }
 
 bool MusaExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
+  gpu::ScopedActivateContext activation(context_.get());
   size_t free_bytes = 0;
   size_t total_bytes = 0;
   absl::Status status =
@@ -227,22 +265,42 @@ MusaExecutor::CreateDeviceDescription() const {
 
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 MusaExecutor::CreateDeviceDescription(int device_ordinal) {
-  TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal));
-  TF_ASSIGN_OR_RETURN(MusaDeviceProperties properties,
-                      MusaRuntime::Get()->GetDeviceProperties(device_ordinal));
-  TF_ASSIGN_OR_RETURN(int runtime_version,
-                      MusaRuntime::Get()->RuntimeVersion());
-  TF_ASSIGN_OR_RETURN(int driver_version, MusaRuntime::Get()->DriverVersion());
+  MusaDriver& driver = MusaDriver::Instance();
+  TF_RETURN_IF_ERROR(driver.Init());
+  TF_ASSIGN_OR_RETURN(MUcontext previous_context, driver.CurrentContext());
+  absl::StatusOr<std::unique_ptr<DeviceDescription>> discovered =
+      [&]() -> absl::StatusOr<std::unique_ptr<DeviceDescription>> {
+    TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal));
+    TF_ASSIGN_OR_RETURN(
+        MusaDeviceProperties properties,
+        MusaRuntime::Get()->GetDeviceProperties(device_ordinal));
+    TF_ASSIGN_OR_RETURN(int runtime_version,
+                        MusaRuntime::Get()->RuntimeVersion());
+    TF_ASSIGN_OR_RETURN(int driver_version, driver.DriverVersion());
 
-  MusaDeviceVersions versions{
-      .runtime_api = runtime_version,
-      .driver_api = driver_version,
-      .compile_time_toolkit = XLA_MUSA_TOOLKIT_VERSION,
-      .kernel_mode_driver = GetKernelModeDriverVersion(),
-  };
-  TF_ASSIGN_OR_RETURN(DeviceDescription description,
-                      BuildMusaDeviceDescription(properties, versions));
-  return std::make_unique<DeviceDescription>(std::move(description));
+    MusaDeviceVersions versions{
+        .runtime_api = runtime_version,
+        .driver_api = driver_version,
+        .compile_time_toolkit = XLA_MUSA_TOOLKIT_VERSION,
+        .kernel_mode_driver = GetKernelModeDriverVersion(),
+    };
+    TF_ASSIGN_OR_RETURN(DeviceDescription description,
+                        BuildMusaDeviceDescription(properties, versions));
+    return std::make_unique<DeviceDescription>(std::move(description));
+  }();
+  absl::Status restore_status = driver.SetCurrentContext(previous_context);
+  if (!restore_status.ok()) {
+    return absl::Status(
+        restore_status.code(),
+        absl::StrCat("Failed to restore the MUSA context after device "
+                     "description discovery: ",
+                     restore_status.message(),
+                     discovered.ok()
+                         ? ""
+                         : absl::StrCat("; discovery also failed: ",
+                                        discovered.status().message())));
+  }
+  return discovered;
 }
 
 absl::StatusOr<std::shared_ptr<DeviceAddressBase>>
@@ -260,9 +318,13 @@ MusaExecutor::CreateOrShareConstant(Stream* stream,
     return status;
   }
   return std::shared_ptr<DeviceAddressBase>(
-      new DeviceAddressBase(allocation), [this](DeviceAddressBase* ptr) {
-        DeviceAddressBase allocation = *ptr;
-        Deallocate(&allocation);
+      new DeviceAddressBase(allocation),
+      [context = context_](DeviceAddressBase* ptr) {
+        gpu::ScopedActivateContext activation(context.get());
+        absl::Status status = MusaRuntime::Get()->Free(ptr->opaque());
+        if (!status.ok()) {
+          LOG(ERROR) << "Failed to free MUSA constant memory: " << status;
+        }
         delete ptr;
       });
 }

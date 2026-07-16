@@ -25,6 +25,94 @@ package_group(
 )
 
 cc_library(
+    name = "musa_dso_loader",
+    srcs = ["musa_dso_loader.cc"],
+    hdrs = ["musa_dso_loader.h"],
+    linkopts = ["-ldl"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_dso_loader_test",
+    srcs = ["musa_dso_loader_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_driver",
+    srcs = ["musa_driver.cc"],
+    hdrs = ["musa_driver.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_status",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+cc_library(
+    name = "musa_context",
+    srcs = ["musa_context.cc"],
+    hdrs = ["musa_context.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_driver",
+        "//xla/stream_executor/gpu:context",
+        "//xla/stream_executor/gpu:scoped_activate_context",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_driver_test",
+    srcs = ["musa_driver_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_driver",
+        ":musa_dso_loader",
+        ":musa_status",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+cc_library(
     name = "musa_compute_capability",
     hdrs = ["musa_compute_capability.h"],
     deps = [
@@ -89,6 +177,9 @@ xla_cc_test(
         ":musa_device_properties",
         ":musa_target_contract",
         "//xla/stream_executor:device_description",
+        "//xla/stream_executor:memory_allocation",
+        "//xla/stream_executor:memory_allocator",
+        "//xla/stream_executor:memory_space",
         "//xla/stream_executor:semantic_version",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",
@@ -105,6 +196,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@local_config_musa//musa:musa_headers",
     ],
 )
 
@@ -136,23 +228,39 @@ cc_library(
     name = "musa_runtime",
     srcs = ["musa_runtime.cc"],
     hdrs = ["musa_runtime.h"],
-    linkopts = ["-ldl"],
     tags = [
         "gpu",
         "musa-only",
     ],
     deps = [
+        ":musa_dso_loader",
         ":musa_device_properties",
         ":musa_status",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@local_config_musa//musa:musa_driver",
-        "@local_config_musa//musa:musart",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_runtime_test",
+    srcs = ["musa_runtime_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_runtime",
+        ":musa_status",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_musa//musa:musa_headers",
     ],
 )
 
@@ -166,6 +274,7 @@ cc_library(
     ],
     deps = [
         ":musa_runtime",
+        "//xla/stream_executor:activate_context",
         "//xla/stream_executor:event",
         "//xla/stream_executor:stream_executor_h",
         "@com_google_absl//absl/status",
@@ -184,6 +293,7 @@ cc_library(
     deps = [
         ":musa_event",
         ":musa_runtime",
+        "//xla/stream_executor:activate_context",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:event",
         "//xla/stream_executor:event_based_timer",
@@ -232,8 +342,10 @@ cc_library(
         "XLA_MUSA_TOOLKIT_VERSION=%s" % musa_config().version_number,
     ],
     deps = [
+        ":musa_context",
         ":musa_device_description",
         ":musa_device_properties",
+        ":musa_driver",
         ":musa_event",
         ":musa_platform_id",
         ":musa_runtime",
@@ -259,18 +371,16 @@ cc_library(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/gpu:gpu_executor_header",
+        "//xla/stream_executor/gpu:scoped_activate_context",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
-        "@local_config_musa//musa:mublas",
-        "@local_config_musa//musa:mudnn",
-        "@local_config_musa//musa:musa_driver",
-        "@local_config_musa//musa:musart",
     ],
     alwayslink = True,
 )
@@ -284,12 +394,34 @@ xla_cc_test(
     ],
     deps = [
         ":musa_compute_capability",
+        ":musa_driver",
         ":musa_executor",
+        "//xla/stream_executor:activate_context",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:semantic_version",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_context_test",
+    srcs = ["musa_context_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_context",
+        ":musa_driver",
+        "//xla/stream_executor/gpu:scoped_activate_context",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_musa//musa:musa_headers",
     ],
 )
 

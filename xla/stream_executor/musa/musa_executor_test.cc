@@ -15,12 +15,21 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include "absl/status/status_matchers.h"
+#include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/memory_allocator.h"
+#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
+#include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -30,8 +39,12 @@ namespace {
 using ::absl_testing::IsOkAndHolds;
 
 TEST(MusaExecutorTest, S80DeviceDescriptionUsesLiveQueries) {
+  MusaDriver& driver = MusaDriver::Instance();
+  TF_ASSERT_OK_AND_ASSIGN(MUcontext context_before, driver.CurrentContext());
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<DeviceDescription> description,
                           MusaExecutor::CreateDeviceDescription(0));
+  TF_ASSERT_OK_AND_ASSIGN(MUcontext context_after, driver.CurrentContext());
+  EXPECT_EQ(context_after, context_before);
 
   EXPECT_EQ(description->name(), "MTT S80");
   EXPECT_EQ(description->device_vendor(), "Moore Threads");
@@ -66,6 +79,81 @@ TEST(MusaExecutorTest, S80DeviceDescriptionUsesLiveQueries) {
 
   EXPECT_THAT(DeviceDescription::FromProto(description->ToProto()),
               IsOkAndHolds(*description));
+}
+
+TEST(MusaExecutorTest, S80PrimaryContextInitializesActivatesAndTearsDown) {
+  MusaDriver& driver = MusaDriver::Instance();
+  {
+    MusaExecutor executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+    absl::Status status = executor.Init();
+    ASSERT_TRUE(status.ok()) << status;
+
+    std::unique_ptr<ActivateContext> activation = executor.Activate();
+    auto current_context = driver.CurrentContext();
+    ASSERT_TRUE(current_context.ok()) << current_context.status();
+    EXPECT_NE(*current_context, nullptr);
+
+    auto current_device = driver.CurrentDevice();
+    ASSERT_TRUE(current_device.ok()) << current_device.status();
+    EXPECT_EQ(*current_device, 0);
+    EXPECT_TRUE(executor.SynchronizeAllActivity());
+
+    int64_t free_bytes = 0;
+    int64_t total_bytes = 0;
+    EXPECT_TRUE(executor.DeviceMemoryUsage(&free_bytes, &total_bytes));
+    EXPECT_GT(free_bytes, 0);
+    EXPECT_GT(total_bytes, 0);
+    EXPECT_LE(free_bytes, total_bytes);
+
+    constexpr int kThreadCount = 4;
+    constexpr int kIterations = 25;
+    std::atomic<bool> all_workers_activated = true;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (int i = 0; i < kThreadCount; ++i) {
+      threads.emplace_back([&] {
+        for (int j = 0; j < kIterations; ++j) {
+          std::unique_ptr<ActivateContext> worker_activation =
+              executor.Activate();
+          auto worker_context = driver.CurrentContext();
+          auto worker_device = driver.CurrentDevice();
+          if (!worker_context.ok() || *worker_context == nullptr ||
+              !worker_device.ok() || *worker_device != 0) {
+            all_workers_activated = false;
+          }
+        }
+      });
+    }
+    for (std::thread& thread : threads) {
+      thread.join();
+    }
+    EXPECT_TRUE(all_workers_activated);
+  }
+
+  // libmusart retains the process primary context and the S80 driver can report
+  // it as current again after our driver reference is released. The hermetic
+  // MusaContext tests verify the exact clear/release call balance; here we
+  // verify that teardown leaves the driver usable.
+  EXPECT_TRUE(driver.CurrentContext().ok());
+}
+
+TEST(MusaExecutorTest, DeviceAllocationRetainsContextPastExecutorLifetime) {
+  std::unique_ptr<MemoryAllocator> allocator;
+  std::unique_ptr<MemoryAllocation> allocation;
+  {
+    MusaExecutor executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+    ASSERT_TRUE(executor.Init().ok());
+    TF_ASSERT_OK_AND_ASSIGN(
+        allocator, executor.CreateMemoryAllocator(MemorySpace::kDevice));
+    TF_ASSERT_OK_AND_ASSIGN(allocation, allocator->Allocate(256));
+    EXPECT_FALSE(allocation->address().is_null());
+  }
+
+  // Both callbacks own the shared primary context, so this free remains valid
+  // after the executor itself has been destroyed.
+  allocation.reset();
+  allocator.reset();
+  EXPECT_TRUE(MusaDriver::Instance().CurrentContext().ok());
 }
 
 }  // namespace

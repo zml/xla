@@ -207,15 +207,6 @@ cc_library(
         "//xla/service/gpu:gpu_executable",
         "//xla/service/gpu:gpu_executable_buffer_allocator",
         "//xla/service/gpu:stream_executor_util",
-    ]) + if_musa([
-        # keep sorted
-        "@local_config_musa//musa:cuda2musa",
-        "@local_config_musa//musa:mccl",
-        "@local_config_musa//musa:mublas",
-        "@local_config_musa//musa:mudnn",
-        "@local_config_musa//musa:musa_driver",
-        "@local_config_musa//musa:musa_headers",
-        "@local_config_musa//musa:musart",
     ]) + if_cuda([
         # keep sorted
         "//xla/stream_executor/cuda:cuda_compute_capability",

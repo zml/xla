@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -47,6 +48,7 @@ MusaStream::MusaStream(
 absl::StatusOr<std::unique_ptr<MusaStream>> MusaStream::Create(
     StreamExecutor* executor,
     std::optional<std::variant<StreamPriority, int>> priority) {
+  std::unique_ptr<ActivateContext> activation = executor->Activate();
   auto stream = MusaRuntime::Get()->StreamCreate();
   if (!stream.ok()) return stream.status();
   return std::unique_ptr<MusaStream>(
@@ -54,6 +56,7 @@ absl::StatusOr<std::unique_ptr<MusaStream>> MusaStream::Create(
 }
 
 MusaStream::~MusaStream() {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   (void)MusaRuntime::Get()->StreamSynchronize(stream_handle_);
   parent()->DeallocateStream(this);
   (void)MusaRuntime::Get()->StreamDestroy(stream_handle_);
@@ -69,6 +72,7 @@ absl::Status MusaStream::RecordEvent(Event* event) {
   if (musa_event == nullptr) {
     return absl::InvalidArgumentError("Expected a MUSA event.");
   }
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->EventRecord(musa_event->handle(), stream_handle_);
 }
 
@@ -79,6 +83,7 @@ absl::Status MusaStream::WaitFor(Event* event) {
 
 absl::Status MusaStream::Memcpy(DeviceAddressBase* gpu_dst,
                                 const void* host_src, uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->MemcpyAsync(gpu_dst->opaque(), host_src, size,
                                          MusaMemcpyKind::kHostToDevice,
                                          stream_handle_);
@@ -87,6 +92,7 @@ absl::Status MusaStream::Memcpy(DeviceAddressBase* gpu_dst,
 absl::Status MusaStream::Memcpy(void* host_dst,
                                 const DeviceAddressBase& gpu_src,
                                 uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->MemcpyAsync(host_dst, gpu_src.opaque(), size,
                                          MusaMemcpyKind::kDeviceToHost,
                                          stream_handle_);
@@ -95,19 +101,20 @@ absl::Status MusaStream::Memcpy(void* host_dst,
 absl::Status MusaStream::Memcpy(DeviceAddressBase* gpu_dst,
                                 const DeviceAddressBase& gpu_src,
                                 uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->MemcpyAsync(gpu_dst->opaque(), gpu_src.opaque(),
-                                         size,
-                                         MusaMemcpyKind::kDeviceToDevice,
+                                         size, MusaMemcpyKind::kDeviceToDevice,
                                          stream_handle_);
 }
 
 absl::Status MusaStream::MemZero(DeviceAddressBase* location, uint64_t size) {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->MemsetAsync(location->opaque(), 0, size,
                                          stream_handle_);
 }
 
-absl::Status MusaStream::Memset32(DeviceAddressBase* location,
-                                  uint32_t pattern, uint64_t size) {
+absl::Status MusaStream::Memset32(DeviceAddressBase* location, uint32_t pattern,
+                                  uint64_t size) {
   if (pattern == 0) {
     return MemZero(location, size);
   }
@@ -122,6 +129,7 @@ absl::Status MusaStream::DoHostCallbackWithStatus(
 }
 
 absl::Status MusaStream::BlockHostUntilDone() {
+  std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->StreamSynchronize(stream_handle_);
 }
 
