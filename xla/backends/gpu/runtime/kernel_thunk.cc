@@ -174,35 +174,39 @@ absl::StatusOr<std::unique_ptr<KernelThunk>> KernelThunk::FromProto(
 }
 
 absl::Status KernelThunk::Initialize(const InitializeParams& params) {
-  absl::MutexLock lock(mutex_);
-
   // Load the kernel into the device if necessary.
   //
   // We could alternatively do this within ExecuteOnStream, but doing it here
   // lets the time spent loading the kernel not count towards our execution
   // profiles.
-  if (!kernel_cache_.contains(params.executor)) {
-    std::unique_ptr<se::Kernel> kernel;
-    if (!params.src.binary.empty()) {
-      ASSIGN_OR_RETURN(
-          kernel, CreateKernel(kernel_name_, args_.size(), params.src.binary,
-                               params.executor, shmem_bytes_, use_pdl_));
-
-    } else {
-      ASSIGN_OR_RETURN(kernel,
-                       CreateKernel(kernel_name_, args_.size(), params.src.text,
-                                    params.executor, shmem_bytes_, use_pdl_));
+  {
+    absl::ReaderMutexLock lock(mutex_);
+    if (kernel_cache_.contains(params.executor)) {
+      return absl::OkStatus();
     }
-
-    kernel_cache_.emplace(params.executor, std::move(kernel));
   }
 
+  // Kernel creation is independent across executors and can involve driver
+  // calls. Do not serialize it behind the cache lock on multi-device launches.
+  std::unique_ptr<se::Kernel> kernel;
+  if (!params.src.binary.empty()) {
+    ASSIGN_OR_RETURN(
+        kernel, CreateKernel(kernel_name_, args_.size(), params.src.binary,
+                             params.executor, shmem_bytes_, use_pdl_));
+  } else {
+    ASSIGN_OR_RETURN(kernel,
+                     CreateKernel(kernel_name_, args_.size(), params.src.text,
+                                  params.executor, shmem_bytes_, use_pdl_));
+  }
+
+  absl::MutexLock lock(mutex_);
+  kernel_cache_.try_emplace(params.executor, std::move(kernel));
   return absl::OkStatus();
 }
 
 absl::StatusOr<se::Kernel*> KernelThunk::GetKernel(
     se::StreamExecutor* executor) const {
-  absl::MutexLock lock(mutex_);
+  absl::ReaderMutexLock lock(mutex_);
   auto it = kernel_cache_.find(executor);
   if (it == kernel_cache_.end() || it->second == nullptr) {
     return absl::InternalError(absl::StrFormat(

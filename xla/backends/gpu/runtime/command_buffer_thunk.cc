@@ -359,8 +359,16 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
 
 absl::StatusOr<std::shared_ptr<CommandBufferThunk::ExecutorCommandBuffer>>
 CommandBufferThunk::GetOrCreateCommandBuffer(se::StreamExecutor* executor) {
+  {
+    absl::ReaderMutexLock lock(state_->mutex);
+    if (auto it = state_->command_buffers.find(executor);
+        it != state_->command_buffers.end()) {
+      return it->second;
+    }
+  }
+
   absl::MutexLock lock(state_->mutex);
-  // Check if command buffer already exists
+  // Another caller may have created it after the read-only lookup.
   if (auto it = state_->command_buffers.find(executor);
       it != state_->command_buffers.end()) {
     return it->second;
