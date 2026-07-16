@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "musa.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_metadata.h"
 #include "xla/stream_executor/launch_dim.h"
 
 namespace stream_executor {
@@ -35,6 +36,7 @@ class StreamExecutor;
 namespace musa {
 
 class MusaModule;
+class MusaModuleReaper;
 
 // Non-owning native function paired with strong ownership of its parent
 // module. Function lookup and launch are intentionally added in C04; this C03
@@ -42,11 +44,15 @@ class MusaModule;
 class MusaKernel final : public Kernel {
  public:
   MusaKernel(StreamExecutor* executor, MUfunction function,
-             std::shared_ptr<MusaModule> module, unsigned arity);
+             std::shared_ptr<MusaModule> module,
+             MusaModuleReaper* module_reaper, unsigned arity);
+  ~MusaKernel() override;
 
   unsigned Arity() const override { return arity_; }
   MUfunction function() const { return function_; }
   const std::shared_ptr<MusaModule>& module() const { return module_; }
+
+  absl::StatusOr<KernelMetadata> GetKernelMetadata() const;
 
   absl::StatusOr<int32_t> GetMaxOccupiedBlocksPerCore(
       ThreadDim threads, size_t dynamic_shared_memory_bytes) const override;
@@ -58,7 +64,8 @@ class MusaKernel final : public Kernel {
  private:
   StreamExecutor* const executor_;
   const MUfunction function_;
-  const std::shared_ptr<MusaModule> module_;
+  std::shared_ptr<MusaModule> module_;
+  MusaModuleReaper* const module_reaper_;
   const unsigned arity_;
 };
 

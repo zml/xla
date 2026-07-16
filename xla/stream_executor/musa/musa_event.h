@@ -31,7 +31,8 @@ class MusaEvent : public Event {
   absl::Status WaitForEventOnExternalStream(std::intptr_t stream) override;
   absl::Status Synchronize() override;
 
-  static absl::StatusOr<MusaEvent> Create(StreamExecutor* executor);
+  static absl::StatusOr<MusaEvent> Create(StreamExecutor* executor,
+                                          bool enable_timing = false);
 
   void* handle() const { return handle_; }
 

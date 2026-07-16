@@ -70,12 +70,16 @@ class MusaRuntime {
   absl::StatusOr<void*> StreamCreate();
   absl::Status StreamDestroy(void* stream);
   absl::Status StreamSynchronize(void* stream);
+  absl::Status StreamQuery(void* stream);
   absl::Status StreamWaitEvent(void* stream, void* event);
+  absl::Status LaunchHostFunc(void* stream, musaHostFn_t callback,
+                              void* user_data);
 
-  absl::StatusOr<void*> EventCreate();
+  absl::StatusOr<void*> EventCreate(bool enable_timing);
   absl::Status EventDestroy(void* event);
   absl::Status EventRecord(void* event, void* stream);
   absl::Status EventSynchronize(void* event);
+  absl::StatusOr<float> EventElapsedTime(void* start, void* end);
   int EventQuery(void* event);
 
   absl::StatusOr<int> RuntimeVersion();
@@ -114,13 +118,20 @@ class MusaRuntime {
   using MusaStreamCreateFn = musaError_t(MUSARTAPI*)(musaStream_t*);
   using MusaStreamDestroyFn = musaError_t(MUSARTAPI*)(musaStream_t);
   using MusaStreamSynchronizeFn = musaError_t(MUSARTAPI*)(musaStream_t);
+  using MusaStreamQueryFn = musaError_t(MUSARTAPI*)(musaStream_t);
   using MusaStreamWaitEventFn = musaError_t(MUSARTAPI*)(musaStream_t,
                                                         musaEvent_t,
                                                         unsigned int);
+  using MusaLaunchHostFuncFn = musaError_t(MUSARTAPI*)(musaStream_t,
+                                                       musaHostFn_t, void*);
   using MusaEventCreateFn = musaError_t(MUSARTAPI*)(musaEvent_t*);
+  using MusaEventCreateWithFlagsFn = musaError_t(MUSARTAPI*)(musaEvent_t*,
+                                                             unsigned int);
   using MusaEventDestroyFn = musaError_t(MUSARTAPI*)(musaEvent_t);
   using MusaEventRecordFn = musaError_t(MUSARTAPI*)(musaEvent_t, musaStream_t);
   using MusaEventSynchronizeFn = musaError_t(MUSARTAPI*)(musaEvent_t);
+  using MusaEventElapsedTimeFn = musaError_t(MUSARTAPI*)(float*, musaEvent_t,
+                                                         musaEvent_t);
   using MusaEventQueryFn = musaError_t(MUSARTAPI*)(musaEvent_t);
   using MusaRuntimeGetVersionFn = musaError_t(MUSARTAPI*)(int*);
   using MusaGetErrorStringFn = const char*(MUSARTAPI*)(musaError_t);

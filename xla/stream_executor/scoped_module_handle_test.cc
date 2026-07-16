@@ -52,5 +52,31 @@ TEST(ScopedModuleHandleTest, NonNullHandleUnloadsOnceAfterMoves) {
   }
 }
 
+TEST(ScopedModuleHandleTest, MoveAssignmentUnloadsDestinationFirst) {
+  ModuleHandle first_handle(reinterpret_cast<void*>(1));
+  ModuleHandle second_handle(reinterpret_cast<void*>(2));
+  MockStreamExecutor executor;
+  {
+    testing::InSequence sequence;
+    EXPECT_CALL(executor, UnloadModule(second_handle)).WillOnce(Return(true));
+    EXPECT_CALL(executor, UnloadModule(first_handle)).WillOnce(Return(true));
+  }
+  {
+    ScopedModuleHandle first(&executor, first_handle);
+    ScopedModuleHandle second(&executor, second_handle);
+    second = std::move(first);
+    ScopedModuleHandle* self = &second;
+    second = std::move(*self);
+  }
+}
+
+TEST(ScopedModuleHandleTest, ReleaseSuppressesUnload) {
+  ModuleHandle handle(reinterpret_cast<void*>(1));
+  MockStreamExecutor executor;
+  EXPECT_CALL(executor, UnloadModule).Times(0);
+  ScopedModuleHandle scoped(&executor, handle);
+  EXPECT_EQ(scoped.release(), handle);
+}
+
 }  // namespace
 }  // namespace stream_executor

@@ -3193,34 +3193,11 @@ cc_library(
 
 cc_library(
     name = "host_callback_registry",
-    srcs = ["host_callback_registry.cc"],
     hdrs = ["host_callback_registry.h"],
-    deps = [
-        "//xla/tsl/platform:env",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/base:nullability",
-        "@com_google_absl//absl/functional:any_invocable",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ],
+    deps = ["//xla/stream_executor/gpu:host_callback_registry"],
 )
 
-xla_cc_test(
+alias(
     name = "host_callback_registry_test",
-    srcs = ["host_callback_registry_test.cc"],
-    deps = [
-        ":host_callback_registry",
-        "//xla/tsl/platform:env",
-        "//xla/tsl/platform:test_benchmark",
-        "//xla/tsl/platform:test_main",
-        "@com_google_absl//absl/functional:any_invocable",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:status_matchers",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-        "@com_google_googletest//:gtest",
-    ],
+    actual = "//xla/stream_executor/gpu:host_callback_registry_test",
 )

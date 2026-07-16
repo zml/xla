@@ -105,6 +105,44 @@ struct FakeApiState {
   std::atomic<int> module_unload_calls{0};
   MUresult module_load_result = MUSA_SUCCESS;
   MUresult module_unload_result = MUSA_SUCCESS;
+  MUfunction function = reinterpret_cast<MUfunction>(0x2468);
+  MUmodule last_lookup_module = nullptr;
+  std::string last_lookup_name;
+  MUresult module_get_function_result = MUSA_SUCCESS;
+  MUdeviceptr global_address = static_cast<MUdeviceptr>(0xabc000);
+  size_t global_size = 64;
+  MUresult module_get_global_result = MUSA_SUCCESS;
+  int function_attribute = 32;
+  MUfunction_attribute last_function_attribute =
+      MU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK;
+  MUresult function_attribute_result = MUSA_SUCCESS;
+  int occupancy_blocks = 3;
+  int last_occupancy_block_size = 0;
+  size_t last_occupancy_dynamic_shared_memory_bytes = 0;
+  MUresult occupancy_result = MUSA_SUCCESS;
+
+  struct LaunchArguments {
+    MUfunction function = nullptr;
+    unsigned int grid_dim_x = 0;
+    unsigned int grid_dim_y = 0;
+    unsigned int grid_dim_z = 0;
+    unsigned int block_dim_x = 0;
+    unsigned int block_dim_y = 0;
+    unsigned int block_dim_z = 0;
+    unsigned int shared_memory_bytes = 0;
+    MUstream stream = nullptr;
+    void** kernel_parameters = nullptr;
+    void** extra = nullptr;
+  } last_launch;
+  std::atomic<int> launch_calls{0};
+  MUresult launch_result = MUSA_SUCCESS;
+
+  MUdeviceptr last_memset_destination = 0;
+  uint32_t last_memset_value = 0;
+  size_t last_memset_count = 0;
+  MUstream last_memset_stream = nullptr;
+  std::atomic<int> memset_calls{0};
+  MUresult memset_result = MUSA_SUCCESS;
 
   std::unordered_map<std::string, void*> gpa_symbols;
   bool gpa_success_null = false;
@@ -268,6 +306,67 @@ MUresult MUSAAPI FakeMuModuleUnload(MUmodule module) {
   return g_state->module_unload_result;
 }
 
+MUresult MUSAAPI FakeMuModuleGetFunction(MUfunction* function, MUmodule module,
+                                         const char* name) {
+  g_state->last_lookup_module = module;
+  g_state->last_lookup_name = name;
+  *function = g_state->function;
+  return g_state->module_get_function_result;
+}
+
+MUresult MUSAAPI FakeMuModuleGetGlobal(MUdeviceptr* address, size_t* size,
+                                       MUmodule module, const char* name) {
+  g_state->last_lookup_module = module;
+  g_state->last_lookup_name = name;
+  *address = g_state->global_address;
+  *size = g_state->global_size;
+  return g_state->module_get_global_result;
+}
+
+MUresult MUSAAPI FakeMuFuncGetAttribute(int* value,
+                                        MUfunction_attribute attribute,
+                                        MUfunction function) {
+  EXPECT_EQ(function, g_state->function);
+  g_state->last_function_attribute = attribute;
+  *value = g_state->function_attribute;
+  return g_state->function_attribute_result;
+}
+
+MUresult MUSAAPI FakeMuOccupancyMaxActiveBlocksPerMultiprocessor(
+    int* blocks, MUfunction function, int block_size,
+    size_t dynamic_shared_memory_bytes) {
+  EXPECT_EQ(function, g_state->function);
+  g_state->last_occupancy_block_size = block_size;
+  g_state->last_occupancy_dynamic_shared_memory_bytes =
+      dynamic_shared_memory_bytes;
+  *blocks = g_state->occupancy_blocks;
+  return g_state->occupancy_result;
+}
+
+MUresult MUSAAPI FakeMuLaunchKernel(
+    MUfunction function, unsigned int grid_dim_x, unsigned int grid_dim_y,
+    unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
+    unsigned int block_dim_z, unsigned int shared_memory_bytes, MUstream stream,
+    void** kernel_parameters, void** extra) {
+  ++g_state->launch_calls;
+  g_state->last_launch = FakeApiState::LaunchArguments{
+      function,    grid_dim_x,        grid_dim_y,  grid_dim_z,
+      block_dim_x, block_dim_y,       block_dim_z, shared_memory_bytes,
+      stream,      kernel_parameters, extra};
+  return g_state->launch_result;
+}
+
+MUresult MUSAAPI FakeMuMemsetD32Async(MUdeviceptr destination,
+                                      unsigned int value, size_t count,
+                                      MUstream stream) {
+  ++g_state->memset_calls;
+  g_state->last_memset_destination = destination;
+  g_state->last_memset_value = value;
+  g_state->last_memset_count = count;
+  g_state->last_memset_stream = stream;
+  return g_state->memset_result;
+}
+
 void InstallBootstrap(FakeSymbolLoader& loader) {
   loader.Add("muInit", &FakeMuInit);
   loader.Add("muGetErrorName", &FakeMuGetErrorName);
@@ -288,6 +387,13 @@ void InstallRequiredDlsymSymbols(FakeSymbolLoader& loader) {
   loader.Add("muCtxSynchronize", &FakeMuCtxSynchronize);
   loader.Add("muModuleLoadData", &FakeMuModuleLoadData);
   loader.Add("muModuleUnload", &FakeMuModuleUnload);
+  loader.Add("muModuleGetFunction", &FakeMuModuleGetFunction);
+  loader.Add("muModuleGetGlobal_v2", &FakeMuModuleGetGlobal);
+  loader.Add("muFuncGetAttribute", &FakeMuFuncGetAttribute);
+  loader.Add("muOccupancyMaxActiveBlocksPerMultiprocessor",
+             &FakeMuOccupancyMaxActiveBlocksPerMultiprocessor);
+  loader.Add("muLaunchKernel", &FakeMuLaunchKernel);
+  loader.Add("muMemsetD32Async", &FakeMuMemsetD32Async);
 }
 
 void InstallGpaSymbols(FakeApiState& state) {
@@ -316,6 +422,18 @@ void InstallGpaSymbols(FakeApiState& state) {
       reinterpret_cast<void*>(&FakeMuModuleLoadData);
   state.gpa_symbols["muModuleUnload"] =
       reinterpret_cast<void*>(&FakeMuModuleUnload);
+  state.gpa_symbols["muModuleGetFunction"] =
+      reinterpret_cast<void*>(&FakeMuModuleGetFunction);
+  state.gpa_symbols["muModuleGetGlobal"] =
+      reinterpret_cast<void*>(&FakeMuModuleGetGlobal);
+  state.gpa_symbols["muFuncGetAttribute"] =
+      reinterpret_cast<void*>(&FakeMuFuncGetAttribute);
+  state.gpa_symbols["muOccupancyMaxActiveBlocksPerMultiprocessor"] =
+      reinterpret_cast<void*>(&FakeMuOccupancyMaxActiveBlocksPerMultiprocessor);
+  state.gpa_symbols["muLaunchKernel"] =
+      reinterpret_cast<void*>(&FakeMuLaunchKernel);
+  state.gpa_symbols["muMemsetD32Async"] =
+      reinterpret_cast<void*>(&FakeMuMemsetD32Async);
 }
 
 std::unique_ptr<FakeSymbolLoader> CompleteLoader() {
@@ -371,6 +489,53 @@ TEST_F(MusaDriverTest, CompleteTableWithoutGetProcAddress) {
   EXPECT_EQ(state_.last_module_image, image);
   EXPECT_TRUE(driver.UnloadModule(*module).ok());
   EXPECT_EQ(state_.last_unloaded_module, state_.module);
+  absl::StatusOr<MUfunction> function =
+      driver.GetModuleFunction(*module, "vector_add");
+  ASSERT_TRUE(function.ok());
+  EXPECT_EQ(*function, state_.function);
+  EXPECT_EQ(state_.last_lookup_module, state_.module);
+  EXPECT_EQ(state_.last_lookup_name, "vector_add");
+  absl::StatusOr<MusaModuleGlobal> global =
+      driver.GetModuleGlobal(*module, "constant_data");
+  ASSERT_TRUE(global.ok());
+  EXPECT_EQ(global->address, state_.global_address);
+  EXPECT_EQ(global->size, state_.global_size);
+  absl::StatusOr<int> attribute =
+      driver.FunctionAttribute(*function, MU_FUNC_ATTRIBUTE_NUM_REGS);
+  ASSERT_TRUE(attribute.ok());
+  EXPECT_EQ(*attribute, 32);
+  EXPECT_EQ(state_.last_function_attribute, MU_FUNC_ATTRIBUTE_NUM_REGS);
+  absl::StatusOr<int> occupancy =
+      driver.MaxActiveBlocksPerMultiprocessor(*function, 256, 1024);
+  ASSERT_TRUE(occupancy.ok());
+  EXPECT_EQ(*occupancy, 3);
+  EXPECT_EQ(state_.last_occupancy_block_size, 256);
+  EXPECT_EQ(state_.last_occupancy_dynamic_shared_memory_bytes, 1024);
+  void* parameters[] = {reinterpret_cast<void*>(0x1111)};
+  void* extra[] = {reinterpret_cast<void*>(0x2222)};
+  MUstream stream = reinterpret_cast<MUstream>(0x3333);
+  EXPECT_TRUE(driver
+                  .LaunchKernel(*function, 5, 6, 7, 8, 9, 10, 2048, stream,
+                                parameters, extra)
+                  .ok());
+  EXPECT_EQ(state_.last_launch.function, state_.function);
+  EXPECT_EQ(state_.last_launch.grid_dim_x, 5);
+  EXPECT_EQ(state_.last_launch.grid_dim_y, 6);
+  EXPECT_EQ(state_.last_launch.grid_dim_z, 7);
+  EXPECT_EQ(state_.last_launch.block_dim_x, 8);
+  EXPECT_EQ(state_.last_launch.block_dim_y, 9);
+  EXPECT_EQ(state_.last_launch.block_dim_z, 10);
+  EXPECT_EQ(state_.last_launch.shared_memory_bytes, 2048);
+  EXPECT_EQ(state_.last_launch.stream, stream);
+  EXPECT_EQ(state_.last_launch.kernel_parameters, parameters);
+  EXPECT_EQ(state_.last_launch.extra, extra);
+  EXPECT_TRUE(
+      driver.MemsetD32Async(state_.global_address, 0xa5a5f00d, 17, stream)
+          .ok());
+  EXPECT_EQ(state_.last_memset_destination, state_.global_address);
+  EXPECT_EQ(state_.last_memset_value, 0xa5a5f00d);
+  EXPECT_EQ(state_.last_memset_count, 17);
+  EXPECT_EQ(state_.last_memset_stream, stream);
   EXPECT_TRUE(driver.ReleasePrimaryContext(10).ok());
   EXPECT_EQ(state_.release_calls, 1);
   EXPECT_EQ(loader_ptr->load_calls, 1);
@@ -423,6 +588,8 @@ TEST_F(MusaDriverTest, UsesVersionedPrimaryContextAliases) {
   EXPECT_EQ(loader_ptr->ResolveCalls("muDevicePrimaryCtxSetFlags_v2"), 1);
   EXPECT_EQ(loader_ptr->ResolveCalls("muDevicePrimaryCtxRelease"), 0);
   EXPECT_EQ(loader_ptr->ResolveCalls("muDevicePrimaryCtxSetFlags"), 0);
+  EXPECT_EQ(loader_ptr->ResolveCalls("muModuleGetGlobal_v2"), 1);
+  EXPECT_EQ(loader_ptr->ResolveCalls("muModuleGetGlobal"), 0);
 }
 
 TEST_F(MusaDriverTest, PrimaryContextErrorsNameLogicalOperations) {
@@ -481,6 +648,13 @@ TEST_F(MusaDriverTest, EveryMissingRequiredCapabilityIsNamed) {
       {"muCtxSynchronize", {"muCtxSynchronize"}},
       {"muModuleLoadData", {"muModuleLoadData"}},
       {"muModuleUnload", {"muModuleUnload"}},
+      {"muModuleGetFunction", {"muModuleGetFunction"}},
+      {"muModuleGetGlobal", {"muModuleGetGlobal_v2"}},
+      {"muFuncGetAttribute", {"muFuncGetAttribute"}},
+      {"muOccupancyMaxActiveBlocksPerMultiprocessor",
+       {"muOccupancyMaxActiveBlocksPerMultiprocessor"}},
+      {"muLaunchKernel", {"muLaunchKernel"}},
+      {"muMemsetD32Async", {"muMemsetD32Async"}},
   };
 
   for (const MissingCapability& capability : capabilities) {
@@ -555,6 +729,138 @@ TEST_F(MusaDriverTest, ModuleErrorsUseCanonicalDriverStatus) {
   absl::Status unload = driver.UnloadModule(state_.module);
   EXPECT_EQ(unload.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_TRUE(absl::StrContains(unload.message(), "muModuleUnload failed"));
+}
+
+TEST_F(MusaDriverTest, ModuleLookupsRejectInvalidInputsAndNullOutputs) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_EQ(driver.GetModuleFunction(nullptr, "kernel").status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.GetModuleFunction(state_.module, nullptr).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.GetModuleFunction(state_.module, "").status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.GetModuleGlobal(nullptr, "global").status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.GetModuleGlobal(state_.module, nullptr).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.GetModuleGlobal(state_.module, "").status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state_.function = nullptr;
+  absl::Status function =
+      driver.GetModuleFunction(state_.module, "kernel").status();
+  EXPECT_EQ(function.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(function.message(), "null function"));
+
+  state_.global_address = 0;
+  absl::Status address =
+      driver.GetModuleGlobal(state_.module, "global").status();
+  EXPECT_EQ(address.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(address.message(), "null address"));
+
+  state_.global_address = static_cast<MUdeviceptr>(0xabc000);
+  state_.global_size = 0;
+  absl::Status size = driver.GetModuleGlobal(state_.module, "global").status();
+  EXPECT_EQ(size.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(size.message(), "zero-byte symbol"));
+}
+
+TEST_F(MusaDriverTest, KernelQueriesAndLaunchValidateInputsAndOutputs) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_EQ(
+      driver.FunctionAttribute(nullptr, MU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+          .status()
+          .code(),
+      absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      driver.MaxActiveBlocksPerMultiprocessor(nullptr, 1, 0).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver.MaxActiveBlocksPerMultiprocessor(state_.function, 0, 0)
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state_.occupancy_blocks = -1;
+  absl::Status occupancy =
+      driver.MaxActiveBlocksPerMultiprocessor(state_.function, 128, 0).status();
+  EXPECT_EQ(occupancy.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(occupancy.message(), "negative block count"));
+
+  EXPECT_EQ(
+      driver
+          .LaunchKernel(nullptr, 1, 1, 1, 1, 1, 1, 0, nullptr, nullptr, nullptr)
+          .code(),
+      absl::StatusCode::kInvalidArgument);
+  const std::vector<std::vector<unsigned int>> dimensions = {
+      {0, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1}, {1, 1, 0, 1, 1, 1},
+      {1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1}, {1, 1, 1, 1, 1, 0},
+  };
+  for (const std::vector<unsigned int>& dims : dimensions) {
+    EXPECT_EQ(
+        driver
+            .LaunchKernel(state_.function, dims[0], dims[1], dims[2], dims[3],
+                          dims[4], dims[5], 0, nullptr, nullptr, nullptr)
+            .code(),
+        absl::StatusCode::kInvalidArgument);
+  }
+  EXPECT_EQ(state_.launch_calls, 0);
+
+  EXPECT_EQ(driver.MemsetD32Async(0, 0, 1, nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.memset_calls, 0);
+}
+
+TEST_F(MusaDriverTest, LookupQueryLaunchAndMemsetErrorsAreCanonical) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  state_.module_get_function_result = MUSA_ERROR_NOT_FOUND;
+  absl::Status function =
+      driver.GetModuleFunction(state_.module, "missing_kernel").status();
+  EXPECT_EQ(function.code(), absl::StatusCode::kNotFound);
+  EXPECT_TRUE(
+      absl::StrContains(function.message(), "muModuleGetFunction failed"));
+
+  state_.module_get_global_result = MUSA_ERROR_NOT_FOUND;
+  absl::Status global =
+      driver.GetModuleGlobal(state_.module, "missing_global").status();
+  EXPECT_EQ(global.code(), absl::StatusCode::kNotFound);
+  EXPECT_TRUE(absl::StrContains(global.message(), "muModuleGetGlobal failed"));
+
+  state_.function_attribute_result = MUSA_ERROR_INVALID_HANDLE;
+  absl::Status attribute =
+      driver
+          .FunctionAttribute(state_.function,
+                             MU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+          .status();
+  EXPECT_EQ(attribute.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(
+      absl::StrContains(attribute.message(), "muFuncGetAttribute failed"));
+
+  state_.occupancy_result = MUSA_ERROR_INVALID_VALUE;
+  absl::Status occupancy =
+      driver.MaxActiveBlocksPerMultiprocessor(state_.function, 128, 4096)
+          .status();
+  EXPECT_EQ(occupancy.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(
+      absl::StrContains(occupancy.message(),
+                        "muOccupancyMaxActiveBlocksPerMultiprocessor failed"));
+
+  state_.launch_result = MUSA_ERROR_LAUNCH_OUT_OF_RESOURCES;
+  absl::Status launch = driver.LaunchKernel(state_.function, 1, 1, 1, 128, 1, 1,
+                                            0, nullptr, nullptr, nullptr);
+  EXPECT_EQ(launch.code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_TRUE(absl::StrContains(launch.message(), "muLaunchKernel failed"));
+
+  state_.memset_result = MUSA_ERROR_INVALID_VALUE;
+  absl::Status memset = driver.MemsetD32Async(
+      static_cast<MUdeviceptr>(0xabc000), 0xff00ff00, 5, nullptr);
+  EXPECT_EQ(memset.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(absl::StrContains(memset.message(), "muMemsetD32Async failed"));
 }
 
 TEST_F(MusaDriverTest, DriverErrorsHaveCanonicalCodeNameAndDescription) {

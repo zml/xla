@@ -205,6 +205,44 @@ MusaModule::~MusaModule() {
   module_ = nullptr;
 }
 
+absl::StatusOr<MUfunction> MusaModule::GetFunction(
+    absl::string_view name) const {
+  if (name.empty()) {
+    return absl::InvalidArgumentError("MUSA function name must not be empty");
+  }
+  {
+    absl::MutexLock lock(symbols_mutex_);
+    auto it = functions_.find(name);
+    if (it != functions_.end()) return it->second;
+  }
+
+  gpu::ScopedActivateContext activation(context_.get());
+  TF_ASSIGN_OR_RETURN(
+      MUfunction function,
+      driver_->GetModuleFunction(module_, std::string(name).c_str()));
+  absl::MutexLock lock(symbols_mutex_);
+  return functions_.emplace(std::string(name), function).first->second;
+}
+
+absl::StatusOr<MusaModuleGlobal> MusaModule::GetGlobal(
+    absl::string_view name) const {
+  if (name.empty()) {
+    return absl::InvalidArgumentError("MUSA global name must not be empty");
+  }
+  {
+    absl::MutexLock lock(symbols_mutex_);
+    auto it = globals_.find(name);
+    if (it != globals_.end()) return it->second;
+  }
+
+  gpu::ScopedActivateContext activation(context_.get());
+  TF_ASSIGN_OR_RETURN(
+      MusaModuleGlobal global,
+      driver_->GetModuleGlobal(module_, std::string(name).c_str()));
+  absl::MutexLock lock(symbols_mutex_);
+  return globals_.emplace(std::string(name), global).first->second;
+}
+
 struct MusaModuleCache::CacheState {
   struct ClientEntry {
     std::shared_ptr<MusaModule> module;

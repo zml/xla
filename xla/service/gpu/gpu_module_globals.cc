@@ -83,6 +83,8 @@ GpuModuleGlobals::ConstantInfo::FromProto(
 absl::StatusOr<const GpuModuleGlobals::BufferAllocToDeviceMemoryMap*>
 GpuModuleGlobals::Resolve(se::Stream* stream) {
   se::StreamExecutor* executor = stream->parent();
+  const bool is_musa =
+      executor->GetPlatform()->id() == se::musa::kMusaPlatformId;
 
   absl::MutexLock lock(mutex_);
   auto it = globals_.find(executor);
@@ -92,7 +94,7 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
 
   se::MultiModuleLoaderSpec module_spec;
   if (!binary_.empty()) {
-    if (executor->GetPlatform()->id() == se::musa::kMusaPlatformId) {
+    if (is_musa) {
       module_spec.AddMusaMubinInMemory(binary_);
     } else {
       module_spec.AddCudaCubinInMemory(binary_);
@@ -107,31 +109,90 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
   if (!binary_.empty()) {
     ASSIGN_OR_RETURN(module_handle, executor->LoadModule(module_spec));
   }
+  se::ScopedModuleHandle scoped_module(executor, module_handle);
 
-  // A flag signalling if constant initialization submitted memcpy operations
-  // to the `stream`.
-  int submitted_mem_copies = 0;
-
-  for (const ConstantInfo& info : constants_) {
-    absl::StatusOr<se::DeviceAddressBase> global_status;
-    if (static_cast<bool>(module_handle)) {
-      global_status = executor->GetSymbol(info.symbol_name, module_handle);
-    }
-
+  struct ResolvedConstant {
+    const ConstantInfo* info;
     se::DeviceAddressBase global;
+  };
+  std::vector<ResolvedConstant> resolved_constants;
+  resolved_constants.reserve(constants_.size());
 
-    CHECK(static_cast<bool>(module_handle) && global_status.ok());
-    // The constant was defined in the PTX and has been allocated by the CUDA
-    // driver.
-    global = *global_status;
+  // Resolve and validate every symbol before submitting any asynchronous
+  // initializer copy. A later missing or undersized symbol must not race an
+  // early-return module unload with work already queued on the stream.
+  for (const ConstantInfo& info : constants_) {
+    if (!static_cast<bool>(module_handle)) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Cannot resolve GPU global %s without a loaded module",
+          info.symbol_name));
+    }
+    absl::StatusOr<se::DeviceAddressBase> global_status =
+        executor->GetSymbol(info.symbol_name, module_handle);
+    if (!global_status.ok()) {
+      return absl::Status(
+          global_status.status().code(),
+          absl::StrFormat("Failed to resolve GPU global %s: %s",
+                          info.symbol_name, global_status.status().message()));
+    }
+    // The constant was defined in the device binary and has been allocated by
+    // the platform driver.
+    se::DeviceAddressBase global = *global_status;
     XLA_VLOG_DEVICE(3, executor->device_ordinal()) << absl::StreamFormat(
         "Resolved global %s to %p", info.symbol_name, global.opaque());
 
     if (!info.content.span().empty()) {
-      // This means the constant did not have an initializer in the PTX and
-      // therefore must be initialized by XLA here.
-      RETURN_IF_ERROR(stream->Memcpy(&global, info.content.span().data(),
-                                     info.content.span().size()));
+      if (info.content.span().size() > global.size()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Initializer for GPU global %s has %d bytes, exceeding the "
+            "%d-byte symbol",
+            info.symbol_name, info.content.span().size(), global.size()));
+      }
+    }
+
+    resolved_constants.push_back(ResolvedConstant{&info, global});
+  }
+
+  // A flag signalling if constant initialization submitted memcpy operations
+  // to the `stream`.
+  bool submitted_mem_copies = false;
+  for (const ResolvedConstant& resolved : resolved_constants) {
+    const ConstantInfo& info = *resolved.info;
+    se::DeviceAddressBase global = resolved.global;
+
+    if (!info.content.span().empty()) {
+      // This means the constant did not have an initializer in the device
+      // binary and therefore must be initialized by XLA here.
+      absl::Status copy_status = stream->Memcpy(
+          &global, info.content.span().data(), info.content.span().size());
+      if (!copy_status.ok()) {
+        absl::Status sync_status = stream->BlockHostUntilDone();
+        if (!sync_status.ok()) {
+          // MusaExecutor explicitly owns released handles until synchronized
+          // teardown. CUDA and ROCm do not expose equivalent retention and the
+          // historical contract is fail-fast rather than unloading a module
+          // while an initializer copy may still be in flight.
+          if (!is_musa) {
+            CHECK_OK(sync_status);
+            return sync_status;
+          }
+          scoped_module.release();
+          return absl::Status(
+              sync_status.code(),
+              absl::StrFormat(
+                  "Failed to initialize GPU global %s (%s), and stream "
+                  "quiescence could not be established (%s)%s",
+                  info.symbol_name, copy_status.message(),
+                  sync_status.message(),
+                  is_musa ? "; retaining the MUSA module until executor "
+                            "teardown"
+                          : ""));
+        }
+        return absl::Status(
+            copy_status.code(),
+            absl::StrFormat("Failed to initialize GPU global %s: %s",
+                            info.symbol_name, copy_status.message()));
+      }
       submitted_mem_copies = true;
     }
 
@@ -144,11 +205,25 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
   // destructor will not race with any operations in flight (deallocate
   // xla::Literal owned by the HLO module).
   if (submitted_mem_copies) {
-    CHECK_OK(stream->BlockHostUntilDone());
+    absl::Status status = stream->BlockHostUntilDone();
+    if (!status.ok()) {
+      if (!is_musa) {
+        CHECK_OK(status);
+        return status;
+      }
+      scoped_module.release();
+      return absl::Status(
+          status.code(),
+          absl::StrFormat(
+              "Failed to initialize GPU module globals and could not prove "
+              "stream quiescence: %s%s",
+              status.message(),
+              is_musa ? "; retaining the MUSA module until executor teardown"
+                      : ""));
+    }
   }
 
-  module_handles_.emplace(executor,
-                          se::ScopedModuleHandle(executor, module_handle));
+  module_handles_.emplace(executor, std::move(scoped_module));
   return globals_.emplace(executor, std::move(globals)).first->second.get();
 }
 

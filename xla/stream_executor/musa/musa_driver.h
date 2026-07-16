@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_MUSA_MUSA_DRIVER_H_
 #define XLA_STREAM_EXECUTOR_MUSA_MUSA_DRIVER_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -31,10 +33,17 @@ struct MusaPrimaryContextState {
   bool active;
 };
 
-// Typed, dynamically loaded subset of the MUSA driver API needed to establish
-// StreamExecutor context ownership. Initialization is attempted exactly once;
-// both success and failure are cached. The resolved function table is immutable
-// and ordinary calls never take the loader's initialization lock.
+// Address and size of a named global owned by a loaded MUSA module. The
+// address remains valid only while the module remains loaded.
+struct MusaModuleGlobal {
+  MUdeviceptr address;
+  size_t size;
+};
+
+// Typed, dynamically loaded subset of the MUSA driver API used by
+// StreamExecutor. Initialization is attempted exactly once; both success and
+// failure are cached. The resolved function table is immutable and ordinary
+// calls never take the loader's initialization lock.
 class MusaDriver {
  public:
   MusaDriver();
@@ -66,6 +75,27 @@ class MusaDriver {
 
   virtual absl::StatusOr<MUmodule> LoadModuleData(const void* image);
   virtual absl::Status UnloadModule(MUmodule module);
+  virtual absl::StatusOr<MUfunction> GetModuleFunction(MUmodule module,
+                                                       const char* name);
+  virtual absl::StatusOr<MusaModuleGlobal> GetModuleGlobal(MUmodule module,
+                                                           const char* name);
+
+  virtual absl::StatusOr<int> FunctionAttribute(MUfunction function,
+                                                MUfunction_attribute attribute);
+  virtual absl::StatusOr<int> MaxActiveBlocksPerMultiprocessor(
+      MUfunction function, int block_size, size_t dynamic_shared_memory_bytes);
+
+  virtual absl::Status LaunchKernel(
+      MUfunction function, unsigned int grid_dim_x, unsigned int grid_dim_y,
+      unsigned int grid_dim_z, unsigned int block_dim_x,
+      unsigned int block_dim_y, unsigned int block_dim_z,
+      unsigned int shared_memory_bytes, MUstream stream,
+      void** kernel_parameters, void** extra);
+
+  // `count` is the number of 32-bit elements, matching the native driver ABI;
+  // callers with a byte count must validate divisibility by four first.
+  virtual absl::Status MemsetD32Async(MUdeviceptr destination, uint32_t value,
+                                      size_t count, MUstream stream);
 
  private:
   struct Api;

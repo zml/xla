@@ -63,6 +63,26 @@ using MuCtxSynchronizeFn = MUresult(MUSAAPI*)();
 using MuModuleLoadDataFn = MUresult(MUSAAPI*)(MUmodule* module,
                                               const void* image);
 using MuModuleUnloadFn = MUresult(MUSAAPI*)(MUmodule module);
+using MuModuleGetFunctionFn = MUresult(MUSAAPI*)(MUfunction* function,
+                                                 MUmodule module,
+                                                 const char* name);
+using MuModuleGetGlobalV2Fn = MUresult(MUSAAPI*)(MUdeviceptr* address,
+                                                 size_t* size, MUmodule module,
+                                                 const char* name);
+using MuFuncGetAttributeFn = MUresult(MUSAAPI*)(int* value,
+                                                MUfunction_attribute attribute,
+                                                MUfunction function);
+using MuOccupancyMaxActiveBlocksPerMultiprocessorFn =
+    MUresult(MUSAAPI*)(int* blocks, MUfunction function, int block_size,
+                       size_t dynamic_shared_memory_bytes);
+using MuLaunchKernelFn = MUresult(MUSAAPI*)(
+    MUfunction function, unsigned int grid_dim_x, unsigned int grid_dim_y,
+    unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
+    unsigned int block_dim_z, unsigned int shared_memory_bytes, MUstream stream,
+    void** kernel_parameters, void** extra);
+using MuMemsetD32AsyncFn = MUresult(MUSAAPI*)(MUdeviceptr destination,
+                                              unsigned int value, size_t count,
+                                              MUstream stream);
 
 constexpr muuint64_t kProcAddressFlags =
     static_cast<muuint64_t>(MU_GET_PROC_ADDRESS_LEGACY_STREAM);
@@ -139,6 +159,13 @@ struct MusaDriver::Api {
   MuCtxSynchronizeFn context_synchronize = nullptr;
   MuModuleLoadDataFn module_load_data = nullptr;
   MuModuleUnloadFn module_unload = nullptr;
+  MuModuleGetFunctionFn module_get_function = nullptr;
+  MuModuleGetGlobalV2Fn module_get_global = nullptr;
+  MuFuncGetAttributeFn function_get_attribute = nullptr;
+  MuOccupancyMaxActiveBlocksPerMultiprocessorFn occupancy_max_active_blocks =
+      nullptr;
+  MuLaunchKernelFn launch_kernel = nullptr;
+  MuMemsetD32AsyncFn memset_d32_async = nullptr;
 };
 
 MusaDriver::MusaDriver() : MusaDriver(internal::CreateMusaDriverDsoLoader()) {}
@@ -243,6 +270,20 @@ absl::Status MusaDriver::Initialize() {
                         "muModuleLoadData", "muModuleLoadData");
   MUSA_RESOLVE_REQUIRED(module_unload, MuModuleUnloadFn, "muModuleUnload",
                         "muModuleUnload");
+  MUSA_RESOLVE_REQUIRED(module_get_function, MuModuleGetFunctionFn,
+                        "muModuleGetFunction", "muModuleGetFunction");
+  MUSA_RESOLVE_REQUIRED(module_get_global, MuModuleGetGlobalV2Fn,
+                        "muModuleGetGlobal", "muModuleGetGlobal_v2");
+  MUSA_RESOLVE_REQUIRED(function_get_attribute, MuFuncGetAttributeFn,
+                        "muFuncGetAttribute", "muFuncGetAttribute");
+  MUSA_RESOLVE_REQUIRED(occupancy_max_active_blocks,
+                        MuOccupancyMaxActiveBlocksPerMultiprocessorFn,
+                        "muOccupancyMaxActiveBlocksPerMultiprocessor",
+                        "muOccupancyMaxActiveBlocksPerMultiprocessor");
+  MUSA_RESOLVE_REQUIRED(launch_kernel, MuLaunchKernelFn, "muLaunchKernel",
+                        "muLaunchKernel");
+  MUSA_RESOLVE_REQUIRED(memset_d32_async, MuMemsetD32AsyncFn,
+                        "muMemsetD32Async", "muMemsetD32Async");
 
 #undef MUSA_RESOLVE_REQUIRED
 
@@ -382,6 +423,136 @@ absl::Status MusaDriver::UnloadModule(MUmodule module) {
   absl::Status status = Init();
   if (!status.ok()) return status;
   return ResultStatus(api_->module_unload(module), "muModuleUnload");
+}
+
+absl::StatusOr<MUfunction> MusaDriver::GetModuleFunction(MUmodule module,
+                                                         const char* name) {
+  if (module == nullptr) {
+    return absl::InvalidArgumentError(
+        "muModuleGetFunction requires a non-null module");
+  }
+  if (name == nullptr || name[0] == '\0') {
+    return absl::InvalidArgumentError(
+        "muModuleGetFunction requires a non-empty name");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  MUfunction function = nullptr;
+  status = ResultStatus(api_->module_get_function(&function, module, name),
+                        "muModuleGetFunction");
+  if (!status.ok()) return status;
+  if (function == nullptr) {
+    return absl::InternalError(
+        "muModuleGetFunction returned success with a null function");
+  }
+  return function;
+}
+
+absl::StatusOr<MusaModuleGlobal> MusaDriver::GetModuleGlobal(MUmodule module,
+                                                             const char* name) {
+  if (module == nullptr) {
+    return absl::InvalidArgumentError(
+        "muModuleGetGlobal requires a non-null module");
+  }
+  if (name == nullptr || name[0] == '\0') {
+    return absl::InvalidArgumentError(
+        "muModuleGetGlobal requires a non-empty name");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  MUdeviceptr address = 0;
+  size_t size = 0;
+  status = ResultStatus(api_->module_get_global(&address, &size, module, name),
+                        "muModuleGetGlobal");
+  if (!status.ok()) return status;
+  if (address == 0) {
+    return absl::InternalError(
+        "muModuleGetGlobal returned success with a null address");
+  }
+  if (size == 0) {
+    return absl::InternalError(
+        "muModuleGetGlobal returned success with a zero-byte symbol");
+  }
+  return MusaModuleGlobal{address, size};
+}
+
+absl::StatusOr<int> MusaDriver::FunctionAttribute(
+    MUfunction function, MUfunction_attribute attribute) {
+  if (function == nullptr) {
+    return absl::InvalidArgumentError(
+        "muFuncGetAttribute requires a non-null function");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  int value = 0;
+  status =
+      ResultStatus(api_->function_get_attribute(&value, attribute, function),
+                   "muFuncGetAttribute");
+  if (!status.ok()) return status;
+  return value;
+}
+
+absl::StatusOr<int> MusaDriver::MaxActiveBlocksPerMultiprocessor(
+    MUfunction function, int block_size, size_t dynamic_shared_memory_bytes) {
+  if (function == nullptr) {
+    return absl::InvalidArgumentError(
+        "muOccupancyMaxActiveBlocksPerMultiprocessor requires a non-null "
+        "function");
+  }
+  if (block_size <= 0) {
+    return absl::InvalidArgumentError(
+        "muOccupancyMaxActiveBlocksPerMultiprocessor requires a positive "
+        "block size");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  int blocks = 0;
+  status = ResultStatus(
+      api_->occupancy_max_active_blocks(&blocks, function, block_size,
+                                        dynamic_shared_memory_bytes),
+      "muOccupancyMaxActiveBlocksPerMultiprocessor");
+  if (!status.ok()) return status;
+  if (blocks < 0) {
+    return absl::InternalError(
+        "muOccupancyMaxActiveBlocksPerMultiprocessor returned success with a "
+        "negative block count");
+  }
+  return blocks;
+}
+
+absl::Status MusaDriver::LaunchKernel(
+    MUfunction function, unsigned int grid_dim_x, unsigned int grid_dim_y,
+    unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
+    unsigned int block_dim_z, unsigned int shared_memory_bytes, MUstream stream,
+    void** kernel_parameters, void** extra) {
+  if (function == nullptr) {
+    return absl::InvalidArgumentError(
+        "muLaunchKernel requires a non-null function");
+  }
+  if (grid_dim_x == 0 || grid_dim_y == 0 || grid_dim_z == 0 ||
+      block_dim_x == 0 || block_dim_y == 0 || block_dim_z == 0) {
+    return absl::InvalidArgumentError(
+        "muLaunchKernel requires non-zero grid and block dimensions");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  return ResultStatus(api_->launch_kernel(function, grid_dim_x, grid_dim_y,
+                                          grid_dim_z, block_dim_x, block_dim_y,
+                                          block_dim_z, shared_memory_bytes,
+                                          stream, kernel_parameters, extra),
+                      "muLaunchKernel");
+}
+
+absl::Status MusaDriver::MemsetD32Async(MUdeviceptr destination, uint32_t value,
+                                        size_t count, MUstream stream) {
+  if (destination == 0) {
+    return absl::InvalidArgumentError(
+        "muMemsetD32Async requires a non-null destination");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  return ResultStatus(api_->memset_d32_async(destination, value, count, stream),
+                      "muMemsetD32Async");
 }
 
 }  // namespace stream_executor::musa

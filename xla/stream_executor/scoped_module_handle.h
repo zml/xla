@@ -36,6 +36,8 @@ class ScopedModuleHandle {
   }
 
   ScopedModuleHandle& operator=(ScopedModuleHandle&& other) {
+    if (this == &other) return *this;
+    Unload();
     executor_ = other.executor_;
     module_handle_ = other.module_handle_;
     other.executor_ = nullptr;
@@ -43,13 +45,27 @@ class ScopedModuleHandle {
     return *this;
   }
 
-  ~ScopedModuleHandle() {
-    if (static_cast<bool>(module_handle_)) {
-      CHECK(executor_->UnloadModule(module_handle_));
-    }
+  ~ScopedModuleHandle() { Unload(); }
+
+  // Relinquishes RAII unloading. This is reserved for error paths where the
+  // caller cannot prove that asynchronous work has quiesced and the executor
+  // explicitly supports retaining released module handles.
+  ModuleHandle release() {
+    ModuleHandle released = module_handle_;
+    module_handle_ = ModuleHandle();
+    executor_ = nullptr;
+    return released;
   }
 
  private:
+  void Unload() {
+    if (static_cast<bool>(module_handle_)) {
+      CHECK(executor_->UnloadModule(module_handle_));
+    }
+    module_handle_ = ModuleHandle();
+    executor_ = nullptr;
+  }
+
   StreamExecutor* executor_;
   ModuleHandle module_handle_;
 

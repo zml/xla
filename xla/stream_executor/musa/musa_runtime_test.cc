@@ -107,6 +107,10 @@ musaError_t MUSARTAPI MemcpyAsyncStub(void*, const void*, size_t,
   return musaSuccess;
 }
 
+musaError_t MUSARTAPI MemsetAsyncStub(void*, int, size_t, musaStream_t) {
+  return musaSuccess;
+}
+
 musaError_t MUSARTAPI HostAllocStub(void** ptr, size_t, unsigned int) {
   *ptr = reinterpret_cast<void*>(0x4000);
   return musaSuccess;
@@ -130,8 +134,18 @@ musaError_t MUSARTAPI StreamSynchronizeStub(musaStream_t) {
   return musaSuccess;
 }
 
+musaError_t MUSARTAPI StreamQueryStub(musaStream_t) {
+  return musaErrorNotReady;
+}
+
 musaError_t MUSARTAPI StreamWaitEventStub(musaStream_t, musaEvent_t,
                                           unsigned int) {
+  return musaSuccess;
+}
+
+musaError_t MUSARTAPI LaunchHostFuncStub(musaStream_t, musaHostFn_t callback,
+                                         void* user_data) {
+  callback(user_data);
   return musaSuccess;
 }
 
@@ -145,6 +159,16 @@ musaError_t MUSARTAPI EventCreateNullStub(musaEvent_t* event) {
   return musaSuccess;
 }
 
+musaError_t MUSARTAPI EventCreateWithFlagsStub(musaEvent_t* event,
+                                               unsigned int) {
+  return EventCreateStub(event);
+}
+
+musaError_t MUSARTAPI EventCreateWithFlagsNullStub(musaEvent_t* event,
+                                                   unsigned int) {
+  return EventCreateNullStub(event);
+}
+
 musaError_t MUSARTAPI EventDestroyStub(musaEvent_t) { return musaSuccess; }
 
 musaError_t MUSARTAPI EventRecordStub(musaEvent_t, musaStream_t) {
@@ -152,6 +176,12 @@ musaError_t MUSARTAPI EventRecordStub(musaEvent_t, musaStream_t) {
 }
 
 musaError_t MUSARTAPI EventSynchronizeStub(musaEvent_t) { return musaSuccess; }
+
+musaError_t MUSARTAPI EventElapsedTimeStub(float* milliseconds, musaEvent_t,
+                                           musaEvent_t) {
+  *milliseconds = 1.25f;
+  return musaSuccess;
+}
 
 musaError_t MUSARTAPI EventQueryStub(musaEvent_t) { return musaSuccess; }
 
@@ -172,19 +202,24 @@ SymbolMap RequiredSymbols() {
       {"musaFree", Symbol(&FreeStub)},
       {"musaMemcpy", Symbol(&MemcpyStub)},
       {"musaMemcpyAsync", Symbol(&MemcpyAsyncStub)},
+      {"musaMemsetAsync", Symbol(&MemsetAsyncStub)},
       {"musaStreamCreate", Symbol(&StreamCreateStub)},
       {"musaStreamDestroy", Symbol(&StreamDestroyStub)},
       {"musaStreamSynchronize", Symbol(&StreamSynchronizeStub)},
+      {"musaStreamQuery", Symbol(&StreamQueryStub)},
       {"musaStreamWaitEvent", Symbol(&StreamWaitEventStub)},
+      {"musaLaunchHostFunc", Symbol(&LaunchHostFuncStub)},
       {"musaEventCreate", Symbol(&EventCreateStub)},
+      {"musaEventCreateWithFlags", Symbol(&EventCreateWithFlagsStub)},
       {"musaEventDestroy", Symbol(&EventDestroyStub)},
       {"musaEventRecord", Symbol(&EventRecordStub)},
       {"musaEventSynchronize", Symbol(&EventSynchronizeStub)},
+      {"musaEventElapsedTime", Symbol(&EventElapsedTimeStub)},
       {"musaEventQuery", Symbol(&EventQueryStub)},
   };
 }
 
-constexpr std::array<absl::string_view, 19> kRequiredSymbols = {
+constexpr std::array<absl::string_view, 24> kRequiredSymbols = {
     "musaGetDeviceCount",
     "musaGetDeviceProperties",
     "musaDeviceGetAttribute",
@@ -195,14 +230,19 @@ constexpr std::array<absl::string_view, 19> kRequiredSymbols = {
     "musaFree",
     "musaMemcpy",
     "musaMemcpyAsync",
+    "musaMemsetAsync",
     "musaStreamCreate",
     "musaStreamDestroy",
     "musaStreamSynchronize",
+    "musaStreamQuery",
     "musaStreamWaitEvent",
+    "musaLaunchHostFunc",
     "musaEventCreate",
+    "musaEventCreateWithFlags",
     "musaEventDestroy",
     "musaEventRecord",
     "musaEventSynchronize",
+    "musaEventElapsedTime",
     "musaEventQuery",
 };
 
@@ -265,8 +305,7 @@ TEST(MusaRuntimeTest, OptionalSymbolsAreUnimplemented) {
             absl::StatusCode::kUnimplemented);
   EXPECT_EQ(runtime->FreeHost(reinterpret_cast<void*>(0x1000)).code(),
             absl::StatusCode::kUnimplemented);
-  EXPECT_EQ(runtime->MemsetAsync(nullptr, 0, 0, nullptr).code(),
-            absl::StatusCode::kUnimplemented);
+  EXPECT_TRUE(runtime->MemsetAsync(nullptr, 0, 0, nullptr).ok());
   size_t free_bytes = 0;
   size_t total_bytes = 0;
   EXPECT_EQ(runtime->MemGetInfo(&free_bytes, &total_bytes).code(),
@@ -280,6 +319,32 @@ TEST(MusaRuntimeTest, OptionalSymbolsAreUnimplemented) {
                                 MusaMemcpyKind::kDeviceToDevice, nullptr)
                   .ok());
   EXPECT_EQ(g_memcpy_async_calls, 1);
+}
+
+TEST(MusaRuntimeTest, NativeHostCallbackAndElapsedTimeAreTyped) {
+  auto loader = std::make_unique<FakeSymbolLoader>(RequiredSymbols());
+  std::unique_ptr<MusaRuntime> runtime =
+      MusaRuntime::CreateForTesting(std::move(loader));
+  ASSERT_TRUE(runtime->Init().ok());
+
+  int callback_calls = 0;
+  auto callback = [](void* data) { ++*static_cast<int*>(data); };
+  EXPECT_TRUE(runtime
+                  ->LaunchHostFunc(reinterpret_cast<void*>(0x2000), callback,
+                                   &callback_calls)
+                  .ok());
+  EXPECT_EQ(callback_calls, 1);
+  EXPECT_EQ(runtime->LaunchHostFunc(nullptr, nullptr, nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  auto elapsed = runtime->EventElapsedTime(reinterpret_cast<void*>(0x3000),
+                                           reinterpret_cast<void*>(0x3001));
+  ASSERT_TRUE(elapsed.ok()) << elapsed.status();
+  EXPECT_FLOAT_EQ(*elapsed, 1.25f);
+  EXPECT_EQ(runtime->EventElapsedTime(nullptr, reinterpret_cast<void*>(0x1))
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(MusaRuntimeTest, HostAllocationSymbolsMustBePresentAsAPair) {
@@ -315,18 +380,26 @@ TEST(MusaRuntimeTest, RuntimeErrorsUseCanonicalStatusCodes) {
 }
 
 TEST(MusaRuntimeTest, SuccessfulCreationRejectsNullStreamAndEventHandles) {
-  for (absl::string_view symbol : {"musaStreamCreate", "musaEventCreate"}) {
+  for (absl::string_view symbol :
+       {"musaStreamCreate", "musaEventCreate", "musaEventCreateWithFlags"}) {
     SymbolMap symbols = RequiredSymbols();
-    symbols[std::string(symbol)] = symbol == "musaStreamCreate"
-                                       ? Symbol(&StreamCreateNullStub)
-                                       : Symbol(&EventCreateNullStub);
+    if (symbol == "musaStreamCreate") {
+      symbols[std::string(symbol)] = Symbol(&StreamCreateNullStub);
+    } else if (symbol == "musaEventCreate") {
+      symbols[std::string(symbol)] = Symbol(&EventCreateNullStub);
+    } else {
+      symbols[std::string(symbol)] = Symbol(&EventCreateWithFlagsNullStub);
+    }
     std::unique_ptr<MusaRuntime> runtime = MusaRuntime::CreateForTesting(
         std::make_unique<FakeSymbolLoader>(std::move(symbols)));
     ASSERT_TRUE(runtime->Init().ok());
 
-    absl::Status status = symbol == "musaStreamCreate"
-                              ? runtime->StreamCreate().status()
-                              : runtime->EventCreate().status();
+    absl::Status status;
+    if (symbol == "musaStreamCreate") {
+      status = runtime->StreamCreate().status();
+    } else {
+      status = runtime->EventCreate(symbol == "musaEventCreate").status();
+    }
     EXPECT_EQ(status.code(), absl::StatusCode::kInternal) << symbol;
     EXPECT_NE(status.message().find("success with a null"),
               absl::string_view::npos)

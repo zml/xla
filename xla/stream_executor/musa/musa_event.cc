@@ -49,9 +49,10 @@ absl::Status MusaEvent::Synchronize() {
   return MusaRuntime::Get()->EventSynchronize(handle_);
 }
 
-absl::StatusOr<MusaEvent> MusaEvent::Create(StreamExecutor* executor) {
+absl::StatusOr<MusaEvent> MusaEvent::Create(StreamExecutor* executor,
+                                            bool enable_timing) {
   std::unique_ptr<ActivateContext> activation = executor->Activate();
-  auto event = MusaRuntime::Get()->EventCreate();
+  auto event = MusaRuntime::Get()->EventCreate(enable_timing);
   if (!event.ok()) return event.status();
   return MusaEvent(executor, *event);
 }

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xla/stream_executor/cuda/host_callback_registry.h"
+#include "xla/stream_executor/gpu/host_callback_registry.h"
 
 #include <atomic>
 #include <cstdint>

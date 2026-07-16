@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xla/stream_executor/cuda/host_callback_registry.h"
+#include "xla/stream_executor/gpu/host_callback_registry.h"
 
 #include <algorithm>
 #include <atomic>
@@ -111,8 +111,8 @@ class StreamStatusMonitor {
         monitor_->is_waiting_ = false;
       }
       // Copies the pointer to the registry handles.
-      local_copy_ =
-          monitor_->host_callback_registry_.GetCurrentStreamCallbackRegistrys();
+      local_copy_ = monitor_->host_callback_registry_
+                        .GetCurrentStreamCallbackRegistries();
     }
 
     const HostCallbackRegistry::RegistryHandles& LocalCopy() const {
@@ -137,7 +137,7 @@ class StreamStatusMonitor {
         poll_interval_(poll_interval) {
     thread_ = std::unique_ptr<tsl::Thread>(tsl::Env::Default()->StartThread(
         tsl::ThreadOptions(),
-        absl::StrFormat("cuda_stream_monitor_%d", device_ordinal),
+        absl::StrFormat("gpu_stream_monitor_%d", device_ordinal),
         [&] { MonitorLoop(); }));
   }
 
@@ -186,9 +186,9 @@ class StreamStatusMonitor {
 };
 
 namespace {
-static constexpr auto kCudaCallback = [](void* data) {
+static constexpr auto kDeviceCallback = [](void* data) {
   auto* callback =
-      // Casting here is a CUDA API requirement.
+      // Device callback APIs expose the bookkeeping node as opaque data.
       // NOLINTNEXTLINE(custom-reinterpret-cast)
       reinterpret_cast<StreamCallbackRegistry::HostCallbackNode*>(data);
   (*callback)();
@@ -227,7 +227,7 @@ absl::Status StreamCallbackRegistry::AddCallback(
   auto node =
       std::make_unique<HostCallbackNode>(/*.callback =*/std::move(callback),
                                          /*.error_cb =*/std::move(error_cb));
-  if (const absl::Status status = enqueue_cb(kCudaCallback, node.get());
+  if (const absl::Status status = enqueue_cb(kDeviceCallback, node.get());
       !status.ok()) {
     node->Cancel(status);
     return status;
@@ -319,7 +319,7 @@ void HostCallbackRegistry::CopyOnWriteImpl(StreamCallbackRegistry* handle,
 }
 
 std::shared_ptr<HostCallbackRegistry::RegistryHandles>
-HostCallbackRegistry::GetCurrentStreamCallbackRegistrys() {
+HostCallbackRegistry::GetCurrentStreamCallbackRegistries() {
   absl::MutexLock lock(mutex_);
   return registry_handles_;
 }

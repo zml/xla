@@ -19,16 +19,21 @@ limitations under the License.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
+#include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/activate_context.h"
@@ -39,6 +44,9 @@ limitations under the License.
 #include "xla/stream_executor/generic_memory_allocator.h"
 #include "xla/stream_executor/gpu/scoped_activate_context.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/kernel_args_packing_spec.h"
+#include "xla/stream_executor/kernel_metadata.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
@@ -48,7 +56,9 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_device_properties.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_event.h"
+#include "xla/stream_executor/musa/musa_kernel.h"
 #include "xla/stream_executor/musa/musa_module.h"
+#include "xla/stream_executor/musa/musa_module_reaper.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_stream.h"
 #include "xla/stream_executor/musa/musa_version_parser.h"
@@ -91,6 +101,21 @@ void* MallocHost(uint64_t size) {
 
 void FreeHost(void* ptr, uint64_t) { std::free(ptr); }
 
+struct RetainedExecutorModules {
+  std::vector<std::shared_ptr<MusaModule>> orphan_modules;
+  std::unique_ptr<MusaModuleCache> module_cache;
+};
+
+void RetainModulesAfterSynchronizationFailure(
+    std::vector<std::shared_ptr<MusaModule>> modules,
+    std::unique_ptr<MusaModuleCache> module_cache) {
+  static auto* mutex = new absl::Mutex;
+  static auto* retained = new std::vector<RetainedExecutorModules>;
+  absl::MutexLock lock(mutex);
+  retained->push_back(
+      RetainedExecutorModules{std::move(modules), std::move(module_cache)});
+}
+
 absl::StatusOr<std::unique_ptr<MemoryAllocation>> AllocateHostMemory(
     std::shared_ptr<MusaContext> context, uint64_t size) {
   gpu::ScopedActivateContext activation(context.get());
@@ -114,11 +139,41 @@ absl::StatusOr<std::unique_ptr<MemoryAllocation>> AllocateHostMemory(
 
 }  // namespace
 
-MusaExecutor::MusaExecutor(Platform* platform, int device_ordinal)
+MusaExecutor::MusaExecutor(Platform* platform, int device_ordinal,
+                           absl::Duration callback_poll_interval)
     : gpu::GpuExecutor(platform, device_ordinal),
-      driver_(&MusaDriver::Instance()) {}
+      driver_(&MusaDriver::Instance()),
+      module_reaper_(std::make_unique<MusaModuleReaper>(device_ordinal)),
+      host_callback_registry_(std::make_unique<gpu::HostCallbackRegistry>(
+          device_ordinal, callback_poll_interval)) {}
 
-MusaExecutor::~MusaExecutor() = default;
+MusaExecutor::~MusaExecutor() {
+  const bool has_orphans =
+      module_reaper_ != nullptr && module_reaper_->HasOrphans();
+  const bool has_cached_modules =
+      module_cache_ != nullptr && !module_cache_->IsQuiescent();
+  if (!has_orphans && !has_cached_modules) return;
+
+  // Ambiguous launch and callback-enqueue failures become reaper orphans. A
+  // successful context synchronization makes them safe for the ordinary
+  // reaper worker. If synchronization fails, retaining both the orphans and
+  // cache is safer than racing module unload with device execution.
+  absl::Status synchronization =
+      context_ == nullptr ? absl::FailedPreconditionError(
+                                "MUSA executor has no context during teardown")
+                          : context_->Synchronize();
+  if (!synchronization.ok()) {
+    LOG(ERROR) << "Unable to synchronize MUSA activity during executor "
+                  "teardown; retaining loaded kernel modules for process "
+                  "lifetime: "
+               << synchronization;
+    RetainModulesAfterSynchronizationFailure(
+        module_reaper_->TakeModulesForProcessLifetime(),
+        std::move(module_cache_));
+    return;
+  }
+  module_reaper_->ReleaseOrphansAfterSynchronization();
+}
 
 std::unique_ptr<ActivateContext> MusaExecutor::Activate() {
   CHECK(context_ != nullptr) << "MUSA executor has not been initialized";
@@ -147,7 +202,8 @@ absl::Status MusaExecutor::Init() {
 absl::StatusOr<std::unique_ptr<Stream>> MusaExecutor::CreateStream(
     std::optional<std::variant<StreamPriority, int>> priority) {
   TF_ASSIGN_OR_RETURN(std::unique_ptr<MusaStream> stream,
-                      MusaStream::Create(this, priority));
+                      MusaStream::Create(this, host_callback_registry_.get(),
+                                         module_reaper_.get(), priority));
   {
     absl::MutexLock lock(&alive_streams_mu_);
     alive_streams_[stream->stream_handle()] = stream.get();
@@ -221,7 +277,11 @@ MusaExecutor::CreateMemoryAllocator(MemorySpace memory_space) {
 }
 
 bool MusaExecutor::SynchronizeAllActivity() {
-  return context_->Synchronize().ok();
+  if (context_ == nullptr) return false;
+  absl::Status status = context_->Synchronize();
+  if (!status.ok()) return false;
+  module_reaper_->ReleaseOrphansAfterSynchronization();
+  return true;
 }
 
 absl::Status MusaExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
@@ -283,7 +343,6 @@ MusaExecutor::CreateDeviceDescription(int device_ordinal) {
   TF_ASSIGN_OR_RETURN(MUcontext previous_context, driver.CurrentContext());
   absl::StatusOr<std::unique_ptr<DeviceDescription>> discovered =
       [&]() -> absl::StatusOr<std::unique_ptr<DeviceDescription>> {
-    TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal));
     TF_ASSIGN_OR_RETURN(
         MusaDeviceProperties properties,
         MusaRuntime::Get()->GetDeviceProperties(device_ordinal));
@@ -344,8 +403,66 @@ MusaExecutor::CreateOrShareConstant(Stream* stream,
 
 absl::StatusOr<std::unique_ptr<Kernel>> MusaExecutor::LoadKernel(
     const KernelLoaderSpec& spec) {
-  return absl::UnimplementedError(
-      "MUSA kernel loading is not implemented in PJRT GPU v1.");
+  if (module_cache_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "MUSA executor must be initialized before loading a kernel");
+  }
+  if (!spec.has_musa_mubin_in_memory()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("MUSA kernel %s requires an explicit MUBIN artifact",
+                        spec.kernel_name()));
+  }
+  if (spec.kernel_name().empty()) {
+    return absl::InvalidArgumentError("MUSA kernel name must not be empty");
+  }
+  if (spec.arity() > std::numeric_limits<unsigned>::max()) {
+    return absl::InvalidArgumentError(
+        absl::StrFormat("MUSA kernel %s arity %d exceeds the supported range",
+                        spec.kernel_name(), spec.arity()));
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      std::shared_ptr<MusaModule> module,
+      module_cache_->GetOrLoadModule(spec.musa_mubin_in_memory()->mubin_bytes));
+  absl::StatusOr<MUfunction> function_status =
+      module->GetFunction(spec.kernel_name());
+  if (!function_status.ok()) {
+    return absl::Status(
+        function_status.status().code(),
+        absl::StrFormat("Failed to resolve MUSA kernel %s on device %d: %s",
+                        spec.kernel_name(), device_ordinal(),
+                        function_status.status().message()));
+  }
+  MUfunction function = *function_status;
+
+  auto kernel = std::make_unique<MusaKernel>(
+      this, function, module, module_reaper_.get(), spec.arity());
+  kernel->set_name(spec.kernel_name());
+  TF_ASSIGN_OR_RETURN(KernelMetadata metadata, kernel->GetKernelMetadata());
+  kernel->set_metadata(metadata);
+
+  if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
+          spec.kernel_args_packing())) {
+    kernel->set_args_packing(std::get<KernelLoaderSpec::KernelArgsPackingFunc>(
+        spec.kernel_args_packing()));
+  } else {
+    const KernelArgsPackingSpec packing_spec =
+        std::get<KernelArgsPackingSpec>(spec.kernel_args_packing());
+    kernel->set_args_packing(
+        [packing_spec](const Kernel&, const KernelArgs& args)
+            -> absl::StatusOr<std::unique_ptr<KernelArgsPackedArrayBase>> {
+          const auto* packable = dynamic_cast<const PackableKernelArgs*>(&args);
+          if (packable == nullptr) {
+            return absl::InvalidArgumentError(
+                "MUSA serializable argument packing requires packable "
+                "kernel arguments");
+          }
+          return packing_spec.BuildArguments(packable->packed_args(),
+                                             args.number_of_shared_bytes());
+        });
+  }
+  module_reaper_->Observe(module);
+  return kernel;
 }
 
 absl::StatusOr<ModuleHandle> MusaExecutor::LoadModule(
@@ -368,8 +485,28 @@ bool MusaExecutor::UnloadModule(ModuleHandle module_handle) {
 
 absl::StatusOr<DeviceAddressBase> MusaExecutor::GetSymbol(
     const std::string& symbol_name, ModuleHandle module_handle) {
-  return absl::UnimplementedError(
-      "MUSA symbol lookup is not implemented in PJRT GPU v1.");
+  if (module_cache_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "MUSA executor must be initialized before symbol lookup");
+  }
+  if (symbol_name.empty()) {
+    return absl::InvalidArgumentError("MUSA symbol name must not be empty");
+  }
+  TF_ASSIGN_OR_RETURN(std::shared_ptr<MusaModule> module,
+                      module_cache_->LookupModule(module_handle));
+  absl::StatusOr<MusaModuleGlobal> global_status =
+      module->GetGlobal(symbol_name);
+  if (!global_status.ok()) {
+    return absl::Status(
+        global_status.status().code(),
+        absl::StrFormat("Failed to resolve MUSA global %s on device %d: %s",
+                        symbol_name, device_ordinal(),
+                        global_status.status().message()));
+  }
+  MusaModuleGlobal global = *global_status;
+  static_assert(sizeof(MUdeviceptr) == sizeof(void*),
+                "MUSA device pointers must match host pointer width");
+  return DeviceAddressBase(absl::bit_cast<void*>(global.address), global.size);
 }
 
 Stream* MusaExecutor::FindAllocatedStream(void* device_stream) {

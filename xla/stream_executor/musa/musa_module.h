@@ -21,8 +21,10 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "musa.h"
 #include "xla/stream_executor/module_spec.h"
@@ -53,6 +55,7 @@ class MusaModule final {
   MusaModule& operator=(const MusaModule&) = delete;
 
   MUmodule module() const { return module_; }
+  MusaDriver* driver() const { return driver_; }
   MusaContext* context() const { return context_.get(); }
   MUcontext native_context() const { return context_->context(); }
   MUdevice device() const { return context_->device(); }
@@ -62,6 +65,9 @@ class MusaModule final {
   const MusaMubinMetadata& metadata() const { return metadata_; }
   const std::string& architecture() const { return architecture_; }
   uint32_t binary_abi_version() const { return binary_abi_version_; }
+
+  absl::StatusOr<MUfunction> GetFunction(absl::string_view name) const;
+  absl::StatusOr<MusaModuleGlobal> GetGlobal(absl::string_view name) const;
 
  private:
   friend class MusaModuleCache;
@@ -84,6 +90,12 @@ class MusaModule final {
   const std::string architecture_;
   const uint32_t binary_abi_version_;
   MUmodule module_;
+
+  mutable absl::Mutex symbols_mutex_;
+  mutable absl::flat_hash_map<std::string, MUfunction> functions_
+      ABSL_GUARDED_BY(symbols_mutex_);
+  mutable absl::flat_hash_map<std::string, MusaModuleGlobal> globals_
+      ABSL_GUARDED_BY(symbols_mutex_);
 };
 
 // Thread-safe, weak module cache for one MUSA context and architecture.

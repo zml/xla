@@ -156,6 +156,24 @@ class FakeModuleDriver final : public MusaDriver {
     return unload_status;
   }
 
+  absl::StatusOr<MUfunction> GetModuleFunction(MUmodule module,
+                                               const char* name) override {
+    ++function_lookup_calls;
+    last_lookup_module = module;
+    last_lookup_name = name;
+    lookup_while_active = fake_current_context == retained_context;
+    return function;
+  }
+
+  absl::StatusOr<MusaModuleGlobal> GetModuleGlobal(MUmodule module,
+                                                   const char* name) override {
+    ++global_lookup_calls;
+    last_lookup_module = module;
+    last_lookup_name = name;
+    lookup_while_active = fake_current_context == retained_context;
+    return global;
+  }
+
   int device = 7;
   MUcontext retained_context = reinterpret_cast<MUcontext>(uintptr_t{0x1234});
   int last_ordinal = -1;
@@ -165,9 +183,16 @@ class FakeModuleDriver final : public MusaDriver {
   std::atomic<int> release_calls{0};
   std::atomic<int> load_calls{0};
   std::atomic<int> unload_calls{0};
+  std::atomic<int> function_lookup_calls{0};
+  std::atomic<int> global_lookup_calls{0};
   std::atomic<uintptr_t> next_module{1};
   std::atomic<bool> loaded_while_active{false};
   std::atomic<bool> unloaded_while_active{false};
+  std::atomic<bool> lookup_while_active{false};
+  MUfunction function = reinterpret_cast<MUfunction>(uintptr_t{0x5678});
+  MusaModuleGlobal global{static_cast<MUdeviceptr>(0x9000), 64};
+  MUmodule last_lookup_module = nullptr;
+  std::string last_lookup_name;
   absl::Status load_status = absl::OkStatus();
   absl::Status unload_status = absl::OkStatus();
   std::function<void()> on_unload;
@@ -208,6 +233,35 @@ TEST(MusaModuleTest, OwnsBytesAndUnloadsUnderRetainedContext) {
   module.reset();
   EXPECT_EQ(driver.unload_calls, 1);
   EXPECT_TRUE(driver.unloaded_while_active);
+}
+
+TEST(MusaModuleTest, CachesFunctionsAndGlobalsUnderOwningContext) {
+  fake_current_context = nullptr;
+  FakeModuleDriver driver;
+  auto context_or = MakeContext(&driver);
+  ASSERT_TRUE(context_or.ok()) << context_or.status();
+  auto module_or = MusaModule::Load(&driver, *std::move(context_or),
+                                    MakeValidMubin(), "mp_21");
+  ASSERT_TRUE(module_or.ok()) << module_or.status();
+  std::shared_ptr<MusaModule> module = *std::move(module_or);
+
+  auto first_function = module->GetFunction("add_one");
+  auto second_function = module->GetFunction("add_one");
+  ASSERT_TRUE(first_function.ok()) << first_function.status();
+  ASSERT_TRUE(second_function.ok()) << second_function.status();
+  EXPECT_EQ(*first_function, driver.function);
+  EXPECT_EQ(*second_function, driver.function);
+  EXPECT_EQ(driver.function_lookup_calls, 1);
+
+  auto first_global = module->GetGlobal("constant");
+  auto second_global = module->GetGlobal("constant");
+  ASSERT_TRUE(first_global.ok()) << first_global.status();
+  ASSERT_TRUE(second_global.ok()) << second_global.status();
+  EXPECT_EQ(first_global->address, driver.global.address);
+  EXPECT_EQ(first_global->size, driver.global.size);
+  EXPECT_EQ(second_global->address, driver.global.address);
+  EXPECT_EQ(driver.global_lookup_calls, 1);
+  EXPECT_TRUE(driver.lookup_while_active);
 }
 
 TEST(MusaModuleCacheTest, DeduplicatesAndCountsHandleClients) {

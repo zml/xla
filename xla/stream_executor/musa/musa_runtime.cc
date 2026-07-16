@@ -57,11 +57,15 @@ struct MusaRuntime::FunctionTable {
   MusaStreamCreateFn stream_create = nullptr;
   MusaStreamDestroyFn stream_destroy = nullptr;
   MusaStreamSynchronizeFn stream_synchronize = nullptr;
+  MusaStreamQueryFn stream_query = nullptr;
   MusaStreamWaitEventFn stream_wait_event = nullptr;
+  MusaLaunchHostFuncFn launch_host_func = nullptr;
   MusaEventCreateFn event_create = nullptr;
+  MusaEventCreateWithFlagsFn event_create_with_flags = nullptr;
   MusaEventDestroyFn event_destroy = nullptr;
   MusaEventRecordFn event_record = nullptr;
   MusaEventSynchronizeFn event_synchronize = nullptr;
+  MusaEventElapsedTimeFn event_elapsed_time = nullptr;
   MusaEventQueryFn event_query = nullptr;
   MusaRuntimeGetVersionFn runtime_get_version = nullptr;
   MusaGetErrorStringFn get_error_string = nullptr;
@@ -132,14 +136,19 @@ absl::Status MusaRuntime::Initialize() const {
   XLA_MUSA_LOAD_REQUIRED(free, "musaFree");
   XLA_MUSA_LOAD_REQUIRED(memcpy, "musaMemcpy");
   XLA_MUSA_LOAD_REQUIRED(memcpy_async, "musaMemcpyAsync");
+  XLA_MUSA_LOAD_REQUIRED(memset_async, "musaMemsetAsync");
   XLA_MUSA_LOAD_REQUIRED(stream_create, "musaStreamCreate");
   XLA_MUSA_LOAD_REQUIRED(stream_destroy, "musaStreamDestroy");
   XLA_MUSA_LOAD_REQUIRED(stream_synchronize, "musaStreamSynchronize");
+  XLA_MUSA_LOAD_REQUIRED(stream_query, "musaStreamQuery");
   XLA_MUSA_LOAD_REQUIRED(stream_wait_event, "musaStreamWaitEvent");
+  XLA_MUSA_LOAD_REQUIRED(launch_host_func, "musaLaunchHostFunc");
   XLA_MUSA_LOAD_REQUIRED(event_create, "musaEventCreate");
+  XLA_MUSA_LOAD_REQUIRED(event_create_with_flags, "musaEventCreateWithFlags");
   XLA_MUSA_LOAD_REQUIRED(event_destroy, "musaEventDestroy");
   XLA_MUSA_LOAD_REQUIRED(event_record, "musaEventRecord");
   XLA_MUSA_LOAD_REQUIRED(event_synchronize, "musaEventSynchronize");
+  XLA_MUSA_LOAD_REQUIRED(event_elapsed_time, "musaEventElapsedTime");
   XLA_MUSA_LOAD_REQUIRED(event_query, "musaEventQuery");
 
   XLA_MUSA_LOAD_OPTIONAL(host_alloc, "musaHostAlloc");
@@ -149,7 +158,6 @@ absl::Status MusaRuntime::Initialize() const {
         absl::StrCat("MUSA runtime ", loader_->loaded_path(),
                      " must export musaHostAlloc and musaFreeHost as a pair"));
   }
-  XLA_MUSA_LOAD_OPTIONAL(memset_async, "musaMemsetAsync");
   XLA_MUSA_LOAD_OPTIONAL(mem_get_info, "musaMemGetInfo");
   XLA_MUSA_LOAD_OPTIONAL(runtime_get_version, "musaRuntimeGetVersion");
   XLA_MUSA_LOAD_OPTIONAL(get_error_string, "musaGetErrorString");
@@ -388,6 +396,16 @@ absl::Status MusaRuntime::StreamSynchronize(void* stream) {
   return ToStatus(result, "musaStreamSynchronize", ErrorString(result));
 }
 
+absl::Status MusaRuntime::StreamQuery(void* stream) {
+  RETURN_IF_ERROR(Load());
+  musaError_t result =
+      functions_->stream_query(reinterpret_cast<musaStream_t>(stream));
+  if (result == musaSuccess || result == musaErrorNotReady) {
+    return absl::OkStatus();
+  }
+  return ToStatus(result, "musaStreamQuery", ErrorString(result));
+}
+
 absl::Status MusaRuntime::StreamWaitEvent(void* stream, void* event) {
   RETURN_IF_ERROR(Load());
   musaError_t result =
@@ -396,12 +414,28 @@ absl::Status MusaRuntime::StreamWaitEvent(void* stream, void* event) {
   return ToStatus(result, "musaStreamWaitEvent", ErrorString(result));
 }
 
-absl::StatusOr<void*> MusaRuntime::EventCreate() {
+absl::Status MusaRuntime::LaunchHostFunc(void* stream, musaHostFn_t callback,
+                                         void* user_data) {
+  if (callback == nullptr) {
+    return absl::InvalidArgumentError(
+        "musaLaunchHostFunc callback must not be null");
+  }
+  RETURN_IF_ERROR(Load());
+  musaError_t result = functions_->launch_host_func(
+      reinterpret_cast<musaStream_t>(stream), callback, user_data);
+  return ToStatus(result, "musaLaunchHostFunc", ErrorString(result));
+}
+
+absl::StatusOr<void*> MusaRuntime::EventCreate(bool enable_timing) {
   RETURN_IF_ERROR(Load());
   musaEvent_t event = nullptr;
-  musaError_t result = functions_->event_create(&event);
+  musaError_t result = enable_timing ? functions_->event_create(&event)
+                                     : functions_->event_create_with_flags(
+                                           &event, musaEventDisableTiming);
   if (result != musaSuccess) {
-    return ToStatus(result, "musaEventCreate", ErrorString(result));
+    return ToStatus(
+        result, enable_timing ? "musaEventCreate" : "musaEventCreateWithFlags",
+        ErrorString(result));
   }
   if (event == nullptr) {
     return absl::InternalError(
@@ -431,6 +465,22 @@ absl::Status MusaRuntime::EventSynchronize(void* event) {
   musaError_t result =
       functions_->event_synchronize(reinterpret_cast<musaEvent_t>(event));
   return ToStatus(result, "musaEventSynchronize", ErrorString(result));
+}
+
+absl::StatusOr<float> MusaRuntime::EventElapsedTime(void* start, void* end) {
+  if (start == nullptr || end == nullptr) {
+    return absl::InvalidArgumentError(
+        "MUSA elapsed-time events must not be null");
+  }
+  RETURN_IF_ERROR(Load());
+  float elapsed_milliseconds = 0.0f;
+  musaError_t result = functions_->event_elapsed_time(
+      &elapsed_milliseconds, reinterpret_cast<musaEvent_t>(start),
+      reinterpret_cast<musaEvent_t>(end));
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaEventElapsedTime", ErrorString(result));
+  }
+  return elapsed_milliseconds;
 }
 
 int MusaRuntime::EventQuery(void* event) {

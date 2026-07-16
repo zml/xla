@@ -21,16 +21,19 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
+#include "xla/stream_executor/gpu/host_callback_registry.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
@@ -43,11 +46,14 @@ namespace stream_executor::musa {
 
 class MusaContext;
 class MusaDriver;
+class MusaModule;
 class MusaModuleCache;
+class MusaModuleReaper;
 
 class MusaExecutor : public gpu::GpuExecutor {
  public:
-  MusaExecutor(Platform* platform, int device_ordinal);
+  MusaExecutor(Platform* platform, int device_ordinal,
+               absl::Duration callback_poll_interval = absl::Seconds(5));
 
   ~MusaExecutor() override;
 
@@ -106,6 +112,10 @@ class MusaExecutor : public gpu::GpuExecutor {
 
   Stream* FindAllocatedStream(void* device_stream) override;
 
+  gpu::HostCallbackRegistry* host_callback_registry() const {
+    return host_callback_registry_.get();
+  }
+
  private:
   MusaDriver* driver_;
   // Allocators and RAII allocations may outlive their executor. They retain
@@ -114,6 +124,10 @@ class MusaExecutor : public gpu::GpuExecutor {
   // Declared after context_ so cached modules unload before the primary
   // context reference is released during executor teardown.
   std::unique_ptr<MusaModuleCache> module_cache_;
+  // Declared before the callback registry so it remains available while the
+  // registry tears down outstanding stream-ordered completion callbacks.
+  std::unique_ptr<MusaModuleReaper> module_reaper_;
+  std::unique_ptr<gpu::HostCallbackRegistry> host_callback_registry_;
 
   mutable absl::Mutex alive_streams_mu_;
   absl::flat_hash_map<void*, Stream*> alive_streams_
