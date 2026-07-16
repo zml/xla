@@ -743,6 +743,7 @@ xla_cc_binary(
         ":pjrt_c_api_gpu",
         "//xla/service:gpu_plugin",
         "//xla/service/gpu:vulkan_gpu_compiler",
+        "//xla/stream_executor/vulkan:vulkan_platform",
     ] + if_cuda_is_configured([
         "//xla/stream_executor:cuda_platform",
     ]) + if_rocm_is_configured([

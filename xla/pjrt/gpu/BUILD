@@ -620,6 +620,21 @@ cc_library(
 )
 
 cc_library(
+    name = "se_gpu_pjrt_compiler_vulkan_registration",
+    srcs = ["se_gpu_pjrt_compiler_vulkan_registration.cc"],
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt:stream_executor_platform_id_mapping",
+        "//xla/service/gpu:vulkan_gpu_compiler",
+        "//xla/stream_executor/platform:initialize",
+        "//xla/stream_executor/vulkan:vulkan_platform_id",
+        "@com_google_absl//absl/log:check",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "se_gpu_pjrt_compiler",
     hdrs = ["se_gpu_pjrt_compiler.h"],
     # TODO(b/382070262): Migrate users off this target - They should go though the PjRt ABI compatibility layer.
@@ -648,7 +663,9 @@ cc_library(
         ":se_gpu_pjrt_compiler_rocm_registration",
     ]) + if_sycl([
         ":se_gpu_pjrt_compiler_sycl_registration",
-    ]),
+    ]) + [
+        ":se_gpu_pjrt_compiler_vulkan_registration",
+    ],
 )
 
 cc_library(

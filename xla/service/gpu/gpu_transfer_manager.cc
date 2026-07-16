@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/service/shaped_buffer.h"
 #include "xla/service/transfer_manager.h"
 #include "xla/shape.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
@@ -383,6 +384,13 @@ static std::unique_ptr<xla::TransferManager> CreateSYCLTransferManager() {
           .getPointerSize(0 /* default address space */));
 }
 
+static std::unique_ptr<xla::TransferManager> CreateVulkanTransferManager() {
+  return std::make_unique<xla::gpu::GpuTransferManager>(
+      /*id=*/stream_executor::vulkan::kVulkanPlatformId,
+      /*pointer_size=*/llvm::DataLayout(xla::gpu::vulkan::DataLayout())
+          .getPointerSize(0 /* default address space */));
+}
+
 static bool InitModule() {
   xla::TransferManager::RegisterTransferManager(
       stream_executor::cuda::kCudaPlatformId, &CreateNVPTXTransferManager);
@@ -390,6 +398,9 @@ static bool InitModule() {
       stream_executor::rocm::kROCmPlatformId, &CreateAMDGPUTransferManager);
   xla::TransferManager::RegisterTransferManager(
       stream_executor::sycl::kSyclPlatformId, &CreateSYCLTransferManager);
+  xla::TransferManager::RegisterTransferManager(
+      stream_executor::vulkan::kVulkanPlatformId,
+      &CreateVulkanTransferManager);
   return true;
 }
 

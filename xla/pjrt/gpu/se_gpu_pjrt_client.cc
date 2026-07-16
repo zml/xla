@@ -1874,12 +1874,14 @@ StreamExecutorGpuHbmMemorySpace::StreamExecutorGpuHbmMemorySpace(
 absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
     const GpuClientOptions& options) {
 #if TENSORFLOW_USE_ROCM
-  auto pjrt_platform_name = xla::RocmName();
+  const char* default_pjrt_platform_name = xla::RocmName();
 #elif TENSORFLOW_USE_SYCL
-  auto pjrt_platform_name = xla::OneapiName();
+  const char* default_pjrt_platform_name = xla::OneapiName();
 #else   // TENSORFLOW_USE_ROCM
-  auto pjrt_platform_name = xla::CudaName();
+  const char* default_pjrt_platform_name = xla::CudaName();
 #endif  // TENSORFLOW_USE_ROCM
+  std::string pjrt_platform_name =
+      options.platform_name.value_or(default_pjrt_platform_name);
 
   bool use_async_dispatch = false;
   if (options.use_async_dispatch.has_value()) {

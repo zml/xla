@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 
@@ -224,6 +225,9 @@ bool InitModule() {
       stream_executor::rocm::kROCmPlatformId, DefaultComputationPlacer);
   xla::ComputationPlacer::RegisterComputationPlacer(
       stream_executor::sycl::kSyclPlatformId, DefaultComputationPlacer);
+  xla::ComputationPlacer::RegisterComputationPlacer(
+      stream_executor::vulkan::kVulkanPlatformId,
+      DefaultComputationPlacer);
   return true;
 }
 
