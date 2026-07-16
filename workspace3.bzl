@@ -66,6 +66,7 @@ def workspace():
         urls = tf_mirror_urls(
             "https://github.com/zml/rules_ml_toolchain/archive/dd8f96029cf7aa6c22186ba3c416e857ff9ae0d1.tar.gz",
         ),
+        patch_file = ["//third_party:rules_ml_toolchain_musa_bridge.patch"],
     )
 
     # Maven dependencies.

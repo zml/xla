@@ -1,0 +1,131 @@
+diff --git a/gpu/musa/BUILD.tpl b/gpu/musa/BUILD.tpl
+index c0a104c..109d83f 100644
+--- a/gpu/musa/BUILD.tpl
++++ b/gpu/musa/BUILD.tpl
+@@ -45,0 +46,82 @@
++filegroup(
++    name = "clang_offload_bundler",
++    srcs = glob(["%{musa_root}/bin/clang-offload-bundler"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "lld",
++    srcs = glob(["%{musa_root}/bin/lld"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "llvm_readobj",
++    srcs = glob(["%{musa_root}/bin/llvm-readobj"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "libdevice",
++    srcs = glob(["%{musa_root}/mtgpu/bitcode/libdevice.bc"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++cc_library(
++    name = "musa_llvm14_headers",
++    defines = ["__MTGPU__"],
++    hdrs = glob(
++        [
++            "%{musa_root}/include/clang/**/*.h",
++            "%{musa_root}/include/clang-c/**/*.h",
++            "%{musa_root}/include/lld/**/*.h",
++            "%{musa_root}/include/llvm/**/*.h",
++            "%{musa_root}/include/llvm-c/**/*.h",
++        ],
++        allow_empty = True,
++    ),
++    textual_hdrs = glob(
++        [
++            "%{musa_root}/include/clang/**/*.def",
++            "%{musa_root}/include/clang/**/*.inc",
++            "%{musa_root}/include/clang/**/*.td",
++            "%{musa_root}/include/lld/**/*.def",
++            "%{musa_root}/include/lld/**/*.inc",
++            "%{musa_root}/include/lld/**/*.td",
++            "%{musa_root}/include/llvm/**/*.def",
++            "%{musa_root}/include/llvm/**/*.inc",
++            "%{musa_root}/include/llvm/**/*.td",
++        ],
++        allow_empty = True,
++    ),
++    includes = ["%{musa_root}/include"],
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "libclang_cpp_file",
++    srcs = glob(["%{musa_root}/lib/libclang-cpp.so.14"], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
++
++cc_library(
++    name = "libclang_cpp",
++    srcs = [":libclang_cpp_file"],
++    visibility = ["//visibility:public"],
++)
++
++alias(
++    name = "musa_llvm14_shared",
++    actual = ":libclang_cpp",
++    visibility = ["//visibility:public"],
++)
++
++cc_library(
++    name = "musa_llvm14",
++    visibility = ["//visibility:public"],
++    deps = [
++        ":libclang_cpp",
++        ":musa_llvm14_headers",
++    ],
++)
++
+@@ -47 +129 @@
+-    srcs = glob(
++    srcs = ["toolchain_identity.txt"] + glob(
+@@ -59,0 +142,6 @@
++
++filegroup(
++    name = "toolchain_identity",
++    srcs = ["toolchain_identity.txt"],
++    visibility = ["//visibility:public"],
++)
+diff --git a/gpu/musa/musa_configure.bzl b/gpu/musa/musa_configure.bzl
+index b5eb694..dca0b3a 100644
+--- a/gpu/musa/musa_configure.bzl
++++ b/gpu/musa/musa_configure.bzl
+@@ -167,0 +168,25 @@
++def _write_toolchain_identity(repository_ctx, enabled, musa_root, config):
++    """Writes the canonical, path-free identity inputs for bridge hashing."""
++    architectures = _split_archs(repository_ctx) if enabled else []
++    fields = [
++        ("schema", "xla-musa-toolchain-v1"),
++        ("enabled", "1" if enabled else "0"),
++        ("musa_root", musa_root),
++        ("musa_version", config.get("musa_version", "0")),
++        ("musa_version_number", config.get("musa_version_number", "0")),
++        ("musa_device", repository_ctx.os.environ.get(_MUSA_DEVICE, "") if enabled else ""),
++        ("musa_gpu_architectures", ",".join(architectures)),
++        ("distro_sha256", repository_ctx.os.environ.get(_MUSA_DISTRO_HASH, "") if enabled else ""),
++        ("llvm_major", "14"),
++        ("mcc", config.get("mcc_path", "__missing_mcc__")),
++        ("clang_offload_bundler", "bin/clang-offload-bundler"),
++        ("lld", "bin/lld"),
++        ("llvm_readobj", "bin/llvm-readobj"),
++        ("libclang_cpp", "lib/libclang-cpp.so.14"),
++        ("libdevice", "mtgpu/bitcode/libdevice.bc"),
++    ]
++    repository_ctx.file(
++        "musa/toolchain_identity.txt",
++        "".join(["{}={}\n".format(name, value) for name, value in fields]),
++    )
++
+@@ -184,0 +210 @@
++    _write_toolchain_identity(repository_ctx, False, "empty", {})
+@@ -211,0 +238 @@
++    _write_toolchain_identity(repository_ctx, True, musa_root, config)

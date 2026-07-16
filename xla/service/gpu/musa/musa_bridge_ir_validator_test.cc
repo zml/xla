@@ -142,8 +142,53 @@ TEST(MusaBridgeIrValidatorTest, VerifiesBeforeTraversalWithoutEchoingIr) {
   EXPECT_FALSE(absl::StrContains(status.message(), "sensitive_parse_token"));
 }
 
+TEST(MusaBridgeIrValidatorTest, SanitizesParsedNamesInDiagnostics) {
+  absl::Status status = Validate(
+      Module("",
+             "define internal void @\"sensitive/function/path\"() #1 {\n"
+             "  ret void\n"
+             "}\n"
+             "attributes #1 = { nounwind }"));
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("capability=function-attributes")));
+  EXPECT_FALSE(absl::StrContains(status.message(), "sensitive/function/path"));
+
+  status = Validate(Module(
+      "", "",
+      "@\"sensitive/global/path\" = internal thread_local global i32 0"));
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("capability=thread-local-global")));
+  EXPECT_FALSE(absl::StrContains(status.message(), "sensitive/global/path"));
+
+  status = Validate(InsertBeforeFirstFunction(
+      MinimalModule(),
+      "!sensitive_named_metadata_token = !{!0}\n!0 = !{i32 7}\n"));
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("capability=named-metadata")));
+  EXPECT_FALSE(
+      absl::StrContains(status.message(), "sensitive_named_metadata_token"));
+
+  status = Validate(absl::StrReplaceAll(
+      MinimalModule(), {{kMusaTargetTriple, "sensitive/triple/path"}}));
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("capability=target-triple")));
+  EXPECT_FALSE(absl::StrContains(status.message(), "sensitive/triple/path"));
+
+  MusaBridgeIrMetadata metadata = Metadata();
+  metadata.architecture = "sensitive/architecture/path";
+  status = Validate(MinimalModule(), metadata);
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("capability=architecture")));
+  EXPECT_FALSE(
+      absl::StrContains(status.message(), "sensitive/architecture/path"));
+}
+
 TEST(MusaBridgeIrValidatorTest, ComposedRequestValidationBindsWireToIr) {
   MusaBridgeCompileRequest request = RequestForIr(MinimalModule());
+  EXPECT_THAT(ValidateMusaBridgeCompileRequestIr(request), IsOk());
+
+  request.set_module_name("1module+part");
+  EXPECT_THAT(ValidateMusaBridgeCompileRequest(request), IsOk());
   EXPECT_THAT(ValidateMusaBridgeCompileRequestIr(request), IsOk());
 
   request.add_exported_symbol_names("unbound_symbol");
@@ -486,6 +531,27 @@ TEST(MusaBridgeIrValidatorTest, RejectsUnlistedGenericIntrinsicAndCallCc) {
                               "define internal void @helper() { ret void }")),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("capability=calling-convention")));
+}
+
+TEST(MusaBridgeIrValidatorTest, RejectsUnversionedFloatingPointSemantics) {
+  EXPECT_THAT(
+      Validate(Module("  %value = fadd fast float 1.0, 2.0\n"
+                      "  store float %value, ptr addrspace(1) %out, align 4")),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("capability=fast-math-flags")));
+  EXPECT_THAT(
+      Validate(Module("  %value = fadd contract float 1.0, 2.0\n"
+                      "  store float %value, ptr addrspace(1) %out, align 4")),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("capability=fast-math-flags")));
+  EXPECT_THAT(
+      Validate(Module(
+          "  %value = call float @llvm.fmuladd.f32(float 2.0, float 3.0, "
+          "float 4.0)\n"
+          "  store float %value, ptr addrspace(1) %out, align 4",
+          "declare float @llvm.fmuladd.f32(float, float, float)")),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("capability=llvm-intrinsic")));
 }
 
 TEST(MusaBridgeIrValidatorTest, RejectsUnqualifiedAtomics) {

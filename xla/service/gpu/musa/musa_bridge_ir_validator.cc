@@ -74,6 +74,26 @@ bool IsSafeToken(absl::string_view value, bool allow_dash,
          std::all_of(value.begin() + 1, value.end(), valid_rest);
 }
 
+bool IsSafeModuleName(absl::string_view value) {
+  if (value.empty() || value.size() > kMusaBridgeMaxModuleNameBytes) {
+    return false;
+  }
+  const auto valid_first = [](char c) {
+    return absl::ascii_isalpha(c) || absl::ascii_isdigit(c) || c == '_';
+  };
+  const auto valid_body = [](char c) {
+    return absl::ascii_isalpha(c) || absl::ascii_isdigit(c) || c == '_' ||
+           c == '-' || c == '.' || c == '+';
+  };
+  return valid_first(value.front()) &&
+         std::all_of(value.begin() + 1, value.end(), valid_body);
+}
+
+std::string SanitizedSymbol(llvm::StringRef value) {
+  return IsSafeToken(value.str(), /*allow_dash=*/true) ? value.str()
+                                                       : "<invalid-symbol>";
+}
+
 absl::Status Rejected(const MusaBridgeIrMetadata& metadata,
                       absl::string_view capability, absl::string_view detail) {
   return absl::InvalidArgumentError(absl::StrFormat(
@@ -81,10 +101,8 @@ absl::Status Rejected(const MusaBridgeIrMetadata& metadata,
       "module=%s capability=%s: %s",
       metadata.protocol_version, metadata.shim_abi_version,
       metadata.mapping_version,
-      IsSafeToken(metadata.module_name, /*allow_dash=*/true,
-                  kMusaBridgeMaxModuleNameBytes)
-          ? metadata.module_name
-          : "<invalid-module-name>",
+      IsSafeModuleName(metadata.module_name) ? metadata.module_name
+                                             : "<invalid-module-name>",
       capability, detail));
 }
 
@@ -99,15 +117,14 @@ absl::Status ValidateMetadata(const MusaBridgeIrMetadata& metadata) {
         metadata.mapping_version, kMusaBridgeProtocolVersion,
         kMusaShimAbiVersion, kMusaShimMappingVersion));
   }
-  if (!IsSafeToken(metadata.module_name, /*allow_dash=*/true,
-                   kMusaBridgeMaxModuleNameBytes)) {
+  if (!IsSafeModuleName(metadata.module_name)) {
     return absl::InvalidArgumentError(
         "MUSA bridge module name must be a bounded safe token");
   }
   if (metadata.architecture != kMusaTargetArchitecture) {
     return Rejected(metadata, "architecture",
-                    absl::StrCat("unsupported target ", metadata.architecture,
-                                 "; require ", kMusaTargetArchitecture));
+                    absl::StrCat("target does not match required architecture ",
+                                 kMusaTargetArchitecture));
   }
   if (metadata.kernel_entry_names.empty() ||
       metadata.kernel_entry_names.size() > kMaxMusaKernelEntries) {
@@ -268,7 +285,6 @@ bool IsAllowedGenericIntrinsic(llvm::Intrinsic::ID id) {
     case llvm::Intrinsic::fabs:
     case llvm::Intrinsic::floor:
     case llvm::Intrinsic::fma:
-    case llvm::Intrinsic::fmuladd:
     case llvm::Intrinsic::fshl:
     case llvm::Intrinsic::fshr:
     case llvm::Intrinsic::lifetime_end:
@@ -395,10 +411,11 @@ absl::Status ValidateShim(const llvm::Function& function,
 absl::Status RejectFunctionAttributes(const llvm::Function& function,
                                       const MusaBridgeIrMetadata& metadata) {
   if (!function.getAttributes().isEmpty()) {
-    return Rejected(metadata, "function-attributes",
-                    absl::StrCat("function ", function.getName().str(),
-                                 " carries attributes outside mapping version "
-                                 "1"));
+    return Rejected(
+        metadata, "function-attributes",
+        absl::StrCat("function ", SanitizedSymbol(function.getName()),
+                     " carries attributes outside mapping version "
+                     "1"));
   }
   return absl::OkStatus();
 }
@@ -412,9 +429,10 @@ absl::Status ValidateFunctionObjectState(const llvm::Function& function,
       function.hasPartition() || function.hasSanitizerMetadata() ||
       function.hasGC() || function.hasPersonalityFn() ||
       function.hasPrefixData() || function.hasPrologueData()) {
-    return Rejected(metadata, "function-object-state",
-                    absl::StrCat("function ", function.getName().str(),
-                                 " carries unsupported ABI or linker state"));
+    return Rejected(
+        metadata, "function-object-state",
+        absl::StrCat("function ", SanitizedSymbol(function.getName()),
+                     " carries unsupported ABI or linker state"));
   }
   return absl::OkStatus();
 }
@@ -431,7 +449,7 @@ absl::Status ValidateGlobalObjectState(const llvm::GlobalVariable& global,
       global.hasPartition() || global.hasSanitizerMetadata() ||
       global.isExternallyInitialized()) {
     return Rejected(metadata, "global-object-state",
-                    absl::StrCat("global ", global.getName().str(),
+                    absl::StrCat("global ", SanitizedSymbol(global.getName()),
                                  " carries unsupported ABI or linker state"));
   }
   return absl::OkStatus();
@@ -443,10 +461,11 @@ absl::Status ValidateIntrinsicAttributes(const llvm::Function& function,
       function.getContext(), function.getIntrinsicID(),
       function.getFunctionType());
   if (function.getAttributes() != expected) {
-    return Rejected(metadata, "intrinsic-attributes",
-                    absl::StrCat("intrinsic ", function.getName().str(),
-                                 " does not carry its canonical LLVM "
-                                 "attributes"));
+    return Rejected(
+        metadata, "intrinsic-attributes",
+        absl::StrCat("intrinsic ", SanitizedSymbol(function.getName()),
+                     " does not carry its canonical LLVM "
+                     "attributes"));
   }
   return absl::OkStatus();
 }
@@ -528,18 +547,18 @@ absl::Status ValidateGlobals(const llvm::Module& module,
     global.getAllMetadata(all_metadata);
     if (!all_metadata.empty()) {
       return Rejected(metadata, "global-metadata",
-                      absl::StrCat("global ", global.getName().str(),
+                      absl::StrCat("global ", SanitizedSymbol(global.getName()),
                                    " carries unsupported metadata"));
     }
     if (global.isThreadLocal()) {
-      return Rejected(
-          metadata, "thread-local-global",
-          absl::StrCat("global ", global.getName().str(), " is thread-local"));
+      return Rejected(metadata, "thread-local-global",
+                      absl::StrCat("global ", SanitizedSymbol(global.getName()),
+                                   " is thread-local"));
     }
     if (global.isDeclaration()) {
-      return Rejected(
-          metadata, "unresolved-global",
-          absl::StrCat("global ", global.getName().str(), " is unresolved"));
+      return Rejected(metadata, "unresolved-global",
+                      absl::StrCat("global ", SanitizedSymbol(global.getName()),
+                                   " is unresolved"));
     }
     if (global.hasInitializer()) {
       llvm::SmallPtrSet<const llvm::Constant*, 16> visited_constants;
@@ -552,22 +571,24 @@ absl::Status ValidateGlobals(const llvm::Module& module,
     auto it = expected.find(global.getName());
     if (global.hasLocalLinkage()) {
       if (it != expected.end()) {
-        return Rejected(metadata, "exported-globals",
-                        absl::StrCat("listed global ", global.getName().str(),
-                                     " has local linkage"));
+        return Rejected(
+            metadata, "exported-globals",
+            absl::StrCat("listed global ", SanitizedSymbol(global.getName()),
+                         " has local linkage"));
       }
       continue;
     }
     if (global.getLinkage() != llvm::GlobalValue::ExternalLinkage) {
-      return Rejected(metadata, "global-linkage",
-                      absl::StrCat("exported global ", global.getName().str(),
-                                   " must have external linkage"));
+      return Rejected(
+          metadata, "global-linkage",
+          absl::StrCat("exported global ", SanitizedSymbol(global.getName()),
+                       " must have external linkage"));
     }
     if (it == expected.end()) {
-      return Rejected(
-          metadata, "exported-globals",
-          absl::StrCat("externally visible global ", global.getName().str(),
-                       " is absent from the request"));
+      return Rejected(metadata, "exported-globals",
+                      absl::StrCat("externally visible global ",
+                                   SanitizedSymbol(global.getName()),
+                                   " is absent from the request"));
     }
     const MusaExportedGlobal& spec = *it->second;
     llvm::TypeSize allocation_size =
@@ -609,9 +630,11 @@ absl::Status ValidateFunctions(const llvm::Module& module,
   absl::flat_hash_set<absl::string_view> found_kernels;
 
   for (const llvm::Function& function : module.functions()) {
+    const llvm::StringRef name = function.getName();
+    const std::string function_name = SanitizedSymbol(name);
     if (function.getAddressSpace() != 0) {
       return Rejected(metadata, "function-address-space",
-                      absl::StrCat("function ", function.getName().str(),
+                      absl::StrCat("function ", function_name,
                                    " must use generic address space 0"));
     }
     if (absl::Status status = ValidateValueType(function, metadata);
@@ -631,9 +654,8 @@ absl::Status ValidateFunctions(const llvm::Module& module,
     if (function.getCallingConv() != llvm::CallingConv::C) {
       return Rejected(
           metadata, "calling-convention",
-          absl::StrCat("function ", function.getName().str(),
-                       " uses calling convention ", function.getCallingConv(),
-                       "; native convention ",
+          absl::StrCat("function ", function_name, " uses calling convention ",
+                       function.getCallingConv(), "; native convention ",
                        stream_executor::musa::kMusaKernelCallingConvention,
                        " is bridge-only"));
     }
@@ -641,20 +663,19 @@ absl::Status ValidateFunctions(const llvm::Module& module,
     function.getAllMetadata(function_metadata);
     if (!function_metadata.empty()) {
       return Rejected(metadata, "function-metadata",
-                      absl::StrCat("function ", function.getName().str(),
+                      absl::StrCat("function ", function_name,
                                    " carries unsupported metadata"));
     }
 
-    llvm::StringRef name = function.getName();
     if (HasForbiddenTargetPrefix(name)) {
       return Rejected(metadata, "foreign-target-construct",
-                      absl::StrCat("forbidden function ", name.str()));
+                      absl::StrCat("forbidden function ", function_name));
     }
     if (name.starts_with("__xla_musa_")) {
       const MusaShimSpec* spec = FindMusaShim(name.str());
       if (spec == nullptr) {
         return Rejected(metadata, "unknown-shim",
-                        absl::StrCat("unknown shim ", name.str()));
+                        absl::StrCat("unknown shim ", function_name));
       }
       if (absl::Status status = ValidateShim(function, *spec, metadata);
           !status.ok()) {
@@ -665,7 +686,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
     if (function.isIntrinsic()) {
       if (!IsAllowedGenericIntrinsic(function.getIntrinsicID())) {
         return Rejected(metadata, "llvm-intrinsic",
-                        absl::StrCat("intrinsic ", name.str(),
+                        absl::StrCat("intrinsic ", function_name,
                                      " is not in mapping version 1"));
       }
       if (absl::Status status = ValidateIntrinsicAttributes(function, metadata);
@@ -674,14 +695,14 @@ absl::Status ValidateFunctions(const llvm::Module& module,
       }
       if (function.getLinkage() != llvm::GlobalValue::ExternalLinkage) {
         return Rejected(metadata, "intrinsic-linkage",
-                        absl::StrCat("intrinsic ", name.str(),
+                        absl::StrCat("intrinsic ", function_name,
                                      " must have external linkage"));
       }
       continue;
     }
     if (function.isDeclaration()) {
       return Rejected(metadata, "unresolved-call",
-                      absl::StrCat("external function ", name.str(),
+                      absl::StrCat("external function ", function_name,
                                    " is not an allowed shim or intrinsic"));
     }
     if (absl::Status status = RejectFunctionAttributes(function, metadata);
@@ -695,15 +716,16 @@ absl::Status ValidateFunctions(const llvm::Module& module,
           !function.getReturnType()->isVoidTy() || function.isVarArg()) {
         return Rejected(
             metadata, "kernel-list",
-            absl::StrCat("kernel ", name.str(),
+            absl::StrCat("kernel ", function_name,
                          " must have external linkage, return void, and be "
                          "nonvariadic"));
       }
       found_kernels.insert(name.str());
     } else if (!function.hasLocalLinkage()) {
-      return Rejected(metadata, "kernel-list",
-                      absl::StrCat("externally visible function ", name.str(),
-                                   " is not listed as a kernel"));
+      return Rejected(
+          metadata, "kernel-list",
+          absl::StrCat("externally visible function ", function_name,
+                       " is not listed as a kernel"));
     }
 
     for (const llvm::BasicBlock& block : function) {
@@ -730,6 +752,13 @@ absl::Status ValidateFunctions(const llvm::Module& module,
             return status;
           }
         }
+        if (const auto* fp = llvm::dyn_cast<llvm::FPMathOperator>(&instruction);
+            fp != nullptr && fp->getFastMathFlags().any()) {
+          return Rejected(metadata, "fast-math-flags",
+                          absl::StrCat("function ", function_name,
+                                       " contains unversioned fast-math "
+                                       "flags"));
+        }
         for (const llvm::Use& operand : instruction.operands()) {
           if (absl::Status status = ValidateValueType(*operand.get(), metadata);
               !status.ok()) {
@@ -750,34 +779,34 @@ absl::Status ValidateFunctions(const llvm::Module& module,
         instruction.getAllMetadata(instruction_metadata);
         if (!instruction_metadata.empty() || instruction.getDebugLoc()) {
           return Rejected(metadata, "instruction-metadata",
-                          absl::StrCat("function ", name.str(),
+                          absl::StrCat("function ", function_name,
                                        " carries unsupported metadata"));
         }
         if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
           if (!call->getAttributes().isEmpty()) {
             return Rejected(metadata, "call-site-attributes",
-                            absl::StrCat("call in function ", name.str(),
+                            absl::StrCat("call in function ", function_name,
                                          " carries attributes outside mapping "
                                          "version 1"));
           }
           if (call->isInlineAsm()) {
             return Rejected(metadata, "inline-assembly",
-                            absl::StrCat("function ", name.str(),
+                            absl::StrCat("function ", function_name,
                                          " contains inline assembly"));
           }
           if (call->hasOperandBundles()) {
             return Rejected(metadata, "operand-bundle",
-                            absl::StrCat("function ", name.str(),
+                            absl::StrCat("function ", function_name,
                                          " contains an operand bundle"));
           }
           if (call->getCalledFunction() == nullptr) {
             return Rejected(metadata, "indirect-call",
-                            absl::StrCat("function ", name.str(),
+                            absl::StrCat("function ", function_name,
                                          " contains an indirect call"));
           }
           if (call->getCallingConv() != llvm::CallingConv::C) {
             return Rejected(metadata, "calling-convention",
-                            absl::StrCat("call in function ", name.str(),
+                            absl::StrCat("call in function ", function_name,
                                          " uses a non-C calling convention"));
           }
         }
@@ -834,11 +863,11 @@ absl::Status ValidateMusaBridgeIr(absl::string_view llvm_ir,
     return Rejected(metadata, "llvm-verifier",
                     "current LLVM verifier rejected the module");
   }
-  const std::string module_triple = module->getTargetTriple().str();
-  if (module_triple != kMusaTargetTriple) {
-    return Rejected(metadata, "target-triple",
-                    absl::StrCat("module triple is ", module_triple,
-                                 "; require ", kMusaTargetTriple));
+  if (module->getTargetTriple().str() != kMusaTargetTriple) {
+    return Rejected(
+        metadata, "target-triple",
+        absl::StrCat("module triple does not match required target ",
+                     kMusaTargetTriple));
   }
   if (module->getDataLayoutStr() != kMusaDataLayout) {
     return Rejected(metadata, "data-layout",
@@ -861,11 +890,8 @@ absl::Status ValidateMusaBridgeIr(absl::string_view llvm_ir,
                     "COMDAT definitions are not in mapping version 1");
   }
   if (module->named_metadata_begin() != module->named_metadata_end()) {
-    return Rejected(
-        metadata, "named-metadata",
-        absl::StrCat("named metadata ",
-                     module->named_metadata_begin()->getName().str(),
-                     " is not in mapping version 1"));
+    return Rejected(metadata, "named-metadata",
+                    "named metadata is not in mapping version 1");
   }
   for (llvm::StructType* type : module->getIdentifiedStructTypes()) {
     llvm::SmallPtrSet<const llvm::Type*, 16> visited_types;
