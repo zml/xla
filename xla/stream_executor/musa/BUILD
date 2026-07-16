@@ -3,11 +3,13 @@
 load(
     "@local_config_musa//musa:build_defs.bzl",
     "if_musa",
+    "musa_config",
 )
 load(
     "//xla/stream_executor:build_defs.bzl",
     "stream_executor_friends",
 )
+load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tsl:tsl.bzl", "internal_visibility", "tsl_copts")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
@@ -27,6 +29,18 @@ cc_library(
     hdrs = ["musa_compute_capability.h"],
     deps = [
         "//xla/stream_executor:device_description_proto_cc",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_compute_capability_test",
+    srcs = ["musa_compute_capability_test.cc"],
+    deps = [
+        ":musa_compute_capability",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -35,6 +49,52 @@ cc_library(
     srcs = ["musa_platform_id.cc"],
     hdrs = ["musa_platform_id.h"],
     deps = ["//xla/stream_executor:platform_id"],
+)
+
+cc_library(
+    name = "musa_device_properties",
+    hdrs = ["musa_device_properties.h"],
+)
+
+cc_library(
+    name = "musa_target_contract",
+    hdrs = ["musa_target_contract.h"],
+)
+
+cc_library(
+    name = "musa_device_description",
+    srcs = ["musa_device_description.cc"],
+    hdrs = ["musa_device_description.h"],
+    deps = [
+        ":musa_compute_capability",
+        ":musa_device_properties",
+        ":musa_target_contract",
+        ":musa_version_parser",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:semantic_version",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_device_description_test",
+    srcs = ["musa_device_description_test.cc"],
+    deps = [
+        ":musa_device_description",
+        ":musa_device_properties",
+        ":musa_target_contract",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(
@@ -49,6 +109,30 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_version_parser",
+    srcs = ["musa_version_parser.cc"],
+    hdrs = ["musa_version_parser.h"],
+    deps = [
+        "//xla/stream_executor:semantic_version",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_version_parser_test",
+    srcs = ["musa_version_parser_test.cc"],
+    deps = [
+        ":musa_version_parser",
+        "//xla/stream_executor:semantic_version",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "musa_runtime",
     srcs = ["musa_runtime.cc"],
     hdrs = ["musa_runtime.h"],
@@ -58,7 +142,9 @@ cc_library(
         "musa-only",
     ],
     deps = [
+        ":musa_device_properties",
         ":musa_status",
+        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -142,12 +228,17 @@ cc_library(
         "gpu",
         "musa-only",
     ],
+    local_defines = [
+        "XLA_MUSA_TOOLKIT_VERSION=%s" % musa_config().version_number,
+    ],
     deps = [
-        ":musa_compute_capability",
+        ":musa_device_description",
+        ":musa_device_properties",
         ":musa_event",
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_stream",
+        ":musa_version_parser",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:blas",
         "//xla/stream_executor:device_address",
@@ -184,6 +275,24 @@ cc_library(
     alwayslink = True,
 )
 
+xla_cc_test(
+    name = "musa_executor_test",
+    srcs = ["musa_executor_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_compute_capability",
+        ":musa_executor",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "musa_platform",
     srcs = ["musa_platform.cc"],
@@ -198,6 +307,7 @@ cc_library(
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_runtime_abi_version",
+        ":musa_version_parser",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:executor_cache",
         "//xla/stream_executor:platform",

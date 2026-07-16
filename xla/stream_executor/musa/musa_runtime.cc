@@ -15,8 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_runtime.h"
 
-#include <dlfcn.h>
-
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -27,6 +26,8 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/tsl/platform/status_macros.h"
+#include <dlfcn.h>
 #include "xla/stream_executor/musa/musa_status.h"
 
 namespace stream_executor::musa {
@@ -52,15 +53,10 @@ bool MusaRuntime::IsLoaded() {
 }
 
 absl::Status MusaRuntime::Load() {
-  if (attempted_load_) {
-    if (handle_ == nullptr) {
-      return absl::FailedPreconditionError(
-          "MUSA runtime library libmusart.so is not available.");
-    }
-    return absl::OkStatus();
+  if (load_status_.has_value()) {
+    return *load_status_;
   }
 
-  attempted_load_ = true;
   for (const char* name : kMusartNames) {
     handle_ = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
     if (handle_ != nullptr) {
@@ -68,84 +64,103 @@ absl::Status MusaRuntime::Load() {
     }
   }
   if (handle_ == nullptr) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "Unable to load MUSA runtime library libmusart.so: ", dlerror()));
+    return FailLoad(absl::FailedPreconditionError(absl::StrCat(
+        "Unable to load MUSA runtime library libmusart.so: ", dlerror())));
   }
 
   if (auto status = LoadSymbol(get_device_count_, "musaGetDeviceCount");
       !status.ok()) {
-    return status;
-  }
-  if (auto status = LoadSymbol(set_device_, "musaSetDevice"); !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status =
-          LoadSymbol(device_synchronize_, "musaDeviceSynchronize");
+          LoadSymbol(get_device_properties_, "musaGetDeviceProperties");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
+  }
+  if (auto status = LoadSymbol(device_get_attribute_, "musaDeviceGetAttribute");
+      !status.ok()) {
+    return FailLoad(status);
+  }
+  if (auto status = LoadSymbol(device_get_pci_bus_id_, "musaDeviceGetPCIBusId");
+      !status.ok()) {
+    return FailLoad(status);
+  }
+  if (auto status = LoadSymbol(set_device_, "musaSetDevice"); !status.ok()) {
+    return FailLoad(status);
+  }
+  if (auto status = LoadSymbol(device_synchronize_, "musaDeviceSynchronize");
+      !status.ok()) {
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(malloc_, "musaMalloc"); !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(free_, "musaFree"); !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(memcpy_, "musaMemcpy"); !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(stream_create_, "musaStreamCreate");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(stream_destroy_, "musaStreamDestroy");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(stream_synchronize_, "musaStreamSynchronize");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(stream_wait_event_, "musaStreamWaitEvent");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(event_create_, "musaEventCreate");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(event_destroy_, "musaEventDestroy");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(event_record_, "musaEventRecord");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(event_synchronize_, "musaEventSynchronize");
       !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
   if (auto status = LoadSymbol(event_query_, "musaEventQuery"); !status.ok()) {
-    return status;
+    return FailLoad(status);
   }
 
-  host_alloc_ =
-      reinterpret_cast<MusaHostAllocFn>(Resolve("musaHostAlloc"));
-  free_host_ =
-      reinterpret_cast<MusaFreeHostFn>(Resolve("musaFreeHost"));
+  host_alloc_ = reinterpret_cast<MusaHostAllocFn>(Resolve("musaHostAlloc"));
+  free_host_ = reinterpret_cast<MusaFreeHostFn>(Resolve("musaFreeHost"));
   memcpy_async_ =
       reinterpret_cast<MusaMemcpyAsyncFn>(Resolve("musaMemcpyAsync"));
   memset_async_ =
       reinterpret_cast<MusaMemsetAsyncFn>(Resolve("musaMemsetAsync"));
-  mem_get_info_ =
-      reinterpret_cast<MusaMemGetInfoFn>(Resolve("musaMemGetInfo"));
+  mem_get_info_ = reinterpret_cast<MusaMemGetInfoFn>(Resolve("musaMemGetInfo"));
   runtime_get_version_ = reinterpret_cast<MusaRuntimeGetVersionFn>(
       Resolve("musaRuntimeGetVersion"));
-  driver_get_version_ = reinterpret_cast<MusaDriverGetVersionFn>(
-      Resolve("musaDriverGetVersion"));
+  driver_get_version_ =
+      reinterpret_cast<MusaDriverGetVersionFn>(Resolve("musaDriverGetVersion"));
   get_error_string_ =
       reinterpret_cast<MusaGetErrorStringFn>(Resolve("musaGetErrorString"));
-  return absl::OkStatus();
+  load_status_ = absl::OkStatus();
+  return *load_status_;
+}
+
+absl::Status MusaRuntime::FailLoad(absl::Status status) {
+  if (handle_ != nullptr) {
+    dlclose(handle_);
+    handle_ = nullptr;
+  }
+  load_status_ = status;
+  return status;
 }
 
 void* MusaRuntime::Resolve(absl::string_view symbol) const {
@@ -166,22 +181,119 @@ absl::StatusOr<int> MusaRuntime::GetDeviceCount() {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
   int count = 0;
-  int result = get_device_count_(&count);
-  if (result != 0) return ToStatus(result, "musaGetDeviceCount", ErrorString(result));
+  musaError_t result = get_device_count_(&count);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaGetDeviceCount", ErrorString(result));
+  }
   return count;
+}
+
+absl::StatusOr<MusaDeviceProperties> MusaRuntime::GetDeviceProperties(
+    int device_ordinal) {
+  absl::MutexLock lock(mu_);
+  RETURN_IF_ERROR(Load());
+
+  musaDeviceProp native = {};
+  musaError_t result = get_device_properties_(&native, device_ordinal);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaGetDeviceProperties", ErrorString(result));
+  }
+
+  MusaDeviceProperties properties;
+  properties.name = native.name;
+  properties.total_memory_bytes = native.totalGlobalMem;
+
+  std::array<char, 32> pci_bus_id = {};
+  result = device_get_pci_bus_id_(
+      pci_bus_id.data(), static_cast<int>(pci_bus_id.size()), device_ordinal);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaDeviceGetPCIBusId", ErrorString(result));
+  }
+  properties.pci_bus_id = pci_bus_id.data();
+
+#define XLA_MUSA_ASSIGN_ATTRIBUTE(field, attribute)                   \
+  ASSIGN_OR_RETURN(                                                   \
+      properties.field,                                               \
+      GetDeviceAttribute(device_ordinal, static_cast<int>(attribute), \
+                         #attribute))
+
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_threads_per_block,
+                            musaDevAttrMaxThreadsPerBlock);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_block_dim_x, musaDevAttrMaxBlockDimX);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_block_dim_y, musaDevAttrMaxBlockDimY);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_block_dim_z, musaDevAttrMaxBlockDimZ);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_grid_dim_x, musaDevAttrMaxGridDimX);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_grid_dim_y, musaDevAttrMaxGridDimY);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_grid_dim_z, musaDevAttrMaxGridDimZ);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_shared_memory_per_block,
+                            musaDevAttrMaxSharedMemoryPerBlock);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_shared_memory_per_multiprocessor,
+                            musaDevAttrMaxSharedMemoryPerMultiprocessor);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_shared_memory_per_block_optin,
+                            musaDevAttrMaxSharedMemoryPerBlockOptin);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(reserved_shared_memory_per_block,
+                            musaDevAttrReservedSharedMemoryPerBlock);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_registers_per_block,
+                            musaDevAttrMaxRegistersPerBlock);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_registers_per_multiprocessor,
+                            musaDevAttrMaxRegistersPerMultiprocessor);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_threads_per_multiprocessor,
+                            musaDevAttrMaxThreadsPerMultiProcessor);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(max_blocks_per_multiprocessor,
+                            musaDevAttrMaxBlocksPerMultiprocessor);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(multiprocessor_count,
+                            musaDevAttrMultiProcessorCount);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(hardware_warp_size, musaDevAttrWarpSize);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(clock_rate_khz, musaDevAttrClockRate);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(memory_clock_rate_khz, musaDevAttrMemoryClockRate);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(memory_bus_width_bits,
+                            musaDevAttrGlobalMemoryBusWidth);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(l2_cache_size_bytes, musaDevAttrL2CacheSize);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(texture_alignment_bytes,
+                            musaDevAttrTextureAlignment);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(texture_pitch_alignment_bytes,
+                            musaDevAttrTexturePitchAlignment);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(total_constant_memory_bytes,
+                            musaDevAttrTotalConstantMemory);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(compute_capability_major,
+                            musaDevAttrComputeCapabilityMajor);
+  XLA_MUSA_ASSIGN_ATTRIBUTE(compute_capability_minor,
+                            musaDevAttrComputeCapabilityMinor);
+  int ecc_enabled = 0;
+  ASSIGN_OR_RETURN(ecc_enabled,
+                   GetDeviceAttribute(device_ordinal,
+                                      static_cast<int>(musaDevAttrEccEnabled),
+                                      "musaDevAttrEccEnabled"));
+  properties.ecc_enabled = ecc_enabled != 0;
+
+#undef XLA_MUSA_ASSIGN_ATTRIBUTE
+
+  return properties;
+}
+
+absl::StatusOr<int> MusaRuntime::GetDeviceAttribute(
+    int device_ordinal, int attribute, absl::string_view name) const {
+  int value = 0;
+  musaError_t result = device_get_attribute_(
+      &value, static_cast<musaDeviceAttr>(attribute), device_ordinal);
+  if (result != musaSuccess) {
+    return ToStatus(result, absl::StrCat("musaDeviceGetAttribute(", name, ")"),
+                    ErrorString(result));
+  }
+  return value;
 }
 
 absl::Status MusaRuntime::SetDevice(int device_ordinal) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = set_device_(device_ordinal);
+  musaError_t result = set_device_(device_ordinal);
   return ToStatus(result, "musaSetDevice", ErrorString(result));
 }
 
 absl::Status MusaRuntime::DeviceSynchronize() {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = device_synchronize_();
+  musaError_t result = device_synchronize_();
   return ToStatus(result, "musaDeviceSynchronize", ErrorString(result));
 }
 
@@ -189,8 +301,10 @@ absl::StatusOr<void*> MusaRuntime::Malloc(uint64_t bytes) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
   void* ptr = nullptr;
-  int result = malloc_(&ptr, static_cast<size_t>(bytes));
-  if (result != 0) return ToStatus(result, "musaMalloc", ErrorString(result));
+  musaError_t result = malloc_(&ptr, static_cast<size_t>(bytes));
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaMalloc", ErrorString(result));
+  }
   return ptr;
 }
 
@@ -198,7 +312,7 @@ absl::Status MusaRuntime::Free(void* ptr) {
   if (ptr == nullptr) return absl::OkStatus();
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = free_(ptr);
+  musaError_t result = free_(ptr);
   return ToStatus(result, "musaFree", ErrorString(result));
 }
 
@@ -209,8 +323,10 @@ absl::StatusOr<void*> MusaRuntime::HostAlloc(uint64_t bytes) {
     return absl::UnimplementedError("musaHostAlloc is not available.");
   }
   void* ptr = nullptr;
-  int result = host_alloc_(&ptr, static_cast<size_t>(bytes), 0);
-  if (result != 0) return ToStatus(result, "musaHostAlloc", ErrorString(result));
+  musaError_t result = host_alloc_(&ptr, static_cast<size_t>(bytes), 0);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaHostAlloc", ErrorString(result));
+  }
   return ptr;
 }
 
@@ -221,7 +337,7 @@ absl::Status MusaRuntime::FreeHost(void* ptr) {
   if (free_host_ == nullptr) {
     return absl::UnimplementedError("musaFreeHost is not available.");
   }
-  int result = free_host_(ptr);
+  musaError_t result = free_host_(ptr);
   return ToStatus(result, "musaFreeHost", ErrorString(result));
 }
 
@@ -229,8 +345,8 @@ absl::Status MusaRuntime::Memcpy(void* dst, const void* src, uint64_t bytes,
                                  MusaMemcpyKind kind) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = memcpy_(dst, src, static_cast<size_t>(bytes),
-                       static_cast<int>(kind));
+  musaError_t result = memcpy_(dst, src, static_cast<size_t>(bytes),
+                               static_cast<::musaMemcpyKind>(kind));
   return ToStatus(result, "musaMemcpy", ErrorString(result));
 }
 
@@ -240,12 +356,13 @@ absl::Status MusaRuntime::MemcpyAsync(void* dst, const void* src,
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
   if (memcpy_async_ == nullptr) {
-    int result = memcpy_(dst, src, static_cast<size_t>(bytes),
-                         static_cast<int>(kind));
+    musaError_t result = memcpy_(dst, src, static_cast<size_t>(bytes),
+                                 static_cast<::musaMemcpyKind>(kind));
     return ToStatus(result, "musaMemcpy", ErrorString(result));
   }
-  int result = memcpy_async_(dst, src, static_cast<size_t>(bytes),
-                             static_cast<int>(kind), stream);
+  musaError_t result = memcpy_async_(dst, src, static_cast<size_t>(bytes),
+                                     static_cast<::musaMemcpyKind>(kind),
+                                     reinterpret_cast<musaStream_t>(stream));
   return ToStatus(result, "musaMemcpyAsync", ErrorString(result));
 }
 
@@ -256,7 +373,8 @@ absl::Status MusaRuntime::MemsetAsync(void* dst, int value, uint64_t bytes,
   if (memset_async_ == nullptr) {
     return absl::UnimplementedError("musaMemsetAsync is not available.");
   }
-  int result = memset_async_(dst, value, static_cast<size_t>(bytes), stream);
+  musaError_t result = memset_async_(dst, value, static_cast<size_t>(bytes),
+                                     reinterpret_cast<musaStream_t>(stream));
   return ToStatus(result, "musaMemsetAsync", ErrorString(result));
 }
 
@@ -268,76 +386,84 @@ absl::Status MusaRuntime::MemGetInfo(size_t* free_bytes,
   if (mem_get_info_ == nullptr) {
     return absl::UnimplementedError("musaMemGetInfo is not available.");
   }
-  int result = mem_get_info_(free_bytes, total_bytes);
+  musaError_t result = mem_get_info_(free_bytes, total_bytes);
   return ToStatus(result, "musaMemGetInfo", ErrorString(result));
 }
 
 absl::StatusOr<void*> MusaRuntime::StreamCreate() {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  void* stream = nullptr;
-  int result = stream_create_(&stream);
-  if (result != 0) return ToStatus(result, "musaStreamCreate", ErrorString(result));
-  return stream;
+  musaStream_t stream = nullptr;
+  musaError_t result = stream_create_(&stream);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaStreamCreate", ErrorString(result));
+  }
+  return reinterpret_cast<void*>(stream);
 }
 
 absl::Status MusaRuntime::StreamDestroy(void* stream) {
   if (stream == nullptr) return absl::OkStatus();
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = stream_destroy_(stream);
+  musaError_t result = stream_destroy_(reinterpret_cast<musaStream_t>(stream));
   return ToStatus(result, "musaStreamDestroy", ErrorString(result));
 }
 
 absl::Status MusaRuntime::StreamSynchronize(void* stream) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = stream_synchronize_(stream);
+  musaError_t result =
+      stream_synchronize_(reinterpret_cast<musaStream_t>(stream));
   return ToStatus(result, "musaStreamSynchronize", ErrorString(result));
 }
 
 absl::Status MusaRuntime::StreamWaitEvent(void* stream, void* event) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = stream_wait_event_(stream, event, 0);
+  musaError_t result =
+      stream_wait_event_(reinterpret_cast<musaStream_t>(stream),
+                         reinterpret_cast<musaEvent_t>(event), 0);
   return ToStatus(result, "musaStreamWaitEvent", ErrorString(result));
 }
 
 absl::StatusOr<void*> MusaRuntime::EventCreate() {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  void* event = nullptr;
-  int result = event_create_(&event);
-  if (result != 0) return ToStatus(result, "musaEventCreate", ErrorString(result));
-  return event;
+  musaEvent_t event = nullptr;
+  musaError_t result = event_create_(&event);
+  if (result != musaSuccess) {
+    return ToStatus(result, "musaEventCreate", ErrorString(result));
+  }
+  return reinterpret_cast<void*>(event);
 }
 
 absl::Status MusaRuntime::EventDestroy(void* event) {
   if (event == nullptr) return absl::OkStatus();
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = event_destroy_(event);
+  musaError_t result = event_destroy_(reinterpret_cast<musaEvent_t>(event));
   return ToStatus(result, "musaEventDestroy", ErrorString(result));
 }
 
 absl::Status MusaRuntime::EventRecord(void* event, void* stream) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = event_record_(event, stream);
+  musaError_t result = event_record_(reinterpret_cast<musaEvent_t>(event),
+                                     reinterpret_cast<musaStream_t>(stream));
   return ToStatus(result, "musaEventRecord", ErrorString(result));
 }
 
 absl::Status MusaRuntime::EventSynchronize(void* event) {
   absl::MutexLock lock(mu_);
   if (auto status = Load(); !status.ok()) return status;
-  int result = event_synchronize_(event);
+  musaError_t result = event_synchronize_(reinterpret_cast<musaEvent_t>(event));
   return ToStatus(result, "musaEventSynchronize", ErrorString(result));
 }
 
 int MusaRuntime::EventQuery(void* event) {
   absl::MutexLock lock(mu_);
   if (!Load().ok()) return -1;
-  return event_query_(event);
+  return event_query_(reinterpret_cast<musaEvent_t>(event));
 }
 
 absl::StatusOr<int> MusaRuntime::RuntimeVersion() {
@@ -347,8 +473,8 @@ absl::StatusOr<int> MusaRuntime::RuntimeVersion() {
     return absl::UnimplementedError("musaRuntimeGetVersion is not available.");
   }
   int version = 0;
-  int result = runtime_get_version_(&version);
-  if (result != 0) {
+  musaError_t result = runtime_get_version_(&version);
+  if (result != musaSuccess) {
     return ToStatus(result, "musaRuntimeGetVersion", ErrorString(result));
   }
   return version;
@@ -361,14 +487,14 @@ absl::StatusOr<int> MusaRuntime::DriverVersion() {
     return absl::UnimplementedError("musaDriverGetVersion is not available.");
   }
   int version = 0;
-  int result = driver_get_version_(&version);
-  if (result != 0) {
+  musaError_t result = driver_get_version_(&version);
+  if (result != musaSuccess) {
     return ToStatus(result, "musaDriverGetVersion", ErrorString(result));
   }
   return version;
 }
 
-const char* MusaRuntime::ErrorString(int result) const {
+const char* MusaRuntime::ErrorString(musaError_t result) const {
   if (get_error_string_ == nullptr) {
     return "";
   }

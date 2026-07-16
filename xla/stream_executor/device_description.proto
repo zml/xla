@@ -27,6 +27,12 @@ message RocmComputeCapabilityProto {
 
 message MusaComputeCapabilityProto {
   string architecture = 1;
+  int32 major = 2;
+  int32 minor = 3;
+  int32 hardware_warp_size = 4;
+  // Zero means that the compiler-visible logical subgroup ABI is not yet
+  // qualified for this target.
+  int32 logical_subgroup_size = 5;
 }
 
 message GpuComputeCapabilityProto {

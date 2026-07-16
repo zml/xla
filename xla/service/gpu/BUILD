@@ -1494,6 +1494,15 @@ cc_library(
     hdrs = ["target_constants.h"],
 )
 
+xla_cc_test(
+    name = "target_constants_test",
+    srcs = ["target_constants_test.cc"],
+    deps = [
+        ":target_constants",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "gpu_transfer_manager",
     srcs = ["gpu_transfer_manager.cc"],

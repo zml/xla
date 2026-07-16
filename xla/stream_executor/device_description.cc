@@ -122,8 +122,17 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
         OneAPIComputeCapability(proto.oneapi_compute_capability());
   }
   if (proto.has_musa_compute_capability()) {
-    device_description.gpu_compute_capability_ =
-        MusaComputeCapability(proto.musa_compute_capability());
+    MusaComputeCapability musa_compute_capability;
+    ASSIGN_OR_RETURN(
+        musa_compute_capability,
+        MusaComputeCapability::FromProto(proto.musa_compute_capability()));
+    if (musa_compute_capability.hardware_warp_size() != 0 &&
+        proto.threads_per_warp() !=
+            musa_compute_capability.hardware_warp_size()) {
+      return absl::InvalidArgumentError(
+          "MUSA hardware warp size does not match threads_per_warp.");
+    }
+    device_description.gpu_compute_capability_ = musa_compute_capability;
   }
   device_description.core_count_ = proto.core_count();
   device_description.fpus_per_core_ = proto.fpus_per_core();
@@ -450,8 +459,10 @@ absl::StatusOr<GpuComputeCapability> GpuComputeCapability::FromProto(
   }
 
   if (proto.has_musa_compute_capability()) {
-    return GpuComputeCapability(
+    ASSIGN_OR_RETURN(
+        MusaComputeCapability musa_compute_capability,
         MusaComputeCapability::FromProto(proto.musa_compute_capability()));
+    return GpuComputeCapability(musa_compute_capability);
   }
 
   return absl::InvalidArgumentError(

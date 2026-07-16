@@ -18,11 +18,14 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "musa_runtime_api.h"
+#include "xla/stream_executor/musa/musa_device_properties.h"
 
 namespace stream_executor::musa {
 
@@ -40,6 +43,7 @@ class MusaRuntime {
   bool IsLoaded();
 
   absl::StatusOr<int> GetDeviceCount();
+  absl::StatusOr<MusaDeviceProperties> GetDeviceProperties(int device_ordinal);
   absl::Status SetDevice(int device_ordinal);
   absl::Status DeviceSynchronize();
 
@@ -72,8 +76,13 @@ class MusaRuntime {
   MusaRuntime() = default;
 
   absl::Status Load() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void* Resolve(absl::string_view symbol) const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  const char* ErrorString(int result) const
+  absl::Status FailLoad(absl::Status status) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void* Resolve(absl::string_view symbol) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  const char* ErrorString(musaError_t result) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::StatusOr<int> GetDeviceAttribute(int device_ordinal, int attribute,
+                                         absl::string_view name) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   template <typename Fn>
@@ -81,34 +90,49 @@ class MusaRuntime {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   mutable absl::Mutex mu_;
-  bool attempted_load_ ABSL_GUARDED_BY(mu_) = false;
+  std::optional<absl::Status> load_status_ ABSL_GUARDED_BY(mu_);
   void* handle_ ABSL_GUARDED_BY(mu_) = nullptr;
 
-  using MusaGetDeviceCountFn = int (*)(int*);
-  using MusaSetDeviceFn = int (*)(int);
-  using MusaDeviceSynchronizeFn = int (*)();
-  using MusaMallocFn = int (*)(void**, size_t);
-  using MusaFreeFn = int (*)(void*);
-  using MusaHostAllocFn = int (*)(void**, size_t, unsigned int);
-  using MusaFreeHostFn = int (*)(void*);
-  using MusaMemcpyFn = int (*)(void*, const void*, size_t, int);
-  using MusaMemcpyAsyncFn = int (*)(void*, const void*, size_t, int, void*);
-  using MusaMemsetAsyncFn = int (*)(void*, int, size_t, void*);
-  using MusaMemGetInfoFn = int (*)(size_t*, size_t*);
-  using MusaStreamCreateFn = int (*)(void**);
-  using MusaStreamDestroyFn = int (*)(void*);
-  using MusaStreamSynchronizeFn = int (*)(void*);
-  using MusaStreamWaitEventFn = int (*)(void*, void*, unsigned int);
-  using MusaEventCreateFn = int (*)(void**);
-  using MusaEventDestroyFn = int (*)(void*);
-  using MusaEventRecordFn = int (*)(void*, void*);
-  using MusaEventSynchronizeFn = int (*)(void*);
-  using MusaEventQueryFn = int (*)(void*);
-  using MusaRuntimeGetVersionFn = int (*)(int*);
-  using MusaDriverGetVersionFn = int (*)(int*);
-  using MusaGetErrorStringFn = const char* (*)(int);
+  using MusaGetDeviceCountFn = musaError_t(MUSARTAPI*)(int*);
+  using MusaGetDevicePropertiesFn = musaError_t(MUSARTAPI*)(musaDeviceProp*,
+                                                            int);
+  using MusaDeviceGetAttributeFn = musaError_t(MUSARTAPI*)(int*, musaDeviceAttr,
+                                                           int);
+  using MusaDeviceGetPciBusIdFn = musaError_t(MUSARTAPI*)(char*, int, int);
+  using MusaSetDeviceFn = musaError_t(MUSARTAPI*)(int);
+  using MusaDeviceSynchronizeFn = musaError_t(MUSARTAPI*)();
+  using MusaMallocFn = musaError_t(MUSARTAPI*)(void**, size_t);
+  using MusaFreeFn = musaError_t(MUSARTAPI*)(void*);
+  using MusaHostAllocFn = musaError_t(MUSARTAPI*)(void**, size_t, unsigned int);
+  using MusaFreeHostFn = musaError_t(MUSARTAPI*)(void*);
+  using MusaMemcpyFn = musaError_t(MUSARTAPI*)(void*, const void*, size_t,
+                                               ::musaMemcpyKind);
+  using MusaMemcpyAsyncFn = musaError_t(MUSARTAPI*)(void*, const void*, size_t,
+                                                    ::musaMemcpyKind,
+                                                    musaStream_t);
+  using MusaMemsetAsyncFn = musaError_t(MUSARTAPI*)(void*, int, size_t,
+                                                    musaStream_t);
+  using MusaMemGetInfoFn = musaError_t(MUSARTAPI*)(size_t*, size_t*);
+  using MusaStreamCreateFn = musaError_t(MUSARTAPI*)(musaStream_t*);
+  using MusaStreamDestroyFn = musaError_t(MUSARTAPI*)(musaStream_t);
+  using MusaStreamSynchronizeFn = musaError_t(MUSARTAPI*)(musaStream_t);
+  using MusaStreamWaitEventFn = musaError_t(MUSARTAPI*)(musaStream_t,
+                                                        musaEvent_t,
+                                                        unsigned int);
+  using MusaEventCreateFn = musaError_t(MUSARTAPI*)(musaEvent_t*);
+  using MusaEventDestroyFn = musaError_t(MUSARTAPI*)(musaEvent_t);
+  using MusaEventRecordFn = musaError_t(MUSARTAPI*)(musaEvent_t, musaStream_t);
+  using MusaEventSynchronizeFn = musaError_t(MUSARTAPI*)(musaEvent_t);
+  using MusaEventQueryFn = musaError_t(MUSARTAPI*)(musaEvent_t);
+  using MusaRuntimeGetVersionFn = musaError_t(MUSARTAPI*)(int*);
+  using MusaDriverGetVersionFn = musaError_t(MUSARTAPI*)(int*);
+  using MusaGetErrorStringFn = const char*(MUSARTAPI*)(musaError_t);
 
   MusaGetDeviceCountFn get_device_count_ ABSL_GUARDED_BY(mu_) = nullptr;
+  MusaGetDevicePropertiesFn get_device_properties_ ABSL_GUARDED_BY(mu_) =
+      nullptr;
+  MusaDeviceGetAttributeFn device_get_attribute_ ABSL_GUARDED_BY(mu_) = nullptr;
+  MusaDeviceGetPciBusIdFn device_get_pci_bus_id_ ABSL_GUARDED_BY(mu_) = nullptr;
   MusaSetDeviceFn set_device_ ABSL_GUARDED_BY(mu_) = nullptr;
   MusaDeviceSynchronizeFn device_synchronize_ ABSL_GUARDED_BY(mu_) = nullptr;
   MusaMallocFn malloc_ ABSL_GUARDED_BY(mu_) = nullptr;

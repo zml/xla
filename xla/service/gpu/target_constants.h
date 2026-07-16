@@ -72,12 +72,21 @@ inline const char* DataLayout() {
 namespace musa {
 
 inline const char* TargetTriple() {
-  static constexpr char kTargetTriple[] = "musa";
+  static constexpr char kTargetTriple[] = "mtgpu-mt-musa";
   return kTargetTriple;
 }
 
+inline const char* TargetCpu() {
+  static constexpr char kTargetCpu[] = "mp_21";
+  return kTargetCpu;
+}
+
 inline const char* DataLayout() {
-  static constexpr char kDataLayout[] = "e-p:64:64-i64:64-n32:64";
+  // Measured from the MUSA 4.0.1 LLVM 14 MTGPU target for an S80 (mp_21).
+  // This is a target ABI contract, not a fallback for other MUSA devices.
+  static constexpr char kDataLayout[] =
+      "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-"
+      "p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128";
   return kDataLayout;
 }
 

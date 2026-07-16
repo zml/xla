@@ -15,20 +15,21 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
-#include <cstdlib>
+#include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <variant>
-#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_split.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
@@ -38,36 +39,48 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_device_description.h"
+#include "xla/stream_executor/musa/musa_device_properties.h"
 #include "xla/stream_executor/musa/musa_event.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_stream.h"
+#include "xla/stream_executor/musa/musa_version_parser.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream.h"
-#include "xla/tsl/platform/status_macros.h"
+
+#ifndef XLA_MUSA_TOOLKIT_VERSION
+#define XLA_MUSA_TOOLKIT_VERSION 0
+#endif
 
 namespace stream_executor::musa {
 namespace {
 
-std::string DefaultArchitecture() {
-  const char* archs = std::getenv("MUSA_GPU_ARCHS");
-  if (archs == nullptr || archs[0] == '\0') {
-    return "unknown";
+std::optional<SemanticVersion> GetKernelModeDriverVersion() {
+  std::FILE* file = std::fopen("/proc/driver/musa/version", "r");
+  if (file == nullptr) {
+    LOG(WARNING) << "Could not open /proc/driver/musa/version";
+    return std::nullopt;
   }
-  std::vector<std::string> split = absl::StrSplit(archs, ',');
-  return split.empty() || split[0].empty() ? "unknown" : split[0];
+  std::array<char, 256> contents = {};
+  const char* read_result = std::fgets(contents.data(), contents.size(), file);
+  std::fclose(file);
+  if (read_result == nullptr) {
+    LOG(WARNING) << "Could not read /proc/driver/musa/version";
+    return std::nullopt;
+  }
+  auto version = ParseMusaKernelDriverVersion(contents.data());
+  if (!version.ok()) {
+    LOG(WARNING) << "Could not parse MUSA kernel driver version: "
+                 << version.status();
+    return std::nullopt;
+  }
+  return *version;
 }
 
-SemanticVersion VersionFromRuntimeInt(int version) {
-  if (version <= 0) {
-    return SemanticVersion{0, 0, 0};
-  }
-  return SemanticVersion{static_cast<unsigned>(version / 1000),
-                         static_cast<unsigned>((version % 1000) / 10),
-                         static_cast<unsigned>(version % 10)};
+void* MallocHost(uint64_t size) {
+  return std::malloc(static_cast<size_t>(size));
 }
-
-void* MallocHost(uint64_t size) { return std::malloc(static_cast<size_t>(size)); }
 
 void FreeHost(void* ptr, uint64_t) { std::free(ptr); }
 
@@ -123,9 +136,8 @@ MusaExecutor::HostMemoryAllocate(uint64_t size) {
   auto ptr = MusaRuntime::Get()->HostAlloc(size);
   if (ptr.ok()) {
     return std::make_unique<GenericMemoryAllocation>(
-        *ptr, size, [](void* p, uint64_t) {
-          (void)MusaRuntime::Get()->FreeHost(p);
-        });
+        *ptr, size,
+        [](void* p, uint64_t) { (void)MusaRuntime::Get()->FreeHost(p); });
   }
   void* host_ptr = MallocHost(size);
   if (host_ptr == nullptr) {
@@ -150,8 +162,8 @@ MusaExecutor::CreateMemoryAllocator(MemorySpace memory_space) {
                 ptr, size, [](void* location, uint64_t) {
                   absl::Status status = MusaRuntime::Get()->Free(location);
                   if (!status.ok()) {
-                    LOG(ERROR) << "Failed to free MUSA device memory: "
-                               << status;
+                    LOG(ERROR)
+                        << "Failed to free MUSA device memory: " << status;
                   }
                 });
           });
@@ -195,8 +207,7 @@ bool MusaExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {
   return false;
 }
 
-bool MusaExecutor::DeviceMemoryUsage(int64_t* free,
-                                     int64_t* total) const {
+bool MusaExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
   size_t free_bytes = 0;
   size_t total_bytes = 0;
   absl::Status status =
@@ -217,40 +228,21 @@ MusaExecutor::CreateDeviceDescription() const {
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 MusaExecutor::CreateDeviceDescription(int device_ordinal) {
   TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal));
-  auto desc = std::make_unique<DeviceDescription>();
-  desc->set_device_vendor("Moore Threads");
-  desc->set_name("MUSA device");
-  desc->set_model_str("MUSA device");
-  desc->set_platform_version("MUSA");
-  desc->set_musa_compute_capability(DefaultArchitecture());
-  desc->set_thread_dim_limit(ThreadDim(1024, 1024, 64));
-  desc->set_block_dim_limit(BlockDim(2147483647, 65535, 65535));
-  desc->set_threads_per_block_limit(1024);
-  desc->set_threads_per_core_limit(2048);
-  desc->set_threads_per_warp(32);
-  desc->set_registers_per_core_limit(65536);
-  desc->set_registers_per_block_limit(65536);
-  desc->set_device_address_bits(64);
-  desc->set_core_count(1);
-  desc->set_fpus_per_core(1);
-  desc->set_shared_memory_per_core(64 * 1024);
-  desc->set_shared_memory_per_block(48 * 1024);
-  desc->set_shared_memory_per_block_optin(64 * 1024);
+  TF_ASSIGN_OR_RETURN(MusaDeviceProperties properties,
+                      MusaRuntime::Get()->GetDeviceProperties(device_ordinal));
+  TF_ASSIGN_OR_RETURN(int runtime_version,
+                      MusaRuntime::Get()->RuntimeVersion());
+  TF_ASSIGN_OR_RETURN(int driver_version, MusaRuntime::Get()->DriverVersion());
 
-  size_t free_bytes = 0;
-  size_t total_bytes = 0;
-  if (MusaRuntime::Get()->MemGetInfo(&free_bytes, &total_bytes).ok()) {
-    desc->set_device_memory_size(static_cast<int64_t>(total_bytes));
-  }
-  if (auto runtime_version = MusaRuntime::Get()->RuntimeVersion();
-      runtime_version.ok()) {
-    desc->set_runtime_version(VersionFromRuntimeInt(*runtime_version));
-  }
-  if (auto driver_version = MusaRuntime::Get()->DriverVersion();
-      driver_version.ok()) {
-    desc->set_driver_version(VersionFromRuntimeInt(*driver_version));
-  }
-  return desc;
+  MusaDeviceVersions versions{
+      .runtime_api = runtime_version,
+      .driver_api = driver_version,
+      .compile_time_toolkit = XLA_MUSA_TOOLKIT_VERSION,
+      .kernel_mode_driver = GetKernelModeDriverVersion(),
+  };
+  TF_ASSIGN_OR_RETURN(DeviceDescription description,
+                      BuildMusaDeviceDescription(properties, versions));
+  return std::make_unique<DeviceDescription>(std::move(description));
 }
 
 absl::StatusOr<std::shared_ptr<DeviceAddressBase>>

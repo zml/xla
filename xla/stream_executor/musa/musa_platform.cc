@@ -22,33 +22,21 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/abi/runtime_abi_version.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/musa/musa_executor.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_runtime_abi_version.h"
+#include "xla/stream_executor/musa/musa_version_parser.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "xla/tsl/platform/status_macros.h"
 
 namespace stream_executor::musa {
-namespace {
-
-SemanticVersion VersionFromRuntimeInt(int version) {
-  if (version <= 0) {
-    return SemanticVersion{0, 0, 0};
-  }
-  return SemanticVersion{static_cast<unsigned>(version / 1000),
-                         static_cast<unsigned>((version % 1000) / 10),
-                         static_cast<unsigned>(version % 10)};
-}
-
-}  // namespace
-
 MusaPlatform::MusaPlatform() : name_(kMusaPlatformId->ToName()) {}
 
 Platform::Id MusaPlatform::id() const { return kMusaPlatformId; }
@@ -82,7 +70,13 @@ absl::StatusOr<std::unique_ptr<RuntimeAbiVersion>>
 MusaPlatform::GetRuntimeAbiVersion() const {
   SemanticVersion runtime_version{0, 0, 0};
   if (auto version = MusaRuntime::Get()->RuntimeVersion(); version.ok()) {
-    runtime_version = VersionFromRuntimeInt(*version);
+    auto parsed = ParseMusaVersion(*version);
+    if (parsed.ok()) {
+      runtime_version = *parsed;
+    } else {
+      LOG(ERROR) << "Failed to decode MUSA runtime version " << *version << ": "
+                 << parsed.status();
+    }
   }
   return std::make_unique<MusaRuntimeAbiVersion>(runtime_version);
 }
