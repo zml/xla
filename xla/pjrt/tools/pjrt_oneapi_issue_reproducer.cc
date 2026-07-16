@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
+#include "xla/pjrt/tools/pjrt_oneapi_issue_profiler.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
@@ -73,6 +74,7 @@ double ExecuteAndWait(PjRtLoadedExecutable& executable, PjRtBuffer& input,
 
 int main() {
   using namespace xla;
+  auto profiler = IssueProfiler::CreateFromEnvironment();
 
   GpuClientOptions client_options;
   client_options.allowed_devices = {0};

@@ -67,7 +67,7 @@ IntelGpuCompiler::CompileTargetBinary(
     std::optional<int> shard_number) {
   tsl::profiler::TraceMe spirv_trace([&] {
     return tsl::profiler::TraceMeEncode(
-        "XLA::CompileToSPIRV",
+        "SPIRV-GENERATION",
         {{"llvm_module", llvm_module->getName().str()},
          {"shard", shard_number.value_or(-1)}});
   });

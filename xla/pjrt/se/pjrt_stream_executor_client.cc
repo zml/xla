@@ -2300,6 +2300,7 @@ PjRtStreamExecutorClient::CompileInternal(
     const std::vector<const Shape*>& argument_layout_pointers,
     LayoutCanonicalizationCallback layout_canonicalization_callback,
     CompileOptions options, bool lookup_addressable_devices) {
+  tsl::profiler::TraceMe pjrt_hlo_trace("PJRT HLO");
   tsl::profiler::TraceMe traceme("PjRtStreamExecutorClient::CompileInternal");
   VLOG(1) << "PjRtStreamExecutorClient::CompileInternal";
   if (key_value_store().has_value() &&

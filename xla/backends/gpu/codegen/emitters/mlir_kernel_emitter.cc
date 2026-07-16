@@ -132,6 +132,7 @@ limitations under the License.
 #include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tsl/profiler/lib/traceme.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
@@ -657,6 +658,7 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
     const se::DeviceDescription& device, const HloModule& hlo_module,
     const std::string& entry_function_name, int unroll_factor,
     mlir::MLIRContext& mlir_context, MlirKernelSource source) {
+  tsl::profiler::TraceMe llvm_generation_trace("LLVM GENERATION");
   auto llvm_context = std::make_unique<llvm::LLVMContext>();
 
   mlir::OwningOpRef<mlir::ModuleOp> module = std::move(source).TakeModule();
