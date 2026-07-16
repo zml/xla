@@ -153,6 +153,10 @@ class GpuCollectives : public Collectives {
   // Returns true if GPU collectives are implemented.
   virtual bool IsImplemented() const = 0;
 
+  // Returns true if communicators created by this implementation can be split
+  // into sub-communicators.
+  virtual bool SupportsCommunicatorSplitting() const { return true; }
+
   // Executes a group of collective launches. All communicators used by the
   // `group` must be listed in `comms`, otherwise behavior is undefined.
   virtual absl::Status GroupLaunch(

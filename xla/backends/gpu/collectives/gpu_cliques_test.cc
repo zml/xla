@@ -62,6 +62,11 @@ static constexpr GlobalDeviceId kD7(7);
 
 using DeviceGroups = std::vector<std::vector<GlobalDeviceId>>;
 
+class NonSplittingLoopbackCollectives : public LoopbackCollectives {
+ public:
+  bool SupportsCommunicatorSplitting() const final { return false; }
+};
+
 static GpuCollectives::CliqueIdCallback DefaultCliqueId() {
   return [&](const CliqueKey&) -> absl::StatusOr<CliqueIds> {
     GpuCollectives* collectives = GpuCollectives::Default("GPU");
@@ -246,6 +251,51 @@ TEST(GpuCliquesTest, SplitCliques) {
     ASSERT_OK_AND_ASSIGN(auto cliques1, WaitCliques(std::move(futures0)));
     ASSERT_OK_AND_ASSIGN(auto cliques2, WaitCliques(std::move(futures1)));
   }
+}
+
+TEST(GpuCliquesTest, DoesNotSplitWhenCollectivesDoNotSupportSplitting) {
+  auto cleanup = absl::MakeCleanup([] { internal::DestroyAcquiredCliques(); });
+
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       PlatformUtil::GetPlatform("gpu"));
+
+  if (platform->VisibleDeviceCount() < 2) {
+    GTEST_SKIP() << "Test requires at least 2 GPUs";
+  }
+
+  tsl::thread::ThreadPool pool(tsl::Env::Default(), "collectives", 2);
+  tsl::Executor& exec = *pool.AsExecutor();
+  NonSplittingLoopbackCollectives collectives;
+
+  GpuCliqueKey parent_key({kD0, kD1}, 2);
+  GpuCliqueKey child_key({kD1, kD0}, 2);
+  DeviceGroups parent_group = {{kD0, kD1}};
+  DeviceGroups child_group = {{kD1, kD0}};
+
+  ASSERT_OK_AND_ASSIGN(std::vector<se::StreamExecutor*> executors,
+                       CreateExecutors(platform, 2));
+  std::vector<AcquiredCliquesMap> acquired_cliques(2);
+
+  auto parent_futures =
+      AcquireCliquesWithCollectives(&collectives, exec, executors, parent_key,
+                                    parent_group, acquired_cliques);
+  ASSERT_OK_AND_ASSIGN(auto parent_cliques,
+                       WaitCliques(std::move(parent_futures)));
+  for (size_t i = 0; i < 2; ++i) {
+    acquired_cliques[i].emplace(parent_key, parent_cliques[i]);
+  }
+
+  std::vector<se::StreamExecutor*> child_executors = {executors[1],
+                                                      executors[0]};
+  std::vector<AcquiredCliquesMap> child_acquired_cliques = {
+      acquired_cliques[1], acquired_cliques[0]};
+  auto child_futures = AcquireCliquesWithCollectives(
+      &collectives, exec, child_executors, child_key, child_group,
+      child_acquired_cliques);
+  ASSERT_OK_AND_ASSIGN(auto child_cliques,
+                       WaitCliques(std::move(child_futures)));
+
+  EXPECT_EQ((*child_cliques.front())->parent(), nullptr);
 }
 
 TEST(GpuCliquesTest, SplitCliquesKeepsReorderedRanksOnCorrectExecutors) {

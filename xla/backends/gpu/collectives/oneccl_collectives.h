@@ -41,6 +41,11 @@ class OnecclCollectives : public GpuCollectives {
  public:
   bool IsImplemented() const final { return true; }
 
+  // oneCCL communicators are currently created with create_communicatorExt,
+  // which does not initialize the ATL communicator required by
+  // ccl::communicator::split.
+  bool SupportsCommunicatorSplitting() const final { return false; }
+
   absl::StatusOr<CliqueId> CreateUniqueCliqueId() const final;
 
   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>

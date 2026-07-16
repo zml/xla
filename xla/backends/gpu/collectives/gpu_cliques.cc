@@ -832,7 +832,7 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   });
 
   // Maybe find if we acquired a clique with communicators that we can split.
-  static const int64_t enable_nccl_comm_splitting =
+  static const bool enable_nccl_comm_splitting =
       GetDebugOptionsFromFlags().xla_gpu_enable_nccl_comm_splitting();
 
   // To be able to split from existing clique, clique key must be a subset of
@@ -841,7 +841,8 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   // doesn't support partial splitting.
   std::optional<GpuCliqueKey> split_from_key = std::nullopt;
   std::shared_ptr<LockableGpuClique::Lock> split_from = nullptr;
-  if (enable_nccl_comm_splitting) {
+  if (enable_nccl_comm_splitting &&
+      collectives->SupportsCommunicatorSplitting()) {
     for (auto& [acquired_clique_key, acquired_clique] : acquired_cliques) {
       if (clique_key.IsSubsetOf(acquired_clique_key) &&
           acquired_clique_key.devices() == FlattenDeviceGroups(device_groups)) {
