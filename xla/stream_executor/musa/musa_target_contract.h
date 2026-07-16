@@ -29,8 +29,17 @@ inline constexpr int kS80HardwareWarpSize = 128;
 inline constexpr int kS80CompilerLogicalSubgroupSize = 32;
 inline constexpr int kQualifiedMusaToolkitVersion = 40001;  // 4.0.1
 
-// Measured MUBIN/kernel ABI facts. The textual compiler bridge ABI is separate
-// and intentionally deferred to C05.
+// Compiler identities shared by the current-LLVM interchange validator and
+// the isolated vendor-LLVM bridge. The data layout is installed before any
+// pointer-size or alignment-sensitive transformation.
+inline constexpr char kMusaTargetTriple[] = "mtgpu-mt-musa";
+inline constexpr char kS80TargetArchitecture[] = "mp_21";
+inline constexpr char kMusaTargetDataLayout[] =
+    "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-p4:"
+    "32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128";
+
+// Measured MUBIN/kernel ABI facts. The versioned textual compiler boundary is
+// defined separately in xla/service/gpu/musa/musa_shim_abi.h.
 inline constexpr int kMusaKernelCallingConvention = 102;
 inline constexpr int kMubinElfMachine = 253;
 

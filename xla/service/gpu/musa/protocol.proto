@@ -1,0 +1,168 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+package xla.gpu.musa;
+
+option cc_enable_arenas = true;
+
+// The protocol deliberately contains no path, environment, working-directory,
+// arbitrary-argument, or output-name field. The host sends one closed compile
+// request and receives one in-memory MUBIN or a structured failure.
+
+enum MusaBridgePointerModel {
+  MUSA_BRIDGE_POINTER_MODEL_UNSPECIFIED = 0;
+  MUSA_BRIDGE_POINTER_MODEL_OPAQUE = 1;
+}
+
+enum MusaBridgeByteOrder {
+  MUSA_BRIDGE_BYTE_ORDER_UNSPECIFIED = 0;
+  MUSA_BRIDGE_BYTE_ORDER_LITTLE_ENDIAN = 1;
+}
+
+enum MusaBridgeGlobalKind {
+  MUSA_BRIDGE_GLOBAL_KIND_UNSPECIFIED = 0;
+  MUSA_BRIDGE_GLOBAL_KIND_MUTABLE = 1;
+  MUSA_BRIDGE_GLOBAL_KIND_CONSTANT = 2;
+}
+
+enum MusaBridgeStatus {
+  MUSA_BRIDGE_STATUS_UNSPECIFIED = 0;
+  MUSA_BRIDGE_STATUS_OK = 1;
+  MUSA_BRIDGE_STATUS_REJECTED = 2;
+  MUSA_BRIDGE_STATUS_COMPILATION_ERROR = 3;
+  MUSA_BRIDGE_STATUS_INTERNAL_ERROR = 4;
+}
+
+enum MusaBridgeDiagnosticSeverity {
+  MUSA_BRIDGE_DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  MUSA_BRIDGE_DIAGNOSTIC_SEVERITY_NOTE = 1;
+  MUSA_BRIDGE_DIAGNOSTIC_SEVERITY_WARNING = 2;
+  MUSA_BRIDGE_DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+message MusaBridgeNumericalFlags {
+  bool fast_math = 1;
+  bool flush_denormals_to_zero = 2;
+  bool finite_math_only = 3;
+  bool unsafe_math_optimizations = 4;
+  bool no_signed_zeros = 5;
+  bool allow_fp_contract = 6;
+}
+
+message MusaBridgeExportedGlobal {
+  string name = 1;
+  MusaBridgeGlobalKind kind = 2;
+  uint32 address_space = 3;
+  uint64 size_bytes = 4;
+  uint32 alignment_bytes = 5;
+}
+
+message MusaBridgeCompileRequest {
+  // These versions are independent. Any semantic change to one boundary must
+  // bump its corresponding value.
+  uint32 protocol_version = 1;
+  uint32 shim_abi_version = 2;
+  uint32 mapping_version = 3;
+
+  string module_name = 4;
+  string normalized_llvm = 5;
+  uint64 normalized_llvm_bytes = 6;
+  // Lower-case, unprefixed SHA-256 hex of normalized_llvm.
+  string normalized_llvm_sha256 = 7;
+
+  // Sorted, unique LLVM symbol names without a leading '@'. Every kernel and
+  // exported global must also occur in exported_symbol_names.
+  repeated string kernel_entry_names = 8;
+  repeated string exported_symbol_names = 9;
+  repeated MusaBridgeExportedGlobal exported_globals = 10;
+
+  string target_triple = 11;
+  string architecture = 12;
+  // Sorted, unique feature tokens. Protocol version 1 defines no feature
+  // overrides, so this list must currently be empty.
+  repeated string target_features = 13;
+  string data_layout = 14;
+  MusaBridgePointerModel pointer_model = 15;
+  uint32 pointer_width_bits = 16;
+  MusaBridgeByteOrder byte_order = 17;
+
+  MusaBridgeNumericalFlags numerical_flags = 18;
+  uint32 optimization_level = 19;
+  bool emit_debug_information = 20;
+  bool deterministic = 21;
+
+  string xla_revision = 22;
+  string current_llvm_revision = 23;
+  string provider_name = 24;
+  // Lower-case, unprefixed SHA-256 fingerprints of immutable artifacts or
+  // canonical manifests selected by the host.
+  string provider_fingerprint = 25;
+  string bridge_fingerprint = 26;
+  string toolchain_fingerprint = 27;
+  // Exact digest of the canonical shim/address-space mapping table.
+  string mapping_fingerprint = 28;
+}
+
+message MusaBridgeDiagnostic {
+  MusaBridgeDiagnosticSeverity severity = 1;
+  // Stable machine-readable token, for example "unknown-shim".
+  string code = 2;
+  string message = 3;
+  // A bridge component/pass token, never a filesystem path.
+  string component = 4;
+  // Both are zero when no normalized-LLVM location is available.
+  uint32 line = 5;
+  uint32 column = 6;
+  // Optional LLVM symbol name without a leading '@'.
+  string symbol_name = 7;
+}
+
+message MusaBridgeCompileStats {
+  uint64 input_llvm_bytes = 1;
+  uint64 output_mubin_bytes = 2;
+  uint32 kernel_count = 3;
+  uint32 exported_symbol_count = 4;
+  uint32 diagnostic_count = 5;
+  uint64 bridge_wall_time_microseconds = 6;
+  uint64 peak_memory_bytes = 7;
+}
+
+message MusaBridgeCompileResponse {
+  uint32 protocol_version = 1;
+  uint32 shim_abi_version = 2;
+  uint32 mapping_version = 3;
+  MusaBridgeStatus status = 4;
+
+  // Lower-case, unprefixed SHA-256 of the complete canonical request wire
+  // (including its magic line), binding this response to exactly one request.
+  string request_sha256 = 5;
+  string provider_name = 6;
+  string provider_fingerprint = 7;
+  // Actual fingerprints reported by the bridge, checked against the pinned
+  // values in the request before the response can be used.
+  string bridge_fingerprint = 8;
+  string toolchain_fingerprint = 9;
+
+  repeated MusaBridgeDiagnostic diagnostics = 10;
+  MusaBridgeCompileStats stats = 11;
+
+  // Present only when status is OK. MUBIN is an explicit binary kind and is
+  // never described as CUDA CUBIN.
+  bytes mubin = 12;
+  string mubin_sha256 = 13;
+  string mapping_fingerprint = 14;
+}

@@ -1,0 +1,64 @@
+// Copyright 2026 The OpenXLA Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This is the single source of truth for shim calls that may cross from the
+// current XLA LLVM process into the isolated vendor-LLVM bridge. Define
+// MUSA_SHIM before including this file. Keep rows sorted by XLA symbol.
+//
+// MUSA_SHIM(id, xla_symbol, vendor_intrinsic, signature, memory_effects,
+//           required_attributes, convergent, minimum_mapping_version)
+
+MUSA_SHIM(kClock32, "__xla_musa_v1_clock32", "llvm.musa.read.ptx.sreg.clock",
+          kI32Void, kInaccessibleReadWrite, kNoUnwind, false, 1)
+MUSA_SHIM(kClock64, "__xla_musa_v1_clock64",
+          "llvm.musa.read.ptx.sreg.clock64", kI64Void, kInaccessibleReadWrite,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kBlockIdX, "__xla_musa_v1_read_ctaid_x",
+          "llvm.musa.read.ptx.sreg.ctaid.x", kI32Void, kNone,
+          kNoUnwind, true, 1)
+MUSA_SHIM(kBlockIdY, "__xla_musa_v1_read_ctaid_y",
+          "llvm.musa.read.ptx.sreg.ctaid.y", kI32Void, kNone,
+          kNoUnwind, true, 1)
+MUSA_SHIM(kBlockIdZ, "__xla_musa_v1_read_ctaid_z",
+          "llvm.musa.read.ptx.sreg.ctaid.z", kI32Void, kNone,
+          kNoUnwind, true, 1)
+MUSA_SHIM(kGridDimX, "__xla_musa_v1_read_nctaid_x",
+          "llvm.musa.read.ptx.sreg.nctaid.x", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kGridDimY, "__xla_musa_v1_read_nctaid_y",
+          "llvm.musa.read.ptx.sreg.nctaid.y", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kGridDimZ, "__xla_musa_v1_read_nctaid_z",
+          "llvm.musa.read.ptx.sreg.nctaid.z", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kBlockDimX, "__xla_musa_v1_read_ntid_x",
+          "llvm.musa.read.ptx.sreg.ntid.x", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kBlockDimY, "__xla_musa_v1_read_ntid_y",
+          "llvm.musa.read.ptx.sreg.ntid.y", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kBlockDimZ, "__xla_musa_v1_read_ntid_z",
+          "llvm.musa.read.ptx.sreg.ntid.z", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kThreadIdX, "__xla_musa_v1_read_tid_x",
+          "llvm.musa.read.ptx.sreg.tid.x", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kThreadIdY, "__xla_musa_v1_read_tid_y",
+          "llvm.musa.read.ptx.sreg.tid.y", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kThreadIdZ, "__xla_musa_v1_read_tid_z",
+          "llvm.musa.read.ptx.sreg.tid.z", kI32Void, kNone,
+          kNoUnwind, false, 1)
+MUSA_SHIM(kWorkgroupBarrier, "__xla_musa_v1_workgroup_barrier",
+          "llvm.musa.barrier0", kVoidVoid, kReadWrite, kNoUnwind, true, 1)

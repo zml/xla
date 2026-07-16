@@ -11,7 +11,7 @@ contract and qualification tests; these values are not fallback defaults.
 | --- | --- |
 | LLVM target triple | `mtgpu-mt-musa` |
 | Target CPU | `mp_21` |
-| Pointer model | 64-bit generic, global, and constant pointers; 32-bit local (address space 3) and private (address space 4) pointers |
+| Pointer model | 64-bit generic (AS0), global (AS1), constant (AS2), and private/local/scratch (AS5) pointers; 32-bit workgroup/shared pointers (AS3); reserved AS4 is forbidden |
 | Data layout | `e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128` |
 | Vendor kernel calling convention | LLVM calling convention 102 |
 | Device binary | ELF64 little-endian shared object (`ET_DYN`), called MUBIN |
@@ -21,7 +21,10 @@ contract and qualification tests; these values are not fallback defaults.
 MUBIN is a first-class MUSA binary kind. It must not be labelled or serialized
 as CUDA CUBIN. Calling convention 102 and vendor intrinsics are installed only
 inside the isolated vendor-LLVM process planned by C06; they must not cross the
-current-XLA LLVM boundary.
+current-XLA LLVM boundary. The C05 boundary is frozen in the
+[MUSA shim ABI](../../service/gpu/musa/MUSA_SHIM_ABI.md): symbol-versioned
+ordinary calls, a mapping fingerprint, and a bounded canonical textual
+protocol.
 
 ## Device and launch contract
 
@@ -79,7 +82,6 @@ shared GPU compiler.
 
 This file does not define:
 
-- the versioned XLA-to-vendor shim or textual bridge protocol (C05);
 - vendor-LLVM translation and MUBIN production (C06);
 - module, function, global, or launch ownership (C02-C04);
 - executable serialization compatibility (C14);
