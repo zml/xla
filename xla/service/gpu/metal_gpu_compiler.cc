@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_sort_thunk.h"
 #include "xla/backends/gpu/runtime/metal_topk_thunk.h"
+#include "xla/backends/gpu/transforms/metal_workspace_rewriter.h"
 #include "xla/comparison_util.h"
 #include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/shape_util.h"
@@ -965,6 +966,27 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   // TopK).
   PrewarmMetalPipelines(optimized.get(), stream_exec);
   return optimized;
+}
+
+absl::Status MetalGpuCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+    CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats, mlir_context));
+  // ScaledDotRewriter and layout assignment have produced the final Metal
+  // custom-call shapes. Wrap every NVFP4/MoE call that needs scratch in the
+  // uniform (result, s8[workspace]) internal ABI before fusion and
+  // pre-scheduling copy insertion. GTE(0) preserves the frontend-visible
+  // result shape.
+  const se::MetalComputeCapability metal_arch =
+      gpu_target_config.device_description.metal_compute_capability();
+  return MetalWorkspaceRewriter(metal_arch.architecture_size(),
+                                metal_arch.architecture_gen())
+      .Run(hlo_module)
+      .status();
 }
 
 absl::Status MetalGpuCompiler::OptimizeHloConvolutionCanonicalization(

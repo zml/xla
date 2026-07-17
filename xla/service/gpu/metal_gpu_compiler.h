@@ -61,6 +61,18 @@ class MetalGpuCompiler : public GpuCompiler {
       std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
       const CompileOptions& options) override;
 
+  // After scaled-dot lowering and layout assignment, make active prefix counts
+  // and mutable Metal custom-call workspaces explicit before fusion and
+  // mandatory copy insertion. This keeps BufferAssignment responsible for
+  // both dependency and scratch lifetime.
+  absl::Status OptimizeHloPostLayoutAssignment(
+      HloModule* hlo_module, se::StreamExecutor* stream_exec,
+      const CompileOptions& options,
+      const GpuTargetConfig& gpu_target_config,
+      const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+      CompilationStats* compilation_stats,
+      mlir::MLIRContext* mlir_context) override;
+
   // No cuDNN/MIOpen convolution rewriting on Metal.
   absl::Status OptimizeHloConvolutionCanonicalization(
       HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
@@ -106,10 +118,11 @@ class MetalGpuCompiler : public GpuCompiler {
   // (metalBLAS); if false they would be FusionWrapper-wrapped into kLoop fusions
   // our elementwise emitter cannot lower.
   //
-  // TODO: override OptimizeHloPostLayoutAssignment to prune the CUDA-centric
+  // TODO: prune the CUDA-centric portion of OptimizeHloPostLayoutAssignment
   // (cublas-LT / Triton / cuDNN-normalization) passes the base body runs
   // ungated, keeping only the layout/float/reduction normalization the
-  // row-major AIR emitter needs. The base impl is used until then.
+  // row-major AIR emitter needs. The override currently delegates to the base
+  // body before appending the Metal workspace pass.
 
  private:
   MetalGpuCompiler(const MetalGpuCompiler&) = delete;
