@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/kernel_args.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -164,6 +165,24 @@ TEST(KernelTest, PackTupleArguments) {
   ASSERT_EQ(i32, 1);
   ASSERT_EQ(f32, 2.0f);
   ASSERT_EQ(f64, 3.0);
+}
+
+TEST(KernelTest, PackTuplePreservesBindingMetadata) {
+  DeviceAddressBase device_address(reinterpret_cast<void*>(0x12345678));
+  std::array<int32_t, 4> dims = {1, 2, 3, 4};
+  auto args = PackKernelArgs(/*shmem_bytes=*/0, device_address, int32_t{7},
+                             dims);
+
+  absl::Span<const KernelArgumentMetadata> metadata =
+      args->argument_metadata();
+  ASSERT_EQ(metadata.size(), 3);
+  EXPECT_EQ(metadata[0].kind,
+            KernelArgumentMetadata::Kind::kDeviceAddress);
+  EXPECT_EQ(metadata[0].size, sizeof(void*));
+  EXPECT_EQ(metadata[1].kind, KernelArgumentMetadata::Kind::kValue);
+  EXPECT_EQ(metadata[1].size, sizeof(int32_t));
+  EXPECT_EQ(metadata[2].kind, KernelArgumentMetadata::Kind::kValue);
+  EXPECT_EQ(metadata[2].size, sizeof(dims));
 }
 
 TEST(KernelTest, PackTupleWithCustomPacking) {

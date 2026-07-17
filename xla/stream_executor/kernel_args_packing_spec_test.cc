@@ -172,6 +172,13 @@ TEST(KernelArgsPackingSpecTest, BuildArguments) {
   EXPECT_EQ(packed_args->number_of_arguments(), 3);
   EXPECT_EQ(packed_args->number_of_shared_bytes(), 8989);
   ASSERT_THAT(packed_args->argument_addresses(), SizeIs(2));
+  ASSERT_THAT(packed_args->argument_metadata(), SizeIs(2));
+  EXPECT_EQ(packed_args->argument_metadata()[0].kind,
+            KernelArgumentMetadata::Kind::kDeviceAddress);
+  EXPECT_EQ(packed_args->argument_metadata()[0].size, sizeof(void*));
+  EXPECT_EQ(packed_args->argument_metadata()[1].kind,
+            KernelArgumentMetadata::Kind::kValue);
+  EXPECT_EQ(packed_args->argument_metadata()[1].size, sizeof(int));
   EXPECT_THAT(
       absl::Span<const char>(
           absl::bit_cast<const char*>(packed_args->argument_addresses().at(0)),

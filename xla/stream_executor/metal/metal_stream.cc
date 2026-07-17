@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
@@ -539,22 +540,12 @@ void MetalStream::FlushOpenBufferIfCarrying(uint64_t value) {
   if (BatchDbgEnabled()) { ++g_bdbg.commits; ++g_bdbg.foic_commit; }
 }
 
-absl::Status MetalStream::LaunchKernel(
-    const ThreadDim& thread_dims, const BlockDim& block_dims,
-    const std::optional<ClusterDim>& cluster_dims, void* function,
-    absl::string_view name, void** args, int64_t shmem_bytes, bool use_pdl) {
-  return LaunchMetalKernel(thread_dims, block_dims, cluster_dims,
-                           /*pipeline=*/function, /*function=*/nullptr,
-                           /*use_argument_buffer=*/false, name, args,
-                           shmem_bytes, use_pdl);
-}
-
 absl::Status MetalStream::LaunchMetalKernel(
     const ThreadDim& thread_dims, const BlockDim& block_dims,
     const std::optional<ClusterDim>& cluster_dims, void* pipeline,
     void* function, bool use_argument_buffer, absl::string_view name,
-    void** args, int64_t shmem_bytes, bool use_pdl,
-    void* indirect_grid_device_ptr) {
+    void** args, absl::Span<const KernelArgumentMetadata> arg_metadata,
+    int64_t shmem_bytes, bool use_pdl) {
   if (cluster_dims.has_value()) {
     return absl::UnimplementedError("Metal cluster launches are not supported.");
   }
@@ -563,39 +554,52 @@ absl::Status MetalStream::LaunchMetalKernel(
         "Metal programmatic dependent launch is not supported.");
   }
 
-  // Resolve the optional indirect-grid device pointer to its backing MTLBuffer +
-  // byte offset (same resolution path as the kernel arguments below).
-  void* indirect_grid_buffer = nullptr;
-  uint64_t indirect_grid_offset = 0;
-  if (indirect_grid_device_ptr != nullptr) {
-    auto allocation = executor_->ResolveAllocation(indirect_grid_device_ptr);
-    if (!allocation.ok()) {
-      return absl::InternalError(
-          "Metal indirect dispatch: could not resolve grid buffer allocation.");
-    }
-    indirect_grid_buffer = allocation->buffer;
-    indirect_grid_offset = static_cast<uint64_t>(
-        reinterpret_cast<uintptr_t>(indirect_grid_device_ptr) -
-        reinterpret_cast<uintptr_t>(allocation->contents));
-  }
-
   std::vector<MetalKernelArgument> arguments;
   if (args != nullptr) {
     auto** packed_arg_addresses = reinterpret_cast<void**>(args[0]);
     size_t arg_count = *reinterpret_cast<size_t*>(args[1]);
+    if (arg_metadata.size() != arg_count) {
+      return absl::InternalError(absl::StrCat(
+          "Metal kernel argument-metadata count ", arg_metadata.size(),
+          " does not match argument count ", arg_count, "."));
+    }
     arguments.reserve(arg_count);
     for (size_t i = 0; i < arg_count; ++i) {
-      void* value = ReadPackedPointer(packed_arg_addresses[i]);
-      auto allocation = executor_->ResolveAllocation(value);
-      if (allocation.ok()) {
-        auto base = reinterpret_cast<uintptr_t>(allocation->contents);
-        auto ptr = reinterpret_cast<uintptr_t>(value);
-        arguments.push_back(MetalKernelArgument{
-            allocation->buffer, static_cast<uint64_t>(ptr - base), nullptr, 0});
-      } else {
-        arguments.push_back(MetalKernelArgument{
-            nullptr, 0, packed_arg_addresses[i], sizeof(uint64_t)});
+      const int64_t arg_size = arg_metadata[i].size;
+      if (arg_size <= 0) {
+        return absl::InternalError(absl::StrCat(
+            "Metal kernel argument ", i, " has invalid size ", arg_size,
+            "."));
       }
+
+      if (arg_metadata[i].kind == KernelArgumentMetadata::Kind::kDeviceAddress) {
+        if (arg_size != sizeof(void*)) {
+          return absl::InternalError(absl::StrCat(
+              "Metal device-address argument ", i, " has size ", arg_size,
+              ", expected ", sizeof(void*), "."));
+        }
+        void* value = ReadPackedPointer(packed_arg_addresses[i]);
+        if (value == nullptr) {
+          arguments.push_back(MetalKernelArgument{
+              MetalKernelArgument::Kind::kBuffer, nullptr, 0, nullptr, 0});
+          continue;
+        }
+        auto allocation = executor_->ResolveAllocation(value);
+        if (allocation.ok()) {
+          auto base = reinterpret_cast<uintptr_t>(allocation->contents);
+          auto ptr = reinterpret_cast<uintptr_t>(value);
+          arguments.push_back(MetalKernelArgument{
+              MetalKernelArgument::Kind::kBuffer, allocation->buffer,
+              static_cast<uint64_t>(ptr - base), nullptr, 0});
+          continue;
+        }
+        return absl::InternalError(absl::StrCat(
+            "Metal kernel device-address argument ", i,
+            " does not resolve to an executor allocation."));
+      }
+      arguments.push_back(MetalKernelArgument{
+          MetalKernelArgument::Kind::kBytes, nullptr, 0,
+          packed_arg_addresses[i], static_cast<size_t>(arg_size)});
     }
   }
 
@@ -605,8 +609,7 @@ absl::Status MetalStream::LaunchMetalKernel(
   EnsureOpenCommandBuffer();
   return metal::EncodeKernel(command_buffer_, pipeline, function,
                              use_argument_buffer, arguments, name, thread_dims,
-                             block_dims, shmem_bytes, indirect_grid_buffer,
-                             indirect_grid_offset);
+                             block_dims, shmem_bytes);
 }
 
 void MetalStream::EnsureOpenCommandBuffer() {
