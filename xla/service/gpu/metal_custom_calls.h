@@ -30,20 +30,22 @@ namespace gpu {
 // thunks/kernels. Kept out of cublas_cudnn.h so the Metal backend doesn't live
 // in a CUDA-named header.
 
-// A general matrix multiplication run on Apple Metal via metalBLAS (no cuBLAS on
-// Metal). GemmRewriter emits this for MetalComputeCapability; ThunkEmitter
+// A general matrix multiplication run on Apple Metal via metalBLAS (no cuBLAS
+// on Metal). GemmRewriter emits this for MetalComputeCapability; ThunkEmitter
 // routes it to MetalGemmThunk.
 inline constexpr absl::string_view kMetalGemmCallTarget = "__metal$gemm";
 
 // Weight-only scaled matmul on Apple Metal: single custom-call target for every
 // fused dequant×GEMM scheme the Metal branch of ScaledDotRewriter supports.
 // Produced from a weight-only kScaledDot (itself from the xla.scaled_dot
-// composite). Common operands:
+// composite). Operands:
 //   {x[M,K] bf16, w[N,K] quant, scale[...]} -> out[M,N] bf16
 // ThunkEmitter dispatches by weight/scale dtypes and layout:
-//   - MX (e8m0 group-32, f8/f4 or legacy u32/u8 pack) -> MetalMxMatmulThunk
 //   - NVFP4 (f4 + e4m3 group-16) -> MetalNvfp4MatmulThunk
 //   - FP8 128-block / per-channel bf16 scales -> MetalFp8GemvThunk
+// OCP microscaling (MX / e8m0 group-32) is deliberately absent: no model emits
+// it -- zml/nn.zig is the only producer of the xla.scaled_dot composite and no
+// checkpoint carries e8m0 scales -- so the arm and its thunk were removed.
 inline constexpr absl::string_view kMetalScaledMatmulCallTarget =
     "zml$scaled_matmul";
 
@@ -58,21 +60,39 @@ inline bool IsMetalGemm(const HloInstruction& hlo) {
          hlo.custom_call_target() == kMetalGemmCallTarget;
 }
 
-// A grouped block-scaled FP8 GEMV for mixture-of-experts on Apple Metal. Unlike
-// the dense GEMMs above, this one is *model-emitted only* -- MoE top-k routing
-// has no dot for GemmRewriter to match, so the model selects experts and emits
-// this call directly (like zml$gdn). The call carries
-//   {x_rows[R,K] bf16, w[E,N,K] f8e4m3fn, scale[E,N/128,K/128] bf16,
-//    expert_id[R] s32} -> out[R,N] bf16,
-// where output row r is computed against expert weights w[expert_id[r]] (128x128
-// block-dequantized). ThunkEmitter routes it to MetalMoeGemvThunk. The $f8
-// suffix leaves room for a future $f4 MoE kernel.
-inline constexpr absl::string_view kMetalMoeGemmF8CallTarget =
-    "__metal$moe_gemm$f8";
+// A grouped block-scaled GEMV for mixture-of-experts on Apple Metal. Unlike the
+// dense GEMMs above, these are *model-emitted only* -- MoE top-k routing has no
+// dot for GemmRewriter to match, so the model selects experts and emits the call
+// directly (like zml$gdn). Output row r is computed against expert weights
+// w[expert_id[r]]. ThunkEmitter routes both flavors to MetalMoeGemvThunk.
+//
+// There is deliberately no fp8 flavor. A __metal$moe_gemm$f8 target and a
+// 128x128 block-dequantizing kernel existed here, with no emitter in any repo in
+// any commit; the MoE producer is zml/moe/metal.zig, whose QuantMode is
+// enum { none, nvfp4 } and whose Backend.auto rejects f8e4m3fn for .metal
+// outright. Adding fp8 MoE means adding the ZML emitter first.
 
-inline bool IsMetalMoeGemm(const HloInstruction& hlo) {
+// NVFP4 flavor of the grouped MoE GEMV: f4e2m1 weights + e4m3 group-16 scales.
+//   {x_rows[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
+//    expert_id[R] s32, w_global_scale[E] f32 (optional)} -> out[R,N] bf16
+//
+// The optional trailing operand is the compressed-tensors per-expert weight
+// *encode divisor* g_ct. Both nvfp4 kernels fold 1/g_ct[expert_id[r]] into the
+// weight's group scale, which is why it is passed rather than applied to x:
+// pre-scaling x costs a gather plus a full read/write pass over x_rows per MoE
+// call, and cannot fuse into this opaque custom call. Folding into the weight
+// also keeps the f32 accumulator at output magnitude -- never divide a
+// global-inflated output, which quantizes small components away. g_ct is not
+// MLX's similarly named global_scale_w (an amax): mlx_global_scale_w =
+// 2688 / g_ct. Do not both pass this operand and pre-divide x by g_ct.
+// ThunkEmitter routes this call to MetalMoeGemvThunk (nvfp4_gather_qmv decode
+// + nvfp4_gather_qmm_rhs prefill).
+inline constexpr absl::string_view kMetalMoeGemmF4CallTarget =
+    "__metal$moe_gemm$f4";
+
+inline bool IsMetalMoeGemmF4(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&
-         hlo.custom_call_target() == kMetalMoeGemmF8CallTarget;
+         hlo.custom_call_target() == kMetalMoeGemmF4CallTarget;
 }
 
 // The bf16/f16 (un-quantized) sibling of the grouped MoE GEMV above: same
@@ -87,16 +107,21 @@ inline bool IsMetalMoeGemmBf16(const HloInstruction& hlo) {
          hlo.custom_call_target() == kMetalMoeGemmCallTarget;
 }
 
-// A native keyed stable sort on Apple Metal. Generic Sort has no lowerable Metal
-// path -- the legacy LLVM bitonic emitter produces NVVM intrinsics that air-as
-// cannot assemble -- so RewriteSortToMetalThunk rewrites a stablehlo Sort that
-// sorts by ONE float key (bf16/f16/f32) along the minor-most axis, carrying iota
-// index operands, into this call:
+// Either of the two MoE GEMM custom-call targets (bf16 / nvfp4).
+inline bool IsMetalMoeGemmAny(const HloInstruction& hlo) {
+  return IsMetalMoeGemmF4(hlo) || IsMetalMoeGemmBf16(hlo);
+}
+
+// A native keyed stable sort on Apple Metal. Generic Sort has no lowerable
+// Metal path -- the legacy LLVM bitonic emitter produces NVVM intrinsics that
+// air-as cannot assemble -- so RewriteSortToMetalThunk rewrites a stablehlo
+// Sort that sorts by ONE float key (bf16/f16/f32) along the minor-most axis,
+// carrying iota index operands, into this call:
 //   {values[rows, n]} -> (sorted_values[rows, n], sorted_indices[rows, n] s32)
 // The permuted indices reproduce every iota result of the original Sort (all
-// iota operands are arange along the sort axis). `opaque` is "desc" (descending)
-// or "asc". ThunkEmitter routes it to MetalSortThunk (the vendored MLX merge
-// sort). Stable: ties keep index-ascending order == XLA is_stable.
+// iota operands are arange along the sort axis). `opaque` is "desc"
+// (descending) or "asc". ThunkEmitter routes it to MetalSortThunk (the vendored
+// MLX merge sort). Stable: ties keep index-ascending order == XLA is_stable.
 inline constexpr absl::string_view kMetalSortCallTarget = "metal$sort";
 
 inline bool IsMetalSort(const HloInstruction& hlo) {

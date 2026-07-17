@@ -113,6 +113,91 @@ TEST_F(LayoutAssignmentTest, Elementwise) {
   }
 }
 
+TEST_F(LayoutAssignmentTest, MetalScaledMatmulUsesRowMajorPhysicalAbi) {
+  const char* hlo_text = R"(
+    HloModule MetalScaledMatmulLayout
+
+    ENTRY main {
+      x = bf16[2,32]{0,1} parameter(0)
+      w = f4e2m1fn[8,32]{0,1:E(4)} parameter(1)
+      scale = f8e4m3fn[8,2]{0,1} parameter(2)
+      ROOT result = bf16[2,8]{0,1} custom-call(x, w, scale),
+        custom_call_target="zml$scaled_matmul"
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+
+  ComputationLayout computation_layout(
+      module->entry_computation()->ComputeProgramShape());
+  const se::GpuComputeCapability metal_gpu_cc{
+      se::MetalComputeCapability("Apple9")};
+  GpuLayoutAssignment layout_assignment(
+      &computation_layout, metal_gpu_cc, default_device_description_);
+  EXPECT_THAT(layout_assignment.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+
+  const HloInstruction* scaled_matmul = nullptr;
+  for (const HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    if (instruction->opcode() == HloOpcode::kCustomCall &&
+        instruction->custom_call_target() == "zml$scaled_matmul") {
+      scaled_matmul = instruction;
+      break;
+    }
+  }
+  ASSERT_THAT(scaled_matmul, NotNull());
+  EXPECT_TRUE(LayoutUtil::IsMonotonicWithDim0Major(
+      scaled_matmul->shape().layout()));
+  for (const HloInstruction* operand : scaled_matmul->operands()) {
+    EXPECT_TRUE(
+        LayoutUtil::IsMonotonicWithDim0Major(operand->shape().layout()));
+  }
+}
+
+TEST_F(LayoutAssignmentTest, MetalMoeGemmUsesRowMajorPhysicalAbi) {
+  const char* hlo_text = R"(
+    HloModule MetalMoeGemmLayout
+
+    ENTRY main {
+      x = bf16[16,32]{0,1} parameter(0)
+      w = f4e2m1fn[4,8,32]{0,1,2:E(4)} parameter(1)
+      scale = f8e4m3fn[4,8,2]{0,1,2} parameter(2)
+      expert_id = s32[16]{0} parameter(3)
+      ROOT result = bf16[16,8]{0,1} custom-call(x, w, scale, expert_id),
+        custom_call_target="__metal$moe_gemm$f4"
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+
+  ComputationLayout computation_layout(
+      module->entry_computation()->ComputeProgramShape());
+  const se::GpuComputeCapability metal_gpu_cc{
+      se::MetalComputeCapability("Apple9")};
+  GpuLayoutAssignment layout_assignment(
+      &computation_layout, metal_gpu_cc, default_device_description_);
+  EXPECT_THAT(layout_assignment.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+
+  const HloInstruction* moe_gemm = nullptr;
+  for (const HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    if (instruction->opcode() == HloOpcode::kCustomCall &&
+        instruction->custom_call_target() == "__metal$moe_gemm$f4") {
+      moe_gemm = instruction;
+      break;
+    }
+  }
+  ASSERT_THAT(moe_gemm, NotNull());
+  EXPECT_TRUE(
+      LayoutUtil::IsMonotonicWithDim0Major(moe_gemm->shape().layout()));
+  for (const HloInstruction* operand : moe_gemm->operands()) {
+    EXPECT_TRUE(
+        LayoutUtil::IsMonotonicWithDim0Major(operand->shape().layout()));
+  }
+}
+
 TEST_F(LayoutAssignmentTest, DotLayoutUnchangedIfValid) {
   const char* hlo_text = R"(
   HloModule DotLayout

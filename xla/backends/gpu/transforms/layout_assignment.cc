@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/gpu/reduction_utils.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/service/layout_assignment.h"
@@ -521,6 +522,23 @@ absl::Status GpuLayoutAssignment::AddBackendConstraints(
     if (IsCustomCallToDnnConvolution(*instruction)) {
       RETURN_IF_ERROR(AddBackendConstraintsToDnnConvCustomCall(
           Cast<HloCustomCallInstruction>(instruction), constraints));
+    }
+
+    // Metal scaled-matmul and MoE GEMM thunks interpret their raw buffers as
+    // contiguous row-major arrays. Make that physical ABI explicit so a
+    // producer with a different layout gets a copy instead of being silently
+    // reinterpreted by the Metal kernel.
+    if (gpu_version_.IsMetal() &&
+        (IsMetalScaledMatmul(*instruction) ||
+         IsMetalMoeGemmAny(*instruction))) {
+      for (int64_t i = 0; i < instruction->operand_count(); ++i) {
+        Shape operand_shape = instruction->operand(i)->shape();
+        LayoutUtil::SetToDefaultLayout(&operand_shape);
+        RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction, i));
+      }
+      Shape output_shape = instruction->shape();
+      LayoutUtil::SetToDefaultLayout(&output_shape);
+      RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction));
     }
 
     CHECK(!IsCublasLtGemm(*instruction))

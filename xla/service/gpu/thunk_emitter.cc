@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -160,7 +161,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_fp8_gemv_thunk.h"
 #include "xla/backends/gpu/runtime/metal_moe_gemv_thunk.h"
 #include "xla/backends/gpu/runtime/metal_nvfp4_matmul_thunk.h"
-#include "xla/backends/gpu/runtime/metal_mx_matmul_thunk.h"
+#include "xla/backends/gpu/runtime/metal_workspace.h"
 #include "xla/backends/gpu/runtime/metal_gdn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
@@ -1272,129 +1273,42 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
     const HloCustomCallInstruction* instr) {
   // One HLO target; dispatch by scale/weight scheme to the matching thunk.
+  if (instr->operand_count() < 3) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul expects at least 3 operands (x, w, scale).");
+  }
+  const PrimitiveType wt = instr->operand(1)->shape().element_type();
+  const PrimitiveType st = instr->operand(2)->shape().element_type();
+  const bool is_nvfp4 = wt == F4E2M1FN && st == F8E4M3FN;
   if (instr->operand_count() != 3) {
     return absl::InvalidArgumentError(
         "zml$scaled_matmul expects 3 operands (x, w, scale).");
   }
-  const PrimitiveType wt = instr->operand(1)->shape().element_type();
-  const PrimitiveType st = instr->operand(2)->shape().element_type();
-  // MX: e8m0 scales (native) or legacy u32-w / u8-scales packing.
-  if (st == F8E8M0FNU || (wt == U32 && st == U8)) {
-    return EmitMetalMxMatmulThunk(instr);
+  if (instr->shape().IsTuple() && instr->shape().tuple_shapes().empty()) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul output tuple must not be empty.");
+  }
+  const Shape& out_shape = instr->shape().IsTuple()
+                               ? instr->shape().tuple_shapes(0)
+                               : instr->shape();
+  auto is_row_major = [](const Shape& shape) {
+    return shape.IsArray() && shape.has_layout() &&
+           LayoutUtil::IsMonotonicWithDim0Major(shape.layout());
+  };
+  if (!is_row_major(instr->operand(0)->shape()) ||
+      !is_row_major(instr->operand(1)->shape()) ||
+      !is_row_major(instr->operand(2)->shape()) ||
+      !is_row_major(out_shape)) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul requires row-major contiguous x, w, scale, and "
+        "output buffers.");
   }
   // NVFP4: f4e2m1 weight + e4m3 group-16 scales.
-  if (wt == F4E2M1FN && st == F8E4M3FN) {
+  if (is_nvfp4) {
     return EmitMetalNvfp4MatmulThunk(instr);
   }
   // FP8 128-block / per-channel (bf16 scales).
   return EmitMetalFp8GemvThunk(instr);
-}
-
-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalMxMatmulThunk(
-    const HloCustomCallInstruction* instr) {
-  if (instr->operand_count() != 3) {
-    return absl::InvalidArgumentError(
-        "zml$scaled_matmul (MX) expects 3 operands (x, w, scales).");
-  }
-  const Shape& x_shape = instr->operand(0)->shape();
-  const Shape& w_shape = instr->operand(1)->shape();
-  const Shape& scales_shape = instr->operand(2)->shape();
-
-  const bool is_tuple = instr->shape().IsTuple();
-  const Shape& out_shape =
-      is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
-
-  if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
-      scales_shape.dimensions().size() != 2 ||
-      out_shape.dimensions().size() != 2) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): x, w, scales, out must all be rank 2.");
-  }
-
-  const int64_t m = x_shape.dimensions(0);
-  const int64_t k = x_shape.dimensions(1);
-  const int64_t n = w_shape.dimensions(0);
-  const int64_t w_cols = w_shape.dimensions(1);
-  const int64_t scale_cols = scales_shape.dimensions(1);
-
-  if (m == 0 || k == 0 || n == 0 || w_cols == 0 || scale_cols == 0) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): invalid dimension (must be > 0).");
-  }
-  // Derive `bits` from the weight element type. Two accepted forms (kernels
-  // read w/scales as raw bytes, so both are byte-identical):
-  //  - native MX (from ScaledDotRewriter's Metal kScaledDot branch):
-  //      w = f8e4m3fn[N,K] / f4e2m1[N,K], scales = f8e8m0[N,K/32]
-  //  - legacy MLX packing (same bytes, integer types):
-  //      w = u32[N,K/(32/bits)], scales = u8[N,K/32]
-  int64_t bits;
-  const PrimitiveType wt = w_shape.element_type();
-  const PrimitiveType st = scales_shape.element_type();
-  if (wt == F8E4M3FN || wt == F4E2M1FN) {
-    bits = (wt == F8E4M3FN) ? 8 : 4;
-    if (w_cols != k) {
-      return absl::UnimplementedError(
-          "zml$scaled_matmul (MX): native-f8 weight must be [N, K] (K minor).");
-    }
-    if (st != F8E8M0FNU) {
-      return absl::UnimplementedError(
-          "zml$scaled_matmul (MX): native-f8 weight needs f8e8m0 scales.");
-    }
-  } else if (wt == U32) {
-    if (st != U8) {
-      return absl::UnimplementedError(
-          "zml$scaled_matmul (MX): u32-packed weight needs u8 scales.");
-    }
-    if (k % w_cols != 0) {
-      return absl::UnimplementedError(
-          "zml$scaled_matmul (MX): K must be a multiple of the packed w minor.");
-    }
-    const int64_t pack = k / w_cols;  // values per uint32 word
-    bits = 32 / pack;
-    if ((bits != 8 && bits != 4) || pack * bits != 32) {
-      return absl::UnimplementedError(absl::StrCat(
-          "zml$scaled_matmul (MX): unsupported packing (K=", k,
-          ", w_cols=", w_cols, " -> bits=", bits, ")."));
-    }
-  } else {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): w must be f8e4m3fn / f4e2m1 / packed u32.");
-  }
-  if (k % scale_cols != 0) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): K must be a multiple of the scale minor dim.");
-  }
-  const int64_t group_size = k / scale_cols;  // 32 for MX
-  if (group_size != 32) {
-    return absl::UnimplementedError(absl::StrCat(
-        "zml$scaled_matmul (MX): only 32-element MX groups supported (got ",
-        group_size, ")."));
-  }
-  if (out_shape.dimensions(0) != m || out_shape.dimensions(1) != n) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): out shape must be [M, N].");
-  }
-  if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (MX): x and out must be bf16.");
-  }
-
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
-                      GetAllocationSliceForHlo(instr->operand(0), {}));
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
-                      GetAllocationSliceForHlo(instr->operand(1), {}));
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scales,
-                      GetAllocationSliceForHlo(instr->operand(2), {}));
-  TF_ASSIGN_OR_RETURN(
-      BufferAllocation::Slice out,
-      GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
-
-  auto thunk = std::make_unique<MetalMxMatmulThunk>(
-      Thunk::ThunkInfo::WithProfileAnnotation(
-          instr, ir_emitter_context_->GetNextThunkId()),
-      x, x_shape, w, w_shape, scales, scales_shape, out, out_shape, m, k, n,
-      bits, group_size);
-  return GetThunkSequence(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
@@ -1406,9 +1320,26 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
   const Shape& scale_shape = instr->operand(2)->shape();
+
+  // MetalWorkspaceRewriter gives the split-K path a tuple(result, s8[bytes])
+  // result; every other path keeps its plain array result.
   const bool is_tuple = instr->shape().IsTuple();
+  if (is_tuple && instr->shape().tuple_shapes().size() != 2) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul (NVFP4) must return either a bf16 result or "
+        "tuple(bf16 result, s8 workspace).");
+  }
   const Shape& out_shape =
       is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+  Shape workspace_shape;
+  if (is_tuple) {
+    workspace_shape = instr->shape().tuple_shapes(1);
+    if (!workspace_shape.IsArray() || workspace_shape.element_type() != S8 ||
+        workspace_shape.dimensions().size() != 1) {
+      return absl::InvalidArgumentError(
+          "zml$scaled_matmul (NVFP4): workspace must be rank-1 s8.");
+    }
+  }
 
   if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
       scale_shape.dimensions().size() != 2 ||
@@ -1440,6 +1371,19 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
     return absl::UnimplementedError(
         "zml$scaled_matmul (NVFP4): out must be [M, N].");
   }
+  const auto metal_arch =
+      ir_emitter_context_->gpu_device_info().metal_compute_capability();
+  TF_ASSIGN_OR_RETURN(const int64_t expected_workspace_bytes,
+                      GetMetalNvfp4WorkspaceBytes(
+                          m, k, n, metal_arch.architecture_size(),
+                          metal_arch.architecture_gen()));
+  const int64_t workspace_bytes =
+      is_tuple ? workspace_shape.dimensions(0) : 0;
+  if (workspace_bytes != expected_workspace_bytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "zml$scaled_matmul (NVFP4): workspace must be s8[",
+        expected_workspace_bytes, "]; got s8[", workspace_bytes, "]."));
+  }
 
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
                       GetAllocationSliceForHlo(instr->operand(0), {}));
@@ -1450,11 +1394,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
   TF_ASSIGN_OR_RETURN(
       BufferAllocation::Slice out,
       GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
+  BufferAllocation::Slice workspace;
+  if (is_tuple) {
+    TF_ASSIGN_OR_RETURN(workspace,
+                        GetAllocationSliceForHlo(instr, ShapeIndex{1}));
+  }
 
   auto thunk = std::make_unique<MetalNvfp4MatmulThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, m, k, n);
+      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, workspace,
+      workspace_shape, m, k, n, metal_arch.architecture_size(),
+      metal_arch.architecture_gen());
   return GetThunkSequence(std::move(thunk));
 }
 
@@ -1526,30 +1477,63 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     const HloCustomCallInstruction* instr) {
-  // Two flavors share one thunk: the fp8 block-scaled call carries a scale
-  // operand (x, w_f8, scale, expert_id); the bf16 call drops it (x, w, expert_id).
-  const bool is_fp8 =
-      instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
-  const int64_t expected_operands = is_fp8 ? 4 : 3;
-  if (instr->operand_count() != expected_operands) {
+  // Two flavors share one thunk:
+  //   nvfp4: {x, w_f4, scale, expert_id, w_global_scale?}
+  //   bf16:  {x, w, expert_id}
+  const bool is_nvfp4 =
+      instr->custom_call_target() == kMetalMoeGemmF4CallTarget;
+  const bool has_scale = is_nvfp4;
+  const int64_t expected_operands = has_scale ? 4 : 3;
+  // nvfp4 only: an optional trailing f32[E] per-expert global scale, folded
+  // into the weight group scale by the kernels.
+  const bool has_global_scale =
+      is_nvfp4 && instr->operand_count() == expected_operands + 1;
+  if (instr->operand_count() != expected_operands && !has_global_scale) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "metal MoE GEMV expects ", expected_operands, " operands."));
+        "metal MoE GEMV expects ", expected_operands,
+        is_nvfp4 ? " or 5 operands." : " operands."));
   }
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
-  const int expert_id_idx = is_fp8 ? 3 : 2;
+  const int expert_id_idx = has_scale ? 3 : 2;
   const Shape& expert_id_shape = instr->operand(expert_id_idx)->shape();
 
-  // Single output [R, N] bf16 (tolerate a 1-tuple too).
+  // MetalWorkspaceRewriter gives the sorted-prefill path a tuple(result,
+  // s8[bytes]) result; the per-row path keeps its plain array result.
   const bool is_tuple = instr->shape().IsTuple();
+  if (is_tuple && instr->shape().tuple_shapes().size() != 2) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV must return either a bf16 result or "
+        "tuple(bf16 result, s8 workspace).");
+  }
   const Shape& out_shape =
       is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+  Shape workspace_shape;
+  if (is_tuple) {
+    workspace_shape = instr->shape().tuple_shapes(1);
+    if (!workspace_shape.IsArray() || workspace_shape.element_type() != S8 ||
+        workspace_shape.dimensions().size() != 1) {
+      return absl::InvalidArgumentError(
+          "metal MoE GEMV: workspace must be rank-1 s8.");
+    }
+  }
 
   if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 3 ||
       expert_id_shape.dimensions().size() != 1 ||
       out_shape.dimensions().size() != 2) {
     return absl::UnimplementedError(
         "metal MoE GEMV: unexpected operand ranks.");
+  }
+  auto is_row_major = [](const Shape& shape) {
+    return shape.IsArray() && shape.has_layout() &&
+           LayoutUtil::IsMonotonicWithDim0Major(shape.layout());
+  };
+  if (!is_row_major(x_shape) || !is_row_major(w_shape) ||
+      !is_row_major(expert_id_shape) || !is_row_major(out_shape) ||
+      (has_scale && !is_row_major(instr->operand(2)->shape()))) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV requires row-major contiguous x, w, scale, "
+        "expert_id, and output buffers.");
   }
 
   const int64_t r = x_shape.dimensions(0);
@@ -1561,26 +1545,33 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     return absl::UnimplementedError(
         "metal MoE GEMV: invalid dimension (must be > 0).");
   }
+  constexpr int64_t kMaxKernelDim = std::numeric_limits<int32_t>::max();
+  if (r > kMaxKernelDim || k > kMaxKernelDim || n > kMaxKernelDim ||
+      e > kMaxKernelDim) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV: R, E, K, and N must fit signed int32.");
+  }
   if (w_shape.dimensions(2) != k || out_shape.dimensions(0) != r ||
       out_shape.dimensions(1) != n || expert_id_shape.dimensions(0) != r) {
     return absl::UnimplementedError(
         "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
   }
-  // fp8 needs the 128x128 block-scale alignment; bf16 only needs the bfloat4
-  // vectorized loads (K,N multiples of 4 — Gemma4-A4B's K=704 qualifies). The
-  // decode GEMV bounds-checks N and the partial K tile; the steel prefill picks
-  // its align_N/K function constants from the real dims (see the thunk).
-  const int64_t block = is_fp8 ? 128 : 4;
-  if (k % block != 0 || n % block != 0) {
-    return absl::UnimplementedError(absl::StrCat(
-        "metal MoE GEMV: N and K must be multiples of ", block,
-        is_fp8 ? " (fp8 block-scale)." : " (bf16 vectorized load)."));
+  // bf16 uses four-wide vector loads. NVFP4 only requires group-16 K: its
+  // QMV/Steel kernels and sorted row copies all have scalar-safe N tails.
+  if (is_nvfp4 && k % 16 != 0) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: K must be multiple of 16 "
+        "(nvfp4 group-16; N supports scalar tails).");
   }
-  const PrimitiveType expected_w = is_fp8 ? F8E4M3FN : BF16;
+  if (!is_nvfp4 && (k % 4 != 0 || n % 4 != 0)) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: K and N must be multiples of 4 "
+        "(bf16 vectorized load).");
+  }
+  const PrimitiveType expected_w = is_nvfp4 ? F4E2M1FN : BF16;
   if (w_shape.element_type() != expected_w) {
     return absl::UnimplementedError(absl::StrCat(
-        "metal MoE GEMV: w must be ",
-        is_fp8 ? "f8e4m3fn" : "bf16", "."));
+        "metal MoE GEMV: w must be ", is_nvfp4 ? "f4e2m1" : "bf16", "."));
   }
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
@@ -1589,21 +1580,52 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
   if (expert_id_shape.element_type() != S32) {
     return absl::UnimplementedError("metal MoE GEMV: expert_id must be s32.");
   }
+  TF_ASSIGN_OR_RETURN(const int64_t expected_workspace_bytes,
+                      GetMetalMoeWorkspaceBytes(r, e, k, n, is_nvfp4));
+  const int64_t workspace_bytes =
+      is_tuple ? workspace_shape.dimensions(0) : 0;
+  if (workspace_bytes != expected_workspace_bytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metal MoE GEMV workspace must be s8[", expected_workspace_bytes,
+        "]; got s8[", workspace_bytes, "]."));
+  }
 
-  // The scale operand is fp8-only; bf16 passes empty slice/shape.
+  // Scale operand: nvfp4 = [E, N, K/16] f8e4m3fn.
   BufferAllocation::Slice scale;
   Shape scale_shape;
-  if (is_fp8) {
+  if (is_nvfp4) {
     scale_shape = instr->operand(2)->shape();
     if (scale_shape.dimensions().size() != 3 ||
-        scale_shape.dimensions(0) != e ||
-        scale_shape.dimensions(1) != n / 128 ||
-        scale_shape.dimensions(2) != k / 128) {
+        scale_shape.dimensions(0) != e || scale_shape.dimensions(1) != n ||
+        scale_shape.dimensions(2) != k / 16) {
       return absl::UnimplementedError(
-          "metal MoE GEMV: scale must be [E, N/128, K/128].");
+          "metal MoE GEMV: nvfp4 scale must be [E, N, K/16].");
+    }
+    if (scale_shape.element_type() != F8E4M3FN) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: nvfp4 scale must be f8e4m3fn.");
     }
     TF_ASSIGN_OR_RETURN(scale,
                         GetAllocationSliceForHlo(instr->operand(2), {}));
+  }
+
+  // Optional nvfp4 per-expert global scale (compressed-tensors g_ct): f32[E].
+  BufferAllocation::Slice global_scale;
+  Shape global_scale_shape;
+  if (has_global_scale) {
+    global_scale_shape = instr->operand(4)->shape();
+    if (global_scale_shape.dimensions().size() != 1 ||
+        global_scale_shape.dimensions(0) != e) {
+      return absl::UnimplementedError(absl::StrCat(
+          "metal MoE GEMV: nvfp4 global scale must be [", e, "]; got ",
+          global_scale_shape.ToString(), "."));
+    }
+    if (global_scale_shape.element_type() != F32) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: nvfp4 global scale must be f32.");
+    }
+    TF_ASSIGN_OR_RETURN(global_scale,
+                        GetAllocationSliceForHlo(instr->operand(4), {}));
   }
 
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
@@ -1616,78 +1638,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
   TF_ASSIGN_OR_RETURN(
       BufferAllocation::Slice out,
       GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
-
-  // PREFILL PADDING CLAMP source (mirrors the dense-GEMM clamp in
-  // EmitMetalGemmThunk above): the MoE call's R = padded_tokens*top_k, but only
-  // the real-prompt routes carry meaningful rows (routes are token-major, so the
-  // padding is a contiguous suffix). Find this exe's prefill attention num_tokens
-  // scalar (the same real-prompt-length device value the GEMMs clamp off) and
-  // recover top_k = R / compiled_tokens, so the thunk clamps the sort/gather/
-  // steel/scatter to R_active = num_tokens*top_k. A decode exe (attention q_len==1
-  // / total_q==num_seqs, no num_tokens operand) matches nothing -> top_k stays 0
-  // -> the thunk runs unclamped (decode is not padded).
-  BufferAllocation::Slice moe_num_tokens;
-  Shape moe_num_tokens_shape;
-  int64_t compiled_tokens = 0;
-  for (const HloInstruction* i : instr->parent()->instructions()) {
-    if (i->opcode() != HloOpcode::kCustomCall) continue;
-    const auto* fa = Cast<HloCustomCallInstruction>(i);
-    if (fa->custom_call_target() != "zml$flash_attn") continue;
-    const Shape& fq = fa->operand(0)->shape();
-    if (fq.dimensions().size() != 3 || fq.dimensions(1) <= 1) continue;  // decode
-    const bool fc = fa->operand(1)->shape().dimensions().size() == 4;
-    const int fbase = fc ? 5 : 4;  // q,k,v,tok[,layer]
-    if (fa->operand_count() != fbase + 1) continue;  // no num_tokens operand
-    TF_ASSIGN_OR_RETURN(moe_num_tokens,
-                        GetAllocationSliceForHlo(fa->operand(fbase), {}));
-    moe_num_tokens_shape = fa->operand(fbase)->shape();
-    compiled_tokens = fq.dimensions(1);
-    break;
+  BufferAllocation::Slice workspace;
+  if (is_tuple) {
+    TF_ASSIGN_OR_RETURN(workspace,
+                        GetAllocationSliceForHlo(instr, ShapeIndex{1}));
   }
-  if (compiled_tokens == 0) {
-    // Paged prefill (llmd chunked prefill): real token count is the last element
-    // of query_start_len[num_seqs] (operand 5 of a prefill zml$paged_attn).
-    for (const HloInstruction* i : instr->parent()->instructions()) {
-      if (i->opcode() != HloOpcode::kCustomCall) continue;
-      const auto* pa = Cast<HloCustomCallInstruction>(i);
-      if (pa->custom_call_target() != "zml$paged_attn") continue;
-      if (pa->operand_count() != 6) continue;
-      const Shape& pq = pa->operand(0)->shape();  // [total_q, heads, hd]
-      const Shape& bt = pa->operand(3)->shape();  // [num_seqs, max_blocks]
-      if (pq.dimensions().size() != 3 || bt.dimensions().size() != 2) continue;
-      const int64_t total_q = pq.dimensions(0);
-      const int64_t num_seqs = bt.dimensions(0);
-      if (total_q <= num_seqs) continue;  // decode module
-      const Shape& qsl_shape = pa->operand(5)->shape();
-      if (qsl_shape.dimensions().size() != 1 ||
-          qsl_shape.dimensions(0) != num_seqs + 1 ||
-          ShapeUtil::ByteSizeOfPrimitiveType(qsl_shape.element_type()) != 4) {
-        continue;
-      }
-      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice qsl,
-                          GetAllocationSliceForHlo(pa->operand(5), {}));
-      moe_num_tokens = BufferAllocation::Slice(
-          qsl.allocation(), qsl.offset() + num_seqs * 4, 4);
-      moe_num_tokens_shape = ShapeUtil::MakeShape(S32, {});
-      compiled_tokens = total_q;
-      break;
-    }
-  }
-  // top_k must evenly divide R (token-major routes) and be in a sane range; else
-  // leave it 0 so the thunk skips the clamp (the slice's presence + top_k>0 gate
-  // has_num_tokens_).
-  int64_t moe_top_k = 0;
-  if (compiled_tokens > 0 && r % compiled_tokens == 0) {
-    const int64_t tk = r / compiled_tokens;
-    if (tk >= 1 && tk <= 256) moe_top_k = tk;
-  }
-  if (moe_top_k == 0) moe_num_tokens = BufferAllocation::Slice();
 
   auto thunk = std::make_unique<MetalMoeGemvThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
-      out, out_shape, r, k, n, moe_num_tokens, moe_num_tokens_shape, moe_top_k);
+      out, out_shape, workspace, workspace_shape, global_scale,
+      global_scale_shape, has_global_scale, r, k, n);
   return GetThunkSequence(std::move(thunk));
 }
 
@@ -4023,10 +3985,9 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   if (IsMetalScaledMatmul(*hlo)) {
     return EmitMetalScaledMatmulThunk(custom_call);
   }
-  // Model-emitted grouped block-scaled FP8 GEMV for MoE experts: the model does
-  // top-k routing and emits __metal$moe_gemm$f8 with {x_rows, w[E,N,K]_f8,
-  // scale, expert_id}; route it to the grouped FP8 GEMV kernel.
-  if (IsMetalMoeGemm(*hlo) || IsMetalMoeGemmBf16(*hlo)) {
+  // Model-emitted grouped MoE GEMV (bf16 / fp8 / nvfp4): the model does top-k
+  // routing and emits __metal$moe_gemm{,$f8,$f4}; route to MetalMoeGemvThunk.
+  if (IsMetalMoeGemmAny(*hlo)) {
     return EmitMoeGemvThunk(custom_call);
   }
   // Apple Metal has no cuBLAS/cuBLAS-LT. GemmRewriter emits an honest
