@@ -26,6 +26,8 @@ message RocmComputeCapabilityProto {
 }
 
 message MetalComputeCapabilityProto {
+  // Raw MTLArchitecture.name (for example, "applegpu_g16s"). The field keeps
+  // its historical name for wire compatibility.
   string gpu_family = 1;
 }
 
