@@ -7,11 +7,12 @@
 # substitution specializes a shader for the live shapes/dtypes before compile.
 #
 # Layout:
+#   metalBLAS's GEMM/GEMV shaders are NOT checked in here: they come from the
+#   pinned @metalblas archive (//third_party/metalblas:workspace.bzl) plus the
+#   MB_TOKCLAMP patch, embedded by :metalblas_shaders below.
 #   vendored/  - third-party-derived shaders. Each bundle documents whether it
 #                is byte-verbatim or adapted; do not assume `vendored/` means a
 #                file can be refreshed with an unreviewed copy:
-#       metalblas/  github.com/Isalia20/metalBLAS  (the compiled families only,
-#                   mpp_tensor.h locally patched — see the note at :metalblas_shaders)
 #       vllm/       vllm-metal                      (verbatim kernels)
 #   mlx_entries/ - our entry sources for the MLX-derived bundles. These #include
 #                the pinned @mlx archive rather than copying it, so upstream's
@@ -36,39 +37,39 @@ package(
     licenses = ["notice"],
 )
 
-# --- metalBLAS GEMM/GEMV shaders (vendored subset) --------------------------
+# --- metalBLAS GEMM/GEMV shaders (from the pinned @metalblas archive) --------
+#
+# The five shader headers are NOT checked in -- they come from the pinned
+# @metalblas archive (//third_party/metalblas:workspace.bzl), which fetches
+# github.com/Isalia20/metalBLAS at a recorded 40-hex and applies the append-only
+# MB_TOKCLAMP patch to mpp_tensor.h (//third_party/metalblas:series.bzl). Four of
+# the five (mb_epi, gemv_bt, gemv_nt, gemv_t) are byte-verbatim against the pin;
+# mpp_tensor.h is upstream + that patch. The archive's :compiled_shaders
+# filegroup lists exactly these five, so drift now fails loud at FETCH instead of
+# rotting behind BUILD prose -- that loud-failure-on-drift is the whole reason
+# for the pin.
 #
 # Each family header is `#ifdef MB_BUILD_<NAME>`-guarded and the only always-
 # active header is the shared epilogue mb_epi.h. So metalblas_gemm.cc compiles a
 # family by concatenating get_mb_epi() + the family header (verbatim) with the
 # matching `-DMB_BUILD_<NAME>` — byte-identical to compiling the upstream binder
-# with that one flag, but with no build-time include-inlining. Embed every shader
-# header individually (one get_<stem>() per file: get_mb_epi(), get_mpp_tensor(),
-# get_gemv_bt(), ...).
+# with that one flag, but with no build-time include-inlining. embed_files names
+# each accessor from the file's BASENAME (xla/util/build_defs.bzl), so the
+# archive paths metalblas/shaders/<stem>.h yield the exact get_<stem>() the C++
+# already calls: get_mb_epi(), get_mpp_tensor(), get_gemv_bt(), get_gemv_nt(),
+# get_gemv_t() (metalblas_gemm.cc:70, 214, 390, 434, 439). The stems are flat and
+# unique, so there is no basename collision (unlike @mlx, which needs a path-
+# keyed include tree; metalBLAS shaders have zero cross-header includes and are
+# embedded, not fed to the Metal compiler via -I).
 #
-# THIS IS A CURATED SUBSET, NOT A MIRROR — do not refresh it with an unreviewed
-# `cp` of upstream shaders/. The bundle tracks exactly the families some C++
-# actually passes to CompileMetalblasKernelToMetallib, which concatenates
-# mb_epi.h + ONE explicitly-passed family; a header nothing names is not
-# conditionally compiled, its bytes never reach the Metal compiler at all. The
-# four flags any caller passes are MB_BUILD_MPP_TENSOR / MB_BUILD_GEMV_BT /
-# MB_BUILD_GEMV_NT / MB_BUILD_GEMV_T (metalblas_gemm.cc:214, 390, 434, 439), so
-# those four families plus the epilogue are what is vendored here.
-#
-# Upstream's other files are deliberately absent. mpp_gemm.h, simd_gemm.h,
-# int_gemm.h, splitk.h, cgemv_t.h, cgemv_nt.h, complex_pack.h and conv1x1.h were
-# carried as embedded .rodata that nothing could ever compile, and were dropped;
-# the binder metalblas.metal, flipt.h and mpp_sgpipe.h were never vendored. Adding
-# one back means adding the C++ that passes its flag, in the same change. Note
-# MB_BUILD_SPLITK is NOT the live split-K: that is MLX's, under the different flag
-# MB_BUILD_MLX_SPLITK (metalblas_gemm.cc:285), sourced from mlx_entries/.
-#
-# The bundle is a subset in a second way too, so a blind `cp` was already wrong
-# before this pruning: mpp_tensor.h carries a local MB_TOKCLAMP patch and differs
-# from upstream by design. Re-sync it by hand, per file, or lose the clamp.
+# The archive's filegroup carries only the four MB_BUILD_* families plus the
+# epilogue -- see //third_party/metalblas:metalblas.BUILD for why the other 11
+# upstream shaders are excluded. Note MB_BUILD_SPLITK is NOT the live split-K:
+# that is MLX's, under the different flag MB_BUILD_MLX_SPLITK
+# (metalblas_gemm.cc:285), sourced from mlx_entries/.
 embed_files(
     name = "metalblas_shaders",
-    srcs = glob(["vendored/metalblas/*.h"]),
+    srcs = ["@metalblas//:compiled_shaders"],
     cpp_namespace = "xla::gpu",
 )
 

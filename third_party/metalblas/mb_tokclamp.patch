@@ -1,0 +1,45 @@
+--- a/metalblas/shaders/mpp_tensor.h
++++ b/metalblas/shaders/mpp_tensor.h
+@@ -19,6 +19,13 @@
+ #define SWIZZLE_LOG __SWIZZLE_LOG__
+ #define MN_ALIGNED  __MN_ALIGNED__
+ #define STATIC_SLICE __STATIC_SLICE__
++// MB_TOKCLAMP (prefill token-axis GEMM): the host dispatches the FULL static M
++// grid and passes the real prompt length as a DEVICE pointer (mb_numtok); each
++// threadgroup early-returns if its whole M-tile is past num_tokens. This replaces
++// the old host-side encode-time read of num_tokens (which raced the GPU producer
++// of that metadata on Metal — there is no totally-ordered stream), so the grid is
++// clamped purely on-GPU like CUDA, with no host-side device read. 0 = full grid.
++#define MB_TOKCLAMP __MB_TOKCLAMP__
+ 
+ // BATCHED (bmm/baddbmm): grid z is the batch index; A/B/C (and the bias) are offset
+ // by their per-matrix strides. Defaults to 0 so the 2-D build is unchanged.
+@@ -70,6 +77,11 @@
+     constant float& beta     [[buffer(6)]],
+     constant float& alpha    [[buffer(7)]],
+ #endif
++#if MB_TOKCLAMP
++    // Real prompt length (cu_seqlens/query_start_len[num_seqs]); read on-GPU.
++    // buffer(4) is free here: the prefill token-axis GEMM is never EPILOGUE.
++    device const int* mb_numtok [[buffer(4)]],
++#endif
+ #if BATCHED
+     constant int4& batch [[buffer(MB_BATCH_BUF)]],   // (sA, sB, sC, sBias) per-batch element strides
+ #endif
+@@ -106,6 +118,16 @@
+     int m_off = tgy * BM;
+     int n_off = tgx * BN;
+ 
++#if MB_TOKCLAMP
++    // GPU-side prefill row clamp: skip any M-tile entirely past the real prompt
++    // length. Tiles straddling num_tokens still run (their valid rows feed the
++    // causal output); for a full prompt num_tokens>=M so no tile is skipped
++    // (byte-identical to the unclamped path). num_tokens<=0 is the "unset" sentinel
++    // (a caller that didn't wire the real length) -> DO NOT clamp; compute every
++    // tile. Without this guard a 0 default would skip ALL tiles (m_off>=0 always).
++    if (*mb_numtok > 0 && m_off >= *mb_numtok) return;
++#endif
++
+ #if STATIC_SLICE
+     // Non-transposed fast path: static-extent slices mark each interior tile exactly
+     // BM x BN and in-bounds, dropping dynamic-slice edge predication (still fp32 accum).

@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+# Nothing is built here. The @metalblas archive is pinned in workspace.bzl and
+# patched via series.bzl; its five Metal shader headers are consumed by
+# //xla/service/gpu/metal_kernels:metalblas_shaders, which xxd's them into
+# get_<stem>() string accessors (NOT an -I include tree -- metalBLAS shaders
+# have no cross-header includes). No build step ever rewrites them, which is
+# what makes "verbatim" true by construction rather than true only if a
+# generator is correct.
