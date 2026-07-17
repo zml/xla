@@ -65,11 +65,13 @@ cc_library(
     ]),
     linkopts = if_macos([
         "-Wl,-framework,Foundation",
+        # IOKit: the GPU core count has no Metal API; it is read from the
+        # IORegistry "gpu-core-count" property (see QueryGpuCoreCount).
+        "-Wl,-framework,IOKit",
         "-Wl,-framework,Metal",
         "-Wl,-framework,MetalPerformanceShaders",
     ]),
     deps = [
-        "//xla/stream_executor:event",
         "//xla/stream_executor:launch_dim",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/log",
@@ -100,8 +102,8 @@ cc_library(
     deps = [
         ":metal_runtime",
         ":metal_stream",
-        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:stream",
@@ -124,6 +126,7 @@ cc_library(
         ":metal_runtime",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:event",
+        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",
@@ -133,7 +136,9 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -141,9 +146,10 @@ cc_library(
     name = "metal_executor_hdrs",
     hdrs = ["metal_executor.h"],
     deps = [
+        ":metal_runtime",
+        "//xla/stream_executor:blas",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
-        "//xla/stream_executor:blas",
         "//xla/stream_executor:dnn",
         "//xla/stream_executor:event",
         "//xla/stream_executor:fft",
@@ -175,9 +181,9 @@ cc_library(
         ":metal_kernel",
         ":metal_runtime",
         ":metal_stream",
+        "//xla/stream_executor:blas",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
-        "//xla/stream_executor:blas",
         "//xla/stream_executor:dnn",
         "//xla/stream_executor:event",
         "//xla/stream_executor:fft",
@@ -230,9 +236,16 @@ cc_library(
     alwayslink = True,
 )
 
-# GPU TopK custom kernel registration for Metal (peer to
-# cuda:topk_kernel_cuda). Registers the TopKKernel<K,KT,VT> traits for the Metal
-# platform id with an MSL-source "metallib" payload compiled lazily at load time.
+# The Metal peer of cuda:all_runtime / rocm:all_runtime: the single label a
+# binary deps on to pull in the Metal platform's registration. It has no srcs of
+# its own -- all it does is force-link :metal_platform, whose static initializer
+# registers the platform. `alwayslink` is therefore LOAD-BEARING: without it the
+# linker drops the initializer and the platform silently never registers.
+#
+# It registers no kernels. (This note used to describe a TopKKernel<K,KT,VT>
+# registration peer to cuda:topk_kernel_cuda; no such thing exists here or ever
+# did. Metal's TopK is a thunk -- //xla/backends/gpu/runtime:metal_topk_thunk --
+# not a stream_executor custom kernel.)
 cc_library(
     name = "all_runtime",
     visibility = ["//visibility:public"],

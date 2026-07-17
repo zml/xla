@@ -17,6 +17,7 @@ limitations under the License.
 
 #import <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
@@ -39,7 +40,6 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/types/span.h"
-#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/tsl/platform/status_macros.h"
 
@@ -233,10 +233,50 @@ int GetDeviceCount() {
   return static_cast<int>([*devices count]);
 }
 
+// Physical GPU core count. Metal exposes no API for this (MTLDevice has no
+// core-count property), so read the IORegistry "gpu-core-count" that the
+// AGXAccelerator service publishes — the same source `system_profiler
+// SPDisplaysDataType` reports. Returns 0 if unavailable (non-Apple-Silicon, or
+// a future registry layout), leaving the fallback to the caller.
+static uint64_t QueryGpuCoreCount() {
+  io_iterator_t iter = IO_OBJECT_NULL;
+  if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                   IOServiceMatching("AGXAccelerator"),
+                                   &iter) != KERN_SUCCESS) {
+    return 0;
+  }
+  uint64_t cores = 0;
+  io_object_t service = IO_OBJECT_NULL;
+  while (cores == 0 && (service = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+    // Search parents too: on some parts the property lives on the parent
+    // IOGPU/AGX node rather than the accelerator itself.
+    CFTypeRef prop = IORegistryEntrySearchCFProperty(
+        service, kIOServicePlane, CFSTR("gpu-core-count"), kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (prop != nullptr) {
+      if (CFGetTypeID(prop) == CFNumberGetTypeID()) {
+        int value = 0;
+        if (CFNumberGetValue(static_cast<CFNumberRef>(prop), kCFNumberIntType,
+                             &value) &&
+            value > 0) {
+          cores = static_cast<uint64_t>(value);
+        }
+      }
+      CFRelease(prop);
+    }
+    IOObjectRelease(service);
+  }
+  IOObjectRelease(iter);
+  return cores;
+}
+
 absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal) {
   TF_ASSIGN_OR_RETURN(id<MTLDevice> device, DeviceAtOrdinal(ordinal));
   MetalDeviceInfo info;
   info.name = NSStringToString([device name]);
+  if (@available(macOS 14.0, *)) {
+    info.architecture = NSStringToString([[device architecture] name]);
+  }
   info.registry_id = absl::StrCat([device registryID]);
   if (@available(macOS 10.15, *)) {
     info.recommended_max_working_set_size =
@@ -249,6 +289,7 @@ absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal) {
       [device maxThreadsPerThreadgroup].height *
       [device maxThreadsPerThreadgroup].depth;
   info.max_threadgroup_memory_length = [device maxThreadgroupMemoryLength];
+  info.gpu_core_count = QueryGpuCoreCount();
   return info;
 }
 
@@ -263,13 +304,6 @@ absl::StatusOr<void*> NewCommandQueue(void* device) {
     return absl::InternalError("Failed to create Metal command queue.");
   }
   return RetainObj(queue);
-}
-
-void* RetainObject(void* object) {
-  if (object != nullptr) {
-    CFRetain(object);
-  }
-  return object;
 }
 
 void ReleaseObject(void* object) {
@@ -486,8 +520,7 @@ static absl::Status EncodeComputeInto(
     id<MTLCommandBuffer> command_buffer, void* pipeline, void* function,
     bool use_argument_buffer, absl::Span<const MetalKernelArgument> arguments,
     absl::string_view name, const ThreadDim& thread_dims,
-    const BlockDim& block_dims, int64_t shmem_bytes = 0,
-    void* indirect_grid_buffer = nullptr, uint64_t indirect_grid_offset = 0) {
+    const BlockDim& block_dims, int64_t shmem_bytes = 0) {
   // Defensive launch guard. maxTotalThreadsPerThreadgroup is PER-PIPELINE (a
   // register-heavy kernel can report < the device's nominal 1024) and
   // maxThreadgroupMemoryLength is the device's threadgroup-memory budget;
@@ -583,12 +616,14 @@ static absl::Status EncodeComputeInto(
     [argument_encoder setArgumentBuffer:argument_buffer offset:0];
     for (NSUInteger i = 0; i < arguments.size(); ++i) {
       const MetalKernelArgument& arg = arguments[i];
-      if (arg.buffer != nullptr) {
+      if (arg.kind == MetalKernelArgument::Kind::kBuffer) {
         [argument_encoder setBuffer:Obj<id<MTLBuffer>>(arg.buffer)
                              offset:arg.offset
                             atIndex:i];
-        [encoder useResource:Obj<id<MTLBuffer>>(arg.buffer)
-                       usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        if (arg.buffer != nullptr) {
+          [encoder useResource:Obj<id<MTLBuffer>>(arg.buffer)
+                         usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        }
       } else {
         void* dst = [argument_encoder constantDataAtIndex:i];
         if (dst == nullptr) {
@@ -603,7 +638,7 @@ static absl::Status EncodeComputeInto(
   } else {
     for (NSUInteger i = 0; i < arguments.size(); ++i) {
       const MetalKernelArgument& arg = arguments[i];
-      if (arg.buffer != nullptr) {
+      if (arg.kind == MetalKernelArgument::Kind::kBuffer) {
         [encoder setBuffer:Obj<id<MTLBuffer>>(arg.buffer)
                     offset:arg.offset
                    atIndex:i];
@@ -623,24 +658,9 @@ static absl::Status EncodeComputeInto(
   }
   MTLSize threads_per_threadgroup =
       MTLSizeMake(thread_dims.x, thread_dims.y, thread_dims.z);
-  if (indirect_grid_buffer != nullptr) {
-    // Indirect dispatch: the threadgroups-per-grid count lives in a device
-    // buffer (a {gx,gy,gz} uint3 the GPU computed this step), so a kernel can
-    // shrink its own launch to the runtime-active work without a host read.
-    // Used by the MoE prefill steel GEMM to launch only ceil(R_active/16)
-    // route-tiles instead of the baked ceil(r_/16); block_dims above is only the
-    // KPROF label's max bound. threadsPerThreadgroup stays host-fixed.
-    [encoder
-        dispatchThreadgroupsWithIndirectBuffer:Obj<id<MTLBuffer>>(
-                                                   indirect_grid_buffer)
-                          indirectBufferOffset:indirect_grid_offset
-                         threadsPerThreadgroup:threads_per_threadgroup];
-  } else {
-    MTLSize threadgroups =
-        MTLSizeMake(block_dims.x, block_dims.y, block_dims.z);
-    [encoder dispatchThreadgroups:threadgroups
-            threadsPerThreadgroup:threads_per_threadgroup];
-  }
+  MTLSize threadgroups = MTLSizeMake(block_dims.x, block_dims.y, block_dims.z);
+  [encoder dispatchThreadgroups:threadgroups
+          threadsPerThreadgroup:threads_per_threadgroup];
   if (!shared_encoder) [encoder endEncoding];
   return absl::OkStatus();
 }
@@ -657,9 +677,7 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
                           void* function, bool use_argument_buffer,
                           absl::Span<const MetalKernelArgument> arguments,
                           absl::string_view name, const ThreadDim& thread_dims,
-                          const BlockDim& block_dims, int64_t shmem_bytes,
-                          void* indirect_grid_buffer,
-                          uint64_t indirect_grid_offset) {
+                          const BlockDim& block_dims, int64_t shmem_bytes) {
   if (batch_command_buffer == nullptr) {
     return absl::InternalError("Metal EncodeKernel: null batch command buffer.");
   }
@@ -668,8 +686,8 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
   id<MTLCommandBuffer> cb =
       Obj<MPSCommandBuffer*>(batch_command_buffer).commandBuffer;
   return EncodeComputeInto(cb, pipeline, function, use_argument_buffer,
-                           arguments, name, thread_dims, block_dims, shmem_bytes,
-                           indirect_grid_buffer, indirect_grid_offset);
+                           arguments, name, thread_dims, block_dims,
+                           shmem_bytes);
 }
 
 absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
@@ -1082,21 +1100,6 @@ absl::Status SynchronizeCommandQueue(void* command_queue) {
                      ErrorMessage([command_buffer error])));
   }
   return absl::OkStatus();
-}
-
-Event::Status PollCommandBufferStatus(void* command_buffer) {
-  if (command_buffer == nullptr) return Event::Status::kComplete;
-  switch ([Obj<id<MTLCommandBuffer>>(command_buffer) status]) {
-    case MTLCommandBufferStatusNotEnqueued:
-    case MTLCommandBufferStatusEnqueued:
-    case MTLCommandBufferStatusCommitted:
-    case MTLCommandBufferStatusScheduled:
-      return Event::Status::kPending;
-    case MTLCommandBufferStatusCompleted:
-      return Event::Status::kComplete;
-    case MTLCommandBufferStatusError:
-      return Event::Status::kError;
-  }
 }
 
 }  // namespace stream_executor::metal

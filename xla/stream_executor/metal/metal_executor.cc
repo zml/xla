@@ -353,6 +353,102 @@ bool MetalExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
   return true;
 }
 
+namespace {
+
+// Published LPDDR peak bandwidth per Apple Silicon part.
+//
+// Nothing on the system reports DRAM bandwidth: Metal has no query, the
+// IORegistry AGXAccelerator node carries only "gpu-core-count", the SoC nodes
+// expose "dramcfg-data" as an undocumented blob, and sysctl has nothing. So it
+// is looked up from the two things the device does report -- the GPU
+// generation, parsed out of [MTLDevice architecture] ("applegpu_g16s" -> 16),
+// and the IORegistry core count, which together name the part exactly. Within a
+// generation, core count identifies the die tier (base / Pro / Max / Ultra) and
+// Apple sizes the memory bus by that same tier.
+//
+// Rows are ascending by core budget within a generation and the first match
+// wins, i.e. the smallest row whose budget covers `cores`. Binned-down GPUs
+// therefore land on their own die's row: a 7-core M1, a 14-core M1 Pro and an
+// 8-core M4 resolve to the base part, and the Max bins that genuinely differ
+// (M3 30 vs 40, M4 32 vs 40, M5 32 vs 40) split at the right boundary.
+//
+// Values are bus width x transfer rate, not Apple's rounded marketing figures:
+// 409.6 rather than "400". The distinction matters here because these numbers
+// are also the denominator when reading a measured GB/s back as a fraction of
+// peak, and rounding down manufactures >100%-of-peak artifacts (this backend's
+// NVFP4 GEMVs measure 533-558 GB/s on a 40-core M4 Max, against 546.1 real and
+// "546" advertised).
+int64_t AppleGpuMemoryBandwidth(const MetalComputeCapability& cc,
+                                uint64_t core_count) {
+  struct Part {
+    int gen;
+    int64_t max_cores;
+    int64_t bytes_per_second;
+  };
+  static constexpr Part kParts[] = {
+      {13, 8, 68'250'000'000},    // M1            128-bit LPDDR4X-4266
+      {13, 16, 204'800'000'000},  // M1 Pro        256-bit LPDDR5-6400
+      {13, 32, 409'600'000'000},  // M1 Max        512-bit
+      {13, 64, 819'200'000'000},  // M1 Ultra     1024-bit
+      {14, 10, 102'400'000'000},  // M2            128-bit LPDDR5-6400
+      {14, 19, 204'800'000'000},  // M2 Pro        256-bit
+      {14, 38, 409'600'000'000},  // M2 Max        512-bit
+      {14, 76, 819'200'000'000},  // M2 Ultra     1024-bit
+      {15, 10, 102'400'000'000},  // M3            128-bit LPDDR5-6400
+      {15, 18, 153'600'000'000},  // M3 Pro        192-bit
+      {15, 30, 307'200'000'000},  // M3 Max        384-bit (30-core bin)
+      {15, 40, 409'600'000'000},  // M3 Max        512-bit (40-core bin)
+      {15, 80, 819'200'000'000},  // M3 Ultra     1024-bit
+      {16, 10, 120'000'000'000},  // M4            128-bit LPDDR5X-7500
+      {16, 20, 273'100'000'000},  // M4 Pro        256-bit LPDDR5X-8533
+      {16, 32, 409'600'000'000},  // M4 Max        384-bit (32-core bin)
+      {16, 40, 546'100'000'000},  // M4 Max        512-bit (40-core bin)
+      {17, 10, 153'600'000'000},  // M5            128-bit LPDDR5X-9600
+      {17, 20, 307'200'000'000},  // M5 Pro        256-bit
+      {17, 32, 460'800'000'000},  // M5 Max        384-bit (32-core bin)
+      {17, 40, 614'400'000'000},  // M5 Max        512-bit (40-core bin)
+  };
+  // Complete for shipping silicon: the Ultra line last updated at M3, and
+  // neither an M4 nor an M5 Ultra exists.
+  //
+  // TODO: the M5 rows are unverified on hardware -- they assume M5 reports
+  // generation 17, i.e. that [MTLDevice architecture] reads "applegpu_g17*".
+  // Corroborated but not proven: MLX gates its neural-accelerator path on
+  // `gen >= (arch == 'p' ? 18 : 17)` (mlx/backend/metal/device.cpp,
+  // is_nax_available), and that path is M5-and-up, so MLX makes the same
+  // assumption. If Apple's numbering skips, these four rows never match and the
+  // per-core fallback below covers M5 instead -- degraded, not broken.
+
+  const int gen = cc.architecture_gen();
+  const int64_t cores = static_cast<int64_t>(core_count);
+  if (cores > 0) {
+    for (const Part& part : kParts) {
+      if (part.gen == gen && cores <= part.max_cores) {
+        return part.bytes_per_second;
+      }
+    }
+  }
+
+  // Unknown silicon (a generation past the table, an Ultra tier that does not
+  // exist yet, or a failed architecture/core-count query). Apple sizes the bus
+  // by die tier and scales GPU cores with the same tier, so bandwidth per core
+  // stays in a narrow band across the whole table -- 8.5 GB/s on M1, rising to
+  // 15.4 on M5 -- which is what makes a single per-core constant a usable
+  // stand-in for a missing row. It tracks the recent end of that band rather
+  // than its middle, because the only parts that can land here are newer than
+  // the table and the trend has been monotonically upward.
+  //
+  // Clamped so a garbage core count degrades to a plausible bandwidth rather
+  // than to zero, which is the degenerate case this whole field exists to
+  // avoid.
+  constexpr int64_t kFallbackBytesPerSecondPerCore = 15'000'000'000;
+  const int64_t assumed_cores = cores > 0 ? cores : 8;
+  return std::clamp<int64_t>(assumed_cores * kFallbackBytesPerSecondPerCore,
+                             60'000'000'000, 3'000'000'000'000);
+}
+
+}  // namespace
+
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 MetalExecutor::CreateDeviceDescription() const {
   TF_ASSIGN_OR_RETURN(MetalDeviceInfo info, GetDeviceInfo(device_ordinal()));
@@ -366,7 +462,7 @@ MetalExecutor::CreateDeviceDescription() const {
   // all self-skip — the exact behavior the old {7,5} masquerade hacked toward,
   // now honest. IsNvidiaGpu() is correctly false for Metal.
   desc->set_gpu_compute_capability(
-      GpuComputeCapability(MetalComputeCapability(info.name)));
+      GpuComputeCapability(MetalComputeCapability(info.architecture)));
   desc->set_driver_version(SemanticVersion{0, 0, 0});
   desc->set_runtime_version(SemanticVersion{0, 0, 0});
   desc->set_compile_time_toolkit_version(SemanticVersion{0, 0, 0});
@@ -387,7 +483,35 @@ MetalExecutor::CreateDeviceDescription() const {
   desc->set_device_address_bits(64);
   desc->set_device_memory_size(info.recommended_max_working_set_size);
   desc->set_l2_cache_size(0);
-  desc->set_memory_bandwidth(0);
+  // Non-zero, order-of-magnitude-correct DRAM bandwidth. This field feeds ONLY
+  // the fusion cost model (GpuPerformanceModelBase::Read/WriteTime and
+  // GpuIndexingPerformanceModel), never codegen — see the clock_rate comment
+  // below for why that distinction is what makes this safe.
+  //
+  // At 0, `WriteTime = absl::Seconds(bytes / 0)` = +InfiniteDuration for EVERY
+  // kernel, so PriorityFusion's producer priority
+  // (`time_unfused - time_fused`) is +Inf - +Inf. absl::Duration saturates
+  // rather than producing NaN, but the result is meaningless and the cost model
+  // can no longer rank anything: on gemma-4-26B-A4B decode this left 51
+  // dispatches per layer, ~12 of them kernels that exist only to broadcast a
+  // scalar or materialize a small constant into their single consumer.
+  //
+  // Look the part up by (GPU generation, core count) -- see
+  // AppleGpuMemoryBandwidth. Both inputs are reported by the device; bandwidth
+  // itself is not, by Metal or the IORegistry or sysctl.
+  //
+  // Getting this per-part matters because of what the model does with it. A
+  // uniform bandwidth error cancels out of PriorityFusion's
+  // `time_unfused - time_fused` (both sides scale together), so the absolute
+  // value is not what counts -- the flops-per-byte ratio is, because that is
+  // what decides whether a kernel is modelled as compute- or memory-bound.
+  // ComputeTime already scales with the real core count, so a bandwidth
+  // CONSTANT made that ratio a function of the part: at a flat 400 GB/s a
+  // 40-core M4 Max modelled 17.9 flop/byte against a true ~26, while a 10-core
+  // base M4 modelled 4.5 against a true ~15 -- three times more memory-bound
+  // than the silicon is.
+  desc->set_memory_bandwidth(AppleGpuMemoryBandwidth(
+      MetalComputeCapability(info.architecture), info.gpu_core_count));
   desc->set_pcie_bandwidth(0);
   // Threadgroup-memory budget from the device, not a hardcoded 32 KB. Every
   // shipping Apple GPU (M1..M4) reports 32768, so this is byte-identical today,
@@ -401,9 +525,45 @@ MetalExecutor::CreateDeviceDescription() const {
   desc->set_shared_memory_per_core(tg_mem);
   desc->set_shared_memory_per_block(tg_mem);
   desc->set_shared_memory_per_block_optin(tg_mem);
-  desc->set_clock_rate_ghz(0.0);
-  desc->set_core_count(1);
-  desc->set_fpus_per_core(1);
+  // Apple GPU shader clock (~1.3-1.6 GHz across M1..M4) and ALUs per GPU core
+  // (128, an Apple GPU architectural constant). Like memory_bandwidth these are
+  // cost-model-only inputs: clock_rate_ghz and fpus_per_core are read solely by
+  // GpuPerformanceModelBase (CalculateEffectiveFlopsPerNs) and the autotune
+  // cache key. At 0/1 the effective FLOP rate is 0, so ComputeTime is +Inf for
+  // every kernel and the model is degenerate in the same way the zero bandwidth
+  // made it.
+  //
+  // Unlike bandwidth this one cannot be derived, and the search is recorded so
+  // it is not repeated: Metal exposes no clock, the IORegistry AGXAccelerator
+  // node carries no frequency or performance-state property (the `frequency-*`
+  // keys elsewhere in the tree are PLL tolerances for a clock source, not the
+  // GPU), and sysctl has nothing. powermetrics can read it but needs root and a
+  // sampling window. The spread across shipping parts is ~1.2x and it enters
+  // the model only through the same flop/byte ratio that the derived bandwidth
+  // now fixes, so a constant is honest here in a way it was not for bandwidth,
+  // which was off by the part's tier.
+  desc->set_clock_rate_ghz(1.4);
+  // Real GPU core count, from the IORegistry (Metal has no such query). At the
+  // historical value of 1 the cost model modelled a single-core GPU, so
+  // CalculateEffectiveFlopsPerNs clamped n_active_core to 1 and overestimated
+  // every kernel's compute time by ~core_count, biasing PriorityFusion against
+  // fusing. Measured on gemma-4-26B-A4B decode (M4 Max, 40 cores): 1344 -> 1194
+  // dispatches/token and 73.88 -> 77.49 tok/s at bs=1, bit-identical output.
+  //
+  // Unlike memory_bandwidth/clock_rate_ghz this field is NOT cost-model-only —
+  // the reduction emitter (min_desired_blocks), the split-K rewriter and the
+  // transpose emitter also key their blocking off it, so it can move reduction
+  // arithmetic order. Verified on this model that it does not (golden sha
+  // unchanged across the 1 -> 40 flip), but re-check the golden when enabling a
+  // new model/shape rather than assuming.
+  //
+  // Fall back to 1 (the historical value) if the registry lookup fails, so a
+  // future OS layout change degrades to today's behavior rather than to a
+  // fabricated core count.
+  desc->set_core_count(info.gpu_core_count == 0
+                           ? 1
+                           : static_cast<int>(info.gpu_core_count));
+  desc->set_fpus_per_core(128);
   desc->set_ecc_enabled(false);
   return desc;
 }

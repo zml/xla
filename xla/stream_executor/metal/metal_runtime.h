@@ -26,13 +26,16 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
 
 namespace stream_executor::metal {
 
 struct MetalDeviceInfo {
   std::string name;
+  // Raw [MTLDevice architecture].name, which is the exact string MLX uses
+  // (for example, "applegpu_g16s"). Empty when running on macOS < 14, where
+  // MTLDevice.architecture is unavailable.
+  std::string architecture;
   std::string registry_id;
   uint64_t recommended_max_working_set_size = 0;
   uint64_t max_buffer_length = 0;
@@ -44,10 +47,18 @@ struct MetalDeviceInfo {
   // silently over-allocate threadgroup memory on a smaller-smem part). 0 if the
   // query is unavailable; callers fall back to the historical 32 KB.
   uint64_t max_threadgroup_memory_length = 0;
+  // Physical GPU core count, from the IORegistry "gpu-core-count" property
+  // (Metal itself exposes no such query). Feeds DeviceDescription::core_count,
+  // which the fusion cost model uses to size the machine it is modelling.
+  // 0 when the IORegistry lookup fails; callers must supply a fallback.
+  uint64_t gpu_core_count = 0;
   bool has_unified_memory = true;
 };
 
 struct MetalKernelArgument {
+  enum class Kind : uint8_t { kBuffer, kBytes };
+
+  Kind kind = Kind::kBytes;
   void* buffer = nullptr;
   uint64_t offset = 0;
   const void* bytes = nullptr;
@@ -71,7 +82,6 @@ absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal);
 absl::StatusOr<void*> RetainDevice(int ordinal);
 absl::StatusOr<void*> NewCommandQueue(void* device);
 
-void* RetainObject(void* object);
 void ReleaseObject(void* object);
 
 absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
@@ -102,17 +112,11 @@ absl::StatusOr<void*> NewComputePipeline(void* device, void* function);
 void* NewBatchCommandBuffer(void* command_queue);
 // Encodes one compute kernel into the open command buffer's current underlying
 // MTLCommandBuffer (a fresh compute encoder per call). Does NOT commit.
-// indirect_grid_buffer (optional): a device MTLBuffer holding a {gx,gy,gz} uint3
-// threadgroups-per-grid count for an INDIRECT dispatch (the GPU computed it this
-// step). When null, dispatches block_dims directly. Lets a kernel shrink its own
-// launch to the runtime-active work with no host read (MoE prefill steel GEMM).
 absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
                           void* function, bool use_argument_buffer,
                           absl::Span<const MetalKernelArgument> arguments,
                           absl::string_view name, const ThreadDim& thread_dims,
-                          const BlockDim& block_dims, int64_t shmem_bytes,
-                          void* indirect_grid_buffer = nullptr,
-                          uint64_t indirect_grid_offset = 0);
+                          const BlockDim& block_dims, int64_t shmem_bytes);
 // Encodes a device-to-device blit copy (MTLBlitCommandEncoder copyFromBuffer:..)
 // into the open command buffer — no commit, no host drain. Metal hazard-tracks
 // the buffers, so the copy is ordered after prior writes / before later reads in
@@ -153,7 +157,6 @@ void CommitBatchCommandBufferWithCompletion(
 
 absl::Status WaitUntilCompleted(void* command_buffer);
 absl::Status SynchronizeCommandQueue(void* command_queue);
-Event::Status PollCommandBufferStatus(void* command_buffer);
 
 // === GPU-side cross-command-buffer ordering (MTLSharedEvent) ================
 // One MTLSharedEvent + a monotonic value per device implements producer->consumer
