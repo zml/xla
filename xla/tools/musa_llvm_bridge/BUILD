@@ -155,7 +155,9 @@ cc_test(
     name = "bridge_core_test",
     size = "small",
     srcs = ["bridge_core_test.cc"],
-    data = glob(["testdata/*.ll"]),
+    data = glob(["testdata/*.ll"]) + [
+        "//xla/service/gpu/musa:musa_llvm14_compatibility_goldens",
+    ],
     tags = [
         "gpu",
         "musa-only",

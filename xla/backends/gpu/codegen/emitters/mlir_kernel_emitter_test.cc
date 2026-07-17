@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/runtime/object_pool.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/launch_dimensions.h"
+#include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 #include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
@@ -337,6 +338,19 @@ TEST_F(MlirKernelFusionTest, MusaLLVMModuleUsesShimAbiAndKernelMarker) {
     EXPECT_FALSE(metadata.getName().starts_with("amdgpu."));
     EXPECT_FALSE(metadata.getName().starts_with("rocdl."));
   }
+
+  ASSERT_OK_AND_ASSIGN(
+      ::xla::gpu::musa::MusaLlvm14CompatibilityResult compatibility,
+      ::xla::gpu::musa::NormalizeMusaLlvmForLlvm14(*raw_module, "fusion"));
+  EXPECT_EQ(compatibility.metadata.kernel_entry_names,
+            std::vector<std::string>{"fusion"});
+  EXPECT_TRUE(compatibility.metadata.exported_globals.empty());
+  EXPECT_FALSE(absl::StrContains(compatibility.normalized_llvm,
+                                 ::xla::gpu::musa::kMusaLlvmKernelMarker));
+  EXPECT_FALSE(absl::StrContains(compatibility.normalized_llvm, "memory("));
+  EXPECT_THAT(::xla::gpu::musa::ValidateMusaBridgeIr(
+                  compatibility.normalized_llvm, compatibility.metadata),
+              tsl::testing::IsOk());
 }
 
 }  // namespace

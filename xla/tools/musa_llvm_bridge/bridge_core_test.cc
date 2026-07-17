@@ -58,6 +58,21 @@ std::string ReadTestdata(const std::string& name) {
                      std::istreambuf_iterator<char>());
 }
 
+std::string ReadCompatibilityCorpus(const std::string& name) {
+  const char* test_srcdir = std::getenv("TEST_SRCDIR");
+  const char* test_workspace = std::getenv("TEST_WORKSPACE");
+  EXPECT_NE(test_srcdir, nullptr);
+  EXPECT_NE(test_workspace, nullptr);
+  const std::string path = absl::StrCat(
+      test_srcdir == nullptr ? "" : test_srcdir, "/",
+      test_workspace == nullptr ? "" : test_workspace,
+      "/xla/service/gpu/musa/testdata/llvm14_compatibility/", name);
+  std::ifstream input(path, std::ios::binary);
+  EXPECT_TRUE(input.is_open()) << name;
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
 MusaBridgeCompileRequest RequestForIr(const std::string& ir,
                                       bool with_global = false) {
   MusaBridgeCompileRequest request;
@@ -241,6 +256,34 @@ TEST(MusaLlvmBridgeCoreTest, TranslatesMinimalModuleStructurally) {
   EXPECT_THAT(translated->llvm_ir, HasSubstr("@llvm.musa.read.ptx.sreg.tid.x"));
   EXPECT_THAT(translated->llvm_ir, HasSubstr("!musa.annotations = !{"));
   EXPECT_FALSE(absl::StrContains(translated->llvm_ir, "__xla_musa_"));
+}
+
+TEST(MusaLlvmBridgeCoreTest,
+     ParsesAndTranslatesCurrentLlvmCompatibilityGolden) {
+  MusaBridgeCompileRequest request =
+      RequestForIr(ReadCompatibilityCorpus("elemental.llvm14.ll"));
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_EQ(translated->translated_shim_calls, 1);
+  EXPECT_EQ(translated->kernel_count, 1);
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("define protected mtgpu_kernel void @kernel"));
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("@llvm.musa.read.ptx.sreg.tid.x"));
+}
+
+TEST(MusaLlvmBridgeCoreTest, ParsesAndTranslatesSqrtCompatibilityGolden) {
+  MusaBridgeCompileRequest request =
+      RequestForIr(ReadCompatibilityCorpus("sqrt.llvm14.ll"));
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_EQ(translated->translated_shim_calls, 0);
+  EXPECT_EQ(translated->kernel_count, 1);
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("declare float @llvm.sqrt.f32(float)"));
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("define protected mtgpu_kernel void @kernel"));
 }
 
 TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV1Shim) {

@@ -135,6 +135,46 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "musa_llvm14_compatibility",
+    srcs = ["musa_llvm14_compatibility.cc"],
+    hdrs = ["musa_llvm14_compatibility.h"],
+    deps = [
+        ":musa_bridge_ir_validator",
+        ":musa_shim_abi",
+        ":protocol",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TransformUtils",
+    ],
+)
+
+filegroup(
+    name = "musa_llvm14_compatibility_goldens",
+    srcs = glob(["testdata/llvm14_compatibility/*.ll"]),
+)
+
+xla_cc_test(
+    name = "musa_llvm14_compatibility_test",
+    srcs = ["musa_llvm14_compatibility_test.cc"],
+    data = [":musa_llvm14_compatibility_goldens"],
+    deps = [
+        ":musa_llvm14_compatibility",
+        ":musa_shim_abi",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
 xla_cc_test(
     name = "musa_bridge_ir_validator_test",
     srcs = ["musa_bridge_ir_validator_test.cc"],

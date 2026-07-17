@@ -166,6 +166,7 @@ xla_cc_test(
         "//xla/runtime:object_pool",
         "//xla/service/gpu:gpu_device_info_for_tests",
         "//xla/service/gpu:launch_dimensions",
+        "//xla/service/gpu/musa:musa_llvm14_compatibility",
         "//xla/service/gpu/musa:musa_shim_abi",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor/musa:musa_compute_capability",

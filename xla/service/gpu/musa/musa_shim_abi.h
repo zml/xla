@@ -32,6 +32,10 @@ inline constexpr uint32_t kMusaShimMappingVersion = 1;
 inline constexpr uint32_t kMusaInterchangePointerWidth = 64;
 inline constexpr bool kMusaInterchangeIsLittleEndian = true;
 inline constexpr char kMusaShimSymbolPrefix[] = "__xla_musa_v1_";
+// Current LLVM marks qualified entry definitions with this string attribute.
+// The C08 compatibility boundary consumes it before textual serialization;
+// vendor LLVM must never observe it as an unversioned target attribute.
+inline constexpr char kMusaLlvmKernelMarker[] = "xla.musa.kernel.v1";
 inline constexpr auto& kMusaTargetTriple =
     stream_executor::musa::kMusaTargetTriple;
 inline constexpr auto& kMusaTargetArchitecture =

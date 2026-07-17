@@ -455,17 +455,48 @@ absl::Status ValidateGlobalObjectState(const llvm::GlobalVariable& global,
   return absl::OkStatus();
 }
 
+bool HasLlvm14SqrtAttributes(const llvm::Function& function) {
+  if (function.getIntrinsicID() != llvm::Intrinsic::sqrt ||
+      function.getAttributes().hasRetAttrs()) {
+    return false;
+  }
+  for (unsigned index = 0; index < function.arg_size(); ++index) {
+    if (function.getAttributes().hasParamAttrs(index)) return false;
+  }
+  for (llvm::Attribute attribute : function.getAttributes().getFnAttrs()) {
+    if (attribute.isStringAttribute()) return false;
+    switch (attribute.getKindAsEnum()) {
+      case llvm::Attribute::Memory:
+      case llvm::Attribute::NoFree:
+      case llvm::Attribute::NoSync:
+      case llvm::Attribute::NoUnwind:
+      case llvm::Attribute::Speculatable:
+      case llvm::Attribute::WillReturn:
+        break;
+      default:
+        return false;
+    }
+  }
+  return function.hasFnAttribute(llvm::Attribute::NoFree) &&
+         function.hasFnAttribute(llvm::Attribute::NoSync) &&
+         function.hasFnAttribute(llvm::Attribute::NoUnwind) &&
+         function.hasFnAttribute(llvm::Attribute::Speculatable) &&
+         function.hasFnAttribute(llvm::Attribute::WillReturn) &&
+         function.getMemoryEffects() == llvm::MemoryEffects::none();
+}
+
 absl::Status ValidateIntrinsicAttributes(const llvm::Function& function,
                                          const MusaBridgeIrMetadata& metadata) {
   const llvm::AttributeList expected = llvm::Intrinsic::getAttributes(
       function.getContext(), function.getIntrinsicID(),
       function.getFunctionType());
-  if (function.getAttributes() != expected) {
+  if (function.getAttributes() != expected &&
+      !HasLlvm14SqrtAttributes(function)) {
     return Rejected(
         metadata, "intrinsic-attributes",
         absl::StrCat("intrinsic ", SanitizedSymbol(function.getName()),
-                     " does not carry its canonical LLVM "
-                     "attributes"));
+                     " is neither canonical current LLVM nor a reviewed "
+                     "LLVM 14 compatibility profile"));
   }
   return absl::OkStatus();
 }

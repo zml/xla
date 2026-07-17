@@ -20,10 +20,12 @@ limitations under the License.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "xla/service/gpu/musa/musa_shim_abi.h"
 
 namespace xla::emitters {
 
-inline constexpr char kMusaKernelMarker[] = "xla.musa.kernel.v1";
+inline constexpr const char* kMusaKernelMarker =
+    ::xla::gpu::musa::kMusaLlvmKernelMarker;
 
 // Installs the qualified MUSA target contract before any pointer- or
 // alignment-sensitive lowering runs.
