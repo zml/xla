@@ -182,6 +182,14 @@ class GpuCompiler : public LLVMCompiler {
       HloPassPipeline& pipeline, const DebugOptions& debug_options,
       const se::GpuComputeCapability& gpu_version) = 0;
 
+  // Rewrites supported dots to the target BLAS custom-call ABI. Targets that
+  // do not yet provide a BLAS adapter can leave dots on the generic emitter
+  // path by overriding this with a no-op.
+  virtual void AddGemmRewriterPasses(
+      HloPassPipeline& pipeline, const DebugOptions& debug_options,
+      const se::GpuComputeCapability& gpu_version,
+      const se::SemanticVersion& toolkit_version);
+
   // During compilation with device, stream_exec != null and autotune_results
   // == null. During deviceless AOT compilation, stream_exec == null and
   // autotune_results != null.

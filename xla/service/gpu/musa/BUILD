@@ -155,6 +155,36 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "musa_compiler_bundle",
+    srcs = ["musa_compiler_bundle.cc"],
+    hdrs = ["musa_compiler_bundle.h"],
+    linkopts = ["-ldl"],
+    deps = [
+        ":musa_compilation_provider",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_compiler_bundle_test",
+    srcs = ["musa_compiler_bundle_test.cc"],
+    deps = [
+        ":musa_compilation_provider",
+        ":musa_compiler_bundle",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/testing:temporary_directory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_binary(
     name = "musa_compilation_provider_test_helper",
     testonly = True,

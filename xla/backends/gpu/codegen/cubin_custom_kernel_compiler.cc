@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/backends/gpu/codegen/kernels/musa_custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/triton/triton_kernel_source.h"
 #include "xla/backends/gpu/codegen/triton/xtile_compiler.h"
@@ -123,15 +124,22 @@ absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
   ASSIGN_OR_RETURN(std::vector<uint8_t> cubin,
                    CompileToCubinImpl(std::move(kernel_source)));
 
-  ASSIGN_OR_RETURN(
-      CustomKernel custom_kernel,
-      kernel::CreateOwnedCubinCustomKernel(
-          sanitized_kernel_name, std::move(cubin),
-          kernel_arguments.args().size(), launch_dimensions.block_counts(),
-          launch_dimensions.thread_counts_per_block(), 0));
+  absl::StatusOr<CustomKernel> custom_kernel =
+      device_info_.gpu_compute_capability().IsMusa()
+          ? kernel::CreateOwnedMubinCustomKernel(
+                sanitized_kernel_name, std::move(cubin),
+                kernel_arguments.args().size(),
+                launch_dimensions.block_counts(),
+                launch_dimensions.thread_counts_per_block(), 0)
+          : kernel::CreateOwnedCubinCustomKernel(
+                sanitized_kernel_name, std::move(cubin),
+                kernel_arguments.args().size(),
+                launch_dimensions.block_counts(),
+                launch_dimensions.thread_counts_per_block(), 0);
+  RETURN_IF_ERROR(custom_kernel.status());
 
   return std::make_unique<CustomKernelThunk>(
-      thunk_info, std::move(custom_kernel), kernel_arguments);
+      thunk_info, *std::move(custom_kernel), kernel_arguments);
 }
 
 xla::Future<TritonWrapperResult> CubinCustomKernelCompiler::CompileTritonToLlvm(

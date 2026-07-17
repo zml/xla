@@ -49,6 +49,16 @@ static absl::StatusOr<ExecutableAbiVersion> CreateForRocm(
   return ExecutableAbiVersion::FromProto(std::move(proto));
 }
 
+// MUSA executable envelopes do not yet serialize the full compiler bundle
+// identity. Preserve that identity in the compilation cache key and use the
+// platform token here until the versioned envelope is introduced.
+static absl::StatusOr<ExecutableAbiVersion> CreateForMusa(
+    const DeviceDescription& /*device_description*/) {
+  ExecutableAbiVersionProto proto;
+  proto.set_platform_name("MUSA");
+  return ExecutableAbiVersion::FromProto(std::move(proto));
+}
+
 // Returns a minimal ABI version for oneAPI with no platform-specific version
 // info. Compatibility checks will treat this as always-compatible, preserving
 // pre-existing oneAPI behavior until proper ABI versioning is designed.
@@ -72,6 +82,9 @@ ExecutableAbiVersion::FromDeviceDescription(
   }
   if (device_description.gpu_compute_capability().IsRocm()) {
     return CreateForRocm(device_description);
+  }
+  if (device_description.gpu_compute_capability().IsMusa()) {
+    return CreateForMusa(device_description);
   }
   if (device_description.gpu_compute_capability().IsOneAPI()) {
     return CreateForOneAPI(device_description);

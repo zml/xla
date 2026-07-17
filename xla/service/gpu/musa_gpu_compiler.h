@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_compiler.h"
+#include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
@@ -44,20 +45,10 @@ namespace xla::gpu {
 class MusaGpuCompiler : public GpuCompiler {
  public:
   MusaGpuCompiler();
+  explicit MusaGpuCompiler(
+      std::unique_ptr<musa::MusaCompilationProvider> compilation_provider);
 
   se::Platform::Id PlatformId() const override;
-
-  absl::StatusOr<std::unique_ptr<HloModule>> RunHloPasses(
-      std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
-      const CompileOptions& options) override;
-
-  absl::StatusOr<std::unique_ptr<Executable>> RunBackend(
-      std::unique_ptr<HloModule> module, se::StreamExecutor* stream_exec,
-      const CompileOptions& options) override;
-
-  absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
-  CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
-                     const AotCompilationOptions& options) override;
 
   std::vector<std::string> GetLLVMCommandLineOptions(
       const DebugOptions& debug_options) const override;
@@ -65,6 +56,11 @@ class MusaGpuCompiler : public GpuCompiler {
   void AddPaddingForGpublasGemms(
       HloPassPipeline& pipeline, const DebugOptions& debug_options,
       const se::GpuComputeCapability& gpu_version) override;
+
+  void AddGemmRewriterPasses(
+      HloPassPipeline& pipeline, const DebugOptions& debug_options,
+      const se::GpuComputeCapability& gpu_version,
+      const se::SemanticVersion& toolkit_version) override;
 
   absl::Status OptimizeHloConvolutionCanonicalization(
       HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
@@ -82,6 +78,21 @@ class MusaGpuCompiler : public GpuCompiler {
       const HloModuleConfig& module_config,
       const stream_executor::DeviceDescription& device_description,
       se::StreamExecutor* absl_nullable stream_exec) override;
+
+ protected:
+  absl::Status AddAutotunerPass(
+      HloPassPipeline* pipeline, HloModule* hlo_module,
+      const se::GpuComputeCapability& gpu_version,
+      const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
+      se::StreamExecutor* stream_executor,
+      const GpuTargetConfig* target_config, const AliasInfo* alias_info,
+      mlir::MLIRContext* mlir_context,
+      HloCostAnalysis::ShapeSizeFunction shape_size_fn,
+      const MultiProcessKeyValueStore& key_value_store) override;
+
+ private:
+  std::unique_ptr<musa::MusaCompilationProvider> compilation_provider_;
+  absl::Status compilation_provider_status_;
 };
 
 }  // namespace xla::gpu

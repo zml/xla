@@ -59,6 +59,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/backends/gpu/codegen/kernels/musa_custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/llvm/llvm_emitter.h"
 #include "xla/backends/gpu/codegen/triton/collective_emitter.h"
@@ -1398,21 +1399,29 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
 
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       instr, ir_emitter_context_->GetNextThunkId());
+  bool is_musa = ir_emitter_context_->gpu_compute_capability().IsMusa();
   return status_or_entry.Map(
       [thunk_info = std::move(thunk_info),
-       kernel_arguments = std::move(kernel_arguments),
+       kernel_arguments = std::move(kernel_arguments), is_musa,
        call_zeroed_outputs =
            std::move(call_zeroed_outputs)](const KernelReuseCache::Entry* entry)
           -> absl::StatusOr<ThunkSequence> {
-        ASSIGN_OR_RETURN(CustomKernel custom_kernel,
-                         kernel::CreateOwnedCubinCustomKernel(
-                             entry->kernel_name, entry->binary,
-                             kernel_arguments.args().size(),
-                             entry->launch_dimensions.block_counts(),
-                             entry->launch_dimensions.thread_counts_per_block(),
-                             entry->shmem_bytes));
+        absl::StatusOr<CustomKernel> custom_kernel =
+            is_musa ? kernel::CreateOwnedMubinCustomKernel(
+                          entry->kernel_name, entry->binary,
+                          kernel_arguments.args().size(),
+                          entry->launch_dimensions.block_counts(),
+                          entry->launch_dimensions.thread_counts_per_block(),
+                          entry->shmem_bytes)
+                    : kernel::CreateOwnedCubinCustomKernel(
+                          entry->kernel_name, entry->binary,
+                          kernel_arguments.args().size(),
+                          entry->launch_dimensions.block_counts(),
+                          entry->launch_dimensions.thread_counts_per_block(),
+                          entry->shmem_bytes);
+        RETURN_IF_ERROR(custom_kernel.status());
         return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
-            thunk_info, std::move(custom_kernel), kernel_arguments,
+            thunk_info, *std::move(custom_kernel), kernel_arguments,
             entry->use_pdl, call_zeroed_outputs, entry->tma_metadata));
       });
 }

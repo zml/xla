@@ -1892,11 +1892,10 @@ absl::Status GpuCompiler::RunPreSchedulingCopyInsertion(
       .status();
 }
 
-namespace {
-void AddGemmRewriterPasses(HloPassPipeline& pipeline,
-                           const DebugOptions& debug_options,
-                           const se::GpuComputeCapability gpu_version,
-                           const se::SemanticVersion& toolkit_version) {
+void GpuCompiler::AddGemmRewriterPasses(
+    HloPassPipeline& pipeline, const DebugOptions& debug_options,
+    const se::GpuComputeCapability& gpu_version,
+    const se::SemanticVersion& toolkit_version) {
   // Adding bias to GEMMs is helpful for skipping kernel launches for `add`
   // operations. However, the bias term can add dependencies between the GEMMs
   // that could otherwise be parallelized. Because of this, we disable bias
@@ -1920,7 +1919,6 @@ void AddGemmRewriterPasses(HloPassPipeline& pipeline,
       gpu_version, toolkit_version,
       GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only, bias_mode});
 }
-}  // namespace
 
 absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     HloModule* hlo_module, se::StreamExecutor* stream_exec,

@@ -105,3 +105,30 @@ xla_test(
         "@com_google_googletest//:gtest",
     ],
 )
+cc_library(
+    name = "musa_custom_kernel",
+    srcs = ["musa_custom_kernel.cc"],
+    hdrs = ["musa_custom_kernel.h"],
+    visibility = [":friends"],
+    deps = [
+        ":custom_kernel",
+        "//xla/stream_executor:kernel_args_packing_spec",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+xla_test(
+    name = "musa_custom_kernel_test",
+    srcs = ["musa_custom_kernel_test.cc"],
+    deps = [
+        ":custom_kernel",
+        ":musa_custom_kernel",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor:launch_dim",
+        "//xla/tsl/platform:statusor",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

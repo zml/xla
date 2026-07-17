@@ -20,6 +20,7 @@ limitations under the License.
 #include "xla/stream_executor/abi/executable_abi_version.pb.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
@@ -73,6 +74,20 @@ TEST(ExecutableAbiVersionTest, FromDeviceDescriptionRocm) {
   EXPECT_THAT(executable_abi_version.platform_name(), "ROCM");
   EXPECT_THAT(executable_abi_version.proto(),
               EqualsProto(R"pb(platform_name: "ROCM")pb"));
+}
+
+TEST(ExecutableAbiVersionTest, FromDeviceDescriptionMusa) {
+  DeviceDescription device_description;
+  device_description.set_gpu_compute_capability(GpuComputeCapability(
+      MusaComputeCapability("mp_21", 2, 1, /*hardware_warp_size=*/128,
+                            /*logical_subgroup_size=*/32)));
+
+  ASSERT_OK_AND_ASSIGN(
+      ExecutableAbiVersion executable_abi_version,
+      ExecutableAbiVersion::FromDeviceDescription(device_description));
+  EXPECT_THAT(executable_abi_version.platform_name(), "MUSA");
+  EXPECT_THAT(executable_abi_version.proto(),
+              EqualsProto(R"pb(platform_name: "MUSA")pb"));
 }
 
 TEST(ExecutableAbiVersionTest, FromDeviceDescriptionOneAPI) {
