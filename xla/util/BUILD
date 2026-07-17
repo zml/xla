@@ -55,6 +55,19 @@ cc_library(
     ],
 )
 
+# The element type of an embed_tree() table (xla/util/build_defs.bzl). Declared
+# by hand rather than by the generated code so the type is stable across every
+# embed_tree target and two of them in one namespace cannot collide.
+cc_library(
+    name = "embedded_file",
+    hdrs = ["embedded_file.h"],
+    compatible_with = get_compatible_with_libtpu_portable(),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 cc_library(
     name = "embedded_constant_buffers",
     srcs = ["embedded_constant_buffers.cc"],

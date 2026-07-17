@@ -360,3 +360,11 @@ use_repo(pjrt_rc_number, "rc_number")
 ### libdrm (dedicated extension to avoid Bzlmod merging issues)
 libdrm_ext = use_extension("//third_party/libdrm:extension.bzl", "libdrm_ext")
 use_repo(libdrm_ext, "libdrm")
+
+### mlx (dedicated extension to avoid Bzlmod merging issues)
+# Registered here AND in workspace2.bzl: .bazelrc still defaults to WORKSPACE
+# while the Metal plugin builds --config=bzlmod, and the Metal kernel deps are
+# ungated (there is no if_metal in this repo), so a bzlmod-only dep would break
+# plain `bazel build //xla/...` at analysis for every openxla user.
+mlx_ext = use_extension("//third_party/mlx:extension.bzl", "mlx_ext")
+use_repo(mlx_ext, "mlx")

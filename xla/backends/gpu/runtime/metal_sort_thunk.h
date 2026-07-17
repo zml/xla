@@ -41,7 +41,7 @@ namespace gpu {
 // values and the permuted original indices (topk/argsort need both). Stable:
 // ties keep original (index-ascending) order == XLA is_stable.
 //
-// Kernel = vendored MLX merge sort (metal_kernels/vendored/mlx/mlx_sort.h,
+// Kernel = MLX merge sort (metal_kernels/mlx_entries/mlx_sort.h,
 // get_mlx_sort()). Fixed block bn=512 / tn=4 (N_PER_BLOCK=2048). One dispatch
 // when the row fits a block (n <= 2048); otherwise multi-block: one per-block
 // sort + ceil(log2(n_blocks)) merge passes (each = a partition + a merge

@@ -7,15 +7,26 @@
 # substitution specializes a shader for the live shapes/dtypes before compile.
 #
 # Layout:
-#   vendored/  - third-party shaders, copied VERBATIM from upstream (update = cp):
-#       metalblas/  github.com/Isalia20/metalBLAS  (the GEMM/GEMV family + binder)
-#       mlx/        github.com/ml-explore/mlx       (steel split-K GEMM, MIT)
-#       vllm/       vllm-metal                      (paged-attention tiled kernel)
+#   vendored/  - third-party-derived shaders. Each bundle documents whether it
+#                is byte-verbatim or adapted; do not assume `vendored/` means a
+#                file can be refreshed with an unreviewed copy:
+#       metalblas/  github.com/Isalia20/metalBLAS  (the compiled families only,
+#                   mpp_tensor.h locally patched — see the note at :metalblas_shaders)
+#       vllm/       vllm-metal                      (verbatim kernels)
+#   mlx_entries/ - our entry sources for the MLX-derived bundles. These #include
+#                the pinned @mlx archive rather than copying it, so upstream's
+#                bytes are never checked in here (see :mlx_include_tree) and
+#                cannot be hand-edited. vendored/mlx/ USED to hold ~9,800 lines
+#                of hand-flattened upstream copies with no recorded base; it is
+#                gone, and this is what replaced it. Adding a copy of upstream
+#                MLX text back to this package is a regression -- add an entry
+#                source and, if you must change upstream's bytes, a patch in
+#                //third_party/mlx:series.bzl.
 #   custom/    - shaders written for this backend (the flash-attention family is
 #                adapted from llama.cpp's kernel_flash_attn_ext_vec; kv_write and
 #                topk are original).
 
-load("//xla/util:build_defs.bzl", "embed_files")
+load("//xla/util:build_defs.bzl", "embed_files", "embed_tree")
 
 package(
     default_visibility = [
@@ -25,7 +36,7 @@ package(
     licenses = ["notice"],
 )
 
-# --- metalBLAS GEMM/GEMV shaders (vendored verbatim) ------------------------
+# --- metalBLAS GEMM/GEMV shaders (vendored subset) --------------------------
 #
 # Each family header is `#ifdef MB_BUILD_<NAME>`-guarded and the only always-
 # active header is the shared epilogue mb_epi.h. So metalblas_gemm.cc compiles a
@@ -33,14 +44,77 @@ package(
 # matching `-DMB_BUILD_<NAME>` — byte-identical to compiling the upstream binder
 # with that one flag, but with no build-time include-inlining. Embed every shader
 # header individually (one get_<stem>() per file: get_mb_epi(), get_mpp_tensor(),
-# get_gemv_bt(), get_mlx_steel_splitk(), ...). Updating the bundle stays a plain
-# `cp` of upstream shaders/.
+# get_gemv_bt(), ...).
+#
+# THIS IS A CURATED SUBSET, NOT A MIRROR — do not refresh it with an unreviewed
+# `cp` of upstream shaders/. The bundle tracks exactly the families some C++
+# actually passes to CompileMetalblasKernelToMetallib, which concatenates
+# mb_epi.h + ONE explicitly-passed family; a header nothing names is not
+# conditionally compiled, its bytes never reach the Metal compiler at all. The
+# four flags any caller passes are MB_BUILD_MPP_TENSOR / MB_BUILD_GEMV_BT /
+# MB_BUILD_GEMV_NT / MB_BUILD_GEMV_T (metalblas_gemm.cc:214, 390, 434, 439), so
+# those four families plus the epilogue are what is vendored here.
+#
+# Upstream's other files are deliberately absent. mpp_gemm.h, simd_gemm.h,
+# int_gemm.h, splitk.h, cgemv_t.h, cgemv_nt.h, complex_pack.h and conv1x1.h were
+# carried as embedded .rodata that nothing could ever compile, and were dropped;
+# the binder metalblas.metal, flipt.h and mpp_sgpipe.h were never vendored. Adding
+# one back means adding the C++ that passes its flag, in the same change. Note
+# MB_BUILD_SPLITK is NOT the live split-K: that is MLX's, under the different flag
+# MB_BUILD_MLX_SPLITK (metalblas_gemm.cc:285), sourced from mlx_entries/.
+#
+# The bundle is a subset in a second way too, so a blind `cp` was already wrong
+# before this pruning: mpp_tensor.h carries a local MB_TOKCLAMP patch and differs
+# from upstream by design. Re-sync it by hand, per file, or lose the clamp.
 embed_files(
     name = "metalblas_shaders",
-    srcs = glob([
-        "vendored/metalblas/*.h",
-        "vendored/mlx/*.h",
-    ]),
+    srcs = glob(["vendored/metalblas/*.h"]),
+    cpp_namespace = "xla::gpu",
+)
+
+# --- MLX's Metal kernel headers, verbatim from the pinned archive ------------
+#
+# Generates get_mlx_include_tree(): every mlx/backend/metal/kernels/**/*.h from
+# the @mlx archive (//third_party/mlx:workspace.bzl), embedded PATH-KEYED and
+# untouched. MetalIncludeRoot() writes it back out once per process and passes
+# it to the Metal compiler as -I, so an entry source in mlx_entries/ below is
+# compiled against upstream's own bytes.
+#
+# Path-keyed, not embed_files: MLX's includes are repo-root-relative, and its
+# basenames collide across the layout (kernels/utils.h vs steel/utils.h,
+# kernels/defines.h vs steel/defines.h, steel/gemm/params.h vs
+# steel/conv/params.h, ...), which embed_files cannot express -- it names each
+# accessor from the basename and throws the path away.
+embed_tree(
+    name = "mlx_include_tree",
+    cpp_namespace = "xla::gpu",
+    root_sentinel = "@mlx//:metal_kernels_root_sentinel",
+    root_sentinel_path = "mlx/backend/metal/kernels/utils.h",
+    tree = "@mlx//:metal_kernel_headers",
+)
+
+# --- MLX Steel / quantized shaders -------------------------------------------
+#
+# One get_<stem>() per bundle: get_mlx_steel_splitk() (the split-K GEMM family
+# metalblas_gemm.cc concatenates after mb_epi), get_mlx_steel_qgemm() (Steel
+# tiled block-FP8 / NVFP4 q-GEMM, dense + MoE gather entries),
+# get_mlx_fp4_qmv(), get_mlx_sort().
+#
+# Every bundle is an entry source: a prologue of #includes into the pinned @mlx
+# tree (resolved via -I, see :mlx_include_tree) plus the [[kernel]] entries and
+# forks that are genuinely ours. Upstream's text is not copied here -- that is
+# the invariant this directory exists to hold, and it is now whole: the
+# hand-flattened vendored/mlx/ blobs are all retired.
+#
+# Stems must stay unique -- embed_files names its accessor from the basename, so
+# two bundles claiming one stem is a duplicate-symbol build error rather than a
+# silent shadow.
+#
+# Kept apart from :metalblas_shaders so "which vendored tree does this thunk pull
+# in" is a Bazel label rather than a BUILD comment.
+embed_files(
+    name = "mlx_kernels",
+    srcs = glob(["mlx_entries/*.h"]),
     cpp_namespace = "xla::gpu",
 )
 
@@ -106,35 +180,19 @@ embed_files(
     cpp_namespace = "xla::gpu",
 )
 
-# --- Tiled block-scaled FP8 thin GEMM for batched decode (M = batch > 1) ------
-# Generates get_fp8_gemm_tiled(). Same block-scaled f8 decode as fp8_gemv, but
-# reuses each weight byte across all M rows (threadgroup weight tile).
-embed_files(
-    name = "fp8_gemm_tiled",
-    srcs = ["custom/fp8_gemm_tiled.metal"],
-    cpp_namespace = "xla::gpu",
-)
-
-# NOTE: the MLX Steel tiled block-FP8 GEMM lives in vendored/mlx/mlx_steel_qgemm.h
-# (entries fp8_qmm_t dense + fp8_gather_qmm_rhs MoE; MLX's simdgroup_matrix Steel
-# q-GEMM with the dequant swapped to our 128x128-block f8e4m3fn scheme). It is
-# embedded by the metalblas_shaders glob above (vendored/mlx/*.h) as
+# NOTE: the MLX Steel tiled block-FP8 GEMM lives in mlx_entries/mlx_steel_qgemm.h
+# (dense fp8_qmm_t entries; MLX's simdgroup_matrix Steel q-GEMM with the dequant
+# swapped to our 128x128-block f8e4m3fn scheme). The MoE gather entries in that
+# same bundle are bf16 and nvfp4 only -- fp8 MoE has no ZML emitter. It is
+# embedded by the :mlx_kernels glob above (mlx_entries/*.h) as
 # get_mlx_steel_qgemm() -- do NOT add a second embed target for it (duplicate
-# symbol). Thunks depend on :metalblas_shaders and call get_mlx_steel_qgemm().
+# symbol). Thunks depend on :mlx_kernels and call get_mlx_steel_qgemm().
 
-# --- Custom grouped FP8 (block-scaled) GEMV for MoE experts ------------------
-# Generates get_fp8_moe_gemv(). Same block-scaled f8 decode as fp8_gemv, but
-# each output row indexes its own expert weight matrix (expert_id[r]) -- the
-# per-expert GEMM for top-k mixture-of-experts decode/prefill.
-embed_files(
-    name = "fp8_moe_gemv",
-    srcs = ["custom/fp8_moe_gemv.metal"],
-    cpp_namespace = "xla::gpu",
-)
-
-# --- bf16 (un-quantized) twin of fp8_moe_gemv for fp8-free MoE (e.g. LFM2) -----
-# Generates get_bf16_moe_gemv(). Same grouped per-expert GEMV, bf16 weights, no
-# block scales.
+# --- Custom grouped bf16 GEMV for MoE experts --------------------------------
+# Generates get_bf16_moe_gemv(). Each output row indexes its own expert weight
+# matrix (expert_id[r]) -- the per-expert GEMM for top-k mixture-of-experts
+# decode/prefill. bf16 weights, no block scales (e.g. LFM2). The NVFP4 flavor is
+# MLX's nvfp4_gather_qmv in :mlx_kernels; there is no fp8 flavor.
 embed_files(
     name = "bf16_moe_gemv",
     srcs = ["custom/bf16_moe_gemv.metal"],
@@ -152,9 +210,10 @@ embed_files(
     cpp_namespace = "xla::gpu",
 )
 
-# --- Custom row gather/scatter for the sorted MoE prefill path ----------------
-# Generates get_permute_rows() (gather_rows + scatter_rows): permute routed rows
-# into expert-sorted order before the gather q-GEMM, scatter the result back.
+# --- Sorted MoE route permutation --------------------------------------------
+# Generates get_permute_rows(): gather_rows and scatter_rows, which permute the
+# routed rows into expert-contiguous order for the sorted-prefill MoE path and
+# permute the result back (MetalMoeGemvThunk).
 embed_files(
     name = "permute_rows",
     srcs = ["custom/permute_rows.metal"],

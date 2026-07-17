@@ -1,58 +1,77 @@
-// Vendored from MLX (github.com/ml-explore/mlx, MIT), backend/metal/kernels/sort.h.
-//
-// MLX GPU merge sort (thread -> threadgroup -> multi-block merge), used here as
+// MLX GPU merge sort (MIT License, Copyright (c) 2023 Apple Inc.,
+// https://github.com/ml-explore/mlx). Entry source for the mlx_sort bundle:
 // the XLA Metal backend's native `metal$sort` primitive (routed via
 // RewriteSortToMetalThunk). It replaces the legacy LLVM bitonic sort emitter,
 // which cannot lower to valid AIR (it emits NVVM intrinsics for thread/block
-// ids). Only the thin `[[kernel]]` entry points at the bottom are ours; the
-// device-side merge-sort building blocks (thread_swap, ThreadSort,
-// BlockMergeSort, KernelMultiBlockMergeSort) are copied VERBATIM from MLX.
+// ids).
 //
-// Deltas from upstream MLX, all in the entry points (not the algorithm):
-//   * Only the MULTI-BLOCK path is exposed (mb_block_sort / mb_block_partition /
-//     mb_block_merge). n_blocks==1 degenerates to a single mb_block_sort that
-//     sorts the whole row in one threadgroup -- so one code path covers any n.
+// The upstream text is NOT checked in. The includes below resolve against the
+// @mlx archive pinned in //third_party/mlx:workspace.bzl, which
+// MetalIncludeRoot() hands to the Metal compiler as -I, so the device-side
+// merge-sort building blocks (thread_swap, ThreadSort, BlockMergeSort,
+// KernelMultiBlockMergeSort) are upstream's own bytes rather than a copy of
+// them. To change upstream's bytes, add a patch to //third_party/mlx:series.bzl.
+//
+// The includes are upstream's own prologue, copied from
+// mlx/backend/metal/kernels/sort.metal:4-7. sort.h has no #pragma once and
+// opens on a bare `using namespace metal;`, so it only compiles behind the
+// prologue its own .metal file establishes.
+//
+// Everything below the includes is ours -- only the thin `[[kernel]]` entry
+// points are, and they differ from upstream's deliberately:
+//   * Only the MULTI-BLOCK path is exposed (xla_mb_block_sort /
+//     xla_mb_block_partition / xla_mb_block_merge). n_blocks==1 degenerates to a
+//     single xla_mb_block_sort that sorts the whole row in one threadgroup -- so
+//     one code path covers any n.
 //   * Contiguous last-axis [rows, n] only: MLX's nc_dim/nc_shape/nc_strides
 //     buffers are dropped and the row base is `tid.y * size_sorted_axis`
 //     (sorted-axis stride == 1).
 //   * All three entries are ARG_SORT (they emit sorted VALUES and the permuted
 //     INDICES together -- topk/argsort need both), and are templated on CompareOp
 //     so DESCENDING is a real instantiation (upstream mb_block_sort /
-//     mb_block_partition hardcode ascending LessThan).
+//     mb_block_partition hardcode ascending).
 //
 // Stability: the merge predicate keeps the A-side (earlier block == lower
 // original index) element on ties, so equal keys retain input order == XLA
 // is_stable (index-ascending ties), for both directions. Padding lanes use a
 // NaN sentinel, which the comparators sink to the END of the sort in both
 // directions -- so a slice<=n never sees padding.
-
 #include <metal_stdlib>
 
-using namespace metal;
-
-#ifndef METAL_FUNC
-#define METAL_FUNC inline
-#endif
-#define MLX_MTL_CONST static constant constexpr const
-#define MLX_MTL_LOOP_UNROLL _Pragma("clang loop unroll(full)")
-
-// Metal 3.1+ native bfloat; MLX names it bfloat16_t.
-typedef bfloat bfloat16_t;
+// clang-format off
+#include "mlx/backend/metal/kernels/utils.h"
+#include "mlx/backend/metal/kernels/sort.h"
+// clang-format on
 
 // Sorted-axis stride is always 1 for the contiguous [rows, n] case; a `constant`
 // so it can bind to the `const constant int&` stride parameter.
 constant constexpr const int one_helper = 1;
 
+
 ///////////////////////////////////////////////////////////////////////////////
-// Comparators (key type is always floating: bf16/f16/f32 logits)
+// Comparators
 ///////////////////////////////////////////////////////////////////////////////
 
+// XLA DELTA: rename-fork of upstream's LessThan (sort.h:39). Upstream's is
+// already in scope via the include and is behaviourally the same for every type
+// we instantiate, but ours reaches `init` directly instead of through
+// Init<T>::v, so keeping our own body keeps the sort's emitted code -- and the
+// greedy golden -- provably unmoved by this migration. It is a rename rather
+// than a patch because a rename-fork cannot collide on a bump and cannot
+// silently un-apply. Fold it into upstream's if the Init<T> indirection is ever
+// worth the churn.
+//
+// XlaGreaterThan has no upstream counterpart: it is a real capability gap.
+// Upstream's mb_block_partition hardcodes ascending, and descending is a
+// direction XLA's Sort must express. It is renamed alongside XlaLessThan so the
+// pair reads as one thing that is ours.
+//
 // Padding sentinel sinks to the END of the sort in both directions: quiet NaN
 // for floats (via the NaN branch), type-max for ascending integers, type-min for
 // descending integers. Keys can be float (bf16/f16/f32) or int (8/16/32-bit,
 // signed/unsigned); the NaN branch is compiled out for integer keys.
 template <typename T>
-struct LessThan {
+struct XlaLessThan {
   static constexpr constant T init =
       metal::is_floating_point_v<T>
           ? static_cast<T>(metal::numeric_limits<float>::quiet_NaN())
@@ -67,7 +86,7 @@ struct LessThan {
 };
 
 template <typename T>
-struct GreaterThan {
+struct XlaGreaterThan {
   static constexpr constant T init =
       metal::is_floating_point_v<T>
           ? static_cast<T>(metal::numeric_limits<float>::quiet_NaN())
@@ -78,290 +97,6 @@ struct GreaterThan {
       if (an | bn) return (!an) & bn;  // NaN sinks last in descending too
     }
     return a > b;
-  }
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// Thread-level sort (MLX verbatim)
-///////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-METAL_FUNC void thread_swap(thread T& a, thread T& b) {
-  T w = a;
-  a = b;
-  b = w;
-}
-
-template <
-    typename ValT,
-    typename IdxT,
-    bool ARG_SORT,
-    short N_PER_THREAD,
-    typename CompareOp>
-struct ThreadSort {
-  static METAL_FUNC void sort(
-      thread ValT (&vals)[N_PER_THREAD],
-      thread IdxT (&idxs)[N_PER_THREAD]) {
-    CompareOp op;
-    MLX_MTL_LOOP_UNROLL
-    for (short i = 0; i < N_PER_THREAD; ++i) {
-      MLX_MTL_LOOP_UNROLL
-      for (short j = i & 1; j < N_PER_THREAD - 1; j += 2) {
-        if (op(vals[j + 1], vals[j])) {
-          thread_swap(vals[j + 1], vals[j]);
-          if (ARG_SORT) {
-            thread_swap(idxs[j + 1], idxs[j]);
-          }
-        }
-      }
-    }
-  }
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// Threadgroup-level sort (MLX verbatim)
-///////////////////////////////////////////////////////////////////////////////
-
-template <
-    typename ValT,
-    typename IdxT,
-    bool ARG_SORT,
-    short BLOCK_THREADS,
-    short N_PER_THREAD,
-    typename CompareOp>
-struct BlockMergeSort {
-  using thread_sort_t =
-      ThreadSort<ValT, IdxT, ARG_SORT, N_PER_THREAD, CompareOp>;
-  static METAL_FUNC int merge_partition(
-      const threadgroup ValT* As,
-      const threadgroup ValT* Bs,
-      short A_sz,
-      short B_sz,
-      short sort_md) {
-    CompareOp op;
-
-    short A_st = max(0, sort_md - B_sz);
-    short A_ed = min(sort_md, A_sz);
-
-    while (A_st < A_ed) {
-      short md = A_st + (A_ed - A_st) / 2;
-      auto a = As[md];
-      auto b = Bs[sort_md - 1 - md];
-
-      if (op(b, a)) {
-        A_ed = md;
-      } else {
-        A_st = md + 1;
-      }
-    }
-
-    return A_ed;
-  }
-
-  static METAL_FUNC void merge_step(
-      const threadgroup ValT* As,
-      const threadgroup ValT* Bs,
-      const threadgroup IdxT* As_idx,
-      const threadgroup IdxT* Bs_idx,
-      short A_sz,
-      short B_sz,
-      thread ValT (&vals)[N_PER_THREAD],
-      thread IdxT (&idxs)[N_PER_THREAD]) {
-    CompareOp op;
-    short a_idx = 0;
-    short b_idx = 0;
-
-    for (int i = 0; i < N_PER_THREAD; ++i) {
-      auto a = (a_idx < A_sz) ? As[a_idx] : ValT(CompareOp::init);
-      auto b = (b_idx < B_sz) ? Bs[b_idx] : ValT(CompareOp::init);
-      bool pred = (b_idx < B_sz) && (a_idx >= A_sz || op(b, a));
-
-      vals[i] = pred ? b : a;
-      if (ARG_SORT) {
-        if (pred) {
-          idxs[i] = Bs_idx[b_idx];
-        } else {
-          idxs[i] = (a_idx < A_sz) ? As_idx[a_idx] : IdxT(0);
-        }
-      }
-
-      b_idx += short(pred);
-      a_idx += short(!pred);
-    }
-  }
-
-  static METAL_FUNC void sort(
-      threadgroup ValT* tgp_vals [[threadgroup(0)]],
-      threadgroup IdxT* tgp_idxs [[threadgroup(1)]],
-      int size_sorted_axis,
-      uint3 lid [[thread_position_in_threadgroup]]) {
-    // Get thread location
-    int idx = lid.x * N_PER_THREAD;
-
-    // Load from shared memory
-    thread ValT thread_vals[N_PER_THREAD];
-    thread IdxT thread_idxs[N_PER_THREAD];
-    for (int i = 0; i < N_PER_THREAD; ++i) {
-      thread_vals[i] = tgp_vals[idx + i];
-      if (ARG_SORT) {
-        thread_idxs[i] = tgp_idxs[idx + i];
-      }
-    }
-
-    // Per thread sort
-    if (idx < size_sorted_axis) {
-      thread_sort_t::sort(thread_vals, thread_idxs);
-    }
-
-    // Do merges using threadgroup memory
-    for (int merge_threads = 2; merge_threads <= BLOCK_THREADS;
-         merge_threads *= 2) {
-      // Update threadgroup memory
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (int i = 0; i < N_PER_THREAD; ++i) {
-        tgp_vals[idx + i] = thread_vals[i];
-        if (ARG_SORT) {
-          tgp_idxs[idx + i] = thread_idxs[i];
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      // Find location in merge step
-      int merge_group = lid.x / merge_threads;
-      int merge_lane = lid.x % merge_threads;
-
-      int sort_sz = N_PER_THREAD * merge_threads;
-      int sort_st = N_PER_THREAD * merge_threads * merge_group;
-
-      // As = tgp_vals[A_st:A_ed] is sorted
-      // Bs = tgp_vals[B_st:B_ed] is sorted
-      int A_st = sort_st;
-      int A_ed = sort_st + sort_sz / 2;
-      int B_st = sort_st + sort_sz / 2;
-      int B_ed = sort_st + sort_sz;
-
-      const threadgroup ValT* As = tgp_vals + A_st;
-      const threadgroup ValT* Bs = tgp_vals + B_st;
-      int A_sz = A_ed - A_st;
-      int B_sz = B_ed - B_st;
-
-      // Find a partition of merge elements
-      //  Ci = merge(As[partition:], Bs[sort_md - partition:])
-      //       of size N_PER_THREAD for each merge lane i
-      //  C = [Ci] is sorted
-      int sort_md = N_PER_THREAD * merge_lane;
-      int partition = merge_partition(As, Bs, A_sz, B_sz, sort_md);
-
-      As += partition;
-      Bs += sort_md - partition;
-
-      A_sz -= partition;
-      B_sz -= sort_md - partition;
-
-      const threadgroup IdxT* As_idx =
-          ARG_SORT ? tgp_idxs + A_st + partition : nullptr;
-      const threadgroup IdxT* Bs_idx =
-          ARG_SORT ? tgp_idxs + B_st + sort_md - partition : nullptr;
-
-      // Merge starting at the partition and store results in thread registers
-      merge_step(As, Bs, As_idx, Bs_idx, A_sz, B_sz, thread_vals, thread_idxs);
-    }
-
-    // Write out to shared memory
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = 0; i < N_PER_THREAD; ++i) {
-      tgp_vals[idx + i] = thread_vals[i];
-      if (ARG_SORT) {
-        tgp_idxs[idx + i] = thread_idxs[i];
-      }
-    }
-  }
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// Multi-block merge sort (MLX verbatim)
-///////////////////////////////////////////////////////////////////////////////
-
-template <
-    typename ValT,
-    typename IdxT,
-    bool ARG_SORT,
-    short BLOCK_THREADS,
-    short N_PER_THREAD,
-    typename CompareOp = LessThan<ValT>>
-struct KernelMultiBlockMergeSort {
-  using block_merge_sort_t = BlockMergeSort<
-      ValT,
-      IdxT,
-      ARG_SORT,
-      BLOCK_THREADS,
-      N_PER_THREAD,
-      CompareOp>;
-
-  MLX_MTL_CONST short N_PER_BLOCK = BLOCK_THREADS * N_PER_THREAD;
-
-  static METAL_FUNC void block_sort(
-      const device ValT* inp,
-      device ValT* out_vals,
-      device IdxT* out_idxs,
-      const constant int& size_sorted_axis,
-      const constant int& stride_sorted_axis,
-      threadgroup ValT* tgp_vals,
-      threadgroup IdxT* tgp_idxs,
-      uint3 tid [[threadgroup_position_in_grid]],
-      uint3 lid [[thread_position_in_threadgroup]]) {
-    // tid.y tells us the segment index
-    int base_idx = tid.x * N_PER_BLOCK;
-
-    // Copy into threadgroup memory
-    for (short i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
-      int idx = base_idx + i;
-      tgp_vals[i] = idx < size_sorted_axis ? inp[idx * stride_sorted_axis]
-                                           : ValT(CompareOp::init);
-      tgp_idxs[i] = idx;
-    }
-
-    // Sort elements within the block
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    block_merge_sort_t::sort(tgp_vals, tgp_idxs, size_sorted_axis, lid);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Write output
-    for (int i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
-      int idx = base_idx + i;
-      if (idx < size_sorted_axis) {
-        out_vals[idx] = tgp_vals[i];
-        out_idxs[idx] = tgp_idxs[i];
-      }
-    }
-  }
-
-  static METAL_FUNC int merge_partition(
-      const device ValT* As,
-      const device ValT* Bs,
-      int A_sz,
-      int B_sz,
-      int sort_md) {
-    CompareOp op;
-
-    int A_st = max(0, sort_md - B_sz);
-    int A_ed = min(sort_md, A_sz);
-
-    while (A_st < A_ed) {
-      int md = A_st + (A_ed - A_st) / 2;
-      auto a = As[md];
-      auto b = Bs[sort_md - 1 - md];
-
-      if (op(b, a)) {
-        A_ed = md;
-      } else {
-        A_st = md + 1;
-      }
-    }
-
-    return A_ed;
   }
 };
 
@@ -594,14 +329,14 @@ xla_mb_block_merge(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Instantiations: {float, half, bfloat16_t} x {asc, desc}. Fixed bn=512, tn=4
-// (N_PER_BLOCK = 2048), MLX's choice for large n; correct for any n via padding.
-// Names are matched by the host (MetalSortThunk) as
-//   xla_sort_{block,part,merge}_<dtype>_<dir>
+// Instantiations: {float, half, bfloat16_t, int, short, char, uint, ushort,
+// uchar} x {asc, desc}. Fixed bn=512, tn=4 (N_PER_BLOCK = 2048), MLX's choice
+// for large n; correct for any n via padding. Names are matched by the host
+// (MetalSortThunk) as xla_sort_{block,part,merge}_<dtype>_<dir>.
+//
+// instantiate_kernel comes from upstream's defines.h (reached via utils.h); our
+// own identical copy of it is gone with the flattened bundle.
 ///////////////////////////////////////////////////////////////////////////////
-
-#define instantiate_kernel(name, func, ...) \
-  template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 
 #define instantiate_xla_sort_dir(dname, dtype, cmp)                            \
   instantiate_kernel(                                                          \
@@ -615,8 +350,8 @@ xla_mb_block_merge(
       cmp<dtype>)
 
 #define instantiate_xla_sort_dtype(dtype)      \
-  instantiate_xla_sort_dir("asc", dtype, LessThan) \
-  instantiate_xla_sort_dir("desc", dtype, GreaterThan)
+  instantiate_xla_sort_dir("asc", dtype, XlaLessThan) \
+  instantiate_xla_sort_dir("desc", dtype, XlaGreaterThan)
 
 instantiate_xla_sort_dtype(float)
 instantiate_xla_sort_dtype(half)

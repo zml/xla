@@ -225,3 +225,148 @@ def embed_files(name, srcs, cpp_namespace = "", compatible_with = None, **kwargs
         **kwargs
     )
 
+def embed_tree(
+        name,
+        tree,
+        root_sentinel,
+        root_sentinel_path,
+        cpp_namespace = "",
+        compatible_with = None,
+        **kwargs):
+    """Embeds a whole source tree PATH-KEYED, as an absl::Span<const EmbeddedFile>.
+
+    Unlike embed_files, which names a `get_<stem>()` accessor after each source's
+    basename and discards the path, this preserves each file's root-relative
+    path as the table key. Two reasons, both load-bearing for an include tree:
+    the path is what an `#include` resolves against, and basenames collide across
+    a real directory layout (MLX alone collides on utils.h, defines.h, params.h,
+    mma.h, loader.h, transforms.h and nax.h).
+
+    Example:
+        embed_tree(
+            name = "mlx_include_tree",
+            tree = "@mlx//:metal_kernel_headers",
+            root_sentinel = "@mlx//:metal_kernels_root_sentinel",
+            root_sentinel_path = "mlx/backend/metal/kernels/utils.h",
+            cpp_namespace = "xla::gpu",
+        )
+
+    generates a cc_library with:
+
+        absl::Span<const ::xla::EmbeddedFile> get_mlx_include_tree();
+
+    The bytes are copied verbatim; this rule never transforms a source.
+
+    Args:
+        name: name for the generated cc_library target; also the accessor stem.
+        tree: a single label (typically a filegroup) expanding to the files to
+            embed.
+        root_sentinel: a single-file label inside `tree` whose root-relative path
+            is known. The root is recovered by stripping root_sentinel_path off
+            the sentinel's resolved location -- a filegroup of many files has no
+            single $(location) to strip, hence the sentinel.
+        root_sentinel_path: root_sentinel's path relative to the tree root.
+        cpp_namespace: If set, the generated code is wrapped in this namespace.
+        compatible_with: The `compatible_with` attribute for the generated targets.
+        **kwargs: keyword arguments passed onto the generated cc_library() rule.
+    """
+
+    namespace_open = ""
+    namespace_close = ""
+    if cpp_namespace:
+        namespace_open = "namespace " + cpp_namespace + " { "
+        namespace_close = "}  // namespace " + cpp_namespace + "\n"
+
+    native.genrule(
+        name = name + "_gen",
+        srcs = [tree, root_sentinel],
+        outs = [
+            name + ".cc",
+            name + ".h",
+        ],
+        tools = ["@xxd//:xxd"],
+        cmd = """
+            HDR_OUT=$(location {name}.h)
+            CC_OUT=$(location {name}.cc)
+            GUARD="{guard}"
+
+            # Recover the tree root by stripping the sentinel's known
+            # root-relative path off its resolved location.
+            ROOT=$$(echo "$(location {root_sentinel})" | sed -e 's|{root_sentinel_path}$$||')
+
+            # 1. Header: just the accessor.
+            echo "#ifndef $${{GUARD}}" > "$${{HDR_OUT}}"
+            echo "#define $${{GUARD}}" >> "$${{HDR_OUT}}"
+            echo '#include "absl/types/span.h"' >> "$${{HDR_OUT}}"
+            echo '#include "xla/util/embedded_file.h"' >> "$${{HDR_OUT}}"
+            echo "" >> "$${{HDR_OUT}}"
+            echo "{namespace_open}" >> "$${{HDR_OUT}}"
+            echo "absl::Span<const ::xla::EmbeddedFile> get_{name}();" >> "$${{HDR_OUT}}"
+            echo "{namespace_close}" >> "$${{HDR_OUT}}"
+            echo "#endif  // $${{GUARD}}" >> "$${{HDR_OUT}}"
+
+            # 2. Source preamble.
+            echo "#include <cstddef>" > "$${{CC_OUT}}"
+            echo '#include "absl/strings/string_view.h"' >> "$${{CC_OUT}}"
+            echo '#include "absl/types/span.h"' >> "$${{CC_OUT}}"
+            echo '#include "xla/util/embedded_file.h"' >> "$${{CC_OUT}}"
+            echo '#include "{name}.h"' >> "$${{CC_OUT}}"
+            echo "" >> "$${{CC_OUT}}"
+            echo "{namespace_open}" >> "$${{CC_OUT}}"
+            echo "namespace {{" >> "$${{CC_OUT}}"
+
+            # 3. One byte array per file, in the tree's expansion order.
+            N=0
+            for src in $(locations {tree}); do
+                $(location @xxd//:xxd) -i "$${{src}}" | \
+                sed -e "s/^unsigned char [^[]*/static const unsigned char kFile$${{N}}/" \
+                    -e "s/^unsigned int .*_len/static const size_t kFile$${{N}}_size/" \
+                    >> "$${{CC_OUT}}"
+                echo "" >> "$${{CC_OUT}}"
+                N=$$((N+1))
+            done
+
+            # 4. The path -> contents table, same order, keys relative to ROOT.
+            echo "const ::xla::EmbeddedFile kFiles[] = {{" >> "$${{CC_OUT}}"
+            N=0
+            for src in $(locations {tree}); do
+                KEY="$${{src#$$ROOT}}"
+                echo "    {{\\"$${{KEY}}\\", absl::string_view(reinterpret_cast<const char*>(kFile$${{N}}), kFile$${{N}}_size)}}," >> "$${{CC_OUT}}"
+                N=$$((N+1))
+            done
+            echo "}};" >> "$${{CC_OUT}}"
+            echo "" >> "$${{CC_OUT}}"
+            echo "}}  // namespace" >> "$${{CC_OUT}}"
+            echo "" >> "$${{CC_OUT}}"
+
+            # 5. The accessor.
+            echo "absl::Span<const ::xla::EmbeddedFile> get_{name}() {{" >> "$${{CC_OUT}}"
+            echo "  return absl::MakeConstSpan(kFiles);" >> "$${{CC_OUT}}"
+            echo "}}" >> "$${{CC_OUT}}"
+            echo "" >> "$${{CC_OUT}}"
+            echo "{namespace_close}" >> "$${{CC_OUT}}"
+        """.format(
+            name = name,
+            guard = name.upper() + "_H_",
+            namespace_open = namespace_open,
+            namespace_close = namespace_close,
+            root_sentinel = root_sentinel,
+            root_sentinel_path = root_sentinel_path,
+            tree = tree,
+        ),
+        compatible_with = compatible_with,
+    )
+
+    cc_library(
+        name = name,
+        srcs = [name + ".cc"],
+        hdrs = [name + ".h"],
+        compatible_with = compatible_with,
+        deps = [
+            "//xla/util:embedded_file",
+            "@com_google_absl//absl/strings",
+            "@com_google_absl//absl/types:span",
+        ],
+        **kwargs
+    )
+

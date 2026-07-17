@@ -1,0 +1,10 @@
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+# Nothing is built here. The @mlx archive is pinned in workspace.bzl and patched
+# via series.bzl; its Metal kernel headers are consumed verbatim as an include
+# tree that the compiler reads through -I (see the mlx.BUILD filegroups and
+# //xla/service/gpu:metal_include_root). No build step ever rewrites them, which
+# is what makes "verbatim" true by construction rather than true only if a
+# generator is correct.

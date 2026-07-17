@@ -28,7 +28,9 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/service/gpu/metal_kernels/metalblas_shaders.h"
+#include "xla/service/gpu/metal_kernels/mlx_kernels.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
+#include "xla/service/gpu/metal_include_root.h"
 #include "xla/service/gpu/metalblas_dispatch.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/tsl/platform/env.h"
@@ -50,12 +52,19 @@ namespace se = ::stream_executor;
 // placeholders are substituted, then compiled via the Metal compiler
 // (`metal -std=metal4.0`, required for the cooperative-tensor GEMM families)
 // → metallib.
+//
+// The MLX families are `family_source`s too, but they are entry sources that
+// #include the pinned @mlx tree instead of inlining it, so the compile also
+// needs -I MetalIncludeRoot(). It is passed here rather than by the caller:
+// with one root for the whole process, two identical translation units can
+// never resolve against different trees and alias in the metallib cache.
 absl::StatusOr<std::vector<uint8_t>> CompileMetalblasKernelToMetallib(
     absl::string_view build_flag, absl::string_view family_source,
     absl::Span<const std::pair<absl::string_view, std::string>> subs,
     absl::string_view extra_defines) {
   TF_ASSIGN_OR_RETURN(std::string metal_c, FindMetalTool("metal"));
   TF_ASSIGN_OR_RETURN(std::string metallib, FindMetalTool("metallib"));
+  TF_ASSIGN_OR_RETURN(std::string include_root, MetalIncludeRoot());
 
   std::string src = absl::StrCat("#define ", build_flag, " 1\n", extra_defines,
                                  get_mb_epi(), "\n", family_source);
@@ -78,10 +87,10 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalblasKernelToMetallib(
   };
 
   TF_RETURN_IF_ERROR(tsl::WriteStringToFile(env, metal_path, src));
-  TF_RETURN_IF_ERROR(
-      RunCommand({metal_c, "-std=metal4.0", "-c", metal_path, "-o", air_path},
-                 false)
-          .status());
+  TF_RETURN_IF_ERROR(RunCommand({metal_c, "-std=metal4.0", "-I", include_root,
+                                 "-c", metal_path, "-o", air_path},
+                                false)
+                         .status());
   TF_RETURN_IF_ERROR(
       RunCommand({metallib, air_path, "-o", metallib_path}, false).status());
 
