@@ -21,6 +21,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "mlir/AsmParser/AsmParser.h"
@@ -36,6 +37,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/literal.h"
+#include "xla/service/shape_inference.h"
+#include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
@@ -51,6 +54,10 @@ absl::StatusOr<DotDimensionNumbers> ParseDimensionNumbers(
   mlir::MLIRContext context;
   mlir::Attribute attr = mlir::parseAttribute(composite_attributes, &context);
   mlir::DictionaryAttr dict_attrs = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+  if (!dict_attrs) {
+    return absl::InvalidArgumentError(
+        "composite.attributes must be an MLIR dictionary attribute");
+  }
   if (!dict_attrs.contains("dimension_numbers")) {
     return absl::InvalidArgumentError(
         "dimension_numbers are not set in composite attributes");
@@ -83,20 +90,61 @@ absl::StatusOr<DotDimensionNumbers> ParseDimensionNumbers(
 
   DotDimensionNumbers dnums;
   for (mlir::Attribute dim : lhs_contracting) {
-    dnums.add_lhs_contracting_dimensions(
-        mlir::cast<mlir::IntegerAttr>(dim).getInt());
+    mlir::IntegerAttr integer = mlir::dyn_cast<mlir::IntegerAttr>(dim);
+    if (!integer) {
+      return absl::InvalidArgumentError(
+          "lhs contracting dimensions must contain only integers");
+    }
+    dnums.add_lhs_contracting_dimensions(integer.getInt());
   }
   for (mlir::Attribute dim : rhs_contracting) {
-    dnums.add_rhs_contracting_dimensions(
-        mlir::cast<mlir::IntegerAttr>(dim).getInt());
+    mlir::IntegerAttr integer = mlir::dyn_cast<mlir::IntegerAttr>(dim);
+    if (!integer) {
+      return absl::InvalidArgumentError(
+          "rhs contracting dimensions must contain only integers");
+    }
+    dnums.add_rhs_contracting_dimensions(integer.getInt());
   }
   for (mlir::Attribute dim : lhs_batch) {
-    dnums.add_lhs_batch_dimensions(mlir::cast<mlir::IntegerAttr>(dim).getInt());
+    mlir::IntegerAttr integer = mlir::dyn_cast<mlir::IntegerAttr>(dim);
+    if (!integer) {
+      return absl::InvalidArgumentError(
+          "lhs batch dimensions must contain only integers");
+    }
+    dnums.add_lhs_batch_dimensions(integer.getInt());
   }
   for (mlir::Attribute dim : rhs_batch) {
-    dnums.add_rhs_batch_dimensions(mlir::cast<mlir::IntegerAttr>(dim).getInt());
+    mlir::IntegerAttr integer = mlir::dyn_cast<mlir::IntegerAttr>(dim);
+    if (!integer) {
+      return absl::InvalidArgumentError(
+          "rhs batch dimensions must contain only integers");
+    }
+    dnums.add_rhs_batch_dimensions(integer.getInt());
   }
   return dnums;
+}
+
+absl::Status ValidateDotShape(const HloCallInstruction& call,
+                              const DotDimensionNumbers& dnums) {
+  if (!call.shape().IsArray()) {
+    return absl::InvalidArgumentError(
+        "xla.scaled_dot composite result must be an array");
+  }
+
+  absl::StatusOr<Shape> inferred = ShapeInference::InferDotOpShape(
+      call.operand(0)->shape(), call.operand(1)->shape(), dnums,
+      call.shape().element_type());
+  if (!inferred.ok()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "invalid xla.scaled_dot dimension numbers or operand shapes: ",
+        inferred.status().message()));
+  }
+  if (!ShapeUtil::Compatible(*inferred, call.shape())) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "xla.scaled_dot result shape ", call.shape().ToString(),
+        " does not match the inferred dot shape ", inferred->ToString()));
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -116,20 +164,32 @@ absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
       VLOG(3) << "No frontend attributes";
       continue;
     }
-    auto frontend_attrs = call->frontend_attributes().map();
-    auto key = "composite.name";
-    if (!frontend_attrs.contains(key) ||
-        frontend_attrs.at(key) != "xla.scaled_dot") {
-      VLOG(3) << key << " is not xla.scaled_dot: " << frontend_attrs.at(key);
+    const auto& frontend_attrs = call->frontend_attributes().map();
+    constexpr char key[] = "composite.name";
+    auto name = frontend_attrs.find(key);
+    if (name == frontend_attrs.end()) {
+      VLOG(3) << key << " is not set";
+      continue;
+    }
+    if (name->second != "xla.scaled_dot") {
+      VLOG(3) << key << " is not xla.scaled_dot: " << name->second;
       continue;
     }
     if (!frontend_attrs.contains("composite.attributes")) {
       return absl::InvalidArgumentError(
           "composite.attributes is not set for xla.scaled_dot");
     }
+    if (call->operand_count() != HloScaledDotInstruction::kOperands) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "xla.scaled_dot composite expects exactly ",
+          HloScaledDotInstruction::kOperands, " operands, got ",
+          call->operand_count()));
+    }
     ASSIGN_OR_RETURN(
         DotDimensionNumbers dot_dimension_numbers,
         ParseDimensionNumbers(frontend_attrs.at("composite.attributes")));
+
+    RETURN_IF_ERROR(ValidateDotShape(*call, dot_dimension_numbers));
 
     if (dot_dimension_numbers.lhs_contracting_dimensions_size() != 1 ||
         dot_dimension_numbers.rhs_contracting_dimensions_size() != 1 ||
@@ -198,6 +258,11 @@ absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
     if (!is_supported(lhs, lhs_scale) || !is_supported(rhs, rhs_scale)) {
       continue;
     }
+    if (ShapeUtil::IsScalar(lhs_scale->shape()) &&
+        ShapeUtil::IsScalar(rhs_scale->shape())) {
+      return absl::InvalidArgumentError(
+          "xla.scaled_dot requires at least one non-scalar scale");
+    }
 
     PrecisionConfig precision{};
     precision.mutable_operand_precision()->Resize(2, PrecisionConfig::DEFAULT);
@@ -206,8 +271,16 @@ absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
             call->shape(), call->mutable_operand(0), call->mutable_operand(1),
             call->mutable_operand(2), call->mutable_operand(3),
             dot_dimension_numbers, precision));
-    RETURN_IF_ERROR(call->ReplaceAllUsesWith(scaled_dot));
-    RETURN_IF_ERROR(computation->RemoveInstruction(call));
+    call->SetupDerivedInstruction(scaled_dot);
+    TF_ASSIGN_OR_RETURN(
+        bool replaced,
+        computation->ReplaceInstruction(
+            call, scaled_dot, /*preserve_sharding=*/true,
+            /*relay_control_dependency=*/true));
+    if (!replaced) {
+      return absl::InternalError(
+          "failed to replace xla.scaled_dot composite call");
+    }
     changed = true;
   }
   return changed;

@@ -16,6 +16,8 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/scaled_dot_rewriter.h"
 
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -151,11 +153,13 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
   HloComputation* computation = dot->parent();
   HloInstruction* operand = dot->mutable_operand(operand_index);
   HloInstruction* scale = dot->mutable_operand(scale_index);
-  if (scale->shape().dimensions().empty()) {
-    // If the scale is a scalar, we don't need to do anything.
-    return operand;
-  }
   std::tie(operand, scale) = UpscaleBoth(operand, scale);
+  if (scale->shape().dimensions().empty()) {
+    HloInstruction* broadcasted_scale = computation->AddInstruction(
+        HloInstruction::CreateBroadcast(operand->shape(), scale, {}));
+    return computation->AddInstruction(HloInstruction::CreateBinary(
+        operand->shape(), HloOpcode::kMultiply, operand, broadcasted_scale));
+  }
   RETURN_IF_ERROR(CheckOperandAndScaleShapes(side, operand, scale));
   HloInstruction* broadcasted_scale =
       BroadcastAndReshape(scale, operand->shape(), computation);
@@ -167,16 +171,19 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
 
 // === Weight-only fused scaled matmul: shared layout predicates + platform emit ===
 
-// True if `s` is the identity (all-ones) scale of an unquantized activation:
-// rank-0, or a bf16 all-ones dense constant with every dim == 1 (ZML weight-only
-// form). Used by backends that fuse only when the act side has no real scale.
+// True if `s` is a bf16 all-ones constant representing an unquantized
+// activation. The ZML weight-only form is either scalar or has every dimension
+// equal to one. Do not infer identity from shape alone: a scalar parameter (or
+// a non-one scalar constant) cannot be dropped by the fused three-operand ABI.
 bool IsIdentityScale(const HloInstruction* s) {
-  if (s->shape().element_type() != BF16) return false;
+  if (s->shape().element_type() != BF16 ||
+      s->opcode() != HloOpcode::kConstant) {
+    return false;
+  }
   for (int64_t d : s->shape().dimensions()) {
     if (d != 1) return false;
   }
-  if (s->shape().dimensions().empty()) return true;  // rank-0 pass-through
-  return s->opcode() == HloOpcode::kConstant && s->literal().IsAllFloat(1.0);
+  return s->literal().IsAllFloat(1.0);
 }
 
 // MX group-32: f8e4m3fn/f4e2m1 weight [N,K] + f8e8m0 scale [N,K/32], K minor.
@@ -244,8 +251,37 @@ bool IsNvfp4Weight(const HloInstruction* w, const HloInstruction* s,
   return sk != 0 && k == sk * 16;
 }
 
-// Weight-only layout common to fused backends: bf16[M,K] x quant[N,K] -> bf16[M,N],
-// K minor on both, identity lhs scale, one of the supported weight/scale layouts.
+// MLX flattens every leading dimension of a row-contiguous lhs when the weight
+// is an unbatched rank-2 matrix. The Metal custom-call ABI is static int32
+// rank-2, so compute that flattened M without overflowing it.
+std::optional<int64_t> GetFlattenedRows(const Shape& x) {
+  const int64_t rank = x.dimensions().size();
+  if (rank == 0) return std::nullopt;
+
+  constexpr int64_t kMaxMetalDimension =
+      std::numeric_limits<int32_t>::max();
+  if (x.is_dynamic_dimension(rank - 1) || x.dimensions(rank - 1) <= 0 ||
+      x.dimensions(rank - 1) > kMaxMetalDimension) {
+    return std::nullopt;
+  }
+
+  int64_t rows = 1;
+  for (int64_t dim = 0; dim < rank - 1; ++dim) {
+    if (x.is_dynamic_dimension(dim)) return std::nullopt;
+    const int64_t size = x.dimensions(dim);
+    if (size <= 0 || size > kMaxMetalDimension / rows) {
+      return std::nullopt;
+    }
+    rows *= size;
+  }
+  return rows;
+}
+
+// Weight-only layout common to fused backends: a bf16 lhs whose final
+// dimension is K, quant[N,K] shared rank-2 weights, identity lhs scale, and one
+// of the supported weight/scale layouts. With no dot batch dimensions, all lhs
+// leading dimensions are independent rows and can be flattened exactly as MLX
+// does for a row-contiguous lhs.
 bool IsWeightOnlyFusableScaledDot(const HloScaledDotInstruction* dot) {
   const DotDimensionNumbers& dn = dot->dot_dimension_numbers();
   if (dn.lhs_batch_dimensions_size() != 0 ||
@@ -259,25 +295,98 @@ bool IsWeightOnlyFusableScaledDot(const HloScaledDotInstruction* dot) {
   const HloInstruction* w = dot->operand(1);
   const HloInstruction* xs = dot->operand(2);
   const HloInstruction* ws = dot->operand(3);
-  if (x->shape().dimensions().size() != 2 ||
-      x->shape().element_type() != BF16 ||
-      dn.lhs_contracting_dimensions(0) != 1 || !IsIdentityScale(xs)) {
+  const int64_t x_rank = x->shape().dimensions().size();
+  if (x_rank == 0 || x->shape().element_type() != BF16 ||
+      dn.lhs_contracting_dimensions(0) != x_rank - 1 ||
+      !IsIdentityScale(xs) || !GetFlattenedRows(x->shape()).has_value()) {
     return false;
   }
   const int64_t rhs_c = dn.rhs_contracting_dimensions(0);
-  return IsMxGroup32Weight(w, ws, rhs_c) || IsBlock128Bf16Weight(w, ws, rhs_c) ||
-         IsPerChannelWeight(w, ws, rhs_c) || IsNvfp4Weight(w, ws, rhs_c);
+  const bool supported_weight =
+      IsMxGroup32Weight(w, ws, rhs_c) ||
+      IsBlock128Bf16Weight(w, ws, rhs_c) ||
+      IsPerChannelWeight(w, ws, rhs_c) || IsNvfp4Weight(w, ws, rhs_c);
+  if (!supported_weight) return false;
+
+  constexpr int64_t kMaxMetalDimension =
+      std::numeric_limits<int32_t>::max();
+  for (int64_t dim = 0; dim < w->shape().dimensions().size(); ++dim) {
+    if (w->shape().is_dynamic_dimension(dim) ||
+        w->shape().dimensions(dim) <= 0 ||
+        w->shape().dimensions(dim) > kMaxMetalDimension) {
+      return false;
+    }
+  }
+  for (int64_t dim = 0; dim < ws->shape().dimensions().size(); ++dim) {
+    if (ws->shape().is_dynamic_dimension(dim) ||
+        ws->shape().dimensions(dim) <= 0) {
+      return false;
+    }
+  }
+  if (w->shape().dimensions(1) != x->shape().dimensions(x_rank - 1)) {
+    return false;
+  }
+
+  // With no batch dimensions and a rank-2 rhs, the dot result is exactly the
+  // lhs leading dimensions followed by rhs N. Validate it explicitly before
+  // constructing a fixed BF16 [M,N] call and reshaping it back; production HLO
+  // is verified earlier, but this keeps the fusion boundary safe on malformed
+  // or partially dynamic input as well.
+  const Shape& result = dot->shape();
+  if (result.dimensions().size() != x_rank) return false;
+  for (int64_t dim = 0; dim < x_rank - 1; ++dim) {
+    if (result.is_dynamic_dimension(dim) ||
+        result.dimensions(dim) != x->shape().dimensions(dim)) {
+      return false;
+    }
+  }
+  return !result.is_dynamic_dimension(x_rank - 1) &&
+         result.dimensions(x_rank - 1) == w->shape().dimensions(0);
 }
 
 // Metal: emit zml$scaled_matmul {x, w, w_scale}; ThunkEmitter dispatches scheme.
 absl::StatusOr<HloInstruction*> TryEmitMetalScaledMatmul(
     HloComputation* comp, HloScaledDotInstruction* dot) {
   if (!IsWeightOnlyFusableScaledDot(dot)) return nullptr;
-  return comp->AddInstruction(HloInstruction::CreateCustomCall(
-      dot->shape(),
-      {dot->mutable_operand(0), dot->mutable_operand(1),
-       dot->mutable_operand(3)},
-      std::string(kMetalScaledMatmulCallTarget)));
+
+  HloInstruction* x = dot->mutable_operand(0);
+  HloInstruction* w = dot->mutable_operand(1);
+  HloInstruction* ws = dot->mutable_operand(3);
+  const bool needs_flatten = x->shape().dimensions().size() != 2;
+  const int64_t m = *GetFlattenedRows(x->shape());
+  const int64_t k = x->shape().dimensions().back();
+  const int64_t n = w->shape().dimensions(0);
+
+  Shape call_result_shape = dot->shape();
+  if (needs_flatten) {
+    Shape flat_x_shape = ShapeUtil::MakeShape(BF16, {m, k});
+    LayoutUtil::SetToDefaultLayout(&flat_x_shape);
+    x = comp->AddInstruction(
+        HloInstruction::CreateReshape(flat_x_shape, x));
+    call_result_shape = ShapeUtil::MakeShape(BF16, {m, n});
+  }
+
+  // The Metal kernels interpret all three inputs and the output as dense
+  // row-major matrices. Carry that ABI requirement on the custom call so GPU
+  // layout assignment inserts copies when an input arrives in another physical
+  // layout. SetToDefaultLayout changes only minor_to_major, preserving the
+  // sub-byte element size on packed fp4 weights.
+  std::vector<HloInstruction*> operands = {x, w, ws};
+  std::vector<Shape> operand_layouts;
+  operand_layouts.reserve(operands.size());
+  for (const HloInstruction* operand : operands) {
+    operand_layouts.push_back(
+        LayoutUtil::GetWithDefaultLayout(operand->shape()));
+  }
+  Shape result_layout =
+      LayoutUtil::GetWithDefaultLayout(call_result_shape);
+  HloInstruction* call = comp->AddInstruction(HloInstruction::CreateCustomCall(
+      result_layout, operands, std::string(kMetalScaledMatmulCallTarget),
+      operand_layouts));
+  if (!needs_flatten) return call;
+
+  return comp->AddInstruction(
+      HloInstruction::CreateReshape(dot->shape(), call));
 }
 
 // Backend switch: try a fused custom call for this platform. Returns nullptr to

@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/parser/hlo_parser.h"
@@ -179,6 +180,314 @@ TEST_P(CompositeRewriterParameterizedTest, Run) {
     EXPECT_THAT(module->entry_computation()->root_instruction()->opcode(),
                 HloOpcode::kCall);
   }
+}
+
+void ExpectInvalidRewrite(absl::string_view hlo,
+                          absl::string_view expected_message) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  CompositeRewriter rewriter;
+  absl::StatusOr<bool> result = rewriter.Run(module.get());
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(result.status().message(),
+              ::testing::HasSubstr(expected_message));
+}
+
+TEST(CompositeRewriterTest, MissingCompositeNameIsIgnoredSafely) {
+  constexpr absl::string_view hlo = R"(
+    HloModule missing_name
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.version="1"
+        }
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  CompositeRewriter rewriter;
+  EXPECT_THAT(rewriter.Run(module.get()), absl_testing::IsOkAndHolds(false));
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kCall);
+}
+
+TEST(CompositeRewriterTest, RejectsNonDictionaryCompositeAttributes) {
+  constexpr absl::string_view hlo = R"(
+    HloModule bad_attributes
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={composite.attributes="42 : i64",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "must be an MLIR dictionary attribute");
+}
+
+TEST(CompositeRewriterTest, RejectsNonIntegerDimensionAttribute) {
+  constexpr absl::string_view hlo = R"(
+    HloModule bad_dimension_type
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[\"bad\"],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo,
+                       "lhs contracting dimensions must contain only integers");
+}
+
+TEST(CompositeRewriterTest, RejectsTooFewOperandsBeforeIndexing) {
+  constexpr absl::string_view hlo = R"(
+    HloModule too_few_operands
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      ROOT call = bf16[2,8]{1,0} call(lhs, rhs, lhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "expects exactly 4 operands, got 3");
+}
+
+TEST(CompositeRewriterTest, RejectsExtraOperandInsteadOfSilentlyDroppingIt) {
+  constexpr absl::string_view hlo = R"(
+    HloModule extra_operand
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      p4 = bf16[] parameter(4)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      global_scale = bf16[] parameter(3)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale, global_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "expects exactly 4 operands, got 5");
+}
+
+TEST(CompositeRewriterTest, RejectsOutOfRangeDimensionNumber) {
+  constexpr absl::string_view hlo = R"(
+    HloModule out_of_range_dimension
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[2],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "dimension numbers or operand shapes");
+}
+
+TEST(CompositeRewriterTest, RejectsMismatchedBatchDimensionCounts) {
+  constexpr absl::string_view hlo = R"(
+    HloModule mismatched_batch_counts
+
+    scaled_dot_body {
+      p0 = bf16[3,2,32]{2,1,0} parameter(0)
+      p1 = f4e2m1fn[3,8,32]{2,1,0:E(4)} parameter(1)
+      p2 = bf16[1,1,1]{2,1,0} parameter(2)
+      p3 = f8e4m3fn[3,8,2]{2,1,0} parameter(3)
+      ROOT dummy = bf16[3,2,3,8]{3,2,1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[3,2,32]{2,1,0} parameter(0)
+      rhs = f4e2m1fn[3,8,32]{2,1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1,1]{2,1,0} constant({{{1}}})
+      rhs_scale = f8e4m3fn[3,8,2]{2,1,0} parameter(2)
+      ROOT call = bf16[3,2,3,8]{3,2,1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[2],[2]],[[0],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "dimension numbers or operand shapes");
+}
+
+TEST(CompositeRewriterTest, RejectsResultShapeMismatch) {
+  constexpr absl::string_view hlo = R"(
+    HloModule result_shape_mismatch
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,7]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      ROOT call = bf16[2,7]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "does not match the inferred dot shape");
+}
+
+TEST(CompositeRewriterTest, RejectsTwoScalarScales) {
+  constexpr absl::string_view hlo = R"(
+    HloModule two_scalar_scales
+
+    scaled_dot_body {
+      p0 = f4e2m1fn[2,32]{1,0:E(4)} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = f8e4m3fn[] parameter(2)
+      p3 = f8e4m3fn[] parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = f4e2m1fn[2,32]{1,0:E(4)} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = f8e4m3fn[] parameter(2)
+      rhs_scale = f8e4m3fn[] parameter(3)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"}
+    }
+  )";
+  ExpectInvalidRewrite(hlo, "requires at least one non-scalar scale");
+}
+
+TEST(CompositeRewriterTest, ReplacementPreservesMetadataShardingAndControlDeps) {
+  constexpr absl::string_view hlo = R"(
+    HloModule replacement_properties
+
+    scaled_dot_body {
+      p0 = bf16[2,32]{1,0} parameter(0)
+      p1 = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      p2 = bf16[1,1]{1,0} parameter(2)
+      p3 = f8e4m3fn[8,2]{1,0} parameter(3)
+      ROOT dummy = bf16[2,8]{1,0} constant({...})
+    }
+
+    ENTRY main {
+      lhs = bf16[2,32]{1,0} parameter(0)
+      rhs = f4e2m1fn[8,32]{1,0:E(4)} parameter(1)
+      lhs_scale = bf16[1,1]{1,0} constant({{1}})
+      rhs_scale = f8e4m3fn[8,2]{1,0} parameter(2)
+      predecessor = u32[] constant(0)
+      ROOT call = bf16[2,8]{1,0}
+        call(lhs, rhs, lhs_scale, rhs_scale),
+        to_apply=scaled_dot_body, is_composite=true,
+        frontend_attributes={
+          composite.attributes="{dimension_numbers=[[[1],[1]],[[],[]]]}",
+          composite.name="xla.scaled_dot",composite.version="1"},
+        metadata={op_name="nvfp4_projection"}, sharding={replicated},
+        control-predecessors={predecessor}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  CompositeRewriter rewriter;
+  EXPECT_THAT(rewriter.Run(module.get()), absl_testing::IsOkAndHolds(true));
+
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kScaledDot);
+  EXPECT_EQ(root->metadata().op_name(), "nvfp4_projection");
+  ASSERT_TRUE(root->has_sharding());
+  EXPECT_TRUE(root->sharding().IsReplicated());
+  ASSERT_EQ(root->control_predecessors().size(), 1);
+  EXPECT_EQ(root->control_predecessors().front()->name(), "predecessor");
 }
 
 INSTANTIATE_TEST_SUITE_P(
