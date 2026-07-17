@@ -19,6 +19,7 @@ limitations under the License.
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +30,7 @@ namespace xla::gpu::musa {
 
 struct MusaSubprocessLimits {
   std::chrono::milliseconds timeout = std::chrono::minutes(2);
+  size_t max_stdin_bytes = 64 << 20;
   size_t max_stdout_bytes = 1 << 20;
   size_t max_stderr_bytes = 1 << 20;
   uint64_t max_file_bytes = uint64_t{128} << 20;
@@ -40,29 +42,37 @@ struct MusaSubprocessLimits {
 struct MusaSubprocessOptions {
   std::string executable;
   std::vector<std::string> arguments;
+  std::string stdin_data;
   std::string working_directory;
   std::vector<std::pair<std::string, std::string>> environment;
   MusaSubprocessLimits limits;
+
+  // Invoked by the parent while the child is running. It must be thread-safe,
+  // nonblocking, and remain valid until this call returns.
+  std::function<bool()> cancellation_requested;
 };
 
 struct MusaSubprocessResult {
   int exit_code = -1;
   int terminating_signal = 0;
   bool timed_out = false;
+  bool cancelled = false;
   bool output_limit_exceeded = false;
   std::string stdout_text;
   std::string stderr_text;
 
   bool exited_successfully() const {
-    return !timed_out && !output_limit_exceeded && terminating_signal == 0 &&
-           exit_code == 0;
+    return !timed_out && !cancelled && !output_limit_exceeded &&
+           terminating_signal == 0 && exit_code == 0;
   }
 };
 
 // Executes one absolute program without a shell. On Linux, the child becomes
 // a process-group leader, receives a clean signal mask/disposition set, keeps
 // only stdin/stdout/stderr, and receives CPU, address-space, file-size, and
-// core limits. Timeout or output overflow kills the process group and direct
+// core limits. Bounded stdin is staged in an anonymous in-memory file before
+// fork so request delivery cannot deadlock with captured child output. Timeout,
+// cancellation, or output overflow kills the process group and direct
 // child; copied output descriptors are forcibly abandoned after a bounded
 // post-kill drain. Pre-fork setup failures are Status values. Child-side setup
 // and exec failures are started-child results with exit code 127.

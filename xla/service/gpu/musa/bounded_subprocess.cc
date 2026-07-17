@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <utility>
@@ -34,6 +35,7 @@ limitations under the License.
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <poll.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -54,7 +56,8 @@ constexpr size_t kMaxEnvironmentBytes = 1 << 20;
 constexpr size_t kMaxPathBytes = 4096;
 constexpr size_t kMaxEnvironmentNameBytes = 256;
 constexpr size_t kMaxEnvironmentValueBytes = 64 << 10;
-constexpr size_t kMaxCapturedStreamBytes = 64 << 20;
+constexpr size_t kMaxInputStreamBytes = size_t{512} << 20;
+constexpr size_t kMaxCapturedStreamBytes = size_t{512} << 20;
 constexpr uint64_t kMaxFileBytes = uint64_t{4} << 30;
 constexpr uint64_t kMaxAddressSpaceBytes = uint64_t{64} << 30;
 constexpr auto kMaxTimeout = std::chrono::hours(1);
@@ -121,7 +124,10 @@ absl::Status ValidateOptions(const MusaSubprocessOptions& options) {
   }
   const MusaSubprocessLimits& limits = options.limits;
   if (limits.timeout <= std::chrono::milliseconds::zero() ||
-      limits.timeout > kMaxTimeout || limits.max_stdout_bytes == 0 ||
+      limits.timeout > kMaxTimeout || limits.max_stdin_bytes == 0 ||
+      limits.max_stdin_bytes > kMaxInputStreamBytes ||
+      options.stdin_data.size() > limits.max_stdin_bytes ||
+      limits.max_stdout_bytes == 0 ||
       limits.max_stdout_bytes > kMaxCapturedStreamBytes ||
       limits.max_stderr_bytes == 0 ||
       limits.max_stderr_bytes > kMaxCapturedStreamBytes ||
@@ -172,6 +178,52 @@ absl::StatusOr<Pipe> MakePipe() {
     fds[i] = replacement;
   }
   return Pipe{.read = fds[0], .write = fds[1]};
+}
+
+absl::StatusOr<int> MakeInputFile(const std::string& input) {
+#if defined(SYS_memfd_create)
+  int fd = syscall(SYS_memfd_create, "xla-musa-subprocess-input", MFD_CLOEXEC);
+  if (fd < 0) {
+    return absl::InternalError(
+        absl::StrCat("memfd_create failed: ", std::strerror(errno)));
+  }
+  if (fd <= STDERR_FILENO) {
+    const int replacement = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (replacement < 0) {
+      const int saved_errno = errno;
+      close(fd);
+      return absl::InternalError(
+          absl::StrCat("failed to move MUSA subprocess input above stdio: ",
+                       std::strerror(saved_errno)));
+    }
+    close(fd);
+    fd = replacement;
+  }
+  size_t written = 0;
+  while (written < input.size()) {
+    const ssize_t count =
+        write(fd, input.data() + written, input.size() - written);
+    if (count > 0) {
+      written += static_cast<size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    const int saved_errno = errno;
+    close(fd);
+    return absl::InternalError(absl::StrCat(
+        "write to MUSA subprocess input failed: ", std::strerror(saved_errno)));
+  }
+  if (lseek(fd, 0, SEEK_SET) != 0) {
+    const int saved_errno = errno;
+    close(fd);
+    return absl::InternalError(absl::StrCat(
+        "rewind MUSA subprocess input failed: ", std::strerror(saved_errno)));
+  }
+  return fd;
+#else
+  return absl::UnimplementedError(
+      "bounded MUSA subprocess stdin requires memfd_create");
+#endif
 }
 
 bool SetLimit(int resource, uint64_t value) {
@@ -331,11 +383,18 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
         "bounded MUSA subprocesses require waitable child processes");
   }
 
+  absl::StatusOr<int> input_fd_or = MakeInputFile(options.stdin_data);
+  if (!input_fd_or.ok()) return input_fd_or.status();
+  int input_fd = *input_fd_or;
   absl::StatusOr<Pipe> stdout_pipe_or = MakePipe();
-  if (!stdout_pipe_or.ok()) return stdout_pipe_or.status();
+  if (!stdout_pipe_or.ok()) {
+    CloseFd(&input_fd);
+    return stdout_pipe_or.status();
+  }
   Pipe stdout_pipe = *stdout_pipe_or;
   absl::StatusOr<Pipe> stderr_pipe_or = MakePipe();
   if (!stderr_pipe_or.ok()) {
+    CloseFd(&input_fd);
     CloseFd(&stdout_pipe.read);
     CloseFd(&stdout_pipe.write);
     return stderr_pipe_or.status();
@@ -366,6 +425,7 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
 
   const long open_max = sysconf(_SC_OPEN_MAX);
   if (open_max <= STDERR_FILENO || open_max > std::numeric_limits<int>::max()) {
+    CloseFd(&input_fd);
     CloseFd(&stdout_pipe.read);
     CloseFd(&stdout_pipe.write);
     CloseFd(&stderr_pipe.read);
@@ -380,6 +440,7 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
   if (pid < 0) {
     const absl::Status status = absl::InternalError(
         absl::StrCat("fork failed: ", std::strerror(errno)));
+    CloseFd(&input_fd);
     CloseFd(&stdout_pipe.read);
     CloseFd(&stdout_pipe.write);
     CloseFd(&stderr_pipe.read);
@@ -412,18 +473,12 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
         !SetLimit(RLIMIT_CPU, cpu_seconds)) {
       ChildFailure(stderr_pipe.write, "setrlimit failed\n");
     }
-    // Do not set O_CLOEXEC here: if stdin was closed in the parent, open can
-    // return fd 0 and dup2(0, 0) intentionally preserves descriptor flags.
-    const int null_fd = open("/dev/null", O_RDONLY);
-    if (null_fd < 0) {
-      ChildFailure(stderr_pipe.write, "open /dev/null failed\n");
-    }
-    if (dup2(null_fd, STDIN_FILENO) < 0 ||
+    if (dup2(input_fd, STDIN_FILENO) < 0 ||
         dup2(stdout_pipe.write, STDOUT_FILENO) < 0 ||
         dup2(stderr_pipe.write, STDERR_FILENO) < 0) {
       ChildFailure(stderr_pipe.write, "dup2 failed\n");
     }
-    if (null_fd > STDERR_FILENO) close(null_fd);
+    CloseFd(&input_fd);
     CloseFd(&stdout_pipe.write);
     CloseFd(&stderr_pipe.write);
     if (!CloseInheritedFileDescriptors(max_fd)) {
@@ -433,6 +488,7 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
     ChildFailure(STDERR_FILENO, "execve failed\n");
   }
 
+  CloseFd(&input_fd);
   CloseFd(&stdout_pipe.write);
   CloseFd(&stderr_pipe.write);
   // Close a race where the child reaches exec before its own setpgid call.
@@ -476,6 +532,11 @@ absl::StatusOr<MusaSubprocessResult> RunLinux(
     if (now >= deadline &&
         (!child_exited || stdout_pipe.read >= 0 || stderr_pipe.read >= 0)) {
       result.timed_out = true;
+      start_kill(now);
+    }
+    if (!result.cancelled && options.cancellation_requested &&
+        options.cancellation_requested()) {
+      result.cancelled = true;
       start_kill(now);
     }
     if (result.output_limit_exceeded) start_kill(now);

@@ -113,6 +113,57 @@ cc_test(
     ],
 )
 
+xla_cc_test(
+    name = "compilation_provider_process_test",
+    size = "medium",
+    srcs = ["compilation_provider_process_test.cc"],
+    data = [
+        ":musa-llvm-bridge",
+        "//xla/service/gpu/musa:musa_llvm14_compatibility_goldens",
+        "@local_config_musa//musa:clang_offload_bundler",
+        "@local_config_musa//musa:libclang_cpp_file",
+        "@local_config_musa//musa:libdevice",
+        "@local_config_musa//musa:lld",
+        "@local_config_musa//musa:llvm_readobj",
+        "@local_config_musa//musa:mcc",
+        "@local_config_musa//musa:toolchain_data",
+        "@local_config_musa//musa:toolchain_identity",
+    ],
+    env = {
+        "MUSA_TEST_BUNDLER": "$(rlocationpath @local_config_musa//musa:clang_offload_bundler)",
+        "MUSA_TEST_IDENTITY": "$(rlocationpath @local_config_musa//musa:toolchain_identity)",
+        "MUSA_TEST_LIBDEVICE": "$(rlocationpath @local_config_musa//musa:libdevice)",
+        "MUSA_TEST_LIBCLANG_CPP": "$(rlocationpath @local_config_musa//musa:libclang_cpp_file)",
+        "MUSA_TEST_LLD": "$(rlocationpath @local_config_musa//musa:lld)",
+        "MUSA_TEST_MCC": "$(rlocationpath @local_config_musa//musa:mcc)",
+        "MUSA_TEST_READOBJ": "$(rlocationpath @local_config_musa//musa:llvm_readobj)",
+    },
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    target_compatible_with = select({
+        "@local_config_musa//musa:using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":toolchain_fingerprint",
+        "//xla/service/gpu/musa:mcc_bundle_codegen",
+        "//xla/service/gpu/musa:musa_compilation_provider",
+        "//xla/service/gpu/musa:musa_llvm14_compatibility",
+        "//xla/service/gpu/musa:protocol",
+        "//xla/stream_executor/musa:musa_mubin",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:resource_loader",
+        "//xla/tsl/testing:temporary_directory",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "bridge_core",
     srcs = [

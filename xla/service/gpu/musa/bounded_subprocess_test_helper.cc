@@ -78,6 +78,7 @@ int main(int argc, char** argv) {
   size_t allocate_bytes = 0;
   bool stdout_forever = false;
   bool check_stdin_eof = false;
+  bool copy_stdin = false;
   bool check_signal_state = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view argument(argv[i]);
@@ -126,6 +127,8 @@ int main(int argc, char** argv) {
       }
     } else if (argument == "--check-stdin-eof") {
       check_stdin_eof = true;
+    } else if (argument == "--copy-stdin") {
+      copy_stdin = true;
     } else if (argument == "--check-signal-state") {
       check_signal_state = true;
     } else if (StartsWith(argument, "--file-bytes=")) {
@@ -150,6 +153,22 @@ int main(int argc, char** argv) {
                               : count > 0 ? "data"
                                           : "error-" + std::to_string(errno);
     if (!WriteAll(STDOUT_FILENO, state)) return 101;
+  }
+  if (copy_stdin) {
+    char buffer[4096];
+    while (true) {
+      const ssize_t count = read(STDIN_FILENO, buffer, sizeof(buffer));
+      if (count > 0) {
+        if (!WriteAll(STDOUT_FILENO,
+                      std::string_view(buffer, static_cast<size_t>(count)))) {
+          return 107;
+        }
+        continue;
+      }
+      if (count == 0) break;
+      if (errno == EINTR) continue;
+      return 108;
+    }
   }
   if (check_signal_state) {
     sigset_t mask;

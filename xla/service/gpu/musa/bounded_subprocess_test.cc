@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/musa/bounded_subprocess.h"
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -65,6 +66,44 @@ TEST(MusaBoundedSubprocessTest, CapturesStreamsAndExitCode) {
   EXPECT_EQ(result->stdout_text, "output");
   EXPECT_EQ(result->stderr_text, "diagnostic");
   EXPECT_FALSE(result->exited_successfully());
+}
+
+TEST(MusaBoundedSubprocessTest, DeliversBoundedStdinWithoutARequestFile) {
+  MusaSubprocessOptions options = Options({"--copy-stdin"});
+  options.stdin_data = std::string("request\0payload", 15);
+  options.limits.max_stdin_bytes = options.stdin_data.size();
+  options.limits.max_stdout_bytes = options.stdin_data.size();
+  absl::StatusOr<MusaSubprocessResult> result =
+      RunMusaBoundedSubprocess(options);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_TRUE(result->exited_successfully());
+  EXPECT_EQ(result->stdout_text, options.stdin_data);
+
+  options.limits.max_stdin_bytes = options.stdin_data.size() - 1;
+  EXPECT_THAT(RunMusaBoundedSubprocess(options),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("resource limits")));
+}
+
+TEST(MusaBoundedSubprocessTest, CancellationKillsTheProcessGroup) {
+  std::atomic<bool> cancel = false;
+  MusaSubprocessOptions options = Options({"--sleep-ms=5000"});
+  options.limits.timeout = std::chrono::seconds(30);
+  options.cancellation_requested = [&] { return cancel.load(); };
+  std::thread canceller([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    cancel.store(true);
+  });
+  const auto started = std::chrono::steady_clock::now();
+  absl::StatusOr<MusaSubprocessResult> result =
+      RunMusaBoundedSubprocess(options);
+  canceller.join();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_TRUE(result->cancelled);
+  EXPECT_FALSE(result->timed_out);
+  EXPECT_FALSE(result->exited_successfully());
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
 }
 
 TEST(MusaBoundedSubprocessTest, UsesOnlyExplicitEnvironmentAndDirectory) {
@@ -318,7 +357,7 @@ TEST(MusaBoundedSubprocessTest, RejectsOpenEndedProcessControls) {
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("environment")));
 
   options = Options();
-  options.limits.max_stdout_bytes = (64 << 20) + 1;
+  options.limits.max_stdout_bytes = (size_t{512} << 20) + 1;
   EXPECT_THAT(RunMusaBoundedSubprocess(options),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("resource limits")));

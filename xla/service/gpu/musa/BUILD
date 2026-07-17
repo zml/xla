@@ -136,6 +136,59 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_compilation_provider",
+    srcs = ["musa_compilation_provider.cc"],
+    hdrs = ["musa_compilation_provider.h"],
+    deps = [
+        ":bounded_subprocess",
+        ":musa_bridge_ir_validator",
+        ":musa_llvm14_compatibility",
+        ":musa_shim_abi",
+        ":protocol",
+        ":protocol_proto_cc",
+        "//xla/stream_executor/musa:musa_mubin",
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_binary(
+    name = "musa_compilation_provider_test_helper",
+    testonly = True,
+    srcs = ["musa_compilation_provider_test_helper.cc"],
+    deps = [
+        ":protocol",
+        ":protocol_proto_cc",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_compilation_provider_test",
+    srcs = ["musa_compilation_provider_test.cc"],
+    data = [":musa_compilation_provider_test_helper"],
+    deps = [
+        ":musa_compilation_provider",
+        ":musa_llvm14_compatibility",
+        ":musa_shim_abi",
+        ":protocol",
+        "//xla/stream_executor/musa:musa_mubin",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:resource_loader",
+        "//xla/tsl/testing:temporary_directory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "musa_llvm14_compatibility",
     srcs = ["musa_llvm14_compatibility.cc"],
     hdrs = ["musa_llvm14_compatibility.h"],
