@@ -31,6 +31,8 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Argument.h"
@@ -39,6 +41,7 @@ limitations under the License.
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -192,14 +195,14 @@ absl::Status NormalizeKernelArgumentAttributes(llvm::Function& function,
   return absl::OkStatus();
 }
 
-absl::Status NormalizeSqrtIntrinsicAttributes(llvm::Function& function,
+absl::Status NormalizePureIntrinsicAttributes(llvm::Function& function,
                                               absl::string_view module_name) {
   const llvm::AttributeList current = llvm::Intrinsic::getAttributes(
       function.getContext(), function.getIntrinsicID(),
       function.getFunctionType());
   if (function.getAttributes() != current) {
     return Rejected(module_name, "intrinsic-attributes",
-                    "sqrt must begin with its canonical current-LLVM attrs");
+                    "pure intrinsic must have canonical current-LLVM attrs");
   }
 
   // This is the exact canonical LLVM 14 declaration observed and checked in
@@ -219,14 +222,24 @@ absl::Status NormalizeFunctions(llvm::Module& module,
                                 MusaBridgeIrMetadata& metadata) {
   for (llvm::Function& function : module.functions()) {
     if (function.isIntrinsic()) {
-      if (function.getIntrinsicID() != llvm::Intrinsic::sqrt) {
-        return Rejected(module_name, "intrinsic-compatibility",
-                        "generic intrinsic lacks an LLVM 14 profile");
-      }
-      if (absl::Status status =
-              NormalizeSqrtIntrinsicAttributes(function, module_name);
-          !status.ok()) {
-        return status;
+      switch (function.getIntrinsicID()) {
+        case llvm::Intrinsic::smax:
+        case llvm::Intrinsic::smin:
+        case llvm::Intrinsic::sin:
+        case llvm::Intrinsic::sqrt:
+        case llvm::Intrinsic::umax:
+        case llvm::Intrinsic::umin:
+          if (absl::Status status =
+                  NormalizePureIntrinsicAttributes(function, module_name);
+              !status.ok()) {
+            return status;
+          }
+          break;
+        default:
+          return Rejected(
+              module_name, "intrinsic-compatibility",
+              absl::StrCat("generic intrinsic ", function.getName().str(),
+                           " lacks an LLVM 14 profile"));
       }
       continue;
     }
@@ -269,12 +282,11 @@ absl::Status NormalizeFunctions(llvm::Module& module,
 
   std::sort(metadata.kernel_entry_names.begin(),
             metadata.kernel_entry_names.end());
-  if (metadata.kernel_entry_names.empty() ||
-      std::adjacent_find(metadata.kernel_entry_names.begin(),
+  if (std::adjacent_find(metadata.kernel_entry_names.begin(),
                          metadata.kernel_entry_names.end()) !=
-          metadata.kernel_entry_names.end()) {
+      metadata.kernel_entry_names.end()) {
     return Rejected(module_name, "kernel-marker",
-                    "kernel marker set must be nonempty and unique");
+                    "kernel marker set must be unique");
   }
   return absl::OkStatus();
 }
@@ -290,6 +302,120 @@ void StripInvariantLoadMetadata(llvm::Module& module) {
       }
     }
   }
+}
+
+absl::Status LowerBfloatMemoryOperations(llvm::Module& module,
+                                         absl::string_view module_name) {
+  std::vector<llvm::FPExtInst*> extensions;
+  std::vector<llvm::StoreInst*> stores;
+  for (llvm::Function& function : module.functions()) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+            load != nullptr && load->getType()->isBFloatTy()) {
+          if (!load->isSimple() || !load->hasOneUse()) {
+            return Rejected(module_name, "bfloat-memory",
+                            "bfloat load must be simple and single-use");
+          }
+          auto* extension =
+              llvm::dyn_cast<llvm::FPExtInst>(*load->user_begin());
+          if (extension == nullptr || !extension->getType()->isFloatTy()) {
+            return Rejected(module_name, "bfloat-memory",
+                            "bfloat load must extend directly to f32");
+          }
+          llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> metadata;
+          load->getAllMetadata(metadata);
+          if (!metadata.empty()) {
+            return Rejected(module_name, "bfloat-memory",
+                            "bfloat load carries unsupported metadata");
+          }
+          extensions.push_back(extension);
+        }
+        auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr ||
+            !store->getValueOperand()->getType()->isBFloatTy()) {
+          continue;
+        }
+        if (!store->isSimple()) {
+          return Rejected(module_name, "bfloat-memory",
+                          "bfloat store must be simple");
+        }
+        auto* truncation =
+            llvm::dyn_cast<llvm::FPTruncInst>(store->getValueOperand());
+        if (truncation == nullptr || !truncation->hasOneUse() ||
+            !truncation->getOperand(0)->getType()->isFloatTy()) {
+          return Rejected(module_name, "bfloat-memory",
+                          "bfloat store must consume a direct f32 truncation");
+        }
+        llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> metadata;
+        store->getAllMetadata(metadata);
+        if (!metadata.empty()) {
+          return Rejected(module_name, "bfloat-memory",
+                          "bfloat store carries unsupported metadata");
+        }
+        stores.push_back(store);
+      }
+    }
+  }
+
+  llvm::Type* i16 = llvm::Type::getInt16Ty(module.getContext());
+  llvm::Type* i32 = llvm::Type::getInt32Ty(module.getContext());
+  for (llvm::FPExtInst* extension : extensions) {
+    auto* load = llvm::cast<llvm::LoadInst>(extension->getOperand(0));
+    llvm::IRBuilder<> builder(extension);
+    llvm::LoadInst* encoded =
+        builder.CreateLoad(i16, load->getPointerOperand(), "bf16_bits");
+    encoded->setAlignment(load->getAlign());
+    llvm::Value* widened = builder.CreateZExt(encoded, i32);
+    llvm::Value* shifted = builder.CreateShl(widened, 16);
+    llvm::Value* decoded = builder.CreateBitCast(shifted, builder.getFloatTy());
+    extension->replaceAllUsesWith(decoded);
+    extension->eraseFromParent();
+    load->eraseFromParent();
+  }
+
+  for (llvm::StoreInst* store : stores) {
+    auto* truncation = llvm::cast<llvm::FPTruncInst>(store->getValueOperand());
+    llvm::IRBuilder<> builder(store);
+    llvm::Value* bits = builder.CreateBitCast(truncation->getOperand(0), i32);
+    llvm::Value* upper = builder.CreateLShr(bits, 16);
+    llvm::Value* least_significant = builder.CreateAnd(upper, 1);
+    llvm::Value* bias = builder.CreateAdd(builder.getInt32(0x7fff),
+                                          least_significant, "bf16_round_bias");
+    llvm::Value* rounded = builder.CreateAdd(bits, bias, "bf16_rounded");
+    llvm::Value* finite_encoded =
+        builder.CreateTrunc(builder.CreateLShr(rounded, 16), i16);
+    llvm::Value* magnitude =
+        builder.CreateAnd(bits, builder.getInt32(0x7fffffff));
+    llvm::Value* is_nan = builder.CreateICmpUGT(
+        magnitude, builder.getInt32(0x7f800000), "bf16_is_nan");
+    llvm::Value* nan_encoded = builder.CreateOr(builder.CreateTrunc(upper, i16),
+                                                builder.getInt16(0x40));
+    llvm::Value* encoded =
+        builder.CreateSelect(is_nan, nan_encoded, finite_encoded, "bf16_bits");
+    llvm::StoreInst* lowered =
+        builder.CreateStore(encoded, store->getPointerOperand());
+    lowered->setAlignment(store->getAlign());
+    store->eraseFromParent();
+    truncation->eraseFromParent();
+  }
+
+  for (const llvm::Function& function : module.functions()) {
+    for (const llvm::BasicBlock& block : function) {
+      for (const llvm::Instruction& instruction : block) {
+        if (instruction.getType()->isBFloatTy() ||
+            std::any_of(instruction.value_op_begin(),
+                        instruction.value_op_end(),
+                        [](const llvm::Value* value) {
+                          return value->getType()->isBFloatTy();
+                        })) {
+          return Rejected(module_name, "bfloat-operations",
+                          "unreviewed bfloat operation remains after lowering");
+        }
+      }
+    }
+  }
+  return absl::OkStatus();
 }
 
 absl::Status CollectExportedGlobals(const llvm::Module& module,
@@ -368,6 +494,64 @@ absl::StatusOr<std::string> RewriteCurrentMemoryAttributes(
   return normalized;
 }
 
+int HexDigitValue(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+  return -1;
+}
+
+absl::StatusOr<std::string> RewriteCurrentFloatLiterals(
+    absl::string_view current_text, absl::string_view module_name) {
+  std::string normalized;
+  normalized.reserve(current_text.size());
+  for (size_t index = 0; index < current_text.size();) {
+    if (index + 3 > current_text.size() ||
+        current_text.substr(index, 3) != "f0x" ||
+        (index != 0 && !absl::ascii_isspace(static_cast<unsigned char>(
+                           current_text[index - 1])))) {
+      normalized.push_back(current_text[index++]);
+      continue;
+    }
+    constexpr size_t kFloatHexDigits = 8;
+    if (index + 3 + kFloatHexDigits > current_text.size()) {
+      return Rejected(module_name, "float-literals",
+                      "truncated current-LLVM float literal");
+    }
+    uint32_t single_bits = 0;
+    for (size_t digit = 0; digit < kFloatHexDigits; ++digit) {
+      const int nibble = HexDigitValue(current_text[index + 3 + digit]);
+      if (nibble < 0) {
+        return Rejected(module_name, "float-literals",
+                        "malformed current-LLVM float literal");
+      }
+      single_bits = (single_bits << 4) | static_cast<uint32_t>(nibble);
+    }
+    const size_t after = index + 3 + kFloatHexDigits;
+    if (after < current_text.size() &&
+        HexDigitValue(current_text[after]) >= 0) {
+      return Rejected(module_name, "float-literals",
+                      "overlong current-LLVM float literal");
+    }
+
+    llvm::APFloat value(llvm::APFloat::IEEEsingle(),
+                        llvm::APInt(32, single_bits));
+    bool loses_information = false;
+    const llvm::APFloat::opStatus status =
+        value.convert(llvm::APFloat::IEEEdouble(),
+                      llvm::APFloat::rmNearestTiesToEven, &loses_information);
+    if (status != llvm::APFloat::opOK || loses_information) {
+      return Rejected(module_name, "float-literals",
+                      "float literal cannot be represented by LLVM 14");
+    }
+    normalized.append(absl::StrFormat(
+        "0x%016X",
+        static_cast<uint64_t>(value.bitcastToAPInt().getZExtValue())));
+    index = after;
+  }
+  return normalized;
+}
+
 absl::Status VerifyNormalizedText(absl::string_view normalized,
                                   absl::string_view module_name,
                                   const MusaBridgeIrMetadata& metadata) {
@@ -426,10 +610,19 @@ absl::StatusOr<MusaLlvm14CompatibilityResult> NormalizeMusaLlvmForLlvm14(
     return status;
   }
   StripInvariantLoadMetadata(*module);
+  if (absl::Status status = LowerBfloatMemoryOperations(*module, module_name);
+      !status.ok()) {
+    return status;
+  }
   if (absl::Status status =
           CollectExportedGlobals(*module, module_name, metadata);
       !status.ok()) {
     return status;
+  }
+  if (metadata.kernel_entry_names.empty() &&
+      metadata.exported_globals.empty()) {
+    return Rejected(module_name, "module-exports",
+                    "module must export at least one kernel or typed global");
   }
 
   const std::string current_text = PrintModule(*module);
@@ -442,6 +635,8 @@ absl::StatusOr<MusaLlvm14CompatibilityResult> NormalizeMusaLlvmForLlvm14(
 
   absl::StatusOr<std::string> normalized =
       RewriteCurrentMemoryAttributes(current_text, module_name);
+  if (!normalized.ok()) return normalized.status();
+  normalized = RewriteCurrentFloatLiterals(*normalized, module_name);
   if (!normalized.ok()) return normalized.status();
   if (normalized->empty() || normalized->size() > kMaxMusaInterchangeIrBytes) {
     return Rejected(module_name, "output-size",

@@ -297,6 +297,116 @@ TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedSqrtProfile) {
   EXPECT_EQ(normalized->normalized_llvm, ReadCorpus("sqrt.llvm14.ll"));
 }
 
+TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedSineProfile) {
+  const std::string text = Module(
+      "  %value = call float @llvm.sin.f32(float 0.0)\n"
+      "  %bits = bitcast float %value to i32\n"
+      "  store i32 %bits, ptr addrspace(1) %out, align 4",
+      "declare float @llvm.sin.f32(float)");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* sine = module->getFunction("llvm.sin.f32");
+  ASSERT_NE(sine, nullptr);
+  sine->setAttributes(llvm::Intrinsic::getAttributes(
+      context, sine->getIntrinsicID(), sine->getFunctionType()));
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "sine_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "nocallback"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "mustprogress"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "memory("));
+  EXPECT_EQ(normalized->normalized_llvm, ReadCorpus("sine.llvm14.ll"));
+}
+
+TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedIntegerMinMaxProfiles) {
+  const std::string text = Module(
+      "  %smin = call i32 @llvm.smin.i32(i32 7, i32 3)\n"
+      "  %smax = call i32 @llvm.smax.i32(i32 %smin, i32 5)\n"
+      "  %umin = call i32 @llvm.umin.i32(i32 %smax, i32 4)\n"
+      "  %umax = call i32 @llvm.umax.i32(i32 %umin, i32 6)\n"
+      "  store i32 %umax, ptr addrspace(1) %out, align 4",
+      "declare i32 @llvm.smin.i32(i32, i32)\n"
+      "declare i32 @llvm.smax.i32(i32, i32)\n"
+      "declare i32 @llvm.umin.i32(i32, i32)\n"
+      "declare i32 @llvm.umax.i32(i32, i32)");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  for (absl::string_view name :
+       {"llvm.smin.i32", "llvm.smax.i32", "llvm.umin.i32", "llvm.umax.i32"}) {
+    llvm::Function* function = module->getFunction(name);
+    ASSERT_NE(function, nullptr);
+    function->setAttributes(llvm::Intrinsic::getAttributes(
+        context, function->getIntrinsicID(), function->getFunctionType()));
+  }
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "integer_minmax_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("readnone"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "nocallback"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "mustprogress"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "memory("));
+  EXPECT_EQ(normalized->normalized_llvm,
+            ReadCorpus("integer_minmax.llvm14.ll"));
+}
+
+TEST(MusaLlvm14CompatibilityTest, RewritesCurrentFloatBitLiteralsForLlvm14) {
+  const std::string text = Module(
+      "  %low = fcmp ole float 0.0, f0xCF000000\n"
+      "  %high = fcmp oge float 0.0, f0x4F000000\n"
+      "  %both = and i1 %low, %high\n"
+      "  store i1 %both, ptr addrspace(1) %out, align 1");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "float_literal_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0xC1E0000000000000"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0x41E0000000000000"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "f0x"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest, DoesNotRewriteFloatPatternInModuleName) {
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(Module(""), "f0xDEADBEEF_name");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("; ModuleID = 'f0xDEADBEEF_name'"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("source_filename = \"f0xDEADBEEF_name\""));
+}
+
+TEST(MusaLlvm14CompatibilityTest, LegalizesBfloatGlobalMemoryAsI16) {
+  const std::string text = Module(
+      "  %input = load bfloat, ptr addrspace(1) %out, align 2\n"
+      "  %wide = fpext bfloat %input to float\n"
+      "  %sum = fadd float %wide, 1.000000e+00\n"
+      "  %narrow = fptrunc float %sum to bfloat\n"
+      "  store bfloat %narrow, ptr addrspace(1) %out, align 2");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_memory_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("load i16"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("store i16"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("bf16_round_bias"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("bf16_is_nan"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "load bfloat"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "store bfloat"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "fpext bfloat"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "to bfloat"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
 TEST(MusaLlvm14CompatibilityTest, CollectsSortedTypedExportedGlobals) {
   const std::string globals =
       "@z_mutable = protected addrspace(1) global i32 0, align 4\n"
@@ -316,6 +426,35 @@ TEST(MusaLlvm14CompatibilityTest, CollectsSortedTypedExportedGlobals) {
   EXPECT_EQ(normalized->metadata.exported_globals[1].name, "z_mutable");
   EXPECT_EQ(normalized->metadata.exported_globals[1].kind,
             MusaExportedGlobalKind::kMutable);
+}
+
+TEST(MusaLlvm14CompatibilityTest, AcceptsGlobalsOnlyConstantsModule) {
+  const std::string input =
+      absl::StrCat("source_filename = \"constants\"\n",
+                   "target datalayout = \"", kMusaDataLayout, "\"\n",
+                   "target triple = \"", kMusaTargetTriple, "\"\n\n",
+                   "@constant_data = protected addrspace(1) global [4 x i32] "
+                   "[i32 1, i32 2, i32 3, i32 4], align 16\n");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(input, "constants_only");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_TRUE(normalized->metadata.kernel_entry_names.empty());
+  ASSERT_EQ(normalized->metadata.exported_globals.size(), 1);
+  EXPECT_EQ(normalized->metadata.exported_globals[0].name, "constant_data");
+  EXPECT_EQ(normalized->metadata.exported_globals[0].kind,
+            MusaExportedGlobalKind::kMutable);
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest, RejectsModuleWithoutKernelOrTypedGlobal) {
+  const std::string input = absl::StrCat(
+      "source_filename = \"empty\"\n", "target datalayout = \"",
+      kMusaDataLayout, "\"\n", "target triple = \"", kMusaTargetTriple, "\"\n");
+  EXPECT_THAT(NormalizeMusaLlvmTextForLlvm14(input, "empty"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=module-exports")));
 }
 
 TEST(MusaLlvm14CompatibilityTest, RejectsUnsupportedCurrentConstructs) {

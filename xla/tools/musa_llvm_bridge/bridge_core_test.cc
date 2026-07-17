@@ -286,6 +286,18 @@ TEST(MusaLlvmBridgeCoreTest, ParsesAndTranslatesSqrtCompatibilityGolden) {
               HasSubstr("define protected mtgpu_kernel void @kernel"));
 }
 
+TEST(MusaLlvmBridgeCoreTest, ParsesAndTranslatesSineCompatibilityGolden) {
+  MusaBridgeCompileRequest request =
+      RequestForIr(ReadCompatibilityCorpus("sine.llvm14.ll"));
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_EQ(translated->translated_shim_calls, 0);
+  EXPECT_EQ(translated->kernel_count, 1);
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("declare float @llvm.sin.f32(float)"));
+}
+
 TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV1Shim) {
   MusaBridgeCompileRequest request = RequestForIr(ReadTestdata("all_shims.ll"));
   absl::StatusOr<VendorLlvmModule> translated =
@@ -296,6 +308,17 @@ TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV1Shim) {
     EXPECT_THAT(translated->llvm_ir, HasSubstr(spec.vendor_intrinsic));
   }
   EXPECT_FALSE(absl::StrContains(translated->llvm_ir, "__xla_musa_"));
+}
+
+TEST(MusaLlvmBridgeCoreTest, AcceptsReviewedIntegerMinMaxCorpus) {
+  MusaBridgeCompileRequest request =
+      RequestForIr(ReadCompatibilityCorpus("integer_minmax.llvm14.ll"));
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("@llvm.smin.i32"));
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("@llvm.umax.i32"));
+  EXPECT_EQ(translated->kernel_count, 1);
 }
 
 TEST(MusaLlvmBridgeCoreTest, InstallsProtectedAbiForExportedGlobals) {
@@ -310,6 +333,48 @@ TEST(MusaLlvmBridgeCoreTest, InstallsProtectedAbiForExportedGlobals) {
   ASSERT_THAT(translated, IsOk());
   EXPECT_THAT(translated->llvm_ir,
               HasSubstr("@mutable_data = protected addrspace(1) global i32 0"));
+}
+
+TEST(MusaLlvmBridgeCoreTest, LowersGenericRuntimeConstantToGlobalAddressSpace) {
+  std::string ir = ReadTestdata("minimal.ll");
+  const size_t definition = ir.find("define void @kernel");
+  ASSERT_NE(definition, std::string::npos);
+  ir.insert(definition, "@mutable_data = global i32 0, align 4\n\n");
+  MusaBridgeCompileRequest request = RequestForIr(ir, /*with_global=*/true);
+  request.mutable_exported_globals(0)->set_address_space(0);
+
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("@mutable_data = protected addrspace(1) global i32 0"));
+  EXPECT_FALSE(absl::StrContains(translated->llvm_ir,
+                                 "@mutable_data = protected global"));
+}
+
+TEST(MusaLlvmBridgeCoreTest, AnchorsGlobalsOnlyModuleForVendorLinker) {
+  const std::string ir = absl::StrCat(
+      "source_filename = \"globals_only\"\n", "target datalayout = \"",
+      kMusaDataLayout, "\"\n", "target triple = \"", kMusaTargetTriple,
+      "\"\n\n", "@mutable_data = global i32 0, align 4\n");
+  MusaBridgeCompileRequest request = RequestForIr(ir, /*with_global=*/true);
+  request.clear_kernel_entry_names();
+  request.clear_exported_symbol_names();
+  request.add_exported_symbol_names("mutable_data");
+  request.mutable_exported_globals(0)->set_address_space(0);
+
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_EQ(translated->kernel_count, 0);
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("@mutable_data = protected addrspace(1) global i32 0"));
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("define protected mtgpu_kernel void "
+                        "@__musa_xla_globals_anchor_v1"));
+  EXPECT_THAT(translated->llvm_ir,
+              HasSubstr("load volatile i8, ptr addrspace(1) @mutable_data"));
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("!musa.annotations = !{"));
 }
 
 TEST(MusaLlvmBridgeCoreTest, TranslationIsDeterministic) {

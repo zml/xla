@@ -149,6 +149,22 @@ TEST(MusaBridgeProtocolTest, Sha256UsesLowerCaseUnprefixedHex) {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 }
 
+TEST(MusaBridgeProtocolTest, AcceptsGlobalsOnlyRequest) {
+  MusaBridgeCompileRequest request = MakeValidRequest();
+  request.clear_kernel_entry_names();
+  EXPECT_TRUE(ValidateMusaBridgeCompileRequest(request).ok());
+
+  MusaBridgeCompileResponse response = MakeValidResponse(request);
+  EXPECT_TRUE(ValidateMusaBridgeCompileResponse(response).ok());
+  EXPECT_TRUE(ValidateMusaBridgeExchange(request, response).ok());
+
+  request.clear_exported_globals();
+  request.clear_exported_symbol_names();
+  EXPECT_THAT(ValidateMusaBridgeCompileRequest(request),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("exported_symbol_names")));
+}
+
 TEST(MusaBridgeProtocolTest, RequestCanonicalRoundTripIsStable) {
   MusaBridgeCompileRequest request = MakeValidRequest();
   absl::StatusOr<std::string> first = EncodeMusaBridgeCompileRequest(request);
@@ -417,6 +433,10 @@ TEST(MusaBridgeProtocolTest, ExportedGlobalMetadataIsTypedAndBounded) {
   EXPECT_THAT(
       ValidateMusaBridgeCompileRequest(request),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("address_space")));
+  request = MakeValidRequest();
+  request.mutable_exported_globals(0)->set_address_space(0);
+  EXPECT_TRUE(ValidateMusaBridgeCompileRequest(request).ok());
+
   request = MakeValidRequest();
   request.mutable_exported_globals(0)->set_address_space(1);
   EXPECT_THAT(

@@ -241,7 +241,10 @@ absl::Status ValidateExportedGlobals(const MusaBridgeCompileRequest& request) {
         global.kind() == MUSA_BRIDGE_GLOBAL_KIND_CONSTANT
             ? MusaAddressSpaceKind::kConstant
             : MusaAddressSpaceKind::kGlobal;
-    if (address_space->kind != expected_address_space) {
+    // Shared GPU codegen emits runtime-resolved constant allocations in the
+    // generic address space. Preserve that representation across the bridge.
+    if (address_space->kind != MusaAddressSpaceKind::kGeneric &&
+        address_space->kind != expected_address_space) {
       return InvalidField("exported_globals.address_space",
                           "does not match the exported global kind");
     }
@@ -409,7 +412,7 @@ absl::Status ValidateMusaBridgeCompileRequest(
 
   status = ValidateSortedUniqueSymbols(request.kernel_entry_names(),
                                        "kernel_entry_names",
-                                       kMusaBridgeMaxKernelCount, true);
+                                       kMusaBridgeMaxKernelCount, false);
   if (!status.ok()) return status;
   status = ValidateSortedUniqueSymbols(request.exported_symbol_names(),
                                        "exported_symbol_names",
@@ -424,6 +427,11 @@ absl::Status ValidateMusaBridgeCompileRequest(
   }
   status = ValidateExportedGlobals(request);
   if (!status.ok()) return status;
+  if (request.kernel_entry_names().empty() &&
+      request.exported_globals().empty()) {
+    return InvalidField("module_exports",
+                        "must contain a kernel or typed global");
+  }
 
   if (request.target_triple() != kMusaTargetTriple) {
     return InvalidField("target_triple", "is not mtgpu-mt-musa");
@@ -566,8 +574,7 @@ absl::Status ValidateMusaBridgeCompileResponse(
       stats.input_llvm_bytes() > kMusaBridgeMaxLlvmBytes) {
     return InvalidField("stats.input_llvm_bytes", "is outside bounds");
   }
-  if (stats.kernel_count() == 0 ||
-      stats.kernel_count() > kMusaBridgeMaxKernelCount) {
+  if (stats.kernel_count() > kMusaBridgeMaxKernelCount) {
     return InvalidField("stats.kernel_count", "is outside bounds");
   }
   if (stats.exported_symbol_count() < stats.kernel_count() ||

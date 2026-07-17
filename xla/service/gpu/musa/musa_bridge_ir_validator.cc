@@ -126,10 +126,9 @@ absl::Status ValidateMetadata(const MusaBridgeIrMetadata& metadata) {
                     absl::StrCat("target does not match required architecture ",
                                  kMusaTargetArchitecture));
   }
-  if (metadata.kernel_entry_names.empty() ||
-      metadata.kernel_entry_names.size() > kMaxMusaKernelEntries) {
+  if (metadata.kernel_entry_names.size() > kMaxMusaKernelEntries) {
     return Rejected(metadata, "kernel-list",
-                    "kernel list must be nonempty and bounded");
+                    "kernel list exceeds the protocol limit");
   }
   absl::string_view previous;
   for (const std::string& name : metadata.kernel_entry_names) {
@@ -169,6 +168,11 @@ absl::Status ValidateMetadata(const MusaBridgeIrMetadata& metadata) {
           absl::StrCat("global ", global.name, " has invalid size/alignment"));
     }
     previous = global.name;
+  }
+  if (metadata.kernel_entry_names.empty() &&
+      metadata.exported_globals.empty()) {
+    return Rejected(metadata, "module-exports",
+                    "module must export at least one kernel or typed global");
   }
   return ValidateMusaShimTable();
 }
@@ -455,9 +459,19 @@ absl::Status ValidateGlobalObjectState(const llvm::GlobalVariable& global,
   return absl::OkStatus();
 }
 
-bool HasLlvm14SqrtAttributes(const llvm::Function& function) {
-  if (function.getIntrinsicID() != llvm::Intrinsic::sqrt ||
-      function.getAttributes().hasRetAttrs()) {
+bool HasReviewedLlvm14PureIntrinsicAttributes(const llvm::Function& function) {
+  switch (function.getIntrinsicID()) {
+    case llvm::Intrinsic::sin:
+    case llvm::Intrinsic::smax:
+    case llvm::Intrinsic::smin:
+    case llvm::Intrinsic::sqrt:
+    case llvm::Intrinsic::umax:
+    case llvm::Intrinsic::umin:
+      break;
+    default:
+      return false;
+  }
+  if (function.getAttributes().hasRetAttrs()) {
     return false;
   }
   for (unsigned index = 0; index < function.arg_size(); ++index) {
@@ -491,7 +505,7 @@ absl::Status ValidateIntrinsicAttributes(const llvm::Function& function,
       function.getContext(), function.getIntrinsicID(),
       function.getFunctionType());
   if (function.getAttributes() != expected &&
-      !HasLlvm14SqrtAttributes(function)) {
+      !HasReviewedLlvm14PureIntrinsicAttributes(function)) {
     return Rejected(
         metadata, "intrinsic-attributes",
         absl::StrCat("intrinsic ", SanitizedSymbol(function.getName()),

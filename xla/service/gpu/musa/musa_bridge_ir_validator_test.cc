@@ -262,6 +262,28 @@ TEST(MusaBridgeIrValidatorTest, AcceptsTypedExportedGlobals) {
   EXPECT_THAT(Validate(ir, metadata), IsOk());
 }
 
+TEST(MusaBridgeIrValidatorTest, AcceptsGlobalsOnlyConstantsModule) {
+  MusaBridgeIrMetadata metadata = Metadata({});
+  metadata.exported_globals = {
+      {"constant_data", MusaExportedGlobalKind::kMutable, 1, 16, 16}};
+  const std::string ir =
+      absl::StrCat("target datalayout = \"", kMusaDataLayout, "\"\n",
+                   "target triple = \"", kMusaTargetTriple, "\"\n",
+                   "@constant_data = protected addrspace(1) global [4 x i32] "
+                   "[i32 1, i32 2, i32 3, i32 4], align 16\n");
+  EXPECT_THAT(Validate(ir, metadata), IsOk());
+}
+
+TEST(MusaBridgeIrValidatorTest, RejectsModuleWithoutKernelOrTypedGlobal) {
+  MusaBridgeIrMetadata metadata = Metadata({});
+  const std::string ir =
+      absl::StrCat("target datalayout = \"", kMusaDataLayout, "\"\n",
+                   "target triple = \"", kMusaTargetTriple, "\"\n");
+  EXPECT_THAT(Validate(ir, metadata),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=module-exports")));
+}
+
 TEST(MusaBridgeIrValidatorTest, RejectsContractAndTargetMismatch) {
   MusaBridgeIrMetadata metadata = Metadata();
   metadata.mapping_version = 2;

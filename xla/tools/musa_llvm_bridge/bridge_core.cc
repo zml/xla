@@ -46,6 +46,7 @@ limitations under the License.
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -66,6 +67,9 @@ limitations under the License.
 
 namespace xla::gpu::musa::bridge {
 namespace {
+
+constexpr absl::string_view kGlobalsOnlyAnchorKernel =
+    "__musa_xla_globals_anchor_v1";
 
 using ::xla::gpu::musa::FindMusaAddressSpace;
 using ::xla::gpu::musa::FindMusaShim;
@@ -897,6 +901,37 @@ absl::StatusOr<uint32_t> TranslateShimCalls(
   return translated_calls;
 }
 
+absl::Status LowerGenericExportedGlobalAddressSpaces(
+    llvm::Module& module, const MusaBridgeCompileRequest& request) {
+  for (const MusaBridgeExportedGlobal& global_spec :
+       request.exported_globals()) {
+    llvm::GlobalVariable* global = module.getGlobalVariable(global_spec.name());
+    if (global == nullptr) {
+      return absl::InternalError(
+          "MUSA bridge lost a validated global before target lowering");
+    }
+    if (global->getAddressSpace() != 0) continue;
+    if (!global->use_empty()) {
+      return Rejected(request, "global-address-space",
+                      absl::StrCat("generic exported global ",
+                                   SanitizedSymbol(global->getName()),
+                                   " has in-module uses"));
+    }
+
+    const unsigned native_address_space =
+        global_spec.kind() == MUSA_BRIDGE_GLOBAL_KIND_CONSTANT ? 2 : 1;
+    auto* lowered = new llvm::GlobalVariable(
+        module, global->getValueType(), global->isConstant(),
+        global->getLinkage(), global->getInitializer(), /*Name=*/"",
+        /*InsertBefore=*/nullptr, global->getThreadLocalMode(),
+        native_address_space, global->isExternallyInitialized());
+    lowered->copyAttributesFrom(global);
+    lowered->takeName(global);
+    global->eraseFromParent();
+  }
+  return absl::OkStatus();
+}
+
 absl::Status InstallExportAbi(llvm::Module& module,
                               const MusaBridgeCompileRequest& request) {
   llvm::NamedMDNode* annotations =
@@ -917,6 +952,32 @@ absl::Status InstallExportAbi(llvm::Module& module,
     };
     annotations->addOperand(llvm::MDNode::get(module.getContext(), operands));
   }
+  llvm::BasicBlock* globals_anchor_entry = nullptr;
+  if (request.kernel_entry_names().empty()) {
+    if (module.getNamedValue(
+            llvm::StringRef(kGlobalsOnlyAnchorKernel.data(),
+                            kGlobalsOnlyAnchorKernel.size())) != nullptr) {
+      return Rejected(request, "reserved-symbol",
+                      "module defines the globals-only anchor symbol");
+    }
+    llvm::FunctionType* type = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(module.getContext()), /*isVarArg=*/false);
+    llvm::Function* anchor =
+        llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                               llvm::StringRef(kGlobalsOnlyAnchorKernel.data(),
+                                               kGlobalsOnlyAnchorKernel.size()),
+                               module);
+    anchor->setCallingConv(llvm::CallingConv::MTGPU_KERNEL);
+    anchor->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+    globals_anchor_entry =
+        llvm::BasicBlock::Create(module.getContext(), "entry", anchor);
+    llvm::Metadata* operands[] = {
+        llvm::ValueAsMetadata::get(anchor),
+        llvm::MDString::get(module.getContext(), "kernel"),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32, 1)),
+    };
+    annotations->addOperand(llvm::MDNode::get(module.getContext(), operands));
+  }
   for (const MusaBridgeExportedGlobal& global_spec :
        request.exported_globals()) {
     llvm::GlobalVariable* global = module.getGlobalVariable(global_spec.name());
@@ -928,6 +989,15 @@ absl::Status InstallExportAbi(llvm::Module& module,
     // data. Keep that target-specific linker detail on the vendor side of the
     // bridge, just like the MTGPU kernel calling convention and annotations.
     global->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+    if (globals_anchor_entry != nullptr) {
+      llvm::IRBuilder<> builder(globals_anchor_entry);
+      llvm::LoadInst* load = builder.CreateLoad(
+          llvm::Type::getInt8Ty(module.getContext()), global, "global_anchor");
+      load->setVolatile(true);
+    }
+  }
+  if (globals_anchor_entry != nullptr) {
+    llvm::ReturnInst::Create(module.getContext(), globals_anchor_entry);
   }
   return absl::OkStatus();
 }
@@ -936,13 +1006,19 @@ absl::Status ValidateKernelAnnotations(
     const llvm::Module& module, const MusaBridgeCompileRequest& request) {
   const llvm::NamedMDNode* annotations =
       module.getNamedMetadata("musa.annotations");
+  const int expected_annotation_count =
+      request.kernel_entry_names_size() +
+      (request.kernel_entry_names().empty() ? 1 : 0);
   if (annotations == nullptr ||
-      annotations->getNumOperands() != request.kernel_entry_names_size()) {
+      annotations->getNumOperands() != expected_annotation_count) {
     return absl::InternalError(
         "MUSA bridge installed an incomplete kernel annotation table");
   }
 
-  for (int i = 0; i < request.kernel_entry_names_size(); ++i) {
+  const int annotations_to_validate = request.kernel_entry_names().empty()
+                                          ? 1
+                                          : request.kernel_entry_names_size();
+  for (int i = 0; i < annotations_to_validate; ++i) {
     const llvm::MDNode* node = annotations->getOperand(i);
     if (node == nullptr || node->getNumOperands() != 3) {
       return absl::InternalError(
@@ -959,12 +1035,37 @@ absl::Status ValidateKernelAnnotations(
             : llvm::dyn_cast<llvm::ConstantInt>(enabled->getValue());
     const llvm::Function* kernel = llvm::dyn_cast_or_null<llvm::Function>(
         value == nullptr ? nullptr : value->getValue());
+    const absl::string_view expected_name =
+        request.kernel_entry_names().empty()
+            ? kGlobalsOnlyAnchorKernel
+            : absl::string_view(request.kernel_entry_names(i));
     if (kernel == nullptr ||
-        kernel->getName() != request.kernel_entry_names(i) || tag == nullptr ||
-        tag->getString() != "kernel" || enabled_value == nullptr ||
-        !enabled_value->equalsInt(1)) {
+        kernel->getName() !=
+            llvm::StringRef(expected_name.data(), expected_name.size()) ||
+        tag == nullptr || tag->getString() != "kernel" ||
+        enabled_value == nullptr || !enabled_value->equalsInt(1)) {
       return absl::InternalError(
           "MUSA bridge installed an incorrect kernel annotation");
+    }
+  }
+  if (request.kernel_entry_names().empty()) {
+    const llvm::MDNode* node = annotations->getOperand(0);
+    const auto* value =
+        llvm::dyn_cast<llvm::ValueAsMetadata>(node->getOperand(0));
+    const llvm::Function* kernel = llvm::dyn_cast_or_null<llvm::Function>(
+        value == nullptr ? nullptr : value->getValue());
+    if (kernel == nullptr ||
+        kernel->getName() != llvm::StringRef(kGlobalsOnlyAnchorKernel.data(),
+                                             kGlobalsOnlyAnchorKernel.size()) ||
+        kernel->getCallingConv() != llvm::CallingConv::MTGPU_KERNEL ||
+        !kernel->hasProtectedVisibility()) {
+      return absl::InternalError(
+          "MUSA bridge installed an invalid globals-only anchor kernel");
+    }
+    if (absl::Status status = ValidateFunctionObjectState(
+            *kernel, request, /*translated_kernel=*/true);
+        !status.ok()) {
+      return status;
     }
   }
   return absl::OkStatus();
@@ -1092,6 +1193,11 @@ absl::StatusOr<VendorLlvmModule> TranslateMusaBridgeRequestToVendorLlvm(
   absl::StatusOr<uint32_t> translated_calls =
       TranslateShimCalls(*module, request);
   if (!translated_calls.ok()) return translated_calls.status();
+  if (absl::Status status =
+          LowerGenericExportedGlobalAddressSpaces(*module, request);
+      !status.ok()) {
+    return status;
+  }
   if (absl::Status status = InstallExportAbi(*module, request); !status.ok()) {
     return status;
   }
