@@ -19,50 +19,63 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/shape.h"
-#include "xla/stream_executor/device_address.h"
-#include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
 
-// The mixture-of-experts arm of the Metal block-scaled FP8 GEMM family: a
-// grouped fused FP8 (block-scaled) GEMV (`custom/fp8_moe_gemv.metal`). Where
-// MetalFp8GemvThunk runs one dense matmul, this runs one matmul per routed row
-// against that row's expert weight matrix, so top-k MoE expert projections need
-// only the selected experts' weights touched (not all E of them).
+// Grouped MoE GEMV on Metal: one matmul per routed row against that row's
+// expert weight matrix (top-k MoE expert projections touch only selected
+// experts). Dispatches by weight dtype:
 //
-// The model (Moe.forward on Metal) emits this via the __metal$moe_gemm$f8
-// custom call after top-k routing: it forms R = num_tokens * top_k rows (token
-// t routed to its k experts contributes k rows) and an expert id per row.
-// There is no dot for GemmRewriter to match, so unlike __metal$gemm$f8 this
-// target is model-emitted only.
+//   bf16     -> custom/bf16_moe_gemv.metal        (__metal$moe_gemm)
+//   f4e2m1   -> MLX nvfp4_gather_qmv              (__metal$moe_gemm$f4)
+//               (mlx_fp4_qmv.h; same metallib as dense nvfp4_qmv)
 //
-// One threadgroup (256 threads) per (n, r) output element reduces over K, with
-// the weight/scale base offset by expert_id[r].
+// The model (Moe.forward on Metal) emits the custom call after top-k routing:
+// R = num_tokens * top_k rows, expert id per row. No dot for GemmRewriter.
 //
-// Operand contract (positional):
-//   0 x         bf16     [R, K]               (row-major; K contraction dim)
-//   1 w         f8e4m3fn [E, N, K]            (row-major; expert-major)
-//   2 scale     bf16     [E, N/128, K/128]
-//   3 expert_id s32      [R]                  (expert each output row uses)
-//   -> 0 out    bf16     [R, N]
+// Operand contracts (positional):
+//   bf16:  {x[R,K] bf16, w[E,N,K] bf16, expert_id[R] s32} -> out[R,N] bf16
+//   nvfp4: {x[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
+//           expert_id[R] s32, w_global_scale[E] f32 (optional)}
+//           -> out[R,N] bf16
+//           (w_global_scale[e] is the compressed-tensors weight-global encode
+//            divisor g_ct; both nvfp4 kernels fold its reciprocal into the
+//            weight's group scale. Folding into the *weight* keeps the f32
+//            accumulator at output magnitude, unlike pre-scaling x -- which
+//            costs a full read/write pass over x -- or dividing the output.
+//            Absent: no buffer is bound and the kernels are unchanged.)
+//
+// Dispatch (MLX GatherQMM-aligned for NVFP4):
+//   small R / decode: per-row GEMV (nvfp4_gather_qmv / bf16_moe_gemv)
+//   large R prefill:  sort-by-expert + Steel gather
+//     - bf16:     R >= 1024
+//     - nvfp4:    R >= 16 && R/E >= 4 (MLX gather_qmm_rhs gate; for E=128 this
+//                 is R >= 512 — prefill, not continuous-batch decode)
+//     - all sorted paths require 1 <= E <= 256 (moe_argsort bucket capacity);
+//       unsupported shapes stay on their per-row GEMV path
 class MetalMoeGemvThunk : public Thunk {
  public:
+  // `global_scale` is bound only when `has_global_scale` (nvfp4 only).
   MetalMoeGemvThunk(ThunkInfo thunk_info, BufferAllocation::Slice x,
                     Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice expert_id, Shape expert_id_shape,
-                    BufferAllocation::Slice out, Shape out_shape, int64_t r,
-                    int64_t k, int64_t n,
-                    BufferAllocation::Slice num_tokens, Shape num_tokens_shape,
-                    int64_t top_k);
+                    BufferAllocation::Slice out, Shape out_shape,
+                    BufferAllocation::Slice workspace, Shape workspace_shape,
+                    BufferAllocation::Slice global_scale, Shape
+                    global_scale_shape, bool has_global_scale, int64_t r,
+                    int64_t k, int64_t n);
+  ~MetalMoeGemvThunk() override;
 
   MetalMoeGemvThunk(const MetalMoeGemvThunk&) = delete;
   MetalMoeGemvThunk& operator=(const MetalMoeGemvThunk&) = delete;
@@ -72,70 +85,30 @@ class MetalMoeGemvThunk : public Thunk {
   BufferUses buffer_uses() const override;
 
  private:
+  struct LoadedState;
+
   // Lazily, on the first execute for a given executor: compile the embedded
-  // metallib (process-cached), load the kernel, and stage the packed
-  // (R, K, N, K/128) dims into a small device buffer. Must hold mu_.
-  absl::Status EnsureLoaded(stream_executor::StreamExecutor* executor)
+  // metallib (process-cached), load the selected kernels, and prepare immutable
+  // inline launch constants. Mutable scratch comes from workspace_. Must hold
+  // mu_.
+  absl::StatusOr<std::shared_ptr<const LoadedState>> EnsureLoaded(
+      stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_;
-  const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_;
+  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_,
+      global_scale_;
+  const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_,
+      workspace_shape_, global_scale_shape_;
+  const bool has_global_scale_;
   const int64_t r_, k_, n_;
-  // Prefill padding clamp (sorted path only): num_tokens_ is the real prompt
-  // length (a device scalar from this exe's prefill attention), top_k_ maps a
-  // route index to its token (R_active = num_tokens*top_k, routes token-major).
-  // The sorted argsort/gather/steel/scatter kernels read num_tokens_ and skip the
-  // padded route suffix. When absent (has_num_tokens_ == false: decode, or a
-  // prefill whose attention carries no num_tokens) a fallback scalar = r_ with
-  // top_k 1 is staged so R_active == r_ (no clamp), preserving old behavior.
-  const BufferAllocation::Slice num_tokens_;
-  const Shape num_tokens_shape_;
-  const int64_t top_k_;
-  const bool has_num_tokens_;
 
   absl::Mutex mu_;
-  stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
-  // R >= kSortedMinR (prefill: many rows per expert) takes the sorted gather
-  // path; below it (decode: ~0.5 rows/expert) takes the per-row GEMV.
-  static constexpr int64_t kSortedMinR = 1024;
-
-  // Decode: per-row x-caching GEMV (kernel_). Prefill: counting-sort the rows by
-  // expert (kernel_argsort_), gather them into that order (kernel_gather_), run
-  // the MLX Steel gather q-GEMM (kernel_steel_, which reuses each expert's
-  // weight across its now-contiguous run of rows), then scatter the result back
-  // to the original order (kernel_scatter_).
-  bool sorted_path_ ABSL_GUARDED_BY(mu_) = false;
-  std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_argsort_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_gather_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_scatter_ ABSL_GUARDED_BY(mu_);
-  // Computes the steel GEMM's indirect-dispatch grid (ceil(R_active/BM) active
-  // route-tiles) into p_steel_grid_ each step, so the GEMM launches only the
-  // real-route tiles instead of the full padded ceil(r_/BM). p_steel_grid_args_
-  // is the {R, n_tiles, top_k, BM} int4 it reads.
-  std::unique_ptr<stream_executor::Kernel> kernel_steel_grid_
-      ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_steel_grid_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_steel_grid_args_ ABSL_GUARDED_BY(mu_);
-
-  // Packed {R, K, N, K/128} int4, bound as fp8_moe_gemv's `constant int4& dims`
-  // (buffer 5); p_dims_steel_ is the {R, N, K} int3 fp8_gather_qmm_rhs wants.
-  stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_dims_steel_ ABSL_GUARDED_BY(mu_);
-  // Sorted-prefill scratch (allocated only when sorted_path_): the permutation
-  // (order), the grouped expert ids, the expert-sorted x and the GEMM output;
-  // plus the int2 {R,*} dims the argsort / gather / scatter kernels read.
-  stream_executor::DeviceAddressBase p_order_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_idx_sorted_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_x_sorted_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_out_sorted_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_argsort_dims_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_gx_dims_ ABSL_GUARDED_BY(mu_);
-  stream_executor::DeviceAddressBase p_gout_dims_ ABSL_GUARDED_BY(mu_);
-  // Fallback num_tokens scalar (= r_) staged only when has_num_tokens_ is false,
-  // so the clamp kernels always have a num_tokens buffer to bind (R_active = r_).
-  stream_executor::DeviceAddressBase p_num_tokens_fallback_ ABSL_GUARDED_BY(mu_);
+  // Fully initialized immutable state per executor. Building is transactional;
+  // shared ownership keeps an executor's state alive while a concurrent launch
+  // encodes it, without A/B executor calls evicting each other's pipelines.
+  absl::flat_hash_map<stream_executor::StreamExecutor*,
+                      std::shared_ptr<const LoadedState>>
+      states_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace gpu
