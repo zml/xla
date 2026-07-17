@@ -23,10 +23,9 @@ limitations under the License.
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
-#include "xla/service/gpu/metal_kernels/fp8_gemm_tiled.h"
 #include "xla/service/gpu/metal_kernels/fp8_gemv.h"
 #include "xla/service/gpu/metal_kernels/fp8_gemv_pc.h"
-#include "xla/service/gpu/metal_kernels/metalblas_shaders.h"
+#include "xla/service/gpu/metal_kernels/mlx_kernels.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
@@ -62,8 +61,7 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
       per_channel_(per_channel) {}
 
 absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
-  if (kernel_ != nullptr && kernel_tiled_ != nullptr &&
-      kernel_steel_ != nullptr && kernel_pc_ != nullptr &&
+  if (kernel_ != nullptr && kernel_steel_ != nullptr && kernel_pc_ != nullptr &&
       kernel_steel64_ != nullptr && kernel_pc_qmm_ != nullptr &&
       kernel_pc_qmm64_ != nullptr)
     return absl::OkStatus();
@@ -77,14 +75,6 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
     TF_ASSIGN_OR_RETURN(
         kernel_,
         metal_exec->LoadKernelWithConstants(lib, "fp8_gemv", /*arity=*/5, {}));
-  }
-  {
-    TF_ASSIGN_OR_RETURN(
-        std::vector<uint8_t> lib,
-        CompileMetalSourceToMetallibCached(get_fp8_gemm_tiled()));
-    TF_ASSIGN_OR_RETURN(kernel_tiled_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_gemm_tiled", /*arity=*/5, {}));
   }
   {
     TF_ASSIGN_OR_RETURN(
@@ -131,7 +121,6 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   absl::MutexLock lock(&mu_);
   if (executor_ != executor) {
     kernel_ = nullptr;
-    kernel_tiled_ = nullptr;
     kernel_steel_ = nullptr;
     kernel_pc_ = nullptr;
     kernel_steel64_ = nullptr;

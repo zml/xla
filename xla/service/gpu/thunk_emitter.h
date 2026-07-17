@@ -208,14 +208,9 @@ class ThunkEmitter {
       const HloCustomCallInstruction* hlo);
 
   // Weight-only scaled matmul "zml$scaled_matmul". Dispatches by scheme:
-  //   MX → MetalMxMatmulThunk
   //   NVFP4 → MetalNvfp4MatmulThunk
   //   FP8 128-block / per-channel → MetalFp8GemvThunk
   absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
-      const HloCustomCallInstruction* hlo);
-
-  // MX arm of zml$scaled_matmul (e8m0 group-32 / legacy u32 pack).
-  absl::StatusOr<ThunkSequence> EmitMetalMxMatmulThunk(
       const HloCustomCallInstruction* hlo);
 
   // NVFP4 arm of zml$scaled_matmul (f4e2m1 + e4m3 group-16).

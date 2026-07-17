@@ -33,8 +33,7 @@ namespace xla {
 namespace gpu {
 
 // FP8 arm of zml$scaled_matmul on Metal: fused weight-only GEMV / thin GEMM for
-// f8e4m3fn weights with bf16 scales. NVFP4 lives in MetalNvfp4MatmulThunk;
-// MX (e8m0) lives in MetalMxMatmulThunk.
+// f8e4m3fn weights with bf16 scales. NVFP4 lives in MetalNvfp4MatmulThunk.
 //
 // Scale layouts:
 //   * 128-block:  scale bf16[N/128, K/128]
@@ -74,7 +73,6 @@ class MetalFp8GemvThunk : public Thunk {
   // b==1: per-row GEMV. b>1: Steel tiled q-GEMM (BM=16 small M, BM=64 prefill).
   // per_channel_: fp8_gemv_pc / pc qmm variants.
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_tiled_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_steel64_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_pc_ ABSL_GUARDED_BY(mu_);
