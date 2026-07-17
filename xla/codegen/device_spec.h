@@ -55,6 +55,9 @@ class DeviceSpec {
   bool IsNvidiaGpu() const {
     return IsGpu() && gpu().gpu_compute_capability().IsCuda();
   }
+  bool IsMusaGpu() const {
+    return IsGpu() && gpu().gpu_compute_capability().IsMusa();
+  }
   bool IsIntelGpu() const {
     return IsGpu() && gpu().gpu_compute_capability().IsOneAPI();
   }

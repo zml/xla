@@ -23,6 +23,17 @@ cc_library(
     ],
 )
 
+xla_cc_test(
+    name = "device_spec_test",
+    srcs = ["device_spec_test.cc"],
+    deps = [
+        ":device_spec",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "kernel_emitter",
     hdrs = ["kernel_emitter.h"],

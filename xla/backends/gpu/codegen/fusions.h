@@ -22,6 +22,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/decision.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 
@@ -96,6 +97,11 @@ class PreBufferAssignmentFusionInfo : public FusionInfo {
 // Returns the emitter for the given fusion.
 std::unique_ptr<FusionInterface> GetFusionEmitter(
     const FusionInfo& fusion_info);
+
+// Returns whether a fusion kind is routed exclusively through the qualified
+// target-neutral or shim-only MUSA paths.
+Decision MusaFusionEmitterQualification(
+    HloFusionAnalysis::EmitterFusionKind fusion_kind);
 
 }  // namespace gpu
 }  // namespace xla

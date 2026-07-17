@@ -121,6 +121,7 @@ cc_library(
         ":lower_to_llvm_common",
         ":lower_to_llvm_gpu_inc_gen",
         ":lowering_utils",
+        ":musa_gpu_to_llvm",
         "//xla/codegen:device_spec",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:device_description_proto_cc",
@@ -155,6 +156,23 @@ cc_library(
         "@llvm-project//mlir:UBToLLVM",
         "@llvm-project//mlir:VectorToLLVM",
         "@tsl//tsl/platform:protobuf",
+    ],
+)
+
+cc_library(
+    name = "musa_gpu_to_llvm",
+    srcs = ["musa_gpu_to_llvm.cc"],
+    hdrs = ["musa_gpu_to_llvm.h"],
+    deps = [
+        "//xla/service/gpu/musa:musa_shim_abi",
+        "//xla/stream_executor/musa:musa_target_contract",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMCommonConversion",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TransformUtils",
     ],
 )
 
@@ -218,6 +236,7 @@ cc_library(
         "//xla/mlir_hlo",
         "//xla/mlir_hlo:map_mhlo_to_scalar_op",
         "//xla/service/gpu:ir_emission_utils",
+        "//xla/service/gpu/musa:musa_shim_abi",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:device_description_proto_cc",
         "//xla/stream_executor/cuda:cuda_compute_capability",

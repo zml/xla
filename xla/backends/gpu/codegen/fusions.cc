@@ -16,8 +16,10 @@ limitations under the License.
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 
+#include "absl/status/status.h"
 #include "xla/backends/gpu/codegen/copy.h"
 #include "xla/backends/gpu/codegen/cudnn.h"
 #include "xla/backends/gpu/codegen/custom.h"
@@ -42,6 +44,58 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
+namespace {
+
+class UnsupportedMusaFusion final : public FusionInterface {
+ public:
+  explicit UnsupportedMusaFusion(std::string error_message)
+      : error_message_(std::move(error_message)) {}
+
+  AsyncThunkSequence Emit(IrEmitterContext&,
+                          const HloFusionInstruction&) const final {
+    return absl::UnimplementedError(error_message_);
+  }
+
+ private:
+  std::string error_message_;
+};
+
+std::unique_ptr<FusionInterface> CreateMlirKernelFusion(
+    const HloFusionAnalysis& analysis,
+    std::unique_ptr<MlirKernelEmitter> emitter) {
+  if (analysis.device_info().gpu_compute_capability().IsMusa()) {
+    return std::make_unique<MusaMlirKernelFusion>(std::move(emitter));
+  }
+  return std::make_unique<MlirKernelFusion>(std::move(emitter));
+}
+
+}  // namespace
+
+Decision MusaFusionEmitterQualification(
+    HloFusionAnalysis::EmitterFusionKind fusion_kind) {
+  switch (fusion_kind) {
+    case HloFusionAnalysis::EmitterFusionKind::kLoop:
+    case HloFusionAnalysis::EmitterFusionKind::kReduction:
+    case HloFusionAnalysis::EmitterFusionKind::kScatter:
+    case HloFusionAnalysis::EmitterFusionKind::kTranspose:
+    case HloFusionAnalysis::EmitterFusionKind::kConcatenate:
+      return Decision::Allow();
+    case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
+      return Decision::Forbid(
+          "custom fusion emission is not qualified for the MUSA backend");
+    case HloFusionAnalysis::EmitterFusionKind::kTriton:
+      return Decision::Forbid(
+          "Triton fusion emission is not qualified for the MUSA backend");
+    case HloFusionAnalysis::EmitterFusionKind::kCuDnn:
+      return Decision::Forbid(
+          "cuDNN fusion emission is not qualified for the MUSA backend");
+    case HloFusionAnalysis::EmitterFusionKind::kSort:
+      return Decision::Forbid(
+          "sort fusion emission is not qualified for the MUSA backend");
+  }
+  return Decision::Forbid(
+      "unknown fusion emission is not qualified for the MUSA backend");
+}
 
 std::optional<std::unique_ptr<FusionInterface>> HloFusionInfo::GetCopyFusion()
     const {
@@ -67,6 +121,13 @@ bool HloFusionInfo::CanEmitDynamicUpdateSliceInPlace() const {
 std::unique_ptr<FusionInterface> GetFusionEmitter(
     const FusionInfo& fusion_info) {
   const auto& analysis = fusion_info.analysis();
+  if (analysis.device_info().gpu_compute_capability().IsMusa()) {
+    Decision qualification =
+        MusaFusionEmitterQualification(analysis.emitter_fusion_kind());
+    if (qualification.IsForbidden()) {
+      return std::make_unique<UnsupportedMusaFusion>(qualification.Explain());
+    }
+  }
   switch (analysis.emitter_fusion_kind()) {
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
       return std::make_unique<CustomFusion>();
@@ -78,26 +139,25 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       }
       if (IsDynamicUpdateSliceFusion(analysis.fusion_spec()) &&
           fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
-        return std::make_unique<MlirKernelFusion>(
+        return CreateMlirKernelFusion(
+            analysis,
             std::make_unique<InPlaceDynamicUpdateSliceFusion>(analysis));
       }
-      return std::make_unique<MlirKernelFusion>(
-          std::make_unique<LoopFusion>(analysis));
+      return CreateMlirKernelFusion(analysis,
+                                    std::make_unique<LoopFusion>(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kReduction: {
-      return std::make_unique<MlirKernelFusion>(
-          CreateReductionFusion(analysis));
+      return CreateMlirKernelFusion(analysis, CreateReductionFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kScatter: {
-      return std::make_unique<MlirKernelFusion>(CreateScatterFusion(analysis));
+      return CreateMlirKernelFusion(analysis, CreateScatterFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kTranspose: {
-      return std::make_unique<MlirKernelFusion>(
-          CreateTransposeFusion(analysis));
+      return CreateMlirKernelFusion(analysis, CreateTransposeFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kConcatenate: {
-      return std::make_unique<MlirKernelFusion>(
-          std::make_unique<ConcatenateFusion>(analysis));
+      return CreateMlirKernelFusion(
+          analysis, std::make_unique<ConcatenateFusion>(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kSort: {
       return std::make_unique<SortFusion>();

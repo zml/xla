@@ -164,7 +164,7 @@ class MlirKernelEmitter {
 // generating an MLIR module from an HLO fusion. MlirKernelFusion then takes
 // this MLIR module and handles the process of lowering it through various
 // passes down to LLVM IR.
-class MlirKernelFusion final : public KernelFusionInterface {
+class MlirKernelFusion : public KernelFusionInterface {
  public:
   explicit MlirKernelFusion(std::unique_ptr<MlirKernelEmitter> emitter)
       : emitter_(std::move(emitter)) {}
@@ -200,11 +200,25 @@ class MlirKernelFusion final : public KernelFusionInterface {
   static constexpr std::array<int, 3> kIndexingMapThreadIdxDims = {0, 1, 2};
   static constexpr std::array<int, 3> kIndexingMapBlockIdxDims = {3, 4, 5};
 
+ protected:
+  virtual bool UsesMusaKernelAbi() const { return false; }
+
  private:
   xla::Future<KernelDefinition<LlvmKernelSource>> EmitLlvmModule(
       const HloFusionInstruction& fusion, const std::string& kernel_name,
       IrEmitterContext& parent_context) const;
   std::unique_ptr<MlirKernelEmitter> emitter_;
+};
+
+// MUSA keeps the ordinary C calling convention in current-LLVM IR. The
+// isolated vendor bridge applies the native MUSA kernel convention after it
+// consumes the explicit versioned kernel marker.
+class MusaMlirKernelFusion final : public MlirKernelFusion {
+ public:
+  using MlirKernelFusion::MlirKernelFusion;
+
+ protected:
+  bool UsesMusaKernelAbi() const final { return true; }
 };
 
 // Adds passes that transform XLA_GPU and SCF loops, e.g. peel, pipeline,

@@ -878,6 +878,10 @@ absl::Status EnsureTritonSupportsComputeCapability(
 
 CodegenDecision IsTritonSupportedInstruction(
     const HloInstruction& instr, const se::GpuComputeCapability& gpu_version) {
+  if (!gpu_version.IsCuda() && !gpu_version.IsRocm()) {
+    return CodegenDecision::Forbid(
+        "Triton code generation is qualified only for CUDA and ROCm GPUs.");
+  }
   CodegenDecision decision =
       IsTritonSupportedInstructionImpl(instr, gpu_version);
   VLOG(2) << absl::StrCat("IsTritonSupportedInstruction: ", instr.ToString(),

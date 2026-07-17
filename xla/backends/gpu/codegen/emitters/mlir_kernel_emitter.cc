@@ -96,6 +96,7 @@ limitations under the License.
 #include "xla/codegen/emitters/kernel_api_builder.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/lower_to_llvm_gpu.h"
+#include "xla/codegen/emitters/transforms/musa_gpu_to_llvm.h"
 #include "xla/codegen/emitters/transforms/pass_pipelines.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -127,6 +128,7 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_target_contract.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
@@ -325,6 +327,7 @@ xla::Future<KernelDefinition<LlvmKernelSource>>
 MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
                                  const std::string& kernel_name,
                                  IrEmitterContext& parent_context) const {
+  const bool uses_musa_kernel_abi = UsesMusaKernelAbi();
   return CreateLLVMModule(parent_context.gpu_device_info(), fusion, kernel_name,
                           &parent_context.buffer_assignment(),
                           parent_context.kernel_compiler(),
@@ -333,8 +336,8 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
             buffer_assignment = &parent_context.buffer_assignment(),
             gpu_device_info = parent_context.gpu_device_info(), kernel_name,
             launch_dims = launch_dimensions(),
-            data_layout = parent_context.data_layout(),
-            fusion = &fusion](LlvmKernelSource source)
+            data_layout = parent_context.data_layout(), fusion = &fusion,
+            uses_musa_kernel_abi](LlvmKernelSource source)
                -> absl::StatusOr<KernelDefinition<LlvmKernelSource>> {
         llvm::orc::ThreadSafeModule safe_module =
             std::move(source).thread_safe_module();
@@ -342,13 +345,26 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
 
         auto* kernel_func = module->getFunction(kernel_name);
 
-        AddRanges(kernel_func, launch_dims, module);
-
-        module->setDataLayout(data_layout);
-        module->setTargetTriple(target_triple);
-
-        llvm::IRBuilder<> builder(module->getContext());
-        AnnotateFunctionAsGpuKernel(module, kernel_func, &builder);
+        if (!uses_musa_kernel_abi) {
+          module->setDataLayout(data_layout);
+          module->setTargetTriple(target_triple);
+          AddRanges(kernel_func, launch_dims, module);
+          llvm::IRBuilder<> builder(module->getContext());
+          AnnotateFunctionAsGpuKernel(module, kernel_func, &builder);
+        } else {
+          TF_RET_CHECK(gpu_device_info.gpu_compute_capability().IsMusa());
+          TF_RET_CHECK(target_triple.str() ==
+                       stream_executor::musa::kMusaTargetTriple);
+          TF_RET_CHECK(data_layout ==
+                       stream_executor::musa::kMusaTargetDataLayout);
+          TF_RET_CHECK(module->getTargetTriple().str() ==
+                       stream_executor::musa::kMusaTargetTriple);
+          TF_RET_CHECK(module->getDataLayoutStr() ==
+                       stream_executor::musa::kMusaTargetDataLayout);
+          TF_RET_CHECK(kernel_func->getCallingConv() == llvm::CallingConv::C);
+          TF_RET_CHECK(
+              kernel_func->hasFnAttribute(::xla::emitters::kMusaKernelMarker));
+        }
         RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(
             gpu_device_info, launch_dims, kernel_func, module));
 
@@ -661,6 +677,13 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
 
   mlir::OwningOpRef<mlir::ModuleOp> module = std::move(source).TakeModule();
 
+  if (device.gpu_compute_capability().IsMusa()) {
+    if (mlir::failed(emitters::ConfigureMusaLLVMModule(*module))) {
+      return absl::InvalidArgumentError(
+          "MUSA MLIR module violates the qualified target contract");
+    }
+  }
+
   mlir::PassManager pm(module->getContext());
   // Only enable verifier in debug builds.
   bool should_verify =
@@ -685,6 +708,14 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   auto llvm_module = mlir::translateModuleToLLVMIR(module.get(), *llvm_context);
   TF_RET_CHECK(llvm_module != nullptr)
       << "Failed to translate module to LLVM IR.";
+
+  if (device.gpu_compute_capability().IsMusa()) {
+    llvm::Function* kernel = llvm_module->getFunction(entry_function_name);
+    TF_RET_CHECK(kernel != nullptr)
+        << "MUSA entry function is missing after MLIR translation.";
+    TF_RET_CHECK(kernel->getCallingConv() == llvm::CallingConv::C);
+    kernel->addFnAttr(::xla::emitters::kMusaKernelMarker);
+  }
 
   return LlvmKernelSource{std::move(llvm_context), std::move(llvm_module)};
 }

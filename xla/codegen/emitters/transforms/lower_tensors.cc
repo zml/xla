@@ -68,6 +68,7 @@ limitations under the License.
 #include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/codegen/emitters/transforms/atomic_rmw_utils.h"
 #include "xla/codegen/emitters/transforms/passes.h"
+#include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
@@ -871,6 +872,10 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
 
   LogicalResult matchAndRewrite(
       AtomicRMWOp op, mlir::PatternRewriter& rewriter) const override {
+    if (device_spec_.IsMusaGpu()) {
+      return rewriter.notifyMatchFailure(
+          op, "MUSA shim mapping does not yet qualify atomics");
+    }
     auto modifier_parameters = GetAtomicModifierParameters(op);
     if (modifier_parameters.has_value()) {
       if (mlir::isa<mlir::VectorType>(modifier_parameters->first.getType()) &&
@@ -1412,6 +1417,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
       *device_spec_.mutable_type() = CpuDeviceSpec{};
     }
 
+    if (mlir::failed(RejectUnqualifiedMusaAtomics())) return;
+
     MLIRContext* mlir_context = &getContext();
     mlir::RewritePatternSet tensor_patterns(mlir_context);
 
@@ -1426,6 +1433,9 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
       signalPassFailure();
       return;
     }
+    // Re-check because packed-element tensor rewrites can introduce an
+    // AtomicRMWOp even when the input module did not contain one.
+    if (mlir::failed(RejectUnqualifiedMusaAtomics())) return;
 
     mlir::RewritePatternSet function_patterns(mlir_context);
     function_patterns.add<RewriteFunctionSignatures>(mlir_context,
@@ -1468,6 +1478,18 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
   }
 
  private:
+  mlir::LogicalResult RejectUnqualifiedMusaAtomics() {
+    if (!device_spec_.IsMusaGpu()) return mlir::success();
+    mlir::WalkResult result = getOperation()->walk([](AtomicRMWOp op) {
+      op.emitOpError() << "is unsupported by MUSA shim mapping version "
+                       << gpu::musa::kMusaShimMappingVersion;
+      return mlir::WalkResult::interrupt();
+    });
+    if (!result.wasInterrupted()) return mlir::success();
+    signalPassFailure();
+    return mlir::failure();
+  }
+
   DeviceSpec device_spec_;
 };
 

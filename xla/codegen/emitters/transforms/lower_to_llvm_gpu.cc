@@ -41,8 +41,8 @@ limitations under the License.
 #include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"  // IWYU pragma: keep
-#include "mlir/Dialect/LLVMIR/NVVMDialect.h"  // IWYU pragma: keep
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"   // IWYU pragma: keep
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"   // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/codegen/device_spec.h"
 #include "xla/codegen/emitters/transforms/lower_to_llvm_common.h"
 #include "xla/codegen/emitters/transforms/lowering_utils.h"
+#include "xla/codegen/emitters/transforms/musa_gpu_to_llvm.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/tsl/platform/logging.h"
@@ -189,6 +190,13 @@ class LowerToLLVMGPUPass
       *device_spec_.mutable_type() = *device_description;
     }
 
+    if (device_spec_.IsMusaGpu()) {
+      if (mlir::failed(ConfigureMusaLLVMModule(getOperation()))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     auto populate_patterns =
         [&](mlir::LLVMTypeConverter& converter,
             mlir::RewritePatternSet& patterns,
@@ -247,9 +255,15 @@ class LowerToLLVMGPUPass
         spirv::populateMathToLLVMSPVConversionPatterns(spirv::getSPIRVMathOps(),
                                                        converter, patterns);
         populateGpuMemorySpaceAttributeConversions(converter);
-      } else {
+      } else if (device_spec_.IsMusaGpu()) {
+        PopulateMusaGpuToLLVMConversionPatterns(converter, patterns, target);
+      } else if (device_spec_.IsNvidiaGpu()) {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);
         mlir::configureGpuToNVVMConversionLegality(target);
+      } else {
+        mlir::emitError(mlir::UnknownLoc::get(&getContext()),
+                        "unsupported GPU target for LLVM lowering");
+        return mlir::failure();
       }
       return mlir::success();
     };

@@ -134,15 +134,20 @@ int64_t MaxUnrollFactor(const HloFusionAnalysis* analysis) {
   constexpr int kMaxNumOutputsForFullUnrolling = 1;
   // On PTX level, we can efficiently vectorize up to 128/256 bits (v4/v8.b32).
   // So we allow aggressive unrolling for narrow types to reach this width.
+  const stream_executor::CudaComputeCapability* cuda_compute_capability =
+      analysis->device_info()
+          .gpu_compute_capability()
+          .cuda_compute_capability();
+  const bool is_blackwell = cuda_compute_capability != nullptr &&
+                            cuda_compute_capability->IsBlackwell();
   const int64_t max_vector_bit_width =
-      (analysis->device_info().cuda_compute_capability().IsBlackwell() &&
-       analysis->device_info().compile_time_toolkit_version() >=
-           stream_executor::SemanticVersion(12, 9, 0))
+      (is_blackwell && analysis->device_info().compile_time_toolkit_version() >=
+                           stream_executor::SemanticVersion(12, 9, 0))
           ? 256
           : 128;
   const int max_bits_for_aggressive_unrolling =
       max_vector_bit_width / kDefaultUnrollFactor;
-  if (analysis->device_info().cuda_compute_capability().IsBlackwell() &&
+  if (is_blackwell &&
       (analysis->emitter_fusion_kind() ==
            HloFusionAnalysis::EmitterFusionKind::kLoop ||
        analysis->emitter_fusion_kind() ==
