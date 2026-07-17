@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
@@ -184,8 +185,7 @@ class OnecclCommunicator final : public GpuCommunicator {
                      std::unique_ptr<tsl::Executor> executor,
                      std::shared_ptr<CancellationToken> cancel);
 
-  absl::Status GroupStart();
-  absl::Status GroupEnd();
+  absl::Status GroupLaunch(absl::FunctionRef<absl::Status()> group);
   absl::Status CheckReady() const;
   Future<> Execute(absl::AnyInvocable<absl::Status() &&> f) const;
 
@@ -208,7 +208,6 @@ class OnecclCommunicator final : public GpuCommunicator {
   std::unique_ptr<tsl::Executor> executor_;
   std::shared_ptr<CancellationToken> cancel_;
   bool aborted_ = false;
-  int64_t group_nesting_level_ = 0;
 };
 
 }  // namespace xla::gpu

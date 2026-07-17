@@ -361,40 +361,24 @@ OnecclCommunicator::CreateSymmetricMemory(se::DeviceAddressBase addr) {
       });
 }
 
-absl::Status OnecclCommunicator::GroupStart() {
+absl::Status OnecclCommunicator::GroupLaunch(
+    absl::FunctionRef<absl::Status()> group) {
   RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ == 0) {
-    auto activation = stream_executor_->Activate();
-    RETURN_IF_ERROR(
-        OnecclCall("ccl::group_start", [] { ccl::group_start(); }));
-  }
-  ++group_nesting_level_;
-  return absl::OkStatus();
-}
+  auto activation = stream_executor_->Activate();
+  RETURN_IF_ERROR(OnecclCall("ccl::group_start", [] { ccl::group_start(); }));
 
-absl::Status OnecclCommunicator::GroupEnd() {
-  RETURN_IF_ERROR(CheckReady());
-  if (group_nesting_level_ <= 0) {
-    return FailedPrecondition("oneCCL group end without a matching group start");
+  absl::Status status = group();
+  absl::Status group_status =
+      OnecclCall("ccl::group_end", [] { ccl::group_end(); });
+  if (status.ok()) {
+    status = group_status;
   }
-  if (--group_nesting_level_ == 0) {
-    auto activation = stream_executor_->Activate();
-    RETURN_IF_ERROR(OnecclCall("ccl::group_end", [] { ccl::group_end(); }));
-  }
-  return absl::OkStatus();
+  return status;
 }
 
 Future<> OnecclCommunicator::GroupExecute(
     absl::AnyInvocable<absl::Status() &&> group) {
-  return Execute([group = std::move(group), this]() mutable -> absl::Status {
-    RETURN_IF_ERROR(GroupStart());
-    absl::Status status = std::move(group)();
-    absl::Status group_status = GroupEnd();
-    if (!status.ok()) {
-      return status;
-    }
-    return group_status;
-  });
+  return Execute(std::move(group));
 }
 
 Future<> OnecclCommunicator::AllReduce(se::DeviceAddressBase send_buffer,
@@ -462,8 +446,8 @@ Future<> OnecclCommunicator::CollectivePermute(
   std::vector<RankId> owned_target_ranks(target_ranks.begin(),
                                          target_ranks.end());
   return Execute([send_buffer, recv_buffer, dtype, count, source_rank,
-                  owned_target_ranks = std::move(owned_target_ranks),
-                  &executor, this]() -> absl::Status {
+                  owned_target_ranks = std::move(owned_target_ranks), &executor,
+                  this]() -> absl::Status {
     return LaunchCollectivePermute(send_buffer, recv_buffer, dtype, count,
                                    source_rank, owned_target_ranks, executor);
   });
@@ -642,22 +626,22 @@ absl::Status OnecclCommunicator::LaunchCollectivePermute(
   auto activation = stream_executor_->Activate();
   ASSIGN_OR_RETURN(ccl::datatype ccl_dtype, ToOnecclDataType(dtype));
 
-  RETURN_IF_ERROR(GroupStart());
-  if (source_rank.has_value()) {
-    RETURN_IF_ERROR(OnecclCall("ccl::recv", [&] {
-      ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-                source_rank->value(), comm(), ccl_stream);
-    }));
-  }
+  return GroupLaunch([&]() -> absl::Status {
+    if (source_rank.has_value()) {
+      RETURN_IF_ERROR(OnecclCall("ccl::recv", [&] {
+        ccl::recv(recv_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
+                  source_rank->value(), comm(), ccl_stream);
+      }));
+    }
 
-  for (RankId target_rank : target_ranks) {
-    RETURN_IF_ERROR(OnecclCall("ccl::send", [&] {
-      ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
-                target_rank.value(), comm(), ccl_stream);
-    }));
-  }
-  RETURN_IF_ERROR(GroupEnd());
-  return absl::OkStatus();
+    for (RankId target_rank : target_ranks) {
+      RETURN_IF_ERROR(OnecclCall("ccl::send", [&] {
+        ccl::send(send_buffer.opaque(), ToOnecclCount(dtype, count), ccl_dtype,
+                  target_rank.value(), comm(), ccl_stream);
+      }));
+    }
+    return absl::OkStatus();
+  });
 }
 
 absl::Status OnecclCommunicator::LaunchSend(
