@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 // ==============================================================================
-// RUN: not emitters_opt %s --allow-unregistered-dialect \
-// RUN:   -xla-lower-tensors="gpu_device_info='threads_per_warp: 128 musa_compute_capability {architecture: \"mp_21\" major: 2 minor: 1 hardware_warp_size: 128 logical_subgroup_size: 32}'" \
+// RUN: not emitters_opt %s \
+// RUN:   -xla-lower-to-llvm-gpu="gpu_device_info='threads_per_warp: 128 musa_compute_capability {architecture: \"mp_21\" major: 2 minor: 1 hardware_warp_size: 128 logical_subgroup_size: 32}'" \
 // RUN:   2>&1 | FileCheck %s
 
-func.func @atomic_rmw_f32(%input: tensor<8xf32>, %index: index)
-    -> tensor<8xf32> {
-  %result = xla.atomic_rmw %input[%index] : tensor<8xf32> {
-    ^bb0(%current : f32):
-      %one = arith.constant 1.0 : f32
-      %sum = arith.addf %current, %one : f32
-      xla.yield %sum : f32
+module {
+  func.func @unsupported_shuffle_width(%value: i32, %offset: i32) -> i32 {
+    %width = arith.constant 16 : i32
+    %shuffled, %valid = gpu.shuffle down %value, %offset, %width : i32
+    return %shuffled : i32
   }
-  return %result : tensor<8xf32>
 }
 
-// CHECK: error: 'xla.atomic_rmw' op is unsupported by MUSA shim mapping version 2
+// CHECK: failed to legalize operation 'gpu.shuffle'

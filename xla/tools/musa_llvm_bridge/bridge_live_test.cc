@@ -729,7 +729,7 @@ std::unique_ptr<Kernel> LoadKernel(MusaExecutor& executor,
 }
 
 TEST(MusaLlvmBridgeLiveTest,
-     CompilesDeterministicallyAndExecutesMappingV1OnS80) {
+     CompilesDeterministicallyAndExecutesMappingV2OnS80) {
   TF_ASSERT_OK_AND_ASSIGN(QualifiedToolchain toolchain,
                           LocateQualifiedToolchain());
   const std::vector<std::string> kernels = {"barrier_reverse", "global_probe",
@@ -918,7 +918,7 @@ TEST(MusaLlvmBridgeLiveTest, RejectsAtomicsUntilMappingVersionBump) {
 }
 
 TEST(MusaLlvmBridgeLiveTest, BoundsKnownSdkClockCodegenFailures) {
-  // MUSA 4.0.1 accepts both mapping-v1 clock intrinsics, then its selector
+  // MUSA 4.0.1 accepts both base-mapping clock intrinsics, then its selector
   // repeats a DAG diagnostic indefinitely. The provider's output bound must
   // turn that SDK defect into a structured failure instead of a bridge hang.
   TF_ASSERT_OK_AND_ASSIGN(QualifiedToolchain toolchain,

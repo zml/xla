@@ -1060,7 +1060,7 @@ std::unique_ptr<ReductionFusion> MultiRowReductionFusion::TryCreate(
   }
 
   // The reduced dimension must fit into a single warp.
-  const int64_t warp_size = analysis.device_info().threads_per_warp();
+  const int64_t warp_size = ::xla::gpu::WarpSize(analysis.device_info());
   if (shape[kRowMinorReduced] > warp_size * vector_size) {
     VLOG(3) << "MultiRowReductionFusion::TryCreate reduced dimension "
             << shape[kRowMinorReduced] << " is larger than warp size "
@@ -1192,7 +1192,7 @@ std::unique_ptr<ReductionFusion> CreateReductionFusion(
     return std::make_unique<RowReductionFusion>(analysis);
   }
 
-  const int64_t warp_size = analysis.device_info().threads_per_warp();
+  const int64_t warp_size = ::xla::gpu::WarpSize(analysis.device_info());
   if (warp_size % reduction_dimensions.dimensions[kColMinorKept] == 0) {
     return std::make_unique<SmallColumnReductionFusion>(analysis);
   }

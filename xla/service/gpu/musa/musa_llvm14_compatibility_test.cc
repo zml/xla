@@ -211,12 +211,13 @@ TEST(MusaLlvm14CompatibilityTest, KernelArgumentPolicyFailClosed) {
                HasSubstr("capability=kernel-attributes")));
 }
 
-TEST(MusaLlvm14CompatibilityTest, RewritesEveryMappingV1ShimMemoryProfile) {
+TEST(MusaLlvm14CompatibilityTest, RewritesEveryMappingV2ShimMemoryProfile) {
   std::string calls;
   std::string declarations;
   int result_number = 0;
   for (const MusaShimSpec& spec : MusaShimSpecs()) {
     absl::string_view return_type;
+    absl::string_view arguments;
     switch (spec.signature) {
       case MusaShimSignature::kVoidVoid:
         return_type = "void";
@@ -232,12 +233,22 @@ TEST(MusaLlvm14CompatibilityTest, RewritesEveryMappingV1ShimMemoryProfile) {
         absl::StrAppend(&calls, "  %r", result_number++, " = call i64 @",
                         spec.xla_symbol, "()\n");
         break;
+      case MusaShimSignature::kI32I32I32:
+        return_type = "i32";
+        arguments = "i32 7, i32 0";
+        absl::StrAppend(&calls, "  %r", result_number++, " = call i32 @",
+                        spec.xla_symbol, "(", arguments, ")\n");
+        break;
     }
     absl::StrAppend(&declarations, "declare ", return_type, " @",
-                    spec.xla_symbol, "() ");
+                    spec.xla_symbol, "(", arguments.empty() ? "" : "i32, i32",
+                    ") ");
     if (spec.convergent) absl::StrAppend(&declarations, "convergent ");
     if ((spec.required_attributes & kNoUnwind) != 0) {
       absl::StrAppend(&declarations, "nounwind ");
+    }
+    if ((spec.required_attributes & kWillReturn) != 0) {
+      absl::StrAppend(&declarations, "willreturn ");
     }
     switch (spec.memory_effects) {
       case MusaMemoryEffects::kNone:
@@ -257,7 +268,7 @@ TEST(MusaLlvm14CompatibilityTest, RewritesEveryMappingV1ShimMemoryProfile) {
 
   absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
       NormalizeMusaLlvmTextForLlvm14(Module(calls, declarations), "all_shims");
-  ASSERT_THAT(normalized, IsOk());
+  ASSERT_TRUE(normalized.ok()) << normalized.status();
   EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "memory("));
   EXPECT_THAT(normalized->normalized_llvm, HasSubstr("readnone"));
   EXPECT_THAT(normalized->normalized_llvm, HasSubstr("inaccessiblememonly"));
@@ -374,6 +385,44 @@ TEST(MusaLlvm14CompatibilityTest, RewritesCurrentFloatBitLiteralsForLlvm14) {
       IsOk());
 }
 
+TEST(MusaLlvm14CompatibilityTest,
+     RewritesCurrentDecimalFloatOutsideLlvm14ParserRange) {
+  const std::string text = Module(
+      "  %low = fcmp ole float -1.000000e+30, 0.000000e+00\n"
+      "  store i1 %low, ptr addrspace(1) %out, align 1");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "decimal_float_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "-1.000000e+30"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("fcmp ole float 0x"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     RewritesEveryInexactDecimalFloatPhiIncomingValue) {
+  const std::string text = Module(
+      "  br i1 true, label %left, label %right\n"
+      "left:\n"
+      "  br label %merge\n"
+      "right:\n"
+      "  br label %merge\n"
+      "merge:\n"
+      "  %value = phi float [ -1.000000e+30, %left ], [ "
+      "1.000000e+30, %right ]\n"
+      "  %low = fcmp ole float %value, 0.000000e+00\n"
+      "  store i1 %low, ptr addrspace(1) %out, align 1");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "decimal_float_phi_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "1.000000e+30"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("phi float [ 0x"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
 TEST(MusaLlvm14CompatibilityTest, DoesNotRewriteFloatPatternInModuleName) {
   absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
       NormalizeMusaLlvmTextForLlvm14(Module(""), "f0xDEADBEEF_name");
@@ -443,6 +492,19 @@ TEST(MusaLlvm14CompatibilityTest, AcceptsGlobalsOnlyConstantsModule) {
   EXPECT_EQ(normalized->metadata.exported_globals[0].name, "constant_data");
   EXPECT_EQ(normalized->metadata.exported_globals[0].kind,
             MusaExportedGlobalKind::kMutable);
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest, PreservesMappingV2NoSignedZeros) {
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(
+          Module("  %value = fadd nsz float 1.0, 2.0\n"
+                 "  store float %value, ptr addrspace(1) %out, align 4"),
+          "nsz");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("fadd nsz float"));
   EXPECT_THAT(
       ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
       IsOk());

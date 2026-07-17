@@ -203,6 +203,7 @@ TEST(MusaBridgeIrValidatorTest, AcceptsEveryMappedShimWithExactSemantics) {
   int result = 0;
   for (const MusaShimSpec& spec : MusaShimSpecs()) {
     absl::string_view return_type;
+    absl::string_view arguments;
     switch (spec.signature) {
       case MusaShimSignature::kVoidVoid:
         return_type = "void";
@@ -218,9 +219,16 @@ TEST(MusaBridgeIrValidatorTest, AcceptsEveryMappedShimWithExactSemantics) {
         absl::StrAppend(&calls, "  %result", result++, " = call i64 @",
                         spec.xla_symbol, "()\n");
         break;
+      case MusaShimSignature::kI32I32I32:
+        return_type = "i32";
+        arguments = "i32 7, i32 0";
+        absl::StrAppend(&calls, "  %result", result++, " = call i32 @",
+                        spec.xla_symbol, "(", arguments, ")\n");
+        break;
     }
     absl::StrAppend(&declarations, "declare ", return_type, " @",
-                    spec.xla_symbol, "() ");
+                    spec.xla_symbol, "(", arguments.empty() ? "" : "i32, i32",
+                    ") ");
     if (spec.convergent) absl::StrAppend(&declarations, "convergent ");
     if ((spec.required_attributes & kNoUnwind) != 0) {
       absl::StrAppend(&declarations, "nounwind ");
@@ -286,7 +294,7 @@ TEST(MusaBridgeIrValidatorTest, RejectsModuleWithoutKernelOrTypedGlobal) {
 
 TEST(MusaBridgeIrValidatorTest, RejectsContractAndTargetMismatch) {
   MusaBridgeIrMetadata metadata = Metadata();
-  metadata.mapping_version = 2;
+  metadata.mapping_version = 1;
   EXPECT_THAT(Validate(MinimalModule(), metadata),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("version mismatch")));
@@ -555,7 +563,14 @@ TEST(MusaBridgeIrValidatorTest, RejectsUnlistedGenericIntrinsicAndCallCc) {
                        HasSubstr("capability=calling-convention")));
 }
 
-TEST(MusaBridgeIrValidatorTest, RejectsUnversionedFloatingPointSemantics) {
+TEST(MusaBridgeIrValidatorTest, AcceptsMappingV2NoSignedZeros) {
+  EXPECT_THAT(
+      Validate(Module("  %value = fadd nsz float 1.0, 2.0\n"
+                      "  store float %value, ptr addrspace(1) %out, align 4")),
+      IsOk());
+}
+
+TEST(MusaBridgeIrValidatorTest, RejectsUncontractedFloatingPointSemantics) {
   EXPECT_THAT(
       Validate(Module("  %value = fadd fast float 1.0, 2.0\n"
                       "  store float %value, ptr addrspace(1) %out, align 4")),

@@ -582,7 +582,7 @@ void AddLoopTransformationPasses(mlir::OpPassManager& pm,
                                  int max_unroll_factor) {
   pm.addNestedPass<FuncOp>(createLowerXlaSharedPass());
   emitters::LowerXlaToScfPassOptions lower_xla_to_scf_options;
-  lower_xla_to_scf_options.warp_size = device.threads_per_warp();
+  lower_xla_to_scf_options.warp_size = WarpSize(device);
   pm.addNestedPass<FuncOp>(
       emitters::createLowerXlaToScfPass(lower_xla_to_scf_options));
   pm.addPass(mlir::createInlinerPass({}, [&](mlir::OpPassManager& pm) {

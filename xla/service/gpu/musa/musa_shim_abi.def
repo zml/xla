@@ -60,5 +60,8 @@ MUSA_SHIM(kThreadIdY, "__xla_musa_v1_read_tid_y",
 MUSA_SHIM(kThreadIdZ, "__xla_musa_v1_read_tid_z",
           "llvm.musa.read.ptx.sreg.tid.z", kI32Void, kNone,
           kNoUnwind, false, 1)
+MUSA_SHIM(kLogicalShuffleI32, "__xla_musa_v1_subgroup_read_lane_i32",
+          "llvm.musa.shfl.idx.sync.fake", kI32I32I32, kNone,
+          kNoUnwind | kWillReturn, true, 2)
 MUSA_SHIM(kWorkgroupBarrier, "__xla_musa_v1_workgroup_barrier",
           "llvm.musa.barrier0", kVoidVoid, kReadWrite, kNoUnwind, true, 1)

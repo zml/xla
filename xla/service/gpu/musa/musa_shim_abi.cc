@@ -62,8 +62,6 @@ constexpr MusaUnsupportedCapability kUnsupportedCapabilities[] = {
      "device-library and numerical behavior require C06/C08 probes"},
     {"subgroup_barrier",
      "the S80 logical subgroup ABI requires C06/C07 conformance"},
-    {"subgroup_shuffle",
-     "scratch layout, mask width, and convergence require C06/C07 probes"},
     {"subgroup_vote",
      "mask width and convergence semantics require C06/C07 conformance"},
 };
@@ -185,6 +183,8 @@ absl::string_view MusaShimSignatureText(MusaShimSignature signature) {
       return "i32 ()";
     case MusaShimSignature::kI64Void:
       return "i64 ()";
+    case MusaShimSignature::kI32I32I32:
+      return "i32 (i32, i32)";
   }
 }
 

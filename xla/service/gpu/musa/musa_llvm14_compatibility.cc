@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +50,7 @@ limitations under the License.
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -501,11 +503,203 @@ int HexDigitValue(char value) {
   return -1;
 }
 
+absl::StatusOr<std::string> FormatLlvm14FloatLiteral(
+    llvm::APFloat value, absl::string_view module_name) {
+  bool loses_information = false;
+  const llvm::APFloat::opStatus status =
+      value.convert(llvm::APFloat::IEEEdouble(),
+                    llvm::APFloat::rmNearestTiesToEven, &loses_information);
+  if (status != llvm::APFloat::opOK || loses_information) {
+    return Rejected(module_name, "float-literals",
+                    "float literal cannot be represented by LLVM 14");
+  }
+  return absl::StrFormat(
+      "0x%016X", static_cast<uint64_t>(value.bitcastToAPInt().getZExtValue()));
+}
+
+bool IsLlvmIdentifierBody(char value) {
+  return absl::ascii_isalnum(static_cast<unsigned char>(value)) ||
+         value == '-' || value == '$' || value == '.' || value == '_';
+}
+
+bool IsLlvmTokenTerminator(char value) {
+  return absl::ascii_isspace(static_cast<unsigned char>(value)) ||
+         value == ',' || value == ')' || value == ']' || value == '}' ||
+         value == '>';
+}
+
+struct DecimalFloatLiteral {
+  size_t end;
+  // Empty when LLVM 14 accepts the exact decimal spelling unchanged.
+  std::string llvm14_spelling;
+};
+
+absl::StatusOr<std::optional<DecimalFloatLiteral>> ParseDecimalFloatLiteral(
+    absl::string_view current_text, size_t literal_start,
+    absl::string_view module_name) {
+  size_t cursor = literal_start;
+  if (current_text[cursor] == '+' || current_text[cursor] == '-') ++cursor;
+  const size_t integer_start = cursor;
+  while (
+      cursor < current_text.size() &&
+      absl::ascii_isdigit(static_cast<unsigned char>(current_text[cursor]))) {
+    ++cursor;
+  }
+  if (cursor == integer_start) return std::nullopt;
+
+  bool has_fraction_or_exponent = false;
+  if (cursor < current_text.size() && current_text[cursor] == '.') {
+    has_fraction_or_exponent = true;
+    ++cursor;
+    const size_t fraction_start = cursor;
+    while (
+        cursor < current_text.size() &&
+        absl::ascii_isdigit(static_cast<unsigned char>(current_text[cursor]))) {
+      ++cursor;
+    }
+    if (cursor == fraction_start) return std::nullopt;
+  }
+  if (cursor < current_text.size() &&
+      (current_text[cursor] == 'e' || current_text[cursor] == 'E')) {
+    has_fraction_or_exponent = true;
+    ++cursor;
+    if (cursor < current_text.size() &&
+        (current_text[cursor] == '+' || current_text[cursor] == '-')) {
+      ++cursor;
+    }
+    const size_t exponent_start = cursor;
+    while (
+        cursor < current_text.size() &&
+        absl::ascii_isdigit(static_cast<unsigned char>(current_text[cursor]))) {
+      ++cursor;
+    }
+    if (cursor == exponent_start) return std::nullopt;
+  }
+  if (!has_fraction_or_exponent ||
+      (cursor < current_text.size() &&
+       !IsLlvmTokenTerminator(current_text[cursor]))) {
+    return std::nullopt;
+  }
+
+  llvm::APFloat value(llvm::APFloat::IEEEsingle());
+  llvm::Expected<llvm::APFloat::opStatus> parsed = value.convertFromString(
+      llvm::StringRef(current_text.data() + literal_start,
+                      cursor - literal_start),
+      llvm::APFloat::rmNearestTiesToEven);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return Rejected(module_name, "float-literals",
+                    "current-LLVM decimal float literal could not be parsed");
+  }
+  if ((*parsed & (llvm::APFloat::opInvalidOp | llvm::APFloat::opOverflow)) !=
+      0) {
+    return Rejected(module_name, "float-literals",
+                    "current-LLVM decimal float literal is not finite");
+  }
+  // LLVM 14 accepts decimal f32 literals only when conversion is exact.
+  // Preserve those spellings so existing interchange goldens stay stable.
+  if (*parsed == llvm::APFloat::opOK) {
+    return DecimalFloatLiteral{cursor, std::string()};
+  }
+
+  absl::StatusOr<std::string> rewritten =
+      FormatLlvm14FloatLiteral(std::move(value), module_name);
+  if (!rewritten.ok()) return rewritten.status();
+  return DecimalFloatLiteral{cursor, std::move(*rewritten)};
+}
+
+// Current LLVM can print finite f32 constants in decimal forms that LLVM 14
+// rejects. Recognize only numeric operands associated with an f32 `float`
+// type, including every incoming value of a scalar `phi float`; declarations,
+// SSA operands, other floating types, comments, and strings are left untouched.
+absl::StatusOr<size_t> RewriteDecimalFloatAfterType(
+    absl::string_view current_text, size_t type_start,
+    absl::string_view module_name, std::string& normalized) {
+  constexpr absl::string_view kFloatType = "float";
+  const size_t after_type = type_start + kFloatType.size();
+  if ((type_start != 0 && IsLlvmIdentifierBody(current_text[type_start - 1])) ||
+      (after_type < current_text.size() &&
+       IsLlvmIdentifierBody(current_text[after_type]))) {
+    return type_start;
+  }
+
+  size_t operand_start = after_type;
+  while (operand_start < current_text.size() &&
+         (current_text[operand_start] == ' ' ||
+          current_text[operand_start] == '\t')) {
+    ++operand_start;
+  }
+  if (operand_start == after_type || operand_start >= current_text.size()) {
+    return type_start;
+  }
+
+  if (current_text[operand_start] != '[') {
+    absl::StatusOr<std::optional<DecimalFloatLiteral>> literal =
+        ParseDecimalFloatLiteral(current_text, operand_start, module_name);
+    if (!literal.ok()) return literal.status();
+    if (!literal->has_value() || (*literal)->llvm14_spelling.empty()) {
+      return type_start;
+    }
+    normalized.append(
+        current_text.substr(type_start, operand_start - type_start));
+    normalized.append((*literal)->llvm14_spelling);
+    return (*literal)->end;
+  }
+
+  const size_t line_end = current_text.find('\n', operand_start);
+  const size_t bounded_line_end =
+      line_end == absl::string_view::npos ? current_text.size() : line_end;
+  size_t copy_start = type_start;
+  size_t scan = operand_start;
+  bool changed = false;
+  while (scan < bounded_line_end) {
+    const size_t bracket = current_text.find('[', scan);
+    if (bracket == absl::string_view::npos || bracket >= bounded_line_end) {
+      break;
+    }
+    size_t literal_start = bracket + 1;
+    while (literal_start < bounded_line_end &&
+           (current_text[literal_start] == ' ' ||
+            current_text[literal_start] == '\t')) {
+      ++literal_start;
+    }
+    absl::StatusOr<std::optional<DecimalFloatLiteral>> literal =
+        ParseDecimalFloatLiteral(current_text, literal_start, module_name);
+    if (!literal.ok()) return literal.status();
+    if (!literal->has_value()) {
+      scan = literal_start;
+      continue;
+    }
+    if (!(*literal)->llvm14_spelling.empty()) {
+      normalized.append(
+          current_text.substr(copy_start, literal_start - copy_start));
+      normalized.append((*literal)->llvm14_spelling);
+      copy_start = (*literal)->end;
+      changed = true;
+    }
+    scan = (*literal)->end;
+  }
+  if (!changed) return type_start;
+  normalized.append(
+      current_text.substr(copy_start, bounded_line_end - copy_start));
+  return bounded_line_end;
+}
+
 absl::StatusOr<std::string> RewriteCurrentFloatLiterals(
     absl::string_view current_text, absl::string_view module_name) {
   std::string normalized;
   normalized.reserve(current_text.size());
   for (size_t index = 0; index < current_text.size();) {
+    if (index + 5 <= current_text.size() &&
+        current_text.substr(index, 5) == "float") {
+      absl::StatusOr<size_t> after = RewriteDecimalFloatAfterType(
+          current_text, index, module_name, normalized);
+      if (!after.ok()) return after.status();
+      if (*after != index) {
+        index = *after;
+        continue;
+      }
+    }
     if (index + 3 > current_text.size() ||
         current_text.substr(index, 3) != "f0x" ||
         (index != 0 && !absl::ascii_isspace(static_cast<unsigned char>(
@@ -536,17 +730,10 @@ absl::StatusOr<std::string> RewriteCurrentFloatLiterals(
 
     llvm::APFloat value(llvm::APFloat::IEEEsingle(),
                         llvm::APInt(32, single_bits));
-    bool loses_information = false;
-    const llvm::APFloat::opStatus status =
-        value.convert(llvm::APFloat::IEEEdouble(),
-                      llvm::APFloat::rmNearestTiesToEven, &loses_information);
-    if (status != llvm::APFloat::opOK || loses_information) {
-      return Rejected(module_name, "float-literals",
-                      "float literal cannot be represented by LLVM 14");
-    }
-    normalized.append(absl::StrFormat(
-        "0x%016X",
-        static_cast<uint64_t>(value.bitcastToAPInt().getZExtValue())));
+    absl::StatusOr<std::string> rewritten =
+        FormatLlvm14FloatLiteral(std::move(value), module_name);
+    if (!rewritten.ok()) return rewritten.status();
+    normalized.append(*rewritten);
     index = after;
   }
   return normalized;

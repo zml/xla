@@ -72,7 +72,12 @@ absl::StatusOr<bool> IsCublasSupportedMatMul(
 // GroupedMatMul.
 bool IsGpublasLtSupportedGroupedMatMul(const HloInstruction& instr);
 
-constexpr int64_t WarpSize(const se::DeviceDescription& gpu_device_info) {
+inline int64_t WarpSize(const se::DeviceDescription& gpu_device_info) {
+  if (const auto* musa =
+          gpu_device_info.gpu_compute_capability().musa_compute_capability();
+      musa != nullptr && musa->logical_subgroup_size() > 0) {
+    return musa->logical_subgroup_size();
+  }
   return gpu_device_info.threads_per_warp();
 }
 
@@ -140,7 +145,6 @@ bool IsCustomCallToTopK(const HloInstruction& hlo);
 // Returns true if `hlo` will be implmented as a call to a custom PTX kernel
 // implementation.
 bool IsCustomCallToPtxKernel(const HloInstruction& hlo);
-
 
 // Returns true if `hlo` will be implemented as a call to a Mosaic GPU kernel
 // with multimem.

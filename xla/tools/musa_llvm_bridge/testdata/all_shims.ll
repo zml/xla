@@ -21,6 +21,7 @@ entry:
   %tid_x = call i32 @__xla_musa_v1_read_tid_x()
   %tid_y = call i32 @__xla_musa_v1_read_tid_y()
   %tid_z = call i32 @__xla_musa_v1_read_tid_z()
+  %read_lane = call i32 @__xla_musa_v1_subgroup_read_lane_i32(i32 %tid_x, i32 0)
   call void @__xla_musa_v1_workgroup_barrier()
   ret void
 }
@@ -39,9 +40,11 @@ declare i32 @__xla_musa_v1_read_ntid_z() #2
 declare i32 @__xla_musa_v1_read_tid_x() #2
 declare i32 @__xla_musa_v1_read_tid_y() #2
 declare i32 @__xla_musa_v1_read_tid_z() #2
+declare i32 @__xla_musa_v1_subgroup_read_lane_i32(i32, i32) #4
 declare void @__xla_musa_v1_workgroup_barrier() #3
 
 attributes #0 = { inaccessiblememonly nounwind }
 attributes #1 = { convergent nounwind readnone }
 attributes #2 = { nounwind readnone }
 attributes #3 = { convergent nounwind }
+attributes #4 = { convergent nounwind readnone willreturn }

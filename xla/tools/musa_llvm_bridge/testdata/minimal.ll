@@ -2,7 +2,7 @@
 ; SPDX-License-Identifier: Apache-2.0
 ;
 ; LLVM 14 spelling is intentional. This fixture crosses the opaque-pointer,
-; textual vendor bridge and calls one mapping-v1 shim.
+; textual vendor bridge and calls one base-mapping shim.
 
 source_filename = "minimal"
 target datalayout = "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128"

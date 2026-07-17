@@ -13,9 +13,11 @@ attributes, vendor intrinsic, minimum mapping revision, and `mp_21` target.
 Current XLA consumes the generated runtime table; the C06 bridge will consume
 the same library and validate its canonical fingerprint before translation.
 Required attributes match the pinned vendor declarations literally; coordinate
-reads are `nounwind` and `memory(none)` but do not claim `willreturn`.
+reads are `nounwind` and `memory(none)` but do not claim `willreturn`. Shim ABI
+v1 currently uses mapping version 2 and the canonical mapping SHA-256 in
+`musa_shim_abi.h`.
 
-ABI v1 admits only the compiler-source-verified register reads for thread,
+The base mapping admits the compiler-source-verified register reads for thread,
 block, block-size, and grid-size coordinates, 32/64-bit clocks, and the
 workgroup barrier. The clock calls intentionally have inaccessible read/write
 effects so optimizers cannot common-subexpression-eliminate changing values.
@@ -26,14 +28,32 @@ it.
 The interchange admits generic AS0, global AS1, constant AS2,
 workgroup/shared AS3, and private/local/scratch AS5. The pinned SDK emits AS5
 for local pointers and defines it as 64-bit. AS4 is a 32-bit reserved space
-with no public semantic contract and is rejected. Admitting AS5 does not admit
-shuffle: its scratch layout and subgroup semantics remain unqualified.
+with no public semantic contract and is rejected.
 
-Subgroup synchronization, shuffle, vote, atomics, and non-generic math are
-named unsupported capability categories in mapping version 1. They fail with a
-specific diagnostic until compiler-source and execution probes establish their
-signatures and semantics. Unknown shims and silent CUDA/NVVM fallback are never
-permitted.
+Mapping version 2 adds a logical 32-lane shuffle while preserving S80's
+physical 128-thread hardware warp. Shared GPU scheduling uses the logical
+subgroup size only for subgroup algorithms; `threads_per_warp` and the target
+device contract remain physical. Current LLVM derives the logical lane as
+`thread_id_x & 31`, lowers all four `gpu.shuffle` modes with constant width 32,
+uses the caller's value for an invalid source lane, decomposes values into i32
+words, and calls `__xla_musa_v1_subgroup_read_lane_i32`.
+
+Only the isolated vendor bridge knows the SDK-specific adapter. It validates
+the registered `llvm.musa.shfl.idx.sync.fake` signature and attributes, adds a
+private aligned `[128 x i32]` AS3 scratch object, and supplies the mask,
+logical source lane, width, predicate, and scratch arguments. Direct S80
+source and LLVM probes establish the selected fake-intrinsic path; the
+similarly named wave-lane/read-lane intrinsics are not used because live
+probes did not implement the required logical shuffle semantics.
+
+Mapping version 2 also admits only the `nsz` fast-math flag needed by shared
+reduction emitters. Every other fast-math relaxation is rejected independently
+by current LLVM validation and vendor LLVM 14 validation.
+
+Subgroup synchronization, vote, atomics, and non-generic math remain named
+unsupported capability categories. Nonconstant or non-32 shuffle widths also
+fail with a specific diagnostic. Unknown shims and silent CUDA/NVVM fallback
+are never permitted.
 
 The native target contract is:
 

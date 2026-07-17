@@ -18,6 +18,8 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -27,6 +29,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
@@ -70,6 +73,22 @@ mlir::Type ShimResultType(mlir::MLIRContext* context,
       return mlir::IntegerType::get(context, 32);
     case musa::MusaShimSignature::kI64Void:
       return mlir::IntegerType::get(context, 64);
+    case musa::MusaShimSignature::kI32I32I32:
+      return mlir::IntegerType::get(context, 32);
+  }
+  llvm_unreachable("unknown MUSA shim signature");
+}
+
+llvm::SmallVector<mlir::Type> ShimArgumentTypes(
+    mlir::MLIRContext* context, musa::MusaShimSignature signature) {
+  switch (signature) {
+    case musa::MusaShimSignature::kVoidVoid:
+    case musa::MusaShimSignature::kI32Void:
+    case musa::MusaShimSignature::kI64Void:
+      return {};
+    case musa::MusaShimSignature::kI32I32I32:
+      return {mlir::IntegerType::get(context, 32),
+              mlir::IntegerType::get(context, 32)};
   }
   llvm_unreachable("unknown MUSA shim signature");
 }
@@ -85,7 +104,7 @@ mlir::LLVM::MemoryEffectsAttr ShimMemoryEffects(
           /*errnoMem=*/kNone, /*targetMem0=*/kNone, /*targetMem1=*/kNone);
     case musa::MusaMemoryEffects::kReadWrite:
       // An absent memory-effects attribute translates to unknown read/write
-      // effects, which is the exact mapping-v1 contract for a full barrier.
+      // effects, which is the exact base mapping contract for a full barrier.
       return {};
     case musa::MusaMemoryEffects::kInaccessibleRead:
       return builder.getAttr<mlir::LLVM::MemoryEffectsAttr>(
@@ -112,7 +131,8 @@ mlir::LLVM::LLVMFuncOp LookupOrCreateShim(
 
   mlir::Type result_type =
       ShimResultType(rewriter.getContext(), spec.signature);
-  auto function_type = mlir::LLVM::LLVMFunctionType::get(result_type, {});
+  auto function_type = mlir::LLVM::LLVMFunctionType::get(
+      result_type, ShimArgumentTypes(rewriter.getContext(), spec.signature));
   auto memory_effects = ShimMemoryEffects(rewriter, spec.memory_effects);
 
   if (mlir::Operation* symbol =
@@ -150,7 +170,8 @@ mlir::LLVM::LLVMFuncOp LookupOrCreateShim(
 
 mlir::FailureOr<mlir::LLVM::CallOp> CreateShimCall(
     mlir::Operation* source, musa::MusaShimId id,
-    mlir::ConversionPatternRewriter& rewriter) {
+    mlir::ConversionPatternRewriter& rewriter,
+    mlir::ValueRange arguments = {}) {
   const musa::MusaShimSpec* spec = FindShimById(id);
   if (spec == nullptr ||
       spec->minimum_mapping_version > musa::kMusaShimMappingVersion) {
@@ -159,11 +180,16 @@ mlir::FailureOr<mlir::LLVM::CallOp> CreateShimCall(
   }
   mlir::LLVM::LLVMFuncOp function = LookupOrCreateShim(source, *spec, rewriter);
   if (!function) return mlir::failure();
+  if (arguments.getTypes() != function.getArgumentTypes()) {
+    source->emitError("MUSA shim call arguments do not match versioned ABI ")
+        << spec->xla_symbol;
+    return mlir::failure();
+  }
 
-  // Do not copy declaration attributes to the call. Mapping version 1 has an
-  // intentionally attribute-free call-site ABI.
+  // Do not copy declaration attributes to the call. The versioned mapping has
+  // an intentionally attribute-free call-site ABI.
   return mlir::LLVM::CallOp::create(rewriter, source->getLoc(), function,
-                                    mlir::ValueRange{});
+                                    arguments);
 }
 
 template <typename Op>
@@ -229,7 +255,7 @@ class MusaBarrierOpLowering
         op.getScope() != mlir::gpu::BarrierScope::Workgroup) {
       return rewriter.notifyMatchFailure(
           op,
-          "mapping version 1 supports only an unnamed full workgroup "
+          "mapping version 2 supports only an unnamed full workgroup "
           "barrier");
     }
     if (mlir::failed(CreateShimCall(op, musa::MusaShimId::kWorkgroupBarrier,
@@ -237,6 +263,101 @@ class MusaBarrierOpLowering
       return mlir::failure();
     }
     rewriter.eraseOp(op);
+    return mlir::success();
+  }
+};
+
+class MusaShuffleOpLowering
+    : public mlir::ConvertOpToLLVMPattern<mlir::gpu::ShuffleOp> {
+ public:
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::gpu::ShuffleOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    llvm::APInt width;
+    bool is_logical_width_32 =
+        mlir::matchPattern(op.getWidth(), mlir::m_ConstantInt(&width)) &&
+        width.getSExtValue() == 32;
+    if (auto constant =
+            adaptor.getWidth().getDefiningOp<mlir::LLVM::ConstantOp>()) {
+      if (auto integer =
+              mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())) {
+        is_logical_width_32 |= integer.getValue().getSExtValue() == 32;
+      }
+    }
+    if (!is_logical_width_32) {
+      return rewriter.notifyMatchFailure(
+          op, "mapping version 2 requires constant logical subgroup width 32");
+    }
+
+    mlir::Location loc = op.getLoc();
+    mlir::Type i32 = rewriter.getI32Type();
+    mlir::Value thirty_one = mlir::LLVM::ConstantOp::create(
+        rewriter, loc, i32, rewriter.getI32IntegerAttr(31));
+    mlir::Value thirty_two = mlir::LLVM::ConstantOp::create(
+        rewriter, loc, i32, rewriter.getI32IntegerAttr(32));
+
+    mlir::FailureOr<mlir::LLVM::CallOp> lane_call =
+        CreateShimCall(op, musa::MusaShimId::kThreadIdX, rewriter);
+    if (mlir::failed(lane_call)) return mlir::failure();
+    mlir::Value physical_lane = lane_call->getResult();
+    mlir::Value logical_lane = mlir::LLVM::AndOp::create(
+        rewriter, loc, i32, physical_lane, thirty_one);
+
+    mlir::Value source_lane;
+    mlir::Value valid;
+    switch (op.getMode()) {
+      case mlir::gpu::ShuffleMode::UP:
+        source_lane = mlir::LLVM::SubOp::create(
+            rewriter, loc, i32, logical_lane, adaptor.getOffset());
+        valid = mlir::LLVM::ICmpOp::create(rewriter, loc,
+                                           mlir::LLVM::ICmpPredicate::ule,
+                                           adaptor.getOffset(), logical_lane);
+        break;
+      case mlir::gpu::ShuffleMode::DOWN:
+        source_lane = mlir::LLVM::AddOp::create(
+            rewriter, loc, i32, logical_lane, adaptor.getOffset());
+        valid = mlir::LLVM::ICmpOp::create(rewriter, loc,
+                                           mlir::LLVM::ICmpPredicate::ult,
+                                           source_lane, thirty_two);
+        break;
+      case mlir::gpu::ShuffleMode::XOR:
+        source_lane = mlir::LLVM::XOrOp::create(
+            rewriter, loc, i32, logical_lane, adaptor.getOffset());
+        valid = mlir::LLVM::ICmpOp::create(rewriter, loc,
+                                           mlir::LLVM::ICmpPredicate::ult,
+                                           source_lane, thirty_two);
+        break;
+      case mlir::gpu::ShuffleMode::IDX:
+        source_lane = adaptor.getOffset();
+        valid = mlir::LLVM::ICmpOp::create(rewriter, loc,
+                                           mlir::LLVM::ICmpPredicate::ult,
+                                           source_lane, thirty_two);
+        break;
+    }
+
+    mlir::Value safe_source_lane = mlir::LLVM::SelectOp::create(
+        rewriter, loc, valid, source_lane, logical_lane);
+
+    llvm::SmallVector<mlir::Value> words;
+    if (mlir::failed(mlir::LLVM::decomposeValue(
+            rewriter, loc, adaptor.getValue(), i32, words))) {
+      return rewriter.notifyMatchFailure(
+          op, "logical shuffle value cannot be decomposed into i32 words");
+    }
+    llvm::SmallVector<mlir::Value> shuffled_words;
+    shuffled_words.reserve(words.size());
+    for (mlir::Value word : words) {
+      mlir::FailureOr<mlir::LLVM::CallOp> shuffled =
+          CreateShimCall(op, musa::MusaShimId::kLogicalShuffleI32, rewriter,
+                         mlir::ValueRange{word, safe_source_lane});
+      if (mlir::failed(shuffled)) return mlir::failure();
+      shuffled_words.push_back(shuffled->getResult());
+    }
+    mlir::Value shuffled_value = mlir::LLVM::composeValue(
+        rewriter, loc, shuffled_words, adaptor.getValue().getType());
+    rewriter.replaceOp(op, {shuffled_value, valid});
     return mlir::success();
   }
 };
@@ -287,6 +408,7 @@ void PopulateMusaGpuToLLVMConversionPatterns(
       std::array{musa::MusaShimId::kGridDimX, musa::MusaShimId::kGridDimY,
                  musa::MusaShimId::kGridDimZ});
   patterns.add<MusaBarrierOpLowering>(converter);
+  patterns.add<MusaShuffleOpLowering>(converter);
 
   target.addIllegalDialect<mlir::gpu::GPUDialect>();
 }

@@ -94,6 +94,14 @@ std::string SanitizedSymbol(llvm::StringRef value) {
                                                        : "<invalid-symbol>";
 }
 
+// Mapping v2 admits exactly the `nsz` flag emitted by shared GPU reduction
+// codegen. Every other fast-math relaxation remains fail-closed.
+bool HasOnlyNoSignedZeros(const llvm::FastMathFlags& flags) {
+  return flags.noSignedZeros() && !flags.allowReassoc() && !flags.noNaNs() &&
+         !flags.noInfs() && !flags.allowReciprocal() &&
+         !flags.allowContract() && !flags.approxFunc();
+}
+
 absl::Status Rejected(const MusaBridgeIrMetadata& metadata,
                       absl::string_view capability, absl::string_view detail) {
   return absl::InvalidArgumentError(absl::StrFormat(
@@ -220,7 +228,7 @@ absl::Status ValidateType(const llvm::Type* type,
   } else if (const auto* vector = llvm::dyn_cast<llvm::VectorType>(type)) {
     if (vector->getElementCount().isScalable()) {
       return Rejected(metadata, "scalable-vector",
-                      "scalable vectors are not in mapping version 1");
+                      "scalable vectors are not in mapping version 2");
     }
     return ValidateType(vector->getElementType(), metadata, visited);
   } else if (llvm::isa<llvm::TargetExtType>(type)) {
@@ -344,16 +352,25 @@ absl::Status ValidateShim(const llvm::Function& function,
         absl::StrCat("shim ", spec.xla_symbol, " must have external linkage"));
   }
   const llvm::FunctionType* type = function.getFunctionType();
-  bool signature_matches = !type->isVarArg() && type->params().empty();
+  bool signature_matches = !type->isVarArg();
   switch (spec.signature) {
     case MusaShimSignature::kVoidVoid:
-      signature_matches &= type->getReturnType()->isVoidTy();
+      signature_matches &=
+          type->params().empty() && type->getReturnType()->isVoidTy();
       break;
     case MusaShimSignature::kI32Void:
-      signature_matches &= type->getReturnType()->isIntegerTy(32);
+      signature_matches &=
+          type->params().empty() && type->getReturnType()->isIntegerTy(32);
       break;
     case MusaShimSignature::kI64Void:
-      signature_matches &= type->getReturnType()->isIntegerTy(64);
+      signature_matches &=
+          type->params().empty() && type->getReturnType()->isIntegerTy(64);
+      break;
+    case MusaShimSignature::kI32I32I32:
+      signature_matches &= type->getReturnType()->isIntegerTy(32) &&
+                           type->params().size() == 2 &&
+                           type->getParamType(0)->isIntegerTy(32) &&
+                           type->getParamType(1)->isIntegerTy(32);
       break;
   }
   if (!signature_matches) {
@@ -732,7 +749,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
       if (!IsAllowedGenericIntrinsic(function.getIntrinsicID())) {
         return Rejected(metadata, "llvm-intrinsic",
                         absl::StrCat("intrinsic ", function_name,
-                                     " is not in mapping version 1"));
+                                     " is not in mapping version 2"));
       }
       if (absl::Status status = ValidateIntrinsicAttributes(function, metadata);
           !status.ok()) {
@@ -798,11 +815,12 @@ absl::Status ValidateFunctions(const llvm::Module& module,
           }
         }
         if (const auto* fp = llvm::dyn_cast<llvm::FPMathOperator>(&instruction);
-            fp != nullptr && fp->getFastMathFlags().any()) {
+            fp != nullptr && fp->getFastMathFlags().any() &&
+            !HasOnlyNoSignedZeros(fp->getFastMathFlags())) {
           return Rejected(metadata, "fast-math-flags",
                           absl::StrCat("function ", function_name,
-                                       " contains unversioned fast-math "
-                                       "flags"));
+                                       " contains fast-math flags outside the "
+                                       "mapping-v2 nsz-only contract"));
         }
         for (const llvm::Use& operand : instruction.operands()) {
           if (absl::Status status = ValidateValueType(*operand.get(), metadata);
@@ -924,19 +942,19 @@ absl::Status ValidateMusaBridgeIr(absl::string_view llvm_ir,
   }
   if (!module->aliases().empty()) {
     return Rejected(metadata, "global-alias",
-                    "global aliases are not in mapping version 1");
+                    "global aliases are not in mapping version 2");
   }
   if (!module->ifuncs().empty()) {
     return Rejected(metadata, "global-ifunc",
-                    "indirect functions are not in mapping version 1");
+                    "indirect functions are not in mapping version 2");
   }
   if (!module->getComdatSymbolTable().empty()) {
     return Rejected(metadata, "module-comdat",
-                    "COMDAT definitions are not in mapping version 1");
+                    "COMDAT definitions are not in mapping version 2");
   }
   if (module->named_metadata_begin() != module->named_metadata_end()) {
     return Rejected(metadata, "named-metadata",
-                    "named metadata is not in mapping version 1");
+                    "named metadata is not in mapping version 2");
   }
   for (llvm::StructType* type : module->getIdentifiedStructTypes()) {
     llvm::SmallPtrSet<const llvm::Type*, 16> visited_types;

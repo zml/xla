@@ -95,6 +95,14 @@ std::string SanitizedSymbol(llvm::StringRef value) {
   return value.str();
 }
 
+// Vendor LLVM 14 must independently enforce the mapping-v2 fast-math
+// contract. `nsz` is the sole accepted relaxation.
+bool HasOnlyNoSignedZeros(const llvm::FastMathFlags& flags) {
+  return flags.noSignedZeros() && !flags.allowReassoc() && !flags.noNaNs() &&
+         !flags.noInfs() && !flags.allowReciprocal() &&
+         !flags.allowContract() && !flags.approxFunc();
+}
+
 absl::Status Rejected(const MusaBridgeCompileRequest& request,
                       absl::string_view capability, absl::string_view detail) {
   // ValidateMusaBridgeCompileRequest has already constrained module_name and
@@ -121,7 +129,7 @@ absl::Status ValidateType(const llvm::Type* type,
   if (const auto* pointer = llvm::dyn_cast<llvm::PointerType>(type)) {
     if (!pointer->isOpaque()) {
       return Rejected(request, "pointer-model",
-                      "mapping version 1 requires opaque pointers");
+                      "mapping version 2 requires opaque pointers");
     }
     const MusaAddressSpaceSpec* address_space =
         FindMusaAddressSpace(pointer->getAddressSpace());
@@ -137,7 +145,7 @@ absl::Status ValidateType(const llvm::Type* type,
   if (const auto* function = llvm::dyn_cast<llvm::FunctionType>(type)) {
     if (function->isVarArg()) {
       return Rejected(request, "variadic-function",
-                      "variadic function types are outside mapping version 1");
+                      "variadic function types are outside mapping version 2");
     }
     if (absl::Status status =
             ValidateType(function->getReturnType(), request, visited);
@@ -162,7 +170,7 @@ absl::Status ValidateType(const llvm::Type* type,
   } else if (const auto* vector = llvm::dyn_cast<llvm::VectorType>(type)) {
     if (vector->getElementCount().isScalable()) {
       return Rejected(request, "scalable-vector",
-                      "scalable vectors are outside mapping version 1");
+                      "scalable vectors are outside mapping version 2");
     }
     return ValidateType(vector->getElementType(), request, visited);
   }
@@ -305,16 +313,34 @@ bool HasExactlyMemoryEffects(const llvm::Function& function,
 bool HasExpectedSignature(const llvm::Function& function,
                           MusaShimSignature signature) {
   const llvm::FunctionType* type = function.getFunctionType();
-  if (type->isVarArg() || !type->params().empty()) return false;
+  if (type->isVarArg()) return false;
   switch (signature) {
     case MusaShimSignature::kVoidVoid:
-      return type->getReturnType()->isVoidTy();
+      return type->params().empty() && type->getReturnType()->isVoidTy();
     case MusaShimSignature::kI32Void:
-      return type->getReturnType()->isIntegerTy(32);
+      return type->params().empty() && type->getReturnType()->isIntegerTy(32);
     case MusaShimSignature::kI64Void:
-      return type->getReturnType()->isIntegerTy(64);
+      return type->params().empty() && type->getReturnType()->isIntegerTy(64);
+    case MusaShimSignature::kI32I32I32:
+      return type->getReturnType()->isIntegerTy(32) &&
+             type->params().size() == 2 &&
+             type->getParamType(0)->isIntegerTy(32) &&
+             type->getParamType(1)->isIntegerTy(32);
   }
   return false;
+}
+
+bool HasExpectedVendorShuffleSignature(const llvm::Function& function) {
+  const llvm::FunctionType* type = function.getFunctionType();
+  return !type->isVarArg() && type->getReturnType()->isIntegerTy(32) &&
+         type->getNumParams() == 6 && type->getParamType(0)->isIntegerTy(32) &&
+         type->getParamType(1)->isIntegerTy(32) &&
+         type->getParamType(2)->isIntegerTy(32) &&
+         type->getParamType(3)->isIntegerTy(32) &&
+         type->getParamType(4)->isPointerTy() &&
+         type->getParamType(4)->getPointerAddressSpace() == 5 &&
+         type->getParamType(5)->isPointerTy() &&
+         type->getParamType(5)->getPointerAddressSpace() == 3;
 }
 
 absl::Status ValidateShimAttributes(const llvm::Function& function,
@@ -565,10 +591,12 @@ absl::Status ValidateInstruction(const llvm::Instruction& instruction,
     }
   }
   if (const auto* fp = llvm::dyn_cast<llvm::FPMathOperator>(&instruction);
-      fp != nullptr && fp->getFastMathFlags().any()) {
+      fp != nullptr && fp->getFastMathFlags().any() &&
+      !HasOnlyNoSignedZeros(fp->getFastMathFlags())) {
     return Rejected(request, "fast-math-flags",
                     absl::StrCat("function ", function_name,
-                                 " contains unversioned fast-math flags"));
+                                 " contains fast-math flags outside the "
+                                 "mapping-v2 nsz-only contract"));
   }
   for (const llvm::Use& operand : instruction.operands()) {
     if (absl::Status status = ValidateValueType(*operand.get(), request);
@@ -627,7 +655,7 @@ absl::Status ValidateInstruction(const llvm::Instruction& instruction,
       llvm::isa<llvm::AtomicRMWInst, llvm::AtomicCmpXchgInst, llvm::FenceInst>(
           instruction)) {
     return Rejected(request, "atomics",
-                    "atomics are not defined by mapping version 1");
+                    "atomics are not defined by mapping version 2");
   }
   return absl::OkStatus();
 }
@@ -698,7 +726,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
       if (!IsAllowedGenericIntrinsic(function.getName())) {
         return Rejected(request, "llvm-intrinsic",
                         absl::StrCat("intrinsic ", function_name,
-                                     " is outside mapping version 1"));
+                                     " is outside mapping version 2"));
       }
       const llvm::AttributeList canonical = llvm::Intrinsic::getAttributes(
           function.getContext(), function.getIntrinsicID());
@@ -793,15 +821,15 @@ absl::Status ValidateInterchangeModule(
   }
   if (!module.alias_empty()) {
     return Rejected(request, "global-alias",
-                    "global aliases are outside mapping version 1");
+                    "global aliases are outside mapping version 2");
   }
   if (!module.ifunc_empty()) {
     return Rejected(request, "global-ifunc",
-                    "indirect functions are outside mapping version 1");
+                    "indirect functions are outside mapping version 2");
   }
   if (!module.getComdatSymbolTable().empty()) {
     return Rejected(request, "module-comdat",
-                    "COMDAT definitions are outside mapping version 1");
+                    "COMDAT definitions are outside mapping version 2");
   }
   if (module.named_metadata_begin() != module.named_metadata_end()) {
     return Rejected(request, "named-metadata",
@@ -829,15 +857,39 @@ absl::StatusOr<llvm::Function*> GetVendorIntrinsic(
     return ToolchainMismatch(
         request, absl::StrCat("SDK does not register ", spec.vendor_intrinsic));
   }
+  llvm::SmallVector<llvm::Type*, 1> overload_types;
   if (llvm::Intrinsic::isOverloaded(id)) {
-    return ToolchainMismatch(
-        request,
-        absl::StrCat("mapped intrinsic unexpectedly became overloaded: ",
-                     spec.vendor_intrinsic));
+    if (spec.signature != MusaShimSignature::kI32I32I32) {
+      return ToolchainMismatch(
+          request,
+          absl::StrCat("mapped intrinsic has an unqualified overload: ",
+                       spec.vendor_intrinsic));
+    }
+    overload_types.push_back(llvm::Type::getInt32Ty(module.getContext()));
   }
-  llvm::Function* function = llvm::Intrinsic::getDeclaration(&module, id);
+  llvm::Function* function =
+      llvm::Intrinsic::getDeclaration(&module, id, overload_types);
   const llvm::StringRef vendor_name(spec.vendor_intrinsic.data(),
                                     spec.vendor_intrinsic.size());
+  if (spec.id == MusaShimId::kLogicalShuffleI32) {
+    if (function == nullptr || function->getName() != vendor_name ||
+        function->getIntrinsicID() != id ||
+        !HasExpectedVendorShuffleSignature(*function) ||
+        function->getCallingConv() != llvm::CallingConv::C ||
+        !function->hasFnAttribute(llvm::Attribute::NoUnwind) ||
+        !function->hasFnAttribute(llvm::Attribute::Convergent) ||
+        !function->hasFnAttribute(llvm::Attribute::WriteOnly) ||
+        function->hasFnAttribute(llvm::Attribute::ReadNone) ||
+        function->hasFnAttribute(llvm::Attribute::ReadOnly) ||
+        function->hasFnAttribute(llvm::Attribute::ArgMemOnly) ||
+        function->hasFnAttribute(llvm::Attribute::InaccessibleMemOnly) ||
+        function->hasFnAttribute(
+            llvm::Attribute::InaccessibleMemOrArgMemOnly)) {
+      return ToolchainMismatch(
+          request, "SDK fake-shuffle declaration disagrees with mapping v2");
+    }
+    return function;
+  }
   if (function == nullptr || function->getName() != vendor_name ||
       function->getIntrinsicID() != id ||
       !HasExpectedSignature(*function, spec.signature) ||
@@ -873,6 +925,8 @@ absl::StatusOr<uint32_t> TranslateShimCalls(
     shims.push_back({&function, spec});
   }
 
+  llvm::Constant* shuffle_scratch_pointer = nullptr;
+
   uint32_t translated_calls = 0;
   for (const ShimDeclaration& shim : shims) {
     absl::StatusOr<llvm::Function*> vendor =
@@ -889,7 +943,47 @@ absl::StatusOr<uint32_t> TranslateShimCalls(
       calls.push_back(call);
     }
     for (llvm::CallBase* call : calls) {
-      call->setCalledFunction(*vendor);
+      if (shim.spec->id == MusaShimId::kLogicalShuffleI32) {
+        auto* call_instruction = llvm::dyn_cast<llvm::CallInst>(call);
+        if (call_instruction == nullptr) {
+          return Rejected(request, "shuffle-adapter",
+                          "logical shuffle must use an ordinary call");
+        }
+        if (shuffle_scratch_pointer == nullptr) {
+          llvm::Type* i32 = llvm::Type::getInt32Ty(module.getContext());
+          llvm::ArrayType* scratch_type = llvm::ArrayType::get(i32, 128);
+          auto* scratch = new llvm::GlobalVariable(
+              module, scratch_type, /*isConstant=*/false,
+              llvm::GlobalValue::PrivateLinkage,
+              llvm::UndefValue::get(scratch_type),
+              "__musa_xla_shuffle_scratch_v2", /*InsertBefore=*/nullptr,
+              llvm::GlobalValue::NotThreadLocal, /*AddressSpace=*/3);
+          scratch->setAlignment(llvm::Align(4));
+          llvm::Constant* zero = llvm::ConstantInt::get(i32, 0);
+          llvm::Constant* indices[] = {zero, zero};
+          shuffle_scratch_pointer =
+              llvm::ConstantExpr::getInBoundsGetElementPtr(scratch_type,
+                                                           scratch, indices);
+        }
+
+        llvm::IRBuilder<> builder(call_instruction);
+        llvm::Type* i32 = llvm::Type::getInt32Ty(module.getContext());
+        llvm::Value* arguments[] = {
+            llvm::ConstantInt::getSigned(i32, -1),
+            call_instruction->getArgOperand(0),
+            call_instruction->getArgOperand(1),
+            llvm::ConstantInt::get(i32, 32),
+            llvm::ConstantPointerNull::get(llvm::PointerType::get(
+                llvm::Type::getInt8Ty(module.getContext()), 5)),
+            shuffle_scratch_pointer};
+        llvm::CallInst* translated =
+            builder.CreateCall(*vendor, arguments, "musa_shuffle");
+        translated->setCallingConv((*vendor)->getCallingConv());
+        call_instruction->replaceAllUsesWith(translated);
+        call_instruction->eraseFromParent();
+      } else {
+        call->setCalledFunction(*vendor);
+      }
       ++translated_calls;
     }
     if (!shim.function->use_empty()) {
@@ -1131,7 +1225,7 @@ absl::Status ValidateTranslatedModule(const llvm::Module& module,
     }
     if (!mapped) {
       return absl::InternalError(
-          "MUSA bridge emitted a target intrinsic outside mapping version 1");
+          "MUSA bridge emitted a target intrinsic outside mapping version 2");
     }
   }
   return absl::OkStatus();
@@ -1178,8 +1272,11 @@ absl::StatusOr<VendorLlvmModule> TranslateMusaBridgeRequestToVendorLlvm(
                       request.normalized_llvm().size()),
       diagnostic, context);
   if (module == nullptr) {
-    return Rejected(request, "llvm14-parse",
-                    "vendor LLVM 14 parser rejected the module");
+    return Rejected(
+        request, "llvm14-parse",
+        absl::StrFormat(
+            "vendor LLVM 14 parser rejected the module at line %d column %d",
+            diagnostic.getLineNo(), diagnostic.getColumnNo()));
   }
   if (llvm::verifyModule(*module)) {
     return Rejected(request, "llvm14-verifier",

@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
 
@@ -69,6 +70,27 @@ class IrEmissionUtilsTest : public HloHardwareIndependentTestBase {
 };
 
 using InlinedVector = absl::InlinedVector<int64_t, 3>;
+
+TEST_F(IrEmissionUtilsTest, WarpSizeUsesMusaLogicalSubgroup) {
+  stream_executor::DeviceDescription device;
+  device.set_threads_per_warp(128);
+  device.set_gpu_compute_capability(stream_executor::GpuComputeCapability(
+      stream_executor::MusaComputeCapability("mp_21", /*major=*/2, /*minor=*/1,
+                                             /*hardware_warp_size=*/128,
+                                             /*logical_subgroup_size=*/32)));
+
+  EXPECT_EQ(WarpSize(device), 32);
+  const auto* capability =
+      device.gpu_compute_capability().musa_compute_capability();
+  ASSERT_NE(capability, nullptr);
+  EXPECT_EQ(capability->hardware_warp_size(), 128);
+}
+
+TEST_F(IrEmissionUtilsTest, WarpSizeDefaultsToGenericSchedulingWidth) {
+  stream_executor::DeviceDescription device;
+  device.set_threads_per_warp(64);
+  EXPECT_EQ(WarpSize(device), 64);
+}
 
 TEST_F(IrEmissionUtilsTest, FindTiledLogicalTranspose) {
   const char* hlo = R"(

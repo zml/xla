@@ -31,7 +31,7 @@ inline constexpr const char* kMusaKernelMarker =
 // alignment-sensitive lowering runs.
 mlir::LogicalResult ConfigureMusaLLVMModule(mlir::ModuleOp module);
 
-// Lowers only the GPU operations qualified by MUSA shim mapping version 1.
+// Lowers only the GPU operations qualified by the current MUSA shim mapping.
 // The GPU dialect is illegal after this conversion, so every other GPU op
 // fails closed instead of falling through to NVVM or ROCDL.
 void PopulateMusaGpuToLLVMConversionPatterns(

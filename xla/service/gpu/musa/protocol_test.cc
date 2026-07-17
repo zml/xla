@@ -178,7 +178,7 @@ TEST(MusaBridgeProtocolTest, RequestCanonicalRoundTripIsStable) {
   EXPECT_EQ(MusaBridgeCompileRequestSha256(*decoded),
             MusaBridgeCompileRequestSha256(request));
   EXPECT_EQ(MusaBridgeSha256Hex(*first),
-            "06f40056f9ba836960dfb2ffd3054df68b88bf555d9e8fd33d4a7d13414a969d");
+            "2f5cd98a59109128c3003605147c3db8425eb38cad5216cdcadd73a16a308c5a");
 }
 
 TEST(MusaBridgeProtocolTest, ResponseCanonicalRoundTripPreservesBinaryMubin) {
@@ -194,7 +194,7 @@ TEST(MusaBridgeProtocolTest, ResponseCanonicalRoundTripPreservesBinaryMubin) {
   EXPECT_EQ(decoded->mubin(), response.mubin());
   EXPECT_EQ(EncodeMusaBridgeCompileResponse(*decoded), wire);
   EXPECT_EQ(MusaBridgeSha256Hex(*wire),
-            "06482c4e81cb8ccda8bc49c6b698de155a09c3d61df24505ccecfa6c3cea6bb8");
+            "00262133fd7aa8fab8ece664a385b68f8eab0e1bd4f83e1040b9ef8b716ed0c3");
 }
 
 TEST(MusaBridgeProtocolTest, WireBoundsCoverWorstCaseTextExpansion) {

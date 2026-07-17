@@ -298,13 +298,16 @@ TEST(MusaLlvmBridgeCoreTest, ParsesAndTranslatesSineCompatibilityGolden) {
               HasSubstr("declare float @llvm.sin.f32(float)"));
 }
 
-TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV1Shim) {
+TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV2Shim) {
   MusaBridgeCompileRequest request = RequestForIr(ReadTestdata("all_shims.ll"));
   absl::StatusOr<VendorLlvmModule> translated =
       TranslateMusaBridgeRequestToVendorLlvm(request);
   ASSERT_THAT(translated, IsOk());
   EXPECT_EQ(translated->translated_shim_calls, MusaShimSpecs().size());
   for (const MusaShimSpec& spec : MusaShimSpecs()) {
+    EXPECT_THAT(translated->llvm_ir,
+                HasSubstr("@__musa_xla_shuffle_scratch_v2 = private "
+                          "addrspace(3) global [128 x i32]"));
     EXPECT_THAT(translated->llvm_ir, HasSubstr(spec.vendor_intrinsic));
   }
   EXPECT_FALSE(absl::StrContains(translated->llvm_ir, "__xla_musa_"));
@@ -388,7 +391,7 @@ TEST(MusaLlvmBridgeCoreTest, TranslationIsDeterministic) {
   EXPECT_EQ(first->llvm_ir, second->llvm_ir);
 }
 
-TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV1) {
+TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV2) {
   struct Rejection {
     const char* fixture;
     const char* capability;
@@ -409,7 +412,18 @@ TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV1) {
   }
 }
 
-TEST(MusaLlvmBridgeCoreTest, RejectsUnversionedFloatingPointSemantics) {
+TEST(MusaLlvmBridgeCoreTest, AcceptsMappingV2NoSignedZeros) {
+  std::string ir = ReadTestdata("minimal.ll");
+  const size_t ret = ir.find("  ret void");
+  ASSERT_NE(ret, std::string::npos);
+  ir.insert(ret,
+            "  %value = fadd nsz float 1.0, 2.0\n"
+            "  store float %value, ptr addrspace(1) %out, align 4\n");
+  MusaBridgeCompileRequest request = RequestForIr(ir);
+  EXPECT_THAT(TranslateMusaBridgeRequestToVendorLlvm(request), IsOk());
+}
+
+TEST(MusaLlvmBridgeCoreTest, RejectsUncontractedFloatingPointSemantics) {
   constexpr absl::string_view kPrefix =
       "target datalayout = \"e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-"
       "p3:32:32-p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-"
@@ -450,6 +464,7 @@ TEST(MusaLlvmBridgeCoreTest, ParserFailureDoesNotEchoUntrustedIr) {
       TranslateMusaBridgeRequestToVendorLlvm(request).status();
   EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument,
                                HasSubstr("capability=llvm14-parse")));
+  EXPECT_THAT(status.message(), HasSubstr("line 1 column 0"));
   EXPECT_FALSE(
       absl::StrContains(status.message(), "sensitive_vendor_bridge_token"));
 }

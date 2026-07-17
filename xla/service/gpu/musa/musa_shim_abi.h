@@ -28,7 +28,7 @@ namespace xla::gpu::musa {
 
 inline constexpr uint32_t kMusaBridgeProtocolVersion = 1;
 inline constexpr uint32_t kMusaShimAbiVersion = 1;
-inline constexpr uint32_t kMusaShimMappingVersion = 1;
+inline constexpr uint32_t kMusaShimMappingVersion = 2;
 inline constexpr uint32_t kMusaInterchangePointerWidth = 64;
 inline constexpr bool kMusaInterchangeIsLittleEndian = true;
 inline constexpr char kMusaShimSymbolPrefix[] = "__xla_musa_v1_";
@@ -46,7 +46,7 @@ inline constexpr auto& kMusaDataLayout =
 // A checked-in digest makes changes to the canonical table an explicit ABI
 // review event. musa_shim_abi_test recomputes it from MusaShimCanonicalText().
 inline constexpr char kMusaShimMappingSha256[] =
-    "5513ef3d1c0ccc1c16a893bed118a1f0dbd634743cddacb8395435da0d860bd4";
+    "15e63d93b88d62890ae6019b244ac62b9cd319ef100d772afbda05188f5e5396";
 
 enum class MusaShimId : uint8_t {
 #define MUSA_SHIM(id, ...) id,
@@ -58,6 +58,7 @@ enum class MusaShimSignature : uint8_t {
   kVoidVoid,
   kI32Void,
   kI64Void,
+  kI32I32I32,
 };
 
 enum class MusaMemoryEffects : uint8_t {
@@ -101,7 +102,7 @@ struct MusaAddressSpaceSpec {
   bool allowed_in_interchange;
 };
 
-// These categories are deliberately named and rejected by mapping version 1.
+// These categories are deliberately named and rejected by the active mapping.
 // Adding one requires compiler-source and end-to-end probes, then a mapping
 // version change. They must never fall through to another GPU target.
 struct MusaUnsupportedCapability {

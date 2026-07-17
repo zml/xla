@@ -47,11 +47,12 @@ std::string Sha256Hex(absl::string_view value) {
 
 TEST(MusaShimAbiTest, MappingIsFiniteVersionedAndSelfConsistent) {
   EXPECT_THAT(ValidateMusaShimTable(), IsOk());
-  EXPECT_EQ(MusaShimSpecs().size(), 15);
+  EXPECT_EQ(MusaShimSpecs().size(), 16);
   for (const MusaShimSpec& spec : MusaShimSpecs()) {
     EXPECT_TRUE(absl::StartsWith(spec.xla_symbol, "__xla_musa_v1_"));
     EXPECT_TRUE(absl::StartsWith(spec.vendor_intrinsic, "llvm.musa."));
-    EXPECT_EQ(spec.minimum_mapping_version, 1);
+    EXPECT_GE(spec.minimum_mapping_version, 1);
+    EXPECT_LE(spec.minimum_mapping_version, kMusaShimMappingVersion);
     EXPECT_FALSE(MusaShimSignatureText(spec.signature).empty());
     EXPECT_FALSE(MusaMemoryEffectsText(spec.memory_effects).empty());
     EXPECT_EQ(FindMusaShim(spec.xla_symbol), &spec);
@@ -81,8 +82,7 @@ TEST(MusaShimAbiTest, AddressSpacesMatchPinnedSdk) {
 
 TEST(MusaShimAbiTest, RiskyCapabilitiesAreExplicitlyRejected) {
   constexpr absl::string_view kRequired[] = {
-      "atomics", "non_generic_math", "subgroup_barrier", "subgroup_shuffle",
-      "subgroup_vote"};
+      "atomics", "non_generic_math", "subgroup_barrier", "subgroup_vote"};
   ASSERT_EQ(MusaUnsupportedCapabilities().size(), std::size(kRequired));
   for (int i = 0; i < std::size(kRequired); ++i) {
     EXPECT_EQ(MusaUnsupportedCapabilities()[i].name, kRequired[i]);
@@ -126,6 +126,14 @@ TEST(MusaShimAbiTest, ShimSemanticsMatchPinnedCompilerDeclarations) {
   EXPECT_EQ(barrier->vendor_intrinsic, "llvm.musa.barrier0");
   EXPECT_EQ(barrier->memory_effects, MusaMemoryEffects::kReadWrite);
   EXPECT_TRUE(barrier->convergent);
+
+  const MusaShimSpec* read_lane =
+      FindMusaShim("__xla_musa_v1_subgroup_read_lane_i32");
+  ASSERT_NE(read_lane, nullptr);
+  EXPECT_EQ(read_lane->vendor_intrinsic, "llvm.musa.shfl.idx.sync.fake");
+  EXPECT_EQ(read_lane->signature, MusaShimSignature::kI32I32I32);
+  EXPECT_EQ(read_lane->minimum_mapping_version, 2);
+  EXPECT_TRUE(read_lane->convergent);
 }
 
 }  // namespace
