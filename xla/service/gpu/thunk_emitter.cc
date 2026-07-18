@@ -1277,9 +1277,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
     return absl::InvalidArgumentError(
         "zml$scaled_matmul expects at least 3 operands (x, w, scale).");
   }
-  const PrimitiveType wt = instr->operand(1)->shape().element_type();
-  const PrimitiveType st = instr->operand(2)->shape().element_type();
-  const bool is_nvfp4 = wt == F4E2M1FN && st == F8E4M3FN;
+  // Classify through the same helper the rewriter matched with, so a scheme can
+  // never be fused here and unimplemented there.
+  const std::optional<MetalScaledMatmulScheme> scheme =
+      ClassifyMetalScaledMatmul(instr->operand(1)->shape(),
+                                instr->operand(2)->shape());
+  if (!scheme.has_value()) {
+    return absl::UnimplementedError(absl::StrCat(
+        "zml$scaled_matmul: no Metal thunk implements weight ",
+        instr->operand(1)->shape().ToString(true), " with scale ",
+        instr->operand(2)->shape().ToString(true), "."));
+  }
   if (instr->operand_count() != 3) {
     return absl::InvalidArgumentError(
         "zml$scaled_matmul expects 3 operands (x, w, scale).");
@@ -1303,12 +1311,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
         "zml$scaled_matmul requires row-major contiguous x, w, scale, and "
         "output buffers.");
   }
-  // NVFP4: f4e2m1 weight + e4m3 group-16 scales.
-  if (is_nvfp4) {
-    return EmitMetalNvfp4MatmulThunk(instr);
+  switch (*scheme) {
+    case MetalScaledMatmulScheme::kNvfp4Group16:
+      return EmitMetalNvfp4MatmulThunk(instr);
+    case MetalScaledMatmulScheme::kFp8Block128:
+    case MetalScaledMatmulScheme::kFp8PerChannel:
+      return EmitMetalFp8GemvThunk(instr);
   }
-  // FP8 128-block / per-channel (bf16 scales).
-  return EmitMetalFp8GemvThunk(instr);
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
@@ -3979,9 +3988,10 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   if (custom_call->custom_call_target() == "zml$gdn") {
     return EmitMetalGdnThunk(custom_call);
   }
-  // Weight-only scaled matmul: ScaledDotRewriter's Metal branch rewrites a
-  // weight-only kScaledDot into zml$scaled_matmul; dispatch MX / NVFP4 / FP8
-  // by weight/scale dtypes.
+  // Weight-only scaled matmul: FusedScaledDotRewriter's Metal arm rewrites a
+  // weight-only kScaledDot into zml$scaled_matmul; dispatch NVFP4 group-16 or
+  // 128-block / per-channel FP8 via ClassifyMetalScaledMatmul (MX is not a
+  // fused scheme -- it never reaches this call).
   if (IsMetalScaledMatmul(*hlo)) {
     return EmitMetalScaledMatmulThunk(custom_call);
   }

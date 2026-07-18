@@ -16,9 +16,14 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_METAL_CUSTOM_CALLS_H_
 #define XLA_SERVICE_GPU_METAL_CUSTOM_CALLS_H_
 
+#include <cstdint>
+#include <optional>
+
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/shape.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
@@ -36,18 +41,71 @@ namespace gpu {
 inline constexpr absl::string_view kMetalGemmCallTarget = "__metal$gemm";
 
 // Weight-only scaled matmul on Apple Metal: single custom-call target for every
-// fused dequant×GEMM scheme the Metal branch of ScaledDotRewriter supports.
+// fused dequant×GEMM scheme the Metal arm of FusedScaledDotRewriter supports.
 // Produced from a weight-only kScaledDot (itself from the xla.scaled_dot
 // composite). Operands:
 //   {x[M,K] bf16, w[N,K] quant, scale[...]} -> out[M,N] bf16
-// ThunkEmitter dispatches by weight/scale dtypes and layout:
-//   - NVFP4 (f4 + e4m3 group-16) -> MetalNvfp4MatmulThunk
-//   - FP8 128-block / per-channel bf16 scales -> MetalFp8GemvThunk
+// ThunkEmitter dispatches by weight/scale dtypes and layout; the schemes are
+// MetalScaledMatmulScheme below.
+inline constexpr absl::string_view kMetalScaledMatmulCallTarget =
+    "zml$scaled_matmul";
+
+// The fused dequant×GEMM schemes the Metal scaled-matmul thunks implement.
+//
+// This enum is the contract between the rewriter that EMITS
+// kMetalScaledMatmulCallTarget and the ThunkEmitter that LOWERS it, and both
+// sides must classify through ClassifyMetalScaledMatmul rather than re-deriving
+// the scheme from dtypes. A scheme the rewriter claims but no thunk implements
+// is not a slow path, it is a compile failure: fusing deletes the kScaledDot,
+// so ScaledDotRewriter's generic dequantize-and-Dot expansion is no longer
+// there to fall back to.
+//
 // OCP microscaling (MX / e8m0 group-32) is deliberately absent: no model emits
 // it -- zml/nn.zig is the only producer of the xla.scaled_dot composite and no
 // checkpoint carries e8m0 scales -- so the arm and its thunk were removed.
-inline constexpr absl::string_view kMetalScaledMatmulCallTarget =
-    "zml$scaled_matmul";
+// Because it is absent here, an e8m0 scaled dot is simply never fused and
+// lowers through the generic expansion.
+enum class MetalScaledMatmulScheme {
+  // f4e2m1 w[N,K] + f8e4m3fn scale[N,K/16] -> MetalNvfp4MatmulThunk.
+  kNvfp4Group16,
+  // f8e4m3fn w[N,K] + bf16 scale[N/128,K/128] -> MetalFp8GemvThunk.
+  kFp8Block128,
+  // f8e4m3fn w[N,K] + bf16 scale[N,1] -> MetalFp8GemvThunk.
+  kFp8PerChannel,
+};
+
+// Classifies a (weight, weight-scale) shape pair against the schemes above.
+// nullopt means no Metal thunk implements this pair, so it must not be fused.
+// Shapes only -- the caller checks dot dimension numbers (K minor) and any
+// backend ABI limits separately.
+inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
+    const Shape& weights, const Shape& scale) {
+  if (weights.dimensions().size() != 2 || scale.dimensions().size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t n = weights.dimensions(0);
+  const int64_t k = weights.dimensions(1);
+  const int64_t scale_n = scale.dimensions(0);
+  const int64_t scale_k = scale.dimensions(1);
+
+  if (weights.element_type() == F4E2M1FN &&
+      scale.element_type() == F8E4M3FN) {
+    if (scale_n == n && scale_k != 0 && k == scale_k * 16) {
+      return MetalScaledMatmulScheme::kNvfp4Group16;
+    }
+    return std::nullopt;
+  }
+  if (weights.element_type() == F8E4M3FN && scale.element_type() == BF16) {
+    if (scale_n == n && scale_k == 1) {
+      return MetalScaledMatmulScheme::kFp8PerChannel;
+    }
+    if (n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&
+        scale_k == k / 128) {
+      return MetalScaledMatmulScheme::kFp8Block128;
+    }
+  }
+  return std::nullopt;
+}
 
 inline bool IsMetalScaledMatmul(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&

@@ -1117,6 +1117,8 @@ cc_library(
     hdrs = ["metal_custom_calls.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/strings",
     ],
