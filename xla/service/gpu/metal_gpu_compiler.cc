@@ -929,10 +929,11 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   // Use set_config (fresh shared_ptr) rather than mutable_config() so the value
   // survives a later SPMD/Shardy pass re-sharing the config.
   // Route the block-scaled dot (kScaledDot, produced by CompositeRewriter from
-  // ZML's xla.scaled_dot composite) to ScaledDotRewriter instead of Triton:
-  // Metal has no Triton codegen, and ScaledDotRewriter is where the Metal MX
-  // matmul lowering (and the dequant fallback) lives. The flag defaults true
-  // (Triton), which on Metal would leave kScaledDot uncodegen-able.
+  // ZML's xla.scaled_dot composite) to the FusedScaledDotRewriter +
+  // ScaledDotRewriter pair instead of Triton: Metal has no Triton codegen, and
+  // that pair is where the Metal MX matmul lowering (and the dequant fallback)
+  // lives. The flag defaults true (Triton), which on Metal would leave
+  // kScaledDot uncodegen-able.
   {
     HloModuleConfig cfg = module->config();
     cfg.mutable_debug_options().set_xla_gpu_dot_merger_threshold_mb(0);
@@ -944,7 +945,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
     // plain kSort, which RewriteSortToMetalThunk routes to the native metal$sort
     // kernel (and the legacy nvvm-emitting bitonic emitter is never reached).
     cfg.mutable_debug_options().set_xla_gpu_enable_cub_radix_sort(false);
-    // Route kScaledDot to ScaledDotRewriter (Metal has no Triton).
+    // Route kScaledDot to the scaled-dot rewriters (Metal has no Triton).
     cfg.mutable_debug_options().set_xla_gpu_experimental_scaled_dot_with_triton(
         false);
     module->set_config(std::move(cfg));

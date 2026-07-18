@@ -26,7 +26,28 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// This pass rewrites the composite a specific instruction.
+// Rewrites a `stablehlo.composite` call into the equivalent native HLO.
+//
+// Today that means the `xla.scaled_dot` composite -> kScaledDot. This composite
+// is the SINGLE supported carrier for block-scaled matmul in this fork: ZML
+// (zml/ops.zig scaledDot) emits it, this pass canonicalizes it, and everything
+// downstream -- FusedScaledDotRewriter's backend fast paths, then
+// ScaledDotRewriter's generic dequantize-and-Dot floor -- consumes kScaledDot.
+//
+// Deliberately NOT used here: the parallel `__op$block_scaled_dot` /
+// `__op$quantize` / `__op$dequantize` custom-call route handled by
+// BlockScalingRewriter. That route is upstream's JAX-facing entry point, is
+// registered only for NVPTX (nvptx_compiler.cc), and is MX-centric. We do not
+// emit into it and do not route through it; it is left untouched for upstream
+// CUDA/ROCm users rather than removed.
+//
+// Quantization schemes: the maintained FUSED paths are 128x128-block FP8 and
+// NVFP4 group-16 (see MetalScaledMatmulScheme in metal_custom_calls.h). OCP
+// microscaling (MX / e8m0 group-32) is accepted here on purpose but has no
+// fused kernel on any backend we own, so it lowers through the generic
+// dequantize-and-Dot floor -- correct, just not fast. Widening acceptance here
+// never risks correctness: an operand/scale pair no fast path claims always
+// falls through to that floor.
 class CompositeRewriter : public HloModulePass {
  public:
   absl::string_view name() const override { return "composite-rewriter"; }

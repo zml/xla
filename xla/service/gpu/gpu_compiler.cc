@@ -113,6 +113,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/estimate_cub_sort_scratch_size.h"
 #include "xla/backends/gpu/transforms/explicit_collectives_group_async_wrapper.h"
 #include "xla/backends/gpu/transforms/explicit_stream_annotation_async_wrapper.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/fusion_wrapper.h"
 #include "xla/backends/gpu/transforms/gemm_broadcast_folding_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_fusion.h"
@@ -765,7 +766,10 @@ absl::Status RunOptimizationPasses(
   pipeline.AddPass<RaggedDotRewriter>(gpu_version,
                                       gpu_target_config.dnn_version_info);
   if (!debug_options.xla_gpu_experimental_scaled_dot_with_triton()) {
-    pipeline.AddPass<ScaledDotRewriter>(gpu_version);
+    // Claim the scaled-dots this backend already has a fused kernel for, then
+    // expand whatever is left generically.
+    pipeline.AddPass<FusedScaledDotRewriter>(gpu_version);
+    pipeline.AddPass<ScaledDotRewriter>();
   }
   pipeline.AddPass<BatchedGatherScatterNormalizer>();
   if (debug_options.xla_gpu_multi_streamed_windowed_einsum()) {
