@@ -25,6 +25,9 @@ limitations under the License.
 #include <utility>
 #include <variant>
 
+#include <sycl/feature_test.hpp>
+#include <sycl/usm.hpp>
+
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -885,6 +888,46 @@ SyclExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
 absl::StatusOr<std::unique_ptr<MemoryAllocation>>
 SyclExecutor::HostMemoryAllocate(uint64_t size) {
   return AllocateHostMemory(sycl_context_.get(), device_ordinal(), size);
+}
+
+bool SyclExecutor::HostMemoryRegister(void* location, uint64_t size) {
+  VLOG(1) << "Registering host memory at " << location << " (" << size
+          << " bytes) for SYCL DMA";
+#if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE)
+  try {
+    const sycl::context context = sycl_context_->context();
+    sycl::ext::oneapi::experimental::prepare_for_device_copy(location, size,
+                                                             context);
+    if (SyclIsHostMemoryRegistered(device_, location)) return true;
+    sycl::ext::oneapi::experimental::release_from_device_copy(location,
+                                                              context);
+    LOG(ERROR) << "SYCL did not register host memory at " << location;
+  } catch (const sycl::exception& e) {
+    LOG(ERROR) << "Failed to register host memory at " << location << ": "
+               << e.what();
+  }
+#else
+  LOG(ERROR) << "The SYCL toolchain does not support host memory import";
+#endif
+  return false;
+}
+
+bool SyclExecutor::HostMemoryUnregister(void* location) {
+  VLOG(1) << "Unregistering host memory at " << location << " from SYCL DMA";
+#if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE)
+  try {
+    sycl::ext::oneapi::experimental::release_from_device_copy(
+        location, sycl_context_->context());
+    if (!SyclIsHostMemoryRegistered(device_, location)) return true;
+    LOG(ERROR) << "SYCL did not unregister host memory at " << location;
+  } catch (const sycl::exception& e) {
+    LOG(ERROR) << "Failed to unregister host memory at " << location << ": "
+               << e.what();
+  }
+#else
+  LOG(ERROR) << "The SYCL toolchain does not support host memory import";
+#endif
+  return false;
 }
 
 void SyclExecutor::DeallocateStream(Stream* stream) {
