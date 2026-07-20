@@ -40,6 +40,7 @@ limitations under the License.
 #include "xla/stream_executor/scoped_module_handle.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/util.h"
 
@@ -95,11 +96,16 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
 
   auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
   se::ModuleHandle module_handle;
+  // Vulkan kernels load their SPIR-V through KernelLoaderSpec. There is no
+  // separate module to load when the executable has no constant globals.
+  const bool skip_vulkan_module =
+      executor->GetPlatform()->id() == se::vulkan::kVulkanPlatformId &&
+      constants_.empty();
   // There is no module to load when constants compilation produced no binary.
   if (binary_.empty()) {
     TF_RET_CHECK(constants_.empty())
         << "Constants metadata is present without a constants binary";
-  } else {
+  } else if (!skip_vulkan_module) {
     ABSL_ASSIGN_OR_RETURN(module_handle, executor->LoadModule(module_spec));
   }
 
