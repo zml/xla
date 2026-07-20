@@ -112,6 +112,14 @@ class MetalExecutor : public gpu::GpuExecutor {
   void* device() const { return device_; }
   void* command_queue() const { return command_queue_; }
 
+  // Makes any staged residency changes take effect. Called before each launch,
+  // so allocations can be batched into the set for free during loading and turn
+  // resident in a single pass before the GPU first reads them. Safe to call
+  // with work in flight: Metal does not synchronize a residency set between CPU
+  // and GPU, and explicitly permits mutating one while a command buffer that
+  // touches its allocations is running.
+  void FlushResidency();
+
   // The per-device MTLSharedEvent used to order dependent executes on the GPU
   // (see metal_runtime.h). Shared by all streams on this device's single queue.
   void* shared_event() const { return shared_event_; }
@@ -142,6 +150,9 @@ class MetalExecutor : public gpu::GpuExecutor {
     void* buffer = nullptr;
     void* contents = nullptr;
     uint64_t size = 0;
+    // Whether this buffer made it into the residency set; false once the cap is
+    // reached, and Deallocate must not try to remove what was never added.
+    bool wired = false;
   };
 
   absl::StatusOr<Allocation> ResolveAllocation(const void* ptr) const;
@@ -151,8 +162,26 @@ class MetalExecutor : public gpu::GpuExecutor {
       absl::Span<const uint8_t> payload, const std::string& kernel_name,
       size_t arity);
 
+  // Commits the staged residency changes and asks for residency. Caller holds
+  // allocations_mu_.
+  void CommitResidencyLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(allocations_mu_);
+
   void* device_ = nullptr;
   void* command_queue_ = nullptr;
+  // Keeps allocations out of the OS memory compressor; see NewResidencySet in
+  // metal_runtime.h. Null when the OS/device does not support residency sets,
+  // in which case every residency call below is a no-op.
+  void* residency_set_ = nullptr;
+  // Wiring is capped at the device's recommended working set, since wiring past
+  // it starves the rest of the system. Bytes beyond the cap simply stay
+  // unwired -- correct, just compressible.
+  uint64_t residency_capacity_ = 0;
+  uint64_t residency_bytes_ ABSL_GUARDED_BY(allocations_mu_) = 0;
+  // Set when allocations have been added to or removed from the residency set
+  // but not yet committed. Read outside the lock on the launch fast path; see
+  // FlushResidency.
+  std::atomic<bool> residency_staged_ = false;
+  uint64_t residency_staged_bytes_ ABSL_GUARDED_BY(allocations_mu_) = 0;
   void* shared_event_ = nullptr;
   void* shared_event_listener_ = nullptr;
   std::atomic<uint64_t> next_event_value_{0};

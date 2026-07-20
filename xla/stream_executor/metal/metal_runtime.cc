@@ -334,6 +334,99 @@ absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
   return RetainObj(buffer);
 }
 
+absl::StatusOr<void*> NewResidencySet(void* device) {
+  id<MTLDevice> dev = Obj<id<MTLDevice>>(device);
+  if (![dev supportsFamily:MTLGPUFamilyMetal3]) {
+    return nullptr;
+  }
+  if (@available(macOS 15.0, *)) {
+    MTLResidencySetDescriptor* desc = [[MTLResidencySetDescriptor alloc] init];
+    desc.label = @"XLA device allocations";
+    // The allocator hands out a small number of large arenas, so the set stays
+    // far below this; sizing it up front just avoids reallocating while the
+    // weights load.
+    desc.initialCapacity = 256;
+    NSError* error = nil;
+    id<MTLResidencySet> set = [dev newResidencySetWithDescriptor:desc
+                                                           error:&error];
+    if (set == nil) {
+      // Degrade to the previous behaviour rather than failing device init.
+      LOG(WARNING) << "Metal: newResidencySetWithDescriptor failed ("
+                   << ErrorMessage(error)
+                   << "); weight buffers may be compressed by the OS, which "
+                      "shows up as a slow first inference.";
+      return nullptr;
+    }
+    // No requestResidency here: it applies to what is committed when it runs,
+    // and the set is empty. Every commit issues its own.
+    return RetainObj(set);
+  }
+  return nullptr;
+}
+
+void ResidencySetAddAllocation(void* residency_set, void* buffer) {
+  if (residency_set == nullptr || buffer == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLResidencySet>>(residency_set)
+        addAllocation:Obj<id<MTLBuffer>>(buffer)];
+  }
+}
+
+void ResidencySetRemoveAllocation(void* residency_set, void* buffer) {
+  if (residency_set == nullptr || buffer == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLResidencySet>>(residency_set)
+        removeAllocation:Obj<id<MTLBuffer>>(buffer)];
+  }
+}
+
+void ResidencySetCommit(void* residency_set) {
+  if (residency_set == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLResidencySet>>(residency_set) commit];
+  }
+}
+
+void ResidencySetRequestResidency(void* residency_set) {
+  if (residency_set == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLResidencySet>>(residency_set) requestResidency];
+  }
+}
+
+void ResidencySetEndResidency(void* residency_set) {
+  if (residency_set == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLResidencySet>>(residency_set) endResidency];
+  }
+}
+
+uint64_t ResidencySetAllocatedSize(void* residency_set) {
+  if (residency_set == nullptr) return 0;
+  if (@available(macOS 15.0, *)) {
+    return [Obj<id<MTLResidencySet>>(residency_set) allocatedSize];
+  }
+  return 0;
+}
+
+uint64_t BufferAllocatedSize(void* buffer) {
+  if (buffer == nullptr) return 0;
+  return [Obj<id<MTLBuffer>>(buffer) allocatedSize];
+}
+
+void CommandQueueAddResidencySet(void* queue, void* residency_set) {
+  if (queue == nullptr || residency_set == nullptr) return;
+  if (@available(macOS 15.0, *)) {
+    [Obj<id<MTLCommandQueue>>(queue)
+        addResidencySet:Obj<id<MTLResidencySet>>(residency_set)];
+  }
+}
+
+uint64_t RecommendedMaxWorkingSetSize(void* device) {
+  if (device == nullptr) return 0;
+  return [Obj<id<MTLDevice>>(device) recommendedMaxWorkingSetSize];
+}
+
 absl::StatusOr<void*> CompileLibrary(void* device, absl::string_view source) {
   NSString* msl =
       [[NSString alloc] initWithBytes:source.data()

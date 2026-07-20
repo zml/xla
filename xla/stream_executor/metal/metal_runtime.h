@@ -82,6 +82,41 @@ absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal);
 absl::StatusOr<void*> RetainDevice(int ordinal);
 absl::StatusOr<void*> NewCommandQueue(void* device);
 
+// Residency sets pin their allocations in physical memory. Without them the
+// macOS memory compressor is free to compress a buffer the GPU has not touched
+// recently, which for model weights means the next kernel that reads them
+// stalls while tens of GB are decompressed -- once, on the first inference,
+// which is exactly the "first request takes forever, then it is fast" symptom.
+// MLX wires its buffers this way (mlx/backend/metal/resident.cpp).
+//
+// Returns nullptr, not an error, when the device or OS cannot support residency
+// sets (pre-macOS 15, or not GPUFamilyMetal3). Every call below is a no-op on a
+// null handle, so callers need no version checks of their own.
+// None of the residency-set calls below are thread-safe (Apple documents this
+// explicitly), so callers must serialize them; MetalExecutor does so under
+// allocations_mu_.
+//
+// Add/remove only stage a change: nothing takes effect until Commit, and
+// RequestResidency applies to whatever is committed when it runs, so a buffer
+// staged after the last RequestResidency stays compressible until the next one.
+absl::StatusOr<void*> NewResidencySet(void* device);
+void ResidencySetAddAllocation(void* residency_set, void* buffer);
+void ResidencySetRemoveAllocation(void* residency_set, void* buffer);
+void ResidencySetCommit(void* residency_set);
+void ResidencySetRequestResidency(void* residency_set);
+// Releases the set's claim so Metal may reuse the memory. Failing to call this
+// is not a leak -- releasing the set does it -- but it makes the hand-off
+// explicit at teardown.
+void ResidencySetEndResidency(void* residency_set);
+// True resident footprint, which exceeds the sum of requested sizes because
+// each allocation is rounded up to a page.
+uint64_t ResidencySetAllocatedSize(void* residency_set);
+uint64_t BufferAllocatedSize(void* buffer);
+void CommandQueueAddResidencySet(void* queue, void* residency_set);
+// Apple's advertised budget for resident GPU memory on this device; 0 if
+// unknown. Used as the wiring cap.
+uint64_t RecommendedMaxWorkingSetSize(void* device);
+
 void ReleaseObject(void* object);
 
 absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,

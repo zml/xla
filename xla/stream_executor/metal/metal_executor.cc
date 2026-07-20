@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -96,6 +97,10 @@ MetalExecutor::~MetalExecutor() {
   }
   ReleaseObject(shared_event_listener_);
   ReleaseObject(shared_event_);
+  // After the buffers above are gone, hand the residency claim back explicitly
+  // rather than leaving it to the set's own release.
+  ResidencySetEndResidency(residency_set_);
+  ReleaseObject(residency_set_);
   ReleaseObject(command_queue_);
   ReleaseObject(device_);
 }
@@ -103,6 +108,21 @@ MetalExecutor::~MetalExecutor() {
 absl::Status MetalExecutor::Init() {
   TF_ASSIGN_OR_RETURN(device_, RetainDevice(device_ordinal()));
   TF_ASSIGN_OR_RETURN(command_queue_, NewCommandQueue(device_));
+  // Pin allocations so the OS memory compressor leaves them alone. Without
+  // this, weights compressed while idle have to be decompressed by the first
+  // kernel that reads them -- tens of seconds on a large model.
+  TF_ASSIGN_OR_RETURN(residency_set_, NewResidencySet(device_));
+  if (residency_set_ != nullptr) {
+    // Default to Apple's advertised budget. METAL_RESIDENCY_LIMIT_MB overrides
+    // it, and 0 disables wiring entirely: for a checkpoint that nearly fills
+    // RAM, wiring most of it leaves the rest of the system nothing to work with
+    // and costs more during load than it saves afterwards.
+    residency_capacity_ = RecommendedMaxWorkingSetSize(device_);
+    if (const char* env = std::getenv("METAL_RESIDENCY_LIMIT_MB")) {
+      residency_capacity_ = static_cast<uint64_t>(std::atoll(env)) << 20;
+    }
+    CommandQueueAddResidencySet(command_queue_, residency_set_);
+  }
   // One shared event per device orders dependent executes on the GPU (see
   // metal_runtime.h / MetalStream). nil only if the driver refuses it — treat as
   // fatal-soft: a null shared_event_ makes the event ops no-op and the stream
@@ -231,10 +251,80 @@ DeviceAddressBase MetalExecutor::Allocate(uint64_t size, int64_t memory_space) {
   }
   if (size != 0) {
     absl::MutexLock lock(allocations_mu_);
+    // Wire it unless that would push us past the device's recommended working
+    // set, and only if it is big enough to be worth it. Short-lived small
+    // buffers -- scratch, the per-executable constant upload in
+    // GpuExecutable::ResolveConstantGlobals -- would otherwise stage an add and
+    // a remove each, driving flushes for memory the compressor was never going
+    // to reclaim much from. What matters here is the weight arenas, and they
+    // are enormous.
+    constexpr uint64_t kMinWiredBytes = 1 << 20;  // 1 MiB
+    // Everything below counts the bytes the set will report, not the bytes
+    // asked for: an allocation is rounded up to a page, so admitting on one
+    // figure and booking the other lets the cap drift -- the same mismatch
+    // between Allocate and Deallocate that CommitResidencyLocked has to
+    // correct for.
+    const uint64_t wired_bytes =
+        residency_set_ != nullptr ? BufferAllocatedSize(*buffer) : 0;
+    const bool wired = residency_set_ != nullptr && size >= kMinWiredBytes &&
+                       residency_bytes_ + wired_bytes <= residency_capacity_;
+    if (wired) {
+      // Stage only. Committing here instead would make loading a large model
+      // quadratic: commit and requestResidency both do work proportional to the
+      // whole set, so paying them once per arena over a set that grows to tens
+      // of GB dominates the load (measured on a 47GiB model: 13s of loading
+      // became 43-63s). Staging is documented as near-free; FlushResidency
+      // below turns the whole batch resident in one pass.
+      ResidencySetAddAllocation(residency_set_, *buffer);
+      residency_staged_ = true;
+      residency_staged_bytes_ += wired_bytes;
+      // Flush in chunks as the arenas arrive rather than once at the end. The
+      // point of wiring is to reach a page before the compressor does, and a
+      // page that has already been compressed has to be decompressed to become
+      // resident -- deferring the whole set to first use just relocates the
+      // stall into the first request instead of preventing it (measured on a
+      // 47GiB model: a single flush at first launch left that request at 56s,
+      // versus 3s when the arenas were made resident as they were allocated).
+      residency_bytes_ += wired_bytes;
+      constexpr uint64_t kResidencyFlushBytes = uint64_t{1} << 30;  // 1 GiB
+      if (residency_staged_bytes_ >= kResidencyFlushBytes) {
+        CommitResidencyLocked();
+      }
+    }
     allocations_.emplace(reinterpret_cast<uintptr_t>(contents),
-                         Allocation{*buffer, contents, size});
+                         Allocation{*buffer, contents, size, wired});
   }
   return DeviceAddressBase(contents, size);
+}
+
+void MetalExecutor::CommitResidencyLocked() {
+  ResidencySetCommit(residency_set_);
+  // requestResidency applies to whatever is committed when it runs, so it has
+  // to follow the commit, not precede it: asking before anything is committed
+  // leaves those allocations compressible.
+  ResidencySetRequestResidency(residency_set_);
+  residency_staged_ = false;
+  residency_staged_bytes_ = 0;
+  // The set is now authoritative; re-read it rather than trusting the running
+  // total, which is what keeps allocate/deallocate rounding from accumulating.
+  residency_bytes_ = ResidencySetAllocatedSize(residency_set_);
+  // requestResidency is explicitly best-effort -- Apple documents it as doing
+  // as much preparatory work as it can "with the system's current conditions"
+  // -- and there is no API that reports how much of the set actually became
+  // resident. This at least makes what we asked for visible when a machine
+  // starts paging anyway.
+  VLOG(2) << "Metal residency: " << (residency_bytes_ >> 20) << " MiB in set of "
+          << (residency_capacity_ >> 20) << " MiB cap";
+}
+
+void MetalExecutor::FlushResidency() {
+  // Hot path: every launch calls this, and after the weights are in place it is
+  // a load-and-branch. Deliberately unsynchronized -- a stale false only defers
+  // the flush to the next launch, and the real check is repeated under the lock.
+  if (residency_set_ == nullptr || !residency_staged_) return;
+  absl::MutexLock lock(allocations_mu_);
+  if (!residency_staged_) return;
+  CommitResidencyLocked();
 }
 
 void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
@@ -248,6 +338,15 @@ void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
                << mem->opaque();
     *mem = DeviceAddressBase(nullptr, 0);
     return;
+  }
+  if (it->second.wired) {
+    // Also staged: a removal that has not been committed still keeps the buffer
+    // resident, but the buffer is about to be released and releasing it drops
+    // its residency regardless, so there is nothing to hurry for.
+    ResidencySetRemoveAllocation(residency_set_, it->second.buffer);
+    residency_staged_ = true;
+    const uint64_t wired_bytes = BufferAllocatedSize(it->second.buffer);
+    residency_bytes_ -= std::min(residency_bytes_, wired_bytes);
   }
   ReleaseObject(it->second.buffer);
   allocations_.erase(it);

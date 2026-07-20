@@ -553,6 +553,16 @@ absl::Status MetalStream::LaunchMetalKernel(
     return absl::UnimplementedError(
         "Metal programmatic dependent launch is not supported.");
   }
+  // Turn any newly allocated buffers resident before the GPU reads them; a
+  // no-op once nothing is staged, which is the case for every launch after the
+  // weights are loaded.
+  //
+  // Only launches flush, deliberately. Allocation already flushes each 1GiB as
+  // the arenas arrive, so this covers the remainder rather than the bulk, and
+  // blits and memcpys are not worth the same check: the write that would race
+  // the compressor is a host store into shared memory, which does not go
+  // through them.
+  executor_->FlushResidency();
 
   std::vector<MetalKernelArgument> arguments;
   if (args != nullptr) {
