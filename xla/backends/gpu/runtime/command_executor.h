@@ -261,9 +261,7 @@ class CommandExecutor {
   // A mapping from buffer allocation index to command ids that reference it.
   std::vector<std::vector<CommandId>> alloc_to_cmds_;
 
-  bool requires_update_on_initialize_ = false;
   bool requires_warmup_ = false;
-  bool requires_update_on_execute_ = false;
   bool support_loop_unroll_ = true;
 
   // Per-command extra resource uses passed at construction time (e.g.

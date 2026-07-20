@@ -507,10 +507,6 @@ GpuExecutable::GpuExecutable(
                                                buffer_assignment_proto_);
   }
   set_module_stats(std::move(module_stats));
-  if (has_module()) {
-    collective_use_minimal_resource_ =
-        ShouldCollectiveUseMinimalResource(module());
-  }
 
   const DebugOptions* allocation_debug_options =
       has_module() ? &module_config().debug_options() : nullptr;
