@@ -1408,12 +1408,10 @@ GetStreamExecutorGpuDeviceAllocator(
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
   const DebugOptions& debug_options = xla::GetDebugOptionsFromFlags();
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
+  // Metal's default is applied where the create options are read
+  // (pjrt_c_api_gpu_internal.cc) rather than forced here, so a client that
+  // asks for preallocation gets it.
   bool preallocate = allocator_config.preallocate;
-#if TENSORFLOW_USE_METAL
-  if (platform->id() == stream_executor::metal::kMetalPlatformId) {
-    preallocate = false;
-  }
-#endif  // TENSORFLOW_USE_METAL
   if (debug_options.xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
       effective_kind != GpuAllocatorConfig::Kind::kVmm) {
@@ -1449,13 +1447,21 @@ GetStreamExecutorGpuDeviceAllocator(
       // allocator over a fixed address range serve both default (lower end) and
       // collective (upper end) memory, so no separate collective allocator is
       // created. Otherwise, use the separate collective allocator below.
-      // Spatial partitioning requires a preallocated arena. Use the actual
-      // `preallocate` in effect (Metal forces it false for unified memory), not
-      // the requested config value, so we don't ask CreateBFCAllocator for
-      // spatial partitioning with preallocate=false (which it rejects).
+      // Spatial partitioning requires a preallocated arena, so gate on the
+      // `preallocate` actually in effect: CreateBFCAllocator rejects the
+      // combination with preallocate=false.
       shared_collective_pool =
           preallocate &&
           debug_options.xla_gpu_enable_allocator_spatial_partitioning();
+#if TENSORFLOW_USE_METAL
+      // The shared pool reads the collectives' symmetric-memory alignment, and
+      // GpuCollectives::Default CHECK-fails on a platform with none registered
+      // rather than returning null. Metal has none, so a client that turns
+      // preallocation on would abort here instead of getting an allocator.
+      if (platform->id() == stream_executor::metal::kMetalPlatformId) {
+        shared_collective_pool = false;
+      }
+#endif  // TENSORFLOW_USE_METAL
       for (const auto& ordinal_and_device : addressable_devices) {
         ASSIGN_OR_RETURN(
             auto bfc_allocator,
