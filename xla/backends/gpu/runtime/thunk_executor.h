@@ -53,6 +53,7 @@ class ThunkExecutor {
   ThunkExecutor& operator=(ThunkExecutor&&) = default;
 
   // Thunk execution lifecycle operations.
+  absl::Status Preload(const Thunk::PreloadParams& params);
   absl::Status Prepare(const Thunk::PrepareParams& params);
   absl::Status Initialize(const Thunk::InitializeParams& params);
   absl::Status ExecuteOnStream(const Thunk::ExecuteParams& params);

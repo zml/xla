@@ -61,6 +61,11 @@ struct LoopNest {
 ThunkExecutor::ThunkExecutor(ThunkSequence thunks)
     : thunks_(std::move(thunks)) {}
 
+absl::Status ThunkExecutor::Preload(const Thunk::PreloadParams& params) {
+  return thunks_.WalkNested(
+      [&](Thunk* thunk) { return thunk->Preload(params); });
+}
+
 absl::Status ThunkExecutor::Prepare(const Thunk::PrepareParams& params) {
   for (const std::unique_ptr<Thunk>& thunk : thunks_) {
     RETURN_IF_ERROR(thunk->Prepare(params));

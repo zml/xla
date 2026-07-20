@@ -27,6 +27,8 @@ limitations under the License.
 #include "xla/backends/gpu/tests/hlo_pjrt_gpu_test_base.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/literal.h"
+#include "xla/literal_util.h"
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/gpu_executable.h"
@@ -34,7 +36,9 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
+#include "xla/tests/literal_test_util.h"
 #include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -49,6 +53,13 @@ using ::tsl::testing::StatusIs;
 
 constexpr size_t kMemoryAllocationSize = 1024;
 
+constexpr char kAddHlo[] = R"(
+    ENTRY e {
+      p0 = u32[4] parameter(0)
+      c1 = u32[4] constant({1, 2, 3, 4})
+      ROOT res = u32[4] add(p0, c1)
+    })";
+
 class SyclExecutorTest : public xla::gpu::HloPjRtGpuTestBase {};
 
 TEST_F(SyclExecutorTest, GetSyclKernel) {
@@ -58,18 +69,10 @@ TEST_F(SyclExecutorTest, GetSyclKernel) {
   TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
                           platform->ExecutorForDevice(kDefaultDeviceOrdinal));
 
-  std::string hlo_text = R"(
-    ENTRY e {
-      p0 = u32[4] parameter(0)
-      c1 = u32[4] constant(1)
-      ROOT res = u32[4] add(p0, c1)
-    })";
-
   xla::HloModuleConfig config;
   config.set_debug_options(GetDebugOptionsForTest());
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<xla::HloModule> hlo_module,
-      xla::ParseAndReturnUnverifiedModule(hlo_text, config));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> hlo_module,
+                          xla::ParseAndReturnUnverifiedModule(kAddHlo, config));
 
   TF_ASSERT_OK_AND_ASSIGN(
       hlo_module, compiler()->RunHloPasses(std::move(hlo_module), executor,
@@ -139,13 +142,7 @@ TEST_F(SyclExecutorTest, CompileAndLoadLevelZeroNativeModule) {
   xla::HloModuleConfig config;
   config.set_debug_options(GetDebugOptionsForTest());
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> hlo_module,
-                          xla::ParseAndReturnUnverifiedModule(R"(
-        ENTRY e {
-          p0 = u32[4] parameter(0)
-          c1 = u32[4] constant(1)
-          ROOT res = u32[4] add(p0, c1)
-        })",
-                                                              config));
+                          xla::ParseAndReturnUnverifiedModule(kAddHlo, config));
   TF_ASSERT_OK_AND_ASSIGN(
       hlo_module, compiler()->RunHloPasses(std::move(hlo_module), executor,
                                            /*device_allocator=*/nullptr));
@@ -181,6 +178,62 @@ TEST_F(SyclExecutorTest, CompileAndLoadLevelZeroNativeModule) {
   incompatible_spec.AddModuleBinary(native.view());
   EXPECT_THAT(executor->LoadModule(incompatible_spec),
               StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST_F(SyclExecutorTest, CompilePreloadAndExecuteLevelZeroNativeExecutable) {
+  ASSERT_OK_AND_ASSIGN(
+      Platform * platform,
+      stream_executor::PlatformManager::PlatformWithId(kSyclPlatformId));
+  ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                       platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+
+  xla::DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_experimental_enable_sycl_native_aot(true);
+  xla::HloModuleConfig config;
+  config.set_debug_options(debug_options);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> hlo_module,
+                       xla::ParseAndReturnUnverifiedModule(kAddHlo, config));
+  ASSERT_OK_AND_ASSIGN(hlo_module,
+                       compiler()->RunHloPasses(std::move(hlo_module), executor,
+                                                /*device_allocator=*/nullptr));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::Executable> exec,
+                       compiler()->RunBackend(std::move(hlo_module), executor,
+                                              /*device_allocator=*/nullptr));
+
+  auto* gpu_exec = static_cast<xla::gpu::GpuExecutable*>(exec.get());
+  ASSERT_NE(gpu_exec, nullptr);
+  EXPECT_EQ(gpu_exec->module_binary().format, ModuleFormat::kLevelZeroNative);
+  EXPECT_THAT(gpu_exec->module_binary().bytes, Not(IsEmpty()));
+  ASSERT_OK_AND_ASSIGN(std::string compatibility_key,
+                       executor->GetModuleCompatibilityKey());
+  EXPECT_EQ(gpu_exec->module_binary().compatibility_key, compatibility_key);
+
+  const xla::gpu::ThunkExecutor& thunk_exec = gpu_exec->thunk_executor();
+  ASSERT_EQ(thunk_exec.thunks().size(), 1);
+  const auto* kernel_thunk = dynamic_cast<const xla::gpu::CustomKernelThunk*>(
+      thunk_exec.thunks().front().get());
+  ASSERT_NE(kernel_thunk, nullptr);
+  std::optional<ModuleBinaryInMemory> kernel_binary =
+      kernel_thunk->custom_kernel().kernel_spec().module_binary();
+  ASSERT_TRUE(kernel_binary.has_value());
+  EXPECT_EQ(kernel_binary->module_binary.format,
+            ModuleFormat::kLevelZeroNative);
+  EXPECT_EQ(kernel_binary->module_binary.compatibility_key, compatibility_key);
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                       executor->CreateStream());
+  EXPECT_THAT(gpu_exec->Preload(stream.get()), IsOk());
+  EXPECT_THAT(gpu_exec->Preload(stream.get()), IsOk());
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> execute_module,
+                       xla::ParseAndReturnUnverifiedModule(kAddHlo, config));
+  xla::Literal argument = xla::LiteralUtil::CreateR1<uint32_t>({1, 2, 3, 4});
+  std::vector<const xla::Literal*> arguments = {&argument};
+  ASSERT_OK_AND_ASSIGN(
+      xla::Literal result,
+      Execute(std::move(execute_module), arguments, /*run_hlo_passes=*/true));
+  EXPECT_TRUE(xla::LiteralTestUtil::Equal(
+      xla::LiteralUtil::CreateR1<uint32_t>({2, 4, 6, 8}), result));
 }
 
 TEST_F(SyclExecutorTest, CreateUnifiedMemoryAllocatorWorks) {

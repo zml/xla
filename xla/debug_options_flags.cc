@@ -479,6 +479,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_hlo_pass_fix_detect_cycles(false);
   // TODO(b/449025971): Set to true once the issue is fixed.
   opts.set_xla_gpu_experimental_enable_heuristic_collective_combining(false);
+  opts.set_xla_gpu_experimental_enable_sycl_native_aot(false);
   opts.set_xla_unsupported_crash_on_hlo_pass_silent_hlo_change(false);
   opts.set_xla_disable_automatic_host_compute_offload(false);
   opts.set_xla_allow_h2h_copy_when_automatic_host_compute_offload_disabled(
@@ -3209,6 +3210,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
               set_xla_gpu_experimental_enable_collective_multi_streaming),
       debug_options->xla_gpu_experimental_enable_collective_multi_streaming(),
       "Enable multi-stream runtime for collectives."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_enable_sycl_native_aot",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_experimental_enable_sycl_native_aot),
+      debug_options->xla_gpu_experimental_enable_sycl_native_aot(),
+      "Compile SYCL SPIR-V modules to Level Zero native binaries during XLA "
+      "compilation. Requires a live target device and produces executables "
+      "tied to its GPU and Level Zero driver."));
   flag_list->push_back(
       tsl::Flag("xla_gpu_experimental_max_unroll_factor",
                 setter_for_unroll_factor(

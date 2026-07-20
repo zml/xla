@@ -159,6 +159,14 @@ class Thunk {
     BinaryMap dnn_compiled_graphs;
   };
 
+  // Parameters for materializing compiler-generated device code before the
+  // first execution. Preloading deliberately excludes resources selected by
+  // runtime libraries and resources that depend on execution inputs.
+  struct PreloadParams {
+    se::StreamExecutor* executor = nullptr;
+    ExecutableSource src;
+  };
+
   // Metadata associated with a Thunk,
   // including profiling and stream execution info.
   struct ThunkInfo {
@@ -393,6 +401,12 @@ class Thunk {
     return thunk_info_.profile_annotation;
   }
   const ThunkInfo& thunk_info() const { return thunk_info_; }
+
+  // Materializes compiler-generated device code when it is stored in a native
+  // module. Portable modules and runtime-selected resources remain lazy.
+  virtual absl::Status Preload(const PreloadParams& params) {
+    return absl::OkStatus();
+  }
 
   // Prepares thunk for execution.
   //
