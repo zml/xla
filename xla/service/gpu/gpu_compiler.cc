@@ -2614,6 +2614,7 @@ absl::StatusOr<GpuCompiler::BackendCompileResult>
 GpuCompiler::CompileSingleModule(
     const HloModuleConfig& module_config,
     const stream_executor::DeviceDescription& device_description,
+    se::StreamExecutor* absl_nullable stream_exec,
     const HloModule* debug_module, llvm::Module* llvm_module, bool relocatable,
     std::optional<int> shard_number) {
   tsl::profiler::TraceMe traceme("CompileSingleModule");
@@ -2656,6 +2657,17 @@ GpuCompiler::CompileSingleModule(
       BackendCompileResult result,
       CompileTargetBinary(module_config, llvm_module, device_description,
                           relocatable, debug_module, shard_number));
+
+  if (debug_options.xla_gpu_experimental_enable_sycl_native_aot() &&
+      result.binary.format == se::ModuleFormat::kSpirv) {
+    if (stream_exec == nullptr) {
+      return FailedPrecondition(
+          "--xla_gpu_experimental_enable_sycl_native_aot requires a live "
+          "SYCL StreamExecutor during compilation");
+    }
+    ASSIGN_OR_RETURN(result.binary,
+                     stream_exec->CompileModuleToNative(result.binary.view()));
+  }
 
   const bool should_dump = DumpingEnabledForHloModule(
       debug_module ? debug_module->name() : "", debug_options);
@@ -2759,8 +2771,8 @@ GpuCompiler::CompileToBackendResult(
                                std::to_string(shard_number.fetch_add(1)));
       ASSIGN_OR_RETURN(
           BackendCompileResult result,
-          CompileSingleModule(module->config(), descr, module, &llvm_module,
-                              false, shard_number.fetch_add(1)));
+          CompileSingleModule(module->config(), descr, stream_exec, module,
+                              &llvm_module, false, shard_number.fetch_add(1)));
 
       absl::MutexLock lock(module_stats_m_);
       MergeModuleStatsInPlace(result.module_stats, module_stats);
@@ -3443,7 +3455,8 @@ GpuCompiler::LoadExecutableFromLegacyAotResult(
           const DebugOptions& opts) -> absl::StatusOr<se::ModuleBinary> {
     ASSIGN_OR_RETURN(
         BackendCompileResult result,
-        CompileSingleModule(hlo_module->config(), descr, hlo_module.get(),
+        CompileSingleModule(hlo_module->config(), descr,
+                            /*stream_exec=*/nullptr, hlo_module.get(),
                             &llvm_module, false, shard_number.fetch_add(1)));
     return std::move(result.binary);
   };

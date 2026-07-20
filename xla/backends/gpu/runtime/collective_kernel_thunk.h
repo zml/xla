@@ -111,6 +111,8 @@ class CollectiveKernelThunk : public TracedCommand {
   // The single host collective thunk actually requires a clique key.
   absl::Status Prepare(const PrepareParams& params) final;
 
+  absl::Status Preload(const PreloadParams& params) final;
+
   // Allocate buffers and events as needed for cross device communication.
   // If InitializeParams contains a PTX kernel, it will be used instead of the
   // custom cuda kernel.
@@ -161,6 +163,9 @@ class CollectiveKernelThunk : public TracedCommand {
   // Returns the input size in bytes for the collective.
   int64_t GetInputSizeBytes() const;
 
+  absl::StatusOr<std::unique_ptr<se::Kernel>> LoadKernelForExecutor(
+      se::StreamExecutor* executor, const ExecutableSource& src) const;
+
   // Whether the one-shot kernel is enabled.
   const bool collective_kernel_enabled_;
   // Whether the collective is run on an async stream.
@@ -191,6 +196,8 @@ class CollectiveKernelThunk : public TracedCommand {
       per_stream_state_ ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_map<se::StreamExecutor*, std::unique_ptr<StreamMemory>>
       per_stream_memory_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<se::StreamExecutor*, std::unique_ptr<se::Kernel>>
+      preloaded_kernels_ ABSL_GUARDED_BY(mutex_);
 
   // Programmatic Dependent Launch.
   const bool use_pdl_;

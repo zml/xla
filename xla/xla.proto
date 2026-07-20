@@ -947,6 +947,11 @@ message DebugOptions {
   optional bool xla_gpu_experimental_enable_subchannel_dequantisation_fusion =
       368;
 
+  // Compile SYCL SPIR-V modules to Level Zero native binaries during XLA
+  // compilation. Native executables require a live device at compile time and
+  // are tied to the target GPU and Level Zero driver.
+  optional bool xla_gpu_experimental_enable_sycl_native_aot = 516;
+
   // When enabled, the PriorityFusion pass will try to make Triton fusions first
   // and foremost where it is possible.
   //
@@ -1674,7 +1679,7 @@ message DebugOptions {
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
 
-  // Next id: 516
+  // Next id: 517
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

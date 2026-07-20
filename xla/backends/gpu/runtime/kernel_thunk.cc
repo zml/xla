@@ -173,7 +173,19 @@ absl::StatusOr<std::unique_ptr<KernelThunk>> KernelThunk::FromProto(
       /*cluster_dim=*/std::nullopt, shmem_bytes, std::move(tma_metadata));
 }
 
+absl::Status KernelThunk::Preload(const PreloadParams& params) {
+  if (params.src.binary.format != se::ModuleFormat::kLevelZeroNative) {
+    return absl::OkStatus();
+  }
+  return LoadKernel(params.executor, params.src);
+}
+
 absl::Status KernelThunk::Initialize(const InitializeParams& params) {
+  return LoadKernel(params.executor, params.src);
+}
+
+absl::Status KernelThunk::LoadKernel(se::StreamExecutor* executor,
+                                     const ExecutableSource& src) {
   absl::MutexLock lock(mutex_);
 
   // Load the kernel into the device if necessary.
@@ -181,20 +193,20 @@ absl::Status KernelThunk::Initialize(const InitializeParams& params) {
   // We could alternatively do this within ExecuteOnStream, but doing it here
   // lets the time spent loading the kernel not count towards our execution
   // profiles.
-  if (!kernel_cache_.contains(params.executor)) {
+  if (!kernel_cache_.contains(executor)) {
     std::unique_ptr<se::Kernel> kernel;
-    if (!params.src.binary.empty()) {
+    if (!src.binary.empty()) {
       ASSIGN_OR_RETURN(
-          kernel, CreateKernel(kernel_name_, args_.size(), params.src.binary,
-                               params.executor, shmem_bytes_, use_pdl_));
+          kernel, CreateKernel(kernel_name_, args_.size(), src.binary, executor,
+                               shmem_bytes_, use_pdl_));
 
     } else {
-      ASSIGN_OR_RETURN(kernel,
-                       CreateKernel(kernel_name_, args_.size(), params.src.text,
-                                    params.executor, shmem_bytes_, use_pdl_));
+      ASSIGN_OR_RETURN(
+          kernel, CreateKernel(kernel_name_, args_.size(), src.text, executor,
+                               shmem_bytes_, use_pdl_));
     }
 
-    kernel_cache_.emplace(params.executor, std::move(kernel));
+    kernel_cache_.emplace(executor, std::move(kernel));
   }
 
   return absl::OkStatus();

@@ -97,6 +97,7 @@ class KernelThunk : public Command {
       LaunchDimensions dims, int64_t shmem_bytes,
       stream_executor::gpu::TmaMetadata tma_metadata = {});
 
+  absl::Status Preload(const PreloadParams& params) override;
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
 
@@ -140,6 +141,9 @@ class KernelThunk : public Command {
   absl::StatusOr<KernelWithArgs> GetKernelAndArgs(
       const BufferAllocations& buffer_allocations,
       se::StreamExecutor* executor) const;
+
+  absl::Status LoadKernel(se::StreamExecutor* executor,
+                          const ExecutableSource& src);
 
   // Buffer slices passed to the kernel as arguments.
   std::vector<ShapedSlice> args_;

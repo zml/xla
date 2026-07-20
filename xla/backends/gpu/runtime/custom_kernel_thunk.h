@@ -62,6 +62,7 @@ class CustomKernelThunk : public Command {
 
   std::string ToString(int indent) const override;
 
+  absl::Status Preload(const PreloadParams& params) override;
   absl::Status Initialize(const InitializeParams& params) override;
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
 
@@ -116,6 +117,8 @@ class CustomKernelThunk : public Command {
   absl::StatusOr<KernelWithArgs> GetKernelAndArgs(
       const BufferAllocations& buffer_allocations,
       se::StreamExecutor* executor) const;
+
+  absl::Status LoadKernel(se::StreamExecutor* executor);
 
   // Buffer slices passed to the kernel as arguments.
   std::vector<ShapedSlice> args_;

@@ -268,6 +268,11 @@ class Executable {
       : hlo_module_(std::move(hlo_module)) {}
   virtual ~Executable() = default;
 
+  // Materializes executable resources that can be prepared without execution
+  // inputs. Implementations must leave unsupported or runtime-selected
+  // resources lazy.
+  virtual absl::Status Preload(se::Stream* stream) { return absl::OkStatus(); }
+
   // Enqueues the compilation result on the provided stream, passing the given
   // arguments. This call is blocking and returns after the execution is done.
   //

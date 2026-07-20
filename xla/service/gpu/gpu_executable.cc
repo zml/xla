@@ -1009,6 +1009,26 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
   return module_globals_->Resolve(stream);
 }
 
+absl::Status GpuExecutable::Preload(se::Stream* stream) {
+  tsl::profiler::TraceMe trace("GpuExecutable::Preload");
+  if (stream == nullptr) {
+    return absl::InvalidArgumentError(
+        "GpuExecutable::Preload requires a stream");
+  }
+
+  if (!binary_.empty() &&
+      binary_.format == se::ModuleFormat::kLevelZeroNative) {
+    absl::StatusOr<const BufferAllocToDeviceMemoryMap*> globals =
+        ResolveConstantGlobals(stream);
+    if (!globals.ok()) return globals.status();
+  }
+
+  Thunk::ExecutableSource executable_source = {"", binary_.view(),
+                                               dnn_compiled_graphs_};
+  return thunk_executor_->Preload(
+      Thunk::PreloadParams{stream->parent(), executable_source});
+}
+
 absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStream(
     const ServiceExecutableRunOptions* run_options,
     std::vector<ExecutionInput> arguments) {

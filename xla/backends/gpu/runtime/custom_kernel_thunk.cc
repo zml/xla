@@ -73,17 +73,30 @@ std::string CustomKernelThunk::ToString(int indent) const {
   return custom_kernel_.ToString();
 }
 
+absl::Status CustomKernelThunk::Preload(const PreloadParams& params) {
+  const se::KernelLoaderSpec& spec = custom_kernel_.kernel_spec();
+  if (!spec.has_module_binary() || spec.module_binary()->module_binary.format !=
+                                       se::ModuleFormat::kLevelZeroNative) {
+    return absl::OkStatus();
+  }
+  return LoadKernel(params.executor);
+}
+
 absl::Status CustomKernelThunk::Initialize(const InitializeParams& params) {
+  return LoadKernel(params.executor);
+}
+
+absl::Status CustomKernelThunk::LoadKernel(se::StreamExecutor* executor) {
   absl::MutexLock lock(mutex_);
 
-  if (!kernel_cache_.contains(params.executor)) {
+  if (!kernel_cache_.contains(executor)) {
     ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                     params.executor->LoadKernel(custom_kernel_.kernel_spec()));
+                     executor->LoadKernel(custom_kernel_.kernel_spec()));
     se::KernelMetadata m = kernel->metadata();
     m.set_shared_memory_bytes(custom_kernel_.shared_memory_bytes());
     kernel->set_metadata(m);
     kernel->set_use_pdl(use_pdl_);
-    kernel_cache_.emplace(params.executor, std::move(kernel));
+    kernel_cache_.emplace(executor, std::move(kernel));
   }
 
   return absl::OkStatus();

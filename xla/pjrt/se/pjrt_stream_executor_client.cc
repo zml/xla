@@ -2466,6 +2466,18 @@ PjRtStreamExecutorClient::LoadInternal(
         "loaded.");
   }
 
+  {
+    tsl::profiler::TraceMe traceme("PjRtStreamExecutorClient::Preload");
+    for (PjRtDevice* device : addressable_devices) {
+      auto* se_device =
+          tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+      ASSIGN_OR_RETURN(LocalDeviceState * local_device_state,
+                       se_device->GetLocalDeviceState());
+      RETURN_IF_ERROR(local_executable->executable()->Preload(
+          local_device_state->compute_stream()));
+    }
+  }
+
   const auto& ex_options = compile_options.executable_build_options;
   const bool xla_dump_hlo_unoptimized_snapshots =
       ex_options.has_debug_options() &&

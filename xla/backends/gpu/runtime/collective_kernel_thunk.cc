@@ -376,6 +376,47 @@ int64_t CollectiveKernelThunk::GetInputSizeBytes() const {
              collective_config_.operand_element_type[0]);
 }
 
+absl::StatusOr<std::unique_ptr<se::Kernel>>
+CollectiveKernelThunk::LoadKernelForExecutor(
+    se::StreamExecutor* executor, const ExecutableSource& src) const {
+  TF_RET_CHECK(!kernel_name_.empty())
+      << "Kernel name must be set for collective kernel thunk.";
+  std::unique_ptr<se::Kernel> kernel;
+  const int32_t num_args = kernel_spec_.argument_descriptors.size();
+  if (binary_.has_value()) {
+    ASSIGN_OR_RETURN(
+        kernel, CreateKernel(kernel_name_, num_args, binary_->view(), executor,
+                             shmem_bytes_));
+  } else if (!src.binary.empty()) {
+    ASSIGN_OR_RETURN(kernel, CreateKernel(kernel_name_, num_args, src.binary,
+                                          executor, shmem_bytes_));
+  } else {
+    ASSIGN_OR_RETURN(kernel, CreateKernel(kernel_name_, num_args, src.text,
+                                          executor, shmem_bytes_));
+  }
+  kernel->set_use_pdl(use_pdl_);
+  return kernel;
+}
+
+absl::Status CollectiveKernelThunk::Preload(const PreloadParams& params) {
+  se::ModuleBinaryView binary =
+      binary_.has_value() ? binary_->view() : params.src.binary;
+  if (kernel_name_.empty() ||
+      binary.format != se::ModuleFormat::kLevelZeroNative) {
+    return absl::OkStatus();
+  }
+
+  absl::MutexLock lock(mutex_);
+  if (per_stream_state_.contains(params.executor) ||
+      preloaded_kernels_.contains(params.executor)) {
+    return absl::OkStatus();
+  }
+  ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                   LoadKernelForExecutor(params.executor, params.src));
+  preloaded_kernels_.emplace(params.executor, std::move(kernel));
+  return absl::OkStatus();
+}
+
 absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
   ASSIGN_OR_RETURN(
       GpuCliqueKey clique_key,
@@ -400,25 +441,15 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
         }
       }
       RETURN_IF_ERROR(params.stream->BlockHostUntilDone());
-      TF_RET_CHECK(!kernel_name_.empty())
-          << "Kernel name must be set for collective kernel thunk.";
-      // Create kernel for execution.
-      std::unique_ptr<se::Kernel> kernel = nullptr;
-      const int32_t num_args = kernel_spec_.argument_descriptors.size();
-      if (binary_.has_value()) {
+      std::unique_ptr<se::Kernel> kernel;
+      auto preloaded = preloaded_kernels_.find(params.executor);
+      if (preloaded != preloaded_kernels_.end()) {
+        kernel = std::move(preloaded->second);
+        preloaded_kernels_.erase(preloaded);
+      } else {
         ASSIGN_OR_RETURN(kernel,
-                         CreateKernel(kernel_name_, num_args, binary_->view(),
-                                      params.executor, shmem_bytes_));
-      } else if (!params.src.binary.empty()) {
-        ASSIGN_OR_RETURN(kernel,
-                         CreateKernel(kernel_name_, num_args, params.src.binary,
-                                      params.executor, shmem_bytes_));
-      } else {  // Use PTX.
-        ASSIGN_OR_RETURN(kernel,
-                         CreateKernel(kernel_name_, num_args, params.src.text,
-                                      params.executor, shmem_bytes_));
+                         LoadKernelForExecutor(params.executor, params.src));
       }
-      kernel->set_use_pdl(use_pdl_);
       // Step2: Emplace into the stream state.
       per_stream_state_.emplace(
           params.executor,

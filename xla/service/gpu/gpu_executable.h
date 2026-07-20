@@ -163,6 +163,8 @@ class GpuExecutable : public Executable {
 
   const BinaryMap& dnn_compiled_graphs() const { return dnn_compiled_graphs_; }
 
+  absl::Status Preload(se::Stream* stream) override;
+
   // ExecuteAsyncOnStream will fail if the compute capability of the stream
   // doesn't match the compute capability passed to this object's constructor.
   absl::StatusOr<ExecutionOutput> ExecuteAsyncOnStream(

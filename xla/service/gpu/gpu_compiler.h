@@ -227,6 +227,7 @@ class GpuCompiler : public LLVMCompiler {
   absl::StatusOr<BackendCompileResult> CompileSingleModule(
       const HloModuleConfig& module_config,
       const stream_executor::DeviceDescription& device_description,
+      se::StreamExecutor* absl_nullable stream_exec,
       const HloModule* debug_module, llvm::Module* llvm_module,
       bool relocatable, std::optional<int> shard_number);
 
