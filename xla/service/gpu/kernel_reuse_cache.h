@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/stream_executor/gpu/tma_metadata.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/module_binary.h"
 
 namespace xla::gpu {
 
@@ -49,13 +50,13 @@ class KernelReuseCache {
     LaunchDimensions launch_dimensions;
     std::optional<se::ClusterDim> cluster_dim;
     int64_t shmem_bytes = 0;
-    std::vector<uint8_t> binary;
+    se::ModuleBinary binary;
     stream_executor::gpu::TmaMetadata tma_metadata;
     bool use_pdl = false;
   };
   struct NamedBinary {
     std::string name;
-    std::vector<uint8_t> binary;
+    se::ModuleBinary binary;
   };
 
   absl::Status Load(const CompilationCacheProto& proto);

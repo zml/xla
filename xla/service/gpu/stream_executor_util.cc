@@ -40,8 +40,8 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "Eigen/Core"
 #include "xla/tsl/platform/status_macros.h"
+#include "Eigen/Core"
 #include "xla/autotuning.pb.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/layout.h"
@@ -406,6 +406,27 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
   se::KernelMetadata m;
   m.set_shared_memory_bytes(shared_mem_bytes);
   kernel->set_metadata(m);
+  kernel->set_use_pdl(use_pdl);
+  return kernel;
+}
+
+absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
+    std::string kernel_name, uint64_t num_args,
+    se::ModuleBinaryView module_binary, se::StreamExecutor* stream_exec,
+    uint32_t shared_mem_bytes, bool use_pdl) {
+  if (module_binary.format == se::ModuleFormat::kUnspecified) {
+    return CreateKernel(std::move(kernel_name), num_args, module_binary.bytes,
+                        stream_exec, shared_mem_bytes, use_pdl);
+  }
+  se::KernelLoaderSpec loader_spec =
+      se::KernelLoaderSpec::CreateModuleBinaryInMemorySpec(
+          module_binary, std::move(kernel_name), num_args);
+
+  ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                   stream_exec->LoadKernel(loader_spec));
+  se::KernelMetadata metadata;
+  metadata.set_shared_memory_bytes(shared_mem_bytes);
+  kernel->set_metadata(metadata);
   kernel->set_use_pdl(use_pdl);
   return kernel;
 }

@@ -24,6 +24,7 @@ import "xla/service/hlo.proto";
 import "xla/shape_util.proto";
 import "xla/stream_executor/abi/executable_abi_version.proto";
 import "xla/stream_executor/device_description.proto";
+import "xla/stream_executor/module_binary.proto";
 import "xla/xla.proto";
 import "xla/xla_data.proto";
 
@@ -58,6 +59,10 @@ message GpuExecutableProto {
   // For CUDA, this is a cubin binary.
   // For ROCm, this is a hsaco binary.
   bytes binary = 4;
+
+  // Typed replacement for `binary`. New serializers write this field; readers
+  // continue to accept `binary` for backward compatibility.
+  stream_executor.ModuleBinaryProto module_binary = 17;
 
   // The DNN compiled graphs of the executable.
   //

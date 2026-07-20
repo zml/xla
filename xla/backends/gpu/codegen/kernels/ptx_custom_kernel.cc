@@ -94,4 +94,16 @@ absl::StatusOr<CustomKernel> CreateOwnedCubinCustomKernel(
                       thread_dim, shared_memory_bytes);
 }
 
+absl::StatusOr<CustomKernel> CreateOwnedBinaryCustomKernel(
+    std::string kernel_name, se::ModuleBinary binary, int num_args,
+    se::BlockDim block_dim, se::ThreadDim thread_dim,
+    size_t shared_memory_bytes) {
+  se::KernelLoaderSpec loader_spec =
+      se::KernelLoaderSpec::CreateOwningModuleBinaryInMemorySpec(
+          std::move(binary), kernel_name, num_args,
+          IdentityPackingSpec(num_args));
+  return CustomKernel(std::move(kernel_name), std::move(loader_spec), block_dim,
+                      thread_dim, shared_memory_bytes);
+}
+
 }  // namespace xla::gpu::kernel

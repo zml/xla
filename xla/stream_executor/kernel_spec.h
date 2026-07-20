@@ -36,8 +36,6 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_KERNEL_SPEC_H_
 #define XLA_STREAM_EXECUTOR_KERNEL_SPEC_H_
 
-#include <stddef.h>
-
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -52,9 +50,11 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include <stddef.h>
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_args_packing_spec.h"
 #include "xla/stream_executor/kernel_spec.pb.h"
+#include "xla/stream_executor/module_binary.h"
 
 namespace stream_executor {
 
@@ -85,6 +85,17 @@ struct CudaCubinInMemory {
 // Like CudaCubinInMemory but the CUBIN data is owned by the loader spec.
 struct OwningCudaCubinInMemory {
   std::vector<uint8_t> cubin_bytes;
+};
+
+// Kernel loader specification for a typed module binary that resides in
+// memory. The format determines which platform loader accepts the payload.
+struct ModuleBinaryInMemory {
+  ModuleBinaryView module_binary;
+};
+
+// Like ModuleBinaryInMemory but the module is owned by the loader spec.
+struct OwningModuleBinaryInMemory {
+  ModuleBinary module_binary;
 };
 
 // Describes how to load a kernel on any subset of a number of target platforms.
@@ -120,6 +131,10 @@ class KernelLoaderSpec {
     return std::holds_alternative<CudaPtxInMemory>(payload_) ||
            std::holds_alternative<OwningCudaPtxInMemory>(payload_);
   }
+  bool has_module_binary() const {
+    return std::holds_alternative<ModuleBinaryInMemory>(payload_) ||
+           std::holds_alternative<OwningModuleBinaryInMemory>(payload_);
+  }
 
   // Accessors for platform variant kernel load specifications.
   std::optional<InProcessSymbol> in_process_symbol() const {
@@ -150,6 +165,17 @@ class KernelLoaderSpec {
     return std::nullopt;
   }
 
+  std::optional<ModuleBinaryInMemory> module_binary() const {
+    if (std::holds_alternative<ModuleBinaryInMemory>(payload_)) {
+      return std::get<ModuleBinaryInMemory>(payload_);
+    }
+    if (std::holds_alternative<OwningModuleBinaryInMemory>(payload_)) {
+      return ModuleBinaryInMemory{
+          std::get<OwningModuleBinaryInMemory>(payload_).module_binary.view()};
+    }
+    return std::nullopt;
+  }
+
   // Use these factory functions to create a spec of any supported type.
   //
   // Note that the kernel_name parameter must be consistent with the kernel in
@@ -174,6 +200,12 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateOwningCudaPtxInMemorySpec(
       std::string ptx, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateModuleBinaryInMemorySpec(
+      ModuleBinaryView module_binary, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateOwningModuleBinaryInMemorySpec(
+      ModuleBinary module_binary, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
 
   void set_kernel_args_packing(KernelArgsPacking kernel_args_packing) {
     kernel_args_packing_ = std::move(kernel_args_packing);
@@ -197,7 +229,8 @@ class KernelLoaderSpec {
  private:
   using Payload =
       std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory>;
+                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
+                   ModuleBinaryInMemory, OwningModuleBinaryInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

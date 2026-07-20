@@ -81,7 +81,9 @@ IntelGpuCompiler::CompileTargetBinary(
     }
   }
   std::vector<uint8_t> spirv_bin(spirv_str.begin(), spirv_str.end());
-  return BackendCompileResult{/*asm_text=*/"", std::move(spirv_bin)};
+  return BackendCompileResult{
+      /*asm_text=*/"",
+      se::ModuleBinary(std::move(spirv_bin), se::ModuleFormat::kSpirv)};
 }
 
 std::vector<std::string> IntelGpuCompiler::GetLLVMCommandLineOptions(

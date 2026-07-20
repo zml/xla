@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/tsl/platform/threadpool.h"
 #include "xla/xla.pb.h"
 
@@ -46,8 +47,8 @@ namespace xla::gpu {
 
 // LlvmIrCompiler abstracts compilation of LLVM IR to target binary.
 // Takes the LLVM module, device description, and debug options as input.
-// Returns the compiled binary as a vector of bytes or an error status.
-using LlvmIrCompiler = absl::AnyInvocable<absl::StatusOr<std::vector<uint8_t>>(
+// Returns the compiled binary and its target format or an error status.
+using LlvmIrCompiler = absl::AnyInvocable<absl::StatusOr<se::ModuleBinary>(
     llvm::Module& module, const stream_executor::DeviceDescription& descr,
     const DebugOptions& opts)>;
 
@@ -80,7 +81,7 @@ class CubinCustomKernelCompiler final : public KernelCompiler {
       const std::string& entry_function_name, int unroll_factor,
       MlirKernelSource source, BorrowedMlirContext borrowed_context) override;
 
-  xla::Future<std::vector<uint8_t>> CompileToTargetBinary(
+  xla::Future<se::ModuleBinary> CompileToTargetBinary(
       LlvmKernelSource kernel_source) override;
 
   xla::Future<TritonWrapperResult> CompileTritonToLlvm(
@@ -92,7 +93,7 @@ class CubinCustomKernelCompiler final : public KernelCompiler {
       bool is_xla_fusion) override;
 
  private:
-  absl::StatusOr<std::vector<uint8_t>> CompileToCubinImpl(
+  absl::StatusOr<se::ModuleBinary> CompileToBinaryImpl(
       LlvmKernelSource kernel_source);
 
   absl::StatusOr<std::unique_ptr<Thunk>> CompileImpl(

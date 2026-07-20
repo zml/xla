@@ -405,9 +405,10 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
       // Create kernel for execution.
       std::unique_ptr<se::Kernel> kernel = nullptr;
       const int32_t num_args = kernel_spec_.argument_descriptors.size();
-      if (cubin_.has_value()) {
-        ASSIGN_OR_RETURN(kernel, CreateKernel(kernel_name_, num_args, *cubin_,
-                                              params.executor, shmem_bytes_));
+      if (binary_.has_value()) {
+        ASSIGN_OR_RETURN(kernel,
+                         CreateKernel(kernel_name_, num_args, binary_->view(),
+                                      params.executor, shmem_bytes_));
       } else if (!params.src.binary.empty()) {
         ASSIGN_OR_RETURN(kernel,
                          CreateKernel(kernel_name_, num_args, params.src.binary,
@@ -674,17 +675,21 @@ CollectiveKernelThunk::FromProto(
     buffers.push_back(std::move(buffer));
   }
 
-  std::optional<std::vector<uint8_t>> cubin = std::nullopt;
-  if (thunk_proto.has_cubin()) {
-    cubin = std::vector<uint8_t>{thunk_proto.cubin().begin(),
-                                 thunk_proto.cubin().end()};
+  std::optional<se::ModuleBinary> binary = std::nullopt;
+  if (thunk_proto.has_module_binary()) {
+    ASSIGN_OR_RETURN(binary.emplace(),
+                     se::ModuleBinary::FromProto(thunk_proto.module_binary()));
+  } else if (thunk_proto.has_cubin()) {
+    binary.emplace(std::vector<uint8_t>{thunk_proto.cubin().begin(),
+                                        thunk_proto.cubin().end()},
+                   se::ModuleFormat::kCudaCubin);
   }
 
   return std::make_unique<CollectiveKernelThunk>(
       thunk_info, collective_config, std::move(kernel_spec),
       thunk_proto.is_async(), std::move(buffers),
       thunk_proto.collective_kernel_enabled(), thunk_proto.kernel_name(),
-      launch_dimensions, thunk_proto.shmem_bytes(), std::move(cubin),
+      launch_dimensions, thunk_proto.shmem_bytes(), std::move(binary),
       thunk_proto.use_pdl());
 }
 
@@ -746,9 +751,8 @@ absl::StatusOr<ThunkProto> CollectiveKernelThunk::ToProto() const {
 
   thunk_proto->set_shmem_bytes(shmem_bytes_);
 
-  if (cubin_.has_value()) {
-    thunk_proto->set_cubin(reinterpret_cast<const char*>(cubin_->data()),
-                           cubin_->size());
+  if (binary_.has_value()) {
+    *thunk_proto->mutable_module_binary() = binary_->ToProto();
   }
 
   thunk_proto->set_use_pdl(use_pdl_);

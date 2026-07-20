@@ -36,6 +36,7 @@ cc_library(
         ":custom_kernel_proto_cc",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:module_binary",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status:statusor",

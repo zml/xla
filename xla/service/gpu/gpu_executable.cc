@@ -180,7 +180,7 @@ class GpuExecutableThunkPassBufferAllocator : public ThunkPassBufferAllocator {
       BufferAllocation::Index start_idx)
       : next_idx_(start_idx) {}
 
-  absl::StatusOr<BufferAllocation* absl_nonnull> NewEmptyAllocation(
+  absl::StatusOr<BufferAllocation * absl_nonnull> NewEmptyAllocation(
       int64_t size) override {
     allocations_.push_back(BufferAllocation(next_idx_++, size, /*color=*/0));
     return &allocations_.back();
@@ -453,7 +453,7 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::Create(
 // Implementation note: HLO profiling is always enabled for GPU executables,
 // since we can use timers around thunks.
 GpuExecutable::GpuExecutable(
-    std::unique_ptr<HloModule> debug_module, std::vector<uint8_t> binary,
+    std::unique_ptr<HloModule> debug_module, se::ModuleBinary binary,
     BinaryMap dnn_compiled_graphs, se::DeviceDescription device_description,
     std::unique_ptr<ThunkExecutor> executable, std::string module_name,
     ProgramShape program_shape, std::vector<BufferAllocation> allocations,
@@ -498,9 +498,11 @@ GpuExecutable::GpuExecutable(
   if (gpu_version_.IsRocm()) {
     // ROCm uses hsaco hashes to distinguish between modules.
     // Bad things happen if multiple modules with identical code are loaded.
-    binary_.resize(binary_.size() + 16);
-    *(uint64_t*)(&binary_[binary_.size() - 16]) = tsl::EnvTime::NowNanos();
-    *(uint64_t*)(&binary_[binary_.size() - 8]) = tsl::random::New64();
+    binary_.bytes.resize(binary_.bytes.size() + 16);
+    *(uint64_t*)(&binary_.bytes[binary_.bytes.size() - 16]) =
+        tsl::EnvTime::NowNanos();
+    *(uint64_t*)(&binary_.bytes[binary_.bytes.size() - 8]) =
+        tsl::random::New64();
   }
   if (has_module() && enable_debug_info_manager_) {
     XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
@@ -1285,7 +1287,7 @@ absl::Status GpuExecutable::ExecuteThunks(
   ScopedModuleAnnotations module_annotations(&module_annotations_);
 
   ModuleIdentifier unique_id = has_module() ? module().unique_id() : -1;
-  Thunk::ExecutableSource executable_source = {"", binary_,
+  Thunk::ExecutableSource executable_source = {"", binary_.view(),
                                                dnn_compiled_graphs_};
 
   se::StreamExecutor* executor = run_options->stream()->parent();
@@ -1407,7 +1409,7 @@ absl::StatusOr<GpuExecutable::OutputInfo> GpuExecutable::OutputInfo::FromProto(
 
 absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
   GpuExecutableProto proto;
-  proto.set_binary(binary_.data(), binary_.size());
+  *proto.mutable_module_binary() = binary_.ToProto();
   proto.mutable_dnn_compiled_graphs()->insert(dnn_compiled_graphs_.cbegin(),
                                               dnn_compiled_graphs_.cend());
 
@@ -1474,8 +1476,20 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
   params.debug_options = std::move(debug_options);
   params.enable_debug_info_manager =
       params.debug_options.xla_gpu_executable_embed_debug_info();
-  const std::string& binary = proto.binary();
-  params.binary.assign(binary.begin(), binary.end());
+  if (proto.has_module_binary()) {
+    ASSIGN_OR_RETURN(params.binary,
+                     se::ModuleBinary::FromProto(proto.module_binary()));
+  } else {
+    const std::string& binary = proto.binary();
+    se::ModuleFormat format =
+        device_description.gpu_compute_capability().IsCuda()
+            ? se::ModuleFormat::kCudaCubin
+        : device_description.gpu_compute_capability().IsRocm()
+            ? se::ModuleFormat::kRocmHsaco
+            : se::ModuleFormat::kSpirv;
+    params.binary = se::ModuleBinary(
+        std::vector<uint8_t>(binary.begin(), binary.end()), format);
+  }
   if (proto.has_hlo_module_with_config()) {
     ASSIGN_OR_RETURN(params.debug_module, HloModule::CreateFromProtoWithConfig(
                                               proto.hlo_module_with_config()));

@@ -843,6 +843,7 @@ cc_library(
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:event_based_timer",
         "//xla/stream_executor:kernel_stats",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:module_spec",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:platform_id",
@@ -895,6 +896,7 @@ tf_proto_library(
         "//xla/service:hlo_proto",
         "//xla/service/cpu:executable_proto",
         "//xla/stream_executor:device_description_proto",
+        "//xla/stream_executor:module_binary_proto",
         "//xla/stream_executor/abi:executable_abi_version_proto",
     ],
 )
@@ -1497,6 +1499,7 @@ cc_library(
 tf_proto_library(
     name = "kernel_reuse_cache_proto",
     srcs = ["kernel_reuse_cache.proto"],
+    deps = ["//xla/stream_executor:module_binary_proto"],
 )
 
 cc_library(
@@ -1611,6 +1614,7 @@ cc_library(
         "//xla/service:logical_buffer",
         "//xla/service/llvm_ir:llvm_command_line_options",
         "//xla/stream_executor:device_description",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:platform",
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/tsl/platform:env",
@@ -2015,6 +2019,7 @@ cc_library(
         "//xla/stream_executor:dnn",
         "//xla/stream_executor:kernel_stats",
         "//xla/stream_executor:memory_space",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:platform_id",
         "//xla/stream_executor:platform_manager",
@@ -3021,6 +3026,7 @@ cc_library(
         "//xla/stream_executor:kernel_metadata",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
@@ -3527,6 +3533,7 @@ cc_library(
         "//xla/codegen/emitters:kernel_arguments",
         "//xla/hlo/ir:hlo",
         "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor/gpu:tma_metadata",
         "//xla/tsl/concurrency:future",
         "//xla/tsl/platform:env",

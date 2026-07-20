@@ -279,7 +279,7 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
        fusion_instr, is_async = !IsGPUSyncCollective(*instr),
        is_collective_kernel_enabled](
           absl::string_view kernel_name, int32_t shmem_bytes,
-          LaunchDimensions launch_dimensions, const std::vector<uint8_t>& cubin,
+          LaunchDimensions launch_dimensions, const se::ModuleBinary& binary,
           bool use_pdl)
       -> absl::StatusOr<std::unique_ptr<CollectiveKernelThunk>> {
     ASSIGN_OR_RETURN(
@@ -289,7 +289,7 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
         thunk_info, config, std::move(kernel_spec), is_async,
         std::move(buffers), is_collective_kernel_enabled, kernel_name,
         launch_dimensions, shmem_bytes,
-        !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl);
+        !binary.empty() ? std::make_optional(binary) : std::nullopt, use_pdl);
   };
   const GpuTopology& gpu_topology = ir_emitter_context_->gpu_topology();
   const DeviceAssignment* device_assignment = nullptr;
@@ -367,10 +367,9 @@ absl::StatusOr<std::string> CanonicalGemmHlo(
          BackendConfigWrapper(gpu_config).GetRawString();
 }
 
-ThunkEmitter::ThunkEmitter(
-    IrEmitterContext* absl_nonnull ir_emitter_context,
-    llvm_ir::LLVMCommandLineOptionsReleasableLock* absl_nonnull
-        llvm_options_lock)
+ThunkEmitter::ThunkEmitter(IrEmitterContext* absl_nonnull ir_emitter_context,
+                           llvm_ir::LLVMCommandLineOptionsReleasableLock*
+                               absl_nonnull llvm_options_lock)
     : ir_emitter_context_(ir_emitter_context),
       send_recv_events_(std::make_shared<HostSendRecvAsyncEvents>()),
       call_graph_(CallGraph::Build(&ir_emitter_context->hlo_module())),
@@ -1392,12 +1391,12 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
               .Map([use_pdl = result.use_pdl, shmem_bytes = result.shmem_bytes,
                     launch_dimensions = std::move(launch_dimensions),
                     tma_metadata = result.tma_metadata,
-                    kernel_name](const std::vector<uint8_t>& cubin) {
+                    kernel_name](const se::ModuleBinary& binary) {
                 return KernelReuseCache::Entry{kernel_name,
                                                launch_dimensions,
                                                /*cluster_dim=*/std::nullopt,
                                                shmem_bytes,
-                                               cubin,
+                                               binary,
                                                tma_metadata,
                                                use_pdl};
               });
@@ -1422,7 +1421,7 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
            std::move(call_zeroed_outputs)](const KernelReuseCache::Entry* entry)
           -> absl::StatusOr<ThunkSequence> {
         ASSIGN_OR_RETURN(CustomKernel custom_kernel,
-                         kernel::CreateOwnedCubinCustomKernel(
+                         kernel::CreateOwnedBinaryCustomKernel(
                              entry->kernel_name, entry->binary,
                              kernel_arguments.args().size(),
                              entry->launch_dimensions.block_counts(),

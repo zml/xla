@@ -43,6 +43,7 @@ limitations under the License.*/
 #include "xla/stream_executor/device_address_handle.h"
 #include "xla/stream_executor/gpu/all_reduce_kernel.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/stream.h"
 
 namespace xla::gpu {
@@ -64,17 +65,16 @@ class CollectiveKernelThunk : public TracedCommand {
   static constexpr auto kMaxNumExecutors =
       ::stream_executor::gpu::kMaxNumAllReduceInputPtrs;
 
-  CollectiveKernelThunk(
-      ThunkInfo info, CollectiveConfig collective_config,  //
-      CollectiveKernelSpec kernel_spec,                    //
-      bool is_async,                                       //
-      std::vector<CollectiveThunk::Buffer> buffers,        //
-      bool is_collective_kernel_enabled,                   //
-      absl::string_view kernel_name,                       //
-      LaunchDimensions launch_dimensions,                  //
-      int32_t shmem_bytes = 0,                             //
-      std::optional<std::vector<uint8_t>> cubin = std::nullopt,
-      bool use_pdl = false)
+  CollectiveKernelThunk(ThunkInfo info, CollectiveConfig collective_config,  //
+                        CollectiveKernelSpec kernel_spec,                    //
+                        bool is_async,                                       //
+                        std::vector<CollectiveThunk::Buffer> buffers,        //
+                        bool is_collective_kernel_enabled,                   //
+                        absl::string_view kernel_name,                       //
+                        LaunchDimensions launch_dimensions,                  //
+                        int32_t shmem_bytes = 0,                             //
+                        std::optional<se::ModuleBinary> binary = std::nullopt,
+                        bool use_pdl = false)
       : TracedCommand{Thunk::kCollectiveKernel, info},
         collective_kernel_enabled_(is_collective_kernel_enabled),
         is_async_(is_async),
@@ -82,7 +82,7 @@ class CollectiveKernelThunk : public TracedCommand {
         kernel_spec_(std::move(kernel_spec)),
         launch_dimensions_(launch_dimensions),
         kernel_name_(kernel_name),
-        cubin_(std::move(cubin)),
+        binary_(std::move(binary)),
         shmem_bytes_(shmem_bytes),
         buffers_(std::move(buffers)),
         use_pdl_(use_pdl) {
@@ -100,7 +100,7 @@ class CollectiveKernelThunk : public TracedCommand {
   LaunchDimensions launch_dimensions() const { return launch_dimensions_; }
 
   bool use_pdl() const { return use_pdl_; }
-  const std::optional<std::vector<uint8_t>>& cubin() const { return cubin_; }
+  const std::optional<se::ModuleBinary>& binary() const { return binary_; }
 
   // Returns the reason why the collective kernel is not supported.
   // Returns OK if the collective kernel is supported.
@@ -176,7 +176,7 @@ class CollectiveKernelThunk : public TracedCommand {
   // Kernel name to execute. Required when Codegen/PTX kernel is used.
   // Must match the kernel name in the generated PTX kernel.
   const std::string kernel_name_;
-  std::optional<std::vector<uint8_t>> cubin_;
+  std::optional<se::ModuleBinary> binary_;
 
   // Number of bytes of shared memory used by the kernel.
   // Only useful when the codegen kernel is used.

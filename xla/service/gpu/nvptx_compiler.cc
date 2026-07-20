@@ -639,16 +639,20 @@ NVPTXCompiler::CompileTargetBinary(
                      compilation_provider->CompileToRelocatableModule(
                          cc, ptx, compilation_options));
     record_ptx_to_cubin_metric();
-    return BackendCompileResult{std::move(ptx),
-                                std::move(relocatable_module.cubin),
-                                std::move(relocatable_module.module_stats)};
+    return BackendCompileResult{
+        std::move(ptx),
+        se::ModuleBinary(std::move(relocatable_module.cubin),
+                         se::ModuleFormat::kCudaCubin),
+        std::move(relocatable_module.module_stats)};
   }
 
   ASSIGN_OR_RETURN(se::cuda::Assembly assembly,
                    compilation_provider->Compile(cc, ptx, compilation_options));
   record_ptx_to_cubin_metric();
-  return BackendCompileResult{std::move(ptx), std::move(assembly.cubin),
-                              std::move(assembly.module_stats)};
+  return BackendCompileResult{
+      std::move(ptx),
+      se::ModuleBinary(std::move(assembly.cubin), se::ModuleFormat::kCudaCubin),
+      std::move(assembly.module_stats)};
 }
 
 absl::StatusOr<bool> NVPTXCompiler::CanUseLinkModules(

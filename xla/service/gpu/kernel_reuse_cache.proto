@@ -17,6 +17,8 @@ syntax = "proto3";
 
 package xla.gpu;
 
+import "xla/stream_executor/module_binary.proto";
+
 option java_outer_classname = "KernelReuseCache";
 option java_multiple_files = true;
 
@@ -37,6 +39,7 @@ message CompilationCacheEntryProto {
   optional ClusterDimProto cluster_dim = 3;
   int64 shmem_bytes = 4;
   bytes binary = 5;
+  stream_executor.ModuleBinaryProto module_binary = 7;
   reserved 6;
 }
 

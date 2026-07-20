@@ -17,6 +17,8 @@ syntax = "proto3";
 
 package xla.gpu;
 
+import "xla/stream_executor/module_binary.proto";
+
 import "xla/backends/gpu/runtime/collective_thunk.proto";
 import "xla/service/gpu/launch_dimensions.proto";
 
@@ -106,4 +108,7 @@ message CollectiveKernelThunkProto {
   // Used to find runtime requirements for an emitted kernel.
   // See collective_params.h for more details.
   CollectiveKernelSpecProto kernel_spec = 12;
+
+  // Typed replacement for `cubin`; `cubin` remains readable for compatibility.
+  stream_executor.ModuleBinaryProto module_binary = 13;
 }

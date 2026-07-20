@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -170,7 +171,7 @@ class GpuCompiler : public LLVMCompiler {
  protected:
   struct BackendCompileResult {
     std::string asm_text;
-    std::vector<uint8_t> binary;
+    se::ModuleBinary binary;
     ModuleStats module_stats;
   };
 

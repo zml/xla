@@ -391,10 +391,10 @@ AsyncThunkSequence MlirKernelFusion::Emit(
                   ->CompileToTargetBinary(std::move(kernel_def).TakeSource())
                   .Map([kernel_name = std::move(kernel_name),
                         launch_dims = std::move(launch_dims),
-                        use_pdl](const std::vector<uint8_t>& cubin) {
+                        use_pdl](const se::ModuleBinary& binary) {
                     KernelReuseCache::Entry entry{kernel_name, launch_dims,
                                                   std::nullopt,
-                                                  /*shmem_bytes=*/0, cubin};
+                                                  /*shmem_bytes=*/0, binary};
 
                     entry.use_pdl = use_pdl;
                     return entry;
@@ -412,7 +412,7 @@ AsyncThunkSequence MlirKernelFusion::Emit(
       VLOG(3) << "Reuse: " << fusion.name() << " -> " << entry->kernel_name;
     }
     ASSIGN_OR_RETURN(CustomKernel custom_kernel,
-                     kernel::CreateOwnedCubinCustomKernel(
+                     kernel::CreateOwnedBinaryCustomKernel(
                          entry->kernel_name, entry->binary, args.args().size(),
                          entry->launch_dimensions.block_counts(),
                          entry->launch_dimensions.thread_counts_per_block(),

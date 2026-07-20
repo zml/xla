@@ -260,7 +260,9 @@ AMDGPUCompiler::CompileTargetBinary(
                                "" /*module_config.compilation_cache_key()*/));
   }
 
-  return BackendCompileResult{"", std::move(hsaco_result.hsaco),
+  return BackendCompileResult{"",
+                              se::ModuleBinary(std::move(hsaco_result.hsaco),
+                                               se::ModuleFormat::kRocmHsaco),
                               std::move(hsaco_result.module_stats)};
 }
 

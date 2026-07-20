@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/module_binary.h"
 
 namespace xla::gpu::kernel {
 
@@ -45,6 +46,11 @@ absl::StatusOr<CustomKernel> GetOwnedPtxCustomKernel(
 
 absl::StatusOr<CustomKernel> CreateOwnedCubinCustomKernel(
     std::string kernel_name, std::vector<uint8_t> cubin, int num_args,
+    se::BlockDim block_dim, se::ThreadDim thread_dim,
+    size_t shared_memory_bytes);
+
+absl::StatusOr<CustomKernel> CreateOwnedBinaryCustomKernel(
+    std::string kernel_name, se::ModuleBinary binary, int num_args,
     se::BlockDim block_dim, se::ThreadDim thread_dim,
     size_t shared_memory_bytes);
 

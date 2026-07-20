@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/tsl/platform/logging.h"
 
 namespace stream_executor {
@@ -76,6 +77,12 @@ class ModuleHandle {
 // corresponds to CUmodule when running on CUDA.
 class MultiModuleLoaderSpec {
  public:
+  bool has_module_binary() const { return has_module_binary_; }
+  ModuleBinaryView module_binary() const {
+    CHECK(has_module_binary());
+    return module_binary_;
+  }
+
   bool has_cuda_cubin_in_memory() const { return has_cuda_cubin_in_memory_; }
   absl::Span<const uint8_t> cuda_cubin_in_memory() const {
     CHECK(has_cuda_cubin_in_memory());
@@ -100,7 +107,15 @@ class MultiModuleLoaderSpec {
     cuda_ptx_in_memory_ = *ptx ? ptx : nullptr;
   }
 
+  void AddModuleBinary(ModuleBinaryView binary) {
+    CHECK(!binary.empty());
+    has_module_binary_ = true;
+    module_binary_ = binary;
+  }
+
  private:
+  ModuleBinaryView module_binary_;
+  bool has_module_binary_ = false;
   absl::Span<const uint8_t> cuda_cubin_in_memory_;
   bool has_cuda_cubin_in_memory_ = false;
   const char* cuda_ptx_in_memory_;

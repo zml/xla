@@ -17,31 +17,21 @@ syntax = "proto3";
 
 package stream_executor;
 
-import "xla/stream_executor/kernel_args_packing_spec.proto";
-import "xla/stream_executor/module_binary.proto";
-
-message CudaPtxProto {
-  string data = 1;
+// Format of an in-memory accelerator module.
+enum ModuleFormatProto {
+  MODULE_FORMAT_UNSPECIFIED = 0;
+  MODULE_FORMAT_CUDA_CUBIN = 1;
+  MODULE_FORMAT_ROCM_HSACO = 2;
+  MODULE_FORMAT_SPIRV = 3;
+  MODULE_FORMAT_LEVEL_ZERO_NATIVE = 4;
 }
 
-message CudaCubinProto {
-  bytes data = 1;
-}
+// A target module together with the information required to load it safely.
+message ModuleBinaryProto {
+  ModuleFormatProto format = 1;
+  bytes data = 2;
 
-message InProcessSymbolProto {
-  string persistent_name = 1;
-}
-
-message KernelLoaderSpecProto {
-  oneof payload {
-    CudaPtxProto ptx = 1;
-    CudaCubinProto cubin = 2;
-    InProcessSymbolProto in_process_symbol = 6;
-    ModuleBinaryProto module_binary = 7;
-  }
-
-  int32 arity = 3;
-  string kernel_name = 4;
-
-  optional KernelArgsPackingSpecProto kernel_args_packing_spec = 5;
+  // Empty for portable formats. Native formats use an executor-defined key
+  // to reject loading on an incompatible device or driver.
+  string compatibility_key = 3;
 }

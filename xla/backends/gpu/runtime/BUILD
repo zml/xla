@@ -2026,6 +2026,7 @@ cc_library(
         "//xla/stream_executor:kernel",
         "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:memory_space",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/stream_executor/gpu:all_reduce_kernel",
@@ -3638,6 +3639,7 @@ cc_library(
         "//xla/service/gpu:buffer_allocations",
         "//xla/service/gpu:gpu_executable_run_options",
         "//xla/service/gpu:ir_emission_utils",
+        "//xla/stream_executor:module_binary",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/concurrency:future",
@@ -4502,6 +4504,7 @@ tf_proto_library(
     deps = [
         ":collective_thunk_proto",
         "//xla/service/gpu:launch_dimensions_proto",
+        "//xla/stream_executor:module_binary_proto",
     ],
 )
 

@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/xla.pb.h"
 
 namespace xla::gpu {
@@ -90,16 +91,14 @@ class KernelCompiler {
       TritonKernelSource triton_source, BorrowedMlirContext borrowed_context,
       bool is_xla_fusion) = 0;
 
-  virtual xla::Future<std::vector<uint8_t>> CompileToTargetBinary(
+  virtual xla::Future<se::ModuleBinary> CompileToTargetBinary(
       LlvmKernelSource kernel_source) = 0;
 
   // Sets a callback to be called prior to llvm::Module compilation.
   void SetPreOptimizationHook(ModuleHook hook) {
     pre_optimization_hook_ = std::move(hook);
   }
-  ModuleHook& pre_optimization_hook() {
-    return pre_optimization_hook_;
-  }
+  ModuleHook& pre_optimization_hook() { return pre_optimization_hook_; }
 
  private:
   ModuleHook pre_optimization_hook_;

@@ -42,13 +42,14 @@ limitations under the License.
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/util.h"
 
 namespace xla::gpu {
 
 struct CompileModuleResults {
-  std::vector<uint8_t> constants_binary;
+  se::ModuleBinary constants_binary;
   std::unique_ptr<BufferAssignment> buffer_assignment;
   std::unique_ptr<ExecutionStreamAssignment> execution_stream_assignment;
   std::unique_ptr<SequentialThunk> executable;
