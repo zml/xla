@@ -15,8 +15,6 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_executor.h"
 
-#include <unistd.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,18 +22,21 @@ limitations under the License.
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/numeric/int128.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
+#include <unistd.h>
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/dnn.h"
@@ -45,6 +46,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_args_packing_spec.h"
 #include "xla/stream_executor/memory_space.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/module_spec.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/plugin_registry.h"
@@ -114,10 +116,10 @@ void UnloadLevelZeroModule(SyclContext* context, ze_module_handle_t module) {
   }
 }
 
-// Loads a SPIR-V binary into a Level Zero module for the given SYCL context
-// and device.
+// Loads a SPIR-V or Level Zero native binary into a module for the given SYCL
+// context and device.
 absl::StatusOr<ze_module_handle_t> LoadLevelZeroModule(
-    SyclContext* context, const char* spirv_binary, const size_t spirv_size) {
+    SyclContext* context, ModuleBinaryView binary) {
   const sycl::context& sycl_context = context->context();
   ASSIGN_OR_RETURN(sycl::device sycl_device,
                    SyclDevicePool::GetDevice(context->device_ordinal()));
@@ -126,45 +128,68 @@ absl::StatusOr<ze_module_handle_t> LoadLevelZeroModule(
   auto lz_context =
       sycl::get_native<sycl::backend::ext_oneapi_level_zero>(sycl_context);
 
-  // Create module description for SPIR-V binary
-  ze_module_desc_t module_desc = {
-      ZE_STRUCTURE_TYPE_MODULE_DESC,
-      /*pNext=*/nullptr,
-      ZE_MODULE_FORMAT_IL_SPIRV,
-      spirv_size,
-      reinterpret_cast<const uint8_t*>(spirv_binary),
-      /*pBuildFlags=*/nullptr,
-      /*pConstants=*/nullptr};
+  ze_module_format_t ze_format;
+  switch (binary.format) {
+    case ModuleFormat::kSpirv:
+      ze_format = ZE_MODULE_FORMAT_IL_SPIRV;
+      break;
+    case ModuleFormat::kLevelZeroNative:
+      ze_format = ZE_MODULE_FORMAT_NATIVE;
+      break;
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unsupported SYCL module format: ", ModuleFormatName(binary.format)));
+  }
 
-  ze_module_build_log_handle_t log_handle;
-  ze_module_handle_t module;
+  ze_module_desc_t module_desc = {ZE_STRUCTURE_TYPE_MODULE_DESC,
+                                  /*pNext=*/nullptr,
+                                  ze_format,
+                                  binary.size(),
+                                  binary.bytes.data(),
+                                  /*pBuildFlags=*/nullptr,
+                                  /*pConstants=*/nullptr};
+
+  ze_module_build_log_handle_t log_handle = nullptr;
+  ze_module_handle_t module = nullptr;
   ze_result_t result =
       zeModuleCreate(lz_context, lz_device, &module_desc, &module, &log_handle);
-  if (result != ZE_RESULT_SUCCESS) {
-    // If module creation fails, retrieve the build log and return it
-    // as part of the error status.
+
+  std::string build_log;
+  if (log_handle != nullptr) {
     size_t log_size = 0;
-    RETURN_IF_ZE_ERROR(zeModuleBuildLogGetString(log_handle, &log_size,
-                                                 /*pBuildLog=*/nullptr),
-                       "LoadLevelZeroModule: Failed to query build log size");
-
-    // Allocate buffer to hold the build log.
-    std::unique_ptr<char[]> log_buffer(new char[log_size]);
-    RETURN_IF_ZE_ERROR(
-        zeModuleBuildLogGetString(log_handle, &log_size, log_buffer.get()),
-        "LoadLevelZeroModule: Failed to retrieve build log string");
-
-    // Destroy the build log handle to free resources.
-    RETURN_IF_ZE_ERROR(
-        zeModuleBuildLogDestroy(log_handle),
-        "LoadLevelZeroModule: Failed to destroy build log handle");
-
-    return absl::InternalError(absl::StrCat(
-        "LoadLevelZeroModule: Failed to create module, got Level Zero error ",
-        result, ": ", log_buffer.get()));
+    ze_result_t log_result =
+        zeModuleBuildLogGetString(log_handle, &log_size, /*pBuildLog=*/nullptr);
+    if (log_result == ZE_RESULT_SUCCESS && log_size > 0) {
+      std::vector<char> log_buffer(log_size);
+      log_result =
+          zeModuleBuildLogGetString(log_handle, &log_size, log_buffer.data());
+      if (log_result == ZE_RESULT_SUCCESS) build_log = log_buffer.data();
+    }
+    ze_result_t destroy_log_result = zeModuleBuildLogDestroy(log_handle);
+    if (result == ZE_RESULT_SUCCESS &&
+        destroy_log_result != ZE_RESULT_SUCCESS) {
+      UnloadLevelZeroModule(context, module);
+      return absl::InternalError(absl::StrCat(
+          "LoadLevelZeroModule: Failed to destroy build log, got Level Zero "
+          "error ",
+          destroy_log_result));
+    }
   }
-  // Module created successfully.
+
+  if (result != ZE_RESULT_SUCCESS) {
+    return absl::InternalError(absl::StrCat(
+        "LoadLevelZeroModule: Failed to create ",
+        ModuleFormatName(binary.format), " module, got Level Zero error ",
+        result, build_log.empty() ? "" : absl::StrCat(": ", build_log)));
+  }
   return module;
+}
+
+std::string ModuleCacheKey(ModuleBinaryView binary) {
+  auto fingerprint = tsl::Fingerprint128(absl::string_view(
+      reinterpret_cast<const char*>(binary.bytes.data()), binary.size()));
+  return absl::StrFormat("%d:%016x%016x", static_cast<int>(binary.format),
+                         fingerprint.high64, fingerprint.low64);
 }
 
 // Retrieve a SYCL kernel by name from a loaded Level Zero module in the
@@ -421,6 +446,8 @@ SyclExecutor::~SyclExecutor() {
   }
   CHECK(kernel_to_gpu_binary_.empty()) << "SyclExecutor has live kernels.";
   CHECK(gpu_binary_to_module_.empty()) << "SyclExecutor has loaded modules.";
+  CHECK(module_cache_.empty()) << "SyclExecutor has cached modules.";
+  CHECK(module_cache_keys_.empty()) << "SyclExecutor has cached module keys.";
   sycl_context_.reset();
 }
 
@@ -439,73 +466,42 @@ dnn::DnnSupport* SyclExecutor::AsDnn() {
 
 absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
     const KernelLoaderSpec& spec) {
-  // Check that a SPIR-V binary is provided in the spec.
-  if (!spec.has_cuda_cubin_in_memory()) {
+  ModuleBinaryView binary;
+  if (spec.has_module_binary()) {
+    binary = spec.module_binary()->module_binary;
+  } else if (spec.has_cuda_cubin_in_memory()) {
+    // Backward compatibility with executables serialized before typed module
+    // binaries were introduced.
+    binary = ModuleBinaryView(spec.cuda_cubin_in_memory()->cubin_bytes,
+                              ModuleFormat::kSpirv);
+  } else {
     return absl::InternalError(
-        "SyclExecutor::LoadKernel: No SPIR-V binary provided in spec.");
+        "SyclExecutor::LoadKernel: No SPIR-V or native binary provided.");
   }
 
-  // Create a new SyclKernel instance for the loaded kernel.
   auto sycl_kernel = std::make_unique<SyclKernel>(this);
   const std::string& kernel_name = spec.kernel_name();
-  const char* spirv_binary = reinterpret_cast<const char*>(
-      spec.cuda_cubin_in_memory()->cubin_bytes.data());
-  size_t spirv_size = spec.cuda_cubin_in_memory()->cubin_bytes.size();
+  ASSIGN_OR_RETURN(ModuleHandle module_handle, LoadModuleBinary(binary));
 
-  ModuleHandle module_handle{spirv_binary};
-  ze_module_handle_t module = nullptr;
-
-  // Check if the module is already loaded.
+  ze_module_handle_t module;
   {
     absl::MutexLock lock{&in_memory_modules_mu_};
     auto in_mem_it = in_memory_modules_.find(module_handle);
-    if (in_mem_it != in_memory_modules_.end()) {
-      module = in_mem_it->second;
+    if (in_mem_it == in_memory_modules_.end()) {
+      return absl::InternalError(
+          "SyclExecutor::LoadKernel: Inconsistent module cache state.");
     }
-  }
-
-  // If module is not loaded, load it outside the lock for efficiency.
-  // Only the first thread to load the module inserts it into the cache.
-  // Other threads reuse the cached module and unload their own redundant
-  // module.
-  if (module == nullptr) {
-    ASSIGN_OR_RETURN(module, LoadLevelZeroModule(sycl_context_.get(),
-                                                 spirv_binary, spirv_size));
-    {
-      absl::MutexLock lock{&in_memory_modules_mu_};
-      // Try to insert the newly loaded module into the cache.
-      auto [in_mem_it, inserted] =
-          in_memory_modules_.emplace(module_handle, module);
-      if (!inserted) {
-        // Another thread loaded the module first.
-        // Unload the redundant module inside the lock since unloading is fast
-        // and also to avoid resource leaks.
-        UnloadLevelZeroModule(sycl_context_.get(), module);
-        module = in_mem_it->second;
-
-        // Increment reference count in gpu_binary_to_module_.
-        auto gpu_bin_it = gpu_binary_to_module_.find(module_handle);
-        if (gpu_bin_it != gpu_binary_to_module_.end()) {
-          ++(gpu_bin_it->second.second);
-        } else {
-          // This should not happen since in_memory_modules_ and
-          // gpu_binary_to_module_ should be consistent.
-          return absl::InternalError(
-              "SyclExecutor::LoadKernel: Inconsistent module cache state.");
-        }
-      } else {
-        // Newly inserted module: Set reference count to 1 in
-        // gpu_binary_to_module_.
-        gpu_binary_to_module_[module_handle] = std::make_pair(module, 1);
-      }
-    }
+    module = in_mem_it->second;
   }
 
   // Retrieve the kernel function from the loaded module.
   VLOG(2) << "Getting function " << kernel_name << " from module " << module;
-  ASSIGN_OR_RETURN(
-      std::unique_ptr<sycl::kernel> function,
-      GetModuleFunction(sycl_context_.get(), module, kernel_name.c_str()));
+  absl::StatusOr<std::unique_ptr<sycl::kernel>> function =
+      GetModuleFunction(sycl_context_.get(), module, kernel_name.c_str());
+  if (!function.ok()) {
+    UnloadModule(module_handle);
+    return function.status();
+  }
   {
     absl::MutexLock lock{&in_memory_modules_mu_};
     // Track which kernels are loaded and their associated modules.
@@ -514,7 +510,7 @@ absl::StatusOr<std::unique_ptr<Kernel>> SyclExecutor::LoadKernel(
   }
 
   // Set kernel function and metadata.
-  sycl_kernel->set_gpu_function(function.release());
+  sycl_kernel->set_gpu_function(function->release());
   // We have to trust the kernel loader spec arity because there doesn't
   // appear to be a way to reflect on the number of expected arguments w/the
   // SPIR API.
@@ -572,13 +568,81 @@ void SyclExecutor::UnloadKernel(const Kernel* kernel) {
 
 absl::StatusOr<ModuleHandle> SyclExecutor::LoadModule(
     const MultiModuleLoaderSpec& spec) {
+  if (spec.has_module_binary()) {
+    return LoadModuleBinary(spec.module_binary());
+  }
   if (spec.has_cuda_cubin_in_memory()) {
-    return LoadModuleFromSpirv(
-        reinterpret_cast<const char*>(spec.cuda_cubin_in_memory().data()),
-        spec.cuda_cubin_in_memory().size());
+    return LoadModuleBinary(
+        ModuleBinaryView(spec.cuda_cubin_in_memory(), ModuleFormat::kSpirv));
   }
   return absl::InternalError(
-      "SyclExecutor::LoadModule: No SPIR-V binary found, cannot load module.");
+      "SyclExecutor::LoadModule: No SPIR-V or native binary found.");
+}
+
+absl::StatusOr<ModuleBinary> SyclExecutor::CompileModuleToNative(
+    ModuleBinaryView module_binary) {
+  if (module_binary.format != ModuleFormat::kSpirv) {
+    return absl::InvalidArgumentError(
+        "SyclExecutor can compile only SPIR-V modules to native format");
+  }
+
+  ASSIGN_OR_RETURN(ze_module_handle_t module,
+                   LoadLevelZeroModule(sycl_context_.get(), module_binary));
+  size_t native_size = 0;
+  ze_result_t result = zeModuleGetNativeBinary(module, &native_size, nullptr);
+  if (result != ZE_RESULT_SUCCESS) {
+    UnloadLevelZeroModule(sycl_context_.get(), module);
+    return absl::InternalError(absl::StrCat(
+        "Failed to query Level Zero native binary size, error ", result));
+  }
+  if (native_size == 0) {
+    UnloadLevelZeroModule(sycl_context_.get(), module);
+    return absl::InternalError(
+        "Level Zero returned an empty native module binary");
+  }
+  std::vector<uint8_t> native_binary(native_size);
+  result = zeModuleGetNativeBinary(module, &native_size, native_binary.data());
+  UnloadLevelZeroModule(sycl_context_.get(), module);
+  if (result != ZE_RESULT_SUCCESS) {
+    return absl::InternalError(absl::StrCat(
+        "Failed to retrieve Level Zero native binary, error ", result));
+  }
+  native_binary.resize(native_size);
+  ASSIGN_OR_RETURN(std::string compatibility_key, GetModuleCompatibilityKey());
+  return ModuleBinary(std::move(native_binary), ModuleFormat::kLevelZeroNative,
+                      std::move(compatibility_key));
+}
+
+absl::StatusOr<std::string> SyclExecutor::GetModuleCompatibilityKey() const {
+  ze_device_handle_t lz_device =
+      sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_);
+  ze_driver_handle_t lz_driver =
+      sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+          device_.get_platform());
+
+  ze_device_properties_t device_props{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+  RETURN_IF_ZE_ERROR(zeDeviceGetProperties(lz_device, &device_props),
+                     "GetModuleCompatibilityKey: zeDeviceGetProperties");
+  ze_driver_properties_t driver_props{ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+  RETURN_IF_ZE_ERROR(zeDriverGetProperties(lz_driver, &driver_props),
+                     "GetModuleCompatibilityKey: zeDriverGetProperties");
+  ze_api_version_t api_version;
+  RETURN_IF_ZE_ERROR(zeDriverGetApiVersion(lz_driver, &api_version),
+                     "GetModuleCompatibilityKey: zeDriverGetApiVersion");
+
+  absl::string_view driver_uuid(
+      reinterpret_cast<const char*>(driver_props.uuid.id),
+      sizeof(driver_props.uuid.id));
+  return absl::StrFormat(
+      "level-zero-native-v1;ip=%s;vendor=%x;device=%x;driver_uuid=%s;"
+      "driver_version=%u;api=%u.%u",
+      GetDeviceDescription()
+          .gpu_compute_capability()
+          .oneapi_compute_capability()
+          ->ToString(),
+      device_props.vendorId, device_props.deviceId,
+      absl::BytesToHexString(driver_uuid), driver_props.driverVersion,
+      ZE_MAJOR_VERSION(api_version), ZE_MINOR_VERSION(api_version));
 }
 
 absl::StatusOr<std::shared_ptr<DeviceMemoryBase>>
@@ -850,86 +914,117 @@ absl::StatusOr<const SyclKernel*> SyclExecutor::GetSyclKernel(
   return static_cast<const SyclKernel*>(*it);
 }
 
-absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleFromSpirv(
-    const char* spirv_binary, size_t spirv_size) {
-  // TODO(intel-tf):
-  // 1. Use absl::Span<const uint8_t> for SPIR-V binary input.
-  // 2. Compute a fingerprint of the SPIR-V binary to use as the module handle
-  //    instead of the raw pointer.
-  ModuleHandle module_handle{spirv_binary};
+absl::StatusOr<ModuleHandle> SyclExecutor::LoadModuleBinary(
+    ModuleBinaryView binary) {
+  if (binary.empty()) {
+    return absl::InvalidArgumentError(
+        "SyclExecutor::LoadModuleBinary: Module binary is empty.");
+  }
+  if (binary.format == ModuleFormat::kLevelZeroNative) {
+    if (binary.compatibility_key.empty()) {
+      return absl::InvalidArgumentError(
+          "SyclExecutor::LoadModuleBinary: Level Zero native binary has no "
+          "compatibility key.");
+    }
+    ASSIGN_OR_RETURN(std::string compatibility_key,
+                     GetModuleCompatibilityKey());
+    if (binary.compatibility_key != compatibility_key) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Level Zero native binary is incompatible with this executor. "
+          "Binary key: ",
+          binary.compatibility_key, "; executor key: ", compatibility_key));
+    }
+  } else if (binary.format != ModuleFormat::kSpirv) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "SyclExecutor::LoadModuleBinary: Unsupported module format ",
+        ModuleFormatName(binary.format)));
+  }
+
+  std::string cache_key = ModuleCacheKey(binary);
   {
     absl::MutexLock lock(&in_memory_modules_mu_);
-    auto it = gpu_binary_to_module_.find(module_handle);
-    if (it != gpu_binary_to_module_.end()) {
-      // Module already loaded: increment reference count.
-      ++(it->second.second);
-      VLOG(2) << "LoadModuleFromSpirv: SPIR-V "
-              << static_cast<const void*>(spirv_binary)
-              << " is already loaded as module " << it->second.first;
-      return module_handle;
+    auto cache_it = module_cache_.find(cache_key);
+    if (cache_it != module_cache_.end()) {
+      auto module_it = gpu_binary_to_module_.find(cache_it->second);
+      if (module_it == gpu_binary_to_module_.end()) {
+        return absl::InternalError(
+            "SyclExecutor::LoadModuleBinary: Inconsistent module cache "
+            "state.");
+      }
+      ++module_it->second.second;
+      VLOG(2) << "LoadModuleBinary: " << ModuleFormatName(binary.format)
+              << " binary is already loaded as module "
+              << module_it->second.first;
+      return cache_it->second;
     }
   }
 
   // Load module outside the lock since it is a slow operation.
-  // TODO(intel-tf): Remove redundant loads via absl::call_once.
   // NOTE: Only the first thread to load the module inserts it into the cache.
   // Concurrent threads reuse the cached module and discard their own redundant
   // module via UnloadLevelZeroModule to avoid resource leaks.
-  ASSIGN_OR_RETURN(
-      ze_module_handle_t lz_module_handle,
-      LoadLevelZeroModule(sycl_context_.get(), spirv_binary, spirv_size));
+  ASSIGN_OR_RETURN(ze_module_handle_t lz_module_handle,
+                   LoadLevelZeroModule(sycl_context_.get(), binary));
+  ModuleHandle module_handle{lz_module_handle};
 
   {
     absl::MutexLock lock(&in_memory_modules_mu_);
-    auto it = gpu_binary_to_module_.find(module_handle);
-    if (it != gpu_binary_to_module_.end()) {
+    auto cache_it = module_cache_.find(cache_key);
+    if (cache_it != module_cache_.end()) {
       // Another thread loaded the module first.
       // Unload the redundant module inside the lock since unloading is fast
       // and also to avoid resource leaks.
       UnloadLevelZeroModule(sycl_context_.get(), lz_module_handle);
-      ++(it->second.second);
-      VLOG(2) << "LoadModuleFromSpirv: SPIR-V "
-              << static_cast<const void*>(spirv_binary)
-              << " is already loaded as module " << it->second.first;
-      return module_handle;
+      auto module_it = gpu_binary_to_module_.find(cache_it->second);
+      if (module_it == gpu_binary_to_module_.end()) {
+        return absl::InternalError(
+            "SyclExecutor::LoadModuleBinary: Inconsistent module cache "
+            "state after concurrent load.");
+      }
+      ++module_it->second.second;
+      VLOG(2) << "LoadModuleBinary: " << ModuleFormatName(binary.format)
+              << " binary was concurrently loaded as module "
+              << module_it->second.first;
+      return cache_it->second;
     }
     // Cache the newly loaded module and set its reference count to 1.
+    module_cache_[cache_key] = module_handle;
+    module_cache_keys_[module_handle] = std::move(cache_key);
     in_memory_modules_[module_handle] = lz_module_handle;
     gpu_binary_to_module_[module_handle] =
         std::make_pair(lz_module_handle, /*reference count=*/1);
   }
-  VLOG(2) << "LoadModuleFromSpirv: Loaded SPIR-V "
-          << static_cast<const void*>(spirv_binary) << " as module "
-          << lz_module_handle;
+  VLOG(2) << "LoadModuleBinary: Loaded " << ModuleFormatName(binary.format)
+          << " binary as module " << lz_module_handle;
   return module_handle;
 }
 
 bool SyclExecutor::UnloadGpuBinary(ModuleHandle module_handle) {
   auto module_it = gpu_binary_to_module_.find(module_handle);
   if (module_it == gpu_binary_to_module_.end()) {
-    VLOG(3) << "SyclExecutor::UnloadGpuBinary: SPIR-V module for "
-            << module_handle << " not found. It may have never been loaded.";
+    VLOG(3) << "SyclExecutor::UnloadGpuBinary: Module for " << module_handle
+            << " not found. It may have never been loaded.";
     return false;
   }
 
-  // SPIR-V module found: decrement reference count.
+  // Module found: decrement reference count.
   ze_module_handle_t lz_module_handle = module_it->second.first;
   uint64_t& ref_count = module_it->second.second;
-  VLOG(3) << "SyclExecutor::UnloadGpuBinary: Found SPIR-V module "
-          << lz_module_handle << " with reference count " << ref_count;
+  VLOG(3) << "SyclExecutor::UnloadGpuBinary: Found module " << lz_module_handle
+          << " with reference count " << ref_count;
 
   if (--ref_count == 0) {
-    // Unload SPIR-V module and remove it from the caches.
-    VLOG(3) << "SyclExecutor::UnloadGpuBinary: Unloading SPIR-V module "
+    // Unload the module and remove it from all caches.
+    VLOG(3) << "SyclExecutor::UnloadGpuBinary: Unloading module "
             << lz_module_handle;
     UnloadLevelZeroModule(sycl_context_.get(), lz_module_handle);
     gpu_binary_to_module_.erase(module_it);
-    ModuleHandle mem_it{};
-    // TODO(intel-tf): Optimize lookup for larger number of modules.
-    for (const auto& it : in_memory_modules_) {
-      if (it.second == lz_module_handle) mem_it = it.first;
+    in_memory_modules_.erase(module_handle);
+    auto key_it = module_cache_keys_.find(module_handle);
+    if (key_it != module_cache_keys_.end()) {
+      module_cache_.erase(key_it->second);
+      module_cache_keys_.erase(key_it);
     }
-    if (mem_it != ModuleHandle{}) in_memory_modules_.erase(mem_it);
   }
   return true;
 }

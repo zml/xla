@@ -24,6 +24,7 @@ limitations under the License.
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/memory_space.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/sycl/sycl_kernel.h"
 #include "xla/stream_executor/sycl/sycl_stream.h"
@@ -68,6 +69,11 @@ class SyclExecutor : public gpu::GpuExecutor {
   // Returns a handle to the loaded module or error status.
   absl::StatusOr<ModuleHandle> LoadModule(
       const MultiModuleLoaderSpec& spec) override;
+
+  absl::StatusOr<ModuleBinary> CompileModuleToNative(
+      ModuleBinaryView module_binary) override;
+
+  absl::StatusOr<std::string> GetModuleCompatibilityKey() const override;
 
   // Returns a shared constant for the given content, creating it on the device
   // if it does not already exist.
@@ -226,21 +232,27 @@ class SyclExecutor : public gpu::GpuExecutor {
   absl::flat_hash_set<const Kernel*> loaded_kernels_
       ABSL_GUARDED_BY(in_memory_modules_mu_);
 
-  // Loads a SPIR-V binary into a Level Zero module for the current SYCL
-  // context. If the module is already loaded, increments its reference count
+  // Loads a typed binary into a Level Zero module for the current SYCL context.
+  // If the module is already loaded, increments its reference count
   // and returns the existing handle. Otherwise, loads the module, caches it,
   // and sets its reference count to 1.
   // Internally acquires in_memory_modules_mu_; the caller should not hold it.
   // Returns a handle to the loaded module on success, or an error status.
-  absl::StatusOr<ModuleHandle> LoadModuleFromSpirv(const char* spirv,
-                                                   const size_t size);
+  absl::StatusOr<ModuleHandle> LoadModuleBinary(ModuleBinaryView binary);
 
-  // Unloads the given SPIR-V module when its reference count reaches zero.
+  // Unloads the given module when its reference count reaches zero.
   // Removes the module from caches and destroys it.
   // REQUIRES: Caller must hold in_memory_modules_mu_.
   // Returns true if the module was unloaded, false otherwise.
   bool UnloadGpuBinary(ModuleHandle module_handle)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(in_memory_modules_mu_);
+
+  // Content key -> loaded module handle. Unlike the legacy pointer-based key,
+  // this deduplicates identical binaries stored at different addresses.
+  absl::flat_hash_map<std::string, ModuleHandle> module_cache_
+      ABSL_GUARDED_BY(in_memory_modules_mu_);
+  absl::flat_hash_map<ModuleHandle, std::string> module_cache_keys_
+      ABSL_GUARDED_BY(in_memory_modules_mu_);
 
   // Mutex for blas, dnn, and fft.
   absl::Mutex mu_;
