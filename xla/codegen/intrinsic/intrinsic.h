@@ -46,6 +46,7 @@ enum class DeviceType {
   kSystemZCpu,
   kNvidiaGpu,
   kAmdGpu,
+  kVulkanGpu,
 };
 
 struct IntrinsicOptions {

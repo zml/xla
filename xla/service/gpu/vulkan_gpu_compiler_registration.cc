@@ -1,4 +1,4 @@
-/* Copyright 2025 The OpenXLA Authors.
+/* Copyright 2026 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,21 +15,19 @@ limitations under the License.
 
 #include <memory>
 
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "xla/hlo/ir/hlo_instructions.h"
-#include "xla/service/gpu/custom_kernel_emitter.h"
-#include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/service/compiler.h"
+#include "xla/service/gpu/vulkan_gpu_compiler.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 
-namespace xla {
-namespace gpu {
+namespace {
 
-absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(
-    const HloCustomCallInstruction* /*instr*/, IrEmitterContext* /*context*/) {
-  return absl::UnimplementedError(
-      "Custom kernel emitter for PTX custom call is not yet implemented in "
-      "this GPU platform.");
+bool RegisterVulkanCompiler() {
+  xla::Compiler::RegisterCompilerFactory(
+      stream_executor::vulkan::kVulkanPlatformId,
+      [] { return std::make_unique<xla::gpu::VulkanGpuCompiler>(); });
+  return true;
 }
 
-}  // namespace gpu
-}  // namespace xla
+const bool kVulkanCompilerRegistered = RegisterVulkanCompiler();
+
+}  // namespace

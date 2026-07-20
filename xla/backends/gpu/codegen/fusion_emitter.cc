@@ -145,6 +145,12 @@ absl::Status AnnotateKernelLaunchDimensions(
     kernel->addFnAttr(
         "amdgpu-max-num-workgroups",
         absl::StrJoin({block_count.x, block_count.y, block_count.z}, ","));
+  } else if (target_triple.getOS() == llvm::Triple::Vulkan) {
+    kernel->addFnAttr(
+        "hlsl.numthreads",
+        absl::StrCat(launch_dims.thread_counts_per_block().x, ",",
+                     launch_dims.thread_counts_per_block().y, ",",
+                     launch_dims.thread_counts_per_block().z));
   }
   return absl::OkStatus();
 }
@@ -157,7 +163,10 @@ absl::StatusOr<llvm::Function*> BuildKernelPrototypeFromUniqueName(
   // Create the kernel and add it to the module.
   llvm::LLVMContext& context = llvm_module->getContext();
   // Explicitly set global addrspace for SPIR backend.
-  int addrspace = llvm::Triple(llvm_module->getTargetTriple()).isSPIR() ? 1 : 0;
+  llvm::Triple target_triple(llvm_module->getTargetTriple());
+  int addrspace = target_triple.getOS() == llvm::Triple::Vulkan
+                      ? 11
+                      : (target_triple.isSPIR() ? 1 : 0);
   std::vector<llvm::Type*> kernel_args;
   kernel_args.reserve(arguments.args().size());
   for (const auto& arg : arguments.args()) {
