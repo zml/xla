@@ -113,6 +113,7 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/env_time.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/util/sorted_range.h"
@@ -526,6 +527,10 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == se::vulkan::kVulkanPlatformId) {
+    TF_RET_CHECK(gpu_version_.IsVulkan())
+        << "Vulkan stream cannot execute an executable compiled for "
+        << gpu_version_.ToString();
   } else {
     return Internal("Unknown platform");
   }

@@ -404,19 +404,45 @@ AsyncThunkSequence MlirKernelFusion::Emit(
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       &fusion, ir_emitter_context.GetNextThunkId());
   bool kernel_cached = cached;
+  bool is_vulkan = ir_emitter_context.gpu_compute_capability().IsVulkan();
   return future_entry.Map([&fusion, thunk_info = std::move(thunk_info),
                            args = std::move(args),
-                           kernel_cached](const KernelReuseCache::Entry* entry)
-                              -> absl::StatusOr<ThunkSequence> {
+                           kernel_cached,
+                           is_vulkan](const KernelReuseCache::Entry* entry)
+                                          -> absl::StatusOr<ThunkSequence> {
     if (kernel_cached) {
       VLOG(3) << "Reuse: " << fusion.name() << " -> " << entry->kernel_name;
     }
-    ASSIGN_OR_RETURN(CustomKernel custom_kernel,
-                     kernel::CreateOwnedCubinCustomKernel(
-                         entry->kernel_name, entry->binary, args.args().size(),
-                         entry->launch_dimensions.block_counts(),
-                         entry->launch_dimensions.thread_counts_per_block(),
-                         entry->shmem_bytes));
+    auto create_custom_kernel = [&]() -> absl::StatusOr<CustomKernel> {
+      if (!is_vulkan) {
+        return kernel::CreateOwnedCubinCustomKernel(
+            entry->kernel_name, entry->binary, args.args().size(),
+            entry->launch_dimensions.block_counts(),
+            entry->launch_dimensions.thread_counts_per_block(),
+            entry->shmem_bytes);
+      }
+
+      std::vector<se::VulkanDescriptorBinding> descriptor_bindings;
+      descriptor_bindings.reserve(args.args().size());
+      for (auto [index, argument] : llvm::enumerate(args.args())) {
+        if (argument.kind() != emitters::KernelArgument::Kind::kManaged) {
+          return absl::UnimplementedError(
+              "Vulkan kernels do not support scalar-by-value arguments.");
+        }
+        descriptor_bindings.push_back(se::VulkanDescriptorBinding{
+            /*descriptor_set=*/0,
+            /*binding=*/static_cast<uint32_t>(index),
+            /*argument_index=*/static_cast<uint32_t>(index),
+            /*slice_index=*/argument.slice_index(),
+            /*read_only=*/!argument.written()});
+      }
+      return kernel::CreateOwnedVulkanSpirvCustomKernel(
+          entry->kernel_name, entry->binary, std::move(descriptor_bindings),
+          entry->launch_dimensions.block_counts(),
+          entry->launch_dimensions.thread_counts_per_block(),
+          entry->shmem_bytes);
+    };
+    ASSIGN_OR_RETURN(CustomKernel custom_kernel, create_custom_kernel());
 
     return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
         thunk_info, std::move(custom_kernel), args, entry->use_pdl));

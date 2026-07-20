@@ -47,10 +47,12 @@ limitations under the License.
 #include "xla/stream_executor/gpu/tma_metadata.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/tensor_map.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/util.h"
 
@@ -183,7 +185,37 @@ absl::Status KernelThunk::Initialize(const InitializeParams& params) {
   // profiles.
   if (!kernel_cache_.contains(params.executor)) {
     std::unique_ptr<se::Kernel> kernel;
-    if (!params.src.binary.empty()) {
+    if (params.executor->GetPlatform()->id() ==
+        se::vulkan::kVulkanPlatformId) {
+      if (params.src.binary.empty()) {
+        return absl::InvalidArgumentError(
+            "Vulkan KernelThunk requires a SPIR-V binary");
+      }
+      TF_RET_CHECK(args_.size() == written_.size());
+
+      std::vector<se::VulkanDescriptorBinding> descriptor_bindings;
+      descriptor_bindings.reserve(args_.size());
+      for (size_t i = 0; i < args_.size(); ++i) {
+        descriptor_bindings.push_back(se::VulkanDescriptorBinding{
+            /*descriptor_set=*/0,
+            /*binding=*/static_cast<uint32_t>(i),
+            /*argument_index=*/static_cast<uint32_t>(i),
+            /*slice_index=*/static_cast<int64_t>(i),
+            /*read_only=*/!written_[i]});
+      }
+
+      se::KernelLoaderSpec loader_spec =
+          se::KernelLoaderSpec::CreateOwningVulkanSpirvInMemorySpec(
+              std::vector<uint8_t>(params.src.binary.begin(),
+                                   params.src.binary.end()),
+              se::VulkanSpirvProto::VULKAN_1_2,
+              std::move(descriptor_bindings), kernel_name_, args_.size());
+      ASSIGN_OR_RETURN(kernel, params.executor->LoadKernel(loader_spec));
+      se::KernelMetadata metadata;
+      metadata.set_shared_memory_bytes(shmem_bytes_);
+      kernel->set_metadata(metadata);
+      kernel->set_use_pdl(use_pdl_);
+    } else if (!params.src.binary.empty()) {
       ASSIGN_OR_RETURN(
           kernel, CreateKernel(kernel_name_, args_.size(), params.src.binary,
                                params.executor, shmem_bytes_, use_pdl_));
