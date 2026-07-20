@@ -116,12 +116,6 @@ struct ProcessGpuCliques {
   absl::flat_hash_map<CliqueCacheKey, std::shared_ptr<LockableGpuClique>>
       cliques ABSL_GUARDED_BY(mu);
 
-  // Persistent locks for already initialized cliques. Reusing the same lock
-  // skips the per-run rendezvous/lock acquisition on steady-state executions.
-  absl::flat_hash_map<CliqueCacheKey,
-                      std::shared_ptr<LockableGpuClique::Lock>>
-      steady_state_locks ABSL_GUARDED_BY(mu);
-
   // Cancellation tokens for GPU cliques that are pending construction. These
   // cancellation token allows XLA to safely cancel clique initialization if
   // one of the participating processes dies in the middle of it. When clique
@@ -172,8 +166,6 @@ namespace internal {
 void DestroyAcquiredCliques() {
   ProcessGpuCliques& state = GetProcessGpuCliques();
   absl::MutexLock lock(state.mu);
-
-  state.steady_state_locks.clear();
 
   // Destroy cliques in a deterministic order, which guarantees that we destroy
   // smaller cliques first, which is required for cliques that could be split
@@ -822,7 +814,7 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
     absl::Span<const std::vector<GlobalDeviceId>> device_groups,
     const GpuCollectives::CliqueIdCallback& clique_id_callback, RankId rank,
     const AcquiredCliquesMap& acquired_cliques, int64_t max_nchannels,
-    bool use_minimal_resource, bool enable_steady_state_fast_path) {
+    bool use_minimal_resource) {
   VLOG(2) << absl::StreamFormat(
       "[%d] [rank=%v] [run=%v] Acquire GPU clique %v; device_groups=%d:[%s]; "
       "acquired_cliques=%d; max_channels=%d",
@@ -861,33 +853,6 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
         break;
       }
     }
-  }
-
-  CliqueCacheKey cache_key(collectives, clique_key);
-  if (enable_steady_state_fast_path && !split_from) {
-    ProcessGpuCliques& state = GetProcessGpuCliques();
-    absl::MutexLock lock(state.mu);
-
-    auto lock_it = state.steady_state_locks.find(cache_key);
-    auto clique_it = state.cliques.find(cache_key);
-    if (lock_it != state.steady_state_locks.end() &&
-        clique_it != state.cliques.end() && lock_it->second &&
-        *lock_it->second) {
-      absl::Status stale =
-          CheckCliqueIsNotStaleImpl(state.task_state_infos, clique_key);
-      if (stale.ok()) {
-        VLOG(3) << absl::StrFormat(
-            "[%d] [rank=%v] Reuse steady-state clique lock for %v",
-            device->device_ordinal(), rank, clique_key);
-        return lock_it->second;
-      }
-    }
-
-    state.steady_state_locks.erase(cache_key);
-  } else if (split_from) {
-    ProcessGpuCliques& state = GetProcessGpuCliques();
-    absl::MutexLock lock(state.mu);
-    state.steady_state_locks.erase(cache_key);
   }
 
   // Get the clique lock via the rendezvous to guarantee that all clique
@@ -1004,11 +969,6 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   if (*clique) {
     VLOG(3) << absl::StrFormat("[%d] [rank=%v] Acquired existing clique %v",
                                device->device_ordinal(), rank, clique_key);
-    if (enable_steady_state_fast_path && !split_from) {
-      ProcessGpuCliques& state = GetProcessGpuCliques();
-      absl::MutexLock lock(state.mu);
-      state.steady_state_locks[cache_key] = clique;
-    }
     return clique;
   }
 
@@ -1032,16 +992,9 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(
   }
 
   // If we can't split any of the acquired cliques, create a new one.
-  ASSIGN_OR_RETURN(std::shared_ptr<LockableGpuClique::Lock> initialized,
-                   InitializeGpuClique(collectives, device, run_id, clique_key,
-                                       clique_id_callback,
-                                       num_local_participants, rank, config));
-  if (enable_steady_state_fast_path && *initialized) {
-    ProcessGpuCliques& state = GetProcessGpuCliques();
-    absl::MutexLock lock(state.mu);
-    state.steady_state_locks[cache_key] = initialized;
-  }
-  return initialized;
+  return InitializeGpuClique(collectives, device, run_id, clique_key,
+                             clique_id_callback, num_local_participants, rank,
+                             config);
 }
 
 //===----------------------------------------------------------------------===//
