@@ -2748,7 +2748,7 @@ GpuCompiler::CompileToBackendResult(
 
     auto llvm_compiler =
         [&](llvm::Module& llvm_module, const se::DeviceDescription& descr,
-            const DebugOptions& opts) -> absl::StatusOr<std::vector<uint8_t>> {
+            const DebugOptions& opts) -> absl::StatusOr<se::ModuleBinary> {
       llvm_ir::DumpIrIfEnabled(*module, llvm_module,
                                /*optimized=*/false,
                                std::to_string(shard_number.fetch_add(1)));
@@ -3075,13 +3075,14 @@ GpuCompiler::LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
           alias_info.get(),
           options.debug_options().xla_debug_buffer_assignment_show_max());
   std::vector<std::unique_ptr<CompiledModule>> results;
-  ASSIGN_OR_RETURN(results.emplace_back(),
-                   LegacyGpuAotCompilationResult::FromModule(
-                       hlo_module.get(),
-                       res.compile_module_results.buffer_assignment->ToProto(),
-                       std::move(buffer_assignment_debug_summary),
-                       res.backend_result.asm_text, res.backend_result.binary,
-                       {}, pointer_size_, this));
+  ASSIGN_OR_RETURN(
+      results.emplace_back(),
+      LegacyGpuAotCompilationResult::FromModule(
+          hlo_module.get(),
+          res.compile_module_results.buffer_assignment->ToProto(),
+          std::move(buffer_assignment_debug_summary),
+          res.backend_result.asm_text, res.backend_result.binary.bytes, {},
+          pointer_size_, this));
 
   return std::move(results);
 }
@@ -3407,7 +3408,13 @@ GpuCompiler::LoadExecutableFromLegacyAotResult(
               : 1,
       });
 
-  std::vector<uint8_t> binary(proto.binary().begin(), proto.binary().end());
+  se::ModuleBinary binary(
+      std::vector<uint8_t>(proto.binary().begin(), proto.binary().end()),
+      device_description.gpu_compute_capability().IsCuda()
+          ? se::ModuleFormat::kCudaCubin
+      : device_description.gpu_compute_capability().IsRocm()
+          ? se::ModuleFormat::kRocmHsaco
+          : se::ModuleFormat::kSpirv);
 
   // Build the executable, which should be a thunk sequence.
   absl::string_view platform_name = PlatformId()->ToName();
@@ -3422,7 +3429,7 @@ GpuCompiler::LoadExecutableFromLegacyAotResult(
   std::atomic<int> shard_number = 0;
   auto llvm_compiler =
       [&](llvm::Module& llvm_module, const se::DeviceDescription& descr,
-          const DebugOptions& opts) -> absl::StatusOr<std::vector<uint8_t>> {
+          const DebugOptions& opts) -> absl::StatusOr<se::ModuleBinary> {
     ASSIGN_OR_RETURN(
         BackendCompileResult result,
         CompileSingleModule(hlo_module->config(), descr, hlo_module.get(),

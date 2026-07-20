@@ -87,21 +87,20 @@ xla::Future<LlvmKernelSource> CubinCustomKernelCompiler::CompileMlirToLlvm(
       });
 }
 
-xla::Future<std::vector<uint8_t>>
-CubinCustomKernelCompiler::CompileToTargetBinary(
+xla::Future<se::ModuleBinary> CubinCustomKernelCompiler::CompileToTargetBinary(
     LlvmKernelSource kernel_source) {
   if (!thread_pool_) {
-    return CompileToCubinImpl(std::move(kernel_source));
+    return CompileToBinaryImpl(std::move(kernel_source));
   }
   return xla::MakeFutureOn(
       *thread_pool_->AsExecutor(),
       [this, kernel_source = std::move(kernel_source)]() mutable {
-        return CompileToCubinImpl(std::move(kernel_source));
+        return CompileToBinaryImpl(std::move(kernel_source));
       });
 }
 
-absl::StatusOr<std::vector<uint8_t>>
-CubinCustomKernelCompiler::CompileToCubinImpl(LlvmKernelSource kernel_source) {
+absl::StatusOr<se::ModuleBinary> CubinCustomKernelCompiler::CompileToBinaryImpl(
+    LlvmKernelSource kernel_source) {
   llvm::orc::ThreadSafeModule thread_safe_module =
       std::move(kernel_source).thread_safe_module();
   llvm::Module* llvm_module = thread_safe_module.getModuleUnlocked();
@@ -110,9 +109,7 @@ CubinCustomKernelCompiler::CompileToCubinImpl(LlvmKernelSource kernel_source) {
     pre_optimization_hook()(*llvm_module);
   }
 
-  ASSIGN_OR_RETURN(std::vector<uint8_t> cubin,
-                   compiler_(*llvm_module, device_info_, debug_options_));
-  return cubin;
+  return compiler_(*llvm_module, device_info_, debug_options_);
 }
 
 absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
@@ -120,13 +117,13 @@ absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
     const std::string& sanitized_kernel_name,
     const emitters::KernelArguments& kernel_arguments,
     const LaunchDimensions& launch_dimensions) {
-  ASSIGN_OR_RETURN(std::vector<uint8_t> cubin,
-                   CompileToCubinImpl(std::move(kernel_source)));
+  ASSIGN_OR_RETURN(se::ModuleBinary binary,
+                   CompileToBinaryImpl(std::move(kernel_source)));
 
   ASSIGN_OR_RETURN(
       CustomKernel custom_kernel,
-      kernel::CreateOwnedCubinCustomKernel(
-          sanitized_kernel_name, std::move(cubin),
+      kernel::CreateOwnedBinaryCustomKernel(
+          sanitized_kernel_name, std::move(binary),
           kernel_arguments.args().size(), launch_dimensions.block_counts(),
           launch_dimensions.thread_counts_per_block(), 0));
 

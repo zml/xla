@@ -63,6 +63,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -114,7 +115,7 @@ class GpuExecutable : public Executable {
   };
 
   struct Params {
-    std::vector<uint8_t> binary;
+    se::ModuleBinary binary;
     BinaryMap dnn_compiled_graphs;
     std::unique_ptr<ThunkExecutor> executable;
     std::vector<ConstantInfo> constants;
@@ -157,7 +158,8 @@ class GpuExecutable : public Executable {
   // in which case compilation is left up to the GPU driver. If both text() and
   // binary() are empty, that means the HLO required no custom kernels to be
   // compiled.
-  const std::vector<uint8_t>& binary() const { return binary_; }
+  const std::vector<uint8_t>& binary() const { return binary_.bytes; }
+  const se::ModuleBinary& module_binary() const { return binary_; }
 
   const BinaryMap& dnn_compiled_graphs() const { return dnn_compiled_graphs_; }
 
@@ -177,7 +179,7 @@ class GpuExecutable : public Executable {
       const ServiceExecutableRunOptions* run_options,
       VariantArguments arguments);
 
-  absl::Span<const BufferAllocation* absl_nonnull const> GetAllocations()
+  absl::Span<const BufferAllocation * absl_nonnull const> GetAllocations()
       const override {
     return allocation_ptrs_;
   }
@@ -266,7 +268,7 @@ class GpuExecutable : public Executable {
 
   // Use GpuExecutable::Create() to create an instance.
   explicit GpuExecutable(
-      std::unique_ptr<HloModule> debug_module, std::vector<uint8_t> binary,
+      std::unique_ptr<HloModule> debug_module, se::ModuleBinary binary,
       BinaryMap dnn_compiled_graphs, se::DeviceDescription device_description,
       std::unique_ptr<ThunkExecutor> executable, std::string module_name,
       ProgramShape program_shape, std::vector<BufferAllocation> allocations,
@@ -315,7 +317,7 @@ class GpuExecutable : public Executable {
   // compute_capability_.
   //
   // May be empty, in which case we leave compilation up to the GPU driver.
-  std::vector<uint8_t> binary_;
+  se::ModuleBinary binary_;
 
   BinaryMap dnn_compiled_graphs_;
 

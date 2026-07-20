@@ -52,6 +52,7 @@ limitations under the License.
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/service_executable_run_options.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/future.h"
@@ -153,8 +154,8 @@ class Thunk {
   // clear what else should become a part of "executable source", we likely
   // need to keep some information about available symbols and signatures.
   struct ExecutableSource {
-    absl::string_view text;            // PTX for NVIDIA backend
-    absl::Span<const uint8_t> binary;  // CUBIN for NVIDIA backends
+    absl::string_view text;  // PTX for NVIDIA backend
+    se::ModuleBinaryView binary;
     BinaryMap dnn_compiled_graphs;
   };
 

@@ -78,6 +78,20 @@ KernelLoaderSpec KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
                           std::move(kernel_name), arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateModuleBinaryInMemorySpec(
+    ModuleBinaryView module_binary, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{ModuleBinaryInMemory{module_binary},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
+KernelLoaderSpec KernelLoaderSpec::CreateOwningModuleBinaryInMemorySpec(
+    ModuleBinary module_binary, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{OwningModuleBinaryInMemory{std::move(module_binary)},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
@@ -99,6 +113,15 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
     proto.mutable_ptx()->set_data(cuda_ptx_in_memory()->ptx);
   }
 
+  if (has_module_binary()) {
+    ModuleBinaryView binary = module_binary()->module_binary;
+    *proto.mutable_module_binary() =
+        ModuleBinary(
+            std::vector<uint8_t>(binary.bytes.begin(), binary.bytes.end()),
+            binary.format, std::string(binary.compatibility_key))
+            .ToProto();
+  }
+
   if (has_in_process_symbol()) {
     if (in_process_symbol()->persistent_name.empty()) {
       return absl::InvalidArgumentError(
@@ -110,7 +133,7 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   }
 
   CHECK(has_cuda_cubin_in_memory() || has_cuda_ptx_in_memory() ||
-        has_in_process_symbol());
+        has_in_process_symbol() || has_module_binary());
 
   if (std::holds_alternative<KernelArgsPackingSpec>(kernel_args_packing_)) {
     ASSIGN_OR_RETURN(
@@ -165,11 +188,17 @@ absl::StatusOr<KernelLoaderSpec> KernelLoaderSpec::FromProto(
           proto.kernel_name(), proto.arity(), kernel_args_packing);
     }
 
+    case KernelLoaderSpecProto::kModuleBinary: {
+      ASSIGN_OR_RETURN(ModuleBinary binary,
+                       ModuleBinary::FromProto(proto.module_binary()));
+      return KernelLoaderSpec::CreateOwningModuleBinaryInMemorySpec(
+          std::move(binary), proto.kernel_name(), proto.arity(),
+          std::move(kernel_args_packing));
+    }
+
     default:
       return absl::InvalidArgumentError(
-          "Invalid KernelLoaderSpecProto. Neither PTX nor CUBIN payload has "
-          "been "
-          "found.");
+          "Invalid KernelLoaderSpecProto: no supported payload found.");
   }
 }
 

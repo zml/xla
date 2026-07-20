@@ -79,7 +79,7 @@ absl::Status SetFileContent(absl::string_view path, absl::string_view content) {
 }
 }  // namespace
 
-constexpr int kCacheCompatibilityVersion = 3;
+constexpr int kCacheCompatibilityVersion = 4;
 
 absl::Status KernelReuseCache::Load(const CompilationCacheProto& proto) {
   if (proto.compatibility_version() != kCacheCompatibilityVersion) {
@@ -95,8 +95,8 @@ absl::Status KernelReuseCache::Load(const CompilationCacheProto& proto) {
           se::ClusterDim{entry.cluster_dim().x(), entry.cluster_dim().y(),
                          entry.cluster_dim().z()};
     }
-    std::vector<uint8_t> binary(entry.binary().data(),
-                                entry.binary().data() + entry.binary().size());
+    ASSIGN_OR_RETURN(se::ModuleBinary binary,
+                     se::ModuleBinary::FromProto(entry.module_binary()));
     TF_RET_CHECK(
         cache_
             .insert(
@@ -147,9 +147,7 @@ CompilationCacheProto KernelReuseCache::Export() const {
       *proto_entry.mutable_cluster_dim() = cluster_dim_proto;
     }
     proto_entry.set_shmem_bytes(cache_entry->shmem_bytes);
-    proto_entry.set_binary(absl::string_view(
-        reinterpret_cast<const char*>(cache_entry->binary.data()),
-        cache_entry->binary.size()));
+    *proto_entry.mutable_module_binary() = cache_entry->binary.ToProto();
   }
   return proto;
 }

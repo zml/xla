@@ -129,22 +129,21 @@ AsyncThunkSequence TritonFusion::Emit(
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       &fusion, ir_emitter_context.GetNextThunkId());
   return Emit(ir_emitter_context, fusion, nullptr, {})
-      .Map(
-          [thunk_info = std::move(thunk_info)](
-              EmitResult result) -> absl::StatusOr<ThunkSequence> {
-            ASSIGN_OR_RETURN(
-                CustomKernel custom_kernel,
-                kernel::CreateOwnedCubinCustomKernel(
-                    result.entry.kernel_name, result.entry.binary,
-                    result.kernel_arguments.args().size(),
-                    result.entry.launch_dimensions.block_counts(),
-                    result.entry.launch_dimensions.thread_counts_per_block(),
-                    result.entry.shmem_bytes));
-            return ThunkSequence::Of<CustomKernelThunk>(
-                thunk_info, std::move(custom_kernel), result.kernel_arguments,
-                result.entry.use_pdl, std::vector<int64_t>{},
-                result.entry.tma_metadata);
-          });
+      .Map([thunk_info = std::move(thunk_info)](
+               EmitResult result) -> absl::StatusOr<ThunkSequence> {
+        ASSIGN_OR_RETURN(
+            CustomKernel custom_kernel,
+            kernel::CreateOwnedBinaryCustomKernel(
+                result.entry.kernel_name, result.entry.binary,
+                result.kernel_arguments.args().size(),
+                result.entry.launch_dimensions.block_counts(),
+                result.entry.launch_dimensions.thread_counts_per_block(),
+                result.entry.shmem_bytes));
+        return ThunkSequence::Of<CustomKernelThunk>(
+            thunk_info, std::move(custom_kernel), result.kernel_arguments,
+            result.entry.use_pdl, std::vector<int64_t>{},
+            result.entry.tma_metadata);
+      });
 }
 
 xla::Future<TritonFusion::EmitResult> TritonFusion::Emit(
@@ -249,12 +248,12 @@ xla::Future<TritonFusion::EmitResult> TritonFusion::Emit(
                     tma_metadata = triton_wrapper_result.tma_metadata,
                     shmem_bytes = triton_wrapper_result.shmem_bytes,
                     use_pdl = triton_wrapper_result.use_pdl](
-                       const std::vector<uint8_t>& cubin) {
+                       const se::ModuleBinary& binary) {
                 return KernelReuseCache::Entry{kernel_name,
                                                launch_dims,
                                                /*cluster_dim=*/std::nullopt,
                                                shmem_bytes,
-                                               cubin,
+                                               binary,
                                                tma_metadata,
                                                use_pdl};
               });

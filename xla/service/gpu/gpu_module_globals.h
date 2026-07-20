@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/service/gpu/dense_data_intermediate.h"
 #include "xla/service/gpu/gpu_executable.pb.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/scoped_module_handle.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -55,12 +56,11 @@ class GpuModuleGlobals {
 
     static absl::StatusOr<ConstantInfo> FromProto(
         const GpuExecutableProto::ConstantInfoProto& proto,
-        const absl::flat_hash_map<std::string,
-                                  const HloInstruction*>* absl_nullable
-            content_overrides = nullptr);
+        const absl::flat_hash_map<std::string, const HloInstruction*>*
+            absl_nullable content_overrides = nullptr);
   };
 
-  GpuModuleGlobals(const std::vector<uint8_t>& binary,
+  GpuModuleGlobals(const se::ModuleBinary& binary,
                    const std::vector<ConstantInfo>& constants)
       : binary_(binary), constants_(constants) {}
 
@@ -70,7 +70,7 @@ class GpuModuleGlobals {
       se::Stream* stream);
 
  private:
-  const std::vector<uint8_t>& binary_;
+  const se::ModuleBinary& binary_;
   const std::vector<ConstantInfo>& constants_;
 
   absl::Mutex mutex_;

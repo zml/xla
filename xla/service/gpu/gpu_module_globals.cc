@@ -89,7 +89,7 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
 
   se::MultiModuleLoaderSpec module_spec;
   if (!binary_.empty()) {
-    module_spec.AddCudaCubinInMemory(binary_);
+    module_spec.AddModuleBinary(binary_.view());
   }
 
   auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();

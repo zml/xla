@@ -180,8 +180,27 @@ cc_library(
     name = "module_spec",
     hdrs = ["module_spec.h"],
     deps = [
+        ":module_binary",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+tf_proto_library(
+    name = "module_binary_proto",
+    srcs = ["module_binary.proto"],
+    make_default_target_header_only = True,
+)
+
+cc_library(
+    name = "module_binary",
+    srcs = ["module_binary.cc"],
+    hdrs = ["module_binary.h"],
+    deps = [
+        ":module_binary_proto_cc",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -866,6 +885,7 @@ cc_library(
         ":kernel_args",
         ":kernel_args_packing_spec",
         ":kernel_spec_proto_cc",
+        ":module_binary",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/functional:function_ref",
@@ -880,7 +900,10 @@ cc_library(
 tf_proto_library(
     name = "kernel_spec_proto",
     srcs = ["kernel_spec.proto"],
-    deps = [":kernel_args_packing_spec_proto"],
+    deps = [
+        ":kernel_args_packing_spec_proto",
+        ":module_binary_proto",
+    ],
 )
 
 xla_cc_test(

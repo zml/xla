@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
@@ -110,6 +111,12 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
 absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
     std::string kernel_name, uint64_t num_args,
     absl::Span<const uint8_t> cubin_data, se::StreamExecutor* stream_exec,
+    uint32_t shared_mem_bytes = 0, bool use_pdl = false);
+
+// Creates a kernel from a typed target module binary.
+absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
+    std::string kernel_name, uint64_t num_args,
+    se::ModuleBinaryView module_binary, se::StreamExecutor* stream_exec,
     uint32_t shared_mem_bytes = 0, bool use_pdl = false);
 
 // Runs loaded kernel on the stream with the provided arguments.
