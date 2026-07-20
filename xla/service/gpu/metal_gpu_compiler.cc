@@ -254,6 +254,19 @@ absl::Status RelaxFlashAttnKVLayout(HloModule* module) {
 // the first execute is a pure cache hit. Best-effort per op; dedups configs.
 // (GEMM kernels are already compiled at thunk-emit time, inside "Compiled all
 // models"; only their PSO load is lazy — a smaller residual left for later.)
+//
+// TODO: rework prewarming. This pass runs before thunk emission, so it has to
+// rediscover from the HLO what each thunk already knows, and that duplication is
+// the source of its problems: only five of the custom calls are covered because
+// the rest are too awkward to reconstruct here; the configs it derives can drift
+// from the thunk's; and the per-op dedup keys are hand-written, so they are
+// easy to under-specify (fa_seen keys on {is_prefill, kv_pos_stride} while the
+// warm also depends on n_kv and head_dim, so calls sharing a stride can collide
+// and leave the second one cold). Warming from the emitted thunks instead —
+// walking the ThunkSequence after RunBackend and asking each thunk to run its
+// own loader — needs none of that, and their loaders are already idempotent and
+// executor-keyed. An attempt at this made the plugin fail to load, so it needs
+// investigating rather than a straight port.
 void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
   absl::flat_hash_set<std::pair<bool, int64_t>> fa_seen;
   absl::flat_hash_set<std::tuple<int, int64_t, int64_t, int64_t>> paged_seen;
@@ -286,7 +299,7 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
         const int64_t kv_pos_stride = pos_major ? n_kv * hd : hd;
         if (fa_seen.insert({is_prefill, kv_pos_stride}).second) {
           MetalFlashAttnThunk::PrewarmPipeline(stream_exec, is_prefill,
-                                               kv_pos_stride, seqlen, hd);
+                                               kv_pos_stride, seqlen, hd, n_kv);
         }
       } else if (target == "zml$paged_attn") {
         if (instr->operand_count() != 6) continue;
