@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
@@ -123,12 +124,34 @@ absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
   ASSIGN_OR_RETURN(std::vector<uint8_t> cubin,
                    CompileToCubinImpl(std::move(kernel_source)));
 
-  ASSIGN_OR_RETURN(
-      CustomKernel custom_kernel,
-      kernel::CreateOwnedCubinCustomKernel(
+  auto create_custom_kernel = [&]() -> absl::StatusOr<CustomKernel> {
+    if (device_info_.gpu_compute_capability().IsVulkan()) {
+      std::vector<se::VulkanDescriptorBinding> descriptor_bindings;
+      descriptor_bindings.reserve(kernel_arguments.args().size());
+      for (auto [index, argument] :
+           llvm::enumerate(kernel_arguments.args())) {
+        if (argument.kind() != emitters::KernelArgument::Kind::kManaged) {
+          return absl::UnimplementedError(
+              "Vulkan kernels do not support scalar-by-value arguments.");
+        }
+        descriptor_bindings.push_back(se::VulkanDescriptorBinding{
+            /*descriptor_set=*/0,
+            /*binding=*/static_cast<uint32_t>(index),
+            /*argument_index=*/static_cast<uint32_t>(index),
+            /*slice_index=*/argument.slice_index(),
+            /*read_only=*/!argument.written()});
+      }
+      return kernel::CreateOwnedVulkanSpirvCustomKernel(
           sanitized_kernel_name, std::move(cubin),
-          kernel_arguments.args().size(), launch_dimensions.block_counts(),
-          launch_dimensions.thread_counts_per_block(), 0));
+          std::move(descriptor_bindings), launch_dimensions.block_counts(),
+          launch_dimensions.thread_counts_per_block(), 0);
+    }
+    return kernel::CreateOwnedCubinCustomKernel(
+        sanitized_kernel_name, std::move(cubin),
+        kernel_arguments.args().size(), launch_dimensions.block_counts(),
+        launch_dimensions.thread_counts_per_block(), 0);
+  };
+  ASSIGN_OR_RETURN(CustomKernel custom_kernel, create_custom_kernel());
 
   return std::make_unique<CustomKernelThunk>(
       thunk_info, std::move(custom_kernel), kernel_arguments);

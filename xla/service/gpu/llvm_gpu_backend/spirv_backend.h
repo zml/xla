@@ -72,6 +72,10 @@ absl::StatusOr<std::string> CompileToSPIRV(
     llvm::Module* module, stream_executor::GpuComputeCapability gpu_version,
     const DebugOptions& debug_options);
 
+absl::StatusOr<std::string> CompileToVulkanSPIRV(
+    llvm::Module* module, stream_executor::GpuComputeCapability gpu_version,
+    const DebugOptions& debug_options);
+
 std::vector<std::string> SPIRVExtensionsEnumToString(
     const llvm::ExtensionSet& enum_extensions);
 

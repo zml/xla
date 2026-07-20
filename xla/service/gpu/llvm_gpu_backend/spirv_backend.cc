@@ -20,6 +20,8 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/no_destructor.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
@@ -28,6 +30,7 @@ limitations under the License.
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
@@ -130,6 +133,108 @@ void ExpandSubByteBitReverse(llvm::Module* module) {
     call->replaceAllUsesWith(result);
     call->eraseFromParent();
   }
+}
+
+absl::Status ValidateVulkanModule(const llvm::Module& module) {
+  for (const llvm::Function& function : module) {
+    if (function.isDeclaration() &&
+        (function.getName().contains("__spirv_ocl_") ||
+         function.getName() == "_Z7barrierj")) {
+      return absl::UnimplementedError(absl::StrCat(
+          "OpenCL device function is not supported by the Vulkan backend: ",
+          function.getName().str()));
+    }
+  }
+  return absl::OkStatus();
+}
+
+llvm::GlobalVariable* CreateResourceName(llvm::Module* module,
+                                         llvm::StringRef kernel_name,
+                                         unsigned binding) {
+  std::string name = absl::StrCat(kernel_name.str(), ".binding.", binding);
+  llvm::Constant* initializer = llvm::ConstantDataArray::getString(
+      module->getContext(), name, /*AddNull=*/true);
+  return new llvm::GlobalVariable(
+      *module, initializer->getType(), /*isConstant=*/true,
+      llvm::GlobalValue::PrivateLinkage, initializer,
+      absl::StrCat(".vulkan.resource.", binding));
+}
+
+absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
+  llvm::LLVMContext& context = module->getContext();
+  llvm::SmallVector<llvm::Function*> entries;
+  for (llvm::Function& function : *module) {
+    if (!function.isDeclaration() && function.hasFnAttribute("hlsl.shader")) {
+      entries.push_back(&function);
+    }
+  }
+  if (entries.empty()) {
+    return absl::OkStatus();
+  }
+
+  for (llvm::Function* implementation : entries) {
+    const std::string entry_name = implementation->getName().str();
+    const std::string numthreads =
+        implementation->hasFnAttribute("hlsl.numthreads")
+            ? implementation->getFnAttribute("hlsl.numthreads")
+                  .getValueAsString()
+                  .str()
+            : "1,1,1";
+    for (llvm::Argument& argument : implementation->args()) {
+      auto* pointer_type = llvm::dyn_cast<llvm::PointerType>(argument.getType());
+      if (pointer_type == nullptr || pointer_type->getAddressSpace() != 11) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Vulkan entry point ", entry_name,
+            " has a non-storage-buffer argument; only managed buffer "
+            "arguments are supported"));
+      }
+    }
+
+    implementation->setName(absl::StrCat(entry_name, ".impl"));
+    implementation->setLinkage(llvm::GlobalValue::InternalLinkage);
+    implementation->addFnAttr(llvm::Attribute::AlwaysInline);
+    implementation->removeFnAttr("hlsl.shader");
+    implementation->removeFnAttr("hlsl.numthreads");
+
+    llvm::Function* entry = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
+        llvm::GlobalValue::ExternalLinkage, entry_name, module);
+    entry->setCallingConv(llvm::CallingConv::C);
+    entry->addFnAttr("hlsl.shader", "compute");
+    entry->addFnAttr("hlsl.numthreads", numthreads);
+
+    llvm::BasicBlock* block = llvm::BasicBlock::Create(context, "entry", entry);
+    llvm::IRBuilder<> builder(block);
+    llvm::SmallVector<llvm::Value*> arguments;
+    arguments.reserve(implementation->arg_size());
+    unsigned binding = 0;
+    for (llvm::Argument& argument : implementation->args()) {
+      const bool writable = !argument.hasAttribute(llvm::Attribute::ReadOnly);
+      llvm::Type* runtime_array = llvm::ArrayType::get(builder.getInt32Ty(), 0);
+      llvm::Type* resource_type = llvm::TargetExtType::get(
+          context, "spirv.VulkanBuffer", {runtime_array},
+          {12, writable ? 1U : 0U});
+      llvm::Function* get_handle = llvm::Intrinsic::getOrInsertDeclaration(
+          module, llvm::Intrinsic::spv_resource_handlefrombinding,
+          {resource_type});
+      llvm::GlobalVariable* resource_name =
+          CreateResourceName(module, entry_name, binding);
+      llvm::Value* handle = builder.CreateCall(
+          get_handle,
+          {builder.getInt32(0), builder.getInt32(binding), builder.getInt32(1),
+           builder.getInt32(0), resource_name});
+      llvm::PointerType* storage_buffer_pointer =
+          llvm::PointerType::get(context, 11);
+      llvm::Function* get_pointer = llvm::Intrinsic::getOrInsertDeclaration(
+          module, llvm::Intrinsic::spv_resource_getbasepointer,
+          {storage_buffer_pointer, resource_type});
+      arguments.push_back(builder.CreateCall(get_pointer, {handle}));
+      ++binding;
+    }
+    builder.CreateCall(implementation, arguments);
+    builder.CreateRetVoid();
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -282,6 +387,35 @@ absl::StatusOr<std::string> CompileToSPIRV(
     ir_builder.CreateRet(load);
   }
 
+  return EmitModuleToSPIRV(module, target_machine.get());
+}
+
+absl::StatusOr<std::string> CompileToVulkanSPIRV(
+    llvm::Module* module, stream_executor::GpuComputeCapability gpu_version,
+    const DebugOptions& debug_options) {
+  static absl::once_flag backend_init_flag;
+  absl::call_once(backend_init_flag, SPIRVBackendInit);
+  llvm_ir::LLVMCommandLineOptionsLock llvm_lock(
+      GetSPIRVBackendOptions(debug_options));
+
+  RETURN_IF_ERROR(ValidateVulkanModule(*module));
+  RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
+
+  llvm::Triple target_triple("spirv1.5-unknown-vulkan1.2-compute");
+  std::unique_ptr<llvm::TargetMachine> target_machine =
+      GetTargetMachine(target_triple, "", debug_options, "");
+  module->setTargetTriple(target_triple);
+  module->setDataLayout(target_machine->createDataLayout());
+
+  llvm::SPIRVTargetMachine* spirv_target =
+      static_cast<llvm::SPIRVTargetMachine*>(target_machine.get());
+  const_cast<llvm::SPIRVSubtarget*>(spirv_target->getSubtargetImpl())
+      ->initAvailableExtensions({});
+
+  RETURN_IF_ERROR(LinkAndOptimizeModule(
+      module, gpu_version, debug_options, "", SPIRVTargetModuleLinker,
+      target_triple, target_machine.get(), kDefaultInlineThreshold));
+  ExpandSubByteBitReverse(module);
   return EmitModuleToSPIRV(module, target_machine.get());
 }
 

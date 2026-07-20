@@ -36,6 +36,7 @@ limitations under the License.
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
+#include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -464,6 +465,44 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
     llvm_intrinsic_or_function = gpu_intrinsic_id.nvptx_intrinsic_or_function;
   } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.amdgpu_intrinsic_or_function;
+  } else if (target_triple.getOS() == llvm::Triple::Vulkan) {
+    llvm::Intrinsic::ID intrinsic;
+    switch (intrinsic_id) {
+      case TargetIntrinsicID::kThreadIdx:
+      case TargetIntrinsicID::kThreadIdy:
+      case TargetIntrinsicID::kThreadIdz:
+        intrinsic = llvm::Intrinsic::spv_thread_id_in_group;
+        break;
+      case TargetIntrinsicID::kBlockIdx:
+      case TargetIntrinsicID::kBlockIdy:
+      case TargetIntrinsicID::kBlockIdz:
+        intrinsic = llvm::Intrinsic::spv_group_id;
+        break;
+      case TargetIntrinsicID::kBlockDimx:
+      case TargetIntrinsicID::kBlockDimy:
+      case TargetIntrinsicID::kBlockDimz:
+        intrinsic = llvm::Intrinsic::spv_workgroup_size;
+        break;
+      case TargetIntrinsicID::kBarrierId:
+      case TargetIntrinsicID::kGroupBarrierId:
+        intrinsic =
+            llvm::Intrinsic::spv_group_memory_barrier_with_group_sync;
+        return b->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+            module, intrinsic));
+    }
+    int dimension = 0;
+    if (intrinsic_id == TargetIntrinsicID::kThreadIdy ||
+        intrinsic_id == TargetIntrinsicID::kBlockIdy ||
+        intrinsic_id == TargetIntrinsicID::kBlockDimy) {
+      dimension = 1;
+    } else if (intrinsic_id == TargetIntrinsicID::kThreadIdz ||
+               intrinsic_id == TargetIntrinsicID::kBlockIdz ||
+               intrinsic_id == TargetIntrinsicID::kBlockDimz) {
+      dimension = 2;
+    }
+    llvm::Function* function = llvm::Intrinsic::getOrInsertDeclaration(
+        module, intrinsic, {b->getInt64Ty()});
+    return b->CreateCall(function, {b->getInt32(dimension)});
   } else if (target_triple.isSPIROrSPIRV()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.spir_intrinsic_or_function;
   } else {
@@ -494,6 +533,9 @@ void AnnotateFunctionAsGpuKernel(llvm::Module* module, llvm::Function* func,
     // Attach information so AMDGPU can recognize function as a AMDGPU kernel.
     func->setCallingConv(llvm::CallingConv::AMDGPU_KERNEL);
     func->addFnAttr("uniform-work-group-size", "true");
+  } else if (target_triple.getOS() == llvm::Triple::Vulkan) {
+    func->setCallingConv(llvm::CallingConv::C);
+    func->addFnAttr("hlsl.shader", "compute");
   } else if (target_triple.isSPIROrSPIRV()) {
     // Attach information so that it can be recognized as a SPIR kernel.
     func->setCallingConv(llvm::CallingConv::SPIR_KERNEL);

@@ -748,8 +748,10 @@ void AppendGlobalConstant(llvm::Module* module, int64_t num_elements,
   }();
 
   // Explicitly set global addrspace for SPIR-V backend.
-  int addrspace =
-      llvm::Triple(module->getTargetTriple()).isSPIROrSPIRV() ? 1 : 0;
+  llvm::Triple target_triple(module->getTargetTriple());
+  int addrspace = target_triple.getOS() == llvm::Triple::Vulkan
+                      ? 10
+                      : (target_triple.isSPIROrSPIRV() ? 1 : 0);
   // These globals will be looked up by name by GpuExecutable so we need to
   // give them an external linkage.  Not all of their uses are visible in
   // the LLVM IR so we can't give then a linkage that merely preserves their

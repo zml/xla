@@ -38,6 +38,17 @@ limitations under the License.
 
 namespace stream_executor {
 
+std::string VulkanComputeCapability::ToString() const {
+  return absl::StrCat("Vulkan ", api_version_major_, ".", api_version_minor_);
+}
+
+VulkanComputeCapabilityProto VulkanComputeCapability::ToProto() const {
+  VulkanComputeCapabilityProto proto;
+  proto.set_api_version_major(api_version_major_);
+  proto.set_api_version_minor(api_version_minor_);
+  return proto;
+}
+
 ExecutionUnitDescriptionProto ExecutionUnitDescription::ToProto() const {
   ExecutionUnitDescriptionProto proto;
   for (const auto& [type, info] : tsl::KeySortedRange(rate_infos_)) {
@@ -120,6 +131,10 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
     device_description.gpu_compute_capability_ =
         OneAPIComputeCapability(proto.oneapi_compute_capability());
   }
+  if (proto.has_vulkan_compute_capability()) {
+    device_description.gpu_compute_capability_ =
+        VulkanComputeCapability(proto.vulkan_compute_capability());
+  }
   device_description.core_count_ = proto.core_count();
   device_description.fpus_per_core_ = proto.fpus_per_core();
 
@@ -176,6 +191,9 @@ GpuDeviceInfoProto DeviceDescription::ToProto() const {
   }
   if (auto* ptr = gpu_compute_capability_.oneapi_compute_capability()) {
     *proto.mutable_oneapi_compute_capability() = ptr->ToProto();
+  }
+  if (auto* ptr = gpu_compute_capability_.vulkan_compute_capability()) {
+    *proto.mutable_vulkan_compute_capability() = ptr->ToProto();
   }
 
   proto.set_device_vendor(device_vendor_);
@@ -362,6 +380,13 @@ OneAPIComputeCapability DeviceDescription::oneapi_compute_capability() const {
   return OneAPIComputeCapability{};
 }
 
+VulkanComputeCapability DeviceDescription::vulkan_compute_capability() const {
+  if (auto* ptr = gpu_compute_capability_.vulkan_compute_capability()) {
+    return *ptr;
+  }
+  return VulkanComputeCapability{};
+}
+
 bool ThreadDimOk(const DeviceDescription& device_description,
                  const ThreadDim& thread_dim) {
   const int64_t total_threads = thread_dim.x * thread_dim.y * thread_dim.z;
@@ -402,9 +427,12 @@ GpuComputeCapabilityProto GpuComputeCapability::ToProto() const {
   } else if (IsOneAPI()) {
     *proto.mutable_oneapi_compute_capability() =
         oneapi_compute_capability()->ToProto();
-  } else {
+  } else if (IsRocm()) {
     *proto.mutable_rocm_compute_capability() =
         rocm_compute_capability()->ToProto();
+  } else {
+    *proto.mutable_vulkan_compute_capability() =
+        vulkan_compute_capability()->ToProto();
   }
   return proto;
 }
@@ -426,6 +454,12 @@ absl::StatusOr<GpuComputeCapability> GpuComputeCapability::FromProto(
   if (proto.has_oneapi_compute_capability()) {
     return GpuComputeCapability(
         OneAPIComputeCapability::FromProto(proto.oneapi_compute_capability()));
+  }
+
+
+  if (proto.has_vulkan_compute_capability()) {
+    return GpuComputeCapability(
+        VulkanComputeCapability(proto.vulkan_compute_capability()));
   }
 
   return absl::InvalidArgumentError(

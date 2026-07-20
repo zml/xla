@@ -87,6 +87,26 @@ struct OwningCudaCubinInMemory {
   std::vector<uint8_t> cubin_bytes;
 };
 
+struct VulkanDescriptorBinding {
+  uint32_t descriptor_set;
+  uint32_t binding;
+  uint32_t argument_index;
+  int64_t slice_index;
+  bool read_only;
+};
+
+struct VulkanSpirvInMemory {
+  absl::Span<const uint8_t> spirv_bytes;
+  VulkanSpirvProto::TargetEnvironment target_environment;
+  absl::Span<const VulkanDescriptorBinding> descriptor_bindings;
+};
+
+struct OwningVulkanSpirvInMemory {
+  std::vector<uint8_t> spirv_bytes;
+  VulkanSpirvProto::TargetEnvironment target_environment;
+  std::vector<VulkanDescriptorBinding> descriptor_bindings;
+};
+
 // Describes how to load a kernel on any subset of a number of target platforms.
 class KernelLoaderSpec {
  public:
@@ -120,6 +140,10 @@ class KernelLoaderSpec {
     return std::holds_alternative<CudaPtxInMemory>(payload_) ||
            std::holds_alternative<OwningCudaPtxInMemory>(payload_);
   }
+  bool has_vulkan_spirv_in_memory() const {
+    return std::holds_alternative<VulkanSpirvInMemory>(payload_) ||
+           std::holds_alternative<OwningVulkanSpirvInMemory>(payload_);
+  }
 
   // Accessors for platform variant kernel load specifications.
   std::optional<InProcessSymbol> in_process_symbol() const {
@@ -150,6 +174,20 @@ class KernelLoaderSpec {
     return std::nullopt;
   }
 
+  std::optional<VulkanSpirvInMemory> vulkan_spirv_in_memory() const {
+    if (std::holds_alternative<VulkanSpirvInMemory>(payload_)) {
+      return std::get<VulkanSpirvInMemory>(payload_);
+    }
+    if (std::holds_alternative<OwningVulkanSpirvInMemory>(payload_)) {
+      const OwningVulkanSpirvInMemory& payload =
+          std::get<OwningVulkanSpirvInMemory>(payload_);
+      return VulkanSpirvInMemory{payload.spirv_bytes,
+                                 payload.target_environment,
+                                 payload.descriptor_bindings};
+    }
+    return std::nullopt;
+  }
+
   // Use these factory functions to create a spec of any supported type.
   //
   // Note that the kernel_name parameter must be consistent with the kernel in
@@ -174,6 +212,12 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateOwningCudaPtxInMemorySpec(
       std::string ptx, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateOwningVulkanSpirvInMemorySpec(
+      std::vector<uint8_t> spirv_bytes,
+      VulkanSpirvProto::TargetEnvironment target_environment,
+      std::vector<VulkanDescriptorBinding> descriptor_bindings,
+      std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
 
   void set_kernel_args_packing(KernelArgsPacking kernel_args_packing) {
     kernel_args_packing_ = std::move(kernel_args_packing);
@@ -197,7 +241,8 @@ class KernelLoaderSpec {
  private:
   using Payload =
       std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory>;
+                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
+                   VulkanSpirvInMemory, OwningVulkanSpirvInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

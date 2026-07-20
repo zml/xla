@@ -94,4 +94,19 @@ absl::StatusOr<CustomKernel> CreateOwnedCubinCustomKernel(
                       thread_dim, shared_memory_bytes);
 }
 
+absl::StatusOr<CustomKernel> CreateOwnedVulkanSpirvCustomKernel(
+    std::string kernel_name, std::vector<uint8_t> spirv,
+    std::vector<se::VulkanDescriptorBinding> descriptor_bindings,
+    se::BlockDim block_dim, se::ThreadDim thread_dim,
+    size_t shared_memory_bytes) {
+  const int arity = descriptor_bindings.size();
+  se::KernelLoaderSpec kernel_spec =
+      se::KernelLoaderSpec::CreateOwningVulkanSpirvInMemorySpec(
+          std::move(spirv), se::VulkanSpirvProto::VULKAN_1_2,
+          std::move(descriptor_bindings), kernel_name, arity,
+          IdentityPackingSpec(arity));
+  return CustomKernel(std::move(kernel_name), std::move(kernel_spec), block_dim,
+                      thread_dim, shared_memory_bytes);
+}
+
 }  // namespace xla::gpu::kernel

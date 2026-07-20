@@ -12,6 +12,31 @@ message CudaCubinProto {
   bytes data = 1;
 }
 
+message VulkanSpirvProto {
+  enum TargetEnvironment {
+    TARGET_ENVIRONMENT_UNSPECIFIED = 0;
+    VULKAN_1_2 = 1;
+  }
+
+  enum DescriptorAccess {
+    DESCRIPTOR_ACCESS_UNSPECIFIED = 0;
+    READ_ONLY = 1;
+    READ_WRITE = 2;
+  }
+
+  message DescriptorBinding {
+    uint32 descriptor_set = 1;
+    uint32 binding = 2;
+    uint32 argument_index = 3;
+    int64 slice_index = 4;
+    DescriptorAccess access = 5;
+  }
+
+  bytes data = 1;
+  TargetEnvironment target_environment = 2;
+  repeated DescriptorBinding descriptor_bindings = 3;
+}
+
 message InProcessSymbolProto {
   string persistent_name = 1;
 }
@@ -21,6 +46,7 @@ message KernelLoaderSpecProto {
     CudaPtxProto ptx = 1;
     CudaCubinProto cubin = 2;
     InProcessSymbolProto in_process_symbol = 6;
+    VulkanSpirvProto vulkan_spirv = 7;
   }
 
   int32 arity = 3;

@@ -58,6 +58,9 @@ class DeviceSpec {
   bool IsIntelGpu() const {
     return IsGpu() && gpu().gpu_compute_capability().IsOneAPI();
   }
+  bool IsVulkan() const {
+    return IsGpu() && gpu().gpu_compute_capability().IsVulkan();
+  }
 
  private:
   DeviceSpecType type_;

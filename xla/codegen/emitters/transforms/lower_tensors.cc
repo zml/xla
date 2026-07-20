@@ -207,7 +207,8 @@ class RewriteFunctionSignatures : public OpRewritePattern<mlir::func::FuncOp> {
         auto cast = UnrealizedConversionCastOp::create(
             rewriter, op.getLoc(), operand, op.getArgument(index));
         op.getArgument(index).replaceAllUsesExcept(cast.getResult(0), cast);
-        operand = ml::LLVMPointerType::get(op.getContext());
+        operand = ml::LLVMPointerType::get(
+            op.getContext(), device_spec_.IsVulkan() ? 11 : 0);
       }
     }
 
@@ -375,7 +376,10 @@ ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
     // Elements are packed.
     num_elements = CeilOfRatio<int64_t>(num_elements, 8 / *sub_byte_width);
   }
-  auto ptr = ml::LLVMPointerType::get(b.getContext());
+  Value backing_ptr = GetPtr(tensor);
+  auto ptr = backing_ptr
+                 ? mlir::cast<ml::LLVMPointerType>(backing_ptr.getType())
+                 : ml::LLVMPointerType::get(b.getContext());
   auto tensor_ptr =
       UnrealizedConversionCastOp::create(b, ptr, tensor).getResult(0);
   mlir::LLVMTypeConverter converter(b.getContext());
@@ -1413,6 +1417,20 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
     }
 
     MLIRContext* mlir_context = &getContext();
+
+    // Vulkan tensor accesses must observe the storage-buffer address space.
+    // Rewrite the ABI first so that GetPtr() can propagate it into GEPs.
+    if (device_spec_.IsVulkan()) {
+      mlir::RewritePatternSet signature_patterns(mlir_context);
+      signature_patterns.add<RewriteFunctionSignatures>(mlir_context,
+                                                        device_spec_);
+      if (mlir::failed(mlir::applyPatternsGreedily(
+              getOperation(), std::move(signature_patterns)))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     mlir::RewritePatternSet tensor_patterns(mlir_context);
 
     tensor_patterns.add<RewriteAtomicRMW>(mlir_context, device_spec_);
