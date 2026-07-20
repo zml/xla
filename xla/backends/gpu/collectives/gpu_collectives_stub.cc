@@ -21,3 +21,5 @@ limitations under the License.
 
 XLA_COLLECTIVES_REGISTER("gpu", "stub", 1,
                          std::make_unique<xla::gpu::GpuCollectivesStub>());
+XLA_COLLECTIVES_REGISTER("VULKAN", "stub", 1,
+                         std::make_unique<xla::gpu::GpuCollectivesStub>());
