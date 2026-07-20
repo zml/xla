@@ -37,6 +37,8 @@ namespace gpu {
 // experts). Dispatches by weight dtype:
 //
 //   bf16     -> custom/bf16_moe_gemv.metal        (__metal$moe_gemm)
+//   f8e4m3fn -> custom/fp8_moe_gemv.metal         (__metal$moe_gemm$f8)
+//               + steel fp8_gather_qmm_rhs (prefill)
 //   f4e2m1   -> MLX nvfp4_gather_qmv              (__metal$moe_gemm$f4)
 //               (mlx_fp4_qmv.h; same metallib as dense nvfp4_qmv)
 //
@@ -45,6 +47,8 @@ namespace gpu {
 //
 // Operand contracts (positional):
 //   bf16:  {x[R,K] bf16, w[E,N,K] bf16, expert_id[R] s32} -> out[R,N] bf16
+//   fp8:   {x[R,K] bf16, w[E,N,K] f8e4m3fn, scale[E,N/128,K/128] bf16,
+//           expert_id[R] s32} -> out[R,N] bf16
 //   nvfp4: {x[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
 //           expert_id[R] s32, w_global_scale[E] f32 (optional)}
 //           -> out[R,N] bf16
@@ -56,9 +60,12 @@ namespace gpu {
 //            Absent: no buffer is bound and the kernels are unchanged.)
 //
 // Dispatch (MLX GatherQMM-aligned for NVFP4):
-//   small R / decode: per-row GEMV (nvfp4_gather_qmv / bf16_moe_gemv)
+//   small R / decode: per-row GEMV (nvfp4_gather_qmv / fp8_moe_gemv /
+//                     bf16_moe_gemv)
 //   large R prefill:  sort-by-expert + Steel gather
 //     - bf16:     R >= 1024
+//     - fp8:      always per-row fp8_moe_gemv for now (steel fp8_gather_qmm_rhs
+//                 sorted path temporarily disabled until golden-checked)
 //     - nvfp4:    R >= 16 && R/E >= 4 (MLX gather_qmm_rhs gate; for E=128 this
 //                 is R >= 512 — prefill, not continuous-batch decode)
 //     - all sorted paths require 1 <= E <= 256 (moe_argsort bucket capacity);

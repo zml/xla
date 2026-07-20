@@ -15,8 +15,9 @@
 // mlx/backend/metal/kernels/fp_quantized.metal:4-6. fp_quantized.h, its fourth,
 // is deliberately NOT included: this bundle does not use upstream's q-GEMM
 // impls (ours take a different ABI and are templated on our own loaders), and
-// pulling it in would put a same-named fp_qmm_t_impl into the overload set for
-// no gain. What the first three give us is what this file actually needs:
+// pulling it in would put a same-named fp_qmm_t_impl / fp_gather_qmm_rhs_impl
+// into the overload set for no gain. What the first three give us is what this
+// file actually needs:
 //   * utils.h + steel/gemm/gemm.h -- the Steel machinery (BlockLoader, BlockMMA,
 //     BaseMMAFrag/MMATile, TransformNone, integral_constant, complex64_t). This
 //     is the 2,653-line span the flattened bundle carried, which was byte-
@@ -31,10 +32,10 @@
 // (a rename-fork) and the dequantize_scale_mx / DequantizeMx pair.
 //
 // This bundle ships the dense block-FP8 path Qwen3.6-27B-FP8 decodes on
-// (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk) and the NVFP4 MoE path
-// gemma-4-26B-A4B-NVFP4 decodes on (nvfp4_gather_qmm_rhs via MetalMoeGemvThunk).
-// Both are golden-gated; see the commit. Note the MoE gather kernels are bf16
-// and nvfp4 only -- there is no fp8 MoE anything, here or in ZML.
+// (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk), the MoE block-FP8 gather path
+// (fp8_gather_qmm_rhs via MetalMoeGemvThunk / __metal$moe_gemm$f8), and the
+// NVFP4 MoE path gemma-4-26B-A4B-NVFP4 decodes on (nvfp4_gather_qmm_rhs via
+// MetalMoeGemvThunk). Dense + MoE FP8 share Fp8BlockLoader.
 //
 // NOTE: this bundle is a standalone TU compiled by CompileMetalSourceToMetallib.
 // It is a .h rather than a .metal only to match the family's convention -- the
@@ -355,6 +356,204 @@ METAL_FUNC void fp_qmm_t_impl(
 // byte-identical to it (diff-zero against quantized_utils.h:6-EOF).
 ///////////////////////////////////////////////////////////////////////////////
 
+// fp_gather_qmm_rhs_impl — MoE gather q-GEMM (transpose=true). Adapted from
+// MLX's fp_gather_qmm_rhs: QuantizedBlockLoader -> Fp8BlockLoader; the
+// per-expert scale stride stride_s = N * K_g becomes the 2-D block form
+// (N/128) * (K/128), the expert base is index * stride_s, and the per-N-tile
+// base advance scales += y_col * K_g becomes scales += (y_col/128) * (K/128).
+// `scales` is bf16 (const device T*).
+///////////////////////////////////////////////////////////////////////////////
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool transpose>
+METAL_FUNC void fp_gather_qmm_rhs_impl(
+    const device T* x,
+    const device uchar* w,
+    const device T* scales,
+    const device uint32_t* indices,
+    device T* y,
+    const int M,
+    const int N,
+    const int K,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int BN_padded = (BN + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      transpose,
+      BK_padded,
+      transpose ? BK_padded : BN_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = Fp8BlockLoader<
+      T,
+      transpose ? BN : BK,
+      transpose ? BK : BN,
+      transpose ? BK_padded : BN_padded,
+      transpose,
+      WM * WN * SIMD_SIZE>;
+
+  // Compute the block. Weights are f8 (pack_factor == 1) so K_w == K, N_w == N.
+  // The scale tensor is [E, N/128, K/128] bf16; per-expert stride and per-tile
+  // base are in *blocks*.
+  const int K_g = K / group_size;
+  const int N_g = N / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = transpose ? size_t(N) * K : size_t(K) * N;
+  const size_t stride_s = transpose ? size_t(N_g) * K_g : size_t(K) * N_g;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const size_t y_row_long = size_t(y_row);
+  const size_t y_col_long = size_t(y_col);
+
+  // Prepare threadgroup bounds
+  const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
+  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+
+  // Calculate the final tiles in the case that K is not aligned
+  const int k_remain = K - K_it * BK;
+  const short2 tile_x = short2(k_remain, tgp_bm);
+  const short2 tile_w =
+      transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+  // Move x and output to the correct block
+  auto wl = (const device uchar*)w;
+  x += y_row_long * K;
+  y += y_row_long * N + y_col_long;
+  wl += transpose ? y_col_long * K : y_col;
+  scales += transpose ? (y_col_long / group_size) * K_g : (y_col / group_size);
+
+  // Do as many matmuls as necessary
+  uint32_t index;
+  short offset;
+  uint32_t index_next = indices[y_row];
+  short offset_next = 0;
+  int n = 0;
+  while (n < tgp_bm) {
+    n++;
+    offset = offset_next;
+    index = index_next;
+    offset_next = tgp_bm;
+    for (; n < tgp_bm; n++) {
+      if (indices[y_row + n] != index) {
+        offset_next = n;
+        index_next = indices[y_row + n];
+        break;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Prepare threadgroup mma operation
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+
+    // Prepare threadgroup loading operations
+    thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+    thread loader_w_t loader_w(
+        wl + index * stride_w,
+        scales + index * stride_s,
+        transpose ? K : N,
+        Ws,
+        simd_group_id,
+        simd_lane_id);
+
+    // Matrices are all aligned check nothing
+    if (align_M && align_N) {
+      gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+      if (!align_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+      }
+
+      // Store results to device memory
+      if (offset_next - offset == BM) {
+        mma_op.store_result(y, N);
+      } else {
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
+      }
+    } else {
+      // Tile aligned so check outside of the hot loop
+      if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
+        gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(
+              Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+
+        // Store results to device memory
+        if (offset_next - offset == BM) {
+          mma_op.store_result(y, N);
+        } else {
+          mma_op.store_result_slice(
+              y, N, short2(0, offset), short2(BN, offset_next));
+        }
+      }
+
+      // Tile partially aligned check rows
+      else if (align_N || tgp_bn == BN) {
+        gemm_loop_unaligned<false, true, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(
+              Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
+      }
+
+      // Tile partially aligned check cols
+      else if (align_M || tgp_bm == BM) {
+        gemm_loop_unaligned<true, false, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(
+              Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
+      }
+
+      // Nothing aligned so check both rows and cols
+      else {
+        gemm_loop_unaligned<false, false, transpose>(
+            Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
+        if (!align_K) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          gemm_loop_finalize(
+              Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
+        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
+      }
+    }
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
+
 ///////////////////////////////////////////////////////////////////////////////
 // NVFP4 tiled q-GEMM (prefill) -- the 1-D group-scale family.
 //
@@ -380,8 +579,8 @@ METAL_FUNC void fp_qmm_t_impl(
 // and the names collided; it is NOT a fork. Each body is upstream's, and each
 // keeps only the float conversion this file uses.
 // TODO: these become plain deletions the day this TU can include fp_quantized.h
-// -- i.e. once our fp_qmm_t_impl is either renamed off upstream's name or
-// replaced by upstream's own, via the ScaleDecoder seam.
+// -- i.e. once our fp_qmm_t_impl / fp_gather_qmm_rhs_impl are either renamed off
+// upstream's names or replaced by upstream's own, via the ScaleDecoder seam.
 struct mlx_fp8_e4m3 {
   operator float() {
     uint16_t v = (bits & 127) << 7;
@@ -1363,9 +1562,48 @@ kernel void fp8_qmm_t_pc_bm64(
       w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 
+// MoE gather variant (transpose=true): each output row r selects expert
+// indices[r]; out[r,n] = sum_k x[r,k] * dequant(w[indices[r], n, k]).
+//   x:       bfloat [R, K]              row-major
+//   w:       uchar  [E, N, K]           f8e4m3fn, flat row-major
+//   scale:   bfloat [E, N/128, K/128]   bf16, flat (one per 128x128 block)
+//   indices: uint32 [R]                 expert index per output row
+//   y:       bfloat [R, N]              row-major
+//   mnk = {R, N, K}
+// Tiles BM=16, BN=32, BK=32, WM=1, WN=2 (=> 64 threads).
+kernel void fp8_gather_qmm_rhs(
+    device const bfloat* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device const uint* indices [[buffer(3)]],
+    device bfloat* y [[buffer(4)]],
+    constant int4& mnk [[buffer(5)]],  // {R, N, K, _}
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sl [[thread_index_in_simdgroup]]) {
+  constexpr int BM = 16;
+  constexpr int BN = 32;
+  constexpr int BK = 32;
+  constexpr int WM = 1;
+  constexpr int WN = 2;
+  constexpr bool transpose = true;
+  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
+  constexpr int BN_padded = (BN + 16 / sizeof(bfloat));
+
+  threadgroup bfloat Xs[BM * BK_padded];
+  threadgroup bfloat Ws[transpose ? BN * BK_padded : BK * BN_padded];
+
+  const int R = max(mnk.x, 0);
+  const int N = mnk.y;
+  const int K = mnk.z;
+
+  fp_gather_qmm_rhs_impl<bfloat, 128, 8, BM, BN, BK, WM, WN, transpose>(
+      x, w, scale, indices, y, R, N, K, Xs, Ws, tid, sg, sl);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
-// bf16 (un-quantized) MoE gather variant: bf16 twin of the nvfp4 gather q-GEMM
-// with no scales at all. The weight loader is the plain bf16 mlx::steel
+// bf16 (un-quantized) MoE gather variant: bf16 twin of fp_gather_qmm_rhs_impl
+// with no block scales. The weight loader is the plain bf16 mlx::steel
 // BlockLoader (the W-tile analogue of the X loader); the sort/gather/store
 // machinery is identical.
 ///////////////////////////////////////////////////////////////////////////////

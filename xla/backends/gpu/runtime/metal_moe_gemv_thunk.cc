@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
@@ -28,6 +29,7 @@ limitations under the License.
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
 #include "xla/service/gpu/metal_kernels/bf16_moe_gemv.h"
+#include "xla/service/gpu/metal_kernels/fp8_moe_gemv.h"
 #include "xla/service/gpu/metal_kernels/mlx_kernels.h"
 #include "xla/service/gpu/metal_kernels/moe_argsort.h"
 #include "xla/service/gpu/metal_kernels/permute_rows.h"
@@ -144,13 +146,14 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   auto next = std::make_shared<LoadedState>(executor);
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
   using FC = se::metal::MetalFunctionConstant;
+  const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
   const bool is_nvfp4 = (w_shape_.element_type() == F4E2M1FN);
 
   // Large R: sort by expert + Steel gather (weight reuse). Match MLX
   // GatherQMM::eval_gpu gather_qmm_rhs gate: M==1 && B>=16 && right_sorted &&
   // B/E >= 4. After we sort, right_sorted holds; with flat routes B=R so
   // R >= 16 && R/E >= 4. For Gemma4 E=128 that is R>=512 (prefill), not
-  // decode bs=16 (R=128) which MLX keeps on gather_qmv.
+  // decode bs=16 (R=128) which MLX keeps on gather_qmv. bf16/fp8 use R>=1024.
   const int64_t num_experts = w_shape_.dimensions(0);
   if (num_experts <= 0) {
     return absl::InvalidArgumentError(
@@ -169,16 +172,36 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
         absl::StrCat("__metal$moe_gemm: expected s8[", expected_workspace_bytes,
                      "] workspace; got ", workspace_shape_.ToString(), "."));
   }
+  // FP8 MoE: always use the per-row x-caching GEMV (fp8_moe_gemv). The steel
+  // sorted gather (fp8_gather_qmm_rhs) is the prefill path for R>=1024, and is
+  // the only new surface vs dense zml$scaled_matmul; with a silent async
+  // poison + no TF log (HLO is clean: no unfused f8 convert), keep the simpler
+  // kernel until that path is golden-checked. Workspace may still be allocated
+  // by the HLO planner for large R; it is unused when sorted_path is false.
   next->sorted_path =
-      ShouldUseMetalMoeSortedPath(r_, num_experts, k_, n_, is_nvfp4);
+      !is_fp8 && ShouldUseMetalMoeSortedPath(r_, num_experts, k_, n_, is_nvfp4);
+  if (is_fp8) {
+    LOG(INFO) << "__metal$moe_gemm$f8 EnsureLoaded: R=" << r_ << " K=" << k_
+              << " N=" << n_ << " E=" << num_experts
+              << " path=fp8_moe_gemv (sorted_steel disabled)";
+  }
 
   // Decode / small-R path: load only the selected per-row GEMV pipeline. A
   // sorted executable never launches it, so compiling it would add cold-start
   // cost and couple the sorted path to an unrelated kernel failure.
   if (!next->sorted_path) {
-    // nvfp4: MLX nvfp4_gather_qmv from the MLX fp4 qmv bundle; bf16: custom
+    // nvfp4: MLX nvfp4_gather_qmv from the MLX fp4 qmv bundle; fp8/bf16: custom
     // x-caching GEMV.
-    if (is_nvfp4) {
+    if (is_fp8) {
+      TF_ASSIGN_OR_RETURN(
+          std::vector<uint8_t> lib,
+          CompileMetalSourceToMetallibCached(get_fp8_moe_gemv()));
+      TF_ASSIGN_OR_RETURN(
+          next->kernel, metal_exec->LoadKernelWithConstants(lib, "fp8_moe_gemv",
+                                                            /*arity=*/6, {}));
+      LOG(INFO) << "__metal$moe_gemm$f8: loaded fp8_moe_gemv metallib ("
+                << lib.size() << " bytes)";
+    } else if (is_nvfp4) {
       TF_ASSIGN_OR_RETURN(
           std::vector<uint8_t> lib,
           CompileMetalSourceToMetallibCached(get_mlx_fp4_qmv()));
@@ -209,8 +232,8 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   }
 
   // Steel gather q-GEMM for sorted path:
-  //   nvfp4: nvfp4_gather_qmm_rhs (x,w,scale,indices,y,mnk; e4m3 scales,
-  //                                packed f4 w)
+  //   fp8:   fp8_gather_qmm_rhs   (x,w,scale,indices,y,mnk)
+  //   nvfp4: nvfp4_gather_qmm_rhs (same arity; e4m3 scales, packed f4 w)
   //   bf16:  bf16_gather_mm_rhs   (no scale)
   // align_M must stay false: the Steel row bound is what keeps a partial final
   // BM tile from reading idx_sorted past R. BN=BK=32 for align_N/K.
@@ -223,7 +246,11 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   TF_ASSIGN_OR_RETURN(
       std::vector<uint8_t> steel_lib,
       CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
-  if (is_nvfp4) {
+  if (is_fp8) {
+    TF_ASSIGN_OR_RETURN(next->kernel_steel,
+                        metal_exec->LoadKernelWithConstants(
+                            steel_lib, "fp8_gather_qmm_rhs", /*arity=*/6, fc));
+  } else if (is_nvfp4) {
     // Function constant 440 (moe_has_global_scale) gates the trailing f32[E]
     // global-scale buffer, as for the GEMV above -- the same id, because it is
     // the same logical constant. Only the nvfp4 entry references it.
@@ -287,11 +314,20 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   std::shared_ptr<const LoadedState> state;
   {
     absl::MutexLock lock(&mu_);
-    TF_ASSIGN_OR_RETURN(state, EnsureLoaded(executor));
+    absl::StatusOr<std::shared_ptr<const LoadedState>> loaded =
+        EnsureLoaded(executor);
+    if (!loaded.ok()) {
+      LOG(ERROR) << "__metal$moe_gemm EnsureLoaded failed: " << loaded.status()
+                 << " w=" << w_shape_.ToString() << " R=" << r_ << " K=" << k_
+                 << " N=" << n_;
+      return loaded.status();
+    }
+    state = *std::move(loaded);
   }
 
+  const bool is_fp8 = (w_shape_.element_type() == F8E4M3FN);
   const bool is_nvfp4 = (w_shape_.element_type() == F4E2M1FN);
-  const bool has_scale = is_nvfp4;
+  const bool has_scale = is_fp8 || is_nvfp4;
   const se::DeviceAddressBase output = allocs.GetDeviceAddress(out_);
 
   // ---- Sorted-prefill path: sort rows by expert, then the MLX gather q-GEMM
@@ -388,7 +424,7 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   // ---- Small-R path: per-row GEMV.
   // NVFP4: MLX gather_qmv launch — group_dims (32, 2, 1), grid (R, ceil(N/8))
   // (MLX uses (M, ceil(N/8), B) with M=1,B=R; we fold B into grid.x).
-  // bf16: 256-thread x-cache variant (TN=8, grid (ceil(N/8), R)).
+  // fp8/bf16: 256-thread x-cache variant (TN=8, grid (ceil(N/8), R)).
   constexpr int64_t kMoeGemvTN = 8;
   // Positional bind order == the kernel's [[buffer(N)]] order:
   // x=0, w=1, scale=2, expert_id=3, out=4, dims=5, w_global_scale=6.
@@ -425,7 +461,8 @@ Thunk::BufferUses MetalMoeGemvThunk::buffer_uses() const {
       BufferUse::Read(x_, x_shape_),
       BufferUse::Read(w_, w_shape_),
   };
-  if (w_shape_.element_type() == F4E2M1FN) {
+  if (w_shape_.element_type() == F8E4M3FN ||
+      w_shape_.element_type() == F4E2M1FN) {
     uses.push_back(BufferUse::Read(scale_, scale_shape_));
   }
   uses.push_back(BufferUse::Read(expert_id_, expert_id_shape_));

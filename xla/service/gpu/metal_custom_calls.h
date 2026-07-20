@@ -122,13 +122,21 @@ inline bool IsMetalGemm(const HloInstruction& hlo) {
 // dense GEMMs above, these are *model-emitted only* -- MoE top-k routing has no
 // dot for GemmRewriter to match, so the model selects experts and emits the call
 // directly (like zml$gdn). Output row r is computed against expert weights
-// w[expert_id[r]]. ThunkEmitter routes both flavors to MetalMoeGemvThunk.
-//
-// There is deliberately no fp8 flavor. A __metal$moe_gemm$f8 target and a
-// 128x128 block-dequantizing kernel existed here, with no emitter in any repo in
-// any commit; the MoE producer is zml/moe/metal.zig, whose QuantMode is
-// enum { none, nvfp4 } and whose Backend.auto rejects f8e4m3fn for .metal
-// outright. Adding fp8 MoE means adding the ZML emitter first.
+// w[expert_id[r]]. ThunkEmitter routes all three flavors to MetalMoeGemvThunk.
+
+// FP8 (DeepSeek-style 128x128 block-scaled) flavor of the grouped MoE GEMV:
+//   {x_rows[R,K] bf16, w[E,N,K] f8e4m3fn, scale[E,N/128,K/128] bf16,
+//    expert_id[R] s32} -> out[R,N] bf16
+// Decode: custom/fp8_moe_gemv.metal (x-caching TN=8). Prefill: steel
+// fp8_gather_qmm_rhs (sorted by expert when R >= 1024). Shares Fp8BlockLoader
+// with the dense fp8_qmm_t family. K and N must be multiples of 128.
+inline constexpr absl::string_view kMetalMoeGemmF8CallTarget =
+    "__metal$moe_gemm$f8";
+
+inline bool IsMetalMoeGemm(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kMetalMoeGemmF8CallTarget;
+}
 
 // NVFP4 flavor of the grouped MoE GEMV: f4e2m1 weights + e4m3 group-16 scales.
 //   {x_rows[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
@@ -165,9 +173,10 @@ inline bool IsMetalMoeGemmBf16(const HloInstruction& hlo) {
          hlo.custom_call_target() == kMetalMoeGemmCallTarget;
 }
 
-// Either of the two MoE GEMM custom-call targets (bf16 / nvfp4).
+// Any of the three MoE GEMM custom-call targets (bf16 / fp8 / nvfp4).
 inline bool IsMetalMoeGemmAny(const HloInstruction& hlo) {
-  return IsMetalMoeGemmF4(hlo) || IsMetalMoeGemmBf16(hlo);
+  return IsMetalMoeGemm(hlo) || IsMetalMoeGemmF4(hlo) ||
+         IsMetalMoeGemmBf16(hlo);
 }
 
 // A native keyed stable sort on Apple Metal. Generic Sort has no lowerable

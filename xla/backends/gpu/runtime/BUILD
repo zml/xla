@@ -5651,6 +5651,7 @@ cc_library(
         "//xla/service/gpu:buffer_allocations",
         "//xla/service/gpu:metal_air_toolchain",
         "//xla/service/gpu/metal_kernels:bf16_moe_gemv",
+        "//xla/service/gpu/metal_kernels:fp8_moe_gemv",
         "//xla/service/gpu/metal_kernels:mlx_kernels",
         "//xla/service/gpu/metal_kernels:moe_argsort",
         "//xla/service/gpu/metal_kernels:permute_rows",

@@ -1486,12 +1486,15 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     const HloCustomCallInstruction* instr) {
-  // Two flavors share one thunk:
+  // Three flavors share one thunk:
+  //   fp8:   {x, w_f8, scale, expert_id}
   //   nvfp4: {x, w_f4, scale, expert_id, w_global_scale?}
   //   bf16:  {x, w, expert_id}
+  const bool is_fp8 =
+      instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
   const bool is_nvfp4 =
       instr->custom_call_target() == kMetalMoeGemmF4CallTarget;
-  const bool has_scale = is_nvfp4;
+  const bool has_scale = is_fp8 || is_nvfp4;
   const int64_t expected_operands = has_scale ? 4 : 3;
   // nvfp4 only: an optional trailing f32[E] per-expert global scale, folded
   // into the weight group scale by the kernels.
@@ -1565,22 +1568,30 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     return absl::UnimplementedError(
         "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
   }
-  // bf16 uses four-wide vector loads. NVFP4 only requires group-16 K: its
-  // QMV/Steel kernels and sorted row copies all have scalar-safe N tails.
+  // FP8 needs 128x128 block-scale and bf16 uses four-wide vector loads.
+  // NVFP4 only requires group-16 K: its QMV/Steel kernels and sorted row
+  // copies all have scalar-safe N tails.
   if (is_nvfp4 && k % 16 != 0) {
     return absl::UnimplementedError(
         "metal MoE GEMV: K must be multiple of 16 "
         "(nvfp4 group-16; N supports scalar tails).");
   }
-  if (!is_nvfp4 && (k % 4 != 0 || n % 4 != 0)) {
-    return absl::UnimplementedError(
-        "metal MoE GEMV: K and N must be multiples of 4 "
-        "(bf16 vectorized load).");
+  const int64_t k_block = is_fp8 ? 128 : 4;
+  const int64_t n_block = is_fp8 ? 128 : 4;
+  if (!is_nvfp4 && (k % k_block != 0 || n % n_block != 0)) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metal MoE GEMV: K must be multiple of ", k_block, ", N of ", n_block,
+        is_fp8 ? " (fp8 block-scale)." : " (bf16 vectorized load)."));
   }
-  const PrimitiveType expected_w = is_nvfp4 ? F4E2M1FN : BF16;
+  const PrimitiveType expected_w =
+      is_fp8 ? F8E4M3FN : (is_nvfp4 ? F4E2M1FN : BF16);
   if (w_shape.element_type() != expected_w) {
     return absl::UnimplementedError(absl::StrCat(
-        "metal MoE GEMV: w must be ", is_nvfp4 ? "f4e2m1" : "bf16", "."));
+        "metal MoE GEMV: w must be ",
+        is_fp8     ? "f8e4m3fn"
+        : is_nvfp4 ? "f4e2m1"
+                   : "bf16",
+        "."));
   }
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
@@ -1599,10 +1610,25 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
         "]; got s8[", workspace_bytes, "]."));
   }
 
-  // Scale operand: nvfp4 = [E, N, K/16] f8e4m3fn.
+  // Scale operand: fp8 = [E, N/128, K/128] bf16; nvfp4 = [E, N, K/16] f8e4m3fn.
   BufferAllocation::Slice scale;
   Shape scale_shape;
-  if (is_nvfp4) {
+  if (is_fp8) {
+    scale_shape = instr->operand(2)->shape();
+    if (scale_shape.dimensions().size() != 3 ||
+        scale_shape.dimensions(0) != e ||
+        scale_shape.dimensions(1) != n / 128 ||
+        scale_shape.dimensions(2) != k / 128) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: fp8 scale must be [E, N/128, K/128].");
+    }
+    if (scale_shape.element_type() != BF16) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: fp8 scale must be bf16.");
+    }
+    TF_ASSIGN_OR_RETURN(scale,
+                        GetAllocationSliceForHlo(instr->operand(2), {}));
+  } else if (is_nvfp4) {
     scale_shape = instr->operand(2)->shape();
     if (scale_shape.dimensions().size() != 3 ||
         scale_shape.dimensions(0) != e || scale_shape.dimensions(1) != n ||

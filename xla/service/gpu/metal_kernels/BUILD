@@ -182,18 +182,27 @@ embed_files(
 )
 
 # NOTE: the MLX Steel tiled block-FP8 GEMM lives in mlx_entries/mlx_steel_qgemm.h
-# (dense fp8_qmm_t entries; MLX's simdgroup_matrix Steel q-GEMM with the dequant
-# swapped to our 128x128-block f8e4m3fn scheme). The MoE gather entries in that
-# same bundle are bf16 and nvfp4 only -- fp8 MoE has no ZML emitter. It is
+# (entries fp8_qmm_t dense + fp8_gather_qmm_rhs MoE; MLX's simdgroup_matrix Steel
+# q-GEMM with the dequant swapped to our 128x128-block f8e4m3fn scheme). It is
 # embedded by the :mlx_kernels glob above (mlx_entries/*.h) as
 # get_mlx_steel_qgemm() -- do NOT add a second embed target for it (duplicate
 # symbol). Thunks depend on :mlx_kernels and call get_mlx_steel_qgemm().
+
+# --- Custom grouped FP8 (block-scaled) GEMV for MoE experts ------------------
+# Generates get_fp8_moe_gemv(). Same block-scaled f8 decode as fp8_gemv, but
+# each output row indexes its own expert weight matrix (expert_id[r]) -- the
+# per-expert GEMM for top-k mixture-of-experts decode/prefill.
+embed_files(
+    name = "fp8_moe_gemv",
+    srcs = ["custom/fp8_moe_gemv.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
 # --- Custom grouped bf16 GEMV for MoE experts --------------------------------
 # Generates get_bf16_moe_gemv(). Each output row indexes its own expert weight
 # matrix (expert_id[r]) -- the per-expert GEMM for top-k mixture-of-experts
 # decode/prefill. bf16 weights, no block scales (e.g. LFM2). The NVFP4 flavor is
-# MLX's nvfp4_gather_qmv in :mlx_kernels; there is no fp8 flavor.
+# MLX's nvfp4_gather_qmv in :mlx_kernels; the fp8 flavor is :fp8_moe_gemv.
 embed_files(
     name = "bf16_moe_gemv",
     srcs = ["custom/bf16_moe_gemv.metal"],
