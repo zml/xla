@@ -318,6 +318,7 @@ cc_library(
         ":memory_allocation",
         ":memory_allocator",
         ":memory_space",
+        ":module_binary",
         ":module_spec",
         ":platform",
         ":stream",

@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/kernel_spec.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
 #include "xla/tsl/platform/status_matchers.h"
@@ -135,6 +136,60 @@ TEST_F(SyclExecutorTest, GetSyclKernel) {
 
   EXPECT_THAT(sycl_executor->GetSyclKernel(nullptr),
               StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(SyclExecutorTest, CompileAndLoadLevelZeroNativeModule) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      Platform * platform,
+      stream_executor::PlatformManager::PlatformWithId(kSyclPlatformId));
+  TF_ASSERT_OK_AND_ASSIGN(StreamExecutor * executor,
+                          platform->ExecutorForDevice(kDefaultDeviceOrdinal));
+
+  xla::HloModuleConfig config;
+  config.set_debug_options(GetDebugOptionsForTest());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> hlo_module,
+                          xla::ParseAndReturnUnverifiedModule(R"(
+        ENTRY e {
+          p0 = u32[4] parameter(0)
+          c1 = u32[4] constant(1)
+          ROOT res = u32[4] add(p0, c1)
+        })",
+                                                              config));
+  TF_ASSERT_OK_AND_ASSIGN(
+      hlo_module, compiler()->RunHloPasses(std::move(hlo_module), executor,
+                                           /*device_allocator=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::Executable> exec,
+      compiler()->RunBackend(std::move(hlo_module), executor,
+                             /*device_allocator=*/nullptr));
+  auto* gpu_exec = static_cast<xla::gpu::GpuExecutable*>(exec.get());
+  ASSERT_NE(gpu_exec, nullptr);
+  ASSERT_EQ(gpu_exec->module_binary().format, ModuleFormat::kSpirv);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      ModuleBinary native,
+      executor->CompileModuleToNative(gpu_exec->module_binary().view()));
+  EXPECT_EQ(native.format, ModuleFormat::kLevelZeroNative);
+  EXPECT_THAT(native.bytes, Not(IsEmpty()));
+  TF_ASSERT_OK_AND_ASSIGN(std::string compatibility_key,
+                          executor->GetModuleCompatibilityKey());
+  EXPECT_EQ(native.compatibility_key, compatibility_key);
+
+  MultiModuleLoaderSpec module_spec;
+  module_spec.AddModuleBinary(native.view());
+  TF_ASSERT_OK_AND_ASSIGN(ModuleHandle module_handle,
+                          executor->LoadModule(module_spec));
+  for (const auto& const_info : gpu_exec->constants()) {
+    EXPECT_THAT(executor->GetSymbol(const_info.symbol_name, module_handle),
+                IsOk());
+  }
+  EXPECT_TRUE(executor->UnloadModule(module_handle));
+
+  native.compatibility_key.append("-incompatible");
+  MultiModuleLoaderSpec incompatible_spec;
+  incompatible_spec.AddModuleBinary(native.view());
+  EXPECT_THAT(executor->LoadModule(incompatible_spec),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
 TEST_F(SyclExecutorTest, CreateUnifiedMemoryAllocatorWorks) {

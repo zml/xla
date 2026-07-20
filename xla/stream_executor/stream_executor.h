@@ -45,6 +45,7 @@ limitations under the License.
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_allocator.h"
 #include "xla/stream_executor/memory_space.h"
+#include "xla/stream_executor/module_binary.h"
 #include "xla/stream_executor/module_spec.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
@@ -159,6 +160,21 @@ class StreamExecutor {
   virtual absl::StatusOr<ModuleHandle> LoadModule(
       const MultiModuleLoaderSpec& spec) {
     return absl::UnimplementedError("Not Implemented");
+  }
+
+  // Compiles a portable module to the native format accepted by this
+  // executor. The returned compatibility key must be checked when the native
+  // module is loaded by a different executor.
+  virtual absl::StatusOr<ModuleBinary> CompileModuleToNative(
+      ModuleBinaryView module_binary) {
+    return absl::UnimplementedError("Native module compilation not supported");
+  }
+
+  // Returns a stable description of the device and driver ABI that native
+  // modules produced by this executor are compatible with.
+  virtual absl::StatusOr<std::string> GetModuleCompatibilityKey() const {
+    return absl::UnimplementedError(
+        "Native module compatibility keys not supported");
   }
 
   // Creates a shared constant using the content provided.
