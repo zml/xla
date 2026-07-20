@@ -721,7 +721,8 @@ cc_library(
     alwayslink = 1,
 )
 
-# PJRT GPU plugin. Can be configured to be built for CUDA or ROCM.
+# PJRT GPU plugin. Can be configured to be built for CUDA, ROCM, or SYCL and
+# includes Vulkan loader/device discovery registration.
 xla_cc_binary(
     name = "pjrt_c_api_gpu_plugin.so",
     additional_linker_inputs = [
@@ -741,6 +742,7 @@ xla_cc_binary(
     deps = [
         ":pjrt_c_api_gpu",
         "//xla/service:gpu_plugin",
+        "//xla/stream_executor/vulkan:vulkan_platform",
     ] + if_cuda_is_configured([
         "//xla/stream_executor:cuda_platform",
     ]) + if_rocm_is_configured([
@@ -748,6 +750,13 @@ xla_cc_binary(
     ]) + if_sycl_is_configured([
         "//xla/stream_executor:sycl_platform",
     ]),
+)
+
+# Keep the platform-neutral Bazel label usable while retaining the conventional
+# shared-library filename for the produced artifact.
+alias(
+    name = "pjrt_c_api_gpu_plugin",
+    actual = ":pjrt_c_api_gpu_plugin.so",
 )
 
 cc_library(
