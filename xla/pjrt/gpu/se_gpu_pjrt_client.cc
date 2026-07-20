@@ -115,6 +115,7 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -1330,6 +1331,8 @@ GetStreamExecutorGpuDeviceAllocator(
         addressable_devices) {
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
   const DebugOptions& debug_options = xla::GetDebugOptionsFromFlags();
+  const bool supports_collective_memory =
+      platform->id() != stream_executor::vulkan::kVulkanPlatformId;
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
   if (debug_options.xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
@@ -1367,7 +1370,7 @@ GetStreamExecutorGpuDeviceAllocator(
       // collective (upper end) memory, so no separate collective allocator is
       // created. Otherwise, use the separate collective allocator below.
       shared_collective_pool =
-          allocator_config.preallocate &&
+          supports_collective_memory && allocator_config.preallocate &&
           debug_options.xla_gpu_enable_allocator_spatial_partitioning();
       for (const auto& ordinal_and_device : addressable_devices) {
         ASSIGN_OR_RETURN(
@@ -1466,7 +1469,7 @@ GetStreamExecutorGpuDeviceAllocator(
   // Add a separate collective allocator unless the default BFC allocator
   // already serves collective memory from its shared, spatially partitioned
   // pool.
-  if (!shared_collective_pool) {
+  if (supports_collective_memory && !shared_collective_pool) {
     for (const auto& ordinal_and_device : addressable_devices) {
       ASSIGN_OR_RETURN(
           auto collective_bfc_allocator,
@@ -1874,12 +1877,14 @@ StreamExecutorGpuHbmMemorySpace::StreamExecutorGpuHbmMemorySpace(
 absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
     const GpuClientOptions& options) {
 #if TENSORFLOW_USE_ROCM
-  auto pjrt_platform_name = xla::RocmName();
+  const char* default_pjrt_platform_name = xla::RocmName();
 #elif TENSORFLOW_USE_SYCL
-  auto pjrt_platform_name = xla::OneapiName();
+  const char* default_pjrt_platform_name = xla::OneapiName();
 #else   // TENSORFLOW_USE_ROCM
-  auto pjrt_platform_name = xla::CudaName();
+  const char* default_pjrt_platform_name = xla::CudaName();
 #endif  // TENSORFLOW_USE_ROCM
+  std::string pjrt_platform_name =
+      options.platform_name.value_or(default_pjrt_platform_name);
 
   bool use_async_dispatch = false;
   if (options.use_async_dispatch.has_value()) {
@@ -1898,8 +1903,12 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   EnablePeerAccess(xla_client->backend().stream_executors());
 
   GpuAllocatorConfig allocator_config = options.allocator_config;
-  auto memory_registration =
-      CreateAllocatorMemoryRegistration(&allocator_config);
+  std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration;
+  if (xla_client->platform()->id() !=
+      stream_executor::vulkan::kVulkanPlatformId) {
+    memory_registration =
+        CreateAllocatorMemoryRegistration(&allocator_config);
+  }
 
   ASSIGN_OR_RETURN(auto allocator,
                    GetStreamExecutorGpuDeviceAllocator(

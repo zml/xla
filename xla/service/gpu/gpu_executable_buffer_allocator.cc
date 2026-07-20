@@ -96,7 +96,7 @@ absl::Status CheckAlignment(const BufferAllocation& allocation,
 // Resolve GpuCollectives instance that we should use for the run.
 // TODO(ezhulenev): We have almost identical method in `collective_params.cc`,
 // this one has to be removed.
-GpuCollectives* ResolveGpuCollectives(
+absl::StatusOr<GpuCollectives*> ResolveGpuCollectives(
     const ServiceExecutableRunOptions* run_options,
     const DebugOptions* debug_options) {
   auto* gpu_options = run_options->run_options().gpu_executable_run_options();
@@ -109,15 +109,17 @@ GpuCollectives* ResolveGpuCollectives(
 
   if (debug_options &&
       !debug_options->xla_gpu_collectives_implementation().empty()) {
-    absl::StatusOr<Collectives*> collectives = CollectivesRegistry::Get(
-        platform_name, debug_options->xla_gpu_collectives_implementation());
-    CHECK_OK(collectives)  // Crash OK
-        << "Failed to get GPU collectives implementation: "
-        << debug_options->xla_gpu_collectives_implementation();
-    return absl::down_cast<GpuCollectives*>(*collectives);
+    ASSIGN_OR_RETURN(
+        Collectives * collectives,
+        CollectivesRegistry::Get(
+            platform_name,
+            debug_options->xla_gpu_collectives_implementation()));
+    return absl::down_cast<GpuCollectives*>(collectives);
   }
 
-  return GpuCollectives::Default(platform_name);
+  ASSIGN_OR_RETURN(Collectives * collectives,
+                   CollectivesRegistry::Default(platform_name));
+  return absl::down_cast<GpuCollectives*>(collectives);
 }
 
 }  // namespace
@@ -199,14 +201,23 @@ GpuExecutableBufferAllocator::ExecutionScope::GenerateBufferAllocations(
       tsl::profiler::TraceMeLevel::kInfo);
 
   absl::flat_hash_map<LogicalBuffer::Color, int64_t> allocate_granularity;
-  if (auto* collectives =
-          ResolveGpuCollectives(run_options, owner_->debug_options_)) {
+  static constexpr int64_t kCollectiveMemoryColor = 1;
+  bool has_collective_allocation = false;
+  for (const BufferAllocation* allocation : owner_->allocations_) {
+    if (allocation->color() == kCollectiveMemoryColor) {
+      has_collective_allocation = true;
+      break;
+    }
+  }
+  if (has_collective_allocation) {
+    ASSIGN_OR_RETURN(
+        GpuCollectives * collectives,
+        ResolveGpuCollectives(run_options, owner_->debug_options_));
     // BFC allocator ignores memory alignment and always allocates 256 byte
     // aligned buffers, however for collective memory underlying libraries
     // require larger alignment. We conservatively round up all allocation
     // sizes to the alignment requirement. Proper fix must be done in BFC
     // allocator and all the other allocator adaptors that we have in XLA.
-    static constexpr int64_t kCollectiveMemoryColor = 1;
     allocate_granularity[kCollectiveMemoryColor] =
         collectives->SymmetricMemoryAlignment();
   }

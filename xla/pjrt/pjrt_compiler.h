@@ -67,6 +67,10 @@ inline const char* OneapiName() {
   static constexpr char kOneapiName[] = "oneapi";
   return kOneapiName;
 }
+inline const char* VulkanName() {
+  static constexpr char kVulkanName[] = "vulkan";
+  return kVulkanName;
+}
 // Temporarily keep SyclName() as there are references to it in Tensorflow.
 // TODO(intel-tf): Remove this function once Tensorflow is updated to use
 // OneapiName() instead of SyclName()
@@ -90,6 +94,10 @@ inline PjRtPlatformId RocmId() {
 inline PjRtPlatformId OneapiId() {
   static const PjRtPlatformId kOneapiId = tsl::Fingerprint64(OneapiName());
   return kOneapiId;
+}
+inline PjRtPlatformId VulkanId() {
+  static const PjRtPlatformId kVulkanId = tsl::Fingerprint64(VulkanName());
+  return kVulkanId;
 }
 
 // Temporarily keep SyclId() as there are references to it in Jaxlib.

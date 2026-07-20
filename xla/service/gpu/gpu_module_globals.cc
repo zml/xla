@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/stream_executor/scoped_module_handle.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/util.h"
 
@@ -96,11 +97,18 @@ GpuModuleGlobals::Resolve(se::Stream* stream) {
 
   auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
   se::ModuleHandle module_handle;
+  // Vulkan kernels load their SPIR-V through KernelLoaderSpec. There is no
+  // separate module to load when the executable has no constant globals.
+  const bool skip_vulkan_module =
+      executor->GetPlatform()->id() == se::vulkan::kVulkanPlatformId &&
+      constants_.empty();
   // The CUDA driver isn't able to load a PTX and a binary which are both empty.
-  // It's okay if we skip loading in this case; if the module isn't loaded, all
-  // symbol lookups will fail, just as they should for an empty module.
-  if (!(executor->GetPlatform()->id() == se::cuda::kCudaPlatformId &&
-        binary_.empty())) {
+  // It's okay if we skip loading in these cases; without constants there are
+  // no symbols to resolve from the omitted module.
+  const bool skip_empty_cuda_module =
+      executor->GetPlatform()->id() == se::cuda::kCudaPlatformId &&
+      binary_.empty();
+  if (!skip_vulkan_module && !skip_empty_cuda_module) {
     ASSIGN_OR_RETURN(module_handle, executor->LoadModule(module_spec));
   }
 

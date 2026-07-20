@@ -21,30 +21,33 @@ limitations under the License.
 
 #include "absl/status/statusor.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/executor_cache.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
 
 namespace stream_executor::vulkan {
 
-// Vulkan platform entry in StreamExecutor's global PlatformManager registry.
-// Device discovery and executor construction are added in later milestones.
 class VulkanPlatform final : public Platform {
  public:
   VulkanPlatform();
+  ~VulkanPlatform() override = default;
 
-  PlatformId id() const override;
+  Platform::Id id() const override;
   const std::string& Name() const override;
   int VisibleDeviceCount() const override;
   absl::StatusOr<std::unique_ptr<DeviceDescription>> DescriptionForDevice(
       int ordinal) const override;
   absl::StatusOr<StreamExecutor*> ExecutorForDevice(int ordinal) override;
+  absl::StatusOr<StreamExecutor*> FindExisting(int ordinal) override;
 
  private:
+  absl::StatusOr<std::unique_ptr<StreamExecutor>> GetUncachedExecutor(
+      int ordinal);
+
   std::string name_;
+  ExecutorCache executor_cache_;
 };
 
 }  // namespace stream_executor::vulkan
 
 #endif  // XLA_STREAM_EXECUTOR_VULKAN_VULKAN_PLATFORM_H_
-
-
