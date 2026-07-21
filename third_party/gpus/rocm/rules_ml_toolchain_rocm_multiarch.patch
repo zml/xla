@@ -1,0 +1,19 @@
+diff --git a/gpu/rocm/rocm_redist.bzl b/gpu/rocm/rocm_redist.bzl
+index 7b53bb2..8f7de61 100644
+--- a/gpu/rocm/rocm_redist.bzl
++++ b/gpu/rocm/rocm_redist.bzl
+@@ -16,4 +16,14 @@
+ rocm_redist = {
++    "rocm_7.14.0_multiarch": struct(
++        packages = [
++            {
++                "url": "https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-multiarch-7.14.0.tar.gz",
++                "sha256": "",
++            },
++        ],
++        required_softlinks = [],
++        rocm_root = "",
++    ),
+     "rocm_7.12.0_gfx94X": struct(
+         packages = [
+             {

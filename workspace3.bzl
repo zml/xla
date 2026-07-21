@@ -52,6 +52,7 @@ def workspace():
         name = "rules_ml_toolchain",
         sha256 = "40963e4bc262dfa9a43146f610140af0068b023ace8f3c50f1705a7b50de0830",
         strip_prefix = "rules_ml_toolchain-cad1047facbac4fb3c1124da68bf2cb36c7eb9ac",
+        patch_file = ["//third_party/gpus/rocm:rules_ml_toolchain_rocm_multiarch.patch"],
         urls = tf_mirror_urls(
             "https://github.com/google-ml-infra/rules_ml_toolchain/archive/cad1047facbac4fb3c1124da68bf2cb36c7eb9ac.tar.gz",
         ),

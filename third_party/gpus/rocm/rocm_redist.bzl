@@ -1,4 +1,14 @@
 rocm_redist = {
+    "rocm_7.14.0_multiarch": struct(
+        packages = [
+             {
+                "url": "https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-multiarch-7.14.0.tar.gz",
+                "sha256": "",
+            },
+        ],
+        required_softlinks = [],
+        rocm_root = "",
+    ),
     "rocm_7.10.0_gfx90X": struct(
         packages = [
             {
