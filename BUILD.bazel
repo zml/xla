@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_license//rules:license.bzl", "license")
 
 package(
@@ -11,6 +12,18 @@ license(
     name = "license",
     package_name = "xla",
     license_kinds = ["@rules_license//licenses/spdx:Apache-2.0"],
+)
+
+bool_flag(
+    name = "rocm_hrx",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "rocm_hrx_enabled",
+    flag_values = {
+        ":rocm_hrx": "True",
+    },
 )
 
 filegroup(

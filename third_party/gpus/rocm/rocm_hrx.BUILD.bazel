@@ -1,0 +1,13 @@
+exports_files(
+    ["hrx/libamdhip64.so.7"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "hrx_runtime",
+    srcs = [
+        "hrx/libamdhip64.so.7",
+        "hrx/libhrx.so.0",
+    ],
+    visibility = ["//visibility:public"],
+)

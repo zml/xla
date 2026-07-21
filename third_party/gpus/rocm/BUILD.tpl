@@ -143,15 +143,27 @@ alias(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "hip_runtime_data",
+    srcs = select({
+        "@xla//:rocm_hrx_enabled": [
+            "@rocm_hrx//:hrx_runtime",
+        ],
+        "//conditions:default": glob([
+            "%{rocm_root}/lib/libamdhip64.so*",
+        ]),
+    }) + glob([
+        "%{rocm_root}/lib/librocm_kpack.so*",
+    ]),
+)
+
 rocm_lib_import(
     name = "hip_runtime",
-    data = glob(
-        [
-            "%{rocm_root}/lib/libamdhip64.so*",
-            "%{rocm_root}/lib/librocm_kpack.so*",
-        ],
-    ),
-    interface_library = "%{rocm_root}/lib/libamdhip64.so",
+    data = [":hip_runtime_data"],
+    interface_library = select({
+        "@xla//:rocm_hrx_enabled": "@rocm_hrx//:hrx/libamdhip64.so.7",
+        "//conditions:default": "%{rocm_root}/lib/libamdhip64.so",
+    }),
     deps = [
         ":amd_comgr_libs",
         ":hiprtc_libs",

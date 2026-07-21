@@ -298,6 +298,9 @@ common:rocm_ci_hermetic --repo_env=TF_ROCM_AMDGPU_TARGETS="gfx908,gfx90a"
 common:rocm_ci_hermetic --repo_env=ROCM_DISTRO_VERSION="rocm_7.12.0_gfx90X"
 common:rocm_ci_hermetic --@local_config_rocm//rocm:rocm_path_type=hermetic
 
+common:rocm_hrx --config=rocm_ci_hermetic
+common:rocm_hrx --//:rocm_hrx=true
+
 # This config option is used for SYCL as GPU backend.
 # SYCL Configuration (non-hermetic)
 common:sycl --@rules_ml_toolchain//common:enable_sycl=True

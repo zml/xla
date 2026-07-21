@@ -2,6 +2,7 @@
 
 load("@bazel_features//:deps.bzl", "bazel_features_deps")
 load("@bazel_skylib//lib:versions.bzl", "versions")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("@bazel_tools//tools/build_defs/repo:java.bzl", "java_import_external")
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load("@io_bazel_rules_closure//closure:defs.bzl", "filegroup_external")
@@ -144,6 +145,12 @@ def _tf_toolchains():
     cc_download_clang_toolchain(name = "local_config_download_clang")
     tensorrt_configure(name = "local_config_tensorrt")
     python_configure(name = "local_config_python")
+    http_archive(
+        name = "rocm_hrx",
+        build_file = "//third_party/gpus/rocm:rocm_hrx.BUILD.bazel",
+        sha256 = "f00c2aec515b494fee891acaffaad43b93584c331f550ce19716735922f1c526",
+        urls = ["https://github.com/zml/hrx-system/releases/download/v0.2/hrx-rocm-linux-amd64.tar.gz"],
+    )
     hipcc_configure(name = "config_rocm_hipcc")  # Must be before rocm_configure.
     rocm_configure(
         name = "local_config_rocm",
