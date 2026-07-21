@@ -16,18 +16,23 @@ limitations under the License.
 #include "xla/service/gpu/metal_include_root.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "absl/base/call_once.h"
+#if defined(__APPLE__)
+#include <unistd.h>  // confstr, _CS_DARWIN_USER_CACHE_DIR
+#endif
+
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tsl/platform/fingerprint.h"
 #include "xla/service/gpu/metal_kernels/mlx_include_tree.h"
@@ -74,10 +79,41 @@ std::string TempDir() {
   return "/tmp";
 }
 
-// Writes the tree under `staging` and publishes it at `root` with one rename(2).
-absl::Status MaterializeTree(const std::string& staging,
-                             const std::string& root) {
-  tsl::Env* env = tsl::Env::Default();
+// The parent directory the content-addressed tree is materialized under.
+//
+// On macOS this is the per-user *cache* directory (_CS_DARWIN_USER_CACHE_DIR,
+// .../C/), NOT the per-user *temp* directory (.../T/, i.e. $TMPDIR). They live
+// on the same volume, but the OS prunes idle files from the temp directory by
+// access time after a few days while leaving the directory tree behind -- which
+// silently guts our include tree out from under a long-lived process (the Metal
+// compiler then fails to open a pruned header). The cache directory is not
+// reaped that way. Fall back to $TMPDIR / /tmp where the cache dir is
+// unavailable; TreeIsComplete() below still makes a reaped tree self-heal there.
+std::string CacheParentDir() {
+#if defined(__APPLE__)
+  char buf[1024];
+  const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
+  if (n > 0 && n <= sizeof(buf)) {
+    absl::string_view dir(buf, n - 1);  // n counts the terminating NUL.
+    while (dir.size() > 1 && dir.back() == '/') dir.remove_suffix(1);
+    if (!dir.empty()) return std::string(dir);
+  }
+#endif
+  return TempDir();
+}
+
+// A tree is only usable if every embedded file is actually on disk. Checking the
+// directory alone is not enough: a reaper (or an interrupted materialize) can
+// leave the directory skeleton with its files deleted.
+bool TreeIsComplete(const std::string& root, tsl::Env* env) {
+  for (const EmbeddedFile& f : SortedTree()) {
+    if (!env->FileExists(absl::StrCat(root, "/", f.path)).ok()) return false;
+  }
+  return true;
+}
+
+// Writes the whole tree under `staging` (files + parent dirs), no publish.
+absl::Status WriteTreeInto(const std::string& staging, tsl::Env* env) {
   for (const EmbeddedFile& f : SortedTree()) {
     const std::string path = absl::StrCat(staging, "/", f.path);
     const std::string::size_type slash = path.find_last_of('/');
@@ -86,36 +122,46 @@ absl::Status MaterializeTree(const std::string& staging,
     }
     TF_RETURN_IF_ERROR(tsl::WriteStringToFile(env, path, f.contents));
   }
-  // Atomic publish. ENOTEMPTY/EEXIST means another process finished first --
-  // its tree hashes to the same name, so its bytes are ours, and the loser just
-  // drops its staging copy.
-  if (std::rename(staging.c_str(), root.c_str()) != 0) {
-    if (!env->FileExists(root).ok()) {
-      return absl::InternalError(absl::StrFormat(
-          "Could not publish the Metal include tree at %s.", root));
-    }
-    int64_t undeleted_files, undeleted_dirs;
-    env->DeleteRecursively(staging, &undeleted_files, &undeleted_dirs)
-        .IgnoreError();
-  }
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> MaterializeOnce() {
-  const std::string root =
-      absl::StrCat(TempDir(), "/xla-metal-inc-", MetalIncludeTreeHash());
+absl::StatusOr<std::string> EnsureMaterialized() {
   tsl::Env* env = tsl::Env::Default();
-  // Content-addressed: an existing directory of this name already holds exactly
-  // these bytes, so a bumped pin can never be served a stale tree.
-  if (env->FileExists(root).ok()) return root;
+  const std::string root =
+      absl::StrCat(CacheParentDir(), "/xla-metal-inc-", MetalIncludeTreeHash());
 
+  // Content-addressed: a complete directory of this name already holds exactly
+  // these bytes. We verify every file is present, not merely the directory, so a
+  // partial tree (reaper, interrupted write) is never served.
+  if (TreeIsComplete(root, env)) return root;
+
+  // Build a complete tree in a private staging directory.
   std::string staging;
   if (!env->LocalTempFilename(&staging)) {
     return absl::InternalError(
         "Could not create a Metal include tree staging path.");
   }
-  TF_RETURN_IF_ERROR(MaterializeTree(staging, root));
-  return root;
+  TF_RETURN_IF_ERROR(WriteTreeInto(staging, env));
+
+  // Clear a stale partial tree occupying `root` so the rename can land. We only
+  // reach here when `root` is incomplete, so this cannot delete a complete tree
+  // another process depends on.
+  if (env->FileExists(root).ok()) {
+    int64_t undeleted_files, undeleted_dirs;
+    env->DeleteRecursively(root, &undeleted_files, &undeleted_dirs)
+        .IgnoreError();
+  }
+  // Atomic publish. On failure the loser adopts the winner's identical tree.
+  if (std::rename(staging.c_str(), root.c_str()) == 0) return root;
+  if (TreeIsComplete(root, env)) {
+    int64_t undeleted_files, undeleted_dirs;
+    env->DeleteRecursively(staging, &undeleted_files, &undeleted_dirs)
+        .IgnoreError();
+    return root;
+  }
+  // The publish lost a race and `root` is still not complete; use our own
+  // complete staging copy so this process can compile regardless.
+  return staging;
 }
 
 }  // namespace
@@ -126,11 +172,13 @@ absl::string_view MetalIncludeTreeHash() {
 }
 
 absl::StatusOr<std::string> MetalIncludeRoot() {
-  static absl::once_flag once;
-  static absl::StatusOr<std::string>* const kRoot =
-      new absl::StatusOr<std::string>();
-  absl::call_once(once, [] { *kRoot = MaterializeOnce(); });
-  return *kRoot;
+  // Re-validate on every call (they occur only on a metallib cache miss): a
+  // first-call result cannot be trusted for the life of a long-running process,
+  // since the tree could have been pruned since. EnsureMaterialized() is cheap
+  // when the tree is already intact.
+  static absl::Mutex* const mu = new absl::Mutex();
+  absl::MutexLock lock(mu);
+  return EnsureMaterialized();
 }
 
 }  // namespace gpu

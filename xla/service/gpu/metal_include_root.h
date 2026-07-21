@@ -36,10 +36,20 @@ namespace xla {
 namespace gpu {
 
 // Returns the directory to pass to the Metal compiler as -I, materializing the
-// embedded tree on the first call (thereafter cached, including the failure).
+// embedded tree if it is not already present and intact.
+//
+// Every call re-checks that the on-disk tree is complete (each embedded file is
+// present) rather than trusting a first-call result, and re-materializes if it
+// is not. This is deliberate: the tree lives under the per-user Darwin *cache*
+// directory precisely so a long-lived process is not served a directory the OS
+// pruned files out of, but the completeness check also self-heals a tree left
+// partial by an interrupted materialize or by any other reaper. Calls happen
+// only on a metallib cache miss, so the per-call stat of the tree is cheap.
+//
 // Thread-safe, and safe against a concurrent process racing on the same path:
 // the directory is named by the tree's content hash and published with a single
-// rename(2), so a reader either sees a complete tree or no tree at all.
+// rename(2), so a reader either sees a complete tree or no tree at all; a stale
+// partial tree is only ever replaced, never a complete one another process uses.
 absl::StatusOr<std::string> MetalIncludeRoot();
 
 // A stable hash of the embedded tree's contents. Every metallib cache key must
