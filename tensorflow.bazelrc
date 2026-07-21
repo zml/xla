@@ -775,3 +775,18 @@ build:pjrt_aarch64_cuda12_nightly --config=pjrt_aarch64_nightly --config=pjrt_cu
 build:pjrt_x86_cuda13_nightly --config=pjrt_x86_nightly --config=pjrt_cuda13
 build:pjrt_aarch64_cuda13_nightly --config=pjrt_aarch64_nightly --config=pjrt_cuda13
 # END PJRT RELEASE CONFIGS
+
+build --repo_env=HERMETIC_PYTHON_VERSION=3.12
+build:rocm_ci_hermetic --repo_env=ROCM_DISTRO_VERSION=rocm_7.14.0_multiarch
+build:rocm_ci_hermetic --repo_env=TF_ROCM_AMDGPU_TARGETS=gfx908,gfx90a,gfx90c,gfx942,gfx950,gfx1010,gfx1011,gfx1012,gfx1030,gfx1031,gfx1032,gfx1033,gfx1034,gfx1035,gfx1036,gfx1100,gfx1101,gfx1102,gfx1103,gfx1150,gfx1151,gfx1152,gfx1200,gfx1201,gfx1153
+build --copt -Wno-sign-compare
+build --copt -Wno-gnu-offsetof-extensions
+
+build --build_tag_filters -no_oss
+build --test_tag_filters -no_oss
+
+test  --build_tag_filters -no_oss
+test  --test_tag_filters -no_oss
+
+common:baseline_arm64   --copt=-march=armv8.2-a # LSE atomics, server baseline ~2018+
+common:baseline_x86_64  --copt=-march=x86-64-v3 # AVX2/FMA/BMI1/BMI2, Haswell-class servers+
