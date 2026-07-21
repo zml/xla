@@ -16,6 +16,16 @@
 """Rocm distribution list, used as a hermetic rocm dependency."""
 
 rocm_redist = {
+    "rocm_10.0.0_multiarch": struct(
+        packages = [
+            {
+                "url": "https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-multiarch-10.0.0.tar.gz",
+                "sha256": "",
+            },
+        ],
+        required_softlinks = [],
+        rocm_root = "",
+    ),
     "rocm_7.13.0_gfx94X": struct(
         packages = [
             {
