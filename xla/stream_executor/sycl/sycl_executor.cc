@@ -896,9 +896,13 @@ bool SyclExecutor::HostMemoryRegister(void* location, uint64_t size) {
 #if defined(SYCL_EXT_ONEAPI_COPY_OPTIMIZE)
   try {
     const sycl::context context = sycl_context_->context();
+    // TODO(intel-tf): Migrate to sycl_ext_oneapi_register_host_memory once the
+    // supported oneAPI toolchain provides it. Unlike prepare_for_device_copy,
+    // that extension makes the registered range visible as a USM host
+    // allocation.
     sycl::ext::oneapi::experimental::prepare_for_device_copy(location, size,
                                                              context);
-    if (SyclIsHostMemoryRegistered(device_, location)) return true;
+    if (SyclIsHostMemoryRegistered(device_, location, size)) return true;
     sycl::ext::oneapi::experimental::release_from_device_copy(location,
                                                               context);
     LOG(ERROR) << "SYCL did not register host memory at " << location;
@@ -918,7 +922,7 @@ bool SyclExecutor::HostMemoryUnregister(void* location) {
   try {
     sycl::ext::oneapi::experimental::release_from_device_copy(
         location, sycl_context_->context());
-    if (!SyclIsHostMemoryRegistered(device_, location)) return true;
+    if (!SyclIsHostMemoryRegistered(device_, location, 1)) return true;
     LOG(ERROR) << "SYCL did not unregister host memory at " << location;
   } catch (const sycl::exception& e) {
     LOG(ERROR) << "Failed to unregister host memory at " << location << ": "
@@ -928,6 +932,10 @@ bool SyclExecutor::HostMemoryUnregister(void* location) {
   LOG(ERROR) << "The SYCL toolchain does not support host memory import";
 #endif
   return false;
+}
+
+bool SyclExecutor::IsHostMemoryPinned(const void* ptr, uint64_t size) {
+  return SyclIsHostMemoryRegistered(device_, ptr, size);
 }
 
 void SyclExecutor::DeallocateStream(Stream* stream) {
