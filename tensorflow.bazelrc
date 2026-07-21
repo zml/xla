@@ -182,3 +182,52 @@ common:cpu_cross --define=with_cross_compiler_support=true
 
 # Flag to enable remote config
 common --experimental_repo_remote_exec
+
+common:rocm_base --copt=-Wno-gnu-offsetof-extensions
+common:rocm_base --define=using_rocm_hipcc=true
+common:rocm_base --define=tensorflow_mkldnn_contraction_kernel=0
+common:rocm_base --repo_env TF_NEED_ROCM=1
+common:rocm_base --define=using_rocm_hipcc=true
+common:rocm_base --define=tensorflow_mkldnn_contraction_kernel=0
+common:rocm_base --action_env=HIPCC_COMPILE_FLAGS_APPEND="--offload-compress"
+common:rocm_base --repo_env=TF_ROCM_AMDGPU_TARGETS="gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1101,gfx1200,gfx1201"
+
+common:rocm_clang_local --config=rocm_base
+common:rocm_clang_local --config=clang_local
+common:rocm_clang_local --extra_toolchains=@local_config_rocm//crosstool:toolchain-linux-x86_64
+common:rocm_clang_local --config=rocm_base
+common:rocm_clang_local --action_env=CLANG_COMPILER_PATH="/usr/lib/llvm-18/bin/clang"
+
+# ROCm with hermetic toolchain from rules_ml_toolchain
+common:rocm_clang_hermetic --config=rocm_base
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_rocm=True
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_cuda=False
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_sycl=False
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:enable_hermetic_cc=True
+common:rocm_clang_hermetic --@local_config_rocm//rocm:rocm_path_type=hermetic --config=workspace
+common:rocm_clang_hermetic --strategy=CppLink=local
+common:rocm_clang_hermetic --@rules_ml_toolchain//common:static_libcxx=False
+
+common:rocm --config=rocm_clang_hermetic
+common:rocm_ci --config=rocm
+common:rocm_ci --@local_config_rocm//rocm:rocm_path_type=hermetic --config=workspace
+
+common:rocm_ci_hermetic --dynamic_mode=off
+common:rocm_ci_hermetic --config=rocm_clang_hermetic
+common:rocm_ci_hermetic --repo_env=TF_ROCM_AMDGPU_TARGETS="gfx908,gfx90a"
+common:rocm_ci_hermetic --repo_env=ROCM_DISTRO_VERSION="rocm_7.13.0_gfx90a"
+common:rocm_ci_hermetic --repo_env=SYSROOT_DIST=linux_glibc_2_31
+common:rocm_ci_hermetic --@local_config_rocm//rocm:rocm_path_type=hermetic --config=workspace
+
+build --repo_env=HERMETIC_PYTHON_VERSION=3.12
+build:rocm_ci_hermetic --repo_env=ROCM_DISTRO_VERSION=rocm_10.0.0_multiarch
+build:rocm_ci_hermetic --repo_env=TF_ROCM_AMDGPU_TARGETS=gfx908,gfx90a,gfx90c,gfx942,gfx950,gfx1010,gfx1011,gfx1012,gfx1030,gfx1031,gfx1032,gfx1033,gfx1034,gfx1035,gfx1036,gfx1100,gfx1101,gfx1102,gfx1103,gfx1150,gfx1151,gfx1152,gfx1200,gfx1201,gfx1153
+build --copt -Wno-sign-compare
+build --copt -Wno-gnu-offsetof-extensions
+
+build --build_tag_filters -no_oss
+build --test_tag_filters -no_oss
+
+test  --build_tag_filters -no_oss
+test  --test_tag_filters -no_oss
+
