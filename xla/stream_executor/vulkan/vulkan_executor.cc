@@ -52,9 +52,61 @@ limitations under the License.
 namespace stream_executor::vulkan {
 namespace {
 
+constexpr char kValidationLayer[] = "VK_LAYER_KHRONOS_validation";
+
 absl::Status VulkanError(absl::string_view operation, VkResult result) {
   return absl::InternalError(
       absl::StrFormat("%s failed with VkResult %d", operation, result));
+}
+
+bool ValidationRequested() {
+  const char* value = std::getenv("XLA_VULKAN_ENABLE_VALIDATION");
+  return value != nullptr && std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "false") != 0;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL ValidationCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
+    void*) {
+  const char* message = callback_data == nullptr ? nullptr
+                                                  : callback_data->pMessage;
+  const char* id = callback_data == nullptr ? nullptr
+                                             : callback_data->pMessageIdName;
+  std::string text = absl::StrFormat(
+      "Vulkan validation [%s, type=0x%x]: %s", id == nullptr ? "unknown" : id,
+      type, message == nullptr ? "(no message)" : message);
+  if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+    LOG(ERROR) << text;
+    // Ask the validation layer to abort the offending Vulkan call. Commands
+    // returning VkResult will report VK_ERROR_VALIDATION_FAILED, which the
+    // executor converts to an absl::Status instead of continuing with invalid
+    // Vulkan state.
+    return VK_TRUE;
+  } else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) !=
+             0) {
+    LOG(WARNING) << text;
+  } else {
+    VLOG(1) << text;
+  }
+  return VK_FALSE;
+}
+
+VkDebugUtilsMessengerCreateInfoEXT DebugMessengerCreateInfo() {
+  VkDebugUtilsMessengerCreateInfoEXT create_info = {};
+  create_info.sType =
+      VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+  create_info.messageSeverity =
+      VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+      VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+      VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+      VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+  create_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+  create_info.pfnUserCallback = ValidationCallback;
+  return create_info;
 }
 
 #define RETURN_IF_VK_ERROR(expr)            \
@@ -138,6 +190,70 @@ class VulkanDriver {
     RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr, "vkCreateInstance",
                                    &create_instance));
 
+    const bool validation_requested = ValidationRequested();
+    std::vector<const char*> enabled_layers;
+    std::vector<const char*> enabled_extensions;
+    bool synchronization_validation = false;
+    if (validation_requested) {
+      PFN_vkEnumerateInstanceLayerProperties enumerate_layers = nullptr;
+      PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions =
+          nullptr;
+      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr,
+                                     "vkEnumerateInstanceLayerProperties",
+                                     &enumerate_layers));
+      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr,
+                                     "vkEnumerateInstanceExtensionProperties",
+                                     &enumerate_extensions));
+
+      uint32_t layer_count = 0;
+      RETURN_IF_VK_ERROR(enumerate_layers(&layer_count, nullptr));
+      std::vector<VkLayerProperties> layers(layer_count);
+      RETURN_IF_VK_ERROR(enumerate_layers(&layer_count, layers.data()));
+      bool has_validation_layer =
+          std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+            return std::strcmp(layer.layerName, kValidationLayer) == 0;
+          });
+      if (!has_validation_layer) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "XLA_VULKAN_ENABLE_VALIDATION is set, but ", kValidationLayer,
+            " is not installed"));
+      }
+      enabled_layers.push_back(kValidationLayer);
+
+      uint32_t extension_count = 0;
+      RETURN_IF_VK_ERROR(
+          enumerate_extensions(nullptr, &extension_count, nullptr));
+      std::vector<VkExtensionProperties> extensions(extension_count);
+      RETURN_IF_VK_ERROR(enumerate_extensions(nullptr, &extension_count,
+                                              extensions.data()));
+      bool has_debug_utils = std::any_of(
+          extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName,
+                               VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+          });
+      if (!has_debug_utils) {
+        return absl::FailedPreconditionError(
+            "Vulkan validation requested, but VK_EXT_debug_utils is missing");
+      }
+      enabled_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+      extension_count = 0;
+      RETURN_IF_VK_ERROR(enumerate_extensions(
+          kValidationLayer, &extension_count, nullptr));
+      extensions.resize(extension_count);
+      RETURN_IF_VK_ERROR(enumerate_extensions(
+          kValidationLayer, &extension_count, extensions.data()));
+      synchronization_validation = std::any_of(
+          extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName,
+                               VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME) == 0;
+          });
+      if (synchronization_validation) {
+        enabled_extensions.push_back(
+            VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+      }
+    }
+
     VkApplicationInfo application_info = {};
     application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application_info.pApplicationName = "XLA Vulkan StreamExecutor";
@@ -149,8 +265,48 @@ class VulkanDriver {
     VkInstanceCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &application_info;
+    create_info.enabledLayerCount =
+        static_cast<uint32_t>(enabled_layers.size());
+    create_info.ppEnabledLayerNames =
+        enabled_layers.empty() ? nullptr : enabled_layers.data();
+    create_info.enabledExtensionCount =
+        static_cast<uint32_t>(enabled_extensions.size());
+    create_info.ppEnabledExtensionNames =
+        enabled_extensions.empty() ? nullptr : enabled_extensions.data();
+
+    // Put the debug messenger in the instance create chain so validation can
+    // report errors raised by vkCreateInstance and vkDestroyInstance too.
+    VkDebugUtilsMessengerCreateInfoEXT debug_create_info =
+        DebugMessengerCreateInfo();
+    VkValidationFeatureEnableEXT synchronization_feature =
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validation_features = {};
+    if (validation_requested) {
+      create_info.pNext = &debug_create_info;
+      if (synchronization_validation) {
+        validation_features.sType =
+            VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+        validation_features.enabledValidationFeatureCount = 1;
+        validation_features.pEnabledValidationFeatures =
+            &synchronization_feature;
+        debug_create_info.pNext = &validation_features;
+      }
+    }
     RETURN_IF_VK_ERROR(
         create_instance(&create_info, /*pAllocator=*/nullptr, &instance_));
+
+    if (validation_requested) {
+      PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger = nullptr;
+      RETURN_IF_ERROR(LoadInstanceProc(
+          get_instance_proc_addr, instance_, "vkCreateDebugUtilsMessengerEXT",
+          &create_debug_messenger));
+      RETURN_IF_VK_ERROR(create_debug_messenger(
+          instance_, &debug_create_info, nullptr, &debug_messenger_));
+      LOG(INFO) << "Enabled " << kValidationLayer
+                << (synchronization_validation
+                        ? " with synchronization validation"
+                        : " (synchronization validation unavailable)");
+    }
 
     PFN_vkEnumeratePhysicalDevices enumerate_physical_devices = nullptr;
     RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
@@ -207,6 +363,7 @@ class VulkanDriver {
   absl::Status status_;
   void* library_ = nullptr;
   VkInstance instance_ = VK_NULL_HANDLE;
+  VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
   std::vector<VkPhysicalDevice> physical_devices_;
 };
 
@@ -304,12 +461,16 @@ struct VulkanExecutor::Impl {
 
   absl::Status WaitForTimeline(uint64_t value) const {
     if (value == 0) return absl::OkStatus();
+    VLOG(2) << "Waiting for Vulkan timeline value " << value;
     VkSemaphoreWaitInfo wait_info = {};
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wait_info.semaphoreCount = 1;
     wait_info.pSemaphores = &timeline;
     wait_info.pValues = &value;
     VkResult result = vkWaitSemaphores(device, &wait_info, UINT64_MAX);
+    if (result == VK_SUCCESS) {
+      VLOG(2) << "Vulkan timeline reached value " << value;
+    }
     return result == VK_SUCCESS
                ? absl::OkStatus()
                : VulkanError("vkWaitSemaphores", result);
@@ -355,6 +516,8 @@ struct VulkanExecutor::Impl {
     submit_info.pSignalSemaphores = &timeline;
     VkResult result = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) return VulkanError("vkQueueSubmit", result);
+    VLOG(1) << "Submitted Vulkan command buffer: wait=" << wait_value
+            << ", signal=" << signal_value;
     submissions.push_back(
         Submission{signal_value, command_buffer, descriptor_pool});
     return signal_value;
@@ -1112,6 +1275,8 @@ absl::Status VulkanExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
                    impl_->FindAllocation(device_dst->opaque(), size));
   std::memcpy(static_cast<std::byte*>(view.allocation->mapped) + view.offset,
               host_src, size);
+  VLOG(2) << "Copied " << size << " host bytes to Vulkan buffer "
+          << view.allocation->buffer << " at offset " << view.offset;
   return absl::OkStatus();
 }
 
@@ -1122,6 +1287,9 @@ absl::Status VulkanExecutor::SynchronousMemcpy(
   std::memcpy(host_dst,
               static_cast<std::byte*>(view.allocation->mapped) + view.offset,
               size);
+  VLOG(2) << "Copied " << size << " bytes from Vulkan buffer "
+          << view.allocation->buffer << " at offset " << view.offset
+          << " after synchronization";
   return absl::OkStatus();
 }
 
@@ -1243,6 +1411,14 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
           kernel.name(), binding.argument_index, buffer_info.range,
           impl_->properties.limits.maxStorageBufferRange));
     }
+    VLOG(1) << "Vulkan kernel " << kernel.name() << " descriptor set="
+            << binding.descriptor_set << ", binding=" << binding.binding
+            << ", argument=" << binding.argument_index
+            << ", slice=" << binding.slice_index
+            << ", read_only=" << binding.read_only
+            << ", buffer=" << buffer_info.buffer
+            << ", offset=" << buffer_info.offset
+            << ", range=" << buffer_info.range;
     buffer_infos.push_back(buffer_info);
   }
 
@@ -1332,6 +1508,10 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
   impl_->vkCmdBindDescriptorSets(
       command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline_layout_,
       0, 1, &descriptor_set, 0, nullptr);
+  VLOG(1) << "Dispatching Vulkan kernel " << kernel.name() << " with groups=("
+          << block_dims.x << ", " << block_dims.y << ", " << block_dims.z
+          << ") and local size=(" << thread_dims.x << ", " << thread_dims.y
+          << ", " << thread_dims.z << ")";
   impl_->vkCmdDispatch(command_buffer, block_dims.x, block_dims.y, block_dims.z);
   VkMemoryBarrier after = {};
   after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
