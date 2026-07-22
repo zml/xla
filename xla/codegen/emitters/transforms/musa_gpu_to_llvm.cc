@@ -255,7 +255,7 @@ class MusaBarrierOpLowering
         op.getScope() != mlir::gpu::BarrierScope::Workgroup) {
       return rewriter.notifyMatchFailure(
           op,
-          "mapping version 2 supports only an unnamed full workgroup "
+          "the active mapping supports only an unnamed full workgroup "
           "barrier");
     }
     if (mlir::failed(CreateShimCall(op, musa::MusaShimId::kWorkgroupBarrier,
@@ -288,7 +288,7 @@ class MusaShuffleOpLowering
     }
     if (!is_logical_width_32) {
       return rewriter.notifyMatchFailure(
-          op, "mapping version 2 requires constant logical subgroup width 32");
+          op, "the active mapping requires constant logical subgroup width 32");
     }
 
     mlir::Location loc = op.getLoc();

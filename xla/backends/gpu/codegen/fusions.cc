@@ -79,6 +79,7 @@ Decision MusaFusionEmitterQualification(
     case HloFusionAnalysis::EmitterFusionKind::kScatter:
     case HloFusionAnalysis::EmitterFusionKind::kTranspose:
     case HloFusionAnalysis::EmitterFusionKind::kConcatenate:
+    case HloFusionAnalysis::EmitterFusionKind::kSort:
       return Decision::Allow();
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
       return Decision::Forbid(
@@ -89,9 +90,6 @@ Decision MusaFusionEmitterQualification(
     case HloFusionAnalysis::EmitterFusionKind::kCuDnn:
       return Decision::Forbid(
           "cuDNN fusion emission is not qualified for the MUSA backend");
-    case HloFusionAnalysis::EmitterFusionKind::kSort:
-      return Decision::Forbid(
-          "sort fusion emission is not qualified for the MUSA backend");
   }
   return Decision::Forbid(
       "unknown fusion emission is not qualified for the MUSA backend");

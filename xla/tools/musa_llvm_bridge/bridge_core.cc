@@ -103,6 +103,21 @@ bool HasOnlyNoSignedZeros(const llvm::FastMathFlags& flags) {
          !flags.allowContract() && !flags.approxFunc();
 }
 
+// Revalidate mapping v3's single probed atomic primitive inside the isolated
+// vendor-LLVM process; never trust the host validator as a security boundary.
+bool IsQualifiedMusaAtomicCmpXchg(const llvm::AtomicCmpXchgInst& cmpxchg) {
+  return cmpxchg.getPointerAddressSpace() == kMusaAtomicCmpXchgAddressSpace &&
+         cmpxchg.getCompareOperand()->getType()->isIntegerTy(
+             kMusaAtomicCmpXchgBitWidth) &&
+         cmpxchg.getNewValOperand()->getType()->isIntegerTy(
+             kMusaAtomicCmpXchgBitWidth) &&
+         !cmpxchg.isWeak() && !cmpxchg.isVolatile() &&
+         cmpxchg.getSyncScopeID() == llvm::SyncScope::System &&
+         cmpxchg.getSuccessOrdering() == llvm::AtomicOrdering::Monotonic &&
+         cmpxchg.getFailureOrdering() == llvm::AtomicOrdering::Monotonic &&
+         cmpxchg.getAlign().value() == kMusaAtomicCmpXchgAlignment;
+}
+
 absl::Status Rejected(const MusaBridgeCompileRequest& request,
                       absl::string_view capability, absl::string_view detail) {
   // ValidateMusaBridgeCompileRequest has already constrained module_name and
@@ -129,7 +144,7 @@ absl::Status ValidateType(const llvm::Type* type,
   if (const auto* pointer = llvm::dyn_cast<llvm::PointerType>(type)) {
     if (!pointer->isOpaque()) {
       return Rejected(request, "pointer-model",
-                      "mapping version 2 requires opaque pointers");
+                      "the active mapping requires opaque pointers");
     }
     const MusaAddressSpaceSpec* address_space =
         FindMusaAddressSpace(pointer->getAddressSpace());
@@ -145,7 +160,7 @@ absl::Status ValidateType(const llvm::Type* type,
   if (const auto* function = llvm::dyn_cast<llvm::FunctionType>(type)) {
     if (function->isVarArg()) {
       return Rejected(request, "variadic-function",
-                      "variadic function types are outside mapping version 2");
+                      "variadic function types are outside the active mapping");
     }
     if (absl::Status status =
             ValidateType(function->getReturnType(), request, visited);
@@ -170,7 +185,7 @@ absl::Status ValidateType(const llvm::Type* type,
   } else if (const auto* vector = llvm::dyn_cast<llvm::VectorType>(type)) {
     if (vector->getElementCount().isScalable()) {
       return Rejected(request, "scalable-vector",
-                      "scalable vectors are outside mapping version 2");
+                      "scalable vectors are outside the active mapping");
     }
     return ValidateType(vector->getElementType(), request, visited);
   }
@@ -596,7 +611,7 @@ absl::Status ValidateInstruction(const llvm::Instruction& instruction,
     return Rejected(request, "fast-math-flags",
                     absl::StrCat("function ", function_name,
                                  " contains fast-math flags outside the "
-                                 "mapping-v2 nsz-only contract"));
+                                 "active mapping's nsz-only contract"));
   }
   for (const llvm::Use& operand : instruction.operands()) {
     if (absl::Status status = ValidateValueType(*operand.get(), request);
@@ -648,14 +663,22 @@ absl::Status ValidateInstruction(const llvm::Instruction& instruction,
     }
   }
 
+  if (const auto* cmpxchg =
+          llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&instruction)) {
+    if (!IsQualifiedMusaAtomicCmpXchg(*cmpxchg)) {
+      return Rejected(request, "atomics",
+                      "cmpxchg is outside the exact mapping-v3 contract");
+    }
+    return absl::OkStatus();
+  }
   const auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
   const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
   if ((load != nullptr && load->isAtomic()) ||
       (store != nullptr && store->isAtomic()) ||
-      llvm::isa<llvm::AtomicRMWInst, llvm::AtomicCmpXchgInst, llvm::FenceInst>(
-          instruction)) {
+      llvm::isa<llvm::AtomicRMWInst, llvm::FenceInst>(instruction)) {
     return Rejected(request, "atomics",
-                    "atomics are not defined by mapping version 2");
+                    "atomic instruction is outside the exact mapping-v3 "
+                    "contract");
   }
   return absl::OkStatus();
 }
@@ -726,7 +749,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
       if (!IsAllowedGenericIntrinsic(function.getName())) {
         return Rejected(request, "llvm-intrinsic",
                         absl::StrCat("intrinsic ", function_name,
-                                     " is outside mapping version 2"));
+                                     " is outside the active mapping"));
       }
       const llvm::AttributeList canonical = llvm::Intrinsic::getAttributes(
           function.getContext(), function.getIntrinsicID());
@@ -821,15 +844,15 @@ absl::Status ValidateInterchangeModule(
   }
   if (!module.alias_empty()) {
     return Rejected(request, "global-alias",
-                    "global aliases are outside mapping version 2");
+                    "global aliases are outside the active mapping");
   }
   if (!module.ifunc_empty()) {
     return Rejected(request, "global-ifunc",
-                    "indirect functions are outside mapping version 2");
+                    "indirect functions are outside the active mapping");
   }
   if (!module.getComdatSymbolTable().empty()) {
     return Rejected(request, "module-comdat",
-                    "COMDAT definitions are outside mapping version 2");
+                    "COMDAT definitions are outside the active mapping");
   }
   if (module.named_metadata_begin() != module.named_metadata_end()) {
     return Rejected(request, "named-metadata",
@@ -886,7 +909,9 @@ absl::StatusOr<llvm::Function*> GetVendorIntrinsic(
         function->hasFnAttribute(
             llvm::Attribute::InaccessibleMemOrArgMemOnly)) {
       return ToolchainMismatch(
-          request, "SDK fake-shuffle declaration disagrees with mapping v2");
+          request,
+          "SDK fake-shuffle declaration disagrees with the active "
+          "logical-shuffle contract introduced in mapping v2");
     }
     return function;
   }
@@ -1225,7 +1250,7 @@ absl::Status ValidateTranslatedModule(const llvm::Module& module,
     }
     if (!mapped) {
       return absl::InternalError(
-          "MUSA bridge emitted a target intrinsic outside mapping version 2");
+          "MUSA bridge emitted a target intrinsic outside the active mapping");
     }
   }
   return absl::OkStatus();

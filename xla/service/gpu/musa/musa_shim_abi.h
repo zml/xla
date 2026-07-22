@@ -28,9 +28,15 @@ namespace xla::gpu::musa {
 
 inline constexpr uint32_t kMusaBridgeProtocolVersion = 1;
 inline constexpr uint32_t kMusaShimAbiVersion = 1;
-inline constexpr uint32_t kMusaShimMappingVersion = 2;
+inline constexpr uint32_t kMusaShimMappingVersion = 3;
 inline constexpr uint32_t kMusaInterchangePointerWidth = 64;
 inline constexpr bool kMusaInterchangeIsLittleEndian = true;
+// Mapping v3 admits exactly one atomic instruction shape. Both bridge
+// validators independently enforce the rest of the contract (scalar i32,
+// strong, non-volatile, system scope, monotonic/monotonic).
+inline constexpr uint32_t kMusaAtomicCmpXchgAddressSpace = 1;
+inline constexpr uint32_t kMusaAtomicCmpXchgBitWidth = 32;
+inline constexpr uint32_t kMusaAtomicCmpXchgAlignment = 4;
 inline constexpr char kMusaShimSymbolPrefix[] = "__xla_musa_v1_";
 // Current LLVM marks qualified entry definitions with this string attribute.
 // The C08 compatibility boundary consumes it before textual serialization;
@@ -46,7 +52,7 @@ inline constexpr auto& kMusaDataLayout =
 // A checked-in digest makes changes to the canonical table an explicit ABI
 // review event. musa_shim_abi_test recomputes it from MusaShimCanonicalText().
 inline constexpr char kMusaShimMappingSha256[] =
-    "15e63d93b88d62890ae6019b244ac62b9cd319ef100d772afbda05188f5e5396";
+    "ef5630e3dc4fef8f23b650aa8b92dbcd0838a859d598c4b54d406c743676dd64";
 
 enum class MusaShimId : uint8_t {
 #define MUSA_SHIM(id, ...) id,

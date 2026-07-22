@@ -27,18 +27,26 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/SourceMgr.h"
+#include "xla/backends/gpu/target_config/target_config.h"
+#include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/parser/hlo_parser.h"
+#include "xla/service/compiler.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 #include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/service/gpu/target_constants.h"
+#include "xla/service/gpu_topology.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 
 namespace xla::gpu {
@@ -47,6 +55,7 @@ namespace {
 using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
+using ::testing::IsEmpty;
 
 class RecordingCompilationProvider final
     : public musa::MusaCompilationProvider {
@@ -67,9 +76,7 @@ class RecordingCompilationProvider final
   const musa::MusaCompilationIdentity& identity() const override {
     return identity_;
   }
-  musa::MusaCompilationCapabilities capabilities() const override {
-    return {};
-  }
+  musa::MusaCompilationCapabilities capabilities() const override { return {}; }
   absl::string_view name() const override { return "recording"; }
 
   mutable int compile_count = 0;
@@ -82,27 +89,24 @@ class RecordingCompilationProvider final
 
 class TestMusaGpuCompiler : public MusaGpuCompiler {
  public:
-  using MusaGpuCompiler::MusaGpuCompiler;
   using MusaGpuCompiler::CompileTargetBinary;
+  using MusaGpuCompiler::MusaGpuCompiler;
 };
 
 std::unique_ptr<llvm::Module> ElementalModule(llvm::LLVMContext& context) {
   const std::string source = absl::StrCat(
-      "source_filename = \"c10-test\"\n",
-      "target datalayout = \"", musa::DataLayout(), "\"\n",
-      "target triple = \"", musa::TargetTriple(), "\"\n\n",
-      "define void @kernel(ptr addrspace(1) %out) #0 {\n",
-      "entry:\n",
-      "  store i32 7, ptr addrspace(1) %out, align 4\n",
-      "  ret void\n",
-      "}\n\n",
-      "attributes #0 = { \"", musa::kMusaLlvmKernelMarker, "\" }\n");
+      "source_filename = \"c10-test\"\n", "target datalayout = \"",
+      musa::DataLayout(), "\"\n", "target triple = \"", musa::TargetTriple(),
+      "\"\n\n", "define void @kernel(ptr addrspace(1) %out) #0 {\n", "entry:\n",
+      "  store i32 7, ptr addrspace(1) %out, align 4\n", "  ret void\n",
+      "}\n\n", "attributes #0 = { \"", musa::kMusaLlvmKernelMarker, "\" }\n");
   llvm::SMDiagnostic diagnostic;
   return llvm::parseAssemblyString(source, diagnostic, context);
 }
 
 stream_executor::DeviceDescription MusaDevice() {
   stream_executor::DeviceDescription device;
+  device.set_threads_per_warp(128);
   device.set_gpu_compute_capability(stream_executor::GpuComputeCapability(
       stream_executor::MusaComputeCapability("mp_21", 2, 1,
                                              /*hardware_warp_size=*/128,
@@ -143,12 +147,12 @@ TEST(MusaGpuCompilerTest, RejectsRelocatableCompilationBeforeProviderCall) {
   std::unique_ptr<llvm::Module> module = ElementalModule(context);
   ASSERT_NE(module, nullptr);
 
-  EXPECT_THAT(compiler.CompileTargetBinary(
-                  HloModuleConfig(), module.get(), MusaDevice(),
-                  /*relocatable=*/true, /*debug_module=*/nullptr,
-                  /*shard_number=*/std::nullopt),
-              StatusIs(absl::StatusCode::kUnimplemented,
-                       HasSubstr("relocatable")));
+  EXPECT_THAT(
+      compiler.CompileTargetBinary(
+          HloModuleConfig(), module.get(), MusaDevice(),
+          /*relocatable=*/true, /*debug_module=*/nullptr,
+          /*shard_number=*/std::nullopt),
+      StatusIs(absl::StatusCode::kUnimplemented, HasSubstr("relocatable")));
   EXPECT_EQ(recording->compile_count, 0);
 }
 
@@ -167,6 +171,79 @@ TEST(MusaGpuCompilerTest, SkipsEmptySharedGpuConstantsModule) {
   ASSERT_THAT(result, IsOk());
   EXPECT_TRUE(result->binary.empty());
   EXPECT_EQ(recording->compile_count, 0);
+}
+
+TEST(MusaGpuCompilerTest, LeavesStandardScanAndSortOnSharedHloFallbacks) {
+  constexpr absl::string_view hlo = R"(
+HloModule no_musa_cub
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  sum = f32[] add(lhs, rhs)
+  ROOT result = (f32[], f32[]) tuple(sum, sum)
+}
+
+less_than {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = pred[] compare(lhs, rhs), direction=LT
+}
+
+ENTRY main {
+  scan_input = f32[100] parameter(0)
+  zero = f32[] constant(0)
+  scan = (f32[100], f32[]) scan(scan_input, zero), dimensions={0}, num_carries=1, is_associative=true, to_apply=add
+  scanned = f32[100] get-tuple-element(scan), index=0
+  sort_input = f32[32768] parameter(1)
+  sorted = f32[32768] sort(sort_input), dimensions={0}, to_apply=less_than
+  ROOT result = (f32[100], f32[32768]) tuple(scanned, sorted)
+}
+)";
+
+  HloModuleConfig config;
+  config.mutable_debug_options().set_xla_gpu_enable_cub_radix_sort(true);
+  auto module = ParseAndReturnUnverifiedModule(hlo, config);
+  ASSERT_THAT(module, IsOk());
+
+  stream_executor::GpuTargetConfigProto target_proto;
+  *target_proto.mutable_gpu_device_info() = MusaDevice().ToProto();
+  target_proto.set_platform_name("MUSA");
+  target_proto.set_device_description_str("MTT S80");
+  auto target_config = gpu::GpuTargetConfig::FromProto(target_proto);
+  ASSERT_TRUE(target_config.ok()) << target_config.status();
+
+  Compiler::CompileOptions options;
+  options.gpu_topology = GetSingleDeviceGpuTopology(
+      /*platform_version=*/"", *target_config);
+  options.early_exit_with_layouts = true;
+
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  auto optimized = compiler.RunHloPasses(std::move(*module),
+                                         /*executor=*/nullptr, options);
+  ASSERT_THAT(optimized, IsOk());
+
+  bool found_reduce_window = false;
+  bool found_sort = false;
+  bool found_call = false;
+  std::vector<std::string> cub_custom_calls;
+  for (const HloComputation* computation : (*optimized)->computations()) {
+    for (const HloInstruction* instruction : computation->instructions()) {
+      found_reduce_window |= instruction->opcode() == HloOpcode::kReduceWindow;
+      found_sort |= instruction->opcode() == HloOpcode::kSort;
+      found_call |= instruction->opcode() == HloOpcode::kCall;
+      if (instruction->opcode() == HloOpcode::kCustomCall &&
+          absl::StartsWith(instruction->custom_call_target(),
+                           "xla.gpu.ext.cub_")) {
+        cub_custom_calls.push_back(instruction->custom_call_target());
+      }
+    }
+  }
+  EXPECT_TRUE(found_reduce_window);
+  EXPECT_TRUE(found_sort);
+  EXPECT_FALSE(found_call);
+  EXPECT_THAT(cub_custom_calls, IsEmpty());
 }
 
 }  // namespace

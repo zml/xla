@@ -258,6 +258,16 @@ TEST(MusaLlvmBridgeCoreTest, TranslatesMinimalModuleStructurally) {
   EXPECT_FALSE(absl::StrContains(translated->llvm_ir, "__xla_musa_"));
 }
 
+TEST(MusaLlvmBridgeCoreTest, TranslatesExactMappingV3AtomicCmpXchg) {
+  MusaBridgeCompileRequest request =
+      RequestForIr(ReadTestdata("atomic_cmpxchg.ll"));
+  absl::StatusOr<VendorLlvmModule> translated =
+      TranslateMusaBridgeRequestToVendorLlvm(request);
+  ASSERT_THAT(translated, IsOk());
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("cmpxchg ptr addrspace(1)"));
+  EXPECT_THAT(translated->llvm_ir, HasSubstr("monotonic monotonic, align 4"));
+}
+
 TEST(MusaLlvmBridgeCoreTest,
      ParsesAndTranslatesCurrentLlvmCompatibilityGolden) {
   MusaBridgeCompileRequest request =
@@ -298,7 +308,7 @@ TEST(MusaLlvmBridgeCoreTest, ParsesAndTranslatesSineCompatibilityGolden) {
               HasSubstr("declare float @llvm.sin.f32(float)"));
 }
 
-TEST(MusaLlvmBridgeCoreTest, TranslatesEveryMappingV2Shim) {
+TEST(MusaLlvmBridgeCoreTest, TranslatesEveryActiveMappingShim) {
   MusaBridgeCompileRequest request = RequestForIr(ReadTestdata("all_shims.ll"));
   absl::StatusOr<VendorLlvmModule> translated =
       TranslateMusaBridgeRequestToVendorLlvm(request);
@@ -391,7 +401,7 @@ TEST(MusaLlvmBridgeCoreTest, TranslationIsDeterministic) {
   EXPECT_EQ(first->llvm_ir, second->llvm_ir);
 }
 
-TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV2) {
+TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV3) {
   struct Rejection {
     const char* fixture;
     const char* capability;
@@ -412,7 +422,7 @@ TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV2) {
   }
 }
 
-TEST(MusaLlvmBridgeCoreTest, AcceptsMappingV2NoSignedZeros) {
+TEST(MusaLlvmBridgeCoreTest, AcceptsActiveMappingNoSignedZeros) {
   std::string ir = ReadTestdata("minimal.ll");
   const size_t ret = ir.find("  ret void");
   ASSERT_NE(ret, std::string::npos);

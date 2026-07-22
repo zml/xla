@@ -119,6 +119,23 @@ TEST(MusaLlvm14CompatibilityTest, IsDeterministicAndDoesNotMutateInput) {
   EXPECT_EQ(module->getSourceFileName(), "ignored/source/path");
 }
 
+TEST(MusaLlvm14CompatibilityTest,
+     PreservesExactMappingV3AtomicCmpXchgForVendorLlvm14) {
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(
+          Module("  %pair = cmpxchg ptr addrspace(1) %out, i32 0, i32 1 "
+                 "monotonic monotonic, align 4"),
+          "atomic_cmpxchg_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("cmpxchg ptr addrspace(1)"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("monotonic monotonic, align 4"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
 TEST(MusaLlvm14CompatibilityTest, StripsIdentDebugFlagsAndInvariantLoadOnly) {
   const std::string metadata =
       "!llvm.ident = !{!1}\n"
@@ -211,7 +228,84 @@ TEST(MusaLlvm14CompatibilityTest, KernelArgumentPolicyFailClosed) {
                HasSubstr("capability=kernel-attributes")));
 }
 
-TEST(MusaLlvm14CompatibilityTest, RewritesEveryMappingV2ShimMemoryProfile) {
+TEST(MusaLlvm14CompatibilityTest,
+     StripsNoAliasFromLocalHelperPointerArgumentsOnly) {
+  const std::string helper =
+      "define internal i32 @helper(ptr noalias dereferenceable(4) %buffer, "
+      "i32 %value) {\n"
+      "entry:\n"
+      "  ret i32 %value\n"
+      "}\n";
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(
+          Module("  %generic = addrspacecast ptr addrspace(1) %out to ptr\n"
+                 "  %value = call i32 @helper(ptr %generic, i32 7)\n"
+                 "  store i32 %value, ptr addrspace(1) %out, align 4",
+                 helper),
+          "helper_noalias");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("define internal i32"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("ptr noalias")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("dereferenceable")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+
+  const std::string unqualified = absl::StrReplaceAll(
+      helper, {{"noalias dereferenceable(4)", "nocapture"}});
+  EXPECT_THAT(
+      NormalizeMusaLlvmTextForLlvm14(
+          Module("  %generic = addrspacecast ptr addrspace(1) %out to ptr\n"
+                 "  %value = call i32 @helper(ptr %generic, i32 7)\n"
+                 "  store i32 %value, ptr addrspace(1) %out, align 4",
+                 unqualified),
+          "helper_nocapture"),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("capability=helper-attributes")));
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     StripsOnlyGeneratedLegacyBitonicOptimizationHints) {
+  const std::string text = Module(
+      "  %block = call i32 @__xla_musa_v1_read_ctaid_x(), !range !0\n"
+      "  %thread = call i32 @__xla_musa_v1_read_tid_x(), !range !1\n"
+      "  %in_range = icmp ult i32 %thread, 8\n"
+      "  call void @llvm.assume(i1 %in_range)\n"
+      "  call void @__xla_musa_v1_workgroup_barrier()\n"
+      "  %value = add i32 %block, %thread\n"
+      "  store i32 %value, ptr addrspace(1) %out, align 4",
+      "declare i32 @__xla_musa_v1_read_ctaid_x() #1\n"
+      "declare i32 @__xla_musa_v1_read_tid_x() #2\n"
+      "declare void @__xla_musa_v1_workgroup_barrier() #3\n"
+      "declare void @llvm.assume(i1)\n",
+      "",
+      "!0 = !{i32 0, i32 2}\n!1 = !{i32 0, i32 8}\n\n"
+      "attributes #1 = { convergent nounwind memory(none) }\n"
+      "attributes #2 = { nounwind memory(none) }\n"
+      "attributes #3 = { convergent nounwind }\n");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* assume = module->getFunction("llvm.assume");
+  ASSERT_NE(assume, nullptr);
+  assume->setAttributes(llvm::Intrinsic::getAttributes(
+      context, assume->getIntrinsicID(), assume->getFunctionType()));
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "legacy_bitonic_hints");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("llvm.assume")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("!range")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("!0 =")));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("%in_range = icmp"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest, RewritesEveryActiveMappingShimMemoryProfile) {
   std::string calls;
   std::string declarations;
   int result_number = 0;
@@ -308,6 +402,28 @@ TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedSqrtProfile) {
   EXPECT_EQ(normalized->normalized_llvm, ReadCorpus("sqrt.llvm14.ll"));
 }
 
+TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedFabsProfile) {
+  const std::string text = Module(
+      "  %value = call float @llvm.fabs.f32(float -2.0)\n"
+      "  %bits = bitcast float %value to i32\n"
+      "  store i32 %bits, ptr addrspace(1) %out, align 4",
+      "declare float @llvm.fabs.f32(float)");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* fabs = module->getFunction("llvm.fabs.f32");
+  ASSERT_NE(fabs, nullptr);
+  fabs->setAttributes(llvm::Intrinsic::getAttributes(
+      context, fabs->getIntrinsicID(), fabs->getFunctionType()));
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "fabs_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_EQ(normalized->normalized_llvm, ReadCorpus("fabs.llvm14.ll"));
+}
+
 TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedSineProfile) {
   const std::string text = Module(
       "  %value = call float @llvm.sin.f32(float 0.0)\n"
@@ -395,6 +511,24 @@ TEST(MusaLlvm14CompatibilityTest,
   ASSERT_THAT(normalized, IsOk());
   EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "-1.000000e+30"));
   EXPECT_THAT(normalized->normalized_llvm, HasSubstr("fcmp ole float 0x"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest, RewritesCurrentSpecialFloatTokensForLlvm14) {
+  const std::string text = Module(
+      "  %positive = fcmp one float 1.0, +inf\n"
+      "  %negative = fcmp one float 1.0, -inf\n"
+      "  %result = and i1 %positive, %negative\n"
+      "  store i1 %result, ptr addrspace(1) %out, align 1");
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "special_float_profile");
+  ASSERT_TRUE(normalized.ok()) << normalized.status();
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0x7FF0000000000000"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0xFFF0000000000000"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "+inf"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "-inf"));
   EXPECT_THAT(
       ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
       IsOk());
@@ -497,7 +631,7 @@ TEST(MusaLlvm14CompatibilityTest, AcceptsGlobalsOnlyConstantsModule) {
       IsOk());
 }
 
-TEST(MusaLlvm14CompatibilityTest, PreservesMappingV2NoSignedZeros) {
+TEST(MusaLlvm14CompatibilityTest, PreservesActiveMappingNoSignedZeros) {
   absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
       NormalizeMusaLlvmTextForLlvm14(
           Module("  %value = fadd nsz float 1.0, 2.0\n"
@@ -539,7 +673,7 @@ TEST(MusaLlvm14CompatibilityTest, RejectsUnsupportedCurrentConstructs) {
       {Module("  %value = load i32, ptr addrspace(1) %out, align 4, "
               "!range !0",
               "", "", "!0 = !{i32 0, i32 4}\n"),
-       "instruction-metadata"},
+       "legacy-bitonic-hints"},
   };
   for (const Rejection& rejection : cases) {
     EXPECT_THAT(

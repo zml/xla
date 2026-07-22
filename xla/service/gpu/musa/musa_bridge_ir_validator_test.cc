@@ -563,7 +563,7 @@ TEST(MusaBridgeIrValidatorTest, RejectsUnlistedGenericIntrinsicAndCallCc) {
                        HasSubstr("capability=calling-convention")));
 }
 
-TEST(MusaBridgeIrValidatorTest, AcceptsMappingV2NoSignedZeros) {
+TEST(MusaBridgeIrValidatorTest, AcceptsActiveMappingNoSignedZeros) {
   EXPECT_THAT(
       Validate(Module("  %value = fadd nsz float 1.0, 2.0\n"
                       "  store float %value, ptr addrspace(1) %out, align 4")),
@@ -591,12 +591,44 @@ TEST(MusaBridgeIrValidatorTest, RejectsUncontractedFloatingPointSemantics) {
                HasSubstr("capability=llvm-intrinsic")));
 }
 
-TEST(MusaBridgeIrValidatorTest, RejectsUnqualifiedAtomics) {
+TEST(MusaBridgeIrValidatorTest, AcceptsExactMappingV3AtomicCmpXchg) {
   EXPECT_THAT(
-      Validate(Module("  %old = atomicrmw add ptr addrspace(1) %out, i32 1 "
-                      "monotonic")),
-      StatusIs(absl::StatusCode::kInvalidArgument,
-               HasSubstr("capability=atomics")));
+      Validate(Module("  %pair = cmpxchg ptr addrspace(1) %out, i32 0, i32 1 "
+                      "monotonic monotonic, align 4")),
+      IsOk());
+}
+
+TEST(MusaBridgeIrValidatorTest, RejectsUnqualifiedAtomics) {
+  for (absl::string_view body : {
+           "  %old = atomicrmw add ptr addrspace(1) %out, i32 1 monotonic",
+           "  %old = load atomic i32, ptr addrspace(1) %out monotonic, align 4",
+           "  store atomic i32 1, ptr addrspace(1) %out monotonic, align 4",
+           "  fence acquire",
+           "  %pair = cmpxchg weak ptr addrspace(1) %out, i32 0, i32 1 "
+           "monotonic monotonic, align 4",
+           "  %pair = cmpxchg volatile ptr addrspace(1) %out, i32 0, i32 1 "
+           "monotonic monotonic, align 4",
+           "  %pair = cmpxchg ptr addrspace(1) %out, i64 0, i64 1 monotonic "
+           "monotonic, align 4",
+           "  %pair = cmpxchg ptr addrspace(1) %out, i32 0, i32 1 acquire "
+           "monotonic, align 4",
+           "  %pair = cmpxchg ptr addrspace(1) %out, i32 0, i32 1 monotonic "
+           "monotonic, align 8",
+           "  %pair = cmpxchg ptr addrspace(1) %out, i32 0, i32 1 "
+           "syncscope(\"singlethread\") monotonic monotonic, align 4",
+           "  %generic = addrspacecast ptr addrspace(1) %out to ptr\n"
+           "  %pair = cmpxchg ptr %generic, i32 0, i32 1 monotonic monotonic, "
+           "align 4",
+           "  %workgroup = addrspacecast ptr addrspace(1) %out to ptr "
+           "addrspace(3)\n"
+           "  %pair = cmpxchg ptr addrspace(3) %workgroup, i32 0, i32 1 "
+           "monotonic monotonic, align 4",
+       }) {
+    SCOPED_TRACE(body);
+    EXPECT_THAT(Validate(Module(body)),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("capability=atomics")));
+  }
 }
 
 TEST(MusaBridgeIrValidatorTest, RejectsInvalidKernelList) {

@@ -56,8 +56,6 @@ constexpr MusaAddressSpaceSpec kAddressSpaceSpecs[] = {
 };
 
 constexpr MusaUnsupportedCapability kUnsupportedCapabilities[] = {
-    {"atomics",
-     "ordering, scope, type, and address-space mappings require C06 probes"},
     {"non_generic_math",
      "device-library and numerical behavior require C06/C08 probes"},
     {"subgroup_barrier",
@@ -214,6 +212,10 @@ std::string MusaShimCanonicalText() {
         spec.name, "\t", spec.pointer_width, "\t",
         spec.allowed_in_interchange ? "interchange" : "vendor", "\n");
   }
+  absl::StrAppend(
+      &text,
+      "atomic\tcmpxchg\ti32\tas1\tstrong\tnonvolatile\tsystem\tmonotonic\t"
+      "monotonic\talign4\n");
   for (const MusaShimSpec& spec : kShimSpecs) {
     absl::StrAppend(&text, "shim\t", spec.xla_symbol, "\t",
                     spec.vendor_intrinsic, "\t",

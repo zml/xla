@@ -837,6 +837,37 @@ bool IsAtomicIntegral(Type element_type) {
   return element_bitwidth == 32 || element_bitwidth == 64;
 }
 
+// Mapping v3 deliberately routes only scalar 32-bit integer (s32/u32) and f32
+// addition through the probed i32 cmpxchg contract. Keep this stricter than
+// the shared direct
+// atomic matcher: the yielded value must be the recognized binary operation,
+// and that operation must consume the current atomic value.
+bool IsQualifiedMusaAtomicRmw(AtomicRMWOp op) {
+  auto modifier_parameters = GetAtomicModifierParameters(op);
+  if (!modifier_parameters.has_value() ||
+      mlir::isa<mlir::VectorType>(modifier_parameters->first.getType())) {
+    return false;
+  }
+
+  Type element_type = op.getInput().getType().getElementType();
+  ml::AtomicBinOp bin_op = modifier_parameters->second;
+  if (!((element_type.isInteger(32) && bin_op == ml::AtomicBinOp::add) ||
+        (element_type.isF32() && bin_op == ml::AtomicBinOp::fadd))) {
+    return false;
+  }
+
+  auto& operations = op.getBody()->getOperations();
+  if (operations.size() != 2) return false;
+  Operation& modifier = operations.front();
+  Operation* terminator = op.getBody()->getTerminator();
+  if (modifier.getNumResults() != 1 || terminator->getNumOperands() != 1 ||
+      terminator->getOperand(0) != modifier.getResult(0)) {
+    return false;
+  }
+  return llvm::is_contained(modifier.getOperands(),
+                            op.getBody()->getArgument(0));
+}
+
 Value CreateBitcast(mlir::ImplicitLocOpBuilder& b, mlir::Operation* op,
                     Value value, Type ty) {
   if (value.getType().isIntOrFloat() && ty.isIntOrFloat()) {
@@ -873,8 +904,13 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
   LogicalResult matchAndRewrite(
       AtomicRMWOp op, mlir::PatternRewriter& rewriter) const override {
     if (device_spec_.IsMusaGpu()) {
-      return rewriter.notifyMatchFailure(
-          op, "MUSA shim mapping does not yet qualify atomics");
+      if (!IsQualifiedMusaAtomicRmw(op)) {
+        return rewriter.notifyMatchFailure(
+            op, "atomic operation is outside the MUSA mapping-v3 contract");
+      }
+      rewriteAsAtomicCAS(op, rewriter);
+      rewriter.replaceOp(op, op.getInput());
+      return success();
     }
     auto modifier_parameters = GetAtomicModifierParameters(op);
     if (modifier_parameters.has_value()) {
@@ -1281,6 +1317,12 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
           ml::ShlOp::create(rewriter, loc, bits_short, shift));
     }
 
+    if (device_spec_.IsMusaGpu()) {
+      auto global_ptr_ty = ml::LLVMPointerType::get(
+          op.getContext(), gpu::musa::kMusaAtomicCmpXchgAddressSpace);
+      addr = ml::AddrSpaceCastOp::create(rewriter, loc, global_ptr_ty, addr);
+    }
+
     // Load initial atomic value and create the loop.
     Value initial = ml::LoadOp::create(rewriter, loc, atomic_ty, addr);
     scf::WhileOp::create(
@@ -1327,7 +1369,9 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
           Value cmpxchg = ml::AtomicCmpXchgOp::create(
               b, loc, addr, old_value, new_value,
               /*success_ordering=*/ml::AtomicOrdering::monotonic,
-              /*failure_ordering=*/ml::AtomicOrdering::monotonic, sync_scope);
+              /*failure_ordering=*/ml::AtomicOrdering::monotonic, sync_scope,
+              device_spec_.IsMusaGpu() ? gpu::musa::kMusaAtomicCmpXchgAlignment
+                                       : 0);
           Value next = ml::ExtractValueOp::create(b, cmpxchg, 0);
           Value ok = ml::ExtractValueOp::create(b, cmpxchg, 1);
           Value low_bit =
@@ -1481,6 +1525,7 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
   mlir::LogicalResult RejectUnqualifiedMusaAtomics() {
     if (!device_spec_.IsMusaGpu()) return mlir::success();
     mlir::WalkResult result = getOperation()->walk([](AtomicRMWOp op) {
+      if (IsQualifiedMusaAtomicRmw(op)) return mlir::WalkResult::advance();
       op.emitOpError() << "is unsupported by MUSA shim mapping version "
                        << gpu::musa::kMusaShimMappingVersion;
       return mlir::WalkResult::interrupt();

@@ -1,6 +1,7 @@
 # Description:
 #   GPU-platform specific StreamExecutor support code.
 
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
@@ -251,6 +252,9 @@ cc_library(
         "gpu_init.h",
     ],
     copts = tsl_copts(),
+    local_defines = if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]),
     linkstatic = True,
     visibility = internal_visibility([
         "//tensorflow/compiler/tf2xla:__subpackages__",
@@ -266,6 +270,18 @@ cc_library(
         "@tsl//tsl/platform:logging",
     ],
     alwayslink = True,
+)
+
+xla_cc_test(
+    name = "gpu_init_test",
+    srcs = ["gpu_init_test.cc"],
+    local_defines = if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]),
+    deps = [
+        ":gpu_init_impl",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(

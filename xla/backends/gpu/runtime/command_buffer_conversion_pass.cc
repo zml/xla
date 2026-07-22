@@ -150,6 +150,14 @@ CommandBufferConfig GetCommandBufferConfig(
     }
   };
 
+  // MUSA command-buffer support is not implemented yet. Keep all thunks on
+  // the ordinary StreamExecutor path until the backend has a qualified graph
+  // implementation.
+  if (device_info.gpu_compute_capability().IsMusa()) {
+    VLOG(1) << "Command buffers are not supported by the MUSA backend";
+    config.enabled_commands.clear();
+  }
+
   // Check if CUDA/ROCM driver supports required features.
   if (device_info.gpu_compute_capability().IsCuda()) {
     if (std::min(device_info.runtime_version(), device_info.driver_version()) <

@@ -82,7 +82,7 @@ TEST(MusaShimAbiTest, AddressSpacesMatchPinnedSdk) {
 
 TEST(MusaShimAbiTest, RiskyCapabilitiesAreExplicitlyRejected) {
   constexpr absl::string_view kRequired[] = {
-      "atomics", "non_generic_math", "subgroup_barrier", "subgroup_vote"};
+      "non_generic_math", "subgroup_barrier", "subgroup_vote"};
   ASSERT_EQ(MusaUnsupportedCapabilities().size(), std::size(kRequired));
   for (int i = 0; i < std::size(kRequired); ++i) {
     EXPECT_EQ(MusaUnsupportedCapabilities()[i].name, kRequired[i]);
@@ -98,9 +98,20 @@ TEST(MusaShimAbiTest, CanonicalMappingHasReviewedSha256) {
       absl::StrContains(canonical, "as\t1\tglobal\tglobal\t64\tinterchange"));
   EXPECT_TRUE(absl::StrContains(
       canonical, "as\t4\tvendor-internal\treserved\t32\tvendor"));
+  EXPECT_TRUE(absl::StrContains(
+      canonical,
+      "atomic\tcmpxchg\ti32\tas1\tstrong\tnonvolatile\tsystem\tmonotonic\t"
+      "monotonic\talign4"));
   EXPECT_FALSE(absl::StrContains(canonical, "llvm.nvvm"));
   EXPECT_FALSE(absl::StrContains(canonical, "llvm.amdgcn"));
   EXPECT_EQ(Sha256Hex(canonical), kMusaShimMappingSha256);
+}
+
+TEST(MusaShimAbiTest, MappingV3AtomicContractIsNarrowAndSelfConsistent) {
+  EXPECT_EQ(kMusaShimMappingVersion, 3);
+  EXPECT_EQ(kMusaAtomicCmpXchgAddressSpace, 1);
+  EXPECT_EQ(kMusaAtomicCmpXchgBitWidth, 32);
+  EXPECT_EQ(kMusaAtomicCmpXchgAlignment, 4);
 }
 
 TEST(MusaShimAbiTest, ShimSemanticsMatchPinnedCompilerDeclarations) {

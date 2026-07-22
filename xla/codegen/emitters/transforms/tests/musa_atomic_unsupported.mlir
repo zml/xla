@@ -16,15 +16,14 @@
 // RUN:   -xla-lower-tensors="gpu_device_info='threads_per_warp: 128 musa_compute_capability {architecture: \"mp_21\" major: 2 minor: 1 hardware_warp_size: 128 logical_subgroup_size: 32}'" \
 // RUN:   2>&1 | FileCheck %s
 
-func.func @atomic_rmw_f32(%input: tensor<8xf32>, %index: index)
-    -> tensor<8xf32> {
-  %result = xla.atomic_rmw %input[%index] : tensor<8xf32> {
-    ^bb0(%current : f32):
-      %one = arith.constant 1.0 : f32
-      %sum = arith.addf %current, %one : f32
-      xla.yield %sum : f32
+func.func @atomic_rmw_i64(%input: tensor<8xi64>, %index: index, %update: i64)
+    -> tensor<8xi64> {
+  %result = xla.atomic_rmw %input[%index] : tensor<8xi64> {
+    ^bb0(%current : i64):
+      %sum = arith.addi %current, %update : i64
+      xla.yield %sum : i64
   }
-  return %result : tensor<8xf32>
+  return %result : tensor<8xi64>
 }
 
-// CHECK: error: 'xla.atomic_rmw' op is unsupported by MUSA shim mapping version 2
+// CHECK: error: 'xla.atomic_rmw' op is unsupported by MUSA shim mapping version 3

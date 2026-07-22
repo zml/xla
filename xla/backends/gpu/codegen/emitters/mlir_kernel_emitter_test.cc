@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
+#include "xla/backends/gpu/codegen/sort.h"
 #include "xla/codegen/emitters/computation_partitioner.h"
 #include "xla/codegen/emitters/transforms/musa_gpu_to_llvm.h"
 #include "xla/codegen/llvm_kernel_source.h"
@@ -233,11 +234,45 @@ TEST_F(MlirKernelFusionTest, MusaFusionQualificationFailsClosed) {
   EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kScatter).IsAllowed());
   EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kTranspose).IsAllowed());
   EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kConcatenate).IsAllowed());
+  EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kSort).IsAllowed());
   EXPECT_TRUE(
       MusaFusionEmitterQualification(Kind::kCustomFusion).IsForbidden());
   EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kTriton).IsForbidden());
   EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kCuDnn).IsForbidden());
-  EXPECT_TRUE(MusaFusionEmitterQualification(Kind::kSort).IsForbidden());
+}
+
+TEST_F(MlirKernelFusionTest, SelectsMusaLegacyBitonicSortFusion) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+    HloModule musa_sort
+
+    less_than {
+      lhs.0 = f32[] parameter(0)
+      rhs.0 = f32[] parameter(1)
+      lhs.1 = s32[] parameter(2)
+      rhs.1 = s32[] parameter(3)
+      ROOT lt = pred[] compare(lhs.0, rhs.0), direction=LT
+    }
+
+    fused_computation {
+      p0 = f32[256] parameter(0)
+      iota = s32[256] iota(), iota_dimension=0
+      ROOT sort = (f32[256], s32[256]) sort(p0, iota), dimensions={0}, to_apply=less_than, is_stable=false
+    }
+
+    ENTRY main {
+      p = f32[256] parameter(0)
+      ROOT fusion = (f32[256], s32[256]) fusion(p), kind=kInput, calls=fused_computation
+    })"));
+  stream_executor::DeviceDescription device = MusaS80DeviceInfo();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(*root, device);
+  ASSERT_EQ(analysis.emitter_fusion_kind(),
+            HloFusionAnalysis::EmitterFusionKind::kSort);
+
+  std::unique_ptr<FusionInterface> emitter =
+      GetFusionEmitter(PreBufferAssignmentFusionInfo{analysis});
+  EXPECT_NE(dynamic_cast<SortFusion*>(emitter.get()), nullptr);
 }
 
 TEST_F(MlirKernelFusionTest, MusaLLVMModuleUsesShimAbiAndKernelMarker) {

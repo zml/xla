@@ -260,6 +260,18 @@ entry:
 }
 )llvm";
 
+constexpr absl::string_view kAtomicCmpXchgIr = R"llvm(
+source_filename = "c13_atomic_cmpxchg_positive"
+target datalayout = "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128"
+target triple = "mtgpu-mt-musa"
+
+define void @atomic_probe(ptr addrspace(1) %output) {
+entry:
+  %pair = cmpxchg ptr addrspace(1) %output, i32 0, i32 1 monotonic monotonic, align 4
+  ret void
+}
+)llvm";
+
 constexpr absl::string_view kClock32Ir = R"llvm(
 source_filename = "c06_clock32_provider_negative"
 target datalayout = "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128"
@@ -729,7 +741,7 @@ std::unique_ptr<Kernel> LoadKernel(MusaExecutor& executor,
 }
 
 TEST(MusaLlvmBridgeLiveTest,
-     CompilesDeterministicallyAndExecutesMappingV2OnS80) {
+     CompilesDeterministicallyAndExecutesActiveMappingOnS80) {
   TF_ASSERT_OK_AND_ASSIGN(QualifiedToolchain toolchain,
                           LocateQualifiedToolchain());
   const std::vector<std::string> kernels = {"barrier_reverse", "global_probe",
@@ -902,7 +914,45 @@ TEST(MusaLlvmBridgeLiveTest,
   executor.Deallocate(&left);
 }
 
-TEST(MusaLlvmBridgeLiveTest, RejectsAtomicsUntilMappingVersionBump) {
+TEST(MusaLlvmBridgeLiveTest, CompilesAndExecutesMappingV3AtomicCmpXchgOnS80) {
+  TF_ASSERT_OK_AND_ASSIGN(QualifiedToolchain toolchain,
+                          LocateQualifiedToolchain());
+  MusaBridgeCompileRequest request =
+      MakeRequest("c13_atomic_cmpxchg_positive", kAtomicCmpXchgIr,
+                  {"atomic_probe"}, {}, toolchain.fingerprints);
+  TF_ASSERT_OK_AND_ASSIGN(
+      MusaBridgeCompileResponse response,
+      InvokeBridge(toolchain, request, "atomic-cmpxchg-positive"));
+  ASSERT_EQ(response.status(), MUSA_BRIDGE_STATUS_OK)
+      << response.ShortDebugString();
+  ASSERT_FALSE(response.mubin().empty());
+
+  const std::vector<uint8_t> mubin(response.mubin().begin(),
+                                   response.mubin().end());
+  MusaExecutor executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+  TF_ASSERT_OK(executor.Init());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor.CreateStream(/*priority=*/std::nullopt));
+  DeviceAddressBase output = executor.Allocate(sizeof(uint32_t), 0);
+  ASSERT_FALSE(output.is_null());
+  TF_ASSERT_OK(stream->MemZero(&output, output.size()));
+  std::unique_ptr<Kernel> kernel =
+      LoadKernel(executor, mubin, "atomic_probe", 1);
+  ASSERT_NE(kernel, nullptr);
+  KernelArgsPackedArray arguments(/*num_args=*/1);
+  arguments.add_argument(output);
+  TF_ASSERT_OK(
+      kernel->Launch(ThreadDim(128), BlockDim(1), stream.get(), arguments));
+  uint32_t result = 0;
+  TF_ASSERT_OK(stream->Memcpy(&result, output, sizeof(result)));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  EXPECT_EQ(result, 1);
+  kernel.reset();
+  stream.reset();
+  executor.Deallocate(&output);
+}
+
+TEST(MusaLlvmBridgeLiveTest, RejectsUnqualifiedAtomicRmwUnderMappingV3) {
   TF_ASSERT_OK_AND_ASSIGN(QualifiedToolchain toolchain,
                           LocateQualifiedToolchain());
   MusaBridgeCompileRequest request =

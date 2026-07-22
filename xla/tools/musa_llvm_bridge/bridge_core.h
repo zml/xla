@@ -24,7 +24,7 @@ limitations under the License.
 
 namespace xla::gpu::musa::bridge {
 
-// A vendor-LLVM-14-native module serialized after the complete mapping-v2
+// A vendor-LLVM-14-native module serialized after the complete active mapping
 // translation. Keeping this interface textual prevents vendor LLVM C++ types
 // from escaping the isolated bridge process or leaking into the PJRT plugin.
 struct VendorLlvmModule {
@@ -39,10 +39,10 @@ struct VendorLlvmModule {
 absl::StatusOr<std::string> LoadedVendorLlvmSharedObjectPath();
 
 // Parses and verifies the normalized interchange module with the MUSA SDK's
-// LLVM 14, validates mapping-v2 again inside the isolated process, replaces
-// each XLA shim call structurally with its registered vendor intrinsic, and
-// installs the native MUSA kernel ABI. The translated module is verified a
-// second time before it is returned.
+// LLVM 14, validates the active mapping again inside the isolated process,
+// replaces each XLA shim call structurally with its registered vendor
+// intrinsic, and installs the native MUSA kernel ABI. The translated module is
+// verified a second time before it is returned.
 absl::StatusOr<VendorLlvmModule> TranslateMusaBridgeRequestToVendorLlvm(
     const MusaBridgeCompileRequest& request);
 

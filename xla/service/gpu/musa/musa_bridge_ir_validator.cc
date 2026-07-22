@@ -102,6 +102,22 @@ bool HasOnlyNoSignedZeros(const llvm::FastMathFlags& flags) {
          !flags.allowContract() && !flags.approxFunc();
 }
 
+// Mapping v3's sole atomic primitive. This is intentionally an exact
+// allowlist: every type, address space, ordering, scope, and flag was bound to
+// the S80 probe before the mapping version changed.
+bool IsQualifiedMusaAtomicCmpXchg(const llvm::AtomicCmpXchgInst& cmpxchg) {
+  return cmpxchg.getPointerAddressSpace() == kMusaAtomicCmpXchgAddressSpace &&
+         cmpxchg.getCompareOperand()->getType()->isIntegerTy(
+             kMusaAtomicCmpXchgBitWidth) &&
+         cmpxchg.getNewValOperand()->getType()->isIntegerTy(
+             kMusaAtomicCmpXchgBitWidth) &&
+         !cmpxchg.isWeak() && !cmpxchg.isVolatile() &&
+         cmpxchg.getSyncScopeID() == llvm::SyncScope::System &&
+         cmpxchg.getSuccessOrdering() == llvm::AtomicOrdering::Monotonic &&
+         cmpxchg.getFailureOrdering() == llvm::AtomicOrdering::Monotonic &&
+         cmpxchg.getAlign().value() == kMusaAtomicCmpXchgAlignment;
+}
+
 absl::Status Rejected(const MusaBridgeIrMetadata& metadata,
                       absl::string_view capability, absl::string_view detail) {
   return absl::InvalidArgumentError(absl::StrFormat(
@@ -228,7 +244,7 @@ absl::Status ValidateType(const llvm::Type* type,
   } else if (const auto* vector = llvm::dyn_cast<llvm::VectorType>(type)) {
     if (vector->getElementCount().isScalable()) {
       return Rejected(metadata, "scalable-vector",
-                      "scalable vectors are not in mapping version 2");
+                      "scalable vectors are not in the active mapping");
     }
     return ValidateType(vector->getElementType(), metadata, visited);
   } else if (llvm::isa<llvm::TargetExtType>(type)) {
@@ -478,6 +494,7 @@ absl::Status ValidateGlobalObjectState(const llvm::GlobalVariable& global,
 
 bool HasReviewedLlvm14PureIntrinsicAttributes(const llvm::Function& function) {
   switch (function.getIntrinsicID()) {
+    case llvm::Intrinsic::fabs:
     case llvm::Intrinsic::sin:
     case llvm::Intrinsic::smax:
     case llvm::Intrinsic::smin:
@@ -749,7 +766,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
       if (!IsAllowedGenericIntrinsic(function.getIntrinsicID())) {
         return Rejected(metadata, "llvm-intrinsic",
                         absl::StrCat("intrinsic ", function_name,
-                                     " is not in mapping version 2"));
+                                     " is not in the active mapping"));
       }
       if (absl::Status status = ValidateIntrinsicAttributes(function, metadata);
           !status.ok()) {
@@ -820,7 +837,7 @@ absl::Status ValidateFunctions(const llvm::Module& module,
           return Rejected(metadata, "fast-math-flags",
                           absl::StrCat("function ", function_name,
                                        " contains fast-math flags outside the "
-                                       "mapping-v2 nsz-only contract"));
+                                       "active mapping's nsz-only contract"));
         }
         for (const llvm::Use& operand : instruction.operands()) {
           if (absl::Status status = ValidateValueType(*operand.get(), metadata);
@@ -849,8 +866,8 @@ absl::Status ValidateFunctions(const llvm::Module& module,
           if (!call->getAttributes().isEmpty()) {
             return Rejected(metadata, "call-site-attributes",
                             absl::StrCat("call in function ", function_name,
-                                         " carries attributes outside mapping "
-                                         "version 1"));
+                                         " carries attributes outside the "
+                                         "active mapping"));
           }
           if (call->isInlineAsm()) {
             return Rejected(metadata, "inline-assembly",
@@ -873,19 +890,26 @@ absl::Status ValidateFunctions(const llvm::Module& module,
                                          " uses a non-C calling convention"));
           }
         }
+        if (const auto* cmpxchg =
+                llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&instruction)) {
+          if (!IsQualifiedMusaAtomicCmpXchg(*cmpxchg)) {
+            return Rejected(metadata, "atomics",
+                            "cmpxchg is outside the exact mapping-v3 contract");
+          }
+          continue;
+        }
         if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
             (load != nullptr && load->isAtomic()) ||
-            llvm::isa<llvm::AtomicRMWInst, llvm::AtomicCmpXchgInst,
-                      llvm::FenceInst>(instruction)) {
+            llvm::isa<llvm::AtomicRMWInst, llvm::FenceInst>(instruction)) {
           return Rejected(
               metadata, "atomics",
-              "atomics are reserved pending the C06 mapping probes");
+              "atomic instruction is outside the exact mapping-v3 contract");
         }
         if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
             store != nullptr && store->isAtomic()) {
           return Rejected(
               metadata, "atomics",
-              "atomics are reserved pending the C06 mapping probes");
+              "atomic instruction is outside the exact mapping-v3 contract");
         }
       }
     }
@@ -942,19 +966,19 @@ absl::Status ValidateMusaBridgeIr(absl::string_view llvm_ir,
   }
   if (!module->aliases().empty()) {
     return Rejected(metadata, "global-alias",
-                    "global aliases are not in mapping version 2");
+                    "global aliases are not in the active mapping");
   }
   if (!module->ifuncs().empty()) {
     return Rejected(metadata, "global-ifunc",
-                    "indirect functions are not in mapping version 2");
+                    "indirect functions are not in the active mapping");
   }
   if (!module->getComdatSymbolTable().empty()) {
     return Rejected(metadata, "module-comdat",
-                    "COMDAT definitions are not in mapping version 2");
+                    "COMDAT definitions are not in the active mapping");
   }
   if (module->named_metadata_begin() != module->named_metadata_end()) {
     return Rejected(metadata, "named-metadata",
-                    "named metadata is not in mapping version 2");
+                    "named metadata is not in the active mapping");
   }
   for (llvm::StructType* type : module->getIdentifiedStructTypes()) {
     llvm::SmallPtrSet<const llvm::Type*, 16> visited_types;

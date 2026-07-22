@@ -4833,6 +4833,28 @@ xla_test(
     ],
 )
 
+xla_cc_test(
+    name = "musa_command_buffer_conversion_pass_test",
+    srcs = ["musa_command_buffer_conversion_pass_test.cc"],
+    deps = [
+        ":command_buffer_conversion_pass",
+        ":device_to_device_copy_thunk",
+        ":thunk",
+        ":thunk_pass_pipeline",
+        "//xla:debug_options_flags",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla:xla_proto_cc",
+        "//xla/service:buffer_assignment",
+        "//xla/service:shaped_slice",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "thunk_buffer_debug_pass",
     srcs = [

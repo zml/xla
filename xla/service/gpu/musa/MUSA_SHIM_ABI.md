@@ -10,11 +10,11 @@ native kernel ABI.
 `musa_shim_abi.def` is the single mapping source. Each enabled row freezes the
 XLA symbol, exact function type, memory effects, convergence, required
 attributes, vendor intrinsic, minimum mapping revision, and `mp_21` target.
-Current XLA consumes the generated runtime table; the C06 bridge will consume
-the same library and validate its canonical fingerprint before translation.
+Current XLA and the isolated bridge consume the generated runtime table; the
+bridge validates its canonical fingerprint before translation.
 Required attributes match the pinned vendor declarations literally; coordinate
 reads are `nounwind` and `memory(none)` but do not claim `willreturn`. Shim ABI
-v1 currently uses mapping version 2 and the canonical mapping SHA-256 in
+v1 currently uses mapping version 3 and the canonical mapping SHA-256 in
 `musa_shim_abi.h`.
 
 The base mapping admits the compiler-source-verified register reads for thread,
@@ -50,10 +50,28 @@ Mapping version 2 also admits only the `nsz` fast-math flag needed by shared
 reduction emitters. Every other fast-math relaxation is rejected independently
 by current LLVM validation and vendor LLVM 14 validation.
 
-Subgroup synchronization, vote, atomics, and non-generic math remain named
-unsupported capability categories. Nonconstant or non-32 shuffle widths also
-fail with a specific diagnostic. Unknown shims and silent CUDA/NVVM fallback
-are never permitted.
+Mapping version 3 adds exactly one atomic instruction contract: a strong,
+non-volatile scalar i32 `cmpxchg` on global AS1, system/default sync scope,
+monotonic success and failure orderings, and alignment 4. The canonical
+mapping text binds every one of those properties. Current XLA routes only
+scalar 32-bit integer (s32/u32) and f32 add reductions through the shared
+compare-and-swap loop;
+f32 values are compared and exchanged through their bitwise i32
+representation. The lowering explicitly casts tensor-buffer addresses to AS1
+and emits alignment 4.
+
+The contract was qualified against MUSA 4.0.1 on S80 `mp_21`: vendor LLVM 14
+accepted the exact interchange form, `mcc` produced a MUBIN, and a driver
+launch changed an initialized i32 from 0 to 1. Current-LLVM validation and the
+isolated vendor-LLVM validator independently enforce the same exact allowlist.
+Atomic loads/stores, `atomicrmw`, fences, weak or volatile cmpxchg, other
+types/address spaces/scopes/orderings/alignments, and every unrecognized
+atomic form remain fail-closed.
+
+Subgroup synchronization, vote, and non-generic math remain named unsupported
+capability categories. Nonconstant or non-32 shuffle widths also fail with a
+specific diagnostic. Unknown shims and silent CUDA/NVVM fallback are never
+permitted.
 
 The native target contract is:
 

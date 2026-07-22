@@ -659,14 +659,17 @@ void LogDebugOptions(HloModule* hlo_module) {
 }
 
 absl::Status RunPreSPMDPartitionerPasses(HloModule* hlo_module,
-                                         CompilationStats* compilation_stats) {
+                                         CompilationStats* compilation_stats,
+                                         bool enable_cub_scan_rewrite) {
   HloPassPipeline pre_spmd_pipeline("pre-spmd-partitioner", compilation_stats);
   // Run some IR cleanup passes before running the SPMD partitioning
   // passes.
   pre_spmd_pipeline.AddPass<CuDnnCustomCallConverter>();
   pre_spmd_pipeline.AddPass<CompositeRewriter>();
   pre_spmd_pipeline.AddPass<ConvertMemoryPlacementToInternalAnnotations>();
-  pre_spmd_pipeline.AddPass<ScanRewriter>();
+  if (enable_cub_scan_rewrite) {
+    pre_spmd_pipeline.AddPass<ScanRewriter>();
+  }
   pre_spmd_pipeline.AddPass<FlattenCallGraph>();
   pre_spmd_pipeline.AddPass<CallInliner>(
       /*single_call_site=*/false, /*update_domain=*/false,
@@ -811,7 +814,7 @@ absl::Status RunOptimizationPasses(
   // would do.
   pipeline.AddPass<PermutationSortExpander>();
 
-  if (debug_options.xla_gpu_enable_cub_radix_sort()) {
+  if (!gpu_version.IsMusa() && debug_options.xla_gpu_enable_cub_radix_sort()) {
     pipeline.AddPass<SortRewriter>(gpu_target_config.device_description,
                                    is_deviceless, is_early_exit_with_layouts);
   }
@@ -881,6 +884,14 @@ absl::Status RunOptimizationPasses(
     pipeline.AddPass<ReduceWindowResizer>();
   }
   pipeline.AddPass<ScanExpander>();
+  if (gpu_version.IsMusa()) {
+    // AssociativeScanRewriter creates a reducer wrapper containing a call.
+    // The MUSA MLIR fusion emitter requires calls to be inlined before
+    // indexing analysis.
+    pipeline.AddPass<CallInliner>(
+        /*single_call_site=*/false, /*update_domain=*/false,
+        /*composites_to_preserve=*/absl::flat_hash_set<std::string>());
+  }
 
   DynamicPadderOptions dynamic_padder_options;
 
@@ -913,7 +924,7 @@ absl::Status RunOptimizationPasses(
   // DynamicPadder creates a stable KeyValue sort for dynamic reshapes.
   pipeline.AddPass<DynamicPadder>(dynamic_padder_options);
   // SortRewriter needs to run before StableSortExpander.
-  if (debug_options.xla_gpu_enable_cub_radix_sort()) {
+  if (!gpu_version.IsMusa() && debug_options.xla_gpu_enable_cub_radix_sort()) {
     pipeline.AddPass<SortRewriter>(gpu_target_config.device_description,
                                    is_deviceless, is_early_exit_with_layouts);
   }
@@ -1762,7 +1773,11 @@ absl::Status GpuCompiler::OptimizeHloModule(
     RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
   }
 
-  RETURN_IF_ERROR(RunPreSPMDPartitionerPasses(hlo_module, compilation_stats));
+  RETURN_IF_ERROR(RunPreSPMDPartitionerPasses(
+      hlo_module, compilation_stats,
+      !gpu_topology.gpu_target_config()
+           .device_description.gpu_compute_capability()
+           .IsMusa()));
   // Set max_windowed_einsum_iteration to slice_size, as there will be
   // significant overhead when scaled beyond the maximum size of the
   // fast-interconnect domain.

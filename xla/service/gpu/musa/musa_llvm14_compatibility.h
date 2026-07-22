@@ -32,7 +32,7 @@ namespace xla::gpu::musa {
 // normalization rule, or an LLVM-14 spelling changes. C09 includes it in the
 // compiler-provider and executable-cache identity.
 inline constexpr char kMusaLlvm14CompatibilityRevision[] =
-    "musa-llvm14-compat-v1";
+    "musa-llvm14-compat-v2";
 
 struct MusaLlvm14CompatibilityResult {
   std::string normalized_llvm;

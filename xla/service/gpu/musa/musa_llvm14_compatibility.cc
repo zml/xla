@@ -38,6 +38,7 @@ limitations under the License.
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -122,7 +123,8 @@ absl::Status StripReviewedNamedMetadata(llvm::Module& module,
     }
     if (named.getName() != "llvm.module.flags") {
       return Rejected(module_name, "named-metadata",
-                      "named metadata is outside compatibility revision 1");
+                      "named metadata is outside the active compatibility "
+                      "revision");
     }
 
     // Debug-only flags do not affect executable semantics after debug
@@ -144,6 +146,105 @@ absl::Status StripReviewedNamedMetadata(llvm::Module& module,
     erase.push_back(&named);
   }
   for (llvm::NamedMDNode* named : erase) named->eraseFromParent();
+  return absl::OkStatus();
+}
+
+bool IsLegacyBitonicCoordinateShim(const llvm::Function& function) {
+  const MusaShimSpec* spec = FindMusaShim(function.getName());
+  if (spec == nullptr) return false;
+  switch (spec->id) {
+    case MusaShimId::kBlockIdX:
+    case MusaShimId::kBlockIdY:
+    case MusaShimId::kBlockIdZ:
+    case MusaShimId::kThreadIdX:
+    case MusaShimId::kThreadIdY:
+    case MusaShimId::kThreadIdZ:
+      return true;
+    default:
+      return false;
+  }
+}
+
+absl::Status StripLegacyBitonicOptimizationHints(
+    llvm::Module& module, absl::string_view module_name) {
+  if (llvm::Function* assume = module.getFunction("llvm.assume")) {
+    if (!assume->isDeclaration() ||
+        assume->getLinkage() != llvm::GlobalValue::ExternalLinkage ||
+        assume->getCallingConv() != llvm::CallingConv::C ||
+        assume->getIntrinsicID() != llvm::Intrinsic::assume ||
+        !assume->getReturnType()->isVoidTy() || assume->arg_size() != 1 ||
+        !assume->getArg(0)->getType()->isIntegerTy(1)) {
+      return Rejected(module_name, "legacy-bitonic-hints",
+                      "llvm.assume is outside the generated bitonic profile");
+    }
+    const llvm::AttributeList canonical = llvm::Intrinsic::getAttributes(
+        module.getContext(), llvm::Intrinsic::assume,
+        assume->getFunctionType());
+    if (assume->getAttributes() != canonical) {
+      return Rejected(module_name, "legacy-bitonic-hints",
+                      "llvm.assume attributes are outside the generated "
+                      "bitonic profile");
+    }
+
+    std::vector<llvm::CallInst*> calls;
+    calls.reserve(assume->getNumUses());
+    for (llvm::User* user : assume->users()) {
+      auto* call = llvm::dyn_cast<llvm::CallInst>(user);
+      llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> metadata;
+      if (call != nullptr) call->getAllMetadata(metadata);
+      if (call == nullptr || call->getCalledFunction() != assume ||
+          call->getCallingConv() != llvm::CallingConv::C ||
+          call->isTailCall() || call->arg_size() != 1 ||
+          !call->getArgOperand(0)->getType()->isIntegerTy(1) ||
+          !call->getType()->isVoidTy() || !call->getAttributes().isEmpty() ||
+          call->hasOperandBundles() || !metadata.empty() ||
+          call->getDebugLoc()) {
+        return Rejected(
+            module_name, "legacy-bitonic-hints",
+            "llvm.assume use is outside the generated bitonic profile");
+      }
+      calls.push_back(call);
+    }
+    // The generated assume communicates only an optimization promise. Erasing
+    // this exact plain form widens semantics and avoids exposing an unqualified
+    // current-LLVM intrinsic to vendor LLVM 14.
+    for (llvm::CallInst* call : calls) call->eraseFromParent();
+    if (!assume->use_empty()) {
+      return Rejected(module_name, "legacy-bitonic-hints",
+                      "llvm.assume retains an unsupported use");
+    }
+    assume->eraseFromParent();
+  }
+
+  for (llvm::Function& function : module.functions()) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        llvm::MDNode* range =
+            instruction.getMetadata(llvm::LLVMContext::MD_range);
+        if (range == nullptr) continue;
+        auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        llvm::Function* callee =
+            call == nullptr ? nullptr : call->getCalledFunction();
+        const auto* lower = range->getNumOperands() == 2
+                                ? llvm::mdconst::dyn_extract<llvm::ConstantInt>(
+                                      range->getOperand(0).get())
+                                : nullptr;
+        const auto* upper = range->getNumOperands() == 2
+                                ? llvm::mdconst::dyn_extract<llvm::ConstantInt>(
+                                      range->getOperand(1).get())
+                                : nullptr;
+        if (callee == nullptr || !IsLegacyBitonicCoordinateShim(*callee) ||
+            !instruction.getType()->isIntegerTy(32) || lower == nullptr ||
+            upper == nullptr || lower->getBitWidth() != 32 ||
+            upper->getBitWidth() != 32 || !lower->isZero() || upper->isZero()) {
+          return Rejected(
+              module_name, "legacy-bitonic-hints",
+              "range metadata is outside the generated coordinate profile");
+        }
+        instruction.setMetadata(llvm::LLVMContext::MD_range, nullptr);
+      }
+    }
+  }
   return absl::OkStatus();
 }
 
@@ -197,6 +298,42 @@ absl::Status NormalizeKernelArgumentAttributes(llvm::Function& function,
   return absl::OkStatus();
 }
 
+absl::Status NormalizeLocalHelperArgumentAttributes(
+    llvm::Function& function, absl::string_view module_name) {
+  if (function.getAttributes().hasRetAttrs() ||
+      function.getAttributes().getFnAttrs().getNumAttributes() != 0) {
+    return Rejected(module_name, "helper-attributes",
+                    "local helper return and function attributes are not "
+                    "qualified");
+  }
+  for (llvm::Argument& argument : function.args()) {
+    for (llvm::Attribute attribute : argument.getAttributes()) {
+      if (attribute.isStringAttribute() || !argument.getType()->isPointerTy() ||
+          (attribute.getKindAsEnum() != llvm::Attribute::NoAlias &&
+           attribute.getKindAsEnum() != llvm::Attribute::Dereferenceable)) {
+        return Rejected(module_name, "helper-attributes",
+                        "only noalias and bounded dereferenceable on local "
+                        "helper pointer arguments are qualified");
+      }
+      if (attribute.getKindAsEnum() == llvm::Attribute::Dereferenceable &&
+          (attribute.getDereferenceableBytes() == 0 ||
+           attribute.getDereferenceableBytes() > kMaxMusaInterchangeIrBytes)) {
+        return Rejected(module_name, "helper-attributes",
+                        "local helper dereferenceable bytes are invalid");
+      }
+    }
+    // These are optimization-only promises, not part of the textual vendor
+    // LLVM helper ABI, and are safe to discard at this boundary.
+    argument.removeAttr(llvm::Attribute::NoAlias);
+    argument.removeAttr(llvm::Attribute::Dereferenceable);
+  }
+  if (!function.getAttributes().isEmpty()) {
+    return Rejected(module_name, "helper-attributes",
+                    "local helper attributes remain after normalization");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status NormalizePureIntrinsicAttributes(llvm::Function& function,
                                               absl::string_view module_name) {
   const llvm::AttributeList current = llvm::Intrinsic::getAttributes(
@@ -225,6 +362,7 @@ absl::Status NormalizeFunctions(llvm::Module& module,
   for (llvm::Function& function : module.functions()) {
     if (function.isIntrinsic()) {
       switch (function.getIntrinsicID()) {
+        case llvm::Intrinsic::fabs:
         case llvm::Intrinsic::smax:
         case llvm::Intrinsic::smin:
         case llvm::Intrinsic::sin:
@@ -251,6 +389,13 @@ absl::Status NormalizeFunctions(llvm::Module& module,
       if (!function.isDeclaration() && !function.hasLocalLinkage()) {
         return Rejected(module_name, "kernel-marker",
                         "externally visible definition lacks the v1 marker");
+      }
+      if (!function.isDeclaration()) {
+        if (absl::Status status =
+                NormalizeLocalHelperArgumentAttributes(function, module_name);
+            !status.ok()) {
+          return status;
+        }
       }
       continue;
     }
@@ -534,6 +679,37 @@ struct DecimalFloatLiteral {
   std::string llvm14_spelling;
 };
 
+absl::StatusOr<std::optional<DecimalFloatLiteral>> ParseSpecialFloatLiteral(
+    absl::string_view current_text, size_t literal_start,
+    absl::string_view module_name) {
+  struct SpecialValue {
+    absl::string_view spelling;
+    uint32_t single_bits;
+  };
+  constexpr SpecialValue kSpecialValues[] = {
+      {"+inf", 0x7f800000},
+      {"-inf", 0xff800000},
+      {"nan", 0x7fc00000},
+  };
+  for (const SpecialValue& special : kSpecialValues) {
+    const size_t end = literal_start + special.spelling.size();
+    if (end > current_text.size() ||
+        current_text.substr(literal_start, special.spelling.size()) !=
+            special.spelling ||
+        (end < current_text.size() &&
+         !IsLlvmTokenTerminator(current_text[end]))) {
+      continue;
+    }
+    llvm::APFloat value(llvm::APFloat::IEEEsingle(),
+                        llvm::APInt(32, special.single_bits));
+    absl::StatusOr<std::string> rewritten =
+        FormatLlvm14FloatLiteral(std::move(value), module_name);
+    if (!rewritten.ok()) return rewritten.status();
+    return DecimalFloatLiteral{end, std::move(*rewritten)};
+  }
+  return std::nullopt;
+}
+
 absl::StatusOr<std::optional<DecimalFloatLiteral>> ParseDecimalFloatLiteral(
     absl::string_view current_text, size_t literal_start,
     absl::string_view module_name) {
@@ -634,16 +810,67 @@ absl::StatusOr<size_t> RewriteDecimalFloatAfterType(
   }
 
   if (current_text[operand_start] != '[') {
-    absl::StatusOr<std::optional<DecimalFloatLiteral>> literal =
-        ParseDecimalFloatLiteral(current_text, operand_start, module_name);
-    if (!literal.ok()) return literal.status();
-    if (!literal->has_value() || (*literal)->llvm14_spelling.empty()) {
-      return type_start;
+    auto parse_literal = [&](size_t start)
+        -> absl::StatusOr<std::optional<DecimalFloatLiteral>> {
+      absl::StatusOr<std::optional<DecimalFloatLiteral>> literal =
+          ParseSpecialFloatLiteral(current_text, start, module_name);
+      if (!literal.ok() || literal->has_value()) return literal;
+      return ParseDecimalFloatLiteral(current_text, start, module_name);
+    };
+
+    // Binary floating-point instructions spell the type only once. Therefore
+    // the second operand of e.g. `fcmp one float %value, +inf` must be examined
+    // together with the first operand; a token-only scan would either miss it
+    // or risk rewriting comments and quoted strings.
+    const size_t line_end = current_text.find('\n', operand_start);
+    size_t bounded_line_end =
+        line_end == absl::string_view::npos ? current_text.size() : line_end;
+    const size_t comment_start = current_text.find(';', operand_start);
+    if (comment_start != absl::string_view::npos &&
+        comment_start < bounded_line_end) {
+      bounded_line_end = comment_start;
     }
-    normalized.append(
-        current_text.substr(type_start, operand_start - type_start));
-    normalized.append((*literal)->llvm14_spelling);
-    return (*literal)->end;
+
+    absl::StatusOr<std::optional<DecimalFloatLiteral>> first =
+        parse_literal(operand_start);
+    if (!first.ok()) return first.status();
+
+    size_t second_start = absl::string_view::npos;
+    absl::StatusOr<std::optional<DecimalFloatLiteral>> second = std::nullopt;
+    const size_t comma = current_text.find(',', operand_start);
+    if (comma != absl::string_view::npos && comma < bounded_line_end) {
+      second_start = comma + 1;
+      while (second_start < bounded_line_end &&
+             (current_text[second_start] == ' ' ||
+              current_text[second_start] == '\t')) {
+        ++second_start;
+      }
+      if (second_start < bounded_line_end) {
+        second = parse_literal(second_start);
+        if (!second.ok()) return second.status();
+      }
+    }
+
+    const bool rewrite_first =
+        first->has_value() && !(*first)->llvm14_spelling.empty();
+    const bool rewrite_second =
+        second->has_value() && !(*second)->llvm14_spelling.empty();
+    if (!rewrite_first && !rewrite_second) return type_start;
+
+    size_t copy_start = type_start;
+    if (rewrite_first) {
+      normalized.append(
+          current_text.substr(copy_start, operand_start - copy_start));
+      normalized.append((*first)->llvm14_spelling);
+      copy_start = (*first)->end;
+    }
+    if (rewrite_second) {
+      normalized.append(
+          current_text.substr(copy_start, second_start - copy_start));
+      normalized.append((*second)->llvm14_spelling);
+      copy_start = (*second)->end;
+    }
+    return copy_start;
   }
 
   const size_t line_end = current_text.find('\n', operand_start);
@@ -664,8 +891,13 @@ absl::StatusOr<size_t> RewriteDecimalFloatAfterType(
       ++literal_start;
     }
     absl::StatusOr<std::optional<DecimalFloatLiteral>> literal =
-        ParseDecimalFloatLiteral(current_text, literal_start, module_name);
+        ParseSpecialFloatLiteral(current_text, literal_start, module_name);
     if (!literal.ok()) return literal.status();
+    if (!literal->has_value()) {
+      literal =
+          ParseDecimalFloatLiteral(current_text, literal_start, module_name);
+      if (!literal.ok()) return literal.status();
+    }
     if (!literal->has_value()) {
       scan = literal_start;
       continue;
@@ -786,6 +1018,11 @@ absl::StatusOr<MusaLlvm14CompatibilityResult> NormalizeMusaLlvmForLlvm14(
   llvm::StripDebugInfo(*module);
 
   if (absl::Status status = StripReviewedNamedMetadata(*module, module_name);
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status =
+          StripLegacyBitonicOptimizationHints(*module, module_name);
       !status.ok()) {
     return status;
   }

@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/gpu/target_util.h"
 
 #include <gtest/gtest.h>
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -24,6 +25,7 @@ limitations under the License.
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/test.h"
 
@@ -64,6 +66,75 @@ TEST_F(TargetUtilTest, AMDGCNGroupBarrier) {
                             &builder_);
   builder_.CreateRetVoid();
   EXPECT_FALSE(llvm::verifyModule(module_, &llvm::errs()));
+}
+
+TEST_F(TargetUtilTest, MusaCoordinatesAndBarrierUseVersionedShimAbi) {
+  module_.setTargetTriple(llvm::Triple(musa::kMusaTargetTriple));
+  struct CoordinateShim {
+    TargetIntrinsicID intrinsic;
+    const char* symbol;
+    bool convergent;
+  };
+  constexpr CoordinateShim kCoordinateShims[] = {
+      {TargetIntrinsicID::kBlockIdx, "__xla_musa_v1_read_ctaid_x", true},
+      {TargetIntrinsicID::kBlockIdy, "__xla_musa_v1_read_ctaid_y", true},
+      {TargetIntrinsicID::kBlockIdz, "__xla_musa_v1_read_ctaid_z", true},
+      {TargetIntrinsicID::kThreadIdx, "__xla_musa_v1_read_tid_x", false},
+      {TargetIntrinsicID::kThreadIdy, "__xla_musa_v1_read_tid_y", false},
+      {TargetIntrinsicID::kThreadIdz, "__xla_musa_v1_read_tid_z", false},
+      {TargetIntrinsicID::kBlockDimx, "__xla_musa_v1_read_ntid_x", false},
+      {TargetIntrinsicID::kBlockDimy, "__xla_musa_v1_read_ntid_y", false},
+      {TargetIntrinsicID::kBlockDimz, "__xla_musa_v1_read_ntid_z", false},
+  };
+  for (const CoordinateShim& shim : kCoordinateShims) {
+    EmitCallToTargetIntrinsic(shim.intrinsic, {}, {}, &builder_);
+  }
+  EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &builder_);
+  builder_.CreateRetVoid();
+  ASSERT_FALSE(llvm::verifyModule(module_, &llvm::errs()));
+
+  llvm::Function* barrier =
+      module_.getFunction("__xla_musa_v1_workgroup_barrier");
+  ASSERT_NE(barrier, nullptr);
+  for (const CoordinateShim& shim : kCoordinateShims) {
+    llvm::Function* function = module_.getFunction(shim.symbol);
+    ASSERT_NE(function, nullptr) << shim.symbol;
+    EXPECT_EQ(function->getCallingConv(), llvm::CallingConv::C);
+    EXPECT_TRUE(function->hasFnAttribute(llvm::Attribute::NoUnwind));
+    EXPECT_EQ(function->hasFnAttribute(llvm::Attribute::Convergent),
+              shim.convergent)
+        << shim.symbol;
+    EXPECT_EQ(function->getMemoryEffects(), llvm::MemoryEffects::none())
+        << shim.symbol;
+  }
+  EXPECT_EQ(barrier->getCallingConv(), llvm::CallingConv::C);
+  EXPECT_TRUE(barrier->hasFnAttribute(llvm::Attribute::NoUnwind));
+  EXPECT_TRUE(barrier->hasFnAttribute(llvm::Attribute::Convergent));
+  EXPECT_FALSE(barrier->hasFnAttribute(llvm::Attribute::Memory));
+
+  for (const llvm::Function& function : module_.functions()) {
+    EXPECT_FALSE(function.getName().starts_with("llvm.nvvm."));
+    EXPECT_FALSE(function.getName().starts_with("llvm.amdgcn."));
+  }
+}
+
+TEST_F(TargetUtilTest, MusaKernelUsesBridgeMarker) {
+  module_.setTargetTriple(llvm::Triple(musa::kMusaTargetTriple));
+  llvm::Function* function = module_.getFunction("fn");
+  ASSERT_NE(function, nullptr);
+  AnnotateFunctionAsGpuKernel(&module_, function, &builder_);
+  EXPECT_EQ(function->getCallingConv(), llvm::CallingConv::C);
+  llvm::Attribute marker =
+      function->getFnAttribute(musa::kMusaLlvmKernelMarker);
+  ASSERT_TRUE(marker.isStringAttribute());
+  EXPECT_TRUE(marker.getValueAsString().empty());
+}
+
+TEST_F(TargetUtilTest, MusaGroupBarrierFailsClosed) {
+  module_.setTargetTriple(llvm::Triple(musa::kMusaTargetTriple));
+  EXPECT_DEATH(EmitCallToTargetIntrinsic(TargetIntrinsicID::kGroupBarrierId, {},
+                                         {}, &builder_),
+               "outside the versioned shim ABI");
 }
 
 TEST(TargetUtil, ObtainDeviceFunctionNameExp) {

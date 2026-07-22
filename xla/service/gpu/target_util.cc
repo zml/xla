@@ -46,6 +46,7 @@ limitations under the License.
 #include "llvm/TargetParser/Triple.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/primitive_util.h"
+#include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/service/llvm_ir/llvm_type_conversion_util.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/util.h"
@@ -108,6 +109,97 @@ llvm::CallInst* EmitDeviceFunctionCall(
   }
 
   return b->CreateCall(callee, llvm_ir::AsArrayRef(operands), name.data());
+}
+
+const musa::MusaShimSpec* MusaShimForTargetIntrinsic(
+    TargetIntrinsicID intrinsic_id) {
+  std::optional<musa::MusaShimId> shim_id;
+  switch (intrinsic_id) {
+    case TargetIntrinsicID::kThreadIdx:
+      shim_id = musa::MusaShimId::kThreadIdX;
+      break;
+    case TargetIntrinsicID::kThreadIdy:
+      shim_id = musa::MusaShimId::kThreadIdY;
+      break;
+    case TargetIntrinsicID::kThreadIdz:
+      shim_id = musa::MusaShimId::kThreadIdZ;
+      break;
+    case TargetIntrinsicID::kBlockIdx:
+      shim_id = musa::MusaShimId::kBlockIdX;
+      break;
+    case TargetIntrinsicID::kBlockIdy:
+      shim_id = musa::MusaShimId::kBlockIdY;
+      break;
+    case TargetIntrinsicID::kBlockIdz:
+      shim_id = musa::MusaShimId::kBlockIdZ;
+      break;
+    case TargetIntrinsicID::kBlockDimx:
+      shim_id = musa::MusaShimId::kBlockDimX;
+      break;
+    case TargetIntrinsicID::kBlockDimy:
+      shim_id = musa::MusaShimId::kBlockDimY;
+      break;
+    case TargetIntrinsicID::kBlockDimz:
+      shim_id = musa::MusaShimId::kBlockDimZ;
+      break;
+    case TargetIntrinsicID::kBarrierId:
+      shim_id = musa::MusaShimId::kWorkgroupBarrier;
+      break;
+    case TargetIntrinsicID::kGroupBarrierId:
+      return nullptr;
+  }
+  if (!shim_id.has_value()) return nullptr;
+  for (const musa::MusaShimSpec& spec : musa::MusaShimSpecs()) {
+    if (spec.id == *shim_id) return &spec;
+  }
+  return nullptr;
+}
+
+llvm::CallInst* EmitMusaTargetIntrinsic(TargetIntrinsicID intrinsic_id,
+                                        llvm::IRBuilderBase* b) {
+  const musa::MusaShimSpec* spec = MusaShimForTargetIntrinsic(intrinsic_id);
+  if (spec == nullptr ||
+      spec->minimum_mapping_version > musa::kMusaShimMappingVersion) {
+    LOG(FATAL) << "MUSA target intrinsic is outside the versioned shim ABI";
+  }
+
+  std::optional<PrimitiveType> output_type;
+  switch (spec->signature) {
+    case musa::MusaShimSignature::kVoidVoid:
+      output_type = std::nullopt;
+      break;
+    case musa::MusaShimSignature::kI32Void:
+      output_type = U32;
+      break;
+    case musa::MusaShimSignature::kI64Void:
+    case musa::MusaShimSignature::kI32I32I32:
+      LOG(FATAL) << "MUSA target intrinsic has an incompatible shim signature";
+  }
+
+  llvm::AttrBuilder attributes(b->getContext());
+  if ((spec->required_attributes & musa::kNoUnwind) != 0) {
+    attributes.addAttribute(llvm::Attribute::NoUnwind);
+  }
+  if ((spec->required_attributes & musa::kWillReturn) != 0) {
+    attributes.addAttribute(llvm::Attribute::WillReturn);
+  }
+  if (spec->convergent) {
+    attributes.addAttribute(llvm::Attribute::Convergent);
+  }
+
+  llvm::CallInst* call = EmitDeviceFunctionCall(
+      std::string(spec->xla_symbol), {}, {}, output_type, attributes, b);
+  switch (spec->memory_effects) {
+    case musa::MusaMemoryEffects::kNone:
+      call->getCalledFunction()->setMemoryEffects(llvm::MemoryEffects::none());
+      break;
+    case musa::MusaMemoryEffects::kReadWrite:
+      break;
+    case musa::MusaMemoryEffects::kInaccessibleRead:
+    case musa::MusaMemoryEffects::kInaccessibleReadWrite:
+      LOG(FATAL) << "MUSA target intrinsic has unsupported memory effects";
+  }
+  return call;
 }
 
 // Gets the llvm intrinsic ids on different platforms (NVPTX, AMDGPU)
@@ -181,28 +273,27 @@ struct TargetIntrinsics GetIntrinsic(TargetIntrinsicID intrin) {
       };
     }
     case TargetIntrinsicID::kBarrierId: {
-      return {[](llvm::IRBuilderBase* b_) -> llvm::CallInst* {
-                // We need to use the callback mechanism here, because the
-                // barrier intrinsics expects a constant 0 as operand, whereas
-                // for AMD no operand is expected. We don't want to distinguish
-                // at the call site.
-                llvm::Module* module = b_->GetInsertBlock()->getModule();
-                llvm::Function* intrinsic =
-                    llvm::Intrinsic::getOrInsertDeclaration(
-                        module,
-                        llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all, {});
-                return b_->CreateCall(intrinsic, {b_->getInt32(0)});
-              },
-              llvm::Intrinsic::amdgcn_s_barrier,
-              [](llvm::IRBuilderBase* b_) -> llvm::CallInst* {
-                // OpenCL barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-                // matches the MLIR emitter pipeline.
-                return EmitDeviceFunctionCall(
-                    "_Z7barrierj", {b_->getInt32(3)}, {U32}, std::nullopt,
-                    llvm::AttrBuilder(b_->getContext())
-                        .addAttribute(llvm::Attribute::Convergent),
-                    b_);
-              }};
+      return {
+          [](llvm::IRBuilderBase* b_) -> llvm::CallInst* {
+            // We need to use the callback mechanism here, because the
+            // barrier intrinsics expects a constant 0 as operand, whereas
+            // for AMD no operand is expected. We don't want to distinguish
+            // at the call site.
+            llvm::Module* module = b_->GetInsertBlock()->getModule();
+            llvm::Function* intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+                module, llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all, {});
+            return b_->CreateCall(intrinsic, {b_->getInt32(0)});
+          },
+          llvm::Intrinsic::amdgcn_s_barrier,
+          [](llvm::IRBuilderBase* b_) -> llvm::CallInst* {
+            // OpenCL barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+            // matches the MLIR emitter pipeline.
+            return EmitDeviceFunctionCall(
+                "_Z7barrierj", {b_->getInt32(3)}, {U32}, std::nullopt,
+                llvm::AttrBuilder(b_->getContext())
+                    .addAttribute(llvm::Attribute::Convergent),
+                b_);
+          }};
     }
     case TargetIntrinsicID::kBlockDimx: {
       return {llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_x,
@@ -461,7 +552,13 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
                std::function<llvm::CallInst*(llvm::IRBuilderBase*)>>
       llvm_intrinsic_or_function;
   llvm::Triple target_triple = llvm::Triple(module->getTargetTriple());
-  if (target_triple.isNVPTX()) {
+  if (target_triple.str() == musa::kMusaTargetTriple) {
+    if (!operands.empty() || !overloaded_types.empty()) {
+      LOG(FATAL) << "MUSA target intrinsic operands are outside the versioned "
+                    "shim ABI";
+    }
+    return EmitMusaTargetIntrinsic(intrinsic_id, b);
+  } else if (target_triple.isNVPTX()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.nvptx_intrinsic_or_function;
   } else if (target_triple.getArch() == llvm::Triple::amdgpu) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.amdgpu_intrinsic_or_function;
@@ -487,7 +584,13 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
 void AnnotateFunctionAsGpuKernel(llvm::Module* module, llvm::Function* func,
                                  llvm::IRBuilderBase* b) {
   llvm::Triple target_triple = llvm::Triple(module->getTargetTriple());
-  if (target_triple.isNVPTX()) {
+  if (target_triple.str() == musa::kMusaTargetTriple) {
+    // Vendor LLVM identifies kernels after the compatibility boundary consumes
+    // this versioned marker. Keep the current-LLVM module on the ordinary C
+    // calling convention used by the frozen MUSA kernel ABI.
+    func->setCallingConv(llvm::CallingConv::C);
+    func->addFnAttr(musa::kMusaLlvmKernelMarker, "");
+  } else if (target_triple.isNVPTX()) {
     // Attach information so NVPTX can recognize function as a CUDA kernel.
     func->setCallingConv(llvm::CallingConv::PTX_Kernel);
 
