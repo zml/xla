@@ -207,8 +207,7 @@ class RewriteFunctionSignatures : public OpRewritePattern<mlir::func::FuncOp> {
         auto cast = UnrealizedConversionCastOp::create(
             rewriter, op.getLoc(), operand, op.getArgument(index));
         op.getArgument(index).replaceAllUsesExcept(cast.getResult(0), cast);
-        operand = ml::LLVMPointerType::get(
-            op.getContext(), device_spec_.IsVulkan() ? 11 : 0);
+        operand = ml::LLVMPointerType::get(op.getContext());
       }
     }
 

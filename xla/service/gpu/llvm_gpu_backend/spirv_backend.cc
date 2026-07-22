@@ -148,21 +148,7 @@ absl::Status ValidateVulkanModule(const llvm::Module& module) {
   return absl::OkStatus();
 }
 
-llvm::GlobalVariable* CreateResourceName(llvm::Module* module,
-                                         llvm::StringRef kernel_name,
-                                         unsigned binding) {
-  std::string name = absl::StrCat(kernel_name.str(), ".binding.", binding);
-  llvm::Constant* initializer = llvm::ConstantDataArray::getString(
-      module->getContext(), name, /*AddNull=*/true);
-  return new llvm::GlobalVariable(
-      *module, initializer->getType(), /*isConstant=*/true,
-      llvm::GlobalValue::PrivateLinkage, initializer,
-      absl::StrCat(".vulkan.resource.", binding));
-}
-
 absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
-  return absl::OkStatus();
-
   llvm::LLVMContext& context = module->getContext();
   llvm::SmallVector<llvm::Function*> entries;
   for (llvm::Function& function : *module) {
@@ -182,15 +168,14 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
                   .getValueAsString()
                   .str()
             : "1,1,1";
-    // for (llvm::Argument& argument : implementation->args()) {
-    //   auto* pointer_type = llvm::dyn_cast<llvm::PointerType>(argument.getType());
-    //   if (pointer_type == nullptr || pointer_type->getAddressSpace() != 11) {
-    //     return absl::UnimplementedError(absl::StrCat(
-    //         "Vulkan entry point ", entry_name,
-    //         " has a non-storage-buffer argument; only managed buffer "
-    //         "arguments are supported"));
-    //   }
-    // }
+    for (llvm::Argument& argument : implementation->args()) {
+      if (!llvm::isa<llvm::PointerType>(argument.getType())) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Vulkan entry point ", entry_name,
+            " has a non-pointer argument; only managed buffer arguments are "
+            "supported"));
+      }
+    }
 
     implementation->setName(absl::StrCat(entry_name, ".impl"));
     implementation->setLinkage(llvm::GlobalValue::InternalLinkage);
@@ -212,25 +197,59 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
     unsigned binding = 0;
     for (llvm::Argument& argument : implementation->args()) {
       const bool writable = !argument.hasAttribute(llvm::Attribute::ReadOnly);
-      llvm::Type* runtime_array = llvm::ArrayType::get(builder.getInt32Ty(), 0);
+      llvm::Type* element_type = nullptr;
+      for (llvm::User* user : argument.users()) {
+        llvm::Type* accessed_type = nullptr;
+        if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
+          accessed_type = gep->getSourceElementType();
+        } else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user)) {
+          accessed_type = load->getType();
+        } else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user)) {
+          accessed_type = store->getValueOperand()->getType();
+        }
+        while (auto* array = llvm::dyn_cast_or_null<llvm::ArrayType>(
+                   accessed_type)) {
+          accessed_type = array->getElementType();
+        }
+        if (auto* vector =
+                llvm::dyn_cast_or_null<llvm::VectorType>(accessed_type)) {
+          accessed_type = vector->getElementType();
+        }
+        if (accessed_type == nullptr) {
+          continue;
+        }
+        if (element_type != nullptr && element_type != accessed_type) {
+          return absl::UnimplementedError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " buffer argument ", binding,
+              " is accessed with incompatible element types"));
+        }
+        element_type = accessed_type;
+      }
+      if (element_type == nullptr) {
+        element_type = builder.getInt32Ty();
+      }
+      llvm::Type* runtime_array = llvm::ArrayType::get(element_type, 0);
       llvm::Type* resource_type = llvm::TargetExtType::get(
           context, "spirv.VulkanBuffer", {runtime_array},
           {12, writable ? 1U : 0U});
       llvm::Function* get_handle = llvm::Intrinsic::getOrInsertDeclaration(
           module, llvm::Intrinsic::spv_resource_handlefrombinding,
           {resource_type});
-      llvm::GlobalVariable* resource_name =
-          CreateResourceName(module, entry_name, binding);
       llvm::Value* handle = builder.CreateCall(
           get_handle,
           {builder.getInt32(0), builder.getInt32(binding), builder.getInt32(1),
-           builder.getInt32(0), resource_name});
+           builder.getInt32(0),
+           llvm::ConstantPointerNull::get(builder.getPtrTy())});
       llvm::PointerType* storage_buffer_pointer =
           llvm::PointerType::get(context, 11);
       llvm::Function* get_pointer = llvm::Intrinsic::getOrInsertDeclaration(
           module, llvm::Intrinsic::spv_resource_getbasepointer,
           {storage_buffer_pointer, resource_type});
-      arguments.push_back(builder.CreateCall(get_pointer, {handle}));
+      llvm::Value* pointer = builder.CreateCall(get_pointer, {handle});
+      if (pointer->getType() != argument.getType()) {
+        pointer = builder.CreateAddrSpaceCast(pointer, argument.getType());
+      }
+      arguments.push_back(pointer);
       ++binding;
     }
     builder.CreateCall(implementation, arguments);
