@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/decision.h"
 #include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/util.h"
 
@@ -74,6 +75,15 @@ llvm::SmallVector<int64_t> GetPaddedTileSizes(
     result.push_back(llvm::PowerOf2Ceil(value));
   }
   return result;
+}
+
+int64_t GetPaddedTileSizeInBytes(absl::Span<const int64_t> tile_sizes,
+                                 int64_t element_size_in_bytes) {
+  int64_t size_in_bytes = element_size_in_bytes;
+  for (int64_t tile_size : tile_sizes) {
+    size_in_bytes *= llvm::PowerOf2Ceil(tile_size);
+  }
+  return size_in_bytes;
 }
 
 }  // namespace
@@ -121,10 +131,18 @@ TritonEmitterConstraints::GetBuilder(
              const HloFusionAdaptor& fusion_adaptor) {
     absl::flat_hash_set<SymbolicMap> unique_tile_size_maps;
     llvm::SmallVector<RootTileInfo, 2> root_infos;
+    llvm::SmallVector<TransposeTileInfo, 2> transpose_tiles;
     auto roots = fusion_adaptor.GetRoots();
     for (const auto& tiled_hlo_instruction : instructions) {
       unique_tile_size_maps.insert(
           tiled_hlo_instruction->symbolic_tile().size_map());
+      if (tiled_hlo_instruction->hlo()->opcode() == HloOpcode::kTranspose &&
+          fusion_adaptor.ContainsInstruction(tiled_hlo_instruction->hlo())) {
+        transpose_tiles.push_back(TransposeTileInfo{
+            tiled_hlo_instruction->symbolic_tile().size_map(),
+            ShapeUtil::ByteSizeOfPrimitiveType(
+                tiled_hlo_instruction->hlo()->shape().element_type())});
+      }
       if (absl::c_any_of(roots, [&tiled_hlo_instruction](
                                     const HloInstructionAdaptor& instr) {
             return &instr.instruction() == tiled_hlo_instruction->hlo();
@@ -149,7 +167,7 @@ TritonEmitterConstraints::GetBuilder(
     return std::unique_ptr<TritonEmitterConstraints>(
         absl::WrapUnique(new TritonEmitterConstraints(
             std::move(tile_size_maps), std::move(root_infos),
-            std::move(custom_constraints),
+            std::move(transpose_tiles), std::move(custom_constraints),
             /*root_shape=*/instructions.back()->hlo()->shape(),
             device_description, std::move(tiled_emitter_constraints))));
   };
@@ -213,6 +231,24 @@ absl::StatusOr<bool> TritonEmitterConstraints::ParametersSatisfyConstraints(
                                       device_info_)) {
     VLOG(2) << "Number of blocks exceeds the device grid limit. Bailing out.";
     return false;
+  }
+
+  // Transposes require at least one tile-sized shared-memory buffer for the
+  // layout conversion. Reject tiles that cannot fit before invoking Triton,
+  // where this would otherwise become a compilation error.
+  for (const TransposeTileInfo& transpose_tile : transpose_tiles_) {
+    llvm::SmallVector<int64_t> tile_sizes =
+        transpose_tile.size_map.Evaluate(tile_parameters);
+    int64_t shared_memory_bytes = GetPaddedTileSizeInBytes(
+        tile_sizes, transpose_tile.element_size_in_bytes);
+    if (shared_memory_bytes >
+        device_info_.shared_memory_per_block_optin()) {
+      VLOG(2) << "Transpose tile requires " << shared_memory_bytes
+              << " bytes of shared memory, but the device only has "
+              << device_info_.shared_memory_per_block_optin()
+              << " bytes per block. Bailing out.";
+      return false;
+    }
   }
 
   // Ensure that we satisfy the custom constraints we derived when padding tile
@@ -297,7 +333,31 @@ Decision VerifyTritonConstraints(const TiledHloComputation& tiled_computation,
     }
   }
 
-  // 2. MMA Limit.
+  // 2. Shared-memory limit for transposes. Triton materializes a transpose
+  // tile in shared memory to perform the layout conversion.
+  for (const TiledHloInstruction* inst : tiled_computation.instructions()) {
+    if (inst->hlo()->opcode() != HloOpcode::kTranspose) {
+      continue;
+    }
+    auto tile_sizes_or = inst->tile().GetStaticTileSizes();
+    if (!tile_sizes_or.ok()) {
+      return Decision(tile_sizes_or.status());
+    }
+    int64_t shared_memory_bytes = GetPaddedTileSizeInBytes(
+        *tile_sizes_or, ShapeUtil::ByteSizeOfPrimitiveType(
+                            inst->hlo()->shape().element_type()));
+    if (shared_memory_bytes >
+        device_info.shared_memory_per_block_optin()) {
+      return Decision::Forbid(absl::StrCat(
+          "Transpose instruction ", inst->hlo()->name(), " requires at least ",
+          shared_memory_bytes,
+          " bytes of shared memory for its tile, which exceeds the device "
+          "limit of ",
+          device_info.shared_memory_per_block_optin(), " bytes."));
+    }
+  }
+
+  // 3. MMA Limit.
   // Triton's GPU codegen constrains dot operands to avoid excessive register
   // pressure and comply with hardware MMA layout constraints. Contracting and
   // free dimension tile sizes are limited to kMaxMMADimSize.

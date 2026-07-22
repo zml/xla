@@ -211,6 +211,48 @@ ENTRY entry_computation {
               absl_testing::IsOkAndHolds(false));
 }
 
+TEST_F(TritonEmitterConstraintsTest,
+       TransposeSharedMemoryConstraintIsEnforced) {
+  device_description_.set_shared_memory_per_block_optin(64 * 1024);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"hlo(
+HloModule m
+
+fused_computation {
+  param_0 = bf16[1024,2080]{0,1} parameter(0)
+  bitcast_0 = bf16[2080,1024]{1,0} bitcast(param_0)
+  slice = bf16[2048,1024]{1,0} slice(bitcast_0),
+    slice={[32:2080], [0:1024]}
+  transpose = bf16[1024,2048]{1,0} transpose(slice), dimensions={1,0}
+  ROOT bitcast_1 = bf16[1024,16,128]{2,1,0} bitcast(transpose)
+}
+
+ENTRY entry_computation {
+  param_0 = bf16[1024,2080]{0,1} parameter(0)
+  ROOT fusion = bf16[1024,16,128]{2,1,0} fusion(param_0), kind=kCustom,
+    calls=fused_computation,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)hlo"));
+
+  std::optional<SymbolicTileAnalysis> analysis =
+      TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const HloInstruction* fusion_root =
+      module->entry_computation()->root_instruction()->fused_expression_root();
+
+  // This root tile propagates to a bf16[16,2048] transpose tile, which
+  // requires exactly 64 KiB of shared memory.
+  EXPECT_THAT(analysis->ParametersSatisfyConstraints(
+                  Tiling({{fusion_root, FlatTiling({16, 16, 128})}})),
+              absl_testing::IsOkAndHolds(true));
+  // This root tile propagates to a bf16[32,2048] transpose tile, which
+  // requires 128 KiB and cannot fit on this device.
+  EXPECT_THAT(analysis->ParametersSatisfyConstraints(
+                  Tiling({{fusion_root, FlatTiling({32, 16, 128})}})),
+              absl_testing::IsOkAndHolds(false));
+}
+
 TEST_F(TritonEmitterConstraintsTest, FusionHasValidTileSizes) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
                        ParseAndReturnVerifiedModule(R"(
@@ -448,6 +490,36 @@ ENTRY entry_computation {
   EXPECT_OK(CheckTiling(module.get(), {128, 128}));
   EXPECT_THAT(CheckTiling(module.get(), {1, 1}),
               StatusIs(_, HasSubstr("Number of blocks exceeds the device")));
+}
+
+TEST_F(VerifyTritonConstraintsTest,
+       TransposeSharedMemoryConstraintIsEnforced) {
+  device_description_.set_shared_memory_per_block_optin(64 * 1024);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"hlo(
+HloModule m
+
+fused_computation {
+  param_0 = bf16[1024,2080]{0,1} parameter(0)
+  bitcast_0 = bf16[2080,1024]{1,0} bitcast(param_0)
+  slice = bf16[2048,1024]{1,0} slice(bitcast_0),
+    slice={[32:2080], [0:1024]}
+  transpose = bf16[1024,2048]{1,0} transpose(slice), dimensions={1,0}
+  ROOT bitcast_1 = bf16[1024,16,128]{2,1,0} bitcast(transpose)
+}
+
+ENTRY entry_computation {
+  param_0 = bf16[1024,2080]{0,1} parameter(0)
+  ROOT fusion = bf16[1024,16,128]{2,1,0} fusion(param_0), kind=kCustom,
+    calls=fused_computation,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)hlo"));
+
+  EXPECT_OK(CheckTiling(module.get(), {16, 16, 128}));
+  EXPECT_THAT(CheckTiling(module.get(), {32, 16, 128}),
+              StatusIs(_, HasSubstr("requires at least 131072 bytes of shared "
+                                    "memory")));
 }
 
 TEST_F(VerifyTritonConstraintsTest, FusionHasValidTileSizes) {

@@ -66,14 +66,23 @@ class TritonEmitterConstraints : public EmitterSpecificConstraints {
     std::vector<int64_t> dim_sizes;
   };
 
+  // Holds the information needed to estimate the minimum amount of shared
+  // memory required to transpose a tile.
+  struct TransposeTileInfo {
+    SymbolicMap size_map;
+    int64_t element_size_in_bytes;
+  };
+
   explicit TritonEmitterConstraints(
       llvm::SmallVector<SymbolicMap, 4> tile_size_maps,
       llvm::SmallVector<RootTileInfo, 2> roots,
+      llvm::SmallVector<TransposeTileInfo, 2> transpose_tiles,
       std::vector<CustomConstraints> custom_constraints,
       const Shape& root_shape, const se::DeviceDescription& device_info,
       std::unique_ptr<TiledEmitterConstraints> tiled_emitter_constraints)
       : tile_size_maps_(std::move(tile_size_maps)),
         roots_(std::move(roots)),
+        transpose_tiles_(std::move(transpose_tiles)),
         custom_constraints_(std::move(custom_constraints)),
         root_shape_(root_shape),
         device_info_(device_info),
@@ -111,6 +120,9 @@ class TritonEmitterConstraints : public EmitterSpecificConstraints {
   // Holds the info for all fusion roots necessary to check whether the tile
   // sizes evaluate to powers of 2 or have the same size as the dimension.
   llvm::SmallVector<RootTileInfo, 2> roots_;
+
+  // Tiles materialized by transpose instructions.
+  llvm::SmallVector<TransposeTileInfo, 2> transpose_tiles_;
 
   // Custom emitter-specific constraints to check in
   // `ParametersSatisfyConstraints`.
