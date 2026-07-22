@@ -29,16 +29,17 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "llvm/IR/Module.h"
 #include "xla/hlo/analysis/alias_info.h"
-#include "xla/service/hlo_cost_analysis.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compilation_stats.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_compiler_bundle.h"
+#include "xla/service/gpu/musa/musa_executable_envelope.h"
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 #include "xla/service/gpu/musa/protocol.h"
 #include "xla/service/gpu/target_constants.h"
+#include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
@@ -56,6 +57,24 @@ absl::Status ProviderUnavailable(const absl::Status& status) {
       status.code(),
       absl::StrCat("MUSA compilation provider is unavailable: ",
                    status.message()));
+}
+
+absl::StatusOr<musa::MusaCompilationOptions> GetMusaCompilationOptions(
+    const HloModuleConfig& module_config) {
+  const DebugOptions& debug_options = module_config.debug_options();
+  if (debug_options.xla_backend_optimization_level() < 2 ||
+      debug_options.xla_backend_optimization_level() > 3) {
+    return absl::UnimplementedError(
+        "MUSA compilation currently supports XLA backend optimization "
+        "levels 2 and 3 through the qualified vendor O2 profile");
+  }
+  if (debug_options.xla_enable_fast_math()) {
+    return absl::UnimplementedError(
+        "MUSA compilation does not yet support xla_enable_fast_math");
+  }
+  // The v1 provider contract is deliberately narrower than XLA's generic
+  // debug options: deterministic vendor O2 with numerical controls disabled.
+  return musa::MusaCompilationOptions();
 }
 
 std::string SafeMusaModuleName(absl::string_view name) {
@@ -120,7 +139,7 @@ void MusaGpuCompiler::AddGemmRewriterPasses(
     HloPassPipeline& pipeline, const DebugOptions& debug_options,
     const se::GpuComputeCapability& gpu_version,
     const se::SemanticVersion& toolkit_version) {
-  // C13 introduces the muBLAS custom-call ABI. Until then, leaving dots in HLO
+  // C15 introduces the muBLAS custom-call ABI. Until then, leaving dots in HLO
   // keeps elemental codegen usable and avoids emitting a CUDA/ROCm library ABI.
   (void)pipeline;
   (void)debug_options;
@@ -151,7 +170,7 @@ absl::Status MusaGpuCompiler::AddAutotunerPass(
     mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
     const MultiProcessKeyValueStore& key_value_store) {
-  // The shared autotuner currently exposes CUDA and ROCm backends. C14 adds
+  // The shared autotuner currently exposes CUDA and ROCm backends. C16 adds
   // MUSA algorithm selection; C10 deliberately preserves the generic emitter.
   (void)pipeline;
   (void)hlo_module;
@@ -206,20 +225,8 @@ MusaGpuCompiler::CompileTargetBinary(
       musa::NormalizeMusaLlvmForLlvm14(*llvm_module, module_name);
   if (!compatible.ok()) return compatible.status();
 
-  const DebugOptions& debug_options = module_config.debug_options();
-  if (debug_options.xla_backend_optimization_level() < 2 ||
-      debug_options.xla_backend_optimization_level() > 3) {
-    return absl::UnimplementedError(
-        "MUSA compilation currently supports XLA backend optimization "
-        "levels 2 and 3 through the qualified vendor O2 profile");
-  }
-  if (debug_options.xla_enable_fast_math()) {
-    return absl::UnimplementedError(
-        "MUSA compilation does not yet support xla_enable_fast_math");
-  }
-  // The v1 provider contract is deliberately narrower than XLA's generic
-  // debug options: deterministic vendor O2 with numerical controls disabled.
-  musa::MusaCompilationOptions options;
+  ASSIGN_OR_RETURN(musa::MusaCompilationOptions options,
+                   GetMusaCompilationOptions(module_config));
 
   absl::StatusOr<musa::MusaCompilationArtifact> artifact =
       compilation_provider_->Compile(*compatible, options);
@@ -229,6 +236,44 @@ MusaGpuCompiler::CompileTargetBinary(
       .binary = std::move(artifact->mubin),
       .module_stats = {},
   };
+}
+
+absl::StatusOr<stream_executor::ExecutableAbiVersion>
+MusaGpuCompiler::CreateExecutableAbiVersion(
+    const HloModule& module,
+    const stream_executor::DeviceDescription& device_description,
+    absl::Span<const uint8_t> main_binary) const {
+  if (!compilation_provider_status_.ok()) {
+    return ProviderUnavailable(compilation_provider_status_);
+  }
+  if (compilation_provider_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "MUSA compilation provider was not initialized");
+  }
+  ASSIGN_OR_RETURN(musa::MusaCompilationOptions options,
+                   GetMusaCompilationOptions(module.config()));
+  return musa::BuildMusaExecutableEnvelope(
+      device_description, compilation_provider_->identity(),
+      compilation_provider_->capabilities(), options, main_binary);
+}
+
+bool MusaGpuCompiler::UseAotCompiledThunks(const HloModule& module) const {
+  (void)module;
+  // MUSA deserialization must never re-enter LLVM or the isolated compiler
+  // bridge. Always select the self-contained compiled-thunk representation,
+  // even if a caller carries an old explicit false value for the experiment.
+  return true;
+}
+
+absl::Status MusaGpuCompiler::ValidatePersistentKernelCache(
+    const HloModuleConfig& module_config) const {
+  if (!module_config.debug_options().xla_gpu_kernel_cache_file().empty()) {
+    return absl::FailedPreconditionError(
+        "MUSA persistent GPU kernel cache is disabled until the shared cache "
+        "format records the complete MUSA architecture, provider, bridge, "
+        "toolchain, libdevice, shim, and numerical identity");
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<bool> MusaGpuCompiler::CanUseLinkModules(

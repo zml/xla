@@ -84,13 +84,26 @@ class RecordingCompilationProvider final
   mutable std::optional<musa::MusaCompilationOptions> last_options;
 
  private:
-  musa::MusaCompilationIdentity identity_;
+  musa::MusaCompilationIdentity identity_{
+      .xla_revision = "xla-test-revision",
+      .current_llvm_revision = "llvm-test-revision",
+      .provider_name = "recording",
+      .provider_fingerprint = std::string(64, '1'),
+      .bridge_fingerprint = std::string(64, '2'),
+      .toolchain_fingerprint = std::string(64, '3'),
+      .libdevice_fingerprint = std::string(64, '4'),
+      .driver_compatibility = "musa-driver-3.0-compatible",
+      .runtime_compatibility = "musa-runtime-4.0.1-compatible",
+  };
 };
 
 class TestMusaGpuCompiler : public MusaGpuCompiler {
  public:
   using MusaGpuCompiler::CompileTargetBinary;
+  using MusaGpuCompiler::CreateExecutableAbiVersion;
   using MusaGpuCompiler::MusaGpuCompiler;
+  using MusaGpuCompiler::UseAotCompiledThunks;
+  using MusaGpuCompiler::ValidatePersistentKernelCache;
 };
 
 std::unique_ptr<llvm::Module> ElementalModule(llvm::LLVMContext& context) {
@@ -111,7 +124,48 @@ stream_executor::DeviceDescription MusaDevice() {
       stream_executor::MusaComputeCapability("mp_21", 2, 1,
                                              /*hardware_warp_size=*/128,
                                              /*logical_subgroup_size=*/32)));
+  device.set_device_address_bits(64);
+  device.set_runtime_version(stream_executor::SemanticVersion(1, 5, 4));
+  device.set_driver_version(stream_executor::SemanticVersion(1, 5, 4));
+  device.set_kernel_mode_driver_version(
+      stream_executor::SemanticVersion(3, 0, 0));
+  device.set_compile_time_toolkit_version(
+      stream_executor::SemanticVersion(4, 0, 1));
   return device;
+}
+
+TEST(MusaGpuCompilerTest, BuildsFullEnvelopeAndForcesCompiledThunkAot) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule envelope
+
+ENTRY main {
+  ROOT result = f32[] constant(1)
+}
+)"));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_aot_compiled_thunks(false);
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  ASSERT_TRUE(version.proto().has_musa_platform_version());
+  EXPECT_EQ(version.proto().musa_platform_version().architecture(), "mp_21");
+  EXPECT_EQ(version.proto().musa_platform_version().binary_kind(), "mubin");
+  EXPECT_TRUE(compiler.UseAotCompiledThunks(*module));
+}
+
+TEST(MusaGpuCompilerTest, PersistentKernelCacheFailsClosed) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  HloModuleConfig config;
+  EXPECT_THAT(compiler.ValidatePersistentKernelCache(config), IsOk());
+  config.mutable_debug_options().set_xla_gpu_kernel_cache_file("cache.pb");
+  EXPECT_THAT(compiler.ValidatePersistentKernelCache(config),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("complete MUSA architecture")));
 }
 
 TEST(MusaGpuCompilerTest, NormalizesAndCompilesThroughInjectedProvider) {

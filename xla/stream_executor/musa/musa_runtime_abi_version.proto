@@ -1,0 +1,38 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+package stream_executor.musa;
+
+option java_multiple_files = true;
+option java_outer_classname = "MusaRuntimeAbiVersionOuter";
+
+// Serializable snapshot of the MUSA versions and optional library ABIs that
+// are available to a running PJRT plugin. Target facts are frozen by the MUSA
+// StreamExecutor implementation and are carried by the executable envelope.
+message MusaRuntimeAbiVersionProto {
+  message OptionalLibraryAbi {
+    string name = 1;
+    string abi_version = 2;
+    string fingerprint = 3;
+  }
+
+  string runtime_version = 1;
+  string driver_version = 2;
+  string kernel_driver_version = 3;
+  string toolkit_version = 4;
+  repeated OptionalLibraryAbi available_optional_library_abis = 5;
+}

@@ -32,5 +32,6 @@ target_config_map = {
     "p100": "//xla/backends/gpu/target_config:specs/p100.txtpb",
     "pvc": "//xla/backends/gpu/target_config:specs/pvc.txtpb",
     "rtx6000pro": "//xla/backends/gpu/target_config:specs/rtx6000pro.txtpb",
+    "s80": "//xla/backends/gpu/target_config:specs/s80.txtpb",
     "v100": "//xla/backends/gpu/target_config:specs/v100.txtpb",
 }

@@ -156,6 +156,47 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_executable_envelope",
+    srcs = ["musa_executable_envelope.cc"],
+    hdrs = ["musa_executable_envelope.h"],
+    deps = [
+        ":musa_compilation_provider",
+        ":musa_llvm14_compatibility",
+        ":musa_shim_abi",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/abi:executable_abi_version_proto_cc",
+        "//xla/stream_executor/musa:musa_executable_abi",
+        "//xla/stream_executor/musa:musa_mubin",
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/stream_executor/musa:musa_target_contract",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_executable_envelope_test",
+    srcs = ["musa_executable_envelope_test.cc"],
+    deps = [
+        ":musa_compilation_provider",
+        ":musa_executable_envelope",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "//xla/stream_executor/musa:musa_executable_abi",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "musa_compiler_bundle",
     srcs = ["musa_compiler_bundle.cc"],
     hdrs = ["musa_compiler_bundle.h"],

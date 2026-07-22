@@ -111,7 +111,9 @@ limitations under the License.
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_reservation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_executable_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
+#include "xla/stream_executor/musa/musa_runtime_abi_version.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -1422,6 +1424,13 @@ absl::StatusOr<GpuExecutable::OutputInfo> GpuExecutable::OutputInfo::FromProto(
 absl::StatusOr<GpuExecutableProto> GpuExecutable::ToProto() const {
   GpuExecutableProto proto;
   proto.set_binary(binary_.data(), binary_.size());
+  if (gpu_version_.IsCuda()) {
+    proto.set_binary_kind(GpuExecutableProto::BINARY_KIND_CUBIN);
+  } else if (gpu_version_.IsRocm()) {
+    proto.set_binary_kind(GpuExecutableProto::BINARY_KIND_HSACO);
+  } else if (gpu_version_.IsMusa()) {
+    proto.set_binary_kind(GpuExecutableProto::BINARY_KIND_MUBIN);
+  }
   proto.mutable_dnn_compiled_graphs()->insert(dnn_compiled_graphs_.cbegin(),
                                               dnn_compiled_graphs_.cend());
 
@@ -1526,6 +1535,46 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
       se::GpuComputeCapability gpu_compute_capability,
       se::GpuComputeCapability::FromProto(proto.gpu_compute_capability()));
 
+  const GpuExecutableProto::BinaryKind binary_kind = proto.binary_kind();
+  if (gpu_compute_capability.IsMusa() &&
+      binary_kind != GpuExecutableProto::BINARY_KIND_MUBIN) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Serialized MUSA executable must declare MUBIN binary kind; got %s",
+        GpuExecutableProto::BinaryKind_Name(binary_kind)));
+  }
+  if (gpu_compute_capability.IsCuda() &&
+      binary_kind != GpuExecutableProto::BINARY_KIND_UNSPECIFIED &&
+      binary_kind != GpuExecutableProto::BINARY_KIND_CUBIN) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Serialized CUDA executable must declare CUBIN binary kind or use "
+        "the legacy unspecified kind; got %s",
+        GpuExecutableProto::BinaryKind_Name(binary_kind)));
+  }
+  if (gpu_compute_capability.IsRocm() &&
+      binary_kind != GpuExecutableProto::BINARY_KIND_UNSPECIFIED &&
+      binary_kind != GpuExecutableProto::BINARY_KIND_HSACO) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Serialized ROCm executable must declare HSACO binary kind or use "
+        "the legacy unspecified kind; got %s",
+        GpuExecutableProto::BinaryKind_Name(binary_kind)));
+  }
+
+  ASSIGN_OR_RETURN(
+      params.executable_abi_version,
+      se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
+  if (gpu_compute_capability.IsMusa()) {
+    RETURN_IF_ERROR(se::musa::ValidateMusaExecutableAbi(
+        params.executable_abi_version, params.binary));
+    ASSIGN_OR_RETURN(se::musa::MusaRuntimeAbiVersion runtime_abi,
+                     se::musa::MusaRuntimeAbiVersion::Create(
+                         device_description.runtime_version(),
+                         device_description.driver_version(),
+                         device_description.kernel_mode_driver_version(),
+                         device_description.compile_time_toolkit_version()));
+    RETURN_IF_ERROR(
+        runtime_abi.IsCompatibleWith(params.executable_abi_version));
+  }
+
   if (gpu_compute_capability != device_description.gpu_compute_capability()) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "GPU compute capability of serialized executable doesn't match target "
@@ -1578,10 +1627,6 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
   params.module_name = proto.module_name();
   ASSIGN_OR_RETURN(params.program_shape,
                    ProgramShape::FromProto(proto.program_shape()));
-
-  ASSIGN_OR_RETURN(
-      params.executable_abi_version,
-      se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
 
   return Create(std::move(params));
 }

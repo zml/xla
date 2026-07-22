@@ -609,6 +609,29 @@ GpuCompiler::GpuCompiler(se::Platform::Id platform_id,
                         .getPointerSize(0 /* default address space */)),
       mlir_context_pool_(CreateMlirContext, kPreallocateMlirContexts) {}
 
+absl::StatusOr<stream_executor::ExecutableAbiVersion>
+GpuCompiler::CreateExecutableAbiVersion(
+    const HloModule& module,
+    const stream_executor::DeviceDescription& device_description,
+    absl::Span<const uint8_t> main_binary) const {
+  (void)module;
+  (void)main_binary;
+  return stream_executor::ExecutableAbiVersion::FromDeviceDescription(
+      device_description);
+}
+
+bool GpuCompiler::UseAotCompiledThunks(const HloModule& module) const {
+  return module.config()
+      .debug_options()
+      .xla_gpu_experimental_aot_compiled_thunks();
+}
+
+absl::Status GpuCompiler::ValidatePersistentKernelCache(
+    const HloModuleConfig& module_config) const {
+  (void)module_config;
+  return absl::OkStatus();
+}
+
 namespace {
 // Adds the HloVerifier for GPU to the given pipeline.
 void AddHloVerifier(HloPassPipeline* pipeline, HloVerifierOpts&& opts = {},
@@ -2718,6 +2741,8 @@ GpuCompiler::CompileToBackendResult(
     mlir::MLIRContext* mlir_context) {
   tsl::profiler::TraceMe traceme("CompileToBackendResult");
 
+  RETURN_IF_ERROR(ValidatePersistentKernelCache(module->config()));
+
   absl::string_view cache_path =
       module->config().debug_options().xla_gpu_kernel_cache_file();
   const bool use_cache = !cache_path.empty();
@@ -2933,8 +2958,8 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
   std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(gpu_device_info);
 
   ASSIGN_OR_RETURN(stream_executor::ExecutableAbiVersion executable_abi_version,
-                   stream_executor::ExecutableAbiVersion::FromDeviceDescription(
-                       gpu_device_info));
+                   CreateExecutableAbiVersion(*module, gpu_device_info,
+                                              res.backend_result.binary));
 
   std::string buffer_allocations_debug_summary =
       res.compile_module_results.buffer_assignment->ToVerboseString(
@@ -3021,9 +3046,7 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,
     return results;
   }
 
-  if (optimized_hlo_module->config()
-          .debug_options()
-          .xla_gpu_experimental_aot_compiled_thunks()) {
+  if (UseAotCompiledThunks(*optimized_hlo_module)) {
     return NewCompileAheadOfTime(std::move(optimized_hlo_module),
                                  options.executor(), compile_options);
   }
@@ -3110,10 +3133,7 @@ absl::StatusOr<std::unique_ptr<CompiledModule>> GpuCompiler::Export(
     return Internal("GpuExecutable is null");
   }
 
-  if (gpu_executable->module()
-          .config()
-          .debug_options()
-          .xla_gpu_experimental_aot_compiled_thunks()) {
+  if (UseAotCompiledThunks(gpu_executable->module())) {
     ASSIGN_OR_RETURN(GpuExecutableProto proto, gpu_executable->ToProto());
     return GpuAotCompilationResult::FromProto(std::move(proto));
   }
@@ -3404,6 +3424,7 @@ GpuCompiler::LoadExecutableFromLegacyAotResult(
   ASSIGN_OR_RETURN(
       std::unique_ptr<HloModule> hlo_module,
       HloModule::CreateFromProtoWithConfig(proto.hlo_module_with_config()));
+  RETURN_IF_ERROR(ValidatePersistentKernelCache(hlo_module->config()));
 
   ExecutionStreamAssignment execution_stream_assignment(
       hlo_module.get(),
@@ -3486,9 +3507,9 @@ GpuCompiler::LoadExecutableFromLegacyAotResult(
   DebugOptions debug_options = hlo_module->config().debug_options();
   std::string hlo_module_name = hlo_module->name();
 
-  ASSIGN_OR_RETURN(auto executable_abi_version,
-                   stream_executor::ExecutableAbiVersion::FromDeviceDescription(
-                       device_description));
+  ASSIGN_OR_RETURN(
+      auto executable_abi_version,
+      CreateExecutableAbiVersion(*hlo_module, device_description, binary));
 
   std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options =
       std::nullopt;

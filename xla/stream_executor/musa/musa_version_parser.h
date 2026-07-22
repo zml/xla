@@ -31,6 +31,10 @@ absl::StatusOr<SemanticVersion> ParseMusaVersion(int musa_version);
 absl::StatusOr<SemanticVersion> ParseMusaKernelDriverVersion(
     absl::string_view contents);
 
+// Reads and parses the installed Linux kernel driver's package version. This
+// query is independent of MUSA device discovery and does not create a context.
+absl::StatusOr<SemanticVersion> GetMusaKernelDriverVersion();
+
 }  // namespace stream_executor::musa
 
 #endif  // XLA_STREAM_EXECUTOR_MUSA_MUSA_VERSION_PARSER_H_

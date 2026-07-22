@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_compiler.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/hlo_module_config.h"
+#include "xla/stream_executor/abi/executable_abi_version.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/platform.h"
@@ -80,6 +81,17 @@ class MusaGpuCompiler : public GpuCompiler {
       se::StreamExecutor* absl_nullable stream_exec) override;
 
  protected:
+  absl::StatusOr<stream_executor::ExecutableAbiVersion>
+  CreateExecutableAbiVersion(
+      const HloModule& module,
+      const stream_executor::DeviceDescription& device_description,
+      absl::Span<const uint8_t> main_binary) const override;
+
+  bool UseAotCompiledThunks(const HloModule& module) const override;
+
+  absl::Status ValidatePersistentKernelCache(
+      const HloModuleConfig& module_config) const override;
+
   absl::Status AddAutotunerPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,

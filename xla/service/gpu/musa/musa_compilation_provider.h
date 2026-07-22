@@ -24,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/service/gpu/musa/bounded_subprocess.h"
@@ -50,6 +51,11 @@ struct MusaCompilationIdentity {
   std::string driver_compatibility;
   std::string runtime_compatibility;
 };
+
+// Validates the canonical, serializable identity shared by compiler requests,
+// persistent-cache keys, and executable ABI envelopes.
+absl::Status ValidateMusaCompilationIdentity(
+    const MusaCompilationIdentity& identity);
 
 struct MusaCompilationOptions {
   uint32_t optimization_level = 2;

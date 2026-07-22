@@ -45,7 +45,8 @@ enum class GpuModel {
   V100,
   GB200,
   GB300,
-  RTX6000PRO
+  RTX6000PRO,
+  S80
 };
 
 // Description of a target device for compilation.

@@ -131,28 +131,6 @@ absl::StatusOr<std::string> CanonicalDirectory(absl::string_view path,
   return resolved;
 }
 
-absl::Status ValidateIdentity(const MusaCompilationIdentity& identity) {
-  if (!IsCompatibilityToken(identity.xla_revision) ||
-      !IsCompatibilityToken(identity.current_llvm_revision) ||
-      !IsCompatibilityToken(identity.provider_name)) {
-    return absl::InvalidArgumentError(
-        "MUSA XLA, LLVM, and provider identities must be canonical tokens");
-  }
-  if (!IsSha256(identity.provider_fingerprint) ||
-      !IsSha256(identity.bridge_fingerprint) ||
-      !IsSha256(identity.toolchain_fingerprint) ||
-      !IsSha256(identity.libdevice_fingerprint)) {
-    return absl::InvalidArgumentError(
-        "MUSA compilation identity fingerprints must be lowercase SHA-256");
-  }
-  if (!IsCompatibilityToken(identity.driver_compatibility) ||
-      !IsCompatibilityToken(identity.runtime_compatibility)) {
-    return absl::InvalidArgumentError(
-        "MUSA driver/runtime compatibility rules must be canonical tokens");
-  }
-  return absl::OkStatus();
-}
-
 absl::Status ValidatePaths(const MusaSubprocessBridgePaths& paths) {
   const absl::string_view values[] = {
       paths.bridge_executable,     paths.toolchain_identity,
@@ -680,7 +658,7 @@ class SubprocessCompilationProvider final : public MusaCompilationProvider {
 absl::StatusOr<MusaSubprocessCompilationProviderOptions>
 ValidateAndCanonicalizeOptions(
     MusaSubprocessCompilationProviderOptions options) {
-  absl::Status status = ValidateIdentity(options.identity);
+  absl::Status status = ValidateMusaCompilationIdentity(options.identity);
   if (!status.ok()) return status;
   status = ValidatePaths(options.paths);
   if (!status.ok()) return status;
@@ -704,11 +682,34 @@ ValidateAndCanonicalizeOptions(
 
 }  // namespace
 
+absl::Status ValidateMusaCompilationIdentity(
+    const MusaCompilationIdentity& identity) {
+  if (!IsCompatibilityToken(identity.xla_revision) ||
+      !IsCompatibilityToken(identity.current_llvm_revision) ||
+      !IsCompatibilityToken(identity.provider_name)) {
+    return absl::InvalidArgumentError(
+        "MUSA XLA, LLVM, and provider identities must be canonical tokens");
+  }
+  if (!IsSha256(identity.provider_fingerprint) ||
+      !IsSha256(identity.bridge_fingerprint) ||
+      !IsSha256(identity.toolchain_fingerprint) ||
+      !IsSha256(identity.libdevice_fingerprint)) {
+    return absl::InvalidArgumentError(
+        "MUSA compilation identity fingerprints must be lowercase SHA-256");
+  }
+  if (!IsCompatibilityToken(identity.driver_compatibility) ||
+      !IsCompatibilityToken(identity.runtime_compatibility)) {
+    return absl::InvalidArgumentError(
+        "MUSA driver/runtime compatibility rules must be canonical tokens");
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<MusaBridgeCompileRequest> BuildMusaBridgeCompileRequest(
     const MusaLlvm14CompatibilityResult& module,
     const MusaCompilationIdentity& identity,
     const MusaCompilationOptions& options) {
-  absl::Status status = ValidateIdentity(identity);
+  absl::Status status = ValidateMusaCompilationIdentity(identity);
   if (!status.ok()) return status;
   if (module.normalized_llvm.empty() ||
       MusaBridgeSha256Hex(module.normalized_llvm) !=
@@ -790,7 +791,7 @@ absl::StatusOr<std::string> MusaCompilationCacheKey(
     const MusaCompilationIdentity& identity) {
   absl::Status status = ValidateMusaBridgeCompileRequestIr(request);
   if (!status.ok()) return status;
-  status = ValidateIdentity(identity);
+  status = ValidateMusaCompilationIdentity(identity);
   if (!status.ok()) return status;
   if (request.xla_revision() != identity.xla_revision ||
       request.current_llvm_revision() != identity.current_llvm_revision ||

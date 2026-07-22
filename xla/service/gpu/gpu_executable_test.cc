@@ -77,6 +77,8 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/gpu/tma_metadata.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
+#include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -621,8 +623,15 @@ TEST_F(GpuExecutableTest, ProtoConversion) {
                        GpuExecutable::Create(std::move(params)));
   ASSERT_OK_AND_ASSIGN(GpuExecutableProto proto,
                        reference_executable->ToProto());
+  EXPECT_EQ(proto.binary_kind(), GpuExecutableProto::BINARY_KIND_CUBIN);
 
   DebugOptions debug_options = GetDebugOptionsFromFlags();
+  GpuExecutableProto legacy_proto = proto;
+  legacy_proto.clear_binary_kind();
+  EXPECT_THAT(GpuExecutable::FromProto(legacy_proto, device_description,
+                                       "TEST_PLATFORM", debug_options),
+              absl_testing::IsOk());
+
   ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<GpuExecutable> reconstructed_executable,
       GpuExecutable::FromProto(proto, device_description, "TEST_PLATFORM",
@@ -641,6 +650,124 @@ TEST_F(GpuExecutableTest, ProtoConversion) {
   EXPECT_EQ(reconstructed_executable->cpu_target_machine_options().value(),
             xla::cpu::TargetMachineOptions("test_triple", "test_cpu",
                                            "+test_features"));
+}
+
+TEST_F(GpuExecutableTest, ToProtoRecordsPlatformBinaryKind) {
+  const auto serialize_kind = [](se::GpuComputeCapability capability)
+      -> absl::StatusOr<GpuExecutableProto> {
+    GpuExecutable::Params params;
+    params.binary = {1, 2, 3};
+    params.executable = std::make_unique<ThunkExecutor>(ThunkSequence{});
+    params.device_description.set_gpu_compute_capability(std::move(capability));
+    SetDummyBufferAssignment(params);
+    ASSIGN_OR_RETURN(std::unique_ptr<GpuExecutable> executable,
+                     GpuExecutable::Create(std::move(params)));
+    return executable->ToProto();
+  };
+
+  ASSERT_OK_AND_ASSIGN(GpuExecutableProto cuda,
+                       serialize_kind(se::GpuComputeCapability{
+                           se::CudaComputeCapability(9, 0)}));
+  EXPECT_EQ(cuda.binary_kind(), GpuExecutableProto::BINARY_KIND_CUBIN);
+
+  ASSERT_OK_AND_ASSIGN(GpuExecutableProto rocm,
+                       serialize_kind(se::GpuComputeCapability{
+                           se::RocmComputeCapability("gfx942")}));
+  EXPECT_EQ(rocm.binary_kind(), GpuExecutableProto::BINARY_KIND_HSACO);
+
+  ASSERT_OK_AND_ASSIGN(
+      GpuExecutableProto musa,
+      serialize_kind(se::GpuComputeCapability{
+          se::MusaComputeCapability("mp_21", 2, 1, /*hardware_warp_size=*/128,
+                                    /*logical_subgroup_size=*/32)}));
+  EXPECT_EQ(musa.binary_kind(), GpuExecutableProto::BINARY_KIND_MUBIN);
+}
+
+TEST_F(GpuExecutableTest,
+       FromProtoRejectsExplicitCudaAndRocmBinaryKindMismatches) {
+  const auto load =
+      [](se::GpuComputeCapability capability,
+         GpuExecutableProto::BinaryKind binary_kind) -> absl::Status {
+    se::DeviceDescription device_description;
+    device_description.set_gpu_compute_capability(capability);
+
+    GpuExecutable::Params params;
+    params.binary = {1, 2, 3};
+    params.executable = std::make_unique<ThunkExecutor>(ThunkSequence{});
+    params.device_description = device_description;
+    SetDummyBufferAssignment(params);
+    ASSIGN_OR_RETURN(std::unique_ptr<GpuExecutable> executable,
+                     GpuExecutable::Create(std::move(params)));
+    ASSIGN_OR_RETURN(GpuExecutableProto proto, executable->ToProto());
+    proto.set_binary_kind(binary_kind);
+    return GpuExecutable::FromProto(proto, device_description, "GPU",
+                                    GetDebugOptionsFromFlags())
+        .status();
+  };
+
+  const se::GpuComputeCapability cuda =
+      se::GpuComputeCapability(se::CudaComputeCapability(9, 0));
+  EXPECT_OK(load(cuda, GpuExecutableProto::BINARY_KIND_UNSPECIFIED));
+  EXPECT_OK(load(cuda, GpuExecutableProto::BINARY_KIND_CUBIN));
+  EXPECT_THAT(load(cuda, GpuExecutableProto::BINARY_KIND_HSACO),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("CUDA executable")));
+  EXPECT_THAT(load(cuda, GpuExecutableProto::BINARY_KIND_MUBIN),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("CUDA executable")));
+
+  const se::GpuComputeCapability rocm =
+      se::GpuComputeCapability(se::RocmComputeCapability("gfx942"));
+  EXPECT_OK(load(rocm, GpuExecutableProto::BINARY_KIND_UNSPECIFIED));
+  EXPECT_OK(load(rocm, GpuExecutableProto::BINARY_KIND_HSACO));
+  EXPECT_THAT(load(rocm, GpuExecutableProto::BINARY_KIND_CUBIN),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("ROCm executable")));
+  EXPECT_THAT(load(rocm, GpuExecutableProto::BINARY_KIND_MUBIN),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     testing::HasSubstr("ROCm executable")));
+}
+
+TEST_F(GpuExecutableTest, FromProtoRequiresExplicitMubinForMusa) {
+  GpuExecutableProto proto = ParseTextProtoOrDie<GpuExecutableProto>(R"pb(
+    module_name: "test_module"
+    binary: "mubin"
+    buffer_assignment {}
+    buffer_allocations_debug_summary: "dummy"
+    gpu_compute_capability {
+      musa_compute_capability {
+        architecture: "mp_21"
+        major: 2
+        minor: 1
+        hardware_warp_size: 128
+        logical_subgroup_size: 32
+      }
+    }
+  )pb");
+
+  se::DeviceDescription device_description;
+  device_description.set_gpu_compute_capability(se::GpuComputeCapability{
+      se::MusaComputeCapability("mp_21", 2, 1,
+                                /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)});
+  const DebugOptions debug_options = GetDebugOptionsFromFlags();
+
+  for (GpuExecutableProto::BinaryKind kind :
+       {GpuExecutableProto::BINARY_KIND_UNSPECIFIED,
+        GpuExecutableProto::BINARY_KIND_CUBIN,
+        GpuExecutableProto::BINARY_KIND_HSACO}) {
+    proto.set_binary_kind(kind);
+    EXPECT_THAT(GpuExecutable::FromProto(proto, device_description, "MUSA",
+                                         debug_options),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    testing::HasSubstr("must declare MUBIN binary kind")));
+  }
+
+  proto.set_binary_kind(GpuExecutableProto::BINARY_KIND_MUBIN);
+  EXPECT_THAT(GpuExecutable::FromProto(proto, device_description, "MUSA",
+                                       debug_options),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(GpuExecutableTest, ProtoConversionWithBackendConfigInterning) {

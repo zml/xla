@@ -25,6 +25,7 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/abi/runtime_abi_version.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_executor.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
@@ -35,6 +36,10 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
+
+#ifndef XLA_MUSA_TOOLKIT_VERSION
+#define XLA_MUSA_TOOLKIT_VERSION 0
+#endif
 
 namespace stream_executor::musa {
 MusaPlatform::MusaPlatform() : name_(kMusaPlatformId->ToName()) {}
@@ -68,17 +73,15 @@ absl::StatusOr<StreamExecutor*> MusaPlatform::FindExisting(int ordinal) {
 
 absl::StatusOr<std::unique_ptr<RuntimeAbiVersion>>
 MusaPlatform::GetRuntimeAbiVersion() const {
-  SemanticVersion runtime_version{0, 0, 0};
-  if (auto version = MusaRuntime::Get()->RuntimeVersion(); version.ok()) {
-    auto parsed = ParseMusaVersion(*version);
-    if (parsed.ok()) {
-      runtime_version = *parsed;
-    } else {
-      LOG(ERROR) << "Failed to decode MUSA runtime version " << *version << ": "
-                 << parsed.status();
-    }
-  }
-  return std::make_unique<MusaRuntimeAbiVersion>(runtime_version);
+  ASSIGN_OR_RETURN(int runtime_version, MusaRuntime::Get()->RuntimeVersion());
+  ASSIGN_OR_RETURN(int driver_version, MusaDriver::Instance().DriverVersion());
+  ASSIGN_OR_RETURN(SemanticVersion kernel_driver_version,
+                   GetMusaKernelDriverVersion());
+  ASSIGN_OR_RETURN(MusaRuntimeAbiVersion version,
+                   MusaRuntimeAbiVersion::CreateFromApiVersions(
+                       runtime_version, driver_version, kernel_driver_version,
+                       XLA_MUSA_TOOLKIT_VERSION));
+  return std::make_unique<MusaRuntimeAbiVersion>(std::move(version));
 }
 
 absl::StatusOr<std::unique_ptr<StreamExecutor>>

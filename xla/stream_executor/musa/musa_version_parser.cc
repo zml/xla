@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_version_parser.h"
 
+#include <array>
 #include <cstddef>
+#include <cstdio>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -52,6 +54,20 @@ absl::StatusOr<SemanticVersion> ParseMusaKernelDriverVersion(
     return absl::InvalidArgumentError("MUSA kernel driver version is empty");
   }
   return SemanticVersion::ParseFromString(version);
+}
+
+absl::StatusOr<SemanticVersion> GetMusaKernelDriverVersion() {
+  std::FILE* file = std::fopen("/proc/driver/musa/version", "r");
+  if (file == nullptr) {
+    return absl::UnavailableError("Could not open /proc/driver/musa/version");
+  }
+  std::array<char, 256> contents = {};
+  const char* read_result = std::fgets(contents.data(), contents.size(), file);
+  std::fclose(file);
+  if (read_result == nullptr) {
+    return absl::DataLossError("Could not read /proc/driver/musa/version");
+  }
+  return ParseMusaKernelDriverVersion(contents.data());
 }
 
 }  // namespace stream_executor::musa

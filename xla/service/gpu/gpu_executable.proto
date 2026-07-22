@@ -36,6 +36,15 @@ import "xla/xla_data.proto";
 // If `thunks` is set, then this is the new format. Otherwise, it's the legacy
 // format.
 message GpuExecutableProto {
+  enum BinaryKind {
+    // Kept for compatibility with executables serialized before binary kinds
+    // were recorded explicitly.
+    BINARY_KIND_UNSPECIFIED = 0;
+    BINARY_KIND_CUBIN = 1;
+    BINARY_KIND_HSACO = 2;
+    BINARY_KIND_MUBIN = 3;
+  }
+
   // The HLO module of the executable - for debugging purposes only.
   xla.HloModuleProtoWithConfig hlo_module_with_config = 1;
 
@@ -57,7 +66,12 @@ message GpuExecutableProto {
   //
   // For CUDA, this is a cubin binary.
   // For ROCm, this is a hsaco binary.
+  // For MUSA, this is a mubin binary.
   bytes binary = 4;
+
+  // The platform-specific format of `binary`. CUDA, ROCm, and MUSA producers
+  // set this field. An unspecified kind remains valid for non-MUSA executables.
+  BinaryKind binary_kind = 17;
 
   // The DNN compiled graphs of the executable.
   //

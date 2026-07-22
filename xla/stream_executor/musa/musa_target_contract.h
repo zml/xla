@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_MUSA_MUSA_TARGET_CONTRACT_H_
 #define XLA_STREAM_EXECUTOR_MUSA_MUSA_TARGET_CONTRACT_H_
 
+#include <cstdint>
+
 namespace stream_executor::musa {
 
 // C01 qualifies exactly this initial hardware/toolkit contract. These values
@@ -28,6 +30,15 @@ inline constexpr int kS80HardwareWarpSize = 128;
 // Subgroup-operation semantics remain gated on the C07/C08 conformance probes.
 inline constexpr int kS80CompilerLogicalSubgroupSize = 32;
 inline constexpr int kQualifiedMusaToolkitVersion = 40001;  // 4.0.1
+
+// StreamExecutor-owned executable envelope facts. Compiler bridge and shim
+// identities are deliberately not part of this contract: they are validated
+// by the compiler service that produces the executable.
+inline constexpr uint32_t kMusaExecutableAbiEnvelopeVersion = 1;
+inline constexpr char kMusaExecutableBinaryKind[] = "mubin";
+inline constexpr char kS80TargetFeatures[] = "none";
+inline constexpr uint32_t kMusaPointerWidth = 64;
+inline constexpr bool kMusaIsLittleEndian = true;
 
 // Compiler identities shared by the current-LLVM interchange validator and
 // the isolated vendor-LLVM bridge. The data layout is installed before any

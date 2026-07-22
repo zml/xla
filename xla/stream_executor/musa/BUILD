@@ -11,6 +11,7 @@ load(
     "stream_executor_friends",
 )
 load("//xla/tsl:tsl.bzl", "internal_visibility", "tsl_copts")
+load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 package(
@@ -160,6 +161,42 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "musa_executable_abi",
+    srcs = ["musa_executable_abi.cc"],
+    hdrs = ["musa_executable_abi.h"],
+    deps = [
+        ":musa_mubin",
+        ":musa_platform_id",
+        ":musa_target_contract",
+        "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/abi:executable_abi_version_proto_cc",
+        "@boringssl//:crypto",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_executable_abi_test",
+    srcs = ["musa_executable_abi_test.cc"],
+    deps = [
+        ":musa_executable_abi",
+        ":musa_mubin",
+        ":musa_target_contract",
+        "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/abi:executable_abi_version_proto_cc",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -529,15 +566,66 @@ cc_library(
         "musa-only",
     ],
     deps = [
+        ":musa_mubin",
         ":musa_platform_id",
-        ":musa_runtime",
+        ":musa_runtime_abi_version_proto_cc",
+        ":musa_target_contract",
+        ":musa_version_parser",
         "//xla/stream_executor:platform_id",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/abi:executable_abi_version_proto_cc",
         "//xla/stream_executor/abi:runtime_abi_version",
+        "//xla/stream_executor/abi:runtime_abi_version_proto_cc",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+tf_proto_library(
+    name = "musa_runtime_abi_version_proto",
+    srcs = ["musa_runtime_abi_version.proto"],
+)
+
+cc_library(
+    name = "musa_runtime_abi_version_registration",
+    srcs = ["musa_runtime_abi_version_registration.cc"],
+    deps = [
+        ":musa_platform_id",
+        ":musa_runtime_abi_version",
+        "//xla/stream_executor/abi:runtime_abi_version_manager",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+    alwayslink = 1,
+)
+
+xla_cc_test(
+    name = "musa_runtime_abi_version_test",
+    srcs = ["musa_runtime_abi_version_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mubin",
+        ":musa_runtime_abi_version",
+        ":musa_runtime_abi_version_proto_cc",
+        ":musa_runtime_abi_version_registration",  # buildcleaner: keep
+        ":musa_target_contract",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/abi:executable_abi_version",
+        "//xla/stream_executor/abi:executable_abi_version_proto_cc",
+        "//xla/stream_executor/abi:runtime_abi_version",
+        "//xla/stream_executor/abi:runtime_abi_version_manager",
+        "//xla/stream_executor/abi:runtime_abi_version_proto_cc",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -705,22 +793,28 @@ cc_library(
     name = "musa_platform",
     srcs = ["musa_platform.cc"],
     hdrs = ["musa_platform.h"],
+    local_defines = [
+        "XLA_MUSA_TOOLKIT_VERSION=%s" % musa_config().version_number,
+    ],
     tags = [
         "gpu",
         "musa-only",
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":musa_driver",
         ":musa_executor",
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_runtime_abi_version",
+        ":musa_runtime_abi_version_registration",  # buildcleaner: keep
         ":musa_version_parser",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:executor_cache",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:platform_manager",
         "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor:semantic_version",
         "//xla/stream_executor/platform:initialize",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/log",

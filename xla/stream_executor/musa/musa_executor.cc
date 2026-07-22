@@ -15,9 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
-#include <array>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <iterator>
 #include <limits>
@@ -72,28 +70,6 @@ limitations under the License.
 
 namespace stream_executor::musa {
 namespace {
-
-std::optional<SemanticVersion> GetKernelModeDriverVersion() {
-  std::FILE* file = std::fopen("/proc/driver/musa/version", "r");
-  if (file == nullptr) {
-    LOG(WARNING) << "Could not open /proc/driver/musa/version";
-    return std::nullopt;
-  }
-  std::array<char, 256> contents = {};
-  const char* read_result = std::fgets(contents.data(), contents.size(), file);
-  std::fclose(file);
-  if (read_result == nullptr) {
-    LOG(WARNING) << "Could not read /proc/driver/musa/version";
-    return std::nullopt;
-  }
-  auto version = ParseMusaKernelDriverVersion(contents.data());
-  if (!version.ok()) {
-    LOG(WARNING) << "Could not parse MUSA kernel driver version: "
-                 << version.status();
-    return std::nullopt;
-  }
-  return *version;
-}
 
 void* MallocHost(uint64_t size) {
   return std::malloc(static_cast<size_t>(size));
@@ -349,12 +325,21 @@ MusaExecutor::CreateDeviceDescription(int device_ordinal) {
     TF_ASSIGN_OR_RETURN(int runtime_version,
                         MusaRuntime::Get()->RuntimeVersion());
     TF_ASSIGN_OR_RETURN(int driver_version, driver.DriverVersion());
+    absl::StatusOr<SemanticVersion> kernel_driver_version =
+        GetMusaKernelDriverVersion();
+    if (!kernel_driver_version.ok()) {
+      LOG(WARNING) << "Could not query MUSA kernel driver version: "
+                   << kernel_driver_version.status();
+    }
 
     MusaDeviceVersions versions{
         .runtime_api = runtime_version,
         .driver_api = driver_version,
         .compile_time_toolkit = XLA_MUSA_TOOLKIT_VERSION,
-        .kernel_mode_driver = GetKernelModeDriverVersion(),
+        .kernel_mode_driver =
+            kernel_driver_version.ok()
+                ? std::optional<SemanticVersion>(*kernel_driver_version)
+                : std::nullopt,
     };
     TF_ASSIGN_OR_RETURN(DeviceDescription description,
                         BuildMusaDeviceDescription(properties, versions));

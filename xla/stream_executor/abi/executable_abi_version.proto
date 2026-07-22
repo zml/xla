@@ -29,7 +29,68 @@ message ExecutableAbiVersionProto {
     bytes cub_version = 3;
   }
 
+  // Versioned, self-describing ABI envelope for an executable containing a
+  // MUSA device binary. Compiler-only identities are intentionally opaque to
+  // StreamExecutor; the MUSA runtime validator checks only loader, target,
+  // version-range, and explicitly required optional-library contracts.
+  message MusaPlatformVersion {
+    message NumericalOptions {
+      uint32 optimization_level = 1;
+      bool emit_debug_information = 2;
+      bool deterministic = 3;
+      bool fast_math = 4;
+      bool flush_denormals_to_zero = 5;
+      bool finite_math_only = 6;
+      bool unsafe_math_optimizations = 7;
+      bool no_signed_zeros = 8;
+      bool allow_fp_contract = 9;
+    }
+
+    message OptionalLibraryAbi {
+      string name = 1;
+      string abi_version = 2;
+      string fingerprint = 3;
+    }
+
+    uint32 envelope_version = 1;
+    string binary_kind = 2;
+    uint32 mubin_loader_abi_version = 3;
+    string main_binary_sha256 = 4;
+    string target_triple = 5;
+    string architecture = 6;
+    string target_features = 7;
+    string data_layout = 8;
+    uint32 pointer_width = 9;
+    bool little_endian = 10;
+    uint32 hardware_warp_size = 11;
+    uint32 logical_subgroup_size = 12;
+    uint32 bridge_protocol_version = 13;
+    uint32 shim_abi_version = 14;
+    uint32 shim_mapping_version = 15;
+    string shim_mapping_sha256 = 16;
+    string llvm14_compatibility_revision = 17;
+    string xla_revision = 18;
+    string current_llvm_revision = 19;
+    string provider_name = 20;
+    string provider_fingerprint = 21;
+    string bridge_fingerprint = 22;
+    string toolchain_fingerprint = 23;
+    string libdevice_fingerprint = 24;
+    string driver_compatibility = 25;
+    string runtime_compatibility = 26;
+    NumericalOptions numerical_options = 27;
+    string required_toolkit_version = 28;
+    string minimum_runtime_version = 29;
+    string maximum_runtime_version = 30;
+    string minimum_driver_version = 31;
+    string maximum_driver_version = 32;
+    string minimum_kernel_driver_version = 33;
+    string maximum_kernel_driver_version = 34;
+    repeated OptionalLibraryAbi required_optional_library_abis = 35;
+  }
+
   oneof platform_specific_version {
     CudaPlatformVersion cuda_platform_version = 3;
+    MusaPlatformVersion musa_platform_version = 4;
   }
 }
