@@ -25,6 +25,7 @@ limitations under the License.
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -167,8 +168,12 @@ class VulkanDriver {
   PFN_vkGetPhysicalDeviceFeatures2 get_physical_device_features2 = nullptr;
   PFN_vkGetPhysicalDeviceMemoryProperties get_physical_device_memory_properties =
       nullptr;
+  PFN_vkGetPhysicalDeviceMemoryProperties2
+      get_physical_device_memory_properties2 = nullptr;
   PFN_vkGetPhysicalDeviceQueueFamilyProperties
       get_physical_device_queue_family_properties = nullptr;
+  PFN_vkEnumerateDeviceExtensionProperties
+      enumerate_device_extension_properties = nullptr;
   PFN_vkCreateDevice create_device = nullptr;
 
  private:
@@ -324,8 +329,16 @@ class VulkanDriver {
         &get_physical_device_memory_properties));
     RETURN_IF_ERROR(LoadInstanceProc(
         get_instance_proc_addr, instance_,
+        "vkGetPhysicalDeviceMemoryProperties2",
+        &get_physical_device_memory_properties2));
+    RETURN_IF_ERROR(LoadInstanceProc(
+        get_instance_proc_addr, instance_,
         "vkGetPhysicalDeviceQueueFamilyProperties",
         &get_physical_device_queue_family_properties));
+    RETURN_IF_ERROR(LoadInstanceProc(
+        get_instance_proc_addr, instance_,
+        "vkEnumerateDeviceExtensionProperties",
+        &enumerate_device_extension_properties));
     RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
                                      "vkCreateDevice", &create_device));
     RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
@@ -573,6 +586,28 @@ struct VulkanExecutor::Impl {
     Driver().get_physical_device_memory_properties(physical_device,
                                                    &memory_properties);
 
+    uint32_t extension_count = 0;
+    RETURN_IF_VK_ERROR(Driver().enumerate_device_extension_properties(
+        physical_device, /*pLayerName=*/nullptr, &extension_count,
+        /*pProperties=*/nullptr));
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    if (extension_count != 0) {
+      RETURN_IF_VK_ERROR(Driver().enumerate_device_extension_properties(
+          physical_device, /*pLayerName=*/nullptr, &extension_count,
+          extensions.data()));
+      extensions.resize(extension_count);
+    }
+    const bool has_memory_budget = std::any_of(
+        extensions.begin(), extensions.end(), [](const auto& extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+        });
+    if (!has_memory_budget) {
+      return absl::FailedPreconditionError(absl::StrFormat(
+          "Vulkan device %s does not support required extension %s",
+          properties.deviceName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME));
+    }
+
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {};
     timeline_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -611,6 +646,11 @@ struct VulkanExecutor::Impl {
     device_info.pNext = &timeline_features;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    const char* enabled_extensions[] = {
+        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
+    };
+    device_info.enabledExtensionCount = 1;
+    device_info.ppEnabledExtensionNames = enabled_extensions;
     RETURN_IF_VK_ERROR(Driver().create_device(
         physical_device, &device_info, /*pAllocator=*/nullptr, &device));
 
@@ -1341,30 +1381,67 @@ bool VulkanExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {
 }
 
 bool VulkanExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
+  budget_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+  VkPhysicalDeviceMemoryProperties2 memory_properties = {};
+  memory_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+  memory_properties.pNext = &budget_properties;
+  Driver().get_physical_device_memory_properties2(
+      impl_->physical_device, &memory_properties);
+
   constexpr VkMemoryPropertyFlags required =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t compatible_heaps = 0;
-  for (uint32_t i = 0; i < impl_->memory_properties.memoryTypeCount; ++i) {
-    const VkMemoryType& type = impl_->memory_properties.memoryTypes[i];
+  for (uint32_t i = 0;
+       i < memory_properties.memoryProperties.memoryTypeCount; ++i) {
+    const VkMemoryType& type =
+        memory_properties.memoryProperties.memoryTypes[i];
     if ((type.propertyFlags & required) == required) {
       compatible_heaps |= 1u << type.heapIndex;
     }
   }
 
-  int64_t available = 0;
-  for (uint32_t i = 0; i < impl_->memory_properties.memoryHeapCount; ++i) {
-    if ((compatible_heaps & (1u << i)) != 0) {
-      available += static_cast<int64_t>(
-          impl_->memory_properties.memoryHeaps[i].size);
-    }
+  uint64_t budget = 0;
+  uint64_t available = 0;
+  for (uint32_t i = 0;
+       i < memory_properties.memoryProperties.memoryHeapCount; ++i) {
+    if ((compatible_heaps & (1u << i)) == 0) continue;
+    const uint64_t heap_budget = budget_properties.heapBudget[i];
+    const uint64_t heap_usage = budget_properties.heapUsage[i];
+    const uint64_t heap_available =
+        heap_usage < heap_budget ? heap_budget - heap_usage : 0;
+    budget = heap_budget > std::numeric_limits<uint64_t>::max() - budget
+                 ? std::numeric_limits<uint64_t>::max()
+                 : budget + heap_budget;
+    available =
+        heap_available > std::numeric_limits<uint64_t>::max() - available
+            ? std::numeric_limits<uint64_t>::max()
+            : available + heap_available;
+    VLOG(1) << "Vulkan memory heap " << i
+            << ": size="
+            << memory_properties.memoryProperties.memoryHeaps[i].size
+            << ", budget=" << heap_budget << ", usage=" << heap_usage
+            << ", available=" << heap_available;
   }
+
   const int64_t configured_limit = GetMemoryLimitBytes();
   if (configured_limit > 0) {
-    available = std::min(available, configured_limit);
+    budget = std::min(budget, static_cast<uint64_t>(configured_limit));
+    available = std::min(available, budget);
   }
-  if (total != nullptr) *total = available;
-  if (free != nullptr) *free = available;
+  constexpr uint64_t kMaxInt64 =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  const int64_t reported_total =
+      static_cast<int64_t>(std::min(budget, kMaxInt64));
+  const int64_t reported_free =
+      static_cast<int64_t>(std::min(available, kMaxInt64));
+  VLOG(1) << "Vulkan memory usage: total budget=" << reported_total
+          << ", free budget=" << reported_free;
+  if (total != nullptr) *total = reported_total;
+  if (free != nullptr) *free = reported_free;
   return true;
 }
 
