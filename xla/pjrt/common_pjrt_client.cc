@@ -1950,8 +1950,10 @@ absl::Status CommonPjRtLoadedExecutable::ExecutePrepare(
   // This also ensures that the returned `execute_event` dominates all inputs'
   // events, and thus output buffer only need to contain `execute_event` as the
   // single definition event.
-  launch_args.extra_deps.reserve(argument_handles.size());
-  launch_args.control_deps.reserve(argument_handles.size());
+  if (argument_handles.size() <= 4) {
+    launch_args.extra_deps.reserve(argument_handles.size());
+    launch_args.control_deps.reserve(argument_handles.size());
+  }
 
   bool is_error = false;
   RETURN_IF_ERROR(CommonPjRtClient::PrepareArguments(
