@@ -91,7 +91,7 @@ absl::Status CheckImplementableInst(const HloAllGatherInstruction* inst) {
 }  // namespace
 
 static absl::Status RunOneSidedAllGather(
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
     Communicator& comm);
 
@@ -174,7 +174,7 @@ absl::Status AllGatherThunk::RunCollective(const ExecuteParams& params,
                                            Communicator& comm) {
   int device_ordinal = stream.parent()->device_ordinal();
 
-  ASSIGN_OR_RETURN(std::vector<DeviceBufferPair> device_buffers,
+  ASSIGN_OR_RETURN(DeviceBufferPairs device_buffers,
                    ConvertToDeviceBuffers(params.buffer_allocations, buffers(),
                                           config_.config.operand_element_type));
   if (use_symmetric_memory() && clique_key.is_local()) {
@@ -203,9 +203,8 @@ absl::Status AllGatherThunk::RunCollective(const ExecuteParams& params,
                                 config_.config.use_symmetric_buffer);
 }
 
-absl::Status RunAllGather(std::vector<DeviceBufferPair>& buffers,
-                          se::Stream& stream, Communicator& comm,
-                          bool use_symmetric_buffer) {
+absl::Status RunAllGather(DeviceBufferPairs& buffers, se::Stream& stream,
+                          Communicator& comm, bool use_symmetric_buffer) {
   int device_ordinal = stream.parent()->device_ordinal();
   XLA_VLOG_DEVICE(3, device_ordinal) << "Performing all-gather";
   auto* gpu_comm = absl::down_cast<GpuCommunicator*>(&comm);
@@ -233,7 +232,7 @@ absl::Status RunAllGather(std::vector<DeviceBufferPair>& buffers,
 //   3. Put our source chunk into each peer's destination buffer.
 //   4. WaitSignal from all peers for their PutSignals (data has arrived).
 static absl::Status RunOneSidedAllGather(
-    const std::vector<DeviceBufferPair>& device_buffers, se::Stream& stream,
+    const DeviceBufferPairs& device_buffers, se::Stream& stream,
     const GpuCliqueKey& clique_key, const Thunk::ExecuteParams& params,
     Communicator& comm) {
   int device_ordinal = stream.parent()->device_ordinal();

@@ -232,7 +232,7 @@ absl::StatusOr<GpuCliqueKey> GetCollectiveGpuCliqueKey(
                          collective_config.group_mode, communication_id);
 }
 
-absl::StatusOr<std::vector<DeviceBufferPair>> ConvertToDeviceBuffers(
+absl::StatusOr<DeviceBufferPairs> ConvertToDeviceBuffers(
     const BufferAllocations* buffer_allocations,
     const std::vector<CollectiveThunk::Buffer>& buffers,
     const std::vector<PrimitiveType>& element_types) {
@@ -240,7 +240,7 @@ absl::StatusOr<std::vector<DeviceBufferPair>> ConvertToDeviceBuffers(
     return FailedPrecondition("Mismatch in operand buffer counts.");
   }
 
-  std::vector<DeviceBufferPair> device_buffers;
+  DeviceBufferPairs device_buffers;
   device_buffers.reserve(buffers.size());
   for (int i = 0; i < buffers.size(); ++i) {
     device_buffers.emplace_back(DeviceBufferPair{

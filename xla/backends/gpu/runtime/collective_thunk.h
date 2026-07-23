@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/call_once.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -289,7 +290,10 @@ struct DeviceBufferPair {
   int64_t destination_memory_space;
 };
 
-absl::StatusOr<std::vector<DeviceBufferPair>> ConvertToDeviceBuffers(
+// Buffers on one device for a collective operation.
+using DeviceBufferPairs = absl::InlinedVector<DeviceBufferPair, 4>;
+
+absl::StatusOr<DeviceBufferPairs> ConvertToDeviceBuffers(
     const BufferAllocations* buffer_allocations,
     const std::vector<CollectiveThunk::Buffer>& buffers,
     const std::vector<PrimitiveType>& element_types);
