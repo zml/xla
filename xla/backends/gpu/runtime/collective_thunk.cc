@@ -302,10 +302,8 @@ absl::Status CollectiveThunk::Prepare(const PrepareParams& params) {
 
   RETURN_IF_ERROR(device_groups_.status());
 
-  ASSIGN_OR_RETURN(
-      GpuCliqueKey clique_key,
-      GetGpuCliqueKey(*params.collective_params, config().replica_groups,
-                      config().group_mode, communication_id_));
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetOrCreateCliqueKey(*params.collective_params));
 
   RETURN_IF_ERROR(params.collective_clique_requests->RequestClique(
       clique_key, *device_groups_, GetCliqueRequirements(clique_key)));
@@ -330,11 +328,29 @@ absl::Status CollectiveThunk::Prepare(const PrepareParams& params) {
 }
 
 absl::Status CollectiveThunk::Initialize(const InitializeParams& params) {
-  ASSIGN_OR_RETURN(
-      GpuCliqueKey clique_key,
-      GetGpuCliqueKey(*params.collective_params, config().replica_groups,
-                      config().group_mode, communication_id_));
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetOrCreateCliqueKey(*params.collective_params));
   return InitializeCollective(params, clique_key);
+}
+
+absl::StatusOr<GpuCliqueKey> CollectiveThunk::GetOrCreateCliqueKey(
+    const CollectiveParams& params) const {
+  CliqueKeyCacheKey cache_key{params.global_device_id, params.device_assn,
+                              params.global_device_id_map, params.incarnations};
+  {
+    absl::MutexLock lock(clique_key_cache_mutex_);
+    auto it = clique_key_cache_.find(cache_key);
+    if (it != clique_key_cache_.end()) {
+      return it->second;
+    }
+  }
+
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetGpuCliqueKey(params, config().replica_groups,
+                                   config().group_mode, communication_id_));
+  absl::MutexLock lock(clique_key_cache_mutex_);
+  auto [it, inserted] = clique_key_cache_.emplace(cache_key, clique_key);
+  return it->second;
 }
 
 absl::Status CollectiveThunk::FirstCallRendezvous(
@@ -377,10 +393,8 @@ absl::Status CollectiveThunk::FirstCallRendezvous(
 absl::Status CollectiveThunk::RunWithCommAndRendezvous(
     const ExecuteParams& params,
     absl::FunctionRef<absl::Status(const GpuCliqueKey&, Communicator&)> fn) {
-  ASSIGN_OR_RETURN(
-      GpuCliqueKey clique_key,
-      GetGpuCliqueKey(*params.collective_params, config().replica_groups,
-                      config().group_mode, communication_id_));
+  ASSIGN_OR_RETURN(GpuCliqueKey clique_key,
+                   GetOrCreateCliqueKey(*params.collective_params));
   ASSIGN_OR_RETURN(Communicator * comm,
                    params.collective_cliques->GetComm(
                        clique_key, params.collective_params->global_device_id));
@@ -463,8 +477,7 @@ Thunk::BufferUses CollectiveThunk::buffer_uses() const {
 
 absl::StatusOr<GpuCliqueKey> CollectiveThunk::GetCliqueKey(
     const ExecuteParams& params) const {
-  return GetGpuCliqueKey(*params.collective_params, config().replica_groups,
-                         config().group_mode, communication_id_);
+  return GetOrCreateCliqueKey(*params.collective_params);
 }
 
 std::string CollectiveThunk::GetDeviceString(
