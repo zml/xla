@@ -46,6 +46,8 @@ VulkanComputeCapabilityProto VulkanComputeCapability::ToProto() const {
   VulkanComputeCapabilityProto proto;
   proto.set_api_version_major(api_version_major_);
   proto.set_api_version_minor(api_version_minor_);
+  proto.set_shader_bfloat16(shader_bfloat16_);
+  proto.set_storage_buffer_16bit_access(storage_buffer_16bit_access_);
   return proto;
 }
 
