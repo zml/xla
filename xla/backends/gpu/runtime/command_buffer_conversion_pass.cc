@@ -128,6 +128,16 @@ CommandBufferConfig GetCommandBufferConfig(
       debug_options.xla_gpu_command_buffer_unroll_loops(),
       num_local_devices};
 
+  // XLA command buffers are reusable execution graphs (for example, CUDA or
+  // HIP graphs), not native Vulkan VkCommandBuffers. VulkanExecutor does not
+  // implement StreamExecutor::CreateCommandBuffer, so preserve the ordinary
+  // thunk sequence for this target.
+  if (device_info.gpu_compute_capability().IsVulkan()) {
+    config.enabled_commands.clear();
+    config.enabled_collectives.reset();
+    return config;
+  }
+
   // Erase command buffer cmd types that are not supported by the gpu runtime.
   static constexpr auto kRequireConditionals = {DebugOptions::CONDITIONAL,
                                                 DebugOptions::WHILE};
