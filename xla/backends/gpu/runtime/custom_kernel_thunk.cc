@@ -74,17 +74,24 @@ std::string CustomKernelThunk::ToString(int indent) const {
 }
 
 absl::Status CustomKernelThunk::Initialize(const InitializeParams& params) {
-  absl::MutexLock lock(mutex_);
-
-  if (!kernel_cache_.contains(params.executor)) {
-    ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                     params.executor->LoadKernel(custom_kernel_.kernel_spec()));
-    se::KernelMetadata m = kernel->metadata();
-    m.set_shared_memory_bytes(custom_kernel_.shared_memory_bytes());
-    kernel->set_metadata(m);
-    kernel->set_use_pdl(use_pdl_);
-    kernel_cache_.emplace(params.executor, std::move(kernel));
+  {
+    absl::ReaderMutexLock lock(mutex_);
+    if (kernel_cache_.contains(params.executor)) {
+      return absl::OkStatus();
+    }
   }
+
+  // Loading kernels for different executors can be expensive and independent.
+  // Keep it outside the cache lock so multi-device initialization is parallel.
+  ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                   params.executor->LoadKernel(custom_kernel_.kernel_spec()));
+  se::KernelMetadata m = kernel->metadata();
+  m.set_shared_memory_bytes(custom_kernel_.shared_memory_bytes());
+  kernel->set_metadata(m);
+  kernel->set_use_pdl(use_pdl_);
+
+  absl::MutexLock lock(mutex_);
+  kernel_cache_.try_emplace(params.executor, std::move(kernel));
 
   return absl::OkStatus();
 }
