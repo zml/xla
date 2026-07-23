@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -55,6 +56,11 @@ class TracedCommandBuffer : public CommandState {
       se::Stream* stream, absl::FunctionRef<absl::Status(se::Stream*)> trace,
       se::StreamPriority priority = se::StreamPriority::Default);
 
+  bool RecordedChildIsCurrent(const se::CommandBuffer::Command* command,
+                              se::CommandBuffer* nested) const;
+  void SetRecordedChild(const se::CommandBuffer::Command* command,
+                        se::CommandBuffer* nested);
+
  private:
   std::vector<BufferAllocation::Index> allocs_indices_;
 
@@ -65,6 +71,8 @@ class TracedCommandBuffer : public CommandState {
   const Command* trace_cmd_;
   int64_t capacity_;
   std::vector<Entry> entries_;
+  absl::flat_hash_map<const se::CommandBuffer::Command*, se::CommandBuffer*>
+      recorded_children_;
 };
 
 }  // namespace xla::gpu

@@ -128,4 +128,16 @@ absl::StatusOr<se::CommandBuffer*> TracedCommandBuffer::GetOrTraceCommandBuffer(
   return shift_right(capacity_ - 1).command_buffer.get();
 }
 
+bool TracedCommandBuffer::RecordedChildIsCurrent(
+    const se::CommandBuffer::Command* command,
+    se::CommandBuffer* nested) const {
+  auto it = recorded_children_.find(command);
+  return it != recorded_children_.end() && it->second == nested;
+}
+
+void TracedCommandBuffer::SetRecordedChild(
+    const se::CommandBuffer::Command* command, se::CommandBuffer* nested) {
+  recorded_children_[command] = nested;
+}
+
 }  // namespace xla::gpu
