@@ -1142,7 +1142,10 @@ absl::Status CommonPjRtClient::PrepareArguments(
     tsl::profiler::TraceMe t2("Handle inputs");
     // State for `TestBufferDonationClashes`.
     absl::flat_hash_map<const void*, std::pair<bool, int>> donation_clashes;
-    donation_clashes.reserve(argument_handles.size());
+    const bool check_donation_clashes = !donated_params.empty();
+    if (check_donation_clashes) {
+      donation_clashes.reserve(argument_handles.size());
+    }
     // The first element is the argument index of the donated buffer, and the
     // second element is the size in bytes of the donated buffer.
     std::vector<std::pair<int, size_t>> donated_buffer_stats;
@@ -1258,8 +1261,10 @@ absl::Status CommonPjRtClient::PrepareArguments(
       }
 
       auto* tfrt_buffer = absl::down_cast<CommonPjRtBufferImpl*>(handle);
-      RETURN_IF_ERROR(TestBufferDonationClashes(
-          tfrt_buffer, donation_clashes, must_donate, i, replica, partition));
+      if (check_donation_clashes) {
+        RETURN_IF_ERROR(TestBufferDonationClashes(
+            tfrt_buffer, donation_clashes, must_donate, i, replica, partition));
+      }
       if (allow_fallback_for_donation && must_donate) {
         // On CPU, we allow donation to succeed by introducing a copy. This was
         // added when enabling buffer donation on CPU since it turned out that a
