@@ -274,6 +274,11 @@ class Thunk {
     // rely on this invariant without revalidating the vector on each step.
     std::optional<absl::Span<const BufferAllocation::Index>>
         persistent_alloc_indices = std::nullopt;
+
+    // Set by thunks when initialization instantiated or updated on-device
+    // control state that must be observed by all local participants before
+    // execution starts.
+    bool* requires_initialization_rendezvous = nullptr;
   };
 
   //===--------------------------------------------------------------------===//

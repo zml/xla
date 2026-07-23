@@ -254,6 +254,9 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
       (!cmd_buffer->persistent_allocs_info_was_valid &&
        persistent_allocs_info_is_valid) ||
       (has_dynamic_allocations && commands_.requires_update_on_initialize())) {
+    if (params.requires_initialization_rendezvous != nullptr) {
+      *params.requires_initialization_rendezvous = true;
+    }
     VLOG(3) << "Initialize command buffer on device #"
             << params.executor->device_ordinal()
             << " by recoding command buffer cmd sequence"
