@@ -94,7 +94,7 @@ CustomKernelThunk::GetKernelAndArgs(const BufferAllocations& buffer_allocations,
                                     se::StreamExecutor* executor) const {
   se::Kernel* kernel;
   {
-    absl::MutexLock lock(mutex_);
+    absl::ReaderMutexLock lock(mutex_);
     auto it = kernel_cache_.find(executor);
     if (it == kernel_cache_.end() || it->second == nullptr) {
       return absl::InternalError(

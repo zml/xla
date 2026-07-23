@@ -200,6 +200,18 @@ absl::Status KernelThunk::Initialize(const InitializeParams& params) {
   return absl::OkStatus();
 }
 
+absl::StatusOr<se::Kernel*> KernelThunk::GetKernel(
+    se::StreamExecutor* executor) const {
+  absl::ReaderMutexLock lock(mutex_);
+  auto it = kernel_cache_.find(executor);
+  if (it == kernel_cache_.end() || it->second == nullptr) {
+    return absl::InternalError(absl::StrFormat(
+        "Kernel not loaded for executor (Initialize() not called): %s",
+        kernel_name_));
+  }
+  return it->second.get();
+}
+
 absl::StatusOr<KernelThunk::KernelWithArgs> KernelThunk::GetKernelAndArgs(
     const BufferAllocations& buffer_allocations,
     se::StreamExecutor* executor) const {
