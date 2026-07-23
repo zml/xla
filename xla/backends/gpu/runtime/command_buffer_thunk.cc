@@ -111,10 +111,10 @@ CommandBufferThunk::CommandBufferThunk(
   TrackCommandBuffers(state_);
 }
 
-std::vector<BufferAllocation::Index>
+Command::UpdatedAllocations
 CommandBufferThunk::ExecutorCommandBuffer::UpdateBufferAllocations(
     const CommandExecutor& commands, const Thunk::ExecuteParams& params) {
-  std::vector<BufferAllocation::Index> updated_allocs;
+  Command::UpdatedAllocations updated_allocs;
   const BufferAllocations* allocs = params.buffer_allocations;
   absl::Span<const BufferAllocation::Index> allocs_to_check =
       commands.allocs_indices();
@@ -270,7 +270,7 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
     uint64_t start_micros = tsl::Env::Default()->NowMicros();
 
     // Update recorded buffer allocations.
-    std::optional<std::vector<BufferAllocation::Index>> updated_allocs =
+    std::optional<Command::UpdatedAllocations> updated_allocs =
         cmd_buffer->UpdateBufferAllocations(commands_, execute_params);
 
     // Allocations can become persistent before their new addresses are
@@ -372,7 +372,7 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
 
     uint64_t start_micros = tsl::Env::Default()->NowMicros();
 
-    std::optional<std::vector<BufferAllocation::Index>> allocs_to_update =
+    std::optional<Command::UpdatedAllocations> allocs_to_update =
         std::move(updated_allocs);
     // Force all commands to update when the recorded information validity does
     // not match this execution. A filtered update could skip a command whose
