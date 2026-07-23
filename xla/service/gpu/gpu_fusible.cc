@@ -107,6 +107,12 @@ int64_t MaxUnrollFactor(const HloFusionAnalysis* analysis) {
   if (analysis == nullptr) {
     return kDefaultUnrollFactor;
   }
+  // LLVM's logical SPIR-V backend cannot reliably legalize vectorized storage
+  // buffer accesses yet. Keep Vulkan loop kernels scalar until that lowering
+  // is supported.
+  if (analysis->device_info().gpu_compute_capability().IsVulkan()) {
+    return 1;
+  }
 
   // On Blackwell we would like to increase the maximum unroll factor to 8, as
   // we need more vectorization for full performance.
