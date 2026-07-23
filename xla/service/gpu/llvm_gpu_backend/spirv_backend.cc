@@ -31,10 +31,12 @@ limitations under the License.
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
+#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/lib/Target/SPIRV/MCTargetDesc/SPIRVBaseInfo.h"
 #include "llvm/lib/Target/SPIRV/SPIRVAPI.h"
@@ -44,6 +46,10 @@ limitations under the License.
 #include "xla/service/gpu/llvm_gpu_backend/gpu_backend_lib.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "tsl/platform/errors.h"
+
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace xla::gpu::spirv {
 
@@ -79,16 +85,48 @@ std::string EmitModuleToSPIRV(llvm::Module* module,
   // address inference pass in the TargetPassConfig. So we do it here
   // explicitly.
   pm.add(llvm::createInferAddressSpacesPass(0));
+  llvm::ScalarizerPassOptions scalarizer_options;
+  scalarizer_options.ScalarizeLoadStore = true;
+  pm.add(llvm::createScalarizerPass(scalarizer_options));
+
+  int scalarized_dump_fd = -1;
+  llvm::SmallString<128> scalarized_dump_path;
+  std::unique_ptr<llvm::raw_fd_ostream> scalarized_dump_stream;
+  std::error_code scalarized_dump_error = llvm::sys::fs::createUniqueFile(
+      "/tmp/xla-vulkan-after-scalarizer-%%%%%%.ll", scalarized_dump_fd,
+      scalarized_dump_path);
+  if (!scalarized_dump_error) {
+    scalarized_dump_stream = std::make_unique<llvm::raw_fd_ostream>(
+        scalarized_dump_fd, /*shouldClose=*/true);
+    scalarized_dump_stream->SetUnbuffered();
+    pm.add(llvm::createPrintModulePass(*scalarized_dump_stream));
+    llvm::errs() << "Scalarized Vulkan LLVM module: " << scalarized_dump_path
+                 << '\n';
+  } else {
+    llvm::errs() << "Could not create scalarized Vulkan LLVM dump: "
+                 << scalarized_dump_error.message() << '\n';
+  }
+
   pm.add(new llvm::TargetLibraryInfoWrapperPass(
       llvm::Triple(module->getTargetTriple())));
   std::unique_ptr<llvm::MachineModuleInfoWrapperPass> mmiwp(
       new llvm::MachineModuleInfoWrapperPass(target_machine));
   target_machine->getObjFileLowering()->Initialize(mmiwp->getMMI().getContext(),
                                                    *target_machine);
-  target_machine->addPassesToEmitFile(pm, buffered_stream, nullptr,
-                                      llvm::CodeGenFileType::ObjectFile);
+  
+  llvm::errs() << "[Vulkan] before addPassesToEmitFile\n";
+
+  bool failed = target_machine->addPassesToEmitFile(
+      pm, buffered_stream, nullptr, llvm::CodeGenFileType::ObjectFile);
+
+  llvm::errs() << "[Vulkan] after addPassesToEmitFile, failed=" << failed << '\n';
+  llvm::errs() << "[Vulkan] before pm.run\n";
 
   pm.run(*module);
+
+  llvm::errs() << "[Vulkan] after pm.run\n";
+  if (scalarized_dump_stream) scalarized_dump_stream->flush();
+
   return spirv_binary;
 }
 
@@ -255,6 +293,22 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
     builder.CreateCall(implementation, arguments);
     builder.CreateRetVoid();
   }
+
+  int dump_fd = -1;
+  llvm::SmallString<128> dump_path;
+  std::error_code error = llvm::sys::fs::createUniqueFile(
+      "/tmp/xla-vulkan-wrapped-%%%%%%.ll", dump_fd, dump_path);
+  if (error) {
+    return absl::InternalError(absl::StrCat(
+        "Failed to create wrapped Vulkan LLVM dump: ", error.message()));
+  }
+
+  llvm::raw_fd_ostream dump_stream(dump_fd, /*shouldClose=*/true);
+  module->print(dump_stream, nullptr);
+  dump_stream.flush();
+
+  llvm::errs() << "Wrapped Vulkan LLVM module: " << dump_path << '\n';
+
   return absl::OkStatus();
 }
 
@@ -422,9 +476,14 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   RETURN_IF_ERROR(ValidateVulkanModule(*module));
   RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
 
+  llvm::errs() << "[Vulkan] before target machine\n";
+
   llvm::Triple target_triple("spirv1.5-unknown-vulkan1.2-compute");
   std::unique_ptr<llvm::TargetMachine> target_machine =
       GetTargetMachine(target_triple, "", debug_options, "");
+
+  llvm::errs() << "[Vulkan] after target machine\n";
+
   module->setTargetTriple(target_triple);
   module->setDataLayout(target_machine->createDataLayout());
 
@@ -433,11 +492,22 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   const_cast<llvm::SPIRVSubtarget*>(spirv_target->getSubtargetImpl())
       ->initAvailableExtensions({});
 
+  llvm::errs() << "[Vulkan] before LinkAndOptimizeModule\n";
+
   RETURN_IF_ERROR(LinkAndOptimizeModule(
       module, gpu_version, debug_options, "", SPIRVTargetModuleLinker,
       target_triple, target_machine.get(), kDefaultInlineThreshold));
+
+  llvm::errs() << "[Vulkan] after LinkAndOptimizeModule\n";
+
   ExpandSubByteBitReverse(module);
-  return EmitModuleToSPIRV(module, target_machine.get());
+
+  llvm::errs() << "[Vulkan] before EmitModuleToSPIRV\n";
+
+  std::string spirv = EmitModuleToSPIRV(module, target_machine.get());
+
+  llvm::errs() << "[Vulkan] after EmitModuleToSPIRV\n";
+  return spirv;
 }
 
 }  // namespace xla::gpu::spirv
