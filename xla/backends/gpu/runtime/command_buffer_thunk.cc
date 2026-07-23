@@ -132,10 +132,10 @@ CommandBufferThunk::ExecutorCommandBuffer::UpdateBufferAllocations(
   // leave every other entry default initialized (nullptr device memory).
   for (BufferAllocation::Index index : allocs_to_check) {
     se::DeviceAddressBase alloc = allocs->GetDeviceAddress(index);
-
+    // recorded_allocs is mapping from buffer allocation index to the device
+    // memory
     if (recorded_allocs.size() <= index) {
       recorded_allocs.resize(index + 1);
-      updated_allocs.push_back(index);
     }
 
     if (!recorded_allocs[index].IsSameAs(alloc)) {
