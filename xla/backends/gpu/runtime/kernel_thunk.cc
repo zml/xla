@@ -215,18 +215,21 @@ absl::StatusOr<se::Kernel*> KernelThunk::GetKernel(
 absl::StatusOr<KernelThunk::KernelWithArgs> KernelThunk::GetKernelAndArgs(
     const BufferAllocations& buffer_allocations,
     se::StreamExecutor* executor) const {
-  se::Kernel* kernel;
-  {
-    absl::MutexLock lock(mutex_);
-    auto it = kernel_cache_.find(executor);
-    if (it == kernel_cache_.end() || it->second == nullptr) {
-      return absl::InternalError(absl::StrFormat(
-          "Kernel not loaded for executor (Initialize() not called): %s",
-          kernel_name_));
+  ASSIGN_OR_RETURN(se::Kernel * kernel, GetKernel(executor));
+  absl::InlinedVector<se::KernelArg, se::kKernelArgsInlineCapacity> kernel_args;
+  kernel_args.reserve(args_.size());
+
+  if (tma_metadata_.arg_index_to_tma_info.empty()) {
+    for (int idx = 0; idx < args_.size(); ++idx) {
+      se::DeviceAddressBase buf =
+          buffer_allocations.GetDeviceAddress(args_[idx].slice);
+      VLOG(5) << "  Arg #" << idx << ": " << args_[idx].slice << ": "
+              << buf.opaque() << " (" << buf.size() << "B)";
+      kernel_args.push_back(buf);
     }
-    kernel = it->second.get();
+    return KernelWithArgs{kernel, std::move(kernel_args)};
   }
-  absl::InlinedVector<se::KernelArg, 4> kernel_args;
+
   for (int idx = 0; idx < args_.size(); ++idx) {
     se::DeviceAddressBase buf =
         buffer_allocations.GetDeviceAddress(args_[idx].slice);

@@ -131,7 +131,7 @@ class KernelThunk : public Command {
   // GetKernelAndArgs.
   struct KernelWithArgs {
     se::Kernel* kernel;
-    absl::InlinedVector<se::KernelArg, 4> args;
+    absl::InlinedVector<se::KernelArg, se::kKernelArgsInlineCapacity> args;
   };
 
   // Looks up the loaded kernel for the given executor. Returns InternalError if

@@ -49,6 +49,8 @@ struct PackedArgBase {
   virtual int64_t size() const = 0;
 };
 
+inline constexpr size_t kKernelArgsInlineCapacity = 32;
+
 //===----------------------------------------------------------------------===//
 // Kernel arguments
 //===----------------------------------------------------------------------===//
@@ -383,7 +385,8 @@ class KernelArgsDeviceAddressArray : public KernelArgs,
   // A storage for packed POD arguments added to this array.
   absl::InlinedVector<std::unique_ptr<PackedArgBase>, 8> packed_args_;
 
-  absl::InlinedVector<DeviceAddressBase, 4> device_addr_args_;
+  absl::InlinedVector<DeviceAddressBase, kKernelArgsInlineCapacity>
+      device_addr_args_;
   size_t shared_memory_bytes_ = 0;
 };
 
@@ -472,13 +475,13 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
 
  private:
   // A storage for device address arguments added to this array.
-  absl::InlinedVector<void*, 8> device_addr_args_;
+  absl::InlinedVector<void*, kKernelArgsInlineCapacity> device_addr_args_;
 
   // A storage for packed POD arguments added to this array.
   absl::InlinedVector<std::unique_ptr<PackedArgBase>, 8> packed_args_;
 
   // Pointers to entries `device_addr_args_` or `packed_args_`.
-  absl::InlinedVector<void*, 8> argument_addresses_;
+  absl::InlinedVector<void*, kKernelArgsInlineCapacity> argument_addresses_;
 
   // Shared memory required by a kernel.
   size_t shared_memory_bytes_ = 0;
