@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/no_destructor.h"
@@ -184,6 +185,50 @@ absl::Status ValidateVulkanModule(const llvm::Module& module) {
     }
   }
   return absl::OkStatus();
+}
+
+void RewriteVulkanWorkItemBuiltins(llvm::Module* module) {
+  llvm::SmallVector<std::pair<llvm::CallInst*, llvm::Intrinsic::ID>> calls;
+  for (llvm::Function& function : *module) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        llvm::Function* callee = call ? call->getCalledFunction() : nullptr;
+        if (callee == nullptr) {
+          continue;
+        }
+        llvm::Intrinsic::ID intrinsic;
+        if (callee->getName() == "_Z12get_local_idj") {
+          intrinsic = llvm::Intrinsic::spv_thread_id_in_group;
+        } else if (callee->getName() == "_Z12get_group_idj") {
+          intrinsic = llvm::Intrinsic::spv_group_id;
+        } else if (callee->getName() == "_Z14get_local_sizej") {
+          intrinsic = llvm::Intrinsic::spv_workgroup_size;
+        } else if (callee->getName() == "_Z14get_num_groupsj") {
+          intrinsic = llvm::Intrinsic::spv_num_workgroups;
+        } else if (callee->getName() == "_Z13get_global_idj") {
+          intrinsic = llvm::Intrinsic::spv_thread_id;
+        } else if (callee->getName() == "_Z15get_global_sizej") {
+          intrinsic = llvm::Intrinsic::spv_global_size;
+        } else if (callee->getName() == "_Z17get_global_offsetj") {
+          intrinsic = llvm::Intrinsic::spv_global_offset;
+        } else {
+          continue;
+        }
+        calls.push_back({call, intrinsic});
+      }
+    }
+  }
+
+  for (auto [call, intrinsic] : calls) {
+    llvm::IRBuilder<> builder(call);
+    llvm::Function* declaration = llvm::Intrinsic::getOrInsertDeclaration(
+        module, intrinsic, {call->getType()});
+    llvm::Value* replacement =
+        builder.CreateCall(declaration, {call->getArgOperand(0)});
+    call->replaceAllUsesWith(replacement);
+    call->eraseFromParent();
+  }
 }
 
 absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
@@ -473,6 +518,7 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(
       GetSPIRVBackendOptions(debug_options));
 
+  RewriteVulkanWorkItemBuiltins(module);
   RETURN_IF_ERROR(ValidateVulkanModule(*module));
   RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
 
