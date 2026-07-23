@@ -74,6 +74,35 @@ absl::Status SPIRVTargetModuleLinker(
   return absl::OkStatus();
 }
 
+bool ContainsBFloat16(llvm::Type* type,
+                      llvm::SmallPtrSetImpl<llvm::Type*>& visited) {
+  if (!visited.insert(type).second) return false;
+  if (type->isBFloatTy()) return true;
+  for (llvm::Type* subtype : type->subtypes()) {
+    if (ContainsBFloat16(subtype, visited)) return true;
+  }
+  return false;
+}
+
+bool UsesBFloat16(const llvm::Module& module) {
+  llvm::SmallPtrSet<llvm::Type*, 16> visited;
+  for (const llvm::GlobalVariable& global : module.globals()) {
+    if (ContainsBFloat16(global.getValueType(), visited)) return true;
+  }
+  for (const llvm::Function& function : module) {
+    if (ContainsBFloat16(function.getFunctionType(), visited)) return true;
+    for (const llvm::BasicBlock& block : function) {
+      for (const llvm::Instruction& instruction : block) {
+        if (ContainsBFloat16(instruction.getType(), visited)) return true;
+        for (const llvm::Use& operand : instruction.operands()) {
+          if (ContainsBFloat16(operand->getType(), visited)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 // LLVM represents unordered floating-point predicates directly, but the
 // corresponding SPIR-V comparison instructions are not available in the
 // Vulkan Shader environment. Express their NaN component with OpIsNan-capable
@@ -733,6 +762,19 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
       GetSPIRVBackendOptions(debug_options));
 
   RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
+  const auto* vulkan_capability = gpu_version.vulkan_compute_capability();
+  if (UsesBFloat16(*module)) {
+    if (vulkan_capability == nullptr ||
+        !vulkan_capability->shader_bfloat16()) {
+      return absl::UnimplementedError(
+          "Vulkan bfloat16 kernels require VK_KHR_shader_bfloat16 and "
+          "shaderBFloat16Type support");
+    }
+    if (!vulkan_capability->storage_buffer_16bit_access()) {
+      return absl::UnimplementedError(
+          "Vulkan bfloat16 buffers require storageBuffer16BitAccess support");
+    }
+  }
 
   llvm::Triple target_triple("spirv1.5-unknown-vulkan1.2-compute");
   std::unique_ptr<llvm::TargetMachine> target_machine =
@@ -742,8 +784,13 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
 
   llvm::SPIRVTargetMachine* spirv_target =
       static_cast<llvm::SPIRVTargetMachine*>(target_machine.get());
+  llvm::ExtensionSet available_extensions;
+  if (vulkan_capability != nullptr &&
+      vulkan_capability->shader_bfloat16()) {
+    available_extensions.insert(llvm::SPIRV::Extension::SPV_KHR_bfloat16);
+  }
   const_cast<llvm::SPIRVSubtarget*>(spirv_target->getSubtargetImpl())
-      ->initAvailableExtensions({});
+      ->initAvailableExtensions(available_extensions);
 
   RETURN_IF_ERROR(LinkAndOptimizeModule(
       module, gpu_version, debug_options, "", SPIRVTargetModuleLinker,

@@ -45,15 +45,25 @@ class VulkanComputeCapability {
  public:
   VulkanComputeCapability() = default;
   VulkanComputeCapability(uint32_t api_version_major,
-                          uint32_t api_version_minor)
+                          uint32_t api_version_minor,
+                          bool shader_bfloat16 = false,
+                          bool storage_buffer_16bit_access = false)
       : api_version_major_(api_version_major),
-        api_version_minor_(api_version_minor) {}
+        api_version_minor_(api_version_minor),
+        shader_bfloat16_(shader_bfloat16),
+        storage_buffer_16bit_access_(storage_buffer_16bit_access) {}
   explicit VulkanComputeCapability(const VulkanComputeCapabilityProto& proto)
       : VulkanComputeCapability(proto.api_version_major(),
-                                proto.api_version_minor()) {}
+                                proto.api_version_minor(),
+                                proto.shader_bfloat16(),
+                                proto.storage_buffer_16bit_access()) {}
 
   uint32_t api_version_major() const { return api_version_major_; }
   uint32_t api_version_minor() const { return api_version_minor_; }
+  bool shader_bfloat16() const { return shader_bfloat16_; }
+  bool storage_buffer_16bit_access() const {
+    return storage_buffer_16bit_access_;
+  }
 
   std::string ToString() const;
   VulkanComputeCapabilityProto ToProto() const;
@@ -61,12 +71,17 @@ class VulkanComputeCapability {
   friend bool operator==(const VulkanComputeCapability& lhs,
                          const VulkanComputeCapability& rhs) {
     return lhs.api_version_major_ == rhs.api_version_major_ &&
-           lhs.api_version_minor_ == rhs.api_version_minor_;
+           lhs.api_version_minor_ == rhs.api_version_minor_ &&
+           lhs.shader_bfloat16_ == rhs.shader_bfloat16_ &&
+           lhs.storage_buffer_16bit_access_ ==
+               rhs.storage_buffer_16bit_access_;
   }
 
  private:
   uint32_t api_version_major_ = 1;
   uint32_t api_version_minor_ = 2;
+  bool shader_bfloat16_ = false;
+  bool storage_buffer_16bit_access_ = false;
 };
 
 // Describes the capabilities and performance characteristics of a specific
@@ -625,9 +640,12 @@ class DeviceDescription {
   }
 
   void set_vulkan_compute_capability(uint32_t api_version_major,
-                                     uint32_t api_version_minor) {
-    gpu_compute_capability_ =
-        VulkanComputeCapability(api_version_major, api_version_minor);
+                                     uint32_t api_version_minor,
+                                     bool shader_bfloat16 = false,
+                                     bool storage_buffer_16bit_access = false) {
+    gpu_compute_capability_ = VulkanComputeCapability(
+        api_version_major, api_version_minor, shader_bfloat16,
+        storage_buffer_16bit_access);
   }
 
   void set_numa_node(int value) { numa_node_ = value; }

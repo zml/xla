@@ -150,6 +150,11 @@ absl::Status LoadDeviceProc(PFN_vkGetDeviceProcAddr get_device_proc_addr,
   return absl::OkStatus();
 }
 
+struct VulkanShaderFeatures {
+  bool shader_bfloat16 = false;
+  bool storage_buffer_16bit_access = false;
+};
+
 class VulkanDriver {
  public:
   ~VulkanDriver() = default;
@@ -161,6 +166,44 @@ class VulkanDriver {
 
   absl::Span<const VkPhysicalDevice> physical_devices() const {
     return physical_devices_;
+  }
+
+  absl::StatusOr<VulkanShaderFeatures> GetShaderFeatures(
+      VkPhysicalDevice physical_device) const {
+    uint32_t extension_count = 0;
+    RETURN_IF_VK_ERROR(enumerate_device_extension_properties(
+        physical_device, /*pLayerName=*/nullptr, &extension_count,
+        /*pProperties=*/nullptr));
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    if (extension_count != 0) {
+      RETURN_IF_VK_ERROR(enumerate_device_extension_properties(
+          physical_device, /*pLayerName=*/nullptr, &extension_count,
+          extensions.data()));
+    }
+    const bool has_extension = std::any_of(
+        extensions.begin(), extensions.end(), [](const auto& extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) == 0;
+        });
+    VkPhysicalDevice16BitStorageFeatures storage_16bit_features = {};
+    storage_16bit_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
+    if (has_extension) {
+      bfloat16_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+      storage_16bit_features.pNext = &bfloat16_features;
+    }
+    VkPhysicalDeviceFeatures2 features = {};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &storage_16bit_features;
+    get_physical_device_features2(physical_device, &features);
+    VulkanShaderFeatures shader_features;
+    shader_features.shader_bfloat16 =
+        has_extension && bfloat16_features.shaderBFloat16Type == VK_TRUE;
+    shader_features.storage_buffer_16bit_access =
+        storage_16bit_features.storageBuffer16BitAccess == VK_TRUE;
+    return shader_features;
   }
 
   PFN_vkGetDeviceProcAddr get_device_proc_addr = nullptr;
@@ -607,6 +650,11 @@ struct VulkanExecutor::Impl {
           "Vulkan device %s does not support required extension %s",
           properties.deviceName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME));
     }
+    TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
+                        Driver().GetShaderFeatures(physical_device));
+    shader_bfloat16 = shader_features.shader_bfloat16;
+    storage_buffer_16bit_access =
+        shader_features.storage_buffer_16bit_access;
 
     VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {};
     timeline_features.sType =
@@ -618,6 +666,23 @@ struct VulkanExecutor::Impl {
     if (timeline_features.timelineSemaphore != VK_TRUE) {
       return absl::FailedPreconditionError(
           "Vulkan timelineSemaphore support is required");
+    }
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
+    VkPhysicalDevice16BitStorageFeatures storage_16bit_features = {};
+    if (shader_bfloat16) {
+      bfloat16_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+      bfloat16_features.shaderBFloat16Type = VK_TRUE;
+    }
+    if (storage_buffer_16bit_access) {
+      storage_16bit_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+      storage_16bit_features.storageBuffer16BitAccess = VK_TRUE;
+      storage_16bit_features.pNext =
+          shader_bfloat16 ? &bfloat16_features : nullptr;
+      timeline_features.pNext = &storage_16bit_features;
+    } else if (shader_bfloat16) {
+      timeline_features.pNext = &bfloat16_features;
     }
 
     uint32_t family_count = 0;
@@ -646,11 +711,14 @@ struct VulkanExecutor::Impl {
     device_info.pNext = &timeline_features;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
-    const char* enabled_extensions[] = {
-        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
-    };
-    device_info.enabledExtensionCount = 1;
-    device_info.ppEnabledExtensionNames = enabled_extensions;
+    std::vector<const char*> enabled_extensions = {
+        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME};
+    if (shader_bfloat16) {
+      enabled_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount =
+        static_cast<uint32_t>(enabled_extensions.size());
+    device_info.ppEnabledExtensionNames = enabled_extensions.data();
     RETURN_IF_VK_ERROR(Driver().create_device(
         physical_device, &device_info, /*pAllocator=*/nullptr, &device));
 
@@ -796,6 +864,8 @@ struct VulkanExecutor::Impl {
   VkCommandPool command_pool = VK_NULL_HANDLE;
   VkPhysicalDeviceProperties properties = {};
   VkPhysicalDeviceMemoryProperties memory_properties = {};
+  bool shader_bfloat16 = false;
+  bool storage_buffer_16bit_access = false;
   absl::Mutex allocations_mutex;
   std::map<uintptr_t, std::unique_ptr<Allocation>> allocations;
   std::mutex queue_mutex;
@@ -1004,6 +1074,8 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
   Driver().get_physical_device_properties(physical_device, &properties);
   Driver().get_physical_device_memory_properties(physical_device,
                                                  &memory_properties);
+  TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
+                      Driver().GetShaderFeatures(physical_device));
 
   auto description = std::make_unique<DeviceDescription>();
   description->set_name(properties.deviceName);
@@ -1016,7 +1088,9 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
       VK_API_VERSION_PATCH(properties.apiVersion)));
   description->set_vulkan_compute_capability(
       VK_API_VERSION_MAJOR(properties.apiVersion),
-      VK_API_VERSION_MINOR(properties.apiVersion));
+      VK_API_VERSION_MINOR(properties.apiVersion),
+      shader_features.shader_bfloat16,
+      shader_features.storage_buffer_16bit_access);
   description->set_thread_dim_limit(ThreadDim(
       properties.limits.maxComputeWorkGroupSize[0],
       properties.limits.maxComputeWorkGroupSize[1],

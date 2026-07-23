@@ -28,6 +28,8 @@ message RocmComputeCapabilityProto {
 message VulkanComputeCapabilityProto {
   uint32 api_version_major = 1;
   uint32 api_version_minor = 2;
+  bool shader_bfloat16 = 3;
+  bool storage_buffer_16bit_access = 4;
 }
 
 message GpuComputeCapabilityProto {
