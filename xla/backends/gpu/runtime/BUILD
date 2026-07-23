@@ -2978,6 +2978,7 @@ cc_library(
         ":collective_thunk_proto_cc",
         ":command",
         ":thunk",
+        ":traced_command_buffer",
         "//xla:debug_options_flags",
         "//xla:shape_util",
         "//xla:status_macros",
