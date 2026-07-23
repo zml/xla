@@ -205,6 +205,27 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
 
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(operation)) {
       if (load->getType() != element_type) {
+        auto* load_integer_type =
+            llvm::dyn_cast<llvm::IntegerType>(load->getType());
+        auto* element_integer_type =
+            llvm::dyn_cast<llvm::IntegerType>(element_type);
+        if (load->isSimple() && load_integer_type != nullptr &&
+            element_integer_type != nullptr &&
+            load_integer_type->getBitWidth() <
+                element_integer_type->getBitWidth()) {
+          // LLVM can narrow an integer load when only its low bits are used.
+          // Storage-buffer access must retain the descriptor's scalar element
+          // type, so load that element and apply the narrowing to the value.
+          llvm::LoadInst* resource_load = builder.CreateAlignedLoad(
+              element_type, normalized_pointer, load->getAlign(),
+              load->getName() + ".resource");
+          resource_load->copyMetadata(*load);
+          llvm::Value* narrowed = builder.CreateTrunc(
+              resource_load, load->getType(), load->getName());
+          load->replaceAllUsesWith(narrowed);
+          load->eraseFromParent();
+          continue;
+        }
         return absl::UnimplementedError(
             "Vulkan storage-buffer load type does not match its scalar "
             "resource layout");
