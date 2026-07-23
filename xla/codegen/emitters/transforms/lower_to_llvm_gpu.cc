@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "llvm/Support/LogicalResult.h"
@@ -26,6 +27,7 @@ limitations under the License.
 #include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
 #include "mlir/Conversion/GPUToLLVMSPV/GPUToLLVMSPVPass.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h"
@@ -41,8 +43,9 @@ limitations under the License.
 #include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"  // IWYU pragma: keep
-#include "mlir/Dialect/LLVMIR/NVVMDialect.h"  // IWYU pragma: keep
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"   // IWYU pragma: keep
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"   // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -73,6 +76,188 @@ namespace se = ::stream_executor;
 
 // log2(e), used to express exp(x) = exp2(x * log2(e)).
 constexpr double kLog2E = 1.4426950408889634;
+
+template <typename Op>
+struct VulkanLaunchConfigConversion : public mlir::ConvertOpToLLVMPattern<Op> {
+  VulkanLaunchConfigConversion(const mlir::LLVMTypeConverter& converter,
+                               llvm::StringRef intrinsic)
+      : mlir::ConvertOpToLLVMPattern<Op>(converter,
+                                         /*benefit=*/mlir::PatternBenefit(2)),
+        intrinsic_(intrinsic) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      Op op, typename Op::Adaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    (void)adaptor;
+    mlir::Location loc = op.getLoc();
+    mlir::Value dimension =
+        mlir::LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                       static_cast<int64_t>(op.getDimension()));
+    mlir::Type index_type = this->getTypeConverter()->getIndexType();
+    rewriter.replaceOpWithNewOp<mlir::LLVM::CallIntrinsicOp>(
+        op, index_type, rewriter.getStringAttr(intrinsic_),
+        mlir::ValueRange{dimension});
+    return mlir::success();
+  }
+
+ private:
+  std::string intrinsic_;
+};
+
+template <typename Op>
+struct VulkanSubgroupQueryConversion : public mlir::ConvertOpToLLVMPattern<Op> {
+  VulkanSubgroupQueryConversion(const mlir::LLVMTypeConverter& converter,
+                                llvm::StringRef intrinsic)
+      : mlir::ConvertOpToLLVMPattern<Op>(converter,
+                                         /*benefit=*/mlir::PatternBenefit(2)),
+        intrinsic_(intrinsic) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      Op op, typename Op::Adaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    (void)adaptor;
+    mlir::Location loc = op.getLoc();
+    mlir::Value result =
+        mlir::LLVM::CallIntrinsicOp::create(
+            rewriter, loc, rewriter.getI32Type(),
+            rewriter.getStringAttr(intrinsic_), mlir::ValueRange{})
+            .getResult(0);
+    mlir::Type index_type = this->getTypeConverter()->getIndexType();
+    if (result.getType() != index_type) {
+      result = mlir::LLVM::ZExtOp::create(rewriter, loc, index_type, result);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+
+ private:
+  std::string intrinsic_;
+};
+
+struct VulkanBarrierConversion
+    : public mlir::ConvertOpToLLVMPattern<mlir::gpu::BarrierOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::gpu::BarrierOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    std::optional<mlir::ArrayAttr> address_spaces = adaptor.getAddressSpaces();
+    bool workgroup_memory_only = address_spaces.has_value();
+    if (workgroup_memory_only) {
+      for (mlir::Attribute attribute : *address_spaces) {
+        auto address_space =
+            mlir::cast<mlir::gpu::AddressSpaceAttr>(attribute).getValue();
+        if (address_space != mlir::gpu::AddressSpace::Workgroup) {
+          workgroup_memory_only = false;
+          break;
+        }
+      }
+    }
+    llvm::StringRef intrinsic =
+        workgroup_memory_only ? "llvm.spv.group.memory.barrier.with.group.sync"
+                              : "llvm.spv.all.memory.barrier.with.group.sync";
+    rewriter.replaceOpWithNewOp<mlir::LLVM::CallIntrinsicOp>(
+        op, rewriter.getStringAttr(intrinsic), mlir::ValueRange{});
+    return mlir::success();
+  }
+};
+
+struct VulkanShuffleConversion
+    : public mlir::ConvertOpToLLVMPattern<mlir::gpu::ShuffleOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::gpu::ShuffleOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    mlir::Location loc = op.getLoc();
+    mlir::Type i32 = rewriter.getI32Type();
+    mlir::Value lane =
+        mlir::LLVM::CallIntrinsicOp::create(
+            rewriter, loc, i32,
+            rewriter.getStringAttr("llvm.spv.subgroup.local.invocation.id"),
+            mlir::ValueRange{})
+            .getResult(0);
+    mlir::Value source_lane;
+    switch (op.getMode()) {
+      case mlir::gpu::ShuffleMode::IDX:
+        source_lane = adaptor.getOffset();
+        break;
+      case mlir::gpu::ShuffleMode::XOR:
+        source_lane = mlir::LLVM::XOrOp::create(rewriter, loc, i32, lane,
+                                                adaptor.getOffset());
+        break;
+      case mlir::gpu::ShuffleMode::UP:
+        source_lane = mlir::LLVM::SubOp::create(rewriter, loc, i32, lane,
+                                                adaptor.getOffset());
+        break;
+      case mlir::gpu::ShuffleMode::DOWN:
+        source_lane = mlir::LLVM::AddOp::create(rewriter, loc, i32, lane,
+                                                adaptor.getOffset());
+        break;
+    }
+
+    mlir::Value shuffled =
+        mlir::LLVM::CallIntrinsicOp::create(
+            rewriter, loc, adaptor.getValue().getType(),
+            rewriter.getStringAttr("llvm.spv.wave.readlane"),
+            mlir::ValueRange{adaptor.getValue(), source_lane})
+            .getResult(0);
+    mlir::Value lane_is_valid = mlir::LLVM::ICmpOp::create(
+        rewriter, loc, mlir::LLVM::ICmpPredicate::ult, lane,
+        adaptor.getWidth());
+    mlir::Value source_is_valid = mlir::LLVM::ICmpOp::create(
+        rewriter, loc, mlir::LLVM::ICmpPredicate::ult, source_lane,
+        adaptor.getWidth());
+    mlir::Value valid = mlir::LLVM::AndOp::create(
+        rewriter, loc, rewriter.getI1Type(), lane_is_valid, source_is_valid);
+    rewriter.replaceOp(op, {shuffled, valid});
+    return mlir::success();
+  }
+};
+
+unsigned VulkanAddressSpace(mlir::gpu::AddressSpace address_space) {
+  switch (address_space) {
+    case mlir::gpu::AddressSpace::Global:
+      return 11;  // SPIR-V StorageBuffer.
+    case mlir::gpu::AddressSpace::Workgroup:
+      return 3;
+    case mlir::gpu::AddressSpace::Private:
+      return 10;
+    case mlir::gpu::AddressSpace::Constant:
+      return 2;  // SPIR-V UniformConstant.
+  }
+  llvm_unreachable("unknown GPU address space");
+}
+
+void populateGpuToLLVMVulkanConversionPatterns(
+    mlir::LLVMTypeConverter& converter, mlir::RewritePatternSet& patterns) {
+  // Retain the generic GPU function/return conversions, but give every GPU
+  // concept with an OpenCL-oriented implementation a higher-benefit Vulkan
+  // lowering below.
+  mlir::populateGpuToLLVMSPVConversionPatterns(converter, patterns);
+  patterns.add<VulkanLaunchConfigConversion<mlir::gpu::ThreadIdOp>>(
+      converter, "llvm.spv.thread.id.in.group");
+  patterns.add<VulkanLaunchConfigConversion<mlir::gpu::BlockIdOp>>(
+      converter, "llvm.spv.group.id");
+  patterns.add<VulkanLaunchConfigConversion<mlir::gpu::BlockDimOp>>(
+      converter, "llvm.spv.workgroup.size");
+  patterns.add<VulkanLaunchConfigConversion<mlir::gpu::GridDimOp>>(
+      converter, "llvm.spv.num.workgroups");
+  patterns.add<VulkanLaunchConfigConversion<mlir::gpu::GlobalIdOp>>(
+      converter, "llvm.spv.thread.id");
+  patterns.add<VulkanSubgroupQueryConversion<mlir::gpu::LaneIdOp>>(
+      converter, "llvm.spv.subgroup.local.invocation.id");
+  patterns.add<VulkanSubgroupQueryConversion<mlir::gpu::SubgroupIdOp>>(
+      converter, "llvm.spv.subgroup.id");
+  patterns.add<VulkanSubgroupQueryConversion<mlir::gpu::NumSubgroupsOp>>(
+      converter, "llvm.spv.num.subgroups");
+  patterns.add<VulkanSubgroupQueryConversion<mlir::gpu::SubgroupSizeOp>>(
+      converter, "llvm.spv.subgroup.size");
+  patterns.add<VulkanBarrierConversion, VulkanShuffleConversion>(
+      converter, /*benefit=*/mlir::PatternBenefit(2));
+  mlir::populateGpuMemorySpaceAttributeConversions(converter,
+                                                   VulkanAddressSpace);
+}
 
 // Lowers a scalar bf16 `math.exp2` to the native gfx1250 `v_exp_bf16`
 // instruction via the `llvm.amdgcn.exp2` intrinsic. Without this, the default
@@ -177,24 +362,24 @@ class LowerToLLVMGPUPass
               converter, /*benefit=*/mlir::PatternBenefit(2));
         }
         target.addIllegalDialect<mlir::amdgpu::AMDGPUDialect>();
-      } else if (device_spec_.IsIntelGpu() || device_spec_.IsVulkan()) {
-        if (device_spec_.IsIntelGpu()) {
-          // Add sub-group-size attribute to Intel functions.
-          int32_t sub_group_size = device_spec_.gpu().threads_per_warp();
-          if (auto module_op = mlir::dyn_cast<mlir::ModuleOp>(getOperation())) {
-            module_op.walk([sub_group_size](mlir::func::FuncOp func) {
-              if (!func.getBody().empty()) {
-                mlir::OpBuilder b(func.getContext());
-                auto sub_group_attr = b.getI32IntegerAttr(sub_group_size);
-                func->setAttr("intel_reqd_sub_group_size", sub_group_attr);
-              }
-            });
-          }
+      } else if (device_spec_.IsIntelGpu()) {
+        // Add sub-group-size attribute to Intel functions.
+        int32_t sub_group_size = device_spec_.gpu().threads_per_warp();
+        if (auto module_op = mlir::dyn_cast<mlir::ModuleOp>(getOperation())) {
+          module_op.walk([sub_group_size](mlir::func::FuncOp func) {
+            if (!func.getBody().empty()) {
+              mlir::OpBuilder b(func.getContext());
+              auto sub_group_attr = b.getI32IntegerAttr(sub_group_size);
+              func->setAttr("intel_reqd_sub_group_size", sub_group_attr);
+            }
+          });
         }
         populateGpuToLLVMSPVConversionPatterns(converter, patterns);
         spirv::populateMathToLLVMSPVConversionPatterns(spirv::getSPIRVMathOps(),
                                                        converter, patterns);
         populateGpuMemorySpaceAttributeConversions(converter);
+      } else if (device_spec_.IsVulkan()) {
+        populateGpuToLLVMVulkanConversionPatterns(converter, patterns);
       } else {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);
         mlir::configureGpuToNVVMConversionLegality(target);

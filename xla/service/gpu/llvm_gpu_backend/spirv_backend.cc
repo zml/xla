@@ -15,16 +15,18 @@ limitations under the License.
 
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/Utils/Local.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -32,9 +34,9 @@ limitations under the License.
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
-#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/Scalarizer.h"
@@ -47,10 +49,6 @@ limitations under the License.
 #include "xla/service/gpu/llvm_gpu_backend/gpu_backend_lib.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "tsl/platform/errors.h"
-
-#include "llvm/ADT/SmallString.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace xla::gpu::spirv {
 
@@ -76,58 +74,208 @@ absl::Status SPIRVTargetModuleLinker(
   return absl::OkStatus();
 }
 
-std::string EmitModuleToSPIRV(llvm::Module* module,
-                              llvm::TargetMachine* target_machine) {
+// LLVM represents unordered floating-point predicates directly, but the
+// corresponding SPIR-V comparison instructions are not available in the
+// Vulkan Shader environment. Express their NaN component with OpIsNan-capable
+// intrinsics after optimization, so later LLVM passes cannot recreate the
+// Kernel-only form.
+void LegalizeVulkanShaderComparisons(llvm::Module* module) {
+  llvm::SmallVector<llvm::FCmpInst*> comparisons;
+  for (llvm::Function& function : *module) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        auto* comparison = llvm::dyn_cast<llvm::FCmpInst>(&instruction);
+        if (comparison != nullptr &&
+            (comparison->getPredicate() == llvm::CmpInst::FCMP_ORD ||
+             (comparison->getPredicate() >= llvm::CmpInst::FCMP_UNO &&
+              comparison->getPredicate() <= llvm::CmpInst::FCMP_UNE))) {
+          comparisons.push_back(comparison);
+        }
+      }
+    }
+  }
+
+  for (llvm::FCmpInst* comparison : comparisons) {
+    llvm::IRBuilder<> builder(comparison);
+    llvm::Value* lhs = comparison->getOperand(0);
+    llvm::Value* rhs = comparison->getOperand(1);
+    llvm::Function* isnan = llvm::Intrinsic::getOrInsertDeclaration(
+        module, llvm::Intrinsic::spv_isnan, {lhs->getType()});
+    llvm::Value* either_is_nan = builder.CreateOr(
+        builder.CreateCall(isnan, {lhs}), builder.CreateCall(isnan, {rhs}));
+
+    llvm::Value* replacement;
+    llvm::CmpInst::Predicate predicate = comparison->getPredicate();
+    if (predicate == llvm::CmpInst::FCMP_UNO) {
+      replacement = either_is_nan;
+    } else if (predicate == llvm::CmpInst::FCMP_ORD) {
+      replacement = builder.CreateNot(either_is_nan);
+    } else {
+      llvm::Value* ordered = builder.CreateFCmp(
+          llvm::FCmpInst::getOrderedPredicate(predicate), lhs, rhs);
+      replacement = builder.CreateOr(either_is_nan, ordered);
+    }
+    comparison->replaceAllUsesWith(replacement);
+    comparison->eraseFromParent();
+  }
+}
+
+// After scalarization, express all storage-buffer accesses as indices into the
+// runtime array carried by spirv.VulkanBuffer. This is the representation the
+// logical SPIR-V backend uses to derive Vulkan ArrayStride and descriptor
+// accesses, including for vectorized XLA loops.
+absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
+  llvm::SmallVector<llvm::Instruction*> memory_operations;
+  for (llvm::Function& function : *module) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        if (llvm::isa<llvm::LoadInst, llvm::StoreInst>(instruction)) {
+          memory_operations.push_back(&instruction);
+        }
+      }
+    }
+  }
+
+  const llvm::DataLayout& data_layout = module->getDataLayout();
+  for (llvm::Instruction* operation : memory_operations) {
+    llvm::Value* pointer =
+        llvm::isa<llvm::LoadInst>(operation)
+            ? llvm::cast<llvm::LoadInst>(operation)->getPointerOperand()
+            : llvm::cast<llvm::StoreInst>(operation)->getPointerOperand();
+    llvm::SmallVector<llvm::GetElementPtrInst*> geps;
+    llvm::Value* root = pointer;
+    while (true) {
+      if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(root)) {
+        geps.push_back(gep);
+        root = gep->getPointerOperand();
+      } else if (auto* cast = llvm::dyn_cast<llvm::AddrSpaceCastInst>(root)) {
+        root = cast->getOperand(0);
+      } else if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(root)) {
+        root = cast->getOperand(0);
+      } else {
+        break;
+      }
+    }
+
+    auto* get_base_pointer = llvm::dyn_cast<llvm::IntrinsicInst>(root);
+    if (get_base_pointer == nullptr ||
+        get_base_pointer->getIntrinsicID() !=
+            llvm::Intrinsic::spv_resource_getbasepointer) {
+      continue;
+    }
+    auto* resource_type = llvm::dyn_cast<llvm::TargetExtType>(
+        get_base_pointer->getArgOperand(0)->getType());
+    auto* runtime_array = resource_type == nullptr
+                              ? nullptr
+                              : llvm::dyn_cast<llvm::ArrayType>(
+                                    resource_type->getTypeParameter(0));
+    if (runtime_array == nullptr || runtime_array->getNumElements() != 0) {
+      return absl::InternalError(
+          "Vulkan storage buffer does not contain a runtime array");
+    }
+
+    llvm::IRBuilder<> builder(operation);
+    unsigned address_space =
+        llvm::cast<llvm::PointerType>(root->getType())->getAddressSpace();
+    llvm::IntegerType* index_type =
+        builder.getIntNTy(data_layout.getIndexSizeInBits(address_space));
+    llvm::Value* byte_offset = llvm::ConstantInt::get(index_type, 0);
+    for (llvm::GetElementPtrInst* gep : geps) {
+      llvm::Value* gep_offset = llvm::emitGEPOffset(&builder, data_layout, gep);
+      byte_offset = builder.CreateAdd(
+          byte_offset, builder.CreateSExtOrTrunc(gep_offset, index_type));
+    }
+
+    llvm::Type* element_type = runtime_array->getElementType();
+    llvm::TypeSize type_size = data_layout.getTypeAllocSize(element_type);
+    if (type_size.isScalable() || type_size.getFixedValue() == 0) {
+      return absl::UnimplementedError(
+          "Vulkan storage buffer has an unsupported scalable or zero-sized "
+          "element type");
+    }
+    llvm::Value* element_index = byte_offset;
+    if (type_size.getFixedValue() != 1) {
+      element_index = builder.CreateSDiv(
+          byte_offset,
+          llvm::ConstantInt::get(index_type, type_size.getFixedValue()));
+    }
+    llvm::Value* normalized_pointer = builder.CreateGEP(
+        runtime_array, root,
+        {llvm::ConstantInt::get(index_type, 0), element_index});
+
+    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(operation)) {
+      if (load->getType() != element_type) {
+        return absl::UnimplementedError(
+            "Vulkan storage-buffer load type does not match its scalar "
+            "resource layout");
+      }
+      load->setOperand(llvm::LoadInst::getPointerOperandIndex(),
+                       normalized_pointer);
+    } else {
+      auto* store = llvm::cast<llvm::StoreInst>(operation);
+      if (store->getValueOperand()->getType() != element_type) {
+        return absl::UnimplementedError(
+            "Vulkan storage-buffer store type does not match its scalar "
+            "resource layout");
+      }
+      store->setOperand(llvm::StoreInst::getPointerOperandIndex(),
+                        normalized_pointer);
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EmitModuleToSPIRV(
+    llvm::Module* module, llvm::TargetMachine* target_machine,
+    bool normalize_vulkan_buffers) {
   std::string spirv_binary;
   llvm::raw_string_ostream string_stream(spirv_binary);
-  llvm::buffer_ostream buffered_stream(string_stream);
-  llvm::legacy::PassManager pm;
+  llvm::legacy::PassManager scalarize_pm;
   // Unlike other GPU backends like NVTPTX and AMDGPU, SPIRV does not have
   // address inference pass in the TargetPassConfig. So we do it here
   // explicitly.
-  pm.add(llvm::createInferAddressSpacesPass(0));
+  scalarize_pm.add(llvm::createInferAddressSpacesPass(0));
   llvm::ScalarizerPassOptions scalarizer_options;
   scalarizer_options.ScalarizeLoadStore = true;
-  pm.add(llvm::createScalarizerPass(scalarizer_options));
-
-  int scalarized_dump_fd = -1;
-  llvm::SmallString<128> scalarized_dump_path;
-  std::unique_ptr<llvm::raw_fd_ostream> scalarized_dump_stream;
-  std::error_code scalarized_dump_error = llvm::sys::fs::createUniqueFile(
-      "/tmp/xla-vulkan-after-scalarizer-%%%%%%.ll", scalarized_dump_fd,
-      scalarized_dump_path);
-  if (!scalarized_dump_error) {
-    scalarized_dump_stream = std::make_unique<llvm::raw_fd_ostream>(
-        scalarized_dump_fd, /*shouldClose=*/true);
-    scalarized_dump_stream->SetUnbuffered();
-    pm.add(llvm::createPrintModulePass(*scalarized_dump_stream));
-    llvm::errs() << "Scalarized Vulkan LLVM module: " << scalarized_dump_path
-                 << '\n';
-  } else {
-    llvm::errs() << "Could not create scalarized Vulkan LLVM dump: "
-                 << scalarized_dump_error.message() << '\n';
+  scalarize_pm.add(llvm::createScalarizerPass(scalarizer_options));
+  scalarize_pm.run(*module);
+  if (normalize_vulkan_buffers) {
+    RETURN_IF_ERROR(NormalizeVulkanBufferAccesses(module));
+    llvm::legacy::PassManager cleanup_pm;
+    cleanup_pm.add(llvm::createDeadCodeEliminationPass());
+    cleanup_pm.run(*module);
   }
 
-  pm.add(new llvm::TargetLibraryInfoWrapperPass(
-      llvm::Triple(module->getTargetTriple())));
-  std::unique_ptr<llvm::MachineModuleInfoWrapperPass> mmiwp(
-      new llvm::MachineModuleInfoWrapperPass(target_machine));
-  target_machine->getObjFileLowering()->Initialize(mmiwp->getMMI().getContext(),
-                                                   *target_machine);
-  
-  llvm::errs() << "[Vulkan] before addPassesToEmitFile\n";
+  {
+    llvm::buffer_ostream buffered_stream(string_stream);
+    llvm::legacy::PassManager pm;
+    pm.add(new llvm::TargetLibraryInfoWrapperPass(
+        llvm::Triple(module->getTargetTriple())));
+    std::unique_ptr<llvm::MachineModuleInfoWrapperPass> mmiwp(
+        new llvm::MachineModuleInfoWrapperPass(target_machine));
+    target_machine->getObjFileLowering()->Initialize(
+        mmiwp->getMMI().getContext(), *target_machine);
 
-  bool failed = target_machine->addPassesToEmitFile(
-      pm, buffered_stream, nullptr, llvm::CodeGenFileType::ObjectFile);
-
-  llvm::errs() << "[Vulkan] after addPassesToEmitFile, failed=" << failed << '\n';
-  llvm::errs() << "[Vulkan] before pm.run\n";
-
-  pm.run(*module);
-
-  llvm::errs() << "[Vulkan] after pm.run\n";
-  if (scalarized_dump_stream) scalarized_dump_stream->flush();
-
+    bool failed = target_machine->addPassesToEmitFile(
+        pm, buffered_stream, nullptr, llvm::CodeGenFileType::ObjectFile);
+    if (failed) {
+      return absl::InternalError(
+          "LLVM SPIR-V target cannot emit the requested module");
+    }
+    pm.run(*module);
+  }
+  string_stream.flush();
+  if (spirv_binary.size() < 5 * sizeof(uint32_t) ||
+      spirv_binary.size() % sizeof(uint32_t) != 0) {
+    return absl::InternalError(absl::StrCat(
+        "LLVM emitted an invalid SPIR-V byte size: ", spirv_binary.size()));
+  }
+  if (static_cast<uint8_t>(spirv_binary[0]) != 0x03 ||
+      static_cast<uint8_t>(spirv_binary[1]) != 0x02 ||
+      static_cast<uint8_t>(spirv_binary[2]) != 0x23 ||
+      static_cast<uint8_t>(spirv_binary[3]) != 0x07) {
+    return absl::InternalError("LLVM emitted invalid SPIR-V magic");
+  }
   return spirv_binary;
 }
 
@@ -175,60 +323,144 @@ void ExpandSubByteBitReverse(llvm::Module* module) {
 }
 
 absl::Status ValidateVulkanModule(const llvm::Module& module) {
+  bool has_shader_entry_point = false;
   for (const llvm::Function& function : module) {
-    if (function.isDeclaration() &&
-        (function.getName().contains("__spirv_ocl_") ||
-         function.getName() == "_Z7barrierj")) {
+    if (function.hasFnAttribute("hlsl.shader")) {
+      has_shader_entry_point = true;
+      if (function.getCallingConv() != llvm::CallingConv::C ||
+          function.arg_size() != 0) {
+        return absl::InternalError(
+            absl::StrCat("Vulkan Shader entry point has an invalid ABI: ",
+                         function.getName().str()));
+      }
+    }
+    if (function.getCallingConv() == llvm::CallingConv::SPIR_KERNEL) {
       return absl::UnimplementedError(absl::StrCat(
-          "OpenCL device function is not supported by the Vulkan backend: ",
+          "SPIR kernel convention is not supported by the Vulkan backend: ",
           function.getName().str()));
     }
+    llvm::StringRef name = function.getName();
+    if (function.isDeclaration() &&
+        (name.contains("__spirv_ocl_") || name.contains("__spirv_BuiltIn") ||
+         name == "_Z7barrierj" || name.starts_with("_Z12get_local_") ||
+         name.starts_with("_Z12get_group_") ||
+         name.starts_with("_Z13get_global_") ||
+         name.starts_with("_Z14get_local_") ||
+         name.starts_with("_Z14get_num_") ||
+         name.starts_with("_Z16get_sub_group") ||
+         name.starts_with("_Z18get_num_sub_group") ||
+         name.starts_with("_Z18get_sub_group") ||
+         name.starts_with("_Z22get_sub_group") ||
+         name.contains("sub_group_shuffle"))) {
+      return absl::UnimplementedError(absl::StrCat(
+          "OpenCL device function is not supported by the Vulkan backend: ",
+          name.str()));
+    }
+    for (const llvm::BasicBlock& block : function) {
+      for (const llvm::Instruction& instruction : block) {
+        const auto* comparison = llvm::dyn_cast<llvm::FCmpInst>(&instruction);
+        if (comparison != nullptr &&
+            (comparison->getPredicate() == llvm::CmpInst::FCMP_ORD ||
+             (comparison->getPredicate() >= llvm::CmpInst::FCMP_UNO &&
+              comparison->getPredicate() <= llvm::CmpInst::FCMP_UNE))) {
+          return absl::InternalError(
+              "Vulkan Shader comparison legalization left an unordered "
+              "floating-point predicate");
+        }
+      }
+    }
+  }
+  if (!has_shader_entry_point) {
+    return absl::InternalError(
+        "Vulkan module does not contain a compute Shader entry point");
   }
   return absl::OkStatus();
 }
 
-void RewriteVulkanWorkItemBuiltins(llvm::Module* module) {
-  llvm::SmallVector<std::pair<llvm::CallInst*, llvm::Intrinsic::ID>> calls;
-  for (llvm::Function& function : *module) {
-    for (llvm::BasicBlock& block : function) {
-      for (llvm::Instruction& instruction : block) {
-        auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-        llvm::Function* callee = call ? call->getCalledFunction() : nullptr;
-        if (callee == nullptr) {
-          continue;
+absl::StatusOr<llvm::Type*> InferVulkanBufferElementType(
+    llvm::Argument& argument, const std::string& entry_name, unsigned binding) {
+  llvm::SmallVector<llvm::Value*> worklist{&argument};
+  llvm::SmallPtrSet<llvm::Value*, 16> visited;
+  llvm::Type* element_type = nullptr;
+
+  auto merge_access_type = [&](llvm::Type* accessed_type) -> absl::Status {
+    while (auto* array =
+               llvm::dyn_cast_or_null<llvm::ArrayType>(accessed_type)) {
+      accessed_type = array->getElementType();
+    }
+    if (auto* vector =
+            llvm::dyn_cast_or_null<llvm::VectorType>(accessed_type)) {
+      accessed_type = vector->getElementType();
+    }
+    if (accessed_type == nullptr) {
+      return absl::OkStatus();
+    }
+    if (element_type == nullptr) {
+      element_type = accessed_type;
+      return absl::OkStatus();
+    }
+    if (element_type != accessed_type) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Vulkan entry point ", entry_name, " buffer argument ", binding,
+          " is accessed with incompatible scalar element types"));
+    }
+    return absl::OkStatus();
+  };
+
+  while (!worklist.empty()) {
+    llvm::Value* pointer = worklist.pop_back_val();
+    if (!visited.insert(pointer).second) {
+      continue;
+    }
+    for (llvm::User* user : pointer->users()) {
+      if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
+        worklist.push_back(gep);
+      } else if (llvm::isa<llvm::BitCastInst, llvm::AddrSpaceCastInst,
+                           llvm::PHINode, llvm::SelectInst, llvm::FreezeInst>(
+                     user)) {
+        worklist.push_back(user);
+      } else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user)) {
+        RETURN_IF_ERROR(merge_access_type(load->getType()));
+      } else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user)) {
+        if (store->getPointerOperand() != pointer) {
+          return absl::UnimplementedError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " buffer argument ", binding,
+              " escapes through a store"));
         }
-        llvm::Intrinsic::ID intrinsic;
-        if (callee->getName() == "_Z12get_local_idj") {
-          intrinsic = llvm::Intrinsic::spv_thread_id_in_group;
-        } else if (callee->getName() == "_Z12get_group_idj") {
-          intrinsic = llvm::Intrinsic::spv_group_id;
-        } else if (callee->getName() == "_Z14get_local_sizej") {
-          intrinsic = llvm::Intrinsic::spv_workgroup_size;
-        } else if (callee->getName() == "_Z14get_num_groupsj") {
-          intrinsic = llvm::Intrinsic::spv_num_workgroups;
-        } else if (callee->getName() == "_Z13get_global_idj") {
-          intrinsic = llvm::Intrinsic::spv_thread_id;
-        } else if (callee->getName() == "_Z15get_global_sizej") {
-          intrinsic = llvm::Intrinsic::spv_global_size;
-        } else if (callee->getName() == "_Z17get_global_offsetj") {
-          intrinsic = llvm::Intrinsic::spv_global_offset;
-        } else {
-          continue;
+        RETURN_IF_ERROR(merge_access_type(store->getValueOperand()->getType()));
+      } else if (auto* call = llvm::dyn_cast<llvm::CallBase>(user)) {
+        llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration()) {
+          return absl::UnimplementedError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " buffer argument ", binding,
+              " escapes to an external call"));
         }
-        calls.push_back({call, intrinsic});
+        for (unsigned i = 0; i < call->arg_size() && i < callee->arg_size();
+             ++i) {
+          if (call->getArgOperand(i) == pointer) {
+            worklist.push_back(callee->getArg(i));
+          }
+        }
+      } else if (!llvm::isa<llvm::ICmpInst>(user)) {
+        return absl::UnimplementedError(
+            absl::StrCat("Vulkan entry point ", entry_name, " buffer argument ",
+                         binding, " has an unsupported pointer use"));
       }
     }
   }
+  return element_type;
+}
 
-  for (auto [call, intrinsic] : calls) {
-    llvm::IRBuilder<> builder(call);
-    llvm::Function* declaration = llvm::Intrinsic::getOrInsertDeclaration(
-        module, intrinsic, {call->getType()});
-    llvm::Value* replacement =
-        builder.CreateCall(declaration, {call->getArgOperand(0)});
-    call->replaceAllUsesWith(replacement);
-    call->eraseFromParent();
-  }
+llvm::GlobalVariable* CreateVulkanResourceName(llvm::Module* module,
+                                               const std::string& entry_name,
+                                               unsigned binding) {
+  std::string name = absl::StrCat(entry_name, ".binding.", binding);
+  llvm::Constant* initializer = llvm::ConstantDataArray::getString(
+      module->getContext(), name, /*AddNull=*/true);
+  return new llvm::GlobalVariable(
+      *module, initializer->getType(), /*isConstant=*/true,
+      llvm::GlobalValue::PrivateLinkage, initializer,
+      absl::StrCat(".vulkan.resource.", entry_name, ".", binding));
 }
 
 absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
@@ -280,49 +512,25 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
     unsigned binding = 0;
     for (llvm::Argument& argument : implementation->args()) {
       const bool writable = !argument.hasAttribute(llvm::Attribute::ReadOnly);
-      llvm::Type* element_type = nullptr;
-      for (llvm::User* user : argument.users()) {
-        llvm::Type* accessed_type = nullptr;
-        if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
-          accessed_type = gep->getSourceElementType();
-        } else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user)) {
-          accessed_type = load->getType();
-        } else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user)) {
-          accessed_type = store->getValueOperand()->getType();
-        }
-        while (auto* array = llvm::dyn_cast_or_null<llvm::ArrayType>(
-                   accessed_type)) {
-          accessed_type = array->getElementType();
-        }
-        if (auto* vector =
-                llvm::dyn_cast_or_null<llvm::VectorType>(accessed_type)) {
-          accessed_type = vector->getElementType();
-        }
-        if (accessed_type == nullptr) {
-          continue;
-        }
-        if (element_type != nullptr && element_type != accessed_type) {
-          return absl::UnimplementedError(absl::StrCat(
-              "Vulkan entry point ", entry_name, " buffer argument ", binding,
-              " is accessed with incompatible element types"));
-        }
-        element_type = accessed_type;
-      }
+      TF_ASSIGN_OR_RETURN(
+          llvm::Type * element_type,
+          InferVulkanBufferElementType(argument, entry_name, binding));
       if (element_type == nullptr) {
         element_type = builder.getInt32Ty();
       }
       llvm::Type* runtime_array = llvm::ArrayType::get(element_type, 0);
-      llvm::Type* resource_type = llvm::TargetExtType::get(
-          context, "spirv.VulkanBuffer", {runtime_array},
-          {12, writable ? 1U : 0U});
+      llvm::Type* resource_type =
+          llvm::TargetExtType::get(context, "spirv.VulkanBuffer",
+                                   {runtime_array}, {12, writable ? 1U : 0U});
       llvm::Function* get_handle = llvm::Intrinsic::getOrInsertDeclaration(
           module, llvm::Intrinsic::spv_resource_handlefrombinding,
           {resource_type});
+      llvm::GlobalVariable* resource_name =
+          CreateVulkanResourceName(module, entry_name, binding);
       llvm::Value* handle = builder.CreateCall(
           get_handle,
           {builder.getInt32(0), builder.getInt32(binding), builder.getInt32(1),
-           builder.getInt32(0),
-           llvm::ConstantPointerNull::get(builder.getPtrTy())});
+           builder.getInt32(0), resource_name});
       llvm::PointerType* storage_buffer_pointer =
           llvm::PointerType::get(context, 11);
       llvm::Function* get_pointer = llvm::Intrinsic::getOrInsertDeclaration(
@@ -338,22 +546,6 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
     builder.CreateCall(implementation, arguments);
     builder.CreateRetVoid();
   }
-
-  int dump_fd = -1;
-  llvm::SmallString<128> dump_path;
-  std::error_code error = llvm::sys::fs::createUniqueFile(
-      "/tmp/xla-vulkan-wrapped-%%%%%%.ll", dump_fd, dump_path);
-  if (error) {
-    return absl::InternalError(absl::StrCat(
-        "Failed to create wrapped Vulkan LLVM dump: ", error.message()));
-  }
-
-  llvm::raw_fd_ostream dump_stream(dump_fd, /*shouldClose=*/true);
-  module->print(dump_stream, nullptr);
-  dump_stream.flush();
-
-  llvm::errs() << "Wrapped Vulkan LLVM module: " << dump_path << '\n';
-
   return absl::OkStatus();
 }
 
@@ -507,7 +699,8 @@ absl::StatusOr<std::string> CompileToSPIRV(
     ir_builder.CreateRet(load);
   }
 
-  return EmitModuleToSPIRV(module, target_machine.get());
+  return EmitModuleToSPIRV(module, target_machine.get(),
+                           /*normalize_vulkan_buffers=*/false);
 }
 
 absl::StatusOr<std::string> CompileToVulkanSPIRV(
@@ -518,18 +711,11 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(
       GetSPIRVBackendOptions(debug_options));
 
-  RewriteVulkanWorkItemBuiltins(module);
-  RETURN_IF_ERROR(ValidateVulkanModule(*module));
   RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
-
-  llvm::errs() << "[Vulkan] before target machine\n";
 
   llvm::Triple target_triple("spirv1.5-unknown-vulkan1.2-compute");
   std::unique_ptr<llvm::TargetMachine> target_machine =
       GetTargetMachine(target_triple, "", debug_options, "");
-
-  llvm::errs() << "[Vulkan] after target machine\n";
-
   module->setTargetTriple(target_triple);
   module->setDataLayout(target_machine->createDataLayout());
 
@@ -538,22 +724,14 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   const_cast<llvm::SPIRVSubtarget*>(spirv_target->getSubtargetImpl())
       ->initAvailableExtensions({});
 
-  llvm::errs() << "[Vulkan] before LinkAndOptimizeModule\n";
-
   RETURN_IF_ERROR(LinkAndOptimizeModule(
       module, gpu_version, debug_options, "", SPIRVTargetModuleLinker,
       target_triple, target_machine.get(), kDefaultInlineThreshold));
-
-  llvm::errs() << "[Vulkan] after LinkAndOptimizeModule\n";
-
+  LegalizeVulkanShaderComparisons(module);
   ExpandSubByteBitReverse(module);
-
-  llvm::errs() << "[Vulkan] before EmitModuleToSPIRV\n";
-
-  std::string spirv = EmitModuleToSPIRV(module, target_machine.get());
-
-  llvm::errs() << "[Vulkan] after EmitModuleToSPIRV\n";
-  return spirv;
+  RETURN_IF_ERROR(ValidateVulkanModule(*module));
+  return EmitModuleToSPIRV(module, target_machine.get(),
+                           /*normalize_vulkan_buffers=*/true);
 }
 
 }  // namespace xla::gpu::spirv
