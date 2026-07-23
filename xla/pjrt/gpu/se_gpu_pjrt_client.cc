@@ -1903,9 +1903,16 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   EnablePeerAccess(xla_client->backend().stream_executors());
 
   GpuAllocatorConfig allocator_config = options.allocator_config;
+  const bool is_vulkan =
+      xla_client->platform()->id() ==
+      stream_executor::vulkan::kVulkanPlatformId;
+  if (is_vulkan && allocator_config.preallocate) {
+    LOG(INFO) << "Vulkan uses host-visible mapped memory; disabling BFC "
+                 "preallocation so the allocator grows with demand.";
+    allocator_config.preallocate = false;
+  }
   std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration;
-  if (xla_client->platform()->id() !=
-      stream_executor::vulkan::kVulkanPlatformId) {
+  if (!is_vulkan) {
     memory_registration =
         CreateAllocatorMemoryRegistration(&allocator_config);
   }
