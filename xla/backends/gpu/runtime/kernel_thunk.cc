@@ -280,23 +280,38 @@ absl::StatusOr<const se::CommandBuffer::Command*> KernelThunk::Record(
     se::CommandBuffer* command_buffer) {
   se::StreamExecutor* executor = execute_params.stream->parent();
 
-  ASSIGN_OR_RETURN(
-      auto kernel_with_args,
-      GetKernelAndArgs(*execute_params.buffer_allocations, executor));
-  auto& [kernel, kernel_args] = kernel_with_args;
-  auto packed_args = se::PackKernelArgs(kernel_args, shmem_bytes_);
+  ASSIGN_OR_RETURN(se::Kernel * kernel, GetKernel(executor));
+  se::KernelArgsPackedArray packed_args(args_.size());
+
+  if (tma_metadata_.arg_index_to_tma_info.empty()) {
+    for (int idx = 0; idx < args_.size(); ++idx) {
+      se::DeviceAddressBase buf =
+          execute_params.buffer_allocations->GetDeviceAddress(args_[idx].slice);
+      VLOG(5) << "  Arg #" << idx << ": " << args_[idx].slice << ": "
+              << buf.opaque() << " (" << buf.size() << "B)";
+      packed_args.add_argument(buf);
+    }
+    packed_args.add_shared_bytes(static_cast<size_t>(shmem_bytes_));
+  } else {
+    ASSIGN_OR_RETURN(
+        auto kernel_with_args,
+        GetKernelAndArgs(*execute_params.buffer_allocations, executor));
+    kernel = kernel_with_args.kernel;
+    se::PackKernelArgsInto(absl::MakeSpan(kernel_with_args.args),
+                           static_cast<uint32_t>(shmem_bytes_), &packed_args);
+  }
 
   if (auto* create = std::get_if<RecordCreate>(&record_action)) {
     return command_buffer->CreateLaunch(
         launch_dimensions_.thread_counts_per_block(),
-        launch_dimensions_.block_counts(), cluster_dim_, *kernel, *packed_args,
+        launch_dimensions_.block_counts(), cluster_dim_, *kernel, packed_args,
         create->dependencies, priority());
   }
   if (auto* update = std::get_if<RecordUpdate>(&record_action)) {
     RETURN_IF_ERROR(command_buffer->UpdateLaunch(
         update->command, launch_dimensions_.thread_counts_per_block(),
         launch_dimensions_.block_counts(), cluster_dim_, *kernel,
-        *packed_args));
+        packed_args));
     return update->command;
   }
   return Internal("Invalid record action");
