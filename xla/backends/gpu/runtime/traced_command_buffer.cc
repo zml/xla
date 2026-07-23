@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/runtime/traced_command_buffer.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -22,9 +23,6 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
-#include "absl/base/optimization.h"
-#include "absl/container/flat_hash_set.h"
-#include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -46,15 +44,17 @@ namespace xla::gpu {
 TracedCommandBuffer::TracedCommandBuffer(const Command* trace_cmd,
                                          Command::BufferUses buffers,
                                          int64_t capacity)
-    : trace_cmd_(trace_cmd), capacity_(capacity), entries_(capacity) {
+    : trace_cmd_(trace_cmd), capacity_(static_cast<size_t>(capacity)) {
   CHECK_GT(capacity, 0) << "capacity must be larger than 0";  // NOLINT
-  // Collect unique buffer allocation indices in a set first and convert to
-  // vector as flat hash set iteration has measurable overheads.
-  absl::flat_hash_set<BufferAllocation::Index> allocs_indices;
+  // Keep allocation indices sorted to make the address key stable and compact.
+  allocs_indices_.reserve(buffers.size());
   for (auto& buffer : buffers) {
-    allocs_indices.insert(buffer.slice().index());
+    allocs_indices_.push_back(buffer.slice().index());
   }
-  allocs_indices_.assign(allocs_indices.begin(), allocs_indices.end());
+  absl::c_sort(allocs_indices_);
+  allocs_indices_.erase(
+      std::unique(allocs_indices_.begin(), allocs_indices_.end()),
+      allocs_indices_.end());
 }
 
 absl::StatusOr<se::CommandBuffer*> TracedCommandBuffer::GetOrTraceCommandBuffer(
@@ -62,70 +62,45 @@ absl::StatusOr<se::CommandBuffer*> TracedCommandBuffer::GetOrTraceCommandBuffer(
     se::Stream* stream, absl::FunctionRef<absl::Status(se::Stream*)> trace,
     se::StreamPriority priority) {
   // Collect memory addresses for relevant allocations.
-  absl::InlinedVector<se::DeviceAddressBase, 4> allocs;
-  allocs.reserve(allocs_indices_.size());
+  AddressKey key;
+  key.allocs.reserve(allocs_indices_.size());
   for (auto& index : allocs_indices_) {
-    allocs.emplace_back(buffer_allocation->GetDeviceAddress(index));
+    key.allocs.emplace_back(buffer_allocation->GetDeviceAddress(index));
   }
 
-  // Moves entry at `i` position to front and moves entries in `[0, i)` range
-  // one element to the right. Returns reference to the first entry.
-  auto shift_right = [&](size_t i) -> Entry& {
-    if (i == 0) {
-      return entries_[0];
+  if (auto it = entries_by_key_.find(key);
+      ABSL_PREDICT_TRUE(it != entries_by_key_.end())) {
+    auto entry = it->second;
+    if (capacity_ <= 64) {
+      entries_.splice(entries_.begin(), entries_, it->second);
+      it->second = entries_.begin();
+      entry = entries_.begin();
     }
-
-    Entry entry = std::move(entries_[i]);
-    do {
-      entries_[i] = std::move(entries_[i - 1]);
-    } while (--i > 0);
-
-    return entries_[0] = std::move(entry);
-  };
-
-  for (size_t i = 0; i < capacity_; ++i) {
-    // Found entry for a given allocations, move it to front and return a
-    // pointer to cached command buffer.
-    if (ABSL_PREDICT_TRUE(absl::c_equal(entries_[i].recorded_allocs, allocs) &&
-                          entries_[i].command_buffer)) {
-      VLOG(6) << "Command buffer trace cache hit for command "
-              << trace_cmd_->ToString(0)
-              << " (buffer: " << entries_[i].command_buffer.get() << ")";
-      return shift_right(i).command_buffer.get();
-    }
-
-    // Create a new entry by calling a user-provided tracing function, move it
-    // to front and return a pointer to cached command buffer.
-    if (entries_[i].command_buffer == nullptr) {
-      ASSIGN_OR_RETURN(
-          entries_[i].command_buffer,
-          se::TraceCommandBufferFactory::Create(executor, stream, trace));
-      entries_[i].recorded_allocs.assign(allocs.begin(), allocs.end());
-      if (priority != se::StreamPriority::Default) {
-        RETURN_IF_ERROR(entries_[i].command_buffer->SetPriority(priority));
-      }
-      VLOG(6) << "Command buffer trace cache create new item for command "
-              << trace_cmd_->ToString(0)
-              << " (buffer: " << entries_[i].command_buffer.get() << ")";
-      return shift_right(i).command_buffer.get();
-    }
+    VLOG(6) << "Command buffer trace cache hit for command "
+            << trace_cmd_->ToString(0);
+    return entry->command_buffer.get();
   }
 
-  // Create a new entry by calling a user-provided tracing function, replace
-  // the last entry with it, move it to front and return a pointer to cached
-  // command buffer.
-  VLOG(6) << "Command buffer trace cache evicting old command buffer "
-          << entries_[capacity_ - 1].command_buffer.get()
-          << " to make room for command " << trace_cmd_->ToString(0);
-  ASSIGN_OR_RETURN(
-      entries_[capacity_ - 1].command_buffer,
+  if (entries_.size() == capacity_) {
+    entries_by_key_.erase(entries_.back().key);
+    entries_.pop_back();
+  }
+
+  Entry entry;
+  entry.key = std::move(key);
+  TF_ASSIGN_OR_RETURN(
+      entry.command_buffer,
       se::TraceCommandBufferFactory::Create(executor, stream, trace));
-  entries_[capacity_ - 1].recorded_allocs.assign(allocs.begin(), allocs.end());
-  VLOG(6) << "Command buffer trace cache does replacement for command "
-          << trace_cmd_->ToString(0)
-          << " (new buffer: " << entries_[capacity_ - 1].command_buffer.get()
-          << ")";
-  return shift_right(capacity_ - 1).command_buffer.get();
+  if (priority != se::StreamPriority::Default) {
+    TF_RETURN_IF_ERROR(entry.command_buffer->SetPriority(priority));
+  }
+
+  entries_.push_front(std::move(entry));
+  entries_by_key_.emplace(entries_.front().key, entries_.begin());
+
+  VLOG(6) << "Command buffer trace cache create new item for command "
+          << trace_cmd_->ToString(0);
+  return entries_.front().command_buffer.get();
 }
 
 bool TracedCommandBuffer::RecordedChildIsCurrent(
