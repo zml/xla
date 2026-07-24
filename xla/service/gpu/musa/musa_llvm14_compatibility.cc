@@ -356,12 +356,179 @@ absl::Status NormalizePureIntrinsicAttributes(llvm::Function& function,
   return absl::OkStatus();
 }
 
+bool HasOnlyNoSignedZeros(const llvm::FastMathFlags& flags) {
+  return flags.noSignedZeros() && !flags.allowReassoc() && !flags.noNaNs() &&
+         !flags.noInfs() && !flags.allowReciprocal() &&
+         !flags.allowContract() && !flags.approxFunc();
+}
+
+bool IsFloatingMinMaxIntrinsic(llvm::Intrinsic::ID id) {
+  return id == llvm::Intrinsic::maximum || id == llvm::Intrinsic::minimum ||
+         id == llvm::Intrinsic::maxnum || id == llvm::Intrinsic::minnum;
+}
+
+absl::Status ValidateFloatingMinMaxCall(const llvm::Function& intrinsic,
+                                        const llvm::CallInst& call,
+                                        absl::string_view module_name) {
+  if (call.getCalledFunction() != &intrinsic ||
+      call.getCallingConv() != llvm::CallingConv::C || call.isTailCall() ||
+      call.arg_size() != 2 || !call.getAttributes().isEmpty() ||
+      call.hasOperandBundles()) {
+    return Rejected(module_name, "floating-minmax-call",
+                    "floating min/max must be a plain direct two-operand call");
+  }
+
+  llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> metadata;
+  call.getAllMetadata(metadata);
+  if (!metadata.empty() || call.getDebugLoc()) {
+    return Rejected(module_name, "floating-minmax-call",
+                    "floating min/max call metadata is not qualified");
+  }
+
+  const llvm::FastMathFlags flags = call.getFastMathFlags();
+  if (flags.any() && !HasOnlyNoSignedZeros(flags)) {
+    return Rejected(module_name, "fast-math-flags",
+                    "floating min/max carries flags outside the nsz-only "
+                    "contract");
+  }
+
+  llvm::Type* type = call.getType();
+  llvm::Type* scalar_type = type->getScalarType();
+  if ((!scalar_type->isHalfTy() && !scalar_type->isFloatTy() &&
+       !scalar_type->isDoubleTy()) ||
+      (type->isVectorTy() &&
+       llvm::cast<llvm::VectorType>(type)->getElementCount().isScalable()) ||
+      call.getArgOperand(0)->getType() != type ||
+      call.getArgOperand(1)->getType() != type) {
+    return Rejected(module_name, "floating-minmax-type",
+                    "floating min/max requires a qualified scalar or fixed "
+                    "vector f16, f32, or f64 overload");
+  }
+  return absl::OkStatus();
+}
+
+llvm::Value* LowerFloatingMinMaxCall(llvm::CallInst& call) {
+  const llvm::Intrinsic::ID id = call.getCalledFunction()->getIntrinsicID();
+  const bool is_max =
+      id == llvm::Intrinsic::maximum || id == llvm::Intrinsic::maxnum;
+  const bool propagates_nan =
+      id == llvm::Intrinsic::maximum || id == llvm::Intrinsic::minimum;
+  llvm::Value* lhs = call.getArgOperand(0);
+  llvm::Value* rhs = call.getArgOperand(1);
+  llvm::Type* type = call.getType();
+  llvm::Type* scalar_type = type->getScalarType();
+  llvm::Type* integer_scalar = llvm::Type::getIntNTy(
+      call.getContext(), scalar_type->getPrimitiveSizeInBits());
+  llvm::Type* integer_type = integer_scalar;
+  if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type)) {
+    integer_type = llvm::FixedVectorType::get(integer_scalar,
+                                              vector_type->getNumElements());
+  }
+
+  const std::string prefix =
+      call.hasName() ? call.getName().str() : "musa_floating_minmax";
+  llvm::IRBuilder<> builder(&call);
+  llvm::Value* ordered_compare =
+      is_max ? builder.CreateFCmpOGT(lhs, rhs, prefix + ".ordered_compare")
+             : builder.CreateFCmpOLT(lhs, rhs, prefix + ".ordered_compare");
+  llvm::Value* ordered = builder.CreateSelect(ordered_compare, lhs, rhs,
+                                              prefix + ".ordered_value");
+
+  // Equal non-NaN values have identical encodings except for signed zero.
+  // IEEE sign ordering is therefore exactly integer AND for maximum and
+  // integer OR for minimum, including +0/-0 in either operand order.
+  llvm::Value* equal = builder.CreateFCmpOEQ(lhs, rhs, prefix + ".equal");
+  llvm::Value* lhs_bits =
+      builder.CreateBitCast(lhs, integer_type, prefix + ".lhs_bits");
+  llvm::Value* rhs_bits =
+      builder.CreateBitCast(rhs, integer_type, prefix + ".rhs_bits");
+  llvm::Value* equal_bits =
+      is_max ? builder.CreateAnd(lhs_bits, rhs_bits, prefix + ".equal_bits")
+             : builder.CreateOr(lhs_bits, rhs_bits, prefix + ".equal_bits");
+  llvm::Value* equal_value =
+      builder.CreateBitCast(equal_bits, type, prefix + ".equal_value");
+  ordered = builder.CreateSelect(equal, equal_value, ordered,
+                                 prefix + ".zero_ordered_value");
+
+  if (propagates_nan) {
+    llvm::Constant* nan_bits = llvm::ConstantInt::get(
+        integer_scalar,
+        llvm::APFloat::getNaN(scalar_type->getFltSemantics()).bitcastToAPInt());
+    if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type)) {
+      nan_bits = llvm::ConstantVector::getSplat(vector_type->getElementCount(),
+                                                nan_bits);
+    }
+    llvm::Value* nan =
+        new llvm::BitCastInst(nan_bits, type, prefix + ".canonical_nan", &call);
+    llvm::Value* unordered =
+        builder.CreateFCmpUNO(lhs, rhs, prefix + ".unordered");
+    return builder.CreateSelect(unordered, nan, ordered, prefix + ".result");
+  }
+
+  llvm::Value* lhs_nan = builder.CreateFCmpUNO(lhs, lhs, prefix + ".lhs_nan");
+  llvm::Value* rhs_nan = builder.CreateFCmpUNO(rhs, rhs, prefix + ".rhs_nan");
+  llvm::Value* rhs_checked = builder.CreateSelect(
+      rhs_nan, lhs, ordered, prefix + ".rhs_checked_value");
+  return builder.CreateSelect(lhs_nan, rhs, rhs_checked, prefix + ".result");
+}
+
+absl::Status LowerFloatingMinMaxIntrinsics(llvm::Module& module,
+                                           absl::string_view module_name) {
+  std::vector<llvm::Function*> intrinsics;
+  for (llvm::Function& function : module.functions()) {
+    if (function.isIntrinsic() &&
+        IsFloatingMinMaxIntrinsic(function.getIntrinsicID())) {
+      intrinsics.push_back(&function);
+    }
+  }
+
+  for (llvm::Function* intrinsic : intrinsics) {
+    if (!intrinsic->isDeclaration() ||
+        intrinsic->getLinkage() != llvm::GlobalValue::ExternalLinkage ||
+        intrinsic->getCallingConv() != llvm::CallingConv::C) {
+      return Rejected(module_name, "floating-minmax-declaration",
+                      "floating min/max must be an external C declaration");
+    }
+    std::vector<llvm::CallInst*> calls;
+    calls.reserve(intrinsic->getNumUses());
+    for (llvm::User* user : intrinsic->users()) {
+      auto* call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (call == nullptr) {
+        return Rejected(module_name, "floating-minmax-call",
+                        "floating min/max has a non-call use");
+      }
+      if (absl::Status status =
+              ValidateFloatingMinMaxCall(*intrinsic, *call, module_name);
+          !status.ok()) {
+        return status;
+      }
+      calls.push_back(call);
+    }
+    for (llvm::CallInst* call : calls) {
+      call->replaceAllUsesWith(LowerFloatingMinMaxCall(*call));
+      call->eraseFromParent();
+    }
+    if (!intrinsic->use_empty()) {
+      return Rejected(module_name, "floating-minmax-call",
+                      "floating min/max retains an unsupported use");
+    }
+    intrinsic->eraseFromParent();
+  }
+  return absl::OkStatus();
+}
+
 absl::Status NormalizeFunctions(llvm::Module& module,
                                 absl::string_view module_name,
                                 MusaBridgeIrMetadata& metadata) {
   for (llvm::Function& function : module.functions()) {
     if (function.isIntrinsic()) {
       switch (function.getIntrinsicID()) {
+        // The pinned MUSA LLVM 14 registry gives this floating min/max family
+        // the same pure, speculatable, will-return contract as current LLVM.
+        case llvm::Intrinsic::maximum:
+        case llvm::Intrinsic::maxnum:
+        case llvm::Intrinsic::minimum:
+        case llvm::Intrinsic::minnum:
         case llvm::Intrinsic::fabs:
         case llvm::Intrinsic::smax:
         case llvm::Intrinsic::smin:
@@ -1030,6 +1197,10 @@ absl::StatusOr<MusaLlvm14CompatibilityResult> NormalizeMusaLlvmForLlvm14(
   MusaBridgeIrMetadata metadata;
   metadata.module_name = std::string(module_name);
   if (absl::Status status = NormalizeFunctions(*module, module_name, metadata);
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status = LowerFloatingMinMaxIntrinsics(*module, module_name);
       !status.ok()) {
     return status;
   }

@@ -484,6 +484,85 @@ TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedIntegerMinMaxProfiles) {
             ReadCorpus("integer_minmax.llvm14.ll"));
 }
 
+TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedFloatingMinMaxProfiles) {
+  const std::string text = Module(
+      "  %minimum = call float @llvm.minimum.f32(float %lhs, float %rhs)\n"
+      "  %maximum = call nsz float @llvm.maximum.f32(float %minimum, float "
+      "%rhs)\n"
+      "  %minnum = call float @llvm.minnum.f32(float %maximum, float %lhs)\n"
+      "  %maxnum = call float @llvm.maxnum.f32(float %minnum, float %rhs)\n"
+      "  %bits = bitcast float %maxnum to i32\n"
+      "  store i32 %bits, ptr addrspace(1) %out, align 4",
+      "declare float @llvm.minimum.f32(float, float)\n"
+      "declare float @llvm.maximum.f32(float, float)\n"
+      "declare float @llvm.minnum.f32(float, float)\n"
+      "declare float @llvm.maxnum.f32(float, float)",
+      "", "", "ptr addrspace(1) %out, float %lhs, float %rhs");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  for (absl::string_view name : {"llvm.minimum.f32", "llvm.maximum.f32",
+                                 "llvm.minnum.f32", "llvm.maxnum.f32"}) {
+    llvm::Function* function = module->getFunction(name);
+    ASSERT_NE(function, nullptr);
+    function->setAttributes(llvm::Intrinsic::getAttributes(
+        context, function->getIntrinsicID(), function->getFunctionType()));
+  }
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "floating_minmax_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "llvm.minimum"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "llvm.maximum"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "llvm.minnum"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "llvm.maxnum"));
+  EXPECT_EQ(normalized->normalized_llvm,
+            ReadCorpus("floating_minmax.llvm14.ll"));
+}
+
+TEST(MusaLlvm14CompatibilityTest, RejectsUnqualifiedFloatingMinMaxFastMath) {
+  const std::string text = Module(
+      "  %value = call nnan float @llvm.maximum.f32(float %lhs, float %rhs)",
+      "declare float @llvm.maximum.f32(float, float)", "", "",
+      "ptr addrspace(1) %out, float %lhs, float %rhs");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* maximum = module->getFunction("llvm.maximum.f32");
+  ASSERT_NE(maximum, nullptr);
+  maximum->setAttributes(llvm::Intrinsic::getAttributes(
+      context, maximum->getIntrinsicID(), maximum->getFunctionType()));
+
+  EXPECT_THAT(NormalizeMusaLlvmForLlvm14(*module, "minmax_fast_math"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=fast-math-flags")));
+}
+
+TEST(MusaLlvm14CompatibilityTest, RejectsFloatingMinMaxCallSiteAttributes) {
+  const std::string text = Module(
+      "  %value = call noundef float @llvm.maximum.f32(float %lhs, float "
+      "%rhs)",
+      "declare float @llvm.maximum.f32(float, float)", "", "",
+      "ptr addrspace(1) %out, float %lhs, float %rhs");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* maximum = module->getFunction("llvm.maximum.f32");
+  ASSERT_NE(maximum, nullptr);
+  maximum->setAttributes(llvm::Intrinsic::getAttributes(
+      context, maximum->getIntrinsicID(), maximum->getFunctionType()));
+
+  EXPECT_THAT(NormalizeMusaLlvmForLlvm14(*module, "minmax_call_attrs"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=floating-minmax-call")));
+}
+
 TEST(MusaLlvm14CompatibilityTest, RewritesCurrentFloatBitLiteralsForLlvm14) {
   const std::string text = Module(
       "  %low = fcmp ole float 0.0, f0xCF000000\n"

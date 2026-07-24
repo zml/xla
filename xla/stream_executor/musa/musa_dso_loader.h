@@ -46,11 +46,19 @@ std::vector<std::string> ExpandMusaDsoCandidates(
     const std::vector<std::string>& candidates);
 
 // Creates a loader that tries `candidates` in order, followed by matching
-// /usr/local/musa/lib paths for bare SONAMEs. A successfully opened DSO is
-// deliberately pinned for the lifetime of the process: unloading a vendor
-// driver or runtime DSO while another thread may be executing it is unsafe.
+// /usr/local/musa/lib paths for bare SONAMEs. If `fail_if_not_found` is true,
+// exhausting all candidates is a configuration error instead of normal DSO
+// absence. An existing path entry that cannot be loaded, including a dangling
+// symbolic link, is always an immediate configuration error; later fallbacks
+// are not tried. A successfully opened DSO is deliberately pinned for the
+// lifetime of the process: unloading a vendor driver or runtime DSO while
+// another thread may be executing it is unsafe.
+//
+// POSIX dlopen does not portably distinguish an absent bare SONAME from a
+// missing transitive dependency. Callers requiring fail-closed diagnostics
+// must provide a slash-containing candidate or set fail_if_not_found.
 std::unique_ptr<MusaSymbolLoader> CreateMusaDsoLoader(
-    std::vector<std::string> candidates);
+    std::vector<std::string> candidates, bool fail_if_not_found = false);
 
 // Creates the qualified MUSA driver loader. The versioned SONAME is preferred
 // so that an unrelated default libmusa cannot silently change the ABI.

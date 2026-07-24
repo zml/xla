@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
@@ -112,6 +113,8 @@ class MusaExecutor : public gpu::GpuExecutor {
 
   Stream* FindAllocatedStream(void* device_stream) override;
 
+  blas::BlasSupport* AsBlas() override;
+
   gpu::HostCallbackRegistry* host_callback_registry() const {
     return host_callback_registry_.get();
   }
@@ -128,6 +131,9 @@ class MusaExecutor : public gpu::GpuExecutor {
   // registry tears down outstanding stream-ordered completion callbacks.
   std::unique_ptr<MusaModuleReaper> module_reaper_;
   std::unique_ptr<gpu::HostCallbackRegistry> host_callback_registry_;
+
+  mutable absl::Mutex support_mu_;
+  std::unique_ptr<blas::BlasSupport> blas_ ABSL_GUARDED_BY(support_mu_);
 
   mutable absl::Mutex alive_streams_mu_;
   absl::flat_hash_map<void*, Stream*> alive_streams_

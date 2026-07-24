@@ -320,13 +320,9 @@ bool IsAllowedGenericIntrinsic(llvm::Intrinsic::ID id) {
     case llvm::Intrinsic::log:
     case llvm::Intrinsic::log10:
     case llvm::Intrinsic::log2:
-    case llvm::Intrinsic::maximum:
-    case llvm::Intrinsic::maxnum:
     case llvm::Intrinsic::memcpy:
     case llvm::Intrinsic::memmove:
     case llvm::Intrinsic::memset:
-    case llvm::Intrinsic::minimum:
-    case llvm::Intrinsic::minnum:
     case llvm::Intrinsic::nearbyint:
     case llvm::Intrinsic::pow:
     case llvm::Intrinsic::powi:

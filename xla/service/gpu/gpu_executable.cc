@@ -113,9 +113,9 @@ limitations under the License.
 #include "xla/stream_executor/module_spec.h"
 #include "xla/stream_executor/musa/musa_executable_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
-#include "xla/stream_executor/musa/musa_runtime_abi_version.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
+#include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -1559,28 +1559,28 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
         GpuExecutableProto::BinaryKind_Name(binary_kind)));
   }
 
-  ASSIGN_OR_RETURN(
-      params.executable_abi_version,
-      se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
-  if (gpu_compute_capability.IsMusa()) {
-    RETURN_IF_ERROR(se::musa::ValidateMusaExecutableAbi(
-        params.executable_abi_version, params.binary));
-    ASSIGN_OR_RETURN(se::musa::MusaRuntimeAbiVersion runtime_abi,
-                     se::musa::MusaRuntimeAbiVersion::Create(
-                         device_description.runtime_version(),
-                         device_description.driver_version(),
-                         device_description.kernel_mode_driver_version(),
-                         device_description.compile_time_toolkit_version()));
-    RETURN_IF_ERROR(
-        runtime_abi.IsCompatibleWith(params.executable_abi_version));
-  }
-
   if (gpu_compute_capability != device_description.gpu_compute_capability()) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "GPU compute capability of serialized executable doesn't match target "
         "device capability. (serialized: %s, target: %s)",
         gpu_compute_capability.ToString(),
         device_description.gpu_compute_capability().ToString()));
+  }
+
+  ASSIGN_OR_RETURN(
+      params.executable_abi_version,
+      se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
+  if (gpu_compute_capability.IsMusa()) {
+    RETURN_IF_ERROR(se::musa::ValidateMusaExecutableAbi(
+        params.executable_abi_version, params.binary));
+    // Keep live runtime and optional-library discovery behind the platform
+    // boundary so shared GPU executable code remains vendor-DSO independent.
+    ASSIGN_OR_RETURN(se::Platform * platform,
+                     se::PlatformManager::PlatformWithName(platform_name));
+    ASSIGN_OR_RETURN(std::unique_ptr<se::RuntimeAbiVersion> runtime_abi,
+                     platform->GetRuntimeAbiVersion());
+    RETURN_IF_ERROR(
+        runtime_abi->IsCompatibleWith(params.executable_abi_version));
   }
 
   params.device_description = device_description;

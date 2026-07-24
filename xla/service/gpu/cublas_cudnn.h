@@ -93,6 +93,9 @@ bool IsCublasLtGemm(const HloInstruction& hlo);
 // Legacy alias for IsCublasLtGemm that also includes legacy cublas.
 bool IsCublasGemm(const HloInstruction& hlo);
 
+// Matrix multiplication that calls into the MUSA muBLAS adapter.
+bool IsMusaGemm(const HloInstruction& hlo);
+
 // Matrix multiplication that calls into legacy cublas.
 bool IsLegacyCublasMatmul(const HloInstruction& hlo);
 
@@ -117,6 +120,9 @@ bool IsTriangularSolve(const HloInstruction& hlo);
 
 // A call to cuBLAS general matrix multiplication API.
 inline constexpr absl::string_view kGemmCallTarget = "__cublas$gemm";
+
+// A call to the MUSA muBLAS general matrix multiplication API.
+inline constexpr absl::string_view kMusaGemmCallTarget = "__mublas$gemm";
 
 // A call to cuBLAS Lt API matrix multiplication.
 inline constexpr absl::string_view kCublasLtMatmulCallTarget =

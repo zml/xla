@@ -48,13 +48,32 @@ limitations under the License.
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
 
+namespace stream_executor {
+class GpuComputeCapability;
+}  // namespace stream_executor
+
 namespace xla::gpu {
 
 class CollectiveKernelThunk;
 struct AllReduceConfig;
+class GemmBackendConfig;
 
 struct DynamicSliceCopyFusion;
 struct StaticSliceCopyFusion;
+
+namespace thunk_emitter_internal {
+
+// Validates the backend configuration accepted by the basic MUSA GEMM route.
+// Kept separate from GemmConfig construction so unsupported extensions fail
+// before shared configuration code accesses their additional operands.
+absl::Status ValidateMusaGemmBackendConfig(const GemmBackendConfig& config);
+
+absl::Status ValidateMusaGemmCustomCall(
+    const HloCustomCallInstruction& instr,
+    const stream_executor::GpuComputeCapability& gpu_compute_capability,
+    const GemmBackendConfig& config);
+
+}  // namespace thunk_emitter_internal
 
 // Emits Thunks for the given HLO module.
 class ThunkEmitter {
@@ -174,6 +193,9 @@ class ThunkEmitter {
       const HloFusionInstruction* instr, const StaticSliceCopyFusion& copy);
 
   absl::StatusOr<ThunkSequence> EmitFftThunk(const HloFftInstruction* instr);
+
+  absl::StatusOr<ThunkSequence> EmitMusaGemmThunk(
+      const HloCustomCallInstruction* instr);
 
   absl::StatusOr<ThunkSequence> EmitInfeed(const HloInfeedInstruction* instr);
 

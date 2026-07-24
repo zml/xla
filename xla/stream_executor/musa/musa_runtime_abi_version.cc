@@ -236,7 +236,8 @@ MusaRuntimeAbiVersion::MusaRuntimeAbiVersion(
 absl::StatusOr<MusaRuntimeAbiVersion>
 MusaRuntimeAbiVersion::CreateFromApiVersions(
     int runtime_version, int driver_version,
-    SemanticVersion kernel_driver_version, int toolkit_version) {
+    SemanticVersion kernel_driver_version, int toolkit_version,
+    std::vector<MusaOptionalLibraryAbi> available_optional_library_abis) {
   ASSIGN_OR_RETURN(SemanticVersion parsed_runtime_version,
                    ParseMusaVersion(runtime_version));
   ASSIGN_OR_RETURN(SemanticVersion parsed_driver_version,
@@ -244,7 +245,8 @@ MusaRuntimeAbiVersion::CreateFromApiVersions(
   ASSIGN_OR_RETURN(SemanticVersion parsed_toolkit_version,
                    ParseMusaVersion(toolkit_version));
   return Create(parsed_runtime_version, parsed_driver_version,
-                kernel_driver_version, parsed_toolkit_version);
+                kernel_driver_version, parsed_toolkit_version,
+                std::move(available_optional_library_abis));
 }
 
 absl::StatusOr<MusaRuntimeAbiVersion> MusaRuntimeAbiVersion::Create(

@@ -16,10 +16,14 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_dso_loader.h"
 
 #include <dlfcn.h>
+#include <sys/stat.h>
+
 #if defined(__linux__)
 #include <link.h>
 #endif
 
+#include <cerrno>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -37,8 +41,10 @@ namespace {
 
 class PosixMusaSymbolLoader final : public MusaSymbolLoader {
  public:
-  explicit PosixMusaSymbolLoader(std::vector<std::string> candidates)
-      : candidates_(std::move(candidates)) {}
+  explicit PosixMusaSymbolLoader(std::vector<std::string> candidates,
+                                 bool fail_if_not_found)
+      : candidates_(std::move(candidates)),
+        fail_if_not_found_(fail_if_not_found) {}
 
   // Do not call dlclose. Driver and runtime DSOs can own process-wide state,
   // TLS destructors, callbacks, and objects retained by other vendor DSOs.
@@ -83,13 +89,36 @@ class PosixMusaSymbolLoader final : public MusaSymbolLoader {
     std::vector<std::string> failures;
     failures.reserve(candidates_.size());
     for (const std::string& candidate : candidates_) {
+      bool candidate_path_exists = false;
+      if (candidate.find('/') != std::string::npos) {
+        struct stat candidate_stat;
+        int stat_result;
+        do {
+          stat_result = lstat(candidate.c_str(), &candidate_stat);
+        } while (stat_result != 0 && errno == EINTR);
+        if (stat_result == 0) {
+          candidate_path_exists = true;
+        } else {
+          const int stat_error = errno;
+          if (stat_error != ENOENT && stat_error != ENOTDIR) {
+            return absl::FailedPreconditionError(
+                absl::StrCat("Could not inspect MUSA shared-library candidate ",
+                             candidate, ": ", std::strerror(stat_error)));
+          }
+        }
+      }
       dlerror();
       handle_ = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL);
       const char* error = dlerror();
       if (handle_ == nullptr) {
-        failures.push_back(
-            absl::StrCat(candidate, ": ",
-                         error == nullptr ? "unknown dlopen error" : error));
+        const char* error_message =
+            error == nullptr ? "unknown dlopen error" : error;
+        failures.push_back(absl::StrCat(candidate, ": ", error_message));
+        if (candidate_path_exists) {
+          return absl::FailedPreconditionError(absl::StrCat(
+              "Could not load a MUSA shared library at existing path ",
+              candidate, ": ", error_message));
+        }
         continue;
       }
 
@@ -104,13 +133,17 @@ class PosixMusaSymbolLoader final : public MusaSymbolLoader {
       return absl::OkStatus();
     }
 
-    return absl::NotFoundError(
-        absl::StrCat("Could not load a MUSA shared library (tried ",
-                     absl::StrJoin(candidates_, ", "),
-                     "): ", absl::StrJoin(failures, "; ")));
+    const std::string message = absl::StrCat(
+        "Could not load a MUSA shared library (tried ",
+        absl::StrJoin(candidates_, ", "), "): ", absl::StrJoin(failures, "; "));
+    if (fail_if_not_found_) {
+      return absl::FailedPreconditionError(message);
+    }
+    return absl::NotFoundError(message);
   }
 
   const std::vector<std::string> candidates_;
+  const bool fail_if_not_found_;
   mutable std::once_flag load_once_;
   absl::Status load_status_ = absl::UnknownError("MUSA DSO not loaded");
   void* handle_ = nullptr;  // Intentionally never passed to dlclose.
@@ -132,14 +165,14 @@ std::vector<std::string> ExpandMusaDsoCandidates(
 }
 
 std::unique_ptr<MusaSymbolLoader> CreateMusaDsoLoader(
-    std::vector<std::string> candidates) {
+    std::vector<std::string> candidates, bool fail_if_not_found) {
   // A normal deployment registers the toolkit with the dynamic linker. The
   // vendor installer used on qualified S80 hosts can instead leave DSOs only
   // under /usr/local/musa/lib. Keep SONAME resolution first, then add that
   // conventional install root as a deterministic fallback. Bazel output and
   // runfiles paths are intentionally not part of the runtime ABI.
   return std::make_unique<PosixMusaSymbolLoader>(
-      ExpandMusaDsoCandidates(candidates));
+      ExpandMusaDsoCandidates(candidates), fail_if_not_found);
 }
 
 std::unique_ptr<MusaSymbolLoader> CreateMusaDriverDsoLoader() {

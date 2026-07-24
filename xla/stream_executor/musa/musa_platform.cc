@@ -18,6 +18,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -27,6 +28,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_executor.h"
+#include "xla/stream_executor/musa/musa_mublas_api.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_runtime_abi_version.h"
@@ -77,10 +79,13 @@ MusaPlatform::GetRuntimeAbiVersion() const {
   ASSIGN_OR_RETURN(int driver_version, MusaDriver::Instance().DriverVersion());
   ASSIGN_OR_RETURN(SemanticVersion kernel_driver_version,
                    GetMusaKernelDriverVersion());
-  ASSIGN_OR_RETURN(MusaRuntimeAbiVersion version,
-                   MusaRuntimeAbiVersion::CreateFromApiVersions(
-                       runtime_version, driver_version, kernel_driver_version,
-                       XLA_MUSA_TOOLKIT_VERSION));
+  ASSIGN_OR_RETURN(std::vector<MusaOptionalLibraryAbi> optional_libraries,
+                   GetAvailableMusaOptionalLibraryAbis());
+  ASSIGN_OR_RETURN(
+      MusaRuntimeAbiVersion version,
+      MusaRuntimeAbiVersion::CreateFromApiVersions(
+          runtime_version, driver_version, kernel_driver_version,
+          XLA_MUSA_TOOLKIT_VERSION, std::move(optional_libraries)));
   return std::make_unique<MusaRuntimeAbiVersion>(std::move(version));
 }
 

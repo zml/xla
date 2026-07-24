@@ -87,6 +87,10 @@ namespace m = match;
 
 // Give this instruction a more useful name than "custom-call.42".
 absl::Status SetName(HloModule* module, HloInstruction* gemm) {
+  if (IsMusaGemm(*gemm)) {
+    module->SetAndUniquifyInstrName(gemm, "mublas-gemm");
+    return absl::OkStatus();
+  }
   if (IsCublasLtMatmul(*gemm)) {
     module->SetAndUniquifyInstrName(gemm, "cublas-lt-matmul");
     return absl::OkStatus();
@@ -106,6 +110,35 @@ absl::Status SetName(HloModule* module, HloInstruction* gemm) {
 
 bool IsF8Type(const HloInstruction* instr) {
   return primitive_util::IsF8Type(instr->shape().element_type());
+}
+
+// The initial MUSA route exposes only the non-batched subset implemented by
+// the first muBLAS adapter. F16 and BF16 inputs are widened to F32 around the
+// call so muBLAS always sees homogeneous inputs and F32 accumulation/output;
+// low-precision results are converted back after the call. Keeping this gate
+// in the target-independent rewriter prevents a MUSA executable from
+// containing a CUDA call target or an unsupported muBLAS call.
+absl::StatusOr<bool> IsMusaSupportedMatMul(const HloInstruction& dot) {
+  ASSIGN_OR_RETURN(
+      bool is_supported_shape,
+      IsCublasSupportedMatMul(dot,
+                              /*allow_matrix_vector_multiplication=*/true));
+  if (!is_supported_shape ||
+      !dot.dot_dimension_numbers().lhs_batch_dimensions().empty() ||
+      !dot.dot_dimension_numbers().rhs_batch_dimensions().empty() ||
+      dot.precision_config().algorithm() != PrecisionConfig::ALG_UNSET) {
+    return false;
+  }
+
+  const PrimitiveType input_type = dot.operand(0)->shape().element_type();
+  if (dot.operand(1)->shape().element_type() != input_type) {
+    return false;
+  }
+  const PrimitiveType output_type = dot.shape().element_type();
+  if (input_type == F16) return output_type == F16 || output_type == F32;
+  return (input_type == BF16 && output_type == BF16) ||
+         (input_type == F32 && output_type == F32) ||
+         (input_type == F64 && output_type == F64);
 }
 
 // Returns a new shape with non-batch dimensions padded to multiples of 16, as
@@ -654,6 +687,12 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         options_(options) {}
 
   absl::Status HandleDot(HloInstruction* instr) override {
+    if (gpu_version_.IsMusa()) {
+      ASSIGN_OR_RETURN(bool is_supported, IsMusaSupportedMatMul(*instr));
+      if (!is_supported) {
+        return absl::OkStatus();
+      }
+    }
     ASSIGN_OR_RETURN(
         bool is_supported_matmul,
         IsCublasSupportedMatMul(*instr,
@@ -763,14 +802,41 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
           ASSIGN_OR_RETURN(
               absl::string_view gemm_custom_call_target,
               GetNonFp8GemmCustomCallTarget(*instr, gemm_backend_config));
-          const Shape& output_shape = instr->shape();
+          std::array<HloInstruction*, 2> operands = {instr->mutable_operand(0),
+                                                     instr->mutable_operand(1)};
+          const PrimitiveType input_type = operands[0]->shape().element_type();
+          const bool widen_musa_operands =
+              gpu_version_.IsMusa() &&
+              (input_type == F16 || input_type == BF16);
+          if (widen_musa_operands) {
+            for (HloInstruction*& operand : operands) {
+              Shape operand_shape = operand->shape();
+              operand_shape.set_element_type(F32);
+              operand = instr->AddInstruction(
+                  HloInstruction::CreateConvert(operand_shape, operand));
+            }
+          }
+
+          Shape output_shape = instr->shape();
+          if (widen_musa_operands) {
+            output_shape.set_element_type(F32);
+          }
+          const PrimitiveType original_output_type =
+              instr->shape().element_type();
+          const bool narrow_musa_output =
+              widen_musa_operands &&
+              (original_output_type == F16 || original_output_type == BF16);
           HloInstruction* gemm_call =
               instr->AddInstruction(HloInstruction::CreateCustomCall(
-                  output_shape,
-                  {instr->mutable_operand(0), instr->mutable_operand(1)},
-                  gemm_custom_call_target));
+                  output_shape, operands, gemm_custom_call_target));
           RETURN_IF_ERROR(gemm_call->set_backend_config(gpu_backend_config));
-          RETURN_IF_ERROR(ReplaceInstruction(instr, gemm_call));
+          if (narrow_musa_output) {
+            HloInstruction* converted = instr->AddInstruction(
+                HloInstruction::CreateConvert(instr->shape(), gemm_call));
+            RETURN_IF_ERROR(ReplaceInstruction(instr, converted));
+          } else {
+            RETURN_IF_ERROR(ReplaceInstruction(instr, gemm_call));
+          }
         }
       } break;
     };
@@ -2308,6 +2374,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   absl::StatusOr<absl::string_view> GetNonFp8GemmCustomCallTarget(
       const HloInstruction& instr,
       const GemmBackendConfig& gemm_backend_config) const {
+    if (gpu_version_.IsMusa()) {
+      return absl::string_view(kMusaGemmCallTarget);
+    }
     // All internal conditions are met, check if we meet the requirements of
     // cublasLt.
     ASSIGN_OR_RETURN(bool gemm_is_supported_by_cublas_lt,

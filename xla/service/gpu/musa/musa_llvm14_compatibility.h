@@ -29,10 +29,10 @@ class Module;
 namespace xla::gpu::musa {
 
 // Bump this token whenever the accepted current-LLVM surface, a
-// normalization rule, or an LLVM-14 spelling changes. C09 includes it in the
-// compiler-provider and executable-cache identity.
+// normalization rule, or an LLVM-14 spelling changes. The compiler provider
+// and executable envelope include it in their cache and compatibility identity.
 inline constexpr char kMusaLlvm14CompatibilityRevision[] =
-    "musa-llvm14-compat-v2";
+    "musa-llvm14-compat-v3";
 
 struct MusaLlvm14CompatibilityResult {
   std::string normalized_llvm;

@@ -17,7 +17,6 @@ limitations under the License.
 #define XLA_SERVICE_GPU_MUSA_MUSA_EXECUTABLE_ENVELOPE_H_
 
 #include <cstdint>
-#include <string>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -25,6 +24,7 @@ limitations under the License.
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/stream_executor/abi/executable_abi_version.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_target_contract.h"
 
 namespace xla::gpu::musa {
@@ -32,11 +32,7 @@ namespace xla::gpu::musa {
 inline constexpr uint32_t kMusaExecutableEnvelopeVersion =
     stream_executor::musa::kMusaExecutableAbiEnvelopeVersion;
 
-struct MusaOptionalLibraryAbi {
-  std::string name;
-  std::string abi_version;
-  std::string fingerprint;
-};
+using MusaOptionalLibraryAbi = stream_executor::musa::MusaOptionalLibraryAbi;
 
 // Builds the compiler-produced, runtime-independent MUSA executable identity.
 // Compiler and bridge fingerprints are provenance and cache identity; they are

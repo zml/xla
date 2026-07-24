@@ -28,11 +28,16 @@ limitations under the License.
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/IR/Module.h"
+#include "xla/backends/gpu/transforms/dot_algorithm_rewriter.h"
+#include "xla/backends/gpu/transforms/gemm_rewriter.h"
 #include "xla/hlo/analysis/alias_info.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compilation_stats.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_compiler_bundle.h"
 #include "xla/service/gpu/musa/musa_executable_envelope.h"
@@ -43,6 +48,7 @@ limitations under the License.
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
+#include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/semantic_version.h"
@@ -57,6 +63,22 @@ absl::Status ProviderUnavailable(const absl::Status& status) {
       status.code(),
       absl::StrCat("MUSA compilation provider is unavailable: ",
                    status.message()));
+}
+
+std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
+    const HloModule& module) {
+  for (const HloComputation* computation : module.computations()) {
+    for (const HloInstruction* instruction : computation->instructions()) {
+      if (IsMusaGemm(*instruction)) {
+        return {{
+            .name = stream_executor::musa::kMusaMuBlasLibraryAbiName,
+            .abi_version = stream_executor::musa::kMusaMuBlasLibraryAbiVersion,
+            .fingerprint = "",
+        }};
+      }
+    }
+  }
+  return {};
 }
 
 absl::StatusOr<musa::MusaCompilationOptions> GetMusaCompilationOptions(
@@ -139,12 +161,16 @@ void MusaGpuCompiler::AddGemmRewriterPasses(
     HloPassPipeline& pipeline, const DebugOptions& debug_options,
     const se::GpuComputeCapability& gpu_version,
     const se::SemanticVersion& toolkit_version) {
-  // C15 introduces the muBLAS custom-call ABI. Until then, leaving dots in HLO
-  // keeps elemental codegen usable and avoids emitting a CUDA/ROCm library ABI.
-  (void)pipeline;
+  // The initial muBLAS route is deliberately narrower than CUDA/ROCm: it does
+  // not expose FP8, bias fusion, a workspace output, or an autotuner contract.
+  // GemmRewriter enforces the homogeneous, non-batched f16/bf16/f32/f64 subset
+  // before emitting the MUSA-specific custom-call target.
   (void)debug_options;
-  (void)gpu_version;
-  (void)toolkit_version;
+  pipeline.AddPass<DotAlgorithmRewriter>();
+  pipeline.AddPass<GemmRewriter>(
+      gpu_version, toolkit_version,
+      GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only,
+                          GemmRewriterOptions::BiasMode::kNoBias});
 }
 
 absl::Status MusaGpuCompiler::OptimizeHloConvolutionCanonicalization(
@@ -152,8 +178,8 @@ absl::Status MusaGpuCompiler::OptimizeHloConvolutionCanonicalization(
     se::dnn::VersionInfo dnn_version,
     const se::SemanticVersion& toolkit_version,
     CompilationStats* compilation_stats) {
-  // C16 adds muDNN convolution canonicalization. Convolutions remain on the
-  // generic HLO path until that optional adapter is available.
+  // Convolutions remain on the generic HLO path until an optional muDNN
+  // adapter and its canonicalization contract are available.
   (void)hlo_module;
   (void)gpu_version;
   (void)dnn_version;
@@ -170,8 +196,9 @@ absl::Status MusaGpuCompiler::AddAutotunerPass(
     mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
     const MultiProcessKeyValueStore& key_value_store) {
-  // The shared autotuner currently exposes CUDA and ROCm backends. C16 adds
-  // MUSA algorithm selection; C10 deliberately preserves the generic emitter.
+  // The shared autotuner currently exposes CUDA and ROCm backends. The basic
+  // MUSA adapter supports only the explicit default algorithm, so preserve the
+  // generic emitter until MUSA algorithm discovery is available.
   (void)pipeline;
   (void)hlo_module;
   (void)gpu_version;
@@ -252,9 +279,12 @@ MusaGpuCompiler::CreateExecutableAbiVersion(
   }
   ASSIGN_OR_RETURN(musa::MusaCompilationOptions options,
                    GetMusaCompilationOptions(module.config()));
+  std::vector<musa::MusaOptionalLibraryAbi> required_optional_libraries =
+      RequiredMusaOptionalLibraries(module);
   return musa::BuildMusaExecutableEnvelope(
       device_description, compilation_provider_->identity(),
-      compilation_provider_->capabilities(), options, main_binary);
+      compilation_provider_->capabilities(), options, main_binary,
+      required_optional_libraries);
 }
 
 bool MusaGpuCompiler::UseAotCompiledThunks(const HloModule& module) const {

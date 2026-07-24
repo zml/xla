@@ -465,6 +465,19 @@ TEST(MusaLlvmBridgeCoreTest, RejectsUncontractedFloatingPointSemantics) {
   EXPECT_THAT(TranslateMusaBridgeRequestToVendorLlvm(request),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("capability=llvm-intrinsic")));
+
+  const std::string maximum_ir = absl::StrCat(
+      kPrefix,
+      "define void @kernel(ptr addrspace(1) %out) {\n"
+      "  %value = call float @llvm.maximum.f32(float 2.0, float 3.0)\n"
+      "  store float %value, ptr addrspace(1) %out, align 4\n"
+      "  ret void\n"
+      "}\n"
+      "declare float @llvm.maximum.f32(float, float)\n");
+  request = RequestForIr(maximum_ir);
+  EXPECT_THAT(TranslateMusaBridgeRequestToVendorLlvm(request),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=llvm-intrinsic")));
 }
 
 TEST(MusaLlvmBridgeCoreTest, ParserFailureDoesNotEchoUntrustedIr) {

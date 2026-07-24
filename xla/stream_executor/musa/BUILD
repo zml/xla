@@ -50,7 +50,113 @@ xla_cc_test(
     ],
     deps = [
         ":musa_dso_loader",
+        "//xla/tsl/platform:env",
         "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_optional_library_abi",
+    hdrs = ["musa_optional_library_abi.h"],
+)
+
+cc_library(
+    name = "musa_mublas_api",
+    srcs = ["musa_mublas_api.cc"],
+    hdrs = ["musa_mublas_api.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_optional_library_abi",
+        "//xla/stream_executor/musa/mublas_shim:mublas_shim_abi",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_mublas_api_test",
+    srcs = ["musa_mublas_api_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_mublas_api",
+        "//xla/stream_executor/musa/mublas_shim:mublas_shim_abi",
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_blas",
+    srcs = ["musa_blas.cc"],
+    hdrs = ["musa_blas.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mublas_api",
+        ":musa_platform_id",
+        "//xla/stream_executor/musa/mublas_shim:mublas_shim_abi",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:blas",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:engine_options",
+        "//xla/stream_executor:plugin_registry",
+        "//xla/stream_executor:scratch_allocator",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+    ],
+    alwayslink = True,
+)
+
+xla_cc_test(
+    name = "musa_blas_test",
+    srcs = ["musa_blas_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_blas",
+        ":musa_dso_loader",
+        ":musa_mublas_api",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:blas",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:engine_options",
+        "//xla/stream_executor:mock_stream",
+        "//xla/stream_executor:mock_stream_executor",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor/musa/mublas_shim:mublas_shim_abi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -567,6 +673,7 @@ cc_library(
     ],
     deps = [
         ":musa_mubin",
+        ":musa_optional_library_abi",
         ":musa_platform_id",
         ":musa_runtime_abi_version_proto_cc",
         ":musa_target_contract",
@@ -641,6 +748,7 @@ cc_library(
         "musa-only",
     ],
     deps = [
+        ":musa_blas",
         ":musa_compute_capability",
         ":musa_context",
         ":musa_device_description",
@@ -673,6 +781,7 @@ cc_library(
         "//xla/stream_executor:memory_space",
         "//xla/stream_executor:module_spec",
         "//xla/stream_executor:platform",
+        "//xla/stream_executor:plugin_registry",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_h",
@@ -804,6 +913,7 @@ cc_library(
     deps = [
         ":musa_driver",
         ":musa_executor",
+        ":musa_mublas_api",
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_runtime_abi_version",

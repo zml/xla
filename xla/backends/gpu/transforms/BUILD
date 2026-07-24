@@ -1936,6 +1936,24 @@ xla_test(
     ],
 )
 
+xla_cc_test(
+    name = "musa_gemm_rewriter_test",
+    srcs = ["musa_gemm_rewriter_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":gemm_rewriter",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 xla_test(
     name = "gemm_rewriter_allocation_test",
     srcs = ["gemm_rewriter_allocation_test.cc"],

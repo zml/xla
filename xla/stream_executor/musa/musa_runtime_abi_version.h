@@ -27,22 +27,12 @@ limitations under the License.
 #include "xla/stream_executor/abi/executable_abi_version.h"
 #include "xla/stream_executor/abi/runtime_abi_version.h"
 #include "xla/stream_executor/abi/runtime_abi_version.pb.h"
+#include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_runtime_abi_version.pb.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/semantic_version.h"
 
 namespace stream_executor::musa {
-
-struct MusaOptionalLibraryAbi {
-  std::string name;
-  std::string abi_version;
-  std::string fingerprint;
-
-  bool operator==(const MusaOptionalLibraryAbi& other) const {
-    return name == other.name && abi_version == other.abi_version &&
-           fingerprint == other.fingerprint;
-  }
-};
 
 class MusaRuntimeAbiVersion : public RuntimeAbiVersion {
  public:
@@ -51,7 +41,8 @@ class MusaRuntimeAbiVersion : public RuntimeAbiVersion {
   // is needed to construct this snapshot.
   static absl::StatusOr<MusaRuntimeAbiVersion> CreateFromApiVersions(
       int runtime_version, int driver_version,
-      SemanticVersion kernel_driver_version, int toolkit_version);
+      SemanticVersion kernel_driver_version, int toolkit_version,
+      std::vector<MusaOptionalLibraryAbi> available_optional_library_abis = {});
 
   static absl::StatusOr<MusaRuntimeAbiVersion> Create(
       SemanticVersion runtime_version, SemanticVersion driver_version,

@@ -169,6 +169,7 @@ cc_library(
         "//xla/stream_executor/abi:executable_abi_version_proto_cc",
         "//xla/stream_executor/musa:musa_executable_abi",
         "//xla/stream_executor/musa:musa_mubin",
+        "//xla/stream_executor/musa:musa_optional_library_abi",
         "//xla/stream_executor/musa:musa_platform_id",
         "//xla/stream_executor/musa:musa_target_contract",
         "@com_google_absl//absl/status",

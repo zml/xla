@@ -589,6 +589,13 @@ TEST(MusaBridgeIrValidatorTest, RejectsUncontractedFloatingPointSemantics) {
           "declare float @llvm.fmuladd.f32(float, float, float)")),
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("capability=llvm-intrinsic")));
+  EXPECT_THAT(
+      Validate(Module(
+          "  %value = call float @llvm.maximum.f32(float 2.0, float 3.0)\n"
+          "  store float %value, ptr addrspace(1) %out, align 4",
+          "declare float @llvm.maximum.f32(float, float)")),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("capability=llvm-intrinsic")));
 }
 
 TEST(MusaBridgeIrValidatorTest, AcceptsExactMappingV3AtomicCmpXchg) {

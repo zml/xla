@@ -770,6 +770,40 @@ TEST_F(GpuExecutableTest, FromProtoRequiresExplicitMubinForMusa) {
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
+TEST_F(GpuExecutableTest,
+       FromProtoRejectsMusaCapabilityMismatchBeforeAbiValidation) {
+  GpuExecutableProto proto = ParseTextProtoOrDie<GpuExecutableProto>(R"pb(
+    binary: "not a valid MUBIN"
+    binary_kind: BINARY_KIND_MUBIN
+    buffer_assignment {}
+    gpu_compute_capability {
+      musa_compute_capability {
+        architecture: "mp_21"
+        major: 2
+        minor: 1
+        hardware_warp_size: 128
+        logical_subgroup_size: 32
+      }
+    }
+  )pb");
+
+  se::DeviceDescription device_description;
+  device_description.set_gpu_compute_capability(se::GpuComputeCapability{
+      se::MusaComputeCapability("mp_22", 2, 2,
+                                /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)});
+
+  // Deliberately omit the executable ABI and use malformed binary bytes. A
+  // target mismatch must be rejected before MUSA executable validation or live
+  // runtime/optional-DSO discovery is attempted.
+  EXPECT_THAT(
+      GpuExecutable::FromProto(proto, device_description, "MUSA",
+                               GetDebugOptionsFromFlags()),
+      absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          testing::HasSubstr("doesn't match target device capability")));
+}
+
 TEST_F(GpuExecutableTest, ProtoConversionWithBackendConfigInterning) {
   se::DeviceDescription device_description;
   device_description.set_gpu_compute_capability(

@@ -38,6 +38,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
@@ -48,6 +49,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
+#include "xla/stream_executor/musa/musa_optional_library_abi.h"
 
 namespace xla::gpu {
 namespace {
@@ -154,7 +156,37 @@ ENTRY main {
   ASSERT_TRUE(version.proto().has_musa_platform_version());
   EXPECT_EQ(version.proto().musa_platform_version().architecture(), "mp_21");
   EXPECT_EQ(version.proto().musa_platform_version().binary_kind(), "mubin");
+  EXPECT_EQ(version.proto()
+                .musa_platform_version()
+                .required_optional_library_abis_size(),
+            0);
   EXPECT_TRUE(compiler.UseAotCompiledThunks(*module));
+}
+
+TEST(MusaGpuCompilerTest, RequiresMublasOnlyForDedicatedMusaGemmTarget) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mublas_envelope
+
+ENTRY main {
+  lhs = f32[8,16]{1,0} parameter(0)
+  rhs = f32[16,4]{1,0} parameter(1)
+  ROOT result = f32[8,4]{1,0} custom-call(lhs, rhs),
+    custom_call_target="__mublas$gemm"
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& musa = version.proto().musa_platform_version();
+  ASSERT_EQ(musa.required_optional_library_abis_size(), 1);
+  EXPECT_EQ(musa.required_optional_library_abis(0).name(),
+            stream_executor::musa::kMusaMuBlasLibraryAbiName);
+  EXPECT_EQ(musa.required_optional_library_abis(0).abi_version(),
+            stream_executor::musa::kMusaMuBlasLibraryAbiVersion);
+  EXPECT_TRUE(musa.required_optional_library_abis(0).fingerprint().empty());
 }
 
 TEST(MusaGpuCompilerTest, PersistentKernelCacheFailsClosed) {
@@ -225,6 +257,33 @@ TEST(MusaGpuCompilerTest, SkipsEmptySharedGpuConstantsModule) {
   ASSERT_THAT(result, IsOk());
   EXPECT_TRUE(result->binary.empty());
   EXPECT_EQ(recording->compile_count, 0);
+}
+
+TEST(MusaGpuCompilerTest, WiresDedicatedMublasGemmRewrite) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule musa_gemm_rewrite
+
+ENTRY main {
+  lhs = f32[8,16]{1,0} parameter(0)
+  rhs = f32[16,4]{1,0} parameter(1)
+  ROOT result = f32[8,4]{1,0} dot(lhs, rhs),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+)"));
+
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  HloPassPipeline pipeline("musa-gemm-rewriter");
+  compiler.AddGemmRewriterPasses(pipeline, module->config().debug_options(),
+                                 MusaDevice().gpu_compute_capability(),
+                                 se::SemanticVersion{4, 0, 1});
+  ASSERT_OK_AND_ASSIGN(bool changed, pipeline.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kCustomCall);
+  EXPECT_EQ(root->custom_call_target(), "__mublas$gemm");
+  EXPECT_TRUE(root->shape().IsArray());
 }
 
 TEST(MusaGpuCompilerTest, LeavesStandardScanAndSortOnSharedHloFallbacks) {

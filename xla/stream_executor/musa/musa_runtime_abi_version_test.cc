@@ -97,6 +97,17 @@ TEST(MusaRuntimeAbiVersionTest, CreatesSnapshotWithoutDeviceDiscovery) {
   EXPECT_EQ(runtime.toolkit_version(), SemanticVersion(4, 0, 1));
 }
 
+TEST(MusaRuntimeAbiVersionTest, ApiSnapshotPreservesOptionalLibraries) {
+  const std::vector<MusaOptionalLibraryAbi> libraries = {
+      {kMusaMuBlasLibraryAbiName, kMusaMuBlasLibraryAbiVersion, ""}};
+  ASSERT_OK_AND_ASSIGN(
+      MusaRuntimeAbiVersion runtime,
+      MusaRuntimeAbiVersion::CreateFromApiVersions(
+          /*runtime_version=*/10504, /*driver_version=*/10504,
+          SemanticVersion(3, 0, 0), /*toolkit_version=*/40001, libraries));
+  EXPECT_EQ(runtime.available_optional_library_abis(), libraries);
+}
+
 TEST(MusaRuntimeAbiVersionTest, ProtoRoundTripPreservesRuntimeFacts) {
   const std::vector<MusaOptionalLibraryAbi> libraries = {
       {"mublas", "4.0", "mublas-fingerprint"},

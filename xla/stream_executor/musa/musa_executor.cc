@@ -35,6 +35,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/activate_context.h"
+#include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
@@ -57,10 +58,12 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_kernel.h"
 #include "xla/stream_executor/musa/musa_module.h"
 #include "xla/stream_executor/musa/musa_module_reaper.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_stream.h"
 #include "xla/stream_executor/musa/musa_version_parser.h"
 #include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream.h"
 
@@ -173,6 +176,24 @@ absl::Status MusaExecutor::Init() {
   module_cache_ = std::make_unique<MusaModuleCache>(driver_, context_,
                                                     capability->architecture());
   return absl::OkStatus();
+}
+
+blas::BlasSupport* MusaExecutor::AsBlas() {
+  absl::MutexLock lock(&support_mu_);
+  if (blas_ != nullptr) return blas_.get();
+
+  PluginRegistry* registry = PluginRegistry::Instance();
+  absl::StatusOr<PluginRegistry::BlasFactory> factory =
+      registry->GetFactory<PluginRegistry::BlasFactory>(kMusaPlatformId);
+  if (!factory.ok()) {
+    LOG(ERROR) << "Unable to retrieve MUSA BLAS factory: " << factory.status();
+    return nullptr;
+  }
+  blas_.reset((*factory)(this));
+  if (blas_ == nullptr) {
+    LOG(ERROR) << "Unable to initialize optional muBLAS support";
+  }
+  return blas_.get();
 }
 
 absl::StatusOr<std::unique_ptr<Stream>> MusaExecutor::CreateStream(

@@ -90,6 +90,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/dynamic_slice_fusion_v2_thunk.h"
 #include "xla/backends/gpu/runtime/execution_stream_id.h"
 #include "xla/backends/gpu/runtime/fft_thunk.h"
+#include "xla/backends/gpu/runtime/gemm_thunk.h"
 #include "xla/backends/gpu/runtime/gpublas_lt_matmul_thunk.h"
 #include "xla/backends/gpu/runtime/host_execute_thunk.h"
 #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
@@ -247,6 +248,86 @@ ShapeIndex GetDstShapeIndex(const HloInstruction* async_start,
 }
 
 }  // namespace
+
+namespace thunk_emitter_internal {
+
+absl::Status ValidateMusaGemmBackendConfig(const GemmBackendConfig& config) {
+  if (config.beta() != 0.0) {
+    return absl::UnimplementedError(absl::StrCat(
+        "basic MUSA GEMM requires beta=0; got beta=", config.beta()));
+  }
+  if (config.epilogue() != GemmBackendConfig::DEFAULT) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM requires the default epilogue");
+  }
+  if (config.algorithm_case() != GemmBackendConfig::ALGORITHM_NOT_SET) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM does not support a selected algorithm");
+  }
+  if (config.precision_config().algorithm() != PrecisionConfig::ALG_UNSET) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM requires precision algorithm ALG_UNSET");
+  }
+  if (config.alpha_imag() != 0.0) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM requires a real alpha scalar");
+  }
+  if (config.scale_mode() != 0 || config.damax_output()) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM does not support scaling or amax output");
+  }
+  if (config.autotune_workspace_size() != 0) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM does not support an autotune workspace");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateMusaGemmCustomCall(
+    const HloCustomCallInstruction& instr,
+    const stream_executor::GpuComputeCapability& gpu_compute_capability,
+    const GemmBackendConfig& config) {
+  if (!gpu_compute_capability.IsMusa()) {
+    return absl::InvalidArgumentError(
+        "__mublas$gemm custom call requires a MUSA compute capability");
+  }
+  if (instr.operand_count() != 2 || !instr.shape().IsArray() ||
+      !instr.operand(0)->shape().IsArray() ||
+      !instr.operand(1)->shape().IsArray()) {
+    return absl::InvalidArgumentError(
+        "basic MUSA GEMM requires two array operands and one array result");
+  }
+  if (!instr.output_to_operand_aliasing().empty()) {
+    return absl::InvalidArgumentError(
+        "basic MUSA GEMM does not support output-to-operand aliasing");
+  }
+
+  RETURN_IF_ERROR(ValidateMusaGemmBackendConfig(config));
+
+  const DotDimensionNumbers& dot_dims = config.dot_dimension_numbers();
+  if (!dot_dims.lhs_batch_dimensions().empty() ||
+      !dot_dims.rhs_batch_dimensions().empty()) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM does not support batched matrix multiplication");
+  }
+  if (dot_dims.lhs_contracting_dimensions_size() != 1 ||
+      dot_dims.rhs_contracting_dimensions_size() != 1) {
+    return absl::InvalidArgumentError(
+        "basic MUSA GEMM requires one contracting dimension per operand");
+  }
+
+  const PrimitiveType lhs_type = instr.operand(0)->shape().element_type();
+  const PrimitiveType rhs_type = instr.operand(1)->shape().element_type();
+  const PrimitiveType output_type = instr.shape().element_type();
+  if ((lhs_type != F32 && lhs_type != F64) || rhs_type != lhs_type ||
+      output_type != lhs_type) {
+    return absl::UnimplementedError(
+        "basic MUSA GEMM requires homogeneous F32 or F64 operands and result");
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace thunk_emitter_internal
 
 AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
     Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
@@ -541,6 +622,34 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConvolutionThunk(
                            instr, ir_emitter_context_->GetNextThunkId()),
                        std::move(descriptor), std::move(operand_slices),
                        std::move(result_slices), scratch_slice));
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMusaGemmThunk(
+    const HloCustomCallInstruction* instr) {
+  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   instr->backend_config<GpuBackendConfig>());
+  RETURN_IF_ERROR(thunk_emitter_internal::ValidateMusaGemmCustomCall(
+      *instr, ir_emitter_context_->gpu_compute_capability(),
+      gpu_config.gemm_backend_config()));
+
+  ASSIGN_OR_RETURN(BufferAllocation::Slice lhs,
+                   GetAllocationSliceForHlo(instr->operand(0), {}));
+  ASSIGN_OR_RETURN(BufferAllocation::Slice rhs,
+                   GetAllocationSliceForHlo(instr->operand(1), {}));
+  ASSIGN_OR_RETURN(BufferAllocation::Slice output,
+                   GetAllocationSliceForHlo(instr, {}));
+  ASSIGN_OR_RETURN(
+      GemmConfig config,
+      GemmConfig::For(instr, gpu_config.gemm_backend_config(),
+                      ir_emitter_context_->gpu_compute_capability()));
+
+  auto thunk = std::make_unique<GemmThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      std::move(config), lhs, rhs, output,
+      /*workspace=*/std::nullopt,
+      RequireDeterminism(ir_emitter_context_->hlo_module().config()));
   return GetThunkSequence(std::move(thunk));
 }
 
@@ -2833,6 +2942,9 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
     const HloInstruction* hlo) {
   auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
 
+  if (IsMusaGemm(*hlo)) {
+    return EmitMusaGemmThunk(custom_call);
+  }
   if (IsCublasLtMatmul(*hlo)) {
     return EmitCublasLtMatmulThunk(custom_call);
   }
