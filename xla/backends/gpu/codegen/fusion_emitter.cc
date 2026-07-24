@@ -19,6 +19,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -59,6 +60,9 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
+
+constexpr char kXlaVulkanBufferElementTypesMetadata[] =
+    "xla.vulkan.buffer_element_types";
 
 void CopySelectAttrs(const llvm::Function& src, llvm::Function& dst) {
   for (uint32_t arg_idx = 0; arg_idx < src.arg_size(); arg_idx++) {
@@ -212,6 +216,30 @@ absl::StatusOr<llvm::Function*> BuildKernelPrototypeFromUniqueName(
     CopySelectAttrs(*impl_func, *kernel);
   }
   AnnotateAttrsIfUnset(arguments, *kernel);
+  if (target_triple.getOS() == llvm::Triple::Vulkan) {
+    llvm::SmallVector<llvm::Metadata*> element_types;
+    element_types.reserve(arguments.args().size());
+    absl::flat_hash_map<int64_t, unsigned> first_argument_for_slice;
+    for (auto [arg_index, argument] :
+         llvm::enumerate(arguments.args())) {
+      element_types.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(
+              llvm::Type::getInt32Ty(context),
+              static_cast<int64_t>(argument.shape().element_type()))));
+      if (argument.kind() != emitters::KernelArgument::Kind::kManaged) {
+        continue;
+      }
+      auto [it, inserted] = first_argument_for_slice.try_emplace(
+          argument.slice_index(), static_cast<unsigned>(arg_index));
+      if (!inserted) {
+        kernel->removeParamAttr(static_cast<unsigned>(arg_index),
+                                llvm::Attribute::NoAlias);
+        kernel->removeParamAttr(it->second, llvm::Attribute::NoAlias);
+      }
+    }
+    kernel->setMetadata(kXlaVulkanBufferElementTypesMetadata,
+                        llvm::MDNode::get(context, element_types));
+  }
   return kernel;
 }
 

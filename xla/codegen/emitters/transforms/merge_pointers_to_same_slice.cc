@@ -28,6 +28,7 @@ limitations under the License.
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "xla/codegen/emitters/kernel_api_builder.h"
+#include "xla/codegen/emitters/transforms/passes.h"
 
 namespace xla {
 namespace emitters {
@@ -43,18 +44,24 @@ class MergePointersToSameSlicePass
     : public impl::MergePointersToSameSlicePassBase<
           MergePointersToSameSlicePass> {
  public:
+  using MergePointersToSameSlicePassBase::MergePointersToSameSlicePassBase;
+
   void runOnOperation() override;
 };
 
 struct PackedArgs {
   llvm::BitVector args_to_erase;
+  llvm::BitVector args_sharing_slice;
+  bool preserve_entry_aliases = false;
   // replacement_args[i] == i iff !args_to_erase[i].
   llvm::SmallVector<int> replacement_args;
 
   PackedArgs() = default;
-  explicit PackedArgs(mlir::func::FuncOp func) {
+  explicit PackedArgs(mlir::func::FuncOp func, bool vulkan)
+      : preserve_entry_aliases(vulkan && func->hasAttr(kXlaEntryAttr)) {
     absl::flat_hash_map<int, std::optional<int>> slice_to_operand;
     args_to_erase.resize(func.getNumArguments());
+    args_sharing_slice.resize(func.getNumArguments());
     replacement_args.reserve(func.getNumArguments());
     for (int i = 0; i < func.getNumArguments(); ++i) {
       replacement_args.push_back(i);
@@ -73,7 +80,11 @@ struct PackedArgs {
       auto& target_index = slice_to_operand[static_cast<int>(
           mlir::cast<mlir::IntegerAttr>(slice_index).getInt())];
       if (target_index) {
-        replacement_args[idx] = *target_index;
+        args_sharing_slice[idx] = true;
+        args_sharing_slice[*target_index] = true;
+        if (!is_entry_func || !vulkan) {
+          replacement_args[idx] = *target_index;
+        }
         args_to_erase[idx] = !is_entry_func;
       } else {
         target_index = idx;
@@ -94,7 +105,8 @@ struct PackedArgs {
     for (int i = 0; i < op.getNumArguments(); ++i) {
       if (op.getArgAttr(i, "xla.slice_index")) {
         op.removeArgAttr(i, "xla.slice_index");
-        if (!op.getArgAttr(i, kXlaNotInvariantAttr)) {
+        if (!op.getArgAttr(i, kXlaNotInvariantAttr) &&
+            !(preserve_entry_aliases && args_sharing_slice[i])) {
           op.setArgAttr(i, mlir::LLVM::LLVMDialect::getNoAliasAttrName(),
                         mlir::UnitAttr::get(op->getContext()));
         } else {
@@ -110,7 +122,7 @@ struct PackedArgs {
 void MergePointersToSameSlicePass::runOnOperation() {
   absl::flat_hash_map<std::string, PackedArgs> args_to_pack;
   getOperation()->walk([&](mlir::func::FuncOp func) {
-    args_to_pack[func.getName()] = PackedArgs(func);
+    args_to_pack[func.getName()] = PackedArgs(func, vulkan_);
   });
   getOperation()->walk([&](mlir::func::CallOp call) {
     args_to_pack[call.getCallee()].Pack(call);

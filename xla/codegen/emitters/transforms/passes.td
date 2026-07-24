@@ -166,6 +166,11 @@ def MergePointersToSameSlicePass :
   let dependentDialects = [
     "mlir::func::FuncDialect"
   ];
+
+  let options = [
+    Option<"vulkan_", "vulkan", "bool", /*default=*/"false",
+           "Preserve distinct Vulkan entry arguments that alias a slice.">,
+  ];
 }
 
 def PropagateSliceIndicesPass :
