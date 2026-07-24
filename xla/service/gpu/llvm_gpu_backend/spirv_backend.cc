@@ -139,19 +139,28 @@ bool UsesBFloat16(const llvm::Module& module) {
 
 // LLVM represents unordered floating-point predicates directly, but the
 // corresponding SPIR-V comparison instructions are not available in the
-// Vulkan Shader environment. Express their NaN component with OpIsNan-capable
-// intrinsics after optimization, so later LLVM passes cannot recreate the
-// Kernel-only form.
+// Vulkan Shader environment. General bfloat16 relational instructions also
+// require SPV_INTEL_bfloat16_arithmetic, which is separate from Vulkan's
+// SPV_KHR_bfloat16 type support. Widen bfloat16 operands to float and express
+// unordered predicates with OpIsNan-capable intrinsics after optimization, so
+// later LLVM passes cannot recreate the unsupported forms.
 void LegalizeVulkanShaderComparisons(llvm::Module* module) {
   llvm::SmallVector<llvm::FCmpInst*> comparisons;
   for (llvm::Function& function : *module) {
     for (llvm::BasicBlock& block : function) {
       for (llvm::Instruction& instruction : block) {
         auto* comparison = llvm::dyn_cast<llvm::FCmpInst>(&instruction);
-        if (comparison != nullptr &&
-            (comparison->getPredicate() == llvm::CmpInst::FCMP_ORD ||
-             (comparison->getPredicate() >= llvm::CmpInst::FCMP_UNO &&
-              comparison->getPredicate() <= llvm::CmpInst::FCMP_UNE))) {
+        if (comparison == nullptr) {
+          continue;
+        }
+        const llvm::CmpInst::Predicate predicate =
+            comparison->getPredicate();
+        const bool is_bfloat_comparison =
+            comparison->getOperand(0)->getType()->getScalarType()->isBFloatTy();
+        if (is_bfloat_comparison ||
+            predicate == llvm::CmpInst::FCMP_ORD ||
+            (predicate >= llvm::CmpInst::FCMP_UNO &&
+             predicate <= llvm::CmpInst::FCMP_UNE)) {
           comparisons.push_back(comparison);
         }
       }
@@ -162,21 +171,39 @@ void LegalizeVulkanShaderComparisons(llvm::Module* module) {
     llvm::IRBuilder<> builder(comparison);
     llvm::Value* lhs = comparison->getOperand(0);
     llvm::Value* rhs = comparison->getOperand(1);
-    llvm::Function* isnan = llvm::Intrinsic::getOrInsertDeclaration(
-        module, llvm::Intrinsic::spv_isnan, {lhs->getType()});
-    llvm::Value* either_is_nan = builder.CreateOr(
-        builder.CreateCall(isnan, {lhs}), builder.CreateCall(isnan, {rhs}));
+    if (lhs->getType()->getScalarType()->isBFloatTy()) {
+      llvm::Type* widened_type = builder.getFloatTy();
+      if (auto* vector_type =
+              llvm::dyn_cast<llvm::VectorType>(lhs->getType())) {
+        widened_type = llvm::VectorType::get(
+            builder.getFloatTy(), vector_type->getElementCount());
+      }
+      lhs = builder.CreateFPExt(lhs, widened_type);
+      rhs = builder.CreateFPExt(rhs, widened_type);
+    }
 
     llvm::Value* replacement;
     llvm::CmpInst::Predicate predicate = comparison->getPredicate();
-    if (predicate == llvm::CmpInst::FCMP_UNO) {
-      replacement = either_is_nan;
-    } else if (predicate == llvm::CmpInst::FCMP_ORD) {
-      replacement = builder.CreateNot(either_is_nan);
+    const bool is_unordered_predicate =
+        predicate >= llvm::CmpInst::FCMP_UNO &&
+        predicate <= llvm::CmpInst::FCMP_UNE;
+    if (predicate == llvm::CmpInst::FCMP_ORD ||
+        is_unordered_predicate) {
+      llvm::Function* isnan = llvm::Intrinsic::getOrInsertDeclaration(
+          module, llvm::Intrinsic::spv_isnan, {lhs->getType()});
+      llvm::Value* either_is_nan = builder.CreateOr(
+          builder.CreateCall(isnan, {lhs}), builder.CreateCall(isnan, {rhs}));
+      if (predicate == llvm::CmpInst::FCMP_UNO) {
+        replacement = either_is_nan;
+      } else if (predicate == llvm::CmpInst::FCMP_ORD) {
+        replacement = builder.CreateNot(either_is_nan);
+      } else {
+        llvm::Value* ordered = builder.CreateFCmp(
+            llvm::FCmpInst::getOrderedPredicate(predicate), lhs, rhs);
+        replacement = builder.CreateOr(either_is_nan, ordered);
+      }
     } else {
-      llvm::Value* ordered = builder.CreateFCmp(
-          llvm::FCmpInst::getOrderedPredicate(predicate), lhs, rhs);
-      replacement = builder.CreateOr(either_is_nan, ordered);
+      replacement = builder.CreateFCmp(predicate, lhs, rhs);
     }
     comparison->replaceAllUsesWith(replacement);
     comparison->eraseFromParent();
