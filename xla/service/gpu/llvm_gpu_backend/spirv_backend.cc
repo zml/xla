@@ -855,6 +855,8 @@ std::vector<std::string> GetSPIRVBackendOptions(
                            backend_extra_llvm_opts.cbegin(),
                            backend_extra_llvm_opts.cend());
 
+  backend_llvm_opts.push_back("-disable-lsr");
+
   return backend_llvm_opts;
 }
 
