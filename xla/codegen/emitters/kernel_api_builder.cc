@@ -71,6 +71,8 @@ namespace xla::emitters {
 
 static constexpr absl::string_view kXlaEntryAttr = "xla.entry";
 static constexpr absl::string_view kXlaSliceIndexAttr = "xla.slice_index";
+static constexpr absl::string_view kXlaBufferElementTypeAttr =
+    "xla.buffer_element_type";
 static constexpr absl::string_view kXlaInvariantAttr = "xla.invariant";
 static constexpr std::array<int, 3> kIndexingMapWorkItemDims = {0, 1, 2};
 static constexpr std::array<int, 3> kIndexingMapWorkGroupDims = {3, 4, 5};
@@ -166,6 +168,11 @@ absl::StatusOr<mlir::func::FuncOp> EmitKernelApi(
     llvm::SmallVector<mlir::NamedAttribute> attrs;
     attrs.push_back(builder.getNamedAttr(
         kXlaSliceIndexAttr, builder.getIndexAttr(arg.slice_index())));
+    if (arg.kind() == KernelArgument::Kind::kManaged) {
+      attrs.push_back(builder.getNamedAttr(
+          kXlaBufferElementTypeAttr,
+          builder.getI32IntegerAttr(arg.shape().element_type())));
+    }
     attrs.push_back(
         builder.getNamedAttr(mlir::LLVM::LLVMDialect::getAlignAttrName(),
                              builder.getIndexAttr(arg.alignment())));

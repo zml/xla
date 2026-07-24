@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -35,6 +36,8 @@ limitations under the License.
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
@@ -45,9 +48,12 @@ limitations under the License.
 #include "llvm/lib/Target/SPIRV/SPIRVAPI.h"
 #include "llvm/lib/Target/SPIRV/SPIRVSubtarget.h"
 #include "llvm/lib/Target/SPIRV/SPIRVTargetMachine.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/llvm_gpu_backend/gpu_backend_lib.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
+#include "xla/service/llvm_ir/llvm_util.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 
 namespace xla::gpu::spirv {
@@ -56,6 +62,34 @@ namespace {
 
 // Default inline threshold value to use in llvm.
 const int kDefaultInlineThreshold = 1100;
+constexpr char kXlaVulkanBufferElementTypesMetadata[] =
+    "xla.vulkan.buffer_element_types";
+
+std::string PrintLlvmValue(const llvm::Value& value) {
+  std::string result;
+  llvm::raw_string_ostream stream(result);
+  value.print(stream);
+  return result;
+}
+
+std::string PrintLlvmType(const llvm::Type& type) {
+  std::string result;
+  llvm::raw_string_ostream stream(result);
+  type.print(stream);
+  return result;
+}
+
+std::string VulkanBindingForAccess(llvm::IntrinsicInst& get_base_pointer) {
+  auto* get_handle =
+      llvm::dyn_cast<llvm::CallBase>(get_base_pointer.getArgOperand(0));
+  if (get_handle == nullptr || get_handle->arg_size() < 2) {
+    return "<unknown>";
+  }
+  auto* binding = llvm::dyn_cast<llvm::ConstantInt>(
+      get_handle->getArgOperand(1));
+  return binding == nullptr ? "<unknown>"
+                            : std::to_string(binding->getZExtValue());
+}
 
 void SPIRVBackendInit() {
   LLVMInitializeSPIRVTargetInfo();
@@ -222,18 +256,87 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
           "Vulkan storage buffer has an unsupported scalable or zero-sized "
           "element type");
     }
+    const std::string binding = VulkanBindingForAccess(*get_base_pointer);
+    auto incompatible_access = [&](llvm::Type* access_type) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Vulkan storage-buffer binding ", binding, " declared element type ",
+          PrintLlvmType(*element_type), " is incompatible with access type ",
+          PrintLlvmType(*access_type), " at byte offset ",
+          PrintLlvmValue(*byte_offset)));
+    };
+    if (auto* constant_offset =
+            llvm::dyn_cast<llvm::ConstantInt>(byte_offset);
+        constant_offset != nullptr &&
+        constant_offset->getValue().urem(type_size.getFixedValue()) != 0) {
+      llvm::Type* access_type =
+          llvm::isa<llvm::LoadInst>(operation)
+              ? operation->getType()
+              : llvm::cast<llvm::StoreInst>(operation)
+                    ->getValueOperand()
+                    ->getType();
+      return incompatible_access(access_type);
+    }
     llvm::Value* element_index = byte_offset;
     if (type_size.getFixedValue() != 1) {
       element_index = builder.CreateSDiv(
           byte_offset,
           llvm::ConstantInt::get(index_type, type_size.getFixedValue()));
     }
-    llvm::Value* normalized_pointer = builder.CreateGEP(
-        runtime_array, root,
-        {llvm::ConstantInt::get(index_type, 0), element_index});
+    auto element_pointer = [&](uint64_t lane) {
+      llvm::Value* lane_index = element_index;
+      if (lane != 0) {
+        lane_index = builder.CreateAdd(
+            element_index, llvm::ConstantInt::get(index_type, lane));
+      }
+      return builder.CreateGEP(
+          runtime_array, root,
+          {llvm::ConstantInt::get(index_type, 0), lane_index});
+    };
+    llvm::Value* normalized_pointer = element_pointer(0);
 
     if (auto* load = llvm::dyn_cast<llvm::LoadInst>(operation)) {
       if (load->getType() != element_type) {
+        auto* vector_type =
+            llvm::dyn_cast<llvm::FixedVectorType>(load->getType());
+        if (load->isSimple() && vector_type != nullptr &&
+            vector_type->getElementType()->isIntegerTy(1) &&
+            element_type->isIntegerTy(8)) {
+          llvm::Value* predicate_vector =
+              llvm::PoisonValue::get(vector_type);
+          for (unsigned lane = 0; lane < vector_type->getNumElements();
+               ++lane) {
+            llvm::LoadInst* lane_load = builder.CreateAlignedLoad(
+                element_type, element_pointer(lane),
+                llvm::commonAlignment(load->getAlign(), lane),
+                load->getName() + ".resource");
+            lane_load->copyMetadata(*load);
+            llvm::Value* predicate = builder.CreateTrunc(
+                lane_load, builder.getInt1Ty(), load->getName() + ".lane");
+            predicate_vector = builder.CreateInsertElement(
+                predicate_vector, predicate, builder.getInt32(lane),
+                load->getName());
+          }
+          load->replaceAllUsesWith(predicate_vector);
+          load->eraseFromParent();
+          continue;
+        }
+        llvm::TypeSize load_size =
+            data_layout.getTypeStoreSizeInBits(load->getType());
+        llvm::TypeSize element_size =
+            data_layout.getTypeStoreSizeInBits(element_type);
+        if (load->isSimple() && !load_size.isScalable() &&
+            !element_size.isScalable() &&
+            load_size.getFixedValue() == element_size.getFixedValue()) {
+          llvm::LoadInst* resource_load = builder.CreateAlignedLoad(
+              element_type, normalized_pointer, load->getAlign(),
+              load->getName() + ".resource");
+          resource_load->copyMetadata(*load);
+          llvm::Value* converted = builder.CreateBitCast(
+              resource_load, load->getType(), load->getName());
+          load->replaceAllUsesWith(converted);
+          load->eraseFromParent();
+          continue;
+        }
         auto* load_integer_type =
             llvm::dyn_cast<llvm::IntegerType>(load->getType());
         auto* element_integer_type =
@@ -255,18 +358,59 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
           load->eraseFromParent();
           continue;
         }
-        return absl::UnimplementedError(
-            "Vulkan storage-buffer load type does not match its scalar "
-            "resource layout");
+        return incompatible_access(load->getType());
       }
       load->setOperand(llvm::LoadInst::getPointerOperandIndex(),
                        normalized_pointer);
     } else {
       auto* store = llvm::cast<llvm::StoreInst>(operation);
       if (store->getValueOperand()->getType() != element_type) {
-        return absl::UnimplementedError(
-            "Vulkan storage-buffer store type does not match its scalar "
-            "resource layout");
+        llvm::Type* store_type = store->getValueOperand()->getType();
+        auto* vector_type =
+            llvm::dyn_cast<llvm::FixedVectorType>(store_type);
+        if (store->isSimple() && vector_type != nullptr &&
+            vector_type->getElementType()->isIntegerTy(1) &&
+            element_type->isIntegerTy(8)) {
+          for (unsigned lane = 0; lane < vector_type->getNumElements();
+               ++lane) {
+            llvm::Value* predicate = builder.CreateExtractElement(
+                store->getValueOperand(), builder.getInt32(lane));
+            llvm::Value* byte =
+                builder.CreateZExt(predicate, element_type);
+            llvm::StoreInst* lane_store = builder.CreateAlignedStore(
+                byte, element_pointer(lane),
+                llvm::commonAlignment(store->getAlign(), lane));
+            lane_store->copyMetadata(*store);
+          }
+          store->eraseFromParent();
+          continue;
+        }
+        if (store->isSimple() && store_type->isIntegerTy(1) &&
+            element_type->isIntegerTy(8)) {
+          llvm::Value* byte =
+              builder.CreateZExt(store->getValueOperand(), element_type);
+          llvm::StoreInst* resource_store = builder.CreateAlignedStore(
+              byte, normalized_pointer, store->getAlign());
+          resource_store->copyMetadata(*store);
+          store->eraseFromParent();
+          continue;
+        }
+        llvm::TypeSize store_size =
+            data_layout.getTypeStoreSizeInBits(store_type);
+        llvm::TypeSize element_size =
+            data_layout.getTypeStoreSizeInBits(element_type);
+        if (store->isSimple() && !store_size.isScalable() &&
+            !element_size.isScalable() &&
+            store_size.getFixedValue() == element_size.getFixedValue()) {
+          llvm::Value* converted =
+              builder.CreateBitCast(store->getValueOperand(), element_type);
+          llvm::StoreInst* resource_store = builder.CreateAlignedStore(
+              converted, normalized_pointer, store->getAlign());
+          resource_store->copyMetadata(*store);
+          store->eraseFromParent();
+          continue;
+        }
+        return incompatible_access(store_type);
       }
       store->setOperand(llvm::StoreInst::getPointerOperandIndex(),
                         normalized_pointer);
@@ -452,7 +596,9 @@ absl::StatusOr<llvm::Type*> InferVulkanBufferElementType(
     if (element_type != accessed_type) {
       return absl::UnimplementedError(absl::StrCat(
           "Vulkan entry point ", entry_name, " buffer argument ", binding,
-          " is accessed with incompatible scalar element types"));
+          " is accessed with incompatible inferred LLVM scalar element types ",
+          PrintLlvmType(*element_type), " and ",
+          PrintLlvmType(*accessed_type)));
     }
     return absl::OkStatus();
   };
@@ -527,6 +673,20 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
 
   for (llvm::Function* implementation : entries) {
     const std::string entry_name = implementation->getName().str();
+    llvm::MDNode* declared_element_types = implementation->getMetadata(
+        kXlaVulkanBufferElementTypesMetadata);
+    if (declared_element_types != nullptr &&
+        declared_element_types->getNumOperands() !=
+            implementation->arg_size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Vulkan entry point ", entry_name, " buffer element type metadata "
+          "is malformed at binding ",
+          std::min<unsigned>(declared_element_types->getNumOperands(),
+                             implementation->arg_size()),
+          ": expected ", implementation->arg_size(), " primitive types, got ",
+          declared_element_types->getNumOperands()));
+    }
+    implementation->setMetadata(kXlaVulkanBufferElementTypesMetadata, nullptr);
     const std::string numthreads =
         implementation->hasFnAttribute("hlsl.numthreads")
             ? implementation->getFnAttribute("hlsl.numthreads")
@@ -562,11 +722,56 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
     unsigned binding = 0;
     for (llvm::Argument& argument : implementation->args()) {
       const bool writable = !argument.hasAttribute(llvm::Attribute::ReadOnly);
-      TF_ASSIGN_OR_RETURN(
-          llvm::Type * element_type,
-          InferVulkanBufferElementType(argument, entry_name, binding));
-      if (element_type == nullptr) {
-        element_type = builder.getInt32Ty();
+      llvm::Type* element_type = nullptr;
+      if (declared_element_types != nullptr) {
+        auto* constant_metadata = llvm::dyn_cast<llvm::ConstantAsMetadata>(
+            declared_element_types->getOperand(binding).get());
+        auto* primitive_constant =
+            constant_metadata == nullptr
+                ? nullptr
+                : llvm::dyn_cast<llvm::ConstantInt>(
+                      constant_metadata->getValue());
+        if (primitive_constant == nullptr ||
+            !primitive_constant->getType()->isIntegerTy(32) ||
+            !PrimitiveType_IsValid(
+                primitive_constant->getValue().getSExtValue())) {
+          const std::string primitive =
+              primitive_constant == nullptr
+                  ? "<non-integer>"
+                  : PrintLlvmValue(*primitive_constant);
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " binding ", binding,
+              " has malformed xla.vulkan.buffer_element_types primitive type ",
+              primitive));
+        }
+        PrimitiveType primitive_type = static_cast<PrimitiveType>(
+            primitive_constant->getValue().getSExtValue());
+        if (!primitive_util::IsArrayType(primitive_type) ||
+            primitive_util::IsComplexType(primitive_type)) {
+          return absl::UnimplementedError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " binding ", binding,
+              " has unsupported declared primitive type ",
+              PrimitiveType_Name(primitive_type)));
+        }
+        element_type =
+            llvm_ir::PrimitiveTypeToIrType(primitive_type, context);
+        if (element_type == nullptr ||
+            (!element_type->isIntegerTy() &&
+             !element_type->isFloatingPointTy()) ||
+            (element_type->isIntegerTy() &&
+             element_type->getIntegerBitWidth() < 8)) {
+          return absl::UnimplementedError(absl::StrCat(
+              "Vulkan entry point ", entry_name, " binding ", binding,
+              " has unsupported declared primitive type ",
+              PrimitiveType_Name(primitive_type)));
+        }
+      } else {
+        TF_ASSIGN_OR_RETURN(
+            element_type,
+            InferVulkanBufferElementType(argument, entry_name, binding));
+        if (element_type == nullptr) {
+          element_type = builder.getInt32Ty();
+        }
       }
       llvm::Type* runtime_array = llvm::ArrayType::get(element_type, 0);
       llvm::Type* resource_type =

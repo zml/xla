@@ -35,11 +35,13 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
@@ -142,6 +144,11 @@ using llvm::SmallVector;
 using mlir::MLIRContext;
 using mlir::Value;
 using mlir::func::FuncOp;
+
+constexpr absl::string_view kXlaBufferElementTypeAttr =
+    "xla.buffer_element_type";
+constexpr char kXlaVulkanBufferElementTypesMetadata[] =
+    "xla.vulkan.buffer_element_types";
 
 void AddRanges(llvm::Function* func, const LaunchDimensions& launch_dims,
                llvm::Module* module) {
@@ -620,7 +627,10 @@ void AddLoweringPasses(mlir::OpPassManager& pm,
   pm.addPass(emitters::createLowerTensorsPass(device));
   pm.addPass(emitters::createLowerPdlWaitPass());
   pm.addPass(mlir::createConvertComplexToStandardPass());
-  pm.addPass(emitters::createMergePointersToSameSlicePass());
+  emitters::MergePointersToSameSlicePassOptions merge_pointers_options;
+  merge_pointers_options.vulkan_ = device.gpu_compute_capability().IsVulkan();
+  pm.addPass(emitters::createMergePointersToSameSlicePass(
+      merge_pointers_options));
 
   // LowerTensors creates new affine.apply ops. Fold and CSE them so
   // simplify-affine has maximally folded expressions to work with.
@@ -687,6 +697,34 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
 
   mlir::OwningOpRef<mlir::ModuleOp> module = std::move(source).TakeModule();
 
+  llvm::SmallVector<int64_t> buffer_element_types;
+  bool has_buffer_element_type = false;
+  if (FuncOp entry = module->lookupSymbol<FuncOp>(entry_function_name)) {
+    buffer_element_types.reserve(entry.getNumArguments());
+    for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
+      mlir::IntegerAttr element_type =
+          entry.getArgAttrOfType<mlir::IntegerAttr>(
+              i, kXlaBufferElementTypeAttr);
+      if (element_type) {
+        has_buffer_element_type = true;
+        buffer_element_types.push_back(element_type.getInt());
+        entry.removeArgAttr(i, kXlaBufferElementTypeAttr);
+      } else if (device.gpu_compute_capability().IsVulkan() &&
+                 has_buffer_element_type) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Vulkan kernel ", entry_function_name, " argument ", i,
+            " is missing xla.buffer_element_type"));
+      }
+    }
+  }
+  if (device.gpu_compute_capability().IsVulkan() && has_buffer_element_type &&
+      buffer_element_types.size() !=
+          module->lookupSymbol<FuncOp>(entry_function_name).getNumArguments()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Vulkan kernel ", entry_function_name,
+                     " has incomplete xla.buffer_element_type attributes"));
+  }
+
   mlir::PassManager pm(module->getContext());
   // Only enable verifier in debug builds.
   bool should_verify =
@@ -711,6 +749,23 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   auto llvm_module = mlir::translateModuleToLLVMIR(module.get(), *llvm_context);
   TF_RET_CHECK(llvm_module != nullptr)
       << "Failed to translate module to LLVM IR.";
+
+  if (device.gpu_compute_capability().IsVulkan() && has_buffer_element_type) {
+    llvm::Function* entry = llvm_module->getFunction(entry_function_name);
+    TF_RET_CHECK(entry != nullptr)
+        << "Translated Vulkan kernel is missing entry function "
+        << entry_function_name;
+    llvm::SmallVector<llvm::Metadata*> metadata;
+    metadata.reserve(buffer_element_types.size());
+    for (int64_t element_type : buffer_element_types) {
+      metadata.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llvm_context),
+                                 element_type)));
+    }
+    entry->setMetadata(
+        kXlaVulkanBufferElementTypesMetadata,
+        llvm::MDNode::get(*llvm_context, metadata));
+  }
 
   return LlvmKernelSource{std::move(llvm_context), std::move(llvm_module)};
 }
