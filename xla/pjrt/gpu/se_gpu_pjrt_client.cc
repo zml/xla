@@ -1392,6 +1392,8 @@ GetStreamExecutorGpuDeviceAllocator(
             << "collective_memory_size is non-zero, but allocator kind is set "
                "to \"platform\". Collective memory will not be preallocated.";
       }
+      constexpr size_t kDeviceAlignment =
+          static_cast<size_t>(gpu::kXlaAllocatedBufferAlignBytes);
       for (const auto& [ordinal, device] : addressable_devices) {
         auto* executor = device->executor();
         auto* stream = device->compute_stream();
@@ -1403,7 +1405,10 @@ GetStreamExecutorGpuDeviceAllocator(
                 executor, static_cast<int64_t>(se::MemorySpace::kDevice));
         allocators.push_back(
             {std::move(default_allocator), stream,
-             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kDefault});
+             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kDefault,
+             /*device_ordinal=*/std::nullopt,
+             /*platform=*/nullptr,
+             /*min_alignment=*/kDeviceAlignment});
 
         // Collective memory space (XLA color 1 -> StreamExecutor
         // MemorySpace::kCollective = 2)
@@ -1412,7 +1417,10 @@ GetStreamExecutorGpuDeviceAllocator(
                 executor, static_cast<int64_t>(se::MemorySpace::kCollective));
         allocators.push_back(
             {std::move(collective_allocator), stream,
-             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kCollective});
+             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kCollective,
+             /*device_ordinal=*/std::nullopt,
+             /*platform=*/nullptr,
+             /*min_alignment=*/kDeviceAlignment});
 
         // Temp buffer memory space (XLA color 2 -> StreamExecutor
         // MemorySpace::kDevice = 0)
@@ -1421,7 +1429,10 @@ GetStreamExecutorGpuDeviceAllocator(
                 executor, static_cast<int64_t>(se::MemorySpace::kDevice));
         allocators.push_back(
             {std::move(temp_allocator), stream,
-             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kTempBuffer});
+             /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kTempBuffer,
+             /*device_ordinal=*/std::nullopt,
+             /*platform=*/nullptr,
+             /*min_alignment=*/kDeviceAlignment});
 
         // Host memory space (StreamExecutor MemorySpace::kHost = 5)
         ASSIGN_OR_RETURN(auto host_allocator, GetGpuHostAllocator(executor));
@@ -1927,6 +1938,12 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   EnablePeerAccess(xla_client->backend().stream_executors());
 
   GpuAllocatorConfig allocator_config = options.allocator_config;
+#if TENSORFLOW_USE_MUSA
+  if (allocator_config.kind == GpuAllocatorConfig::Kind::kDefault) {
+    allocator_config.kind = GpuAllocatorConfig::Kind::kPlatform;
+    LOG(INFO) << "Using platform allocator by default for MUSA.";
+  }
+#endif
   auto memory_registration =
       CreateAllocatorMemoryRegistration(&allocator_config);
 

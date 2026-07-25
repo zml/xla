@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -55,14 +56,47 @@ std::string StreamExecutorMemoryAllocator::Name() {
 
 void* StreamExecutorMemoryAllocator::AllocateRaw(size_t alignment,
                                                  size_t num_bytes) {
-  auto result = executor_->AllocateArray<char>(num_bytes, memory_space_);
-  return result.opaque();
+  CHECK_NE(alignment, 0);
+  CHECK_EQ(alignment & (alignment - 1), 0)
+      << "alignment must be a power of 2, got " << alignment;
+
+  const size_t padding = alignment - 1;
+  if (num_bytes > std::numeric_limits<size_t>::max() - padding) {
+    return nullptr;
+  }
+
+  auto allocation =
+      executor_->AllocateArray<char>(num_bytes + padding, memory_space_);
+  if (allocation == nullptr) {
+    return nullptr;
+  }
+
+  const uintptr_t base = reinterpret_cast<uintptr_t>(allocation.opaque());
+  if (base > std::numeric_limits<uintptr_t>::max() - padding) {
+    executor_->Deallocate(&allocation);
+    return nullptr;
+  }
+  void* aligned = reinterpret_cast<void*>((base + padding) & ~padding);
+  {
+    absl::MutexLock lock(mu_);
+    CHECK(allocation_bases_.emplace(aligned, allocation).second)
+        << "StreamExecutor returned overlapping live allocations";
+  }
+  return aligned;
 }
 
 void StreamExecutorMemoryAllocator::DeallocateRaw(void* ptr) {
   if (ptr != nullptr) {
-    DeviceAddressBase dev_mem(ptr);
-    executor_->Deallocate(&dev_mem);
+    DeviceAddressBase allocation(ptr);
+    {
+      absl::MutexLock lock(mu_);
+      auto it = allocation_bases_.find(ptr);
+      if (it != allocation_bases_.end()) {
+        allocation = it->second;
+        allocation_bases_.erase(it);
+      }
+    }
+    executor_->Deallocate(&allocation);
   }
 }
 

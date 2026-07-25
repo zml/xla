@@ -83,6 +83,7 @@ limitations under the License.
 #include "xla/pjrt/se/local_device_state.h"
 #include "xla/pjrt/se/pjrt_stream_executor_client.h"
 #include "xla/runtime/device_id.h"
+#include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu_topology.h"
 #include "xla/service/gpu_topology.pb.h"
 #include "xla/service/platform_util.h"
@@ -2307,11 +2308,33 @@ TEST(StreamExecutorGpuClientTest,
       se_topology->gpu_topology().host_target_machine_options().has_value());
 }
 
-// The "platform" allocator must return a MultiDeviceAdapter wrapping
-// synchronous StreamExecutorMemoryAllocator instances at the PJRT level.
-TEST(StreamExecutorGpuClientTest, PlatformAllocatorIsSynchronousPassthrough) {
+// The "platform" allocator must return a MultiDeviceAdapter wrapping aligned
+// StreamExecutorMemoryAllocator instances at the PJRT level.
+TEST(StreamExecutorGpuClientTest, PlatformAllocatorProvidesAlignedPassthrough) {
   GpuClientOptions options;
   options.allocator_config.kind = GpuAllocatorConfig::Kind::kPlatform;
+  options.allowed_devices = {0};
+
+  ASSERT_OK_AND_ASSIGN(auto client, GetStreamExecutorGpuClient(options));
+
+  auto* pjrt_se_client =
+      absl::down_cast<PjRtStreamExecutorClient*>(client.get());
+  auto* allocator =
+      dynamic_cast<se::MultiDeviceAdapter*>(pjrt_se_client->allocator());
+  ASSERT_NE(allocator, nullptr);
+
+  ASSERT_OK_AND_ASSIGN(auto allocation,
+                       allocator->Allocate(/*device_ordinal=*/0, /*size=*/1,
+                                           /*retry_on_failure=*/false,
+                                           /*memory_space=*/0));
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->opaque()) %
+                gpu::kXlaAllocatedBufferAlignBytes,
+            0);
+}
+
+#if TENSORFLOW_USE_MUSA
+TEST(StreamExecutorGpuClientTest, MusaUsesPlatformAllocatorByDefault) {
+  GpuClientOptions options;
   options.allowed_devices = {0};
 
   ASSERT_OK_AND_ASSIGN(auto client, GetStreamExecutorGpuClient(options));
@@ -2321,6 +2344,7 @@ TEST(StreamExecutorGpuClientTest, PlatformAllocatorIsSynchronousPassthrough) {
   EXPECT_NE(dynamic_cast<se::MultiDeviceAdapter*>(pjrt_se_client->allocator()),
             nullptr);
 }
+#endif
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 class VmmTest : public ::testing::Test {

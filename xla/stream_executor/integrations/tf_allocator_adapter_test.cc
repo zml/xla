@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -71,6 +72,30 @@ class TestAllocator : public tsl::Allocator {
   size_t start_address_;
   std::shared_ptr<absl::flat_hash_set<void*>> allocations_;
 };
+
+TEST(StreamExecutorMemoryAllocator, HonorsAlignmentAndDeallocationFallback) {
+  TF_ASSERT_OK_AND_ASSIGN(auto* platform,
+                          xla::PlatformUtil::GetDefaultPlatform());
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<StreamExecutor*> executors,
+                          xla::PlatformUtil::GetStreamExecutors(platform));
+  ASSERT_FALSE(executors.empty());
+
+  StreamExecutorMemoryAllocator allocator(
+      executors[0], static_cast<int64_t>(MemorySpace::kDevice));
+  void* aligned = allocator.AllocateRaw(/*alignment=*/4096, /*num_bytes=*/257);
+  ASSERT_NE(aligned, nullptr);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(aligned) % 4096, 0);
+  allocator.DeallocateRaw(aligned);
+
+  DeviceAddressBase foreign = executors[0]->Allocate(/*size=*/1);
+  ASSERT_FALSE(foreign.is_null());
+  allocator.DeallocateRaw(foreign.opaque());
+
+  EXPECT_EQ(allocator.AllocateRaw(
+                /*alignment=*/256,
+                /*num_bytes=*/std::numeric_limits<size_t>::max()),
+            nullptr);
+}
 
 TEST(MultiDeviceAdapter, UsesCorrectAllocator) {
   TF_ASSERT_OK_AND_ASSIGN(auto* platform,

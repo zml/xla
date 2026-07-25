@@ -55,6 +55,9 @@ class StreamExecutorMemoryAllocator : public tsl::Allocator {
  private:
   StreamExecutor* executor_;
   int64_t memory_space_;
+  absl::Mutex mu_;
+  absl::flat_hash_map<void*, DeviceAddressBase> allocation_bases_
+      ABSL_GUARDED_BY(mu_);
 };
 
 // Adapter class that wraps a Tensorflow allocator.
