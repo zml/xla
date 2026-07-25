@@ -337,6 +337,32 @@ class SupportLegacyTest : public HloHardwareIndependentTestBase,
   }
 };
 
+TEST_F(SupportLegacyTest, MusaGemmIsExplicitlyUnsupported) {
+  const std::string hlo = R"(
+HloModule musa_dot
+
+ENTRY e {
+  lhs = f32[2,3]{1,0} parameter(0)
+  rhs = f32[3,4]{1,0} parameter(1)
+  ROOT dot = f32[2,4]{1,0} dot(lhs, rhs),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo));
+  const stream_executor::GpuComputeCapability musa(
+      stream_executor::MusaComputeCapability("mp_21", 2, 1,
+                                             /*hardware_warp_size=*/128,
+                                             /*logical_subgroup_size=*/32));
+
+  EXPECT_THAT(legacy_triton::CanTritonHandleGEMM(
+                  *Cast<HloDotInstruction>(
+                      module->entry_computation()->root_instruction()),
+                  musa)
+                  .Explain(),
+              ::testing::HasSubstr("not supported on MUSA GPUs"));
+}
+
 TEST_F(SupportLegacyTest, UnsupportedDotOutputTypeFailsCanTritonHandleGEMM) {
   const std::string kHloTest = R"(
 triton_computation {

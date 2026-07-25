@@ -318,6 +318,10 @@ CodegenDecision CanTritonHandleGEMM(
     return CodegenDecision::Forbid(
         "Triton backend is not supported on Intel GPUs.");
   }
+  if (gpu_version.IsMusa()) {
+    return CodegenDecision::Forbid(
+        "Legacy Triton backend is not supported on MUSA GPUs.");
+  }
 
   CHECK(cuda_compute_capability || rocm_compute_capability);
 
