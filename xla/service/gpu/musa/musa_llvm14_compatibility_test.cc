@@ -229,6 +229,27 @@ TEST(MusaLlvm14CompatibilityTest, KernelArgumentPolicyFailClosed) {
 }
 
 TEST(MusaLlvm14CompatibilityTest,
+     AcceptsLogicalBufferBoundsLargerThanIrTransport) {
+  // LLM embedding tables are commonly much larger than the bounded textual
+  // LLVM request carrying their kernels. The bound is an optimization-only
+  // property of the device allocation and is stripped before the LLVM 14
+  // bridge, so it must not be compared with the interchange byte limit.
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(
+          Module("", "", "", "",
+                 "ptr addrspace(1) noalias align 256 "
+                 "dereferenceable(788004864) %out"),
+          "large_logical_buffer");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("noalias")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("align 256")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("dereferenceable")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
      StripsNoAliasFromLocalHelperPointerArgumentsOnly) {
   const std::string helper =
       "define internal i32 @helper(ptr noalias dereferenceable(4) %buffer, "
@@ -449,6 +470,39 @@ TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedSineProfile) {
   EXPECT_EQ(normalized->normalized_llvm, ReadCorpus("sine.llvm14.ll"));
 }
 
+TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedCosineAndExpProfiles) {
+  const std::string text = Module(
+      "  %cosine = call float @llvm.cos.f32(float 0.0)\n"
+      "  %exponential = call float @llvm.exp.f32(float %cosine)\n"
+      "  %bits = bitcast float %exponential to i32\n"
+      "  store i32 %bits, ptr addrspace(1) %out, align 4",
+      "declare float @llvm.cos.f32(float)\n"
+      "declare float @llvm.exp.f32(float)");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  for (absl::string_view name : {"llvm.cos.f32", "llvm.exp.f32"}) {
+    llvm::Function* function = module->getFunction(name);
+    ASSERT_NE(function, nullptr);
+    function->setAttributes(llvm::Intrinsic::getAttributes(
+        context, function->getIntrinsicID(), function->getFunctionType()));
+  }
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "cosine_exp_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("call float @llvm.cos.f32"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("call float @llvm.exp.f32"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "memory("));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
 TEST(MusaLlvm14CompatibilityTest, NormalizesReviewedIntegerMinMaxProfiles) {
   const std::string text = Module(
       "  %smin = call i32 @llvm.smin.i32(i32 7, i32 3)\n"
@@ -667,6 +721,379 @@ TEST(MusaLlvm14CompatibilityTest, LegalizesBfloatGlobalMemoryAsI16) {
   EXPECT_THAT(
       ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
       IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     MakesNarrowBfloatStorageIndicesExplicitlyPointerWidth) {
+  const std::string text = Module(
+      "  %storage = getelementptr inbounds [394002432 x bfloat], "
+      "ptr addrspace(1) %out, i32 0, i32 %index\n"
+      "  %input = load bfloat, ptr addrspace(1) %storage, align 2\n"
+      "  %wide = fpext bfloat %input to float\n"
+      "  store float %wide, ptr addrspace(1) %out, align 4",
+      "", "", "", "ptr addrspace(1) %out, i32 %index");
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_pointer_index_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("zext i32 %index to i64"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("shl i64"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("ashr i64"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("getelementptr inbounds i16"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("[394002432 x i16]")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     PromotesLlamaBfloatStorageAddressDagAtPointerWidth) {
+  const std::string text = Module(
+      "  %bounded = call i32 @llvm.umin.i32(i32 %index, i32 128255)\n"
+      "  %lane = and i32 %index, 767\n"
+      "  %lane_offset = mul i32 %lane, 4\n"
+      "  %row_offset = mul i32 %bounded, 3072\n"
+      "  %element = add i32 %lane_offset, %row_offset\n"
+      "  %storage = getelementptr inbounds [394002432 x bfloat], "
+      "ptr addrspace(1) %out, i32 0, i32 %element\n"
+      "  %input = load bfloat, ptr addrspace(1) %storage, align 2\n"
+      "  %wide = fpext bfloat %input to float\n"
+      "  store float %wide, ptr addrspace(1) %out, align 4",
+      "declare i32 @llvm.umin.i32(i32, i32)", "", "",
+      "ptr addrspace(1) %out, i32 %index");
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* umin = module->getFunction("llvm.umin.i32");
+  ASSERT_NE(umin, nullptr);
+  umin->setAttributes(llvm::Intrinsic::getAttributes(
+      context, umin->getIntrinsicID(), umin->getFunctionType()));
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "llama_bfloat_address_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("zext i32 %bounded to i64"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("mul i64"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr(", 3072"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr(", 4"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("add i64"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("mul i32")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("add i32")));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("getelementptr inbounds i16"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("[394002432 x i16]")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     RejectsBfloatStorageGepWithNonzeroArrayIndex) {
+  const std::string text = Module(
+      "  %storage = getelementptr inbounds [4 x bfloat], "
+      "ptr addrspace(1) %out, i32 1, i32 0\n"
+      "  %input = load bfloat, ptr addrspace(1) %storage, align 2\n"
+      "  %wide = fpext bfloat %input to float\n"
+      "  store float %wide, ptr addrspace(1) %out, align 4");
+
+  EXPECT_THAT(
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_nonzero_array_index"),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("bfloat array GEP requires a zero array index")));
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersQualifiedWidthTwoBfloatVectorToIntegerAbi) {
+  const std::string text = Module(
+      "  %storage = getelementptr inbounds [2 x bfloat], ptr addrspace(1) "
+      "%out, i64 0, i64 0\n"
+      "  %packed = load <2 x bfloat>, ptr addrspace(1) %storage, align 2\n"
+      "  %first = extractelement <2 x bfloat> %packed, i64 0\n"
+      "  %second = extractelement <2 x bfloat> %packed, i64 1\n"
+      "  %first_wide = fpext bfloat %first to float\n"
+      "  %second_wide = fpext bfloat %second to float\n"
+      "  %sum = fadd float %first_wide, %second_wide\n"
+      "  store float %sum, ptr addrspace(1) %out, align 4");
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_width_two_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("getelementptr inbounds i16"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("load <2 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("extractelement <2 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr(" x bfloat")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("load bfloat")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersQualifiedBfloatVectorAndHelperProfileToIntegerAbi) {
+  const std::string helpers =
+      "define internal float @extend_bfloat(bfloat %value) {\n"
+      "entry:\n"
+      "  %wide = fpext bfloat %value to float\n"
+      "  ret float %wide\n"
+      "}\n\n"
+      "define internal bfloat @truncate_bfloat(float %value) {\n"
+      "entry:\n"
+      "  %narrow = fptrunc float %value to bfloat\n"
+      "  ret bfloat %narrow\n"
+      "}\n";
+  const std::string text = Module(
+      "  %storage = getelementptr inbounds [4 x bfloat], ptr addrspace(1) "
+      "%out, i64 0, i64 0\n"
+      "  %packed = load <4 x bfloat>, ptr addrspace(1) %storage, align 2\n"
+      "  %lane = extractelement <4 x bfloat> %packed, i64 0\n"
+      "  %wide = call float @extend_bfloat(bfloat %lane)\n"
+      "  %replacement = call bfloat @truncate_bfloat(float %wide)\n"
+      "  %updated = insertelement <4 x bfloat> poison, bfloat %replacement, "
+      "i64 0\n"
+      "  store <4 x bfloat> %updated, ptr addrspace(1) %storage, align 2",
+      helpers);
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_vector_helper_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("getelementptr inbounds i16"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("load <4 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("extractelement <4 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("zext i16 %lane.bf16_bits to i32"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("insertelement <4 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("store <4 x i16>"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("define internal")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr(" x bfloat")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     RejectsFastMathFlagsOnQualifiedBfloatHelperCall) {
+  const std::string helper =
+      "define internal bfloat @truncate_bfloat(float %value) {\n"
+      "entry:\n"
+      "  %narrow = fptrunc float %value to bfloat\n"
+      "  ret bfloat %narrow\n"
+      "}\n";
+  const std::string text = Module(
+      "  %narrow = call fast bfloat @truncate_bfloat(float %value)\n"
+      "  store bfloat %narrow, ptr addrspace(1) %out, align 2",
+      helper, "", "", "ptr addrspace(1) %out, float %value");
+
+  EXPECT_THAT(NormalizeMusaLlvmTextForLlvm14(text, "bfloat_fast_helper_call"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=bfloat-helper-inline")));
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersBfloatRoundingAndSpecialValuesToExactIntegerBits) {
+  const std::string text = Module(
+      "  %negative_zero_ptr = getelementptr i16, ptr addrspace(1) %out, "
+      "i64 1\n"
+      "  %positive_infinity_ptr = getelementptr i16, ptr addrspace(1) %out, "
+      "i64 2\n"
+      "  %negative_infinity_ptr = getelementptr i16, ptr addrspace(1) %out, "
+      "i64 3\n"
+      "  %quiet_nan_ptr = getelementptr i16, ptr addrspace(1) %out, i64 4\n"
+      "  %even_tie_ptr = getelementptr i16, ptr addrspace(1) %out, i64 5\n"
+      "  %odd_tie_ptr = getelementptr i16, ptr addrspace(1) %out, i64 6\n"
+      "  %positive_zero = fptrunc float 0.000000e+00 to bfloat\n"
+      "  %negative_zero = fptrunc float -0.000000e+00 to bfloat\n"
+      "  %positive_infinity = fptrunc float 0x7FF0000000000000 to bfloat\n"
+      "  %negative_infinity = fptrunc float 0xFFF0000000000000 to bfloat\n"
+      "  %quiet_nan = fptrunc float 0x7FF8000000000000 to bfloat\n"
+      // 1 + 1/256 is exactly halfway from bfloat 0x3f80 to 0x3f81 and
+      // therefore rounds to the even low bit, 0x3f80.
+      "  %even_tie = fptrunc float 0x3FF0100000000000 to bfloat\n"
+      // 1 + 3/256 is exactly halfway from bfloat 0x3f81 to 0x3f82 and
+      // therefore rounds up to the even low bit, 0x3f82.
+      "  %odd_tie = fptrunc float 0x3FF0300000000000 to bfloat\n"
+      "  store bfloat %positive_zero, ptr addrspace(1) %out, align 2\n"
+      "  store bfloat %negative_zero, ptr addrspace(1) %negative_zero_ptr, "
+      "align 2\n"
+      "  store bfloat %positive_infinity, ptr addrspace(1) "
+      "%positive_infinity_ptr, align 2\n"
+      "  store bfloat %negative_infinity, ptr addrspace(1) "
+      "%negative_infinity_ptr, align 2\n"
+      "  store bfloat %quiet_nan, ptr addrspace(1) %quiet_nan_ptr, align 2\n"
+      "  store bfloat %even_tie, ptr addrspace(1) %even_tie_ptr, align 2\n"
+      "  store bfloat %odd_tie, ptr addrspace(1) %odd_tie_ptr, align 2");
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_exact_rounding");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("store i16 0, ptr addrspace(1) %out, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr(
+          "store i16 -32768, ptr addrspace(1) %negative_zero_ptr, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr(
+          "store i16 32640, ptr addrspace(1) %positive_infinity_ptr, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr(
+          "store i16 -128, ptr addrspace(1) %negative_infinity_ptr, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr("store i16 32704, ptr addrspace(1) %quiet_nan_ptr, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr("store i16 16256, ptr addrspace(1) %even_tie_ptr, align 2"));
+  EXPECT_THAT(
+      normalized->normalized_llvm,
+      HasSubstr("store i16 16258, ptr addrspace(1) %odd_tie_ptr, align 2"));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersQualifiedMultiBlockBfloatHelperWithReviewedIntrinsic) {
+  const std::string helper =
+      "define internal bfloat @reduce_to_narrow(ptr addrspace(1) %input, "
+      "i32 %limit) {\n"
+      "entry:\n"
+      "  br label %loop\n"
+      "loop:\n"
+      "  %index = phi i32 [ 0, %entry ], [ %next_index, %body ]\n"
+      "  %acc = phi float [ 0.000000e+00, %entry ], [ %next_acc, %body ]\n"
+      "  %done = icmp eq i32 %index, %limit\n"
+      "  br i1 %done, label %exit, label %body\n"
+      "body:\n"
+      "  %element = getelementptr inbounds [4 x bfloat], "
+      "ptr addrspace(1) %input, i32 0, i32 %index\n"
+      "  %narrow = load bfloat, ptr addrspace(1) %element, align 2\n"
+      "  %wide = fpext bfloat %narrow to float\n"
+      "  %root = call float @llvm.sqrt.f32(float %wide)\n"
+      "  %next_acc = fadd float %acc, %root\n"
+      "  %next_index = add i32 %index, 1\n"
+      "  br label %loop\n"
+      "exit:\n"
+      "  %result = fptrunc float %acc to bfloat\n"
+      "  ret bfloat %result\n"
+      "}\n\n"
+      "declare float @llvm.sqrt.f32(float)";
+  const std::string text = Module(
+      "  %narrow = call bfloat @reduce_to_narrow(ptr addrspace(1) %out, "
+      "i32 1)\n"
+      "  %wide = fpext bfloat %narrow to float\n"
+      "  store float %wide, ptr addrspace(1) %out, align 4",
+      helper);
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseAssemblyString(text, diagnostic, context);
+  ASSERT_NE(module, nullptr);
+  llvm::Function* sqrt = module->getFunction("llvm.sqrt.f32");
+  ASSERT_NE(sqrt, nullptr);
+  sqrt->setAttributes(llvm::Intrinsic::getAttributes(
+      context, sqrt->getIntrinsicID(), sqrt->getFunctionType()));
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmForLlvm14(*module, "decode_reduction_helper");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("@reduce_to_narrow")));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("getelementptr inbounds i16"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("call float @llvm.sqrt.f32"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("ret bfloat")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("load bfloat")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersQualifiedBfloatControlFlowAndNegativeInfinityToIntegerAbi) {
+  const std::string text = Module(
+      "  br i1 %condition, label %left, label %right\n"
+      "left:\n"
+      "  %left_value = fptrunc float %lhs to bfloat\n"
+      "  br label %merge\n"
+      "right:\n"
+      "  %right_value = fptrunc float %rhs to bfloat\n"
+      "  br label %merge\n"
+      "merge:\n"
+      "  %joined = phi bfloat [ %left_value, %left ], [ %right_value, "
+      "%right ]\n"
+      "  %mask = select i1 %condition, bfloat 0.000000e+00, bfloat -inf\n"
+      "  %joined_wide = fpext bfloat %joined to float\n"
+      "  %mask_wide = fpext bfloat %mask to float\n"
+      "  %result = fadd float %joined_wide, %mask_wide\n"
+      "  store float %result, ptr addrspace(1) %out, align 4",
+      "", "", "",
+      "ptr addrspace(1) %out, i1 %condition, float %lhs, float %rhs");
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_control_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("%joined.bf16_bits = phi i16"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("select i1 %condition, i16 0, i16 -128"));
+  EXPECT_THAT(normalized->normalized_llvm,
+              HasSubstr("zext i16 %mask.bf16_bits to i32"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("phi bfloat")));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("bfloat -inf")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     LowersScalarBfloatComparisonThroughExactF32Values) {
+  const std::string text = Module(
+      "  %lhs_narrow = fptrunc float %lhs to bfloat\n"
+      "  %rhs_narrow = fptrunc float %rhs to bfloat\n"
+      "  %ordered = fcmp ogt bfloat %lhs_narrow, %rhs_narrow\n"
+      "  %selected = select i1 %ordered, bfloat %lhs_narrow, bfloat "
+      "%rhs_narrow\n"
+      "  %wide = fpext bfloat %selected to float\n"
+      "  store float %wide, ptr addrspace(1) %out, align 4",
+      "", "", "", "ptr addrspace(1) %out, float %lhs, float %rhs");
+
+  absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
+      NormalizeMusaLlvmTextForLlvm14(text, "bfloat_comparison_profile");
+  ASSERT_THAT(normalized, IsOk());
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("fcmp ogt float"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("select i1 %ordered"));
+  EXPECT_THAT(normalized->normalized_llvm, Not(HasSubstr("fcmp ogt bfloat")));
+  EXPECT_THAT(normalized->normalized_llvm,
+              Not(HasSubstr("select i1 %ordered, bfloat")));
+  EXPECT_THAT(
+      ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
+      IsOk());
+}
+
+TEST(MusaLlvm14CompatibilityTest,
+     RejectsUnreviewedBfloatArithmeticBeforeIntegerLowering) {
+  const std::string text = Module(
+      "  %packed = load <4 x bfloat>, ptr addrspace(1) %out, align 2\n"
+      "  %lhs = extractelement <4 x bfloat> %packed, i64 0\n"
+      "  %rhs = extractelement <4 x bfloat> %packed, i64 1\n"
+      "  %sum = fadd bfloat %lhs, %rhs\n"
+      "  %updated = insertelement <4 x bfloat> poison, bfloat %sum, i64 0\n"
+      "  store <4 x bfloat> %updated, ptr addrspace(1) %out, align 2");
+
+  EXPECT_THAT(NormalizeMusaLlvmTextForLlvm14(text, "bfloat_arithmetic_profile"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=bfloat-integer-profile")));
 }
 
 TEST(MusaLlvm14CompatibilityTest, CollectsSortedTypedExportedGlobals) {

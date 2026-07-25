@@ -205,6 +205,10 @@ absl::Status ValidateType(const llvm::Type* type,
                           const MusaBridgeIrMetadata& metadata,
                           llvm::SmallPtrSetImpl<const llvm::Type*>& visited) {
   if (!visited.insert(type).second) return absl::OkStatus();
+  if (type->isBFloatTy()) {
+    return Rejected(metadata, "bfloat-type",
+                    "bfloat must be lowered to the integer interchange ABI");
+  }
   if (const auto* pointer = llvm::dyn_cast<llvm::PointerType>(type)) {
     uint32_t number = pointer->getAddressSpace();
     const MusaAddressSpaceSpec* spec = FindMusaAddressSpace(number);

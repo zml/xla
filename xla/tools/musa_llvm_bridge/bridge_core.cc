@@ -141,6 +141,11 @@ absl::Status ValidateType(const llvm::Type* type,
                           llvm::SmallPtrSetImpl<const llvm::Type*>& visited) {
   if (!visited.insert(type).second) return absl::OkStatus();
 
+  if (type->isBFloatTy()) {
+    return Rejected(request, "bfloat-type",
+                    "bfloat must be lowered to the integer interchange ABI");
+  }
+
   if (const auto* pointer = llvm::dyn_cast<llvm::PointerType>(type)) {
     if (!pointer->isOpaque()) {
       return Rejected(request, "pointer-model",

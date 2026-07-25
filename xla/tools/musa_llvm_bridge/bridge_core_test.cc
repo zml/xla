@@ -422,6 +422,20 @@ TEST(MusaLlvmBridgeCoreTest, RejectsCapabilitiesOutsideMappingV3) {
   }
 }
 
+TEST(MusaLlvmBridgeCoreTest, RejectsBfloatGepSourceTypeRecursively) {
+  std::string ir = ReadTestdata("minimal.ll");
+  const size_t ret = ir.find("  ret void");
+  ASSERT_NE(ret, std::string::npos);
+  ir.insert(ret,
+            "  %element = getelementptr inbounds [4 x bfloat], ptr "
+            "addrspace(1) %out, i64 0, i64 1\n");
+  MusaBridgeCompileRequest request = RequestForIr(ir);
+
+  EXPECT_THAT(TranslateMusaBridgeRequestToVendorLlvm(request),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=bfloat-type")));
+}
+
 TEST(MusaLlvmBridgeCoreTest, AcceptsActiveMappingNoSignedZeros) {
   std::string ir = ReadTestdata("minimal.ll");
   const size_t ret = ir.find("  ret void");

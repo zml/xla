@@ -111,6 +111,13 @@ TEST(MusaBridgeIrValidatorTest, AcceptsMinimalVersionedInterchange) {
   EXPECT_THAT(Validate(MinimalModule()), IsOk());
 }
 
+TEST(MusaBridgeIrValidatorTest, RejectsScalarBfloatType) {
+  EXPECT_THAT(Validate(Module(
+                  "  %value = load bfloat, ptr addrspace(1) %out, align 2")),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("capability=bfloat-type")));
+}
+
 TEST(MusaBridgeIrValidatorTest, AcceptsSafeDashedKernelSymbols) {
   std::string ir =
       absl::StrReplaceAll(MinimalModule(), {{"@kernel", "@kernel-name"}});
