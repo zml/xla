@@ -493,12 +493,16 @@ class HloInstruction {
 
   // Creates a scaled dot op with operands 'lhs', 'lhs_scale', 'rhs', and
   // 'rhs_scale', with contracting, batch, ragged, and group dimensions
-  // specified in 'dimension_numbers'.
+  // specified in 'dimension_numbers'. 'input_global_scale' and
+  // 'weight_global_scale' are optional NVFP4 per-tensor scalar globals (pass
+  // both or neither).
   static std::unique_ptr<HloInstruction> CreateScaledDot(
       const Shape& shape, HloInstruction* lhs, HloInstruction* rhs,
       HloInstruction* lhs_scale, HloInstruction* rhs_scale,
       const DotDimensionNumbers& dimension_numbers,
-      const PrecisionConfig& precision_config);
+      const PrecisionConfig& precision_config,
+      HloInstruction* input_global_scale = nullptr,
+      HloInstruction* weight_global_scale = nullptr);
 
   // Creates a reduce-precision op, where operand is the data to reduce in
   // precision, and exponent_bits and mantissa_bits describe the precision to

@@ -1222,9 +1222,15 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       break;
     }
     case HloOpcode::kScaledDot: {
-      int expected_operands = HloScaledDotInstruction::kOperands;
-      TF_RET_CHECK(proto.operand_ids_size() == expected_operands)
-          << proto.opcode() << " instruction should have " << expected_operands
+      const bool with_globals =
+          proto.operand_ids_size() ==
+          HloScaledDotInstruction::kOperandsWithGlobals;
+      TF_RET_CHECK(proto.operand_ids_size() ==
+                       HloScaledDotInstruction::kOperands ||
+                   with_globals)
+          << proto.opcode() << " instruction should have "
+          << HloScaledDotInstruction::kOperands << " or "
+          << HloScaledDotInstruction::kOperandsWithGlobals
           << " operands but sees " << proto.operand_ids_size();
       TF_RET_CHECK(proto.has_dot_dimension_numbers())
           << "ScaledDot instruction should have dot_dimension_numbers.";
@@ -1237,7 +1243,9 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(
       auto operand_vector = all_operands();
       instruction = std::make_unique<HloScaledDotInstruction>(
           shape, operands(0), operands(1), operands(2), operands(3),
-          proto.dot_dimension_numbers(), precision_config);
+          proto.dot_dimension_numbers(), precision_config,
+          with_globals ? operands(4) : nullptr,
+          with_globals ? operands(5) : nullptr);
       break;
     }
     case HloOpcode::kDomain: {
@@ -1743,10 +1751,11 @@ HloInstruction::CreateTriangularSolve(const Shape& shape, HloInstruction* a,
     const Shape& shape, HloInstruction* lhs, HloInstruction* rhs,
     HloInstruction* lhs_scale, HloInstruction* rhs_scale,
     const DotDimensionNumbers& dimension_numbers,
-    const PrecisionConfig& precision_config) {
-  return std::make_unique<HloScaledDotInstruction>(shape, lhs, rhs, lhs_scale,
-                                                   rhs_scale, dimension_numbers,
-                                                   precision_config);
+    const PrecisionConfig& precision_config,
+    HloInstruction* input_global_scale, HloInstruction* weight_global_scale) {
+  return std::make_unique<HloScaledDotInstruction>(
+      shape, lhs, rhs, lhs_scale, rhs_scale, dimension_numbers,
+      precision_config, input_global_scale, weight_global_scale);
 }
 
 /* static */ std::unique_ptr<HloInstruction>

@@ -3672,10 +3672,13 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
         return nullptr;
       }
 
-      int expected_size = HloScaledDotInstruction::kOperands;
-      if (operands.size() != expected_size) {
-        Error(loc, StrCat("expects ", expected_size, " operands, but has ",
-                          operands.size(), " operands"));
+      const bool with_globals =
+          operands.size() == HloScaledDotInstruction::kOperandsWithGlobals;
+      if (operands.size() != HloScaledDotInstruction::kOperands &&
+          !with_globals) {
+        Error(loc, StrCat("expects ", HloScaledDotInstruction::kOperands,
+                          " or ", HloScaledDotInstruction::kOperandsWithGlobals,
+                          " operands, but has ", operands.size(), " operands"));
         return nullptr;
       }
 
@@ -3717,7 +3720,8 @@ HloInstruction* HloParserImpl::CreateInstruction(  // NOLINT
       }
       return builder->AddInstruction(HloInstruction::CreateScaledDot(
           *shape, operands[0], operands[1], operands[2], operands[3], dnum,
-          precision_config));
+          precision_config, with_globals ? operands[4] : nullptr,
+          with_globals ? operands[5] : nullptr));
     }
     case HloOpcode::kGather: {
       optional<std::vector<int64_t>> offset_dims;

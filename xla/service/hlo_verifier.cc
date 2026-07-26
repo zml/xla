@@ -280,8 +280,12 @@ absl::Status ScalesShapeVerifier(
 }
 
 absl::Status ShapeVerifier::HandleScaledDot(HloInstruction* scaled_dot) {
-  RETURN_IF_ERROR(
-      CheckOperandCount(scaled_dot, HloScaledDotInstruction::kOperands));
+  const bool with_globals =
+      scaled_dot->operand_count() ==
+      HloScaledDotInstruction::kOperandsWithGlobals;
+  RETURN_IF_ERROR(CheckOperandCount(
+      scaled_dot, with_globals ? HloScaledDotInstruction::kOperandsWithGlobals
+                               : HloScaledDotInstruction::kOperands));
 
   ASSIGN_OR_RETURN(auto dim_numbers, DotOperandDims::FromScaledDot(scaled_dot));
   RETURN_IF_ERROR(ScalesShapeVerifier(scaled_dot, dim_numbers, 0, 2));
@@ -291,6 +295,17 @@ absl::Status ShapeVerifier::HandleScaledDot(HloInstruction* scaled_dot) {
     return absl::FailedPreconditionError(absl::StrFormat(
         "At least one of the scales should be not a scalar in %s",
         scaled_dot->ToString()));
+  }
+  // NVFP4 per-tensor globals must be scalars.
+  if (with_globals) {
+    for (int64_t i = HloScaledDotInstruction::kOperands;
+         i < HloScaledDotInstruction::kOperandsWithGlobals; ++i) {
+      if (!ShapeUtil::IsScalar(scaled_dot->operand(i)->shape())) {
+        return absl::FailedPreconditionError(absl::StrFormat(
+            "ScaledDot global scale operand %d must be a scalar in %s", i,
+            scaled_dot->ToString()));
+      }
+    }
   }
   ASSIGN_OR_RETURN(
       const Shape expected,

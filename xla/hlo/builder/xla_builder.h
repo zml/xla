@@ -732,7 +732,9 @@ class XlaBuilder {
       XlaOp lhs, XlaOp rhs, XlaOp lhs_scale, XlaOp rhs_scale,
       const DotDimensionNumbers& dimension_number,
       const PrecisionConfig* precision_config = nullptr,
-      std::optional<PrimitiveType> preferred_element_type = std::nullopt);
+      std::optional<PrimitiveType> preferred_element_type = std::nullopt,
+      XlaOp input_global_scale = XlaOp(),
+      XlaOp weight_global_scale = XlaOp());
 
   XlaOp Conv(
       XlaOp lhs, XlaOp rhs, absl::Span<const int64_t> window_strides,
@@ -1525,7 +1527,8 @@ class XlaBuilder {
   friend XlaOp ScaledDot(XlaOp lhs, XlaOp rhs, XlaOp lhs_scale, XlaOp rhs_scale,
                          const DotDimensionNumbers& dimension_number,
                          const PrecisionConfig* precision_config,
-                         std::optional<PrimitiveType> preferred_element_type);
+                         std::optional<PrimitiveType> preferred_element_type,
+                         XlaOp input_global_scale, XlaOp weight_global_scale);
   virtual absl::StatusOr<XlaOp> DotGeneralInternal(
       const Shape& shape, XlaOp lhs, XlaOp rhs,
       const DotDimensionNumbers& dimension_number,
@@ -2595,6 +2598,16 @@ XlaOp RaggedDot(
     const RaggedDotDimensionNumbers& dimension_numbers,
     const PrecisionConfig* precision_config = nullptr,
     std::optional<PrimitiveType> preferred_element_type = std::nullopt);
+
+// Enqueues a block/group-scaled dot instruction onto the computation.
+// 'input_global_scale'/'weight_global_scale' are optional NVFP4 per-tensor
+// scalar globals (pass both or neither).
+XlaOp ScaledDot(
+    XlaOp lhs, XlaOp rhs, XlaOp lhs_scale, XlaOp rhs_scale,
+    const DotDimensionNumbers& dimension_numbers,
+    const PrecisionConfig* precision_config = nullptr,
+    std::optional<PrimitiveType> preferred_element_type = std::nullopt,
+    XlaOp input_global_scale = XlaOp(), XlaOp weight_global_scale = XlaOp());
 
 // Enqueues a convolution instruction onto the computation, which uses the
 // default convolution dimension numbers.

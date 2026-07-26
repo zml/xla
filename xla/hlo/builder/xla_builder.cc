@@ -2208,7 +2208,8 @@ XlaOp XlaBuilder::ScaledDot(
     XlaOp lhs, XlaOp rhs, XlaOp lhs_scale, XlaOp rhs_scale,
     const DotDimensionNumbers& dimension_numbers,
     const PrecisionConfig* precision_config,
-    std::optional<PrimitiveType> preferred_element_type) {
+    std::optional<PrimitiveType> preferred_element_type,
+    XlaOp input_global_scale, XlaOp weight_global_scale) {
   return ReportErrorOrReturn([&]() -> absl::StatusOr<XlaOp> {
     ASSIGN_OR_RETURN(const Shape* lhs_shape, GetShapePtr(lhs));
     ASSIGN_OR_RETURN(const Shape* rhs_shape, GetShapePtr(rhs));
@@ -2221,6 +2222,12 @@ XlaOp XlaBuilder::ScaledDot(
     *instr.mutable_dot_dimension_numbers() = dimension_numbers;
     if (precision_config != nullptr) {
       *instr.mutable_precision_config() = *precision_config;
+    }
+    // NVFP4 per-tensor globals: append both or neither.
+    if (input_global_scale.valid() && weight_global_scale.valid()) {
+      return AddInstruction(std::move(instr), HloOpcode::kScaledDot,
+                            {lhs, rhs, lhs_scale, rhs_scale, input_global_scale,
+                             weight_global_scale});
     }
     return AddInstruction(std::move(instr), HloOpcode::kScaledDot,
                           {lhs, rhs, lhs_scale, rhs_scale});
@@ -2244,10 +2251,12 @@ XlaOp ScaledDot(const XlaOp lhs, const XlaOp rhs, const XlaOp lhs_scale,
                 const XlaOp rhs_scale,
                 const DotDimensionNumbers& dimension_numbers,
                 const PrecisionConfig* precision_config,
-                std::optional<PrimitiveType> preferred_element_type) {
+                std::optional<PrimitiveType> preferred_element_type,
+                XlaOp input_global_scale, XlaOp weight_global_scale) {
   return lhs.builder()->ScaledDot(lhs, rhs, lhs_scale, rhs_scale,
                                   dimension_numbers, precision_config,
-                                  preferred_element_type);
+                                  preferred_element_type, input_global_scale,
+                                  weight_global_scale);
 }
 
 XlaOp XlaBuilder::RaggedAllToAll(

@@ -4197,11 +4197,16 @@ HloRaggedDotInstruction::CloneWithNewOperandsImpl(
       ragged_dot_dimension_numbers_, precision_config_);
 }
 
+// Out-of-line definitions for the ODR-used static operand-count constants.
+const int HloScaledDotInstruction::kOperands;
+const int HloScaledDotInstruction::kOperandsWithGlobals;
+
 HloScaledDotInstruction::HloScaledDotInstruction(
     const Shape& shape, HloInstruction* lhs, HloInstruction* rhs,
     HloInstruction* lhs_scale, HloInstruction* rhs_scale,
     const DotDimensionNumbers& dimension_numbers,
-    const PrecisionConfig& precision_config)
+    const PrecisionConfig& precision_config,
+    HloInstruction* input_global_scale, HloInstruction* weight_global_scale)
     : HloInstruction(HloOpcode::kScaledDot, shape),
       dot_dimension_numbers_(dimension_numbers),
       precision_config_(precision_config) {
@@ -4209,6 +4214,13 @@ HloScaledDotInstruction::HloScaledDotInstruction(
   AppendOperand(rhs);
   AppendOperand(lhs_scale);
   AppendOperand(rhs_scale);
+  // NVFP4 per-tensor globals: both present or both absent.
+  CHECK_EQ(input_global_scale == nullptr, weight_global_scale == nullptr)
+      << "ScaledDot global scales must be passed as a pair";
+  if (input_global_scale != nullptr) {
+    AppendOperand(input_global_scale);
+    AppendOperand(weight_global_scale);
+  }
 }
 
 void HloScaledDotInstruction::ToProto(HloInstructionProto* proto) const {
@@ -4240,10 +4252,21 @@ std::unique_ptr<HloInstruction>
 HloScaledDotInstruction::CloneWithNewOperandsImpl(
     const Shape& shape, absl::Span<HloInstruction* const> new_operands,
     HloCloneContext* context) const {
-  CHECK_EQ(new_operands.size(), kOperands);
+  CHECK(new_operands.size() == kOperands ||
+        new_operands.size() == kOperandsWithGlobals)
+      << "ScaledDot expects " << kOperands << " or " << kOperandsWithGlobals
+      << " operands, got " << new_operands.size();
+  // A clone must not change the arity. Narrowing 7 or 6 down to 4 would drop
+  // the NVFP4 globals, which no consumer would report -- the result would just
+  // be off by weight_global_scale. Nothing in tree needs to reshape this op.
+  CHECK_EQ(new_operands.size(), operand_count())
+      << "ScaledDot clone must preserve the operand count";
+  const bool with_globals = new_operands.size() == kOperandsWithGlobals;
+  HloInstruction* igs = with_globals ? new_operands[4] : nullptr;
+  HloInstruction* wgs = with_globals ? new_operands[5] : nullptr;
   return std::make_unique<HloScaledDotInstruction>(
       shape, new_operands[0], new_operands[1], new_operands[2], new_operands[3],
-      dot_dimension_numbers_, precision_config_);
+      dot_dimension_numbers_, precision_config_, igs, wgs);
 }
 
 HloDomainInstruction::HloDomainInstruction(

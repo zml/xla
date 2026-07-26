@@ -2808,17 +2808,37 @@ class HloRaggedDotInstruction : public HloInstruction {
 class HloScaledDotInstruction : public HloInstruction {
  public:
   static const int kOperands = 4;
+  // NVFP4 additionally carries two per-tensor global scales (input/weight) as
+  // trailing scalar operands. Single-level schemes (FP8 128-block, FP8
+  // per-channel, MX e8m0) stay at kOperands.
+  static const int kOperandsWithGlobals = 6;
 
   // Creates a dot op with operands 'lhs' and 'rhs' with contracting and batch
   // dimensions specified in 'dimension_numbers' and with 'lhs_scale' and
   // 'rhs_scale' as the scale factors. Dimensions of the scale factors should
   // have the same order as the dimensions of the dot operation.
-  explicit HloScaledDotInstruction(const Shape& shape, HloInstruction* lhs,
-                                   HloInstruction* rhs,
-                                   HloInstruction* lhs_scale,
-                                   HloInstruction* rhs_scale,
-                                   const DotDimensionNumbers& dimension_numbers,
-                                   const PrecisionConfig& precision_config);
+  //
+  // 'input_global_scale' and 'weight_global_scale' are optional per-tensor
+  // scalar globals (NVFP4). Pass both or neither: when both are non-null the op
+  // has kOperandsWithGlobals operands, otherwise kOperands.
+
+  explicit HloScaledDotInstruction(
+      const Shape& shape, HloInstruction* lhs, HloInstruction* rhs,
+      HloInstruction* lhs_scale, HloInstruction* rhs_scale,
+      const DotDimensionNumbers& dimension_numbers,
+      const PrecisionConfig& precision_config,
+      HloInstruction* input_global_scale = nullptr,
+      HloInstruction* weight_global_scale = nullptr);
+
+  // True when the op carries the two NVFP4 per-tensor global scales.
+  bool has_global_scales() const {
+    return operand_count() == kOperandsWithGlobals;
+  }
+
+  // The NVFP4 per-tensor global scales. Only valid when has_global_scales().
+  const HloInstruction* input_global_scale() const { return operand(4); }
+  const HloInstruction* weight_global_scale() const { return operand(5); }
+
 
   // Returns data on the dimension numbers used for a dot operation.
   const DotDimensionNumbers& dot_dimension_numbers() const {
