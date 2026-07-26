@@ -383,6 +383,42 @@ TEST_F(ShardyXLATest, CostantSplitter) {
   // EXPECT_EQ(dot->operand(0)->operand(0), dot->operand(1)->operand(0));
 }
 
+// Regression test for the NVFP4 `xla.scaled_dot` multi-device SPMD crash. The
+// kScaledDot opcode (produced by CompositeRewriter from the composite) must
+// survive the ShardyXLA HLO<->StableHLO round-trip. Before kScaledDot had an
+// MHLO op + importer/exporter cases it became `mhlo.unknown` on import and
+// failed StableHLO legalization on export with "Unable to convert MHLO to
+// StableHLO".
+TEST_F(ShardyXLATest, ScaledDot) {
+  const char* const hloString = R"(
+    HloModule module
+    ENTRY %main {
+      %lhs = bf16[512,3840] parameter(0)
+      %rhs = f4e2m1fn[4096,3840] parameter(1)
+      %lhs_scale = bf16[1,1] parameter(2)
+      %rhs_scale = f8e4m3fn[4096,240] parameter(3)
+      ROOT %sd = bf16[512,4096] scaled-dot(%lhs, %rhs, %lhs_scale, %rhs_scale),
+        lhs_contracting_dims={1}, rhs_contracting_dims={1},
+        sharding={devices=[1,2]<=[2]}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hloString));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_enable_hlo_sharding_v3(false);
+  module->add_frontend_attribute(std::string(kImportMhloShardings), "t");
+
+  // Must not fail: the round-trip previously produced mhlo.unknown for
+  // kScaledDot and failed StableHLO legalization on export.
+  TF_ASSERT_OK(
+      ShardyXLA(/*runSdyShardingPropagation=*/true).Run(module.get()).status());
+
+  // There is no Shardy sharding rule for scaled_dot yet (Tier 2), so the op is
+  // preserved and conservatively replicated rather than partitioned.
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kScaledDot);
+}
+
 TEST_F(ShardyXLATest, Dot) {
   const char* const hloString = R"(
     HloModule module

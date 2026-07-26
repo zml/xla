@@ -2943,6 +2943,48 @@ def MHLO_RaggedDotOp: MHLO_Op<"ragged_dot", [Pure]> {
   let hasVerifier = 1;
 }
 
+def MHLO_ScaledDotOp: MHLO_Op<"scaled_dot", [Pure]> {
+  let summary = "Block/group-scaled (quantized) matrix multiplication";
+  let description = [{
+    Computes a dot product between `lhs` and `rhs`, where each operand is
+    dequantized by a corresponding block/group scale tensor (`lhs_scale`,
+    `rhs_scale`) before the contraction. Each scale dimension divides the
+    corresponding data dimension (block/group granularity); a scale extent of 1
+    along a dimension means that operand is not block-scaled along it. An
+    optional global scalar scale is applied outside this op as a separate
+    multiply. `dot_dimension_numbers` and `precision_config` have the same
+    meaning as in dot_general.
+
+    This is an XLA-internal op (HLO opcode kScaledDot) with no StableHLO
+    counterpart, produced by CompositeRewriter from
+    `stablehlo.composite @xla.scaled_dot`. It exists so kScaledDot can survive
+    the HLO<->MHLO round-trip performed by Shardy sharding propagation.
+
+    An optional pair of per-tensor scalar `global_scales` (NVFP4: input and
+    weight) may follow the four data/scale operands; present as a 2-element
+    variadic or absent entirely.
+  }];
+
+  let arguments = (ins
+    MHLO_Tensor:$lhs,
+    MHLO_Tensor:$rhs,
+    MHLO_Tensor:$lhs_scale,
+    MHLO_Tensor:$rhs_scale,
+    Variadic<MHLO_Tensor>:$global_scales,
+    MHLO_DotDimensionNumbers:$dot_dimension_numbers,
+    OptionalAttr<MHLO_PrecisionConfigAttr>:$precision_config
+  );
+
+  let results = (outs HLO_Tensor:$result);
+  // ScaledDot op requires a custom exporter to pass the preferred element type
+  // to the Xla builder.
+  let hasCustomHLOConverter = 1;
+  // No verifier: this op is a transient carrier for the Shardy round-trip and
+  // is authoritatively verified at the HLO level (ShapeVerifier::HandleScaledDot
+  // enforces the scale/data divisibility invariants before and after SPMD).
+  let hasVerifier = 0;
+}
+
 def MHLO_EinsumOp: MHLO_Op<"einsum", [Pure]> {
   let summary = "Einsum operation";
   let description = [{

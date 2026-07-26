@@ -51,6 +51,7 @@ lit_test_suite(
             "opaque_elements_attr.mlir",
             "ragged_dot.mlir",
             "rng_get_and_update_state.mlir",
+            "scaled_dot.mlir",
             "sharding.mlir",
             "shardy.mlir",
             "simple.mlir",

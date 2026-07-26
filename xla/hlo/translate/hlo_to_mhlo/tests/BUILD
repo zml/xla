@@ -35,6 +35,7 @@ lit_test_suite(
             "module_config.hlo",
             "operand_convert_for_convolution.hlo",
             "ragged_dot.hlo",
+            "scaled_dot.hlo",
             "simple.hlo",
             "spmd_module_sharding.hlo",
             "stablehlo.hlo",

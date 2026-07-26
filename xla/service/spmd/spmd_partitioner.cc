@@ -5769,6 +5769,129 @@ absl::Status SpmdPartitioningVisitor::HandleRaggedDot(HloInstruction* hlo) {
   return absl::OkStatus();
 }
 
+absl::Status SpmdPartitioningVisitor::HandleScaledDot(HloInstruction* hlo) {
+  // kScaledDot reaches the GSPMD partitioner only after ShardyXLA has
+  // propagated mutually-consistent shardings (gpu_spmd_pipeline.cc runs
+  // sdy::ShardyXLA before StatefulRngSpmdPartitioner). This thin handler
+  // mechanically applies those shardings, mirroring HandleRaggedDot.
+  CHECK(hlo->parent()->parent()->config().use_shardy_partitioner())
+      << "ScaledDot is only supported with Shardy.";
+
+  // The base accessor handles kScaledDot via DynCast.
+  const DotDimensionNumbers& dot_dnums = hlo->dot_dimension_numbers();
+
+  // Operand order: lhs(0), rhs(1), lhs_scale(2), rhs_scale(3). Each scale
+  // shares the dim order of its data operand.
+  PartitionedHlo& lhs = GetPartitionedHlo(hlo->operand(0));
+  PartitionedHlo& rhs = GetPartitionedHlo(hlo->operand(1));
+  PartitionedHlo& lhs_scale = GetPartitionedHlo(hlo->operand(2));
+  PartitionedHlo& rhs_scale = GetPartitionedHlo(hlo->operand(3));
+  // lhs may alias rhs; copy rhs AND its scale so the partitioner does not reuse
+  // the same partitioned buffer for both operands (ragged copies only rhs).
+  if (lhs.hlo() == rhs.hlo()) {
+    rhs = MakeACopyAndReturnItsPartitionedHlo(rhs, builder());
+    rhs_scale = MakeACopyAndReturnItsPartitionedHlo(rhs_scale, builder());
+  }
+
+  // Make each scale consistent with its data operand. Shardy may leave a scale
+  // replicated (e.g. a fixed replicated input parameter) while its data operand
+  // is sharded; because the scale shares the data operand's dim order (with the
+  // block dim divided down), it must follow the same per-dim sharding, else
+  // CloneWithNewOperands would build a malformed scaled-dot (data dim not a
+  // multiple of the matching scale dim). An all-ones/scalar scale carries no
+  // block structure and is simply replicated.
+  auto follow_data = [&](PartitionedHlo& scale,
+                         const PartitionedHlo& data) -> bool {
+    const Shape& scale_shape = scale.base_shape();
+    bool all_ones = absl::c_all_of(scale_shape.dimensions(),
+                                   [](int64_t d) { return d == 1; });
+    if (all_ones || !data.sharding().IsTiled()) {
+      scale = scale.Reshard(HloSharding::Replicate());
+      return true;
+    }
+    // The scale can follow the data operand's sharding only if every scale dim
+    // is divisible by the data operand's tile count on that dim (guaranteed by
+    // the ScaledDot OpShardingRule, which shards a block dim only on block-count
+    // boundaries). Otherwise fall back to the safe replicated DefaultAction.
+    for (int64_t d = 0; d < scale_shape.dimensions().size(); ++d) {
+      if (scale_shape.dimensions(d) % data.sharding().dimension(d) != 0) {
+        return false;
+      }
+    }
+    scale = scale.Reshard(data.sharding());
+    return true;
+  };
+  if (!follow_data(lhs_scale, lhs) || !follow_data(rhs_scale, rhs)) {
+    return DefaultAction(hlo);
+  }
+
+  std::vector<int64_t> sharded_lhs_contracting_dims;
+  if (lhs.sharding().IsTiled()) {
+    for (int64_t dim : dot_dnums.lhs_contracting_dimensions()) {
+      if (lhs.sharding().dimension(dim) > 1) {
+        sharded_lhs_contracting_dims.push_back(dim);
+      }
+    }
+  }
+
+  // Row-parallel (contracting dim sharded) zero-pads the data and scale
+  // contracting dims independently. Those pads only preserve the data/scale
+  // block ratio (data_dim / scale_dim) when every operand divides evenly along
+  // its sharded contracting dims. The ScaledDot OpShardingRule only shards the
+  // contracting dim on block-count boundaries, so this always holds under
+  // Shardy; if some other sharding violates it, fall back to the safe
+  // (replicated) DefaultAction rather than emit a malformed scaled-dot.
+  if (!sharded_lhs_contracting_dims.empty()) {
+    auto divides_evenly = [](const PartitionedHlo& p, int64_t dim) {
+      return !p.sharding().IsTiled() || p.sharding().dimension(dim) <= 1 ||
+             p.base_shape().dimensions(dim) % p.sharding().dimension(dim) == 0;
+    };
+    for (int64_t i = 0; i < dot_dnums.lhs_contracting_dimensions_size(); ++i) {
+      int64_t l = dot_dnums.lhs_contracting_dimensions(i);
+      int64_t r = dot_dnums.rhs_contracting_dimensions(i);
+      if (!divides_evenly(lhs, l) || !divides_evenly(rhs, r) ||
+          !divides_evenly(lhs_scale, l) || !divides_evenly(rhs_scale, r)) {
+        return DefaultAction(hlo);
+      }
+    }
+    lhs =
+        lhs.PadWithZeroOnSpecifiedDims(dot_dnums.lhs_contracting_dimensions());
+    rhs =
+        rhs.PadWithZeroOnSpecifiedDims(dot_dnums.rhs_contracting_dimensions());
+    lhs_scale = lhs_scale.PadWithZeroOnSpecifiedDims(
+        dot_dnums.lhs_contracting_dimensions());
+    rhs_scale = rhs_scale.PadWithZeroOnSpecifiedDims(
+        dot_dnums.rhs_contracting_dimensions());
+  }
+
+  // NVFP4 per-tensor scalar globals (operands 4,5) carry no block structure and
+  // no dot dims; replicate and pass them through unchanged.
+  std::vector<HloInstruction*> new_operands = {lhs.hlo(), rhs.hlo(),
+                                               lhs_scale.hlo(), rhs_scale.hlo()};
+  for (int64_t i = 4; i < hlo->operand_count(); ++i) {
+    new_operands.push_back(GetPartitionedHlo(hlo->operand(i))
+                               .Reshard(HloSharding::Replicate())
+                               .hlo());
+  }
+
+  // CloneWithNewOperands preserves the raw kScaledDot opcode + stored
+  // dot_dimension_numbers/precision_config, which the downstream
+  // ScaledDotRewriter dequant lowering requires.
+  Shape pshape = MakePartitionedShape(hlo->shape(), hlo->sharding());
+  HloInstruction* phlo =
+      b_.AddInstruction(hlo->CloneWithNewOperands(pshape, new_operands));
+
+  if (!sharded_lhs_contracting_dims.empty()) {
+    phlo = lhs.state().partitioner->AllReduceAlongShardingDims(
+        lhs.state().b, phlo, lhs.sharding(), lhs.state().next_channel_id,
+        sharded_lhs_contracting_dims, lhs.state().collective_ops_creator,
+        MakeBinaryAdd(phlo->shape().element_type(), lhs.state().module));
+  }
+
+  SetPartitionedHlo(hlo, phlo);
+  return absl::OkStatus();
+}
+
 HloInstruction* CreateAllReduceListsOfLists(
     int64_t num_replicas, int64_t num_partitions, SpmdBuilder* b,
     HloInstruction* operand, HloComputation* reduction,

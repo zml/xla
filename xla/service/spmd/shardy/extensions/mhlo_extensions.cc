@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 
 #include "absl/log/check.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -192,6 +193,165 @@ struct RaggedDotShardingRuleOpInterface
   }
 };
 
+// Sharding rule for `mhlo.scaled_dot` (block/group-scaled dot).
+//
+// Operand order is (lhs, rhs, lhs_scale, rhs_scale). The dot part behaves like
+// `dot_general`; the two scale operands share the dim order of their data
+// operand (the HLO verifier guarantees scale rank == data rank, and each data
+// dim is an integer multiple of the matching scale dim).
+//
+// For every dot factor covering a (lhsDim, rhsDim) pair we emit a shared
+// "group" factor across {lhs, rhs, matching real scale dims, result}. When a
+// scale block-scales the dim (its extent is a proper divisor of the data dim),
+// the group factor is sized to the block count (= scale extent) and an extra
+// data-only "block" factor of size data/blockCount is added and marked
+// kNeedReplication + isBlocked, so Shardy only ever shards that dim on
+// block-count boundaries and never splits a scale block across devices. A
+// scale extent of 1 along a dim is a broadcast (per-tensor along it): the data
+// dim can shard freely while the scale stays replicated.
+struct ScaledDotShardingRuleOpInterface
+    : public mlir::sdy::ShardingRuleOpInterface::ExternalModel<
+          ScaledDotShardingRuleOpInterface, mhlo::ScaledDotOp> {
+  mlir::sdy::OpShardingRuleAttr getShardingRule(mlir::Operation* op) const {
+    mhlo::ScaledDotOp scaledDot = llvm::cast<mhlo::ScaledDotOp>(op);
+    mhlo::DotDimensionNumbersAttr dimNumbers =
+        scaledDot.getDotDimensionNumbers();
+    ArrayRef<int64_t> lhsBatchingDims = dimNumbers.getLhsBatchingDimensions();
+    ArrayRef<int64_t> rhsBatchingDims = dimNumbers.getRhsBatchingDimensions();
+    ArrayRef<int64_t> lhsContractingDims =
+        dimNumbers.getLhsContractingDimensions();
+    ArrayRef<int64_t> rhsContractingDims =
+        dimNumbers.getRhsContractingDimensions();
+
+    mlir::RankedTensorType lhsType = scaledDot.getLhs().getType();
+    mlir::RankedTensorType rhsType = scaledDot.getRhs().getType();
+    auto lhsScaleType = llvm::dyn_cast<mlir::RankedTensorType>(
+        scaledDot.getLhsScale().getType());
+    auto rhsScaleType = llvm::dyn_cast<mlir::RankedTensorType>(
+        scaledDot.getRhsScale().getType());
+
+    const int64_t lhsRank = lhsType.getRank();
+    const int64_t rhsRank = rhsType.getRank();
+
+    OpShardingRuleBuilder builder(scaledDot);
+
+    // NVFP4 carries two trailing per-tensor scalar globals (operands 4,5) that
+    // are rank-0 and never participate in any factor (fully replicated).
+    // addFactor's operand array is zip_equal'd against the operand mappings, so
+    // it must cover every operand: pad with kNullDim when the globals are
+    // present.
+    const bool hasGlobals = !scaledDot.getGlobalScales().empty();
+    auto operandDims = [&](int64_t lhsDim, int64_t rhsDim, int64_t lhsScaleDim,
+                           int64_t rhsScaleDim) -> llvm::SmallVector<int64_t> {
+      llvm::SmallVector<int64_t> dims{lhsDim, rhsDim, lhsScaleDim, rhsScaleDim};
+      if (hasGlobals) {
+        dims.push_back(kNullDim);
+        dims.push_back(kNullDim);
+      }
+      return dims;
+    };
+
+    // Emits the shared group factor (and, for a genuinely blocked dim, a
+    // data-only block factor) for a single dot factor. `reduce` marks a
+    // contracting factor (kReduction, absent from the result).
+    auto addScaledFactor = [&](int64_t lhsDim, int64_t rhsDim, int64_t outDim,
+                               int64_t dataSize, bool reduce) {
+      int64_t groupSize = dataSize;
+      int64_t lhsScaleDim = kNullDim;
+      int64_t rhsScaleDim = kNullDim;
+      // A scale shares this factor only when it has real structure on the
+      // matching dim (1:1 when scaleSize == dataSize, or a genuine block when
+      // 1 < scaleSize and scaleSize divides dataSize).
+      auto consider = [&](mlir::RankedTensorType scaleType, int64_t dim,
+                          int64_t& scaleSlot) {
+        if (!scaleType || dim == kNullDim || dim >= scaleType.getRank()) {
+          return;
+        }
+        int64_t s = scaleType.getDimSize(dim);
+        if (s > 1 && dataSize % s == 0) {
+          // Both operands may block the same factor at different granularity
+          // (e.g. lhs per 32 elements, rhs per 16). The shared factor is then
+          // the coarsest split both agree on -- their gcd -- and each operand
+          // gets its own finer factor below. Taking either block count alone
+          // would over-shard the other operand.
+          groupSize = std::gcd(groupSize, s);
+          scaleSlot = dim;
+        }
+      };
+      // lhs_scale shares lhs's dim index; rhs_scale shares rhs's dim index.
+      consider(lhsScaleType, lhsDim, lhsScaleDim);
+      consider(rhsScaleType, rhsDim, rhsScaleDim);
+
+      FactorType groupType =
+          reduce ? FactorType::kReduction : FactorType::kPassThrough;
+      int64_t resultDim = reduce ? kNullDim : outDim;
+
+      // Shared group factor, at the granularity both scales agree on.
+      builder.addFactor(operandDims(lhsDim, rhsDim, lhsScaleDim, rhsScaleDim),
+                        resultDim, groupSize, groupType);
+
+      // Per-operand refinement: a scale that blocks this dim more finely than
+      // the shared factor keeps the remainder as its own never-sharded factor,
+      // so a shard can never fall inside one of its blocks. Derived from the
+      // operand, never hardcoded.
+      auto addScaleRefinement = [&](mlir::RankedTensorType scaleType,
+                                    int64_t dim, bool isLhs) {
+        if (!scaleType || dim == kNullDim || dim >= scaleType.getRank()) return;
+        const int64_t s = scaleType.getDimSize(dim);
+        if (s <= groupSize || s % groupSize != 0) return;
+        builder.addFactor(
+            operandDims(isLhs ? lhsDim : kNullDim, isLhs ? kNullDim : rhsDim,
+                        isLhs ? dim : kNullDim, isLhs ? kNullDim : dim),
+            resultDim, s / groupSize, FactorType::kNeedReplication,
+            /*isBlocked=*/true);
+      };
+      addScaleRefinement(lhsScaleType, lhsScaleDim, /*isLhs=*/true);
+      addScaleRefinement(rhsScaleType, rhsScaleDim, /*isLhs=*/false);
+
+      // Data-only block / minor factor: never shard across a scale block.
+      if (dataSize > groupSize) {
+        builder.addFactor(operandDims(lhsDim, rhsDim, kNullDim, kNullDim),
+                          resultDim, dataSize / groupSize,
+                          FactorType::kNeedReplication,
+                          /*isBlocked=*/true);
+      }
+    };
+
+    int64_t outputDim = 0;
+    // Batch dimensions.
+    for (auto [lhsDim, rhsDim] :
+         llvm::zip_equal(lhsBatchingDims, rhsBatchingDims)) {
+      addScaledFactor(lhsDim, rhsDim, outputDim++, lhsType.getDimSize(lhsDim),
+                      /*reduce=*/false);
+    }
+    // LHS non-contracting dimensions.
+    for (int64_t i = 0; i < lhsRank; ++i) {
+      if (!llvm::is_contained(lhsContractingDims, i) &&
+          !llvm::is_contained(lhsBatchingDims, i)) {
+        addScaledFactor(/*lhsDim=*/i, /*rhsDim=*/kNullDim, outputDim++,
+                        lhsType.getDimSize(i), /*reduce=*/false);
+      }
+    }
+    // RHS non-contracting dimensions.
+    for (int64_t i = 0; i < rhsRank; ++i) {
+      if (!llvm::is_contained(rhsContractingDims, i) &&
+          !llvm::is_contained(rhsBatchingDims, i)) {
+        addScaledFactor(/*lhsDim=*/kNullDim, /*rhsDim=*/i, outputDim++,
+                        rhsType.getDimSize(i), /*reduce=*/false);
+      }
+    }
+    // Contracting dimensions.
+    for (auto [lhsDim, rhsDim] :
+         llvm::zip_equal(lhsContractingDims, rhsContractingDims)) {
+      addScaledFactor(lhsDim, rhsDim, /*outDim=*/kNullDim,
+                      lhsType.getDimSize(lhsDim), /*reduce=*/true);
+    }
+
+
+    return builder.build();
+  }
+};
+
 struct TopKShardingRuleOpInterface
     : public mlir::sdy::ShardingRuleOpInterface::ExternalModel<
           TopKShardingRuleOpInterface, mhlo::TopKOp> {
@@ -362,6 +522,7 @@ void registerMhloExtensions(mlir::DialectRegistry& registry) {
   registry.addExtension(+[](mlir::MLIRContext* ctx, mhlo::MhloDialect*) {
     mhlo::CopyOp::attachInterface<CopyShardingRuleOpInterface>(*ctx);
     mhlo::RaggedDotOp::attachInterface<RaggedDotShardingRuleOpInterface>(*ctx);
+    mhlo::ScaledDotOp::attachInterface<ScaledDotShardingRuleOpInterface>(*ctx);
     mhlo::ScanOp::attachInterface<ScanShardingRuleOpInterface>(*ctx);
     mhlo::TopKOp::attachInterface<TopKShardingRuleOpInterface>(*ctx);
   });
