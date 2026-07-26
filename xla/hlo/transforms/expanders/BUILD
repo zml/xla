@@ -18,6 +18,20 @@ package_group(
 )
 
 cc_library(
+    name = "scaled_dot_global_scale_expander",
+    srcs = ["scaled_dot_global_scale_expander.cc"],
+    hdrs = ["scaled_dot_global_scale_expander.h"],
+    deps = [
+        ":op_expander_pass",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
     name = "op_expander_pass",
     srcs = ["op_expander_pass.cc"],
     hdrs = ["op_expander_pass.h"],

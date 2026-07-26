@@ -148,11 +148,15 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
   HloComputation* computation = dot->parent();
   HloInstruction* operand = dot->mutable_operand(operand_index);
   HloInstruction* scale = dot->mutable_operand(scale_index);
-  if (scale->shape().dimensions().empty()) {
-    // If the scale is a scalar, we don't need to do anything.
-    return operand;
-  }
   std::tie(operand, scale) = UpscaleBoth(operand, scale);
+  if (scale->shape().dimensions().empty()) {
+    // A rank-0 scale needs no broadcast dimensions, but it still needs the
+    // multiply: the operand holds quantized values either way.
+    HloInstruction* broadcasted_scale = computation->AddInstruction(
+        HloInstruction::CreateBroadcast(operand->shape(), scale, {}));
+    return computation->AddInstruction(HloInstruction::CreateBinary(
+        operand->shape(), HloOpcode::kMultiply, operand, broadcasted_scale));
+  }
   RETURN_IF_ERROR(CheckOperandAndScaleShapes(side, operand, scale));
   HloInstruction* broadcasted_scale =
       BroadcastAndReshape(scale, operand->shape(), computation);
@@ -184,11 +188,12 @@ absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
     dot_shape.set_element_type(GetTargetType(lhs->shape().element_type(),
                                              dot->shape().element_type()));
 
+    HloInstruction* dot_result =
+        computation->AddInstruction(HloInstruction::CreateDot(
+            dot_shape, lhs, rhs, dot->dot_dimension_numbers(),
+            dot->precision_config()));
     RETURN_IF_ERROR(dot->ReplaceAllUsesWith(
-        Convert(computation->AddInstruction(HloInstruction::CreateDot(
-                    dot_shape, lhs, rhs, dot->dot_dimension_numbers(),
-                    dot->precision_config())),
-                dot->shape().element_type())));
+        Convert(dot_result, dot->shape().element_type())));
     RETURN_IF_ERROR(computation->RemoveInstruction(dot));
   }
   return changed;

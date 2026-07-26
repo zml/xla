@@ -26,7 +26,33 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// This pass rewrites the composite a specific instruction.
+// Rewrites a `stablehlo.composite` call into the equivalent native HLO.
+//
+// Today that means the `xla.scaled_dot` composite -> kScaledDot. This composite
+// is the SINGLE supported carrier for block-scaled matmul in this fork: ZML
+// (zml/ops.zig scaledDot) emits it, this pass canonicalizes it, and everything
+// downstream consumes kScaledDot. The default floor is ScaledDotRewriter's
+// generic dequantize-and-Dot expansion (correct on every GPU backend). Optional
+// fused kernels, when a backend has them, claim a matched subset ahead of that
+// floor without changing this entry point.
+//
+// Deliberately NOT used here: the parallel `__op$block_scaled_dot` /
+// `__op$quantize` / `__op$dequantize` custom-call route handled by
+// BlockScalingRewriter. That route is upstream's JAX-facing entry point, is
+// registered only for NVPTX (nvptx_compiler.cc), and is MX-centric. We do not
+// emit into it and do not route through it; it is left untouched for upstream
+// CUDA/ROCm users rather than removed. What this pass produces instead is a
+// plain kScaledDot, which gpu_compiler.cc lowers through its ladder: a fused
+// backend arm, then Triton, then the generic dequant floor.
+//
+// Quantization schemes accepted (any operand/scale pair whose dimensions
+// divide cleanly). The primary ones ZML emits today:
+//   - FP8 128x128-block: f8e4m3fn weights + bf16/f32 scales [N/128, K/128]
+//   - FP8 per-channel:   f8e4m3fn weights + bf16/f32 scales [N, 1]
+//   - NVFP4 group-16:    f4e2m1fn weights + f8e4m3fn scales [N, K/16]
+// OCP microscaling (MX / e8m0 group-32) is also accepted and lowers through the
+// same dequantize floor. Widening acceptance here never risks correctness: an
+// operand/scale pair no fast path claims always falls through to that floor.
 class CompositeRewriter : public HloModulePass {
  public:
   absl::string_view name() const override { return "composite-rewriter"; }

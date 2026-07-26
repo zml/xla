@@ -29,8 +29,15 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// This pass rewrites ScaledDot instructions into a sequence of other HLO
-// instructions, including Convert, Broadcast, Reshape, Multiply, and Dot.
+// Generic dequantize-and-Dot expansion for kScaledDot.
+//
+// This is the correctness floor for every block-scaled scheme CompositeRewriter
+// accepts (FP8 128-block, FP8 per-channel, NVFP4 group-16, MX e8m0, ...), and
+// the last rung of the lowering ladder in gpu_compiler.cc: a fused backend arm
+// and then Triton each get a chance to claim a scaled-dot, and whatever neither
+// takes lands here and expands to Convert / Broadcast / Reshape / Multiply /
+// Dot. Registered unconditionally, so a scaled-dot can never reach codegen
+// unlowered.
 class ScaledDotRewriter : public HloModulePass {
  public:
   // If `extra_filter` is provided, only ScaledDot instructions for which
