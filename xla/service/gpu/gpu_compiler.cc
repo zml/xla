@@ -134,6 +134,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/rename_fusions.h"
 #include "xla/backends/gpu/transforms/sanitize_constant_names.h"
 #include "xla/backends/gpu/transforms/scalar_constant_sinker.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scan_rewriter.h"
 #include "xla/backends/gpu/transforms/scatter_determinism_expander.h"
@@ -187,6 +188,7 @@ limitations under the License.
 #include "xla/hlo/transforms/expanders/ragged_dot_rewriter.h"
 #include "xla/hlo/transforms/expanders/reduce_decomposer.h"
 #include "xla/hlo/transforms/expanders/reshape_decomposer.h"
+#include "xla/hlo/transforms/expanders/scaled_dot_global_scale_expander.h"
 #include "xla/hlo/transforms/expanders/rng_bit_generator_expander.h"
 #include "xla/hlo/transforms/expanders/rng_expander.h"
 #include "xla/hlo/transforms/expanders/stable_sort_expander.h"
@@ -765,6 +767,22 @@ absl::Status RunOptimizationPasses(
   }
   pipeline.AddPass<RaggedDotRewriter>(gpu_version,
                                       gpu_target_config.dnn_version_info);
+  // Claim the scaled-dots this backend has a fused kernel for (NVFP4 -> the
+  // cutlass fp4 custom call on sm120a), then let the Triton path and finally
+  // ScaledDotRewriter expand whatever is left generically. This runs post-SPMD,
+  // so each already-sharded kScaledDot becomes a per-shard fused call and
+  // tensor parallelism comes for free from the kScaledDot sharding rule.
+  //
+  // Unconditional: the arm matches a strict shape/type signature no other path
+  // handles better, and gating it on !scaled_dot_with_triton made it invisible
+  // whenever the Triton scaled-dot path was on (which is the default).
+  pipeline.AddPass<FusedScaledDotRewriter>(gpu_version);
+  // Tier 1.5: the backend arm above is the only consumer that reads the NVFP4
+  // per-tensor globals as operands. Strip them to explicit HLO now, so every
+  // pass after this point sees the long-standing four-operand op it already
+  // models -- instead of a wider one whose trailing operands it would drop in
+  // silence. Runs after SPMD, so the epilogue lands outside any all-reduce.
+  pipeline.AddPass<ScaledDotGlobalScaleExpander>();
   pipeline.AddPass<ScaledDotRewriter>([&compiler, &gpu_target_config](
                                           const HloInstruction* instr) {
     return !compiler.IsScaledDotSupportedByBackend(instr, gpu_target_config);
@@ -1639,6 +1657,19 @@ bool RequiresCollectiveScheduleLinearizer(const HloModule* module,
 bool GpuCompiler::IsScaledDotSupportedByBackend(
     const HloInstruction* instr,
     const GpuTargetConfig& gpu_target_config) const {
+  // An NVFP4 scaled-dot carries two per-tensor global scales as trailing
+  // operands. The Triton scaled-dot emitter models only the four-operand form
+  // and would silently ignore them, producing a result off by
+  // weight_global_scale (O(1e3)) -- i.e. garbage, with no error anywhere.
+  // Only an arm that explicitly consumes the globals (the cutlass fp4 arm in
+  // FusedScaledDotRewriter) may claim these; anything else must fall through
+  // to the generic dequant+Dot expansion in ScaledDotRewriter, which does
+  // apply them. Declining here is what makes that floor a real fallback.
+  if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
+    if (scaled_dot->has_global_scales()) {
+      return false;
+    }
+  }
   const DebugOptions& debug_options =
       instr->GetModule()->config().debug_options();
   const se::GpuComputeCapability& gpu_version =
@@ -2020,6 +2051,16 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<HoistFusedBitcasts>();
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
+
+    // Terminal rung of the scaled-dot ladder. Everything above it may decline:
+    // the backend arm on shape/type, Triton on codegen support, and the earlier
+    // ScaledDotRewriter only predicts Triton rather than observing it (it runs
+    // long before GemmFusion). This instance is unfiltered, so any scaled-dot
+    // still standing here -- including one Triton turned down after the
+    // prediction said otherwise -- is expanded to dequantize + dot. It emits
+    // only convert/broadcast/reshape/multiply/dot and its shape checks are the
+    // verifier's own invariants, so it cannot fail on a module that verifies.
+    pipeline.AddPass<ScaledDotRewriter>();
 
     // Rewrite GEMMs into custom calls.
     AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);

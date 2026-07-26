@@ -1525,6 +1525,15 @@ class GemmFusionVisitor : public DfsHloRewriteVisitor {
 
   absl::Status HandleScaledDot(HloInstruction* scaled_dot) override {
     CHECK_EQ(scaled_dot->opcode(), HloOpcode::kScaledDot);
+    // NVFP4 carries the two per-tensor global scales as trailing operands.
+    // Everything below fuses operands 0..3 by index, so fusing a wider
+    // scaled-dot would silently rebuild it without them and return a result off
+    // by weight_global_scale (O(1e3)) with no error anywhere. Leave those for
+    // the fused cutlass arm or the dequant floor, both of which do consume the
+    // globals.
+    if (scaled_dot->operand_count() > HloScaledDotInstruction::kOperands) {
+      return absl::OkStatus();
+    }
     HloComputation::Builder builder(
         absl::StrCat("fusion_", scaled_dot->name()));
 

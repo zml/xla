@@ -2693,6 +2693,27 @@ cc_library(
 )
 
 cc_library(
+    name = "fused_scaled_dot_rewriter",
+    srcs = ["fused_scaled_dot_rewriter.cc"],
+    hdrs = ["fused_scaled_dot_rewriter.h"],
+    deps = [
+        ":nvfp4_scale_swizzle",
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/tsl/platform:status_macros",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
     name = "scaled_dot_rewriter",
     srcs = ["scaled_dot_rewriter.cc"],
     hdrs = ["scaled_dot_rewriter.h"],
@@ -2713,15 +2734,30 @@ cc_library(
 )
 
 cc_library(
+    name = "nvfp4_scale_swizzle",
+    srcs = ["nvfp4_scale_swizzle.cc"],
+    hdrs = ["nvfp4_scale_swizzle.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "composite_rewriter",
     srcs = ["composite_rewriter.cc"],
     hdrs = ["composite_rewriter.h"],
     deps = [
+        ":nvfp4_scale_swizzle",
         "//xla:literal",
+        "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
+        "//xla/service:shape_inference",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
@@ -2729,6 +2765,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@llvm-project//mlir:AsmParser",
         "@llvm-project//mlir:IR",

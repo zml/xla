@@ -18,6 +18,7 @@ load("//third_party/compute_library:workspace.bzl", compute_library = "repo")
 load("//third_party/cpuinfo:workspace.bzl", cpuinfo = "repo")
 load("//third_party/cudnn_frontend:workspace.bzl", cudnn_frontend = "repo")
 load("//third_party/cutlass:workspace.bzl", cutlass = "repo")
+load("//third_party/cutlass4:workspace.bzl", cutlass4 = "repo")
 load("//third_party/dlpack:workspace.bzl", dlpack = "repo")
 load("//third_party/ducc:workspace.bzl", ducc = "repo")
 load("//third_party/eigen3:workspace.bzl", eigen3 = "repo")
@@ -129,6 +130,7 @@ def _initialize_third_party():
     uv()
     xnnpack()
     cutlass()
+    cutlass4()
 
     # copybara: tsl vendor
 

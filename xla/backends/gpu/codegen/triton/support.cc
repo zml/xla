@@ -610,6 +610,14 @@ CodegenDecision IsTritonSupportedScaledDot(
     const HloScaledDotInstruction& dot,
     const se::GpuComputeCapability& gpu_version) {
   CHECK_GE(dot.operand_count(), 4);
+  // This emitter models only the four-operand form. NVFP4 additionally carries
+  // the two per-tensor global scales as trailing operands; claiming such a dot
+  // here would drop them silently and yield a result off by
+  // weight_global_scale, with no error raised anywhere.
+  if (dot.operand_count() > HloScaledDotInstruction::kOperands) {
+    return CodegenDecision::Forbid(
+        "Scaled dot with per-tensor global scales is not supported.");
+  }
   PrimitiveType lhs_type = dot.operand(0)->shape().element_type();
   PrimitiveType rhs_type = dot.operand(1)->shape().element_type();
   std::vector<PrimitiveType> supported_types = {F8E4M3FN, F4E2M1FN, F8E5M2,

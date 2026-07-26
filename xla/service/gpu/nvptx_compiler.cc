@@ -287,6 +287,11 @@ bool NVPTXCompiler::IsScaledDotSupportedByBackend(
     return true;
   }
   if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
+    // cuDNN has no representation for the NVFP4 per-tensor globals either --
+    // see GpuCompiler::IsScaledDotSupportedByBackend.
+    if (scaled_dot->has_global_scales()) {
+      return false;
+    }
     return CudnnScaledDotHelper::IsSupported(scaled_dot);
   }
   return false;

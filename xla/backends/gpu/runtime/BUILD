@@ -4949,6 +4949,7 @@ cc_library(
     srcs = ["runtime_intrinsics.cc"],
     hdrs = ["runtime_intrinsics.h"],
     deps = [
+        "//xla/backends/gpu/fp4spike:cutlass_fp4_ffi",  # registers cutlass$fp4_mm
         "//xla:literal",
         "//xla:shape_util",
         "//xla:util",
