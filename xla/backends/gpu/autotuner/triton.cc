@@ -202,7 +202,11 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
 
   const bool exhaustive_search =
       debug_options().xla_gpu_exhaustive_tiling_search();
-  for (int block_m = 128; block_m <= 256; block_m *= 2) {
+  // Start block_m at 16 (the mma.sync m16 minimum) so decode (thin-M, e.g.
+  // num_tokens=16) isn't force-padded into a 128-row MMA tile. Large-M prefill
+  // still autotunes to 128/256; the small-M decode fusions can pick 16/32/64,
+  // which removes the ~8x padding waste in the dominant nvfp4 scaled-dot.
+  for (int block_m = 16; block_m <= 256; block_m *= 2) {
     for (int block_n = 16; block_n <= 256; block_n *= 2) {
       for (int block_k = 128; block_k <= 256; block_k *= 2) {
         // TODO(b/436988479): fine tune the search space.
@@ -215,15 +219,22 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
           continue;
         }
 
-        auto config = std::make_unique<BackendConfig>();
-        *config->mutable_triton() = TritonGemmConfig(block_m, block_n,
-                                                     /*block_k=*/block_k,
-                                                     /*num_stages=*/1,
-                                                     /*num_warps=*/4,
-                                                     /*num_ctas=*/1,
-                                                     /*is_tma_allowed=*/false)
-                                        .ToProto();
-        configs.push_back(std::move(config));
+        // Explore software-pipelining depth (num_stages) and warp count: the
+        // dominant nvfp4 scaled-dot decode matmuls are memory-bound, and with
+        // num_stages=1 the weight-load latency is not hidden. Let the autotuner
+        // pick; large-K projections benefit from more stages/warps.
+        for (int num_stages = 1; num_stages <= 4; ++num_stages) {
+          for (int num_warps = 4; num_warps <= 8; num_warps *= 2) {
+            auto config = std::make_unique<BackendConfig>();
+            *config->mutable_triton() =
+                TritonGemmConfig(block_m, block_n,
+                                 /*block_k=*/block_k, num_stages, num_warps,
+                                 /*num_ctas=*/1,
+                                 /*is_tma_allowed=*/false)
+                    .ToProto();
+            configs.push_back(std::move(config));
+          }
+        }
       }
     }
   }
