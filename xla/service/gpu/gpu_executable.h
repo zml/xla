@@ -393,6 +393,18 @@ class GpuExecutable : public Executable {
 
   std::vector<ConstantInfo> constants_;
   std::unique_ptr<GpuModuleGlobals> module_globals_;
+
+  // Vulkan-only constant globals. Vulkan has no CUDA module/symbol table, so
+  // its constants are allocated and initialized directly in
+  // ResolveConstantGlobals (GpuModuleGlobals above handles the CUDA path) and
+  // cached here per executor.
+  absl::Mutex vulkan_module_mutex_;
+  absl::flat_hash_map<se::StreamExecutor*,
+                      std::unique_ptr<BufferAllocToDeviceMemoryMap>>
+      vulkan_module_globals_ ABSL_GUARDED_BY(vulkan_module_mutex_);
+  absl::flat_hash_map<se::StreamExecutor*, std::vector<se::DeviceAddressBase>>
+      vulkan_constant_allocations_ ABSL_GUARDED_BY(vulkan_module_mutex_);
+
   const absl::flat_hash_map<ShapeIndex, OutputInfo> output_info_;
   bool enable_debug_info_manager_;
   std::unique_ptr<GpuExecutableBufferAllocator> buffer_allocator_;

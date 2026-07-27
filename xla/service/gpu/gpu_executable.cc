@@ -502,6 +502,19 @@ GpuExecutable::GpuExecutable(
 }
 
 GpuExecutable::~GpuExecutable() {
+  // Free the Vulkan constant globals allocated directly in
+  // ResolveConstantGlobals. The CUDA path's module handles and globals are
+  // owned by GpuModuleGlobals.
+  {
+    absl::MutexLock lock(&vulkan_module_mutex_);
+    for (auto& [executor, allocations] : vulkan_constant_allocations_) {
+      for (se::DeviceAddressBase& allocation : allocations) {
+        executor->Deallocate(&allocation);
+      }
+    }
+    vulkan_constant_allocations_.clear();
+  }
+
   if (has_module() && enable_debug_info_manager_) {
     XlaDebugInfoManager::Get()->UnregisterModule(module().unique_id());
   }
@@ -992,6 +1005,72 @@ absl::Status BarrierAfterExecutable(
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>
 GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
+  se::StreamExecutor* executor = stream->parent();
+
+  if (executor->GetPlatform()->id() == se::vulkan::kVulkanPlatformId) {
+    // Vulkan kernels load their SPIR-V through KernelLoaderSpec and there is no
+    // separate module or symbol table for constant globals. Allocate and
+    // initialize each constant directly, then cache the result per executor.
+    absl::MutexLock lock(vulkan_module_mutex_);
+    if (auto it = vulkan_module_globals_.find(executor);
+        it != vulkan_module_globals_.end()) {
+      return it->second.get();
+    }
+
+    auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
+    std::vector<se::DeviceAddressBase>& owned_allocations =
+        vulkan_constant_allocations_[executor];
+    bool submitted_mem_copies = false;
+
+    for (const ConstantInfo& info : constants_) {
+      if (info.allocation_index == -1) {
+        continue;
+      }
+
+      absl::Span<const BufferAllocation* const> allocations = GetAllocations();
+      if (info.allocation_index < 0 ||
+          info.allocation_index >= allocations.size()) {
+        return absl::InternalError(absl::StrCat(
+            "Vulkan constant global ", info.symbol_name,
+            " has invalid allocation index ", info.allocation_index));
+      }
+
+      uint64_t allocation_size = allocations[info.allocation_index]->size();
+      uint64_t content_size = info.content.span().size();
+      uint64_t size = content_size == 0 ? allocation_size : content_size;
+      if (size == 0) {
+        CHECK(globals
+                  ->emplace(info.allocation_index,
+                            se::DeviceAddressBase(nullptr, 0))
+                  .second);
+        continue;
+      }
+
+      se::DeviceAddressBase global =
+          executor->Allocate(size, /*memory_space=*/0);
+      if (global.opaque() == nullptr) {
+        return absl::InternalError(absl::StrCat(
+            "Failed to allocate Vulkan constant global ", info.symbol_name));
+      }
+      owned_allocations.push_back(global);
+
+      if (content_size == 0) {
+        RETURN_IF_ERROR(stream->MemZero(&global, size));
+      } else {
+        RETURN_IF_ERROR(
+            stream->Memcpy(&global, info.content.span().data(), content_size));
+      }
+      submitted_mem_copies = true;
+      CHECK(globals->emplace(info.allocation_index, global).second);
+    }
+
+    if (submitted_mem_copies) {
+      CHECK_OK(stream->BlockHostUntilDone());
+    }
+    return vulkan_module_globals_.emplace(executor, std::move(globals))
+        .first->second.get();
+  }
+
   return module_globals_->Resolve(stream);
 }
 

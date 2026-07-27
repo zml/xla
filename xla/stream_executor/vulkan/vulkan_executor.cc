@@ -1164,8 +1164,13 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   shader_info.codeSize = spirv->spirv_bytes.size();
   shader_info.pCode =
       reinterpret_cast<const uint32_t*>(spirv->spirv_bytes.data());
+  LOG(INFO) << "Vulkan kernel " << kernel->name()
+            << ": creating shader module from " << shader_info.codeSize
+            << " SPIR-V bytes";
   RETURN_IF_VK_ERROR(impl_->vkCreateShaderModule(
       impl_->device, &shader_info, nullptr, &kernel->shader_module_));
+  LOG(INFO) << "Vulkan kernel " << kernel->name()
+            << ": shader module created";
 
   std::vector<VkDescriptorSetLayoutBinding> layout_bindings;
   layout_bindings.reserve(kernel->bindings_.size());
@@ -1202,9 +1207,13 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   pipeline_info.stage.module = kernel->shader_module_;
   pipeline_info.stage.pName = kernel->name().data();
   pipeline_info.layout = kernel->pipeline_layout_;
+  LOG(INFO) << "Vulkan kernel " << kernel->name()
+            << ": creating compute pipeline";
   RETURN_IF_VK_ERROR(impl_->vkCreateComputePipelines(
       impl_->device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
       &kernel->pipeline_));
+  LOG(INFO) << "Vulkan kernel " << kernel->name()
+            << ": compute pipeline created";
 
   if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
           spec.kernel_args_packing())) {
