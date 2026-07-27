@@ -95,7 +95,7 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
       workspaceBytes, stream, occupancy)
 
 // Helper macro to dispatch with scheduler check.
-// FI_FP4_NO_STREAMK (defined by the xla fp4spike build) drops the StreamK path
+// FI_FP4_NO_STREAMK (defined by the xla nvfp4 build) drops the StreamK path
 // so we don't compile the StreamK GemmUniversalAdapter for every tile — halves
 // the instantiation count. StreamK rarely wins for the thin-M decode GEMV.
 #ifdef FI_FP4_NO_STREAMK

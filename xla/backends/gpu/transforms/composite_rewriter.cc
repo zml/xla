@@ -148,176 +148,174 @@ absl::Status ValidateDotShape(const HloCallInstruction& call,
   return absl::OkStatus();
 }
 
+// Accepts FP8 / NVFP4 / MX block-or-channel scales, and the identity bf16
+// activation scale used by weight-only forms.
+bool IsSupportedScaledOperand(const HloInstruction* operand,
+                              const HloInstruction* scale) {
+  const PrimitiveType op_type = operand->shape().element_type();
+  const PrimitiveType scale_type = scale->shape().element_type();
+  if (op_type == F8E4M3FN || op_type == F8E5M2 || op_type == F4E2M1FN) {
+    if (scale_type != F8E8M0FNU && scale_type != F8E4M3FN &&
+        scale_type != BF16 && scale_type != F32) {
+      return false;
+    }
+    if (scale->shape().dimensions().empty()) {
+      return true;  // scalar scale
+    }
+    if (scale->shape().dimensions().size() !=
+        operand->shape().dimensions().size()) {
+      return false;
+    }
+    // Every scale dim must divide the matching operand dim (block-128, NVFP4
+    // group-16, MX group-32, per-channel, ...).
+    for (int64_t d = 0; d < operand->shape().dimensions().size(); ++d) {
+      const int64_t o = operand->shape().dimensions(d);
+      const int64_t s = scale->shape().dimensions(d);
+      if (s == 0 || o % s != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (op_type == BF16 && scale_type == BF16) {
+    if (scale->shape().dimensions().size() !=
+        operand->shape().dimensions().size()) {
+      return false;
+    }
+    for (int64_t dim : scale->shape().dimensions()) {
+      if (dim != 1) return false;
+    }
+    return scale->opcode() == HloOpcode::kConstant &&
+           scale->literal().IsAllFloat(1.0);
+  }
+  return false;
+}
+
+// Resolve a blocked [N/128, kg/4, 512] rhs scale to natural [N, kg] in place on
+// the call. No-op when the scale is already natural. Defined at the composite
+// boundary so kScaledDot never sees the SF layout, while MatchNvfp4ScaleUnswizzle
+// can still recover the blocked buffer for fused arms.
+absl::Status MaybeUnswizzleRhsScale(HloCallInstruction* call) {
+  if (call->operand(3)->shape().dimensions().size() != 3 ||
+      call->operand(1)->shape().dimensions().size() != 2) {
+    return absl::OkStatus();
+  }
+  const Shape& rhs = call->operand(1)->shape();
+  const int64_t n = rhs.dimensions(0);
+  const Shape& sf = call->operand(3)->shape();
+  const int64_t kg = sf.dimensions(1) * kSfGroupsPerBlock;
+  if (rhs.dimensions(1) % kg != 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "xla.scaled_dot: blocked rhs_scale ", sf.ToString(),
+        " does not divide the contracting dimension of ", rhs.ToString()));
+  }
+  HloInstruction* natural =
+      EmitNvfp4ScaleUnswizzle(call->mutable_operand(3), n, kg);
+  if (natural == nullptr) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "xla.scaled_dot: rhs_scale ", sf.ToString(),
+        " is rank-3 but not a valid [N/128, kg/4, 512] block scale for ",
+        rhs.ToString()));
+  }
+  return call->ReplaceOperandWithDifferentShape(3, natural);
+}
+
+// Rewrite one xla.scaled_dot composite call into kScaledDot.
+// Returns true if the call was rewritten; false if this is not our composite
+// or the form is unsupported (left for other passes). Errors on malformed
+// composites that claim to be xla.scaled_dot.
+absl::StatusOr<bool> TryRewriteScaledDotComposite(HloComputation* computation,
+                                                  HloCallInstruction* call) {
+  if (!call->is_composite()) return false;
+  if (!call->has_frontend_attributes()) {
+    VLOG(3) << "No frontend attributes";
+    return false;
+  }
+  const auto& frontend_attrs = call->frontend_attributes().map();
+  constexpr char kNameKey[] = "composite.name";
+  auto name = frontend_attrs.find(kNameKey);
+  if (name == frontend_attrs.end()) {
+    VLOG(3) << kNameKey << " is not set";
+    return false;
+  }
+  if (name->second != "xla.scaled_dot") {
+    VLOG(3) << kNameKey << " is not xla.scaled_dot: " << name->second;
+    return false;
+  }
+  if (!frontend_attrs.contains("composite.attributes")) {
+    return absl::InvalidArgumentError(
+        "composite.attributes is not set for xla.scaled_dot");
+  }
+  const bool with_globals =
+      call->operand_count() == HloScaledDotInstruction::kOperandsWithGlobals;
+  if (call->operand_count() != HloScaledDotInstruction::kOperands &&
+      !with_globals) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "xla.scaled_dot composite expects ",
+        HloScaledDotInstruction::kOperands, " or ",
+        HloScaledDotInstruction::kOperandsWithGlobals, " operands, got ",
+        call->operand_count()));
+  }
+
+  RETURN_IF_ERROR(MaybeUnswizzleRhsScale(call));
+
+  ASSIGN_OR_RETURN(
+      DotDimensionNumbers dnums,
+      ParseDimensionNumbers(frontend_attrs.at("composite.attributes")));
+  RETURN_IF_ERROR(ValidateDotShape(*call, dnums));
+
+  if (dnums.lhs_contracting_dimensions_size() != 1 ||
+      dnums.rhs_contracting_dimensions_size() != 1 ||
+      dnums.lhs_batch_dimensions_size() > 1 ||
+      dnums.rhs_batch_dimensions_size() > 1) {
+    LOG(ERROR) << "Unsupported dimension numbers: " << dnums.DebugString();
+    return false;
+  }
+
+  if (!IsSupportedScaledOperand(call->operand(0), call->operand(2)) ||
+      !IsSupportedScaledOperand(call->operand(1), call->operand(3))) {
+    return false;
+  }
+  if (ShapeUtil::IsScalar(call->operand(2)->shape()) &&
+      ShapeUtil::IsScalar(call->operand(3)->shape())) {
+    return absl::InvalidArgumentError(
+        "xla.scaled_dot requires at least one non-scalar scale");
+  }
+
+  PrecisionConfig precision{};
+  precision.mutable_operand_precision()->Resize(2, PrecisionConfig::DEFAULT);
+  auto* scaled_dot =
+      computation->AddInstruction(HloInstruction::CreateScaledDot(
+          call->shape(), call->mutable_operand(0), call->mutable_operand(1),
+          call->mutable_operand(2), call->mutable_operand(3), dnums, precision,
+          with_globals ? call->mutable_operand(4) : nullptr,
+          with_globals ? call->mutable_operand(5) : nullptr));
+  call->SetupDerivedInstruction(scaled_dot);
+  TF_ASSIGN_OR_RETURN(
+      bool replaced,
+      computation->ReplaceInstruction(call, scaled_dot,
+                                      /*preserve_sharding=*/true,
+                                      /*relay_control_dependency=*/true));
+  if (!replaced) {
+    return absl::InternalError(
+        "failed to replace xla.scaled_dot composite call");
+  }
+  return true;
+}
+
 }  // namespace
 
 absl::StatusOr<bool> CompositeRewriter::RewriteComputation(
     HloComputation* computation) {
   bool changed = false;
   for (HloInstruction* instruction : computation->MakeInstructionPostOrder()) {
-    if (instruction->opcode() != HloOpcode::kCall) {
-      continue;
-    }
-    auto call = Cast<HloCallInstruction>(instruction);
-    if (!call->is_composite()) {
-      continue;
-    }
-    if (!call->has_frontend_attributes()) {
-      VLOG(3) << "No frontend attributes";
-      continue;
-    }
-    const auto& frontend_attrs = call->frontend_attributes().map();
-    constexpr char key[] = "composite.name";
-    auto name = frontend_attrs.find(key);
-    if (name == frontend_attrs.end()) {
-      VLOG(3) << key << " is not set";
-      continue;
-    }
-    if (name->second != "xla.scaled_dot") {
-      VLOG(3) << key << " is not xla.scaled_dot: " << name->second;
-      continue;
-    }
-    if (!frontend_attrs.contains("composite.attributes")) {
-      return absl::InvalidArgumentError(
-          "composite.attributes is not set for xla.scaled_dot");
-    }
-    const bool with_globals =
-        call->operand_count() == HloScaledDotInstruction::kOperandsWithGlobals;
-    if (call->operand_count() != HloScaledDotInstruction::kOperands &&
-        !with_globals) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "xla.scaled_dot composite expects ",
-          HloScaledDotInstruction::kOperands, " or ",
-          HloScaledDotInstruction::kOperandsWithGlobals, " operands, got ",
-          call->operand_count()));
-    }
-    // Operand 3 may arrive in either spelling. The blocked
-    // [N/128, kg/4, 512] form is the hardware SF layout; resolve it here, at
-    // the boundary, so the op itself is always defined on the natural [N, kg]
-    // scale and no pass downstream needs to know the layout exists. A backend
-    // arm that wants the swizzled bytes matches the chain back
-    // (MatchNvfp4ScaleUnswizzle); everything else just sees reshape/transpose.
-    if (call->operand(3)->shape().dimensions().size() == 3 &&
-        call->operand(1)->shape().dimensions().size() == 2) {
-      const Shape& rhs = call->operand(1)->shape();
-      const int64_t n = rhs.dimensions(0);
-      const Shape& sf = call->operand(3)->shape();
-      const int64_t kg = sf.dimensions(1) * kSfGroupsPerBlock;
-      if (rhs.dimensions(1) % kg != 0) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "xla.scaled_dot: blocked rhs_scale ", sf.ToString(),
-            " does not divide the contracting dimension of ", rhs.ToString()));
-      }
-      HloInstruction* natural =
-          EmitNvfp4ScaleUnswizzle(call->mutable_operand(3), n, kg);
-      if (natural == nullptr) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "xla.scaled_dot: rhs_scale ", sf.ToString(),
-            " is rank-3 but not a valid [N/128, kg/4, 512] block scale for ",
-            rhs.ToString()));
-      }
-      RETURN_IF_ERROR(call->ReplaceOperandWithDifferentShape(3, natural));
-    }
-
+    if (instruction->opcode() != HloOpcode::kCall) continue;
     ASSIGN_OR_RETURN(
-        DotDimensionNumbers dot_dimension_numbers,
-        ParseDimensionNumbers(frontend_attrs.at("composite.attributes")));
-
-    RETURN_IF_ERROR(ValidateDotShape(*call, dot_dimension_numbers));
-
-    if (dot_dimension_numbers.lhs_contracting_dimensions_size() != 1 ||
-        dot_dimension_numbers.rhs_contracting_dimensions_size() != 1 ||
-        dot_dimension_numbers.lhs_batch_dimensions_size() > 1 ||
-        dot_dimension_numbers.rhs_batch_dimensions_size() > 1) {
-      LOG(ERROR) << "Unsupported dimension numbers: "
-                 << dot_dimension_numbers.DebugString();
-      continue;
-    }
-
-    const HloInstruction* lhs = call->operand(0);
-    const HloInstruction* rhs = call->operand(1);
-    const HloInstruction* lhs_scale = call->operand(2);
-    const HloInstruction* rhs_scale = call->operand(3);
-
-    auto is_supported = [&](const HloInstruction* operand,
-                            const HloInstruction* scale) {
-      auto op_type = operand->shape().element_type();
-      auto scale_type = scale->shape().element_type();
-      if (op_type == F8E4M3FN || op_type == F8E5M2 || op_type == F4E2M1FN) {
-        if (scale_type != F8E8M0FNU && scale_type != F8E4M3FN &&
-            scale_type != BF16 && scale_type != F32) {
-          return false;
-        }
-
-        // scalar
-        if (scale->shape().dimensions().empty()) {
-          return true;
-        }
-
-        if (scale->shape().dimensions().size() !=
-            operand->shape().dimensions().size()) {
-          return false;
-        }
-
-        // Every scale dimension must divide the matching operand dimension
-        // (block-128, group-16 NVFP4, group-32 MX, per-channel, ...).
-        for (int64_t d = 0; d < operand->shape().dimensions().size(); ++d) {
-          int64_t o = operand->shape().dimensions(d);
-          int64_t s = scale->shape().dimensions(d);
-          if (s == 0 || o % s != 0) {
-            return false;
-          }
-        }
-
-        return true;
-      }
-
-      if (op_type == BF16 && scale_type == BF16) {
-        if (scale->shape().dimensions().size() !=
-            operand->shape().dimensions().size()) {
-          return false;
-        }
-        for (int64_t dim : scale->shape().dimensions()) {
-          if (dim != 1) {
-            return false;
-          }
-        }
-        if (scale->opcode() != HloOpcode::kConstant) {
-          return false;
-        }
-        return scale->literal().IsAllFloat(1.0);
-      }
-      return false;
-    };
-
-    if (!is_supported(lhs, lhs_scale) || !is_supported(rhs, rhs_scale)) {
-      continue;
-    }
-    if (ShapeUtil::IsScalar(lhs_scale->shape()) &&
-        ShapeUtil::IsScalar(rhs_scale->shape())) {
-      return absl::InvalidArgumentError(
-          "xla.scaled_dot requires at least one non-scalar scale");
-    }
-
-    PrecisionConfig precision{};
-    precision.mutable_operand_precision()->Resize(2, PrecisionConfig::DEFAULT);
-    auto* scaled_dot =
-        computation->AddInstruction(HloInstruction::CreateScaledDot(
-            call->shape(), call->mutable_operand(0), call->mutable_operand(1),
-            call->mutable_operand(2), call->mutable_operand(3),
-            dot_dimension_numbers, precision,
-            with_globals ? call->mutable_operand(4) : nullptr,
-            with_globals ? call->mutable_operand(5) : nullptr));
-    call->SetupDerivedInstruction(scaled_dot);
-    TF_ASSIGN_OR_RETURN(
-        bool replaced,
-        computation->ReplaceInstruction(
-            call, scaled_dot, /*preserve_sharding=*/true,
-            /*relay_control_dependency=*/true));
-    if (!replaced) {
-      return absl::InternalError(
-          "failed to replace xla.scaled_dot composite call");
-    }
-    changed = true;
+        bool rewritten,
+        TryRewriteScaledDotComposite(computation,
+                                     Cast<HloCallInstruction>(instruction)));
+    changed |= rewritten;
   }
   return changed;
 }
