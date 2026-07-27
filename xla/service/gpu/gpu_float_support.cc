@@ -178,12 +178,37 @@ bool GpuFloatSupport::IsSupported(const HloInstruction& hlo) const {
       return false;
     }
     // Reduction.
-    case HloOpcode::kReduce:
+    case HloOpcode::kReduce: {
+      if (LowPrecisionType() == BF16) {
+        if (const auto* vulkan_capability =
+                compute_capability_.vulkan_compute_capability()) {
+          if (!vulkan_capability->shader_bfloat16() ||
+              !vulkan_capability->storage_buffer_16bit_access()) {
+            return false;
+          }
+          return absl::c_all_of(
+              hlo.called_computations().front()->instructions(),
+              [](const HloInstruction* instruction) {
+                switch (instruction->opcode()) {
+                  case HloOpcode::kParameter:
+                  case HloOpcode::kCompare:
+                  case HloOpcode::kSelect:
+                  case HloOpcode::kAnd:
+                  case HloOpcode::kOr:
+                  case HloOpcode::kTuple:
+                    return true;
+                  default:
+                    return false;
+                }
+              });
+        }
+      }
       return absl::c_all_of(hlo.called_computations().front()->instructions(),
                             [this](const HloInstruction* hlo) {
                               return hlo->opcode() == HloOpcode::kParameter ||
                                      this->IsSupported(*hlo);
                             });
+    }
     // Sort
     case HloOpcode::kSort:
       VLOG(10) << "Sort: " << hlo.ToString();
