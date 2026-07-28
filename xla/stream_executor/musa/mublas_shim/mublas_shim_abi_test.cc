@@ -39,6 +39,7 @@ static_assert(sizeof(XlaMusaMuBlasOperation) == 4);
 static_assert(sizeof(XlaMusaMuBlasCapabilities) == 8);
 static_assert(sizeof(XlaMusaMuBlasAlgorithm) == 4);
 static_assert(sizeof(XlaMusaMuBlasAdvancedCapabilities) == 8);
+static_assert(sizeof(XlaMusaMuBlasScalType) == 4);
 static_assert(std::is_standard_layout_v<XlaMusaMuBlasApiV1>);
 static_assert(std::is_standard_layout_v<XlaMusaMuBlasApiV2>);
 
@@ -56,7 +57,7 @@ TEST(MuBlasShimAbiTest, HasStableElf64Layout) {
   EXPECT_EQ(XLA_MUSA_MUBLAS_API_V1_MIN_STRUCT_SIZE, sizeof(XlaMusaMuBlasApiV1));
 }
 
-TEST(MuBlasShimAbiTest, V2HasStableElf64LayoutWithoutChangingV1) {
+TEST(MuBlasShimAbiTest, V2AppendsScalWithoutChangingRequiredPrefixOrV1) {
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, struct_size), 0);
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, abi_version), 4);
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, capabilities), 8);
@@ -70,8 +71,11 @@ TEST(MuBlasShimAbiTest, V2HasStableElf64LayoutWithoutChangingV1) {
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_with_algorithm), 72);
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_batched), 80);
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_strided_batched), 88);
-  EXPECT_EQ(sizeof(XlaMusaMuBlasApiV2), 96);
-  EXPECT_EQ(XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE, sizeof(XlaMusaMuBlasApiV2));
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, scal), 96);
+  EXPECT_EQ(sizeof(XlaMusaMuBlasApiV2), 104);
+  EXPECT_EQ(XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE, 96);
+  EXPECT_EQ(XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE,
+            sizeof(XlaMusaMuBlasApiV2));
   EXPECT_EQ(sizeof(XlaMusaMuBlasApiV1), 56);
 }
 
@@ -106,7 +110,17 @@ TEST(MuBlasShimAbiTest, V2AlgorithmsAndCapabilitiesAreNormalized) {
   EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE,
             UINT64_C(16));
   EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32, UINT64_C(32));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL, UINT64_C(64));
   EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2, UINT64_C(63));
+}
+
+TEST(MuBlasShimAbiTest, ScalRoutesAreNormalizedAndStable) {
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_F32, UINT32_C(1));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_F64, UINT32_C(2));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_C64, UINT32_C(3));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_C128, UINT32_C(4));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32, UINT32_C(5));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64, UINT32_C(6));
 }
 
 TEST(MuBlasShimAbiTest, ConvertsF32ScalarsToF16WithIeeeRounding) {

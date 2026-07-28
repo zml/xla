@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/gpu/host_callback_registry.h"
 #include "xla/stream_executor/kernel.h"
@@ -115,6 +116,8 @@ class MusaExecutor : public gpu::GpuExecutor {
 
   blas::BlasSupport* AsBlas() override;
 
+  fft::FftSupport* AsFft() override;
+
   gpu::HostCallbackRegistry* host_callback_registry() const {
     return host_callback_registry_.get();
   }
@@ -134,6 +137,7 @@ class MusaExecutor : public gpu::GpuExecutor {
 
   mutable absl::Mutex support_mu_;
   std::unique_ptr<blas::BlasSupport> blas_ ABSL_GUARDED_BY(support_mu_);
+  std::unique_ptr<fft::FftSupport> fft_ ABSL_GUARDED_BY(support_mu_);
 
   mutable absl::Mutex alive_streams_mu_;
   absl::flat_hash_map<void*, Stream*> alive_streams_

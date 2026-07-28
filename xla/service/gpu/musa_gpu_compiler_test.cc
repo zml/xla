@@ -50,6 +50,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_mufft_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 
 namespace xla::gpu {
@@ -278,6 +279,94 @@ ENTRY main {
   ASSERT_EQ(libraries.size(), 1);
   EXPECT_EQ(libraries[0].fingerprint(),
             stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2);
+}
+
+TEST(MusaGpuCompilerTest, ForwardFftRequiresExactMufftFingerprint) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mufft_forward_envelope
+
+ENTRY main {
+  input = c64[8]{0} parameter(0)
+  ROOT result = c64[8]{0} fft(input), fft_type=FFT, fft_length={8}
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 1);
+  EXPECT_EQ(libraries[0].name(),
+            stream_executor::musa::kMusaMuFftLibraryAbiName);
+  EXPECT_EQ(libraries[0].abi_version(),
+            stream_executor::musa::kMusaMuFftLibraryAbiVersion);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuFftAbiFingerprintV1);
+}
+
+TEST(MusaGpuCompilerTest, InverseFftRequiresMufftAndScalFingerprints) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mufft_inverse_envelope
+
+ENTRY main {
+  input = c128[4,8]{1,0} parameter(0)
+  ROOT result = c128[4,8]{1,0} fft(input), fft_type=IFFT,
+    fft_length={4,8}
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 2);
+  EXPECT_EQ(libraries[0].name(),
+            stream_executor::musa::kMusaMuBlasScalLibraryAbiName);
+  EXPECT_EQ(libraries[0].abi_version(),
+            stream_executor::musa::kMusaMuBlasScalLibraryAbiVersion);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuBlasScalAbiFingerprintV1);
+  EXPECT_EQ(libraries[1].name(),
+            stream_executor::musa::kMusaMuFftLibraryAbiName);
+  EXPECT_EQ(libraries[1].fingerprint(),
+            stream_executor::musa::kMusaMuFftAbiFingerprintV1);
+}
+
+TEST(MusaGpuCompilerTest, CombinedGemmAndFftRequirementsAreCanonical) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mublas_mufft_envelope
+
+ENTRY main {
+  lhs = f32[2,2]{1,0} parameter(0)
+  rhs = f32[2,2]{1,0} parameter(1)
+  gemm = f32[2,2]{1,0} custom-call(lhs, rhs),
+    custom_call_target="__mublas$gemm"
+  fft_input = c64[8]{0} parameter(2)
+  transformed = c64[8]{0} fft(fft_input), fft_type=IFFT, fft_length={8}
+  ROOT result = (f32[2,2]{1,0}, c64[8]{0}) tuple(gemm, transformed)
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 3);
+  EXPECT_EQ(libraries[0].name(),
+            stream_executor::musa::kMusaMuBlasLibraryAbiName);
+  EXPECT_EQ(libraries[1].name(),
+            stream_executor::musa::kMusaMuBlasScalLibraryAbiName);
+  EXPECT_EQ(libraries[2].name(),
+            stream_executor::musa::kMusaMuFftLibraryAbiName);
 }
 
 TEST(MusaGpuCompilerTest, PersistentKernelCacheFailsClosed) {

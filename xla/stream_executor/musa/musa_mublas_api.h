@@ -42,6 +42,10 @@ inline constexpr char kMusaMuBlasAdvancedAbiContractV2[] =
     "xla-musa-mublas;abi=2;base=7;advanced=63;workspace=0";
 inline constexpr char kMusaMuBlasAdvancedAbiFingerprintV2[] =
     "097f516c7b70c49b3873926b6b20e39bafd74a80687a5e9e66a2927433dc1a68";
+inline constexpr char kMusaMuBlasScalAbiContractV1[] =
+    "xla-musa-mublas-scal;abi=1;routes=sscal,dscal,cscal,zscal,csscal,zdscal";
+inline constexpr char kMusaMuBlasScalAbiFingerprintV1[] =
+    "aee8bd3fc6ac91980f38d634b83a7789633d2573eb962de231ab5f129ae22560";
 
 namespace internal {
 
@@ -87,9 +91,13 @@ class MusaMuBlasApi {
   bool SupportsGemmStridedBatched() const;
   bool SupportsTensorOpF32() const;
   bool UsesZeroExternalWorkspace() const;
+  bool SupportsScal() const;
   // Empty for a v1 shim. For v2 this is a deterministic cache/serialization
   // identity for operations that depend on the advanced ABI contract.
   std::string advanced_abi_fingerprint() const;
+  // Empty unless the optional V2 SCAL tail is complete. Kept separate from
+  // the C16 fingerprint so old V2 shims and executables remain compatible.
+  std::string scal_abi_fingerprint() const;
   absl::string_view loaded_path() const;
 
   absl::Status Create(void** handle) const;
@@ -97,6 +105,8 @@ class MusaMuBlasApi {
   absl::Status SetStream(void* handle, void* stream) const;
   absl::Status GetVersion(void* handle, int32_t* version) const;
   absl::Status SetAtomicsMode(void* handle, bool allow_atomics) const;
+  absl::Status Scal(void* handle, XlaMusaMuBlasScalType scal_type, int64_t n,
+                    const void* alpha, void* x, int64_t incx) const;
   absl::Status Gemm(void* handle, XlaMusaMuBlasDataType input_type,
                     XlaMusaMuBlasDataType output_type,
                     XlaMusaMuBlasComputeType compute_type,
@@ -151,7 +161,7 @@ MusaMuBlasApi* GetMusaMuBlasApi();
 // and produces an empty list. A present but malformed shim is a packaging
 // error and is returned to the caller.
 absl::StatusOr<std::vector<MusaOptionalLibraryAbi>>
-GetAvailableMusaOptionalLibraryAbis();
+GetAvailableMusaMuBlasOptionalLibraryAbis();
 
 }  // namespace stream_executor::musa
 

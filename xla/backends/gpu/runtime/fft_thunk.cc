@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/fft_thunk.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -157,6 +158,10 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
   VLOG(3) << "Input shape: " << ShapeUtil::HumanStringWithLayout(input_shape);
   VLOG(3) << "Output shape: " << ShapeUtil::HumanStringWithLayout(output_shape);
 
+  // Empty FFT batches are a no-op. Avoid asking vendor planners to accept a
+  // zero batch count, and avoid dereferencing null zero-byte buffers.
+  if (ShapeUtil::ElementsIn(output_shape) == 0) return absl::OkStatus();
+
   se::OwningScratchAllocator<2> scratch_allocator(device_ordinal,
                                                   memory_allocator);
 
@@ -170,10 +175,26 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
   ASSIGN_OR_RETURN(auto fft, GetFft(stream));
   if (fft_plan == nullptr) {
     const int64_t fft_rank = fft_len.size();
-    CHECK_LE(fft_rank, 3);
+    if (fft_rank < 1 || fft_rank > 3) {
+      return InvalidArgument("FFT rank must be between 1 and 3; got %d",
+                             fft_rank);
+    }
+    if (input_shape.dimensions().size() < fft_rank ||
+        output_shape.dimensions().size() < fft_rank) {
+      return InvalidArgument(
+          "FFT input and output ranks must be at least the FFT rank; got "
+          "input rank %d, output rank %d, and FFT rank %d",
+          input_shape.dimensions().size(), output_shape.dimensions().size(),
+          fft_rank);
+    }
     int batch_size = 1;
     for (int i = 0; i < input_shape.dimensions().size() - fft_rank; ++i) {
-      batch_size *= input_shape.dimensions(i);
+      const int64_t dimension = input_shape.dimensions(i);
+      if (dimension <= 0 ||
+          dimension > std::numeric_limits<int>::max() / batch_size) {
+        return InvalidArgument("FFT batch size does not fit in int32");
+      }
+      batch_size *= static_cast<int>(dimension);
     }
     uint64_t fft_length[3];
     uint64_t input_embed[3];
@@ -184,11 +205,25 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
     uint64_t output_distance = 1;
 
     for (int i = 0; i < fft_rank; ++i) {
+      if (fft_len[i] <= 0) {
+        return InvalidArgument("FFT dimensions must be positive; got %d",
+                               fft_len[i]);
+      }
       auto dim_offset = input_shape.dimensions().size() - fft_rank + i;
       fft_length[i] = static_cast<uint64_t>(fft_len[i]);
       input_embed[i] = input_shape.dimensions(dim_offset);
+      if (input_embed[i] != 0 &&
+          input_distance >
+              std::numeric_limits<uint64_t>::max() / input_embed[i]) {
+        return InvalidArgument("FFT input batch distance overflows uint64");
+      }
       input_distance *= input_shape.dimensions(dim_offset);
       output_embed[i] = output_shape.dimensions(dim_offset);
+      if (output_embed[i] != 0 &&
+          output_distance >
+              std::numeric_limits<uint64_t>::max() / output_embed[i]) {
+        return InvalidArgument("FFT output batch distance overflows uint64");
+      }
       output_distance *= output_shape.dimensions(dim_offset);
     }
 
@@ -198,7 +233,7 @@ absl::Status RunFft(se::DeviceAddressBase input, const Shape& input_shape,
         output_embed, output_stride, output_distance, fft_type, kInPlaceFft,
         batch_size, &scratch_allocator);
     TF_RET_CHECK(fft_plan != nullptr)
-        << "Failed to create cuFFT batched plan with scratch allocator";
+        << "Failed to create GPU FFT batched plan with scratch allocator";
     fft_plan_ptr->scale_factor = output_distance;
   } else {
     fft->UpdatePlanWithScratchAllocator(stream, fft_plan.get(),

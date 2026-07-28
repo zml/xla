@@ -95,6 +95,21 @@ index c0a104c..109d83f 100644
 +    srcs = ["toolchain_identity.txt"],
 +    visibility = ["//visibility:public"],
 +)
+@@ -94,0 +183,14 @@
++
++# Optional muFFT link target. Only the separately packaged XLA shim depends on
++# this target; the core PJRT plugin remains free of vendor-library link edges.
++cc_library(
++    name = "mufft",
++    hdrs = glob(["%{musa_root}/include/**/*.h"], allow_empty = True),
++    includes = ["%{musa_root}/include"],
++    srcs = glob(["%{musa_root}/**/libmufft.so*"], allow_empty = True),
++    data = glob([
++        "%{musa_root}/**/libmtfft-device-*.so*",
++        "%{musa_root}/**/libmusart.so*",
++    ], allow_empty = True),
++    visibility = ["//visibility:public"],
++)
 diff --git a/gpu/musa/musa_configure.bzl b/gpu/musa/musa_configure.bzl
 index b5eb694..dca0b3a 100644
 --- a/gpu/musa/musa_configure.bzl

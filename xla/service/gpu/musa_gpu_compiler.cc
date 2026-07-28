@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_mufft_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
@@ -68,6 +69,8 @@ absl::Status ProviderUnavailable(const absl::Status& status) {
 std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
     const HloModule& module) {
   bool requires_mublas = false;
+  bool requires_mufft = false;
+  bool requires_mublas_scal = false;
   // Deterministic execution configures the muBLAS atomics mode before every
   // GEMM. That setter is part of the v2 table even when the HLO itself is an
   // unbatched GEMM using the default algorithm.
@@ -76,6 +79,11 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
       module.config().debug_options().xla_gpu_exclude_nondeterministic_ops();
   for (const HloComputation* computation : module.computations()) {
     for (const HloInstruction* instruction : computation->instructions()) {
+      if (instruction->opcode() == HloOpcode::kFft) {
+        requires_mufft = true;
+        requires_mublas_scal |= instruction->fft_type() == FftType::IFFT ||
+                                instruction->fft_type() == FftType::IRFFT;
+      }
       if (!IsMusaGemm(*instruction)) continue;
       requires_mublas = true;
 
@@ -93,17 +101,37 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
                                   dimensions.rhs_batch_dimensions_size() != 0;
     }
   }
+  std::vector<musa::MusaOptionalLibraryAbi> requirements;
   if (requires_mublas) {
-    return {{
+    requirements.push_back({
         .name = stream_executor::musa::kMusaMuBlasLibraryAbiName,
         .abi_version = stream_executor::musa::kMusaMuBlasLibraryAbiVersion,
         .fingerprint =
             requires_advanced_mublas
                 ? stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2
                 : "",
-    }};
+    });
   }
-  return {};
+  if (requires_mublas_scal) {
+    requirements.push_back({
+        .name = stream_executor::musa::kMusaMuBlasScalLibraryAbiName,
+        .abi_version = stream_executor::musa::kMusaMuBlasScalLibraryAbiVersion,
+        .fingerprint = stream_executor::musa::kMusaMuBlasScalAbiFingerprintV1,
+    });
+  }
+  if (requires_mufft) {
+    requirements.push_back({
+        .name = stream_executor::musa::kMusaMuFftLibraryAbiName,
+        .abi_version = stream_executor::musa::kMusaMuFftLibraryAbiVersion,
+        .fingerprint = stream_executor::musa::kMusaMuFftAbiFingerprintV1,
+    });
+  }
+  std::sort(requirements.begin(), requirements.end(),
+            [](const musa::MusaOptionalLibraryAbi& lhs,
+               const musa::MusaOptionalLibraryAbi& rhs) {
+              return lhs.name < rhs.name;
+            });
+  return requirements;
 }
 
 absl::StatusOr<musa::MusaCompilationOptions> GetMusaCompilationOptions(

@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_blas.h"
 
 #include <array>
+#include <complex>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -63,6 +65,7 @@ struct GemmCall {
   int algorithm_gemms = 0;
   int batched_gemms = 0;
   int strided_batched_gemms = 0;
+  int scals = 0;
   int atomics_calls = 0;
   bool allow_atomics = true;
   int64_t batch_count = 0;
@@ -79,6 +82,10 @@ struct GemmCall {
   int64_t m = 0;
   int64_t n = 0;
   int64_t k = 0;
+  std::vector<XlaMusaMuBlasScalType> scal_types;
+  int64_t scal_n = 0;
+  int64_t scal_incx = 0;
+  void* scal_x = nullptr;
 };
 
 GemmCall* g_call = nullptr;
@@ -166,6 +173,15 @@ XlaMusaMuBlasStatus GemmStridedBatched(
   g_call->algorithm = algorithm;
   return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
 }
+XlaMusaMuBlasStatus Scal(void*, XlaMusaMuBlasScalType scal_type, int64_t n,
+                         const void*, void* x, int64_t incx) {
+  ++g_call->scals;
+  g_call->scal_types.push_back(scal_type);
+  g_call->scal_n = n;
+  g_call->scal_incx = incx;
+  g_call->scal_x = x;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
 const XlaMusaMuBlasApiV1* Getter() { return g_table; }
 const XlaMusaMuBlasApiV2* GetterV2() { return g_table_v2; }
 
@@ -206,7 +222,8 @@ XlaMusaMuBlasApiV2 TableV2() {
   table.struct_size = sizeof(table);
   table.abi_version = XLA_MUSA_MUBLAS_ABI_VERSION_2;
   table.capabilities = XLA_MUSA_MUBLAS_CAPABILITIES_V1;
-  table.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2;
+  table.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
+                                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
   table.create = Create;
   table.destroy = Destroy;
   table.set_stream = SetStream;
@@ -216,6 +233,7 @@ XlaMusaMuBlasApiV2 TableV2() {
   table.gemm_with_algorithm = GemmWithAlgorithm;
   table.gemm_batched = GemmBatched;
   table.gemm_strided_batched = GemmStridedBatched;
+  table.scal = Scal;
   return table;
 }
 
@@ -419,6 +437,91 @@ TEST_F(MusaBlasTest, ActivatesContextAndDispatchesF16Gemm) {
   EXPECT_EQ(call_.m, 2);
   EXPECT_EQ(call_.n, 3);
   EXPECT_EQ(call_.k, 4);
+}
+
+TEST_F(MusaBlasTest, DispatchesAllSixScalRoutesOnPerStreamHandle) {
+  NiceMock<MockStreamExecutor> executor;
+  NiceMock<MockStream> stream;
+  ON_CALL(executor, Activate()).WillByDefault([] {
+    return std::make_unique<ActivateContext>();
+  });
+  ON_CALL(stream, parent()).WillByDefault(Return(&executor));
+  ON_CALL(stream, platform_specific_handle())
+      .WillByDefault(Return(
+          Stream::PlatformSpecificHandle{reinterpret_cast<void*>(0x2222)}));
+  auto api = MusaMuBlasApi::CreateForTesting(std::make_unique<FakeLoader>());
+  MusaBlas blas(&executor, api.get());
+  ASSERT_TRUE(blas.Init());
+
+  DeviceAddress<float> f32 = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x3000), 32);
+  DeviceAddress<double> f64 = DeviceAddress<double>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x4000), 64);
+  DeviceAddress<std::complex<float>> c64 =
+      DeviceAddress<std::complex<float>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0x5000), 64);
+  DeviceAddress<std::complex<double>> c128 =
+      DeviceAddress<std::complex<double>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0x6000), 128);
+
+  EXPECT_TRUE(blas.DoBlasScal(&stream, 4, 0.5f, &f32, 2));
+  EXPECT_TRUE(blas.DoBlasScal(&stream, 4, 0.25, &f64, 2));
+  EXPECT_TRUE(blas.DoBlasScal(&stream, 4, 0.125f, &c64, 2));
+  EXPECT_TRUE(blas.DoBlasScal(&stream, 4, 0.0625, &c128, 2));
+  EXPECT_TRUE(
+      blas.DoBlasScal(&stream, 4, std::complex<float>(0.5f, 0.25f), &c64, 2));
+  EXPECT_TRUE(
+      blas.DoBlasScal(&stream, 4, std::complex<double>(0.25, 0.125), &c128, 2));
+
+  EXPECT_EQ(call_.scals, 6);
+  EXPECT_THAT(call_.scal_types, ElementsAre(XLA_MUSA_MUBLAS_SCAL_TYPE_F32,
+                                            XLA_MUSA_MUBLAS_SCAL_TYPE_F64,
+                                            XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32,
+                                            XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64,
+                                            XLA_MUSA_MUBLAS_SCAL_TYPE_C64,
+                                            XLA_MUSA_MUBLAS_SCAL_TYPE_C128));
+  EXPECT_EQ(call_.scal_n, 4);
+  EXPECT_EQ(call_.scal_incx, 2);
+  EXPECT_EQ(call_.scal_x, c128.opaque());
+  EXPECT_EQ(call_.creates, 2);
+  EXPECT_EQ(call_.set_streams, 2);
+  EXPECT_EQ(call_.stream, reinterpret_cast<void*>(0x2222));
+  ASSERT_TRUE(blas.IsMainStreamSet().ok());
+  EXPECT_FALSE(*blas.IsMainStreamSet());
+
+  DeviceAddress<float> null_f32;
+  EXPECT_TRUE(blas.DoBlasScal(&stream, 0, 1.0f, &null_f32, 1));
+  EXPECT_FALSE(blas.DoBlasScal(&stream, 1, 1.0f, &null_f32, 1));
+  EXPECT_FALSE(blas.DoBlasScal(&stream, 1, 1.0f, &f32, 0));
+  EXPECT_FALSE(blas.DoBlasScal(&stream, std::numeric_limits<uint64_t>::max(),
+                               1.0f, &f32, 1));
+  DeviceAddress<float> short_f32 = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x7000), 12);
+  EXPECT_FALSE(blas.DoBlasScal(&stream, 4, 1.0f, &short_f32, 1));
+  EXPECT_EQ(call_.scals, 6);
+}
+
+TEST_F(MusaBlasTest, OldSizeV2RejectsScalWithoutBreakingInitialization) {
+  table_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE;
+  table_v2_.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2;
+  table_v2_.scal = Scal;
+  NiceMock<MockStreamExecutor> executor;
+  NiceMock<MockStream> stream;
+  ON_CALL(executor, Activate()).WillByDefault([] {
+    return std::make_unique<ActivateContext>();
+  });
+  ON_CALL(stream, parent()).WillByDefault(Return(&executor));
+  ON_CALL(stream, platform_specific_handle())
+      .WillByDefault(Return(
+          Stream::PlatformSpecificHandle{reinterpret_cast<void*>(0x2222)}));
+  auto api = MusaMuBlasApi::CreateForTesting(std::make_unique<FakeLoader>());
+  MusaBlas blas(&executor, api.get());
+  ASSERT_TRUE(blas.Init());
+  EXPECT_FALSE(api->SupportsScal());
+  DeviceAddress<float> x = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x3000), 0);
+  EXPECT_FALSE(blas.DoBlasScal(&stream, 1, 1.0f, &x, 1));
+  EXPECT_EQ(call_.scals, 0);
 }
 
 TEST_F(MusaBlasTest, RejectsUnsupportedTypeAndCommandBufferClearly) {

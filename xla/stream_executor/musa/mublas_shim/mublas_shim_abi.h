@@ -92,6 +92,9 @@ enum {
                                                                 << 4,
   // The normalized tensor-op algorithm is qualified only for homogeneous F32.
   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32 = UINT64_C(1) << 5,
+  // Optional append-only V2 tail. It is deliberately excluded from
+  // XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 so old V2 shims remain valid.
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL = UINT64_C(1) << 6,
 };
 
 #define XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2                 \
@@ -101,6 +104,19 @@ enum {
    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_STRIDED_BATCHED |    \
    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE | \
    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32)
+
+// Normalized SCAL routes. Numeric values are part of the SDK-free ABI and do
+// not match or expose vendor enums. C64 and C128 name the vector element type;
+// the suffix names the scalar type when it differs from the vector type.
+typedef uint32_t XlaMusaMuBlasScalType;
+enum {
+  XLA_MUSA_MUBLAS_SCAL_TYPE_F32 = 1,
+  XLA_MUSA_MUBLAS_SCAL_TYPE_F64 = 2,
+  XLA_MUSA_MUBLAS_SCAL_TYPE_C64 = 3,
+  XLA_MUSA_MUBLAS_SCAL_TYPE_C128 = 4,
+  XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32 = 5,
+  XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64 = 6,
+};
 
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasCreateFn)(void** handle);
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasDestroyFn)(void* handle);
@@ -155,6 +171,13 @@ typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasGemmStridedBatchedFn)(
     const void* beta, void* c, int64_t ldc, int64_t stride_c,
     int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm);
 
+// Executes x[i * incx] = alpha * x[i * incx] for i in [0, n). `alpha` and
+// `x` have the scalar/vector types selected by `scal_type`. Dimensions are
+// signed 64-bit at this boundary and range-checked before the vendor LP64 API.
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasScalFn)(
+    void* handle, XlaMusaMuBlasScalType scal_type, int64_t n, const void* alpha,
+    void* x, int64_t incx);
+
 typedef struct XlaMusaMuBlasApiV1 {
   // Callers must check both fields before reading function pointers. Newer
   // compatible shims may append fields and increase `struct_size`.
@@ -191,11 +214,16 @@ typedef struct XlaMusaMuBlasApiV2 {
   XlaMusaMuBlasGemmWithAlgorithmFn gemm_with_algorithm;
   XlaMusaMuBlasGemmBatchedFn gemm_batched;
   XlaMusaMuBlasGemmStridedBatchedFn gemm_strided_batched;
+  // Optional tail. Callers must check struct_size, capability, and pointer.
+  XlaMusaMuBlasScalFn scal;
 } XlaMusaMuBlasApiV2;
 
 #define XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE          \
   (offsetof(XlaMusaMuBlasApiV2, gemm_strided_batched) + \
    sizeof(((XlaMusaMuBlasApiV2*)0)->gemm_strided_batched))
+
+#define XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE \
+  (offsetof(XlaMusaMuBlasApiV2, scal) + sizeof(((XlaMusaMuBlasApiV2*)0)->scal))
 
 typedef const XlaMusaMuBlasApiV2* (*XlaMusaMuBlasGetApiV2Fn)(void);
 

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
@@ -39,6 +40,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
 #include "xla/stream_executor/gpu/scoped_activate_context.h"
@@ -55,6 +57,7 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_device_properties.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_event.h"
+#include "xla/stream_executor/musa/musa_fft.h"
 #include "xla/stream_executor/musa/musa_kernel.h"
 #include "xla/stream_executor/musa/musa_module.h"
 #include "xla/stream_executor/musa/musa_module_reaper.h"
@@ -74,8 +77,19 @@ limitations under the License.
 namespace stream_executor::musa {
 namespace {
 
+// StreamExecutor host allocations back a BFC suballocator, whose chunks are
+// 256-byte aligned. The qualified musaHostAlloc implementation guarantees
+// only 16-byte alignment, so retain the vendor base allocation and expose an
+// aligned address within it.
+constexpr size_t kHostMemoryAlignment = 256;
+
 void* MallocHost(uint64_t size) {
-  return std::malloc(static_cast<size_t>(size));
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, kHostMemoryAlignment, static_cast<size_t>(size)) !=
+      0) {
+    return nullptr;
+  }
+  return ptr;
 }
 
 void FreeHost(void* ptr, uint64_t) { std::free(ptr); }
@@ -97,13 +111,39 @@ void RetainModulesAfterSynchronizationFailure(
 
 absl::StatusOr<std::unique_ptr<MemoryAllocation>> AllocateHostMemory(
     std::shared_ptr<MusaContext> context, uint64_t size) {
+  if (size == 0) {
+    return std::make_unique<GenericMemoryAllocation>(nullptr, 0, FreeHost);
+  }
+  if (size > std::numeric_limits<size_t>::max() - (kHostMemoryAlignment - 1)) {
+    return absl::ResourceExhaustedError(
+        "MUSA host allocation size exceeds the aligned host ABI");
+  }
+  const size_t padded_size =
+      static_cast<size_t>(size) + kHostMemoryAlignment - 1;
   gpu::ScopedActivateContext activation(context.get());
-  auto ptr = MusaRuntime::Get()->HostAlloc(size);
+  auto ptr = MusaRuntime::Get()->HostAlloc(padded_size);
   if (ptr.ok()) {
+    void* const base = *ptr;
+    if (base == nullptr) {
+      return absl::ResourceExhaustedError(
+          "musaHostAlloc returned success with a null pointer");
+    }
+    void* aligned = base;
+    size_t available = padded_size;
+    if (std::align(kHostMemoryAlignment, static_cast<size_t>(size), aligned,
+                   available) == nullptr) {
+      absl::Status free_status = MusaRuntime::Get()->FreeHost(base);
+      if (!free_status.ok()) {
+        LOG(ERROR) << "Failed to free unalignable MUSA host memory: "
+                   << free_status;
+      }
+      return absl::InternalError(
+          "musaHostAlloc returned a pointer that could not be aligned");
+    }
     return std::make_unique<GenericMemoryAllocation>(
-        *ptr, size, [context = std::move(context)](void* p, uint64_t) {
+        aligned, size, [context = std::move(context), base](void*, uint64_t) {
           gpu::ScopedActivateContext activation(context.get());
-          absl::Status status = MusaRuntime::Get()->FreeHost(p);
+          absl::Status status = MusaRuntime::Get()->FreeHost(base);
           if (!status.ok()) {
             LOG(ERROR) << "Failed to free MUSA host memory: " << status;
           }
@@ -194,6 +234,24 @@ blas::BlasSupport* MusaExecutor::AsBlas() {
     LOG(ERROR) << "Unable to initialize optional muBLAS support";
   }
   return blas_.get();
+}
+
+fft::FftSupport* MusaExecutor::AsFft() {
+  absl::MutexLock lock(&support_mu_);
+  if (fft_ != nullptr) return fft_.get();
+
+  PluginRegistry* registry = PluginRegistry::Instance();
+  absl::StatusOr<PluginRegistry::FftFactory> factory =
+      registry->GetFactory<PluginRegistry::FftFactory>(kMusaPlatformId);
+  if (!factory.ok()) {
+    LOG(ERROR) << "Unable to retrieve MUSA FFT factory: " << factory.status();
+    return nullptr;
+  }
+  fft_.reset((*factory)(this));
+  if (fft_ == nullptr) {
+    LOG(ERROR) << "Unable to initialize optional muFFT support";
+  }
+  return fft_.get();
 }
 
 absl::StatusOr<std::unique_ptr<Stream>> MusaExecutor::CreateStream(

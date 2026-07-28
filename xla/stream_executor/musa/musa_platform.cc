@@ -28,7 +28,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_executor.h"
-#include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_optional_libraries.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
 #include "xla/stream_executor/musa/musa_runtime_abi_version.h"

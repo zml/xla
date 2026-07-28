@@ -483,8 +483,60 @@ XlaMusaMuBlasStatus GemmStridedBatched(
       native_compute_type, native_algorithm));
 }
 
+XlaMusaMuBlasStatus Scal(void* handle, XlaMusaMuBlasScalType scal_type,
+                         int64_t n, const void* alpha, void* x, int64_t incx) {
+  if (handle == nullptr || alpha == nullptr || x == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  if (!FitsNonNegativeInt32(n) || !FitsPositiveInt32(incx)) {
+    return XLA_MUSA_MUBLAS_STATUS_OUT_OF_RANGE;
+  }
+
+  const mublas_int native_n = static_cast<mublas_int>(n);
+  const mublas_int native_incx = static_cast<mublas_int>(incx);
+  mublasHandle_t native_handle = static_cast<mublasHandle_t>(handle);
+  switch (scal_type) {
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_F32:
+      return ToShimStatus(mublasSscal(native_handle, native_n,
+                                      static_cast<const float*>(alpha),
+                                      static_cast<float*>(x), native_incx));
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_F64:
+      return ToShimStatus(mublasDscal(native_handle, native_n,
+                                      static_cast<const double*>(alpha),
+                                      static_cast<double*>(x), native_incx));
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C64: {
+      muComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(float));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(mublasCscal(native_handle, native_n, &native_alpha,
+                                      static_cast<muComplex*>(x), native_incx));
+    }
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C128: {
+      muDoubleComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(double));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(mublasZscal(native_handle, native_n, &native_alpha,
+                                      static_cast<muDoubleComplex*>(x),
+                                      native_incx));
+    }
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32:
+      return ToShimStatus(mublasCsscal(
+          native_handle, native_n, static_cast<const float*>(alpha),
+          static_cast<muComplex*>(x), native_incx));
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64:
+      return ToShimStatus(mublasZdscal(
+          native_handle, native_n, static_cast<const double*>(alpha),
+          static_cast<muDoubleComplex*>(x), native_incx));
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_NOT_SUPPORTED;
+  }
+}
+
 constexpr XlaMusaMuBlasCapabilities kCapabilities =
     XLA_MUSA_MUBLAS_CAPABILITIES_V1;
+constexpr XlaMusaMuBlasAdvancedCapabilities kAdvancedCapabilities =
+    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
+    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
 
 const XlaMusaMuBlasApiV1 kApiV1 = {sizeof(XlaMusaMuBlasApiV1),
                                    XLA_MUSA_MUBLAS_ABI_VERSION_1,
@@ -498,7 +550,7 @@ const XlaMusaMuBlasApiV1 kApiV1 = {sizeof(XlaMusaMuBlasApiV1),
 const XlaMusaMuBlasApiV2 kApiV2 = {sizeof(XlaMusaMuBlasApiV2),
                                    XLA_MUSA_MUBLAS_ABI_VERSION_2,
                                    kCapabilities,
-                                   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2,
+                                   kAdvancedCapabilities,
                                    Create,
                                    Destroy,
                                    SetStream,
@@ -507,7 +559,8 @@ const XlaMusaMuBlasApiV2 kApiV2 = {sizeof(XlaMusaMuBlasApiV2),
                                    SetAtomicsMode,
                                    GemmWithAlgorithm,
                                    GemmBatched,
-                                   GemmStridedBatched};
+                                   GemmStridedBatched,
+                                   Scal};
 
 }  // namespace
 

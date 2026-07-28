@@ -250,6 +250,21 @@ absl::Status ValidateNormalizedAlgorithm(
   return absl::OkStatus();
 }
 
+absl::Status ValidateNormalizedScalType(XlaMusaMuBlasScalType scal_type) {
+  switch (scal_type) {
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_F32:
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_F64:
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C64:
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C128:
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32:
+    case XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64:
+      return absl::OkStatus();
+    default:
+      return absl::InvalidArgumentError(
+          absl::StrCat("unknown normalized muBLAS SCAL type ", scal_type));
+  }
+}
+
 }  // namespace
 
 namespace internal {
@@ -363,9 +378,23 @@ bool MusaMuBlasApi::UsesZeroExternalWorkspace() const {
       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE);
 }
 
+bool MusaMuBlasApi::SupportsScal() const {
+  if (!Init().ok() || api_v2_ == nullptr ||
+      api_v2_->struct_size < XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE) {
+    return false;
+  }
+  return HasCapability(api_v2_->advanced_capabilities,
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL) &&
+         api_v2_->scal != nullptr;
+}
+
 std::string MusaMuBlasApi::advanced_abi_fingerprint() const {
   if (abi_version() != XLA_MUSA_MUBLAS_ABI_VERSION_2) return {};
   return kMusaMuBlasAdvancedAbiFingerprintV2;
+}
+
+std::string MusaMuBlasApi::scal_abi_fingerprint() const {
+  return SupportsScal() ? kMusaMuBlasScalAbiFingerprintV1 : std::string();
 }
 
 absl::string_view MusaMuBlasApi::loaded_path() const {
@@ -429,6 +458,26 @@ absl::Status MusaMuBlasApi::SetAtomicsMode(void* handle,
   return MuBlasStatus(api_v2_->set_atomics_mode(
                           handle, allow_atomics ? UINT32_C(1) : UINT32_C(0)),
                       "set_atomics_mode");
+}
+
+absl::Status MusaMuBlasApi::Scal(void* handle, XlaMusaMuBlasScalType scal_type,
+                                 int64_t n, const void* alpha, void* x,
+                                 int64_t incx) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  if (alpha == nullptr || x == nullptr) {
+    return absl::InvalidArgumentError(
+        "muBLAS SCAL requires non-null scalar and vector pointers");
+  }
+  RETURN_IF_ERROR(ValidateNormalizedScalType(scal_type));
+  if (!SupportsScal()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support the optional V2 SCAL contract");
+  }
+  return MuBlasStatus(api_v2_->scal(handle, scal_type, n, alpha, x, incx),
+                      "scal");
 }
 
 absl::Status MusaMuBlasApi::Gemm(
@@ -536,7 +585,7 @@ MusaMuBlasApi* GetMusaMuBlasApi() {
 }
 
 absl::StatusOr<std::vector<MusaOptionalLibraryAbi>>
-GetAvailableMusaOptionalLibraryAbis() {
+GetAvailableMusaMuBlasOptionalLibraryAbis() {
   MusaMuBlasApi* api = GetMusaMuBlasApi();
   absl::Status status = api->Init();
   if (absl::IsNotFound(status)) {
@@ -546,9 +595,15 @@ GetAvailableMusaOptionalLibraryAbis() {
   // The public optional-library ABI remains v1. Advanced executables opt into
   // the nonempty v2 contract fingerprint; basic v1 executables require no
   // fingerprint and remain compatible with either table.
-  return std::vector<MusaOptionalLibraryAbi>{{kMusaMuBlasLibraryAbiName,
-                                              kMusaMuBlasLibraryAbiVersion,
-                                              api->advanced_abi_fingerprint()}};
+  std::vector<MusaOptionalLibraryAbi> libraries = {
+      {kMusaMuBlasLibraryAbiName, kMusaMuBlasLibraryAbiVersion,
+       api->advanced_abi_fingerprint()}};
+  if (api->SupportsScal()) {
+    libraries.push_back({kMusaMuBlasScalLibraryAbiName,
+                         kMusaMuBlasScalLibraryAbiVersion,
+                         api->scal_abi_fingerprint()});
+  }
+  return libraries;
 }
 
 }  // namespace stream_executor::musa

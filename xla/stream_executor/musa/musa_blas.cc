@@ -640,29 +640,108 @@ absl::Status MusaBlas::GetVersion(std::string* version) {
   return absl::OkStatus();
 }
 
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, float, DeviceAddress<float>*,
-                          int) {
-  return UnsupportedBool("SCAL f32");
+absl::Status MusaBlas::DoBlasScalInternal(Stream* stream, uint64_t n,
+                                          const void* alpha,
+                                          DeviceAddressBase* x, int incx,
+                                          XlaMusaMuBlasScalType scal_type,
+                                          size_t element_size) {
+  if (!api_->SupportsScal()) {
+    return absl::UnimplementedError(
+        "loaded muBLAS shim does not advertise the optional SCAL contract");
+  }
+  if (n > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return absl::OutOfRangeError(
+        "muBLAS SCAL element count exceeds the shim's signed 64-bit ABI");
+  }
+  if (incx <= 0) {
+    return absl::InvalidArgumentError("muBLAS SCAL increment must be positive");
+  }
+  if (n == 0) return absl::OkStatus();
+  if (alpha == nullptr || x == nullptr || x->is_null()) {
+    return absl::InvalidArgumentError(
+        "muBLAS SCAL scalar or vector pointer is null");
+  }
+
+  const uint64_t unsigned_incx = static_cast<uint64_t>(incx);
+  if (n - 1 > (std::numeric_limits<uint64_t>::max() - 1) / unsigned_incx) {
+    return absl::OutOfRangeError("muBLAS SCAL vector extent overflows");
+  }
+  const uint64_t required_elements = (n - 1) * unsigned_incx + 1;
+  if (required_elements > std::numeric_limits<uint64_t>::max() / element_size) {
+    return absl::OutOfRangeError("muBLAS SCAL byte extent overflows");
+  }
+  const uint64_t required_bytes = required_elements * element_size;
+  if (x->size() != 0 && x->size() < required_bytes) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("muBLAS SCAL vector has ", x->size(),
+                     " bytes; needs at least ", required_bytes));
+  }
+
+  ASSIGN_OR_RETURN(std::shared_ptr<HandleState> state,
+                   GetOrCreateHandle(stream));
+  std::unique_ptr<ActivateContext> activation = parent_->Activate();
+  absl::MutexLock state_lock(&state->mu);
+  RETURN_IF_ERROR(api_->Scal(state->handle, scal_type, static_cast<int64_t>(n),
+                             alpha, x->opaque(), incx));
+  {
+    absl::MutexLock lock(&handles_mu_);
+    last_stream_ = state->native_stream;
+  }
+  return absl::OkStatus();
 }
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, double, DeviceAddress<double>*,
-                          int) {
-  return UnsupportedBool("SCAL f64");
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n, float alpha,
+                          DeviceAddress<float>* x, int incx) {
+  absl::Status status = DoBlasScalInternal(
+      stream, n, &alpha, x, incx, XLA_MUSA_MUBLAS_SCAL_TYPE_F32, sizeof(float));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
 }
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, float,
-                          DeviceAddress<std::complex<float>>*, int) {
-  return UnsupportedBool("SCAL complex-f32 by f32");
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n, double alpha,
+                          DeviceAddress<double>* x, int incx) {
+  absl::Status status =
+      DoBlasScalInternal(stream, n, &alpha, x, incx,
+                         XLA_MUSA_MUBLAS_SCAL_TYPE_F64, sizeof(double));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
 }
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, double,
-                          DeviceAddress<std::complex<double>>*, int) {
-  return UnsupportedBool("SCAL complex-f64 by f64");
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n, float alpha,
+                          DeviceAddress<std::complex<float>>* x, int incx) {
+  absl::Status status = DoBlasScalInternal(stream, n, &alpha, x, incx,
+                                           XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32,
+                                           sizeof(std::complex<float>));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
 }
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, std::complex<float>,
-                          DeviceAddress<std::complex<float>>*, int) {
-  return UnsupportedBool("SCAL complex-f32");
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n, double alpha,
+                          DeviceAddress<std::complex<double>>* x, int incx) {
+  absl::Status status = DoBlasScalInternal(stream, n, &alpha, x, incx,
+                                           XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64,
+                                           sizeof(std::complex<double>));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
 }
-bool MusaBlas::DoBlasScal(Stream*, uint64_t, std::complex<double>,
-                          DeviceAddress<std::complex<double>>*, int) {
-  return UnsupportedBool("SCAL complex-f64");
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n, std::complex<float> alpha,
+                          DeviceAddress<std::complex<float>>* x, int incx) {
+  absl::Status status = DoBlasScalInternal(stream, n, &alpha, x, incx,
+                                           XLA_MUSA_MUBLAS_SCAL_TYPE_C64,
+                                           sizeof(std::complex<float>));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
+}
+
+bool MusaBlas::DoBlasScal(Stream* stream, uint64_t n,
+                          std::complex<double> alpha,
+                          DeviceAddress<std::complex<double>>* x, int incx) {
+  absl::Status status = DoBlasScalInternal(stream, n, &alpha, x, incx,
+                                           XLA_MUSA_MUBLAS_SCAL_TYPE_C128,
+                                           sizeof(std::complex<double>));
+  if (!status.ok()) LOG(ERROR) << status;
+  return status.ok();
 }
 
 bool MusaBlas::DoBlasGemv(Stream*, blas::Transpose, uint64_t, uint64_t, float,

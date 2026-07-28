@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_MUSA_MUSA_BLAS_H_
 #define XLA_STREAM_EXECUTOR_MUSA_MUSA_BLAS_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -79,6 +80,10 @@ class MusaBlas final : public blas::BlasSupport {
                                 const EngineOptions& engine_options,
                                 XlaMusaMuBlasAlgorithm algorithm)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(state->mu);
+  absl::Status DoBlasScalInternal(Stream* stream, uint64_t n, const void* alpha,
+                                  DeviceAddressBase* x, int incx,
+                                  XlaMusaMuBlasScalType scal_type,
+                                  size_t element_size);
   absl::Status DoBlasGemmInternal(
       Stream* stream, blas::Transpose transa, blas::Transpose transb,
       uint64_t m, uint64_t n, uint64_t k, const void* alpha,

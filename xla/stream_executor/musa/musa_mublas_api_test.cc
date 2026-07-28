@@ -49,6 +49,7 @@ struct FakeCalls {
   int gemm_with_algorithm = 0;
   int gemm_batched = 0;
   int gemm_strided_batched = 0;
+  int scal = 0;
   void* stream = nullptr;
   bool allow_atomics = false;
   XlaMusaMuBlasDataType input_type = 0;
@@ -59,6 +60,11 @@ struct FakeCalls {
   int64_t stride_a = 0;
   int64_t stride_b = 0;
   int64_t stride_c = 0;
+  XlaMusaMuBlasScalType scal_type = 0;
+  int64_t scal_n = 0;
+  int64_t scal_incx = 0;
+  const void* scal_alpha = nullptr;
+  void* scal_x = nullptr;
 };
 
 FakeCalls* g_calls = nullptr;
@@ -150,6 +156,17 @@ XlaMusaMuBlasStatus FakeGemmStridedBatched(
   return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
 }
 
+XlaMusaMuBlasStatus FakeScal(void*, XlaMusaMuBlasScalType scal_type, int64_t n,
+                             const void* alpha, void* x, int64_t incx) {
+  ++g_calls->scal;
+  g_calls->scal_type = scal_type;
+  g_calls->scal_n = n;
+  g_calls->scal_incx = incx;
+  g_calls->scal_alpha = alpha;
+  g_calls->scal_x = x;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
+
 const XlaMusaMuBlasApiV1* FakeGetterV1() { return g_api_v1; }
 const XlaMusaMuBlasApiV2* FakeGetterV2() { return g_api_v2; }
 
@@ -171,7 +188,8 @@ XlaMusaMuBlasApiV2 CompleteApiV2() {
   api.struct_size = sizeof(api);
   api.abi_version = XLA_MUSA_MUBLAS_ABI_VERSION_2;
   api.capabilities = XLA_MUSA_MUBLAS_CAPABILITIES_V1;
-  api.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2;
+  api.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
+                              XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
   api.create = FakeCreate;
   api.destroy = FakeDestroy;
   api.set_stream = FakeSetStream;
@@ -181,6 +199,7 @@ XlaMusaMuBlasApiV2 CompleteApiV2() {
   api.gemm_with_algorithm = FakeGemmWithAlgorithm;
   api.gemm_batched = FakeGemmBatched;
   api.gemm_strided_batched = FakeGemmStridedBatched;
+  api.scal = FakeScal;
   return api;
 }
 
@@ -309,20 +328,40 @@ TEST_F(MusaMuBlasApiTest, PrefersV2AndDispatchesAdvancedOperations) {
               ElementsAre("xla_musa_mublas_get_api_v2"));
   EXPECT_EQ(api->abi_version(), XLA_MUSA_MUBLAS_ABI_VERSION_2);
   EXPECT_EQ(api->advanced_capabilities(),
-            XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2);
+            XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
+                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL);
   EXPECT_TRUE(api->SupportsSetAtomicsMode());
   EXPECT_TRUE(api->SupportsGemmWithAlgorithm());
   EXPECT_TRUE(api->SupportsGemmBatched());
   EXPECT_TRUE(api->SupportsGemmStridedBatched());
   EXPECT_TRUE(api->SupportsTensorOpF32());
   EXPECT_TRUE(api->UsesZeroExternalWorkspace());
+  EXPECT_TRUE(api->SupportsScal());
   EXPECT_EQ(api->advanced_abi_fingerprint(),
             kMusaMuBlasAdvancedAbiFingerprintV2);
+  EXPECT_EQ(api->scal_abi_fingerprint(), kMusaMuBlasScalAbiFingerprintV1);
 
   void* handle = nullptr;
   ASSERT_TRUE(api->Create(&handle).ok());
   ASSERT_TRUE(api->SetAtomicsMode(handle, false).ok());
   EXPECT_FALSE(calls_.allow_atomics);
+
+  float scal_alpha = 0.25f;
+  void* scal_x = reinterpret_cast<void*>(0x7770);
+  ASSERT_TRUE(api->Scal(handle, XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32, 17,
+                        &scal_alpha, scal_x, 3)
+                  .ok());
+  EXPECT_EQ(calls_.scal, 1);
+  EXPECT_EQ(calls_.scal_type, XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32);
+  EXPECT_EQ(calls_.scal_n, 17);
+  EXPECT_EQ(calls_.scal_incx, 3);
+  EXPECT_EQ(calls_.scal_alpha, &scal_alpha);
+  EXPECT_EQ(calls_.scal_x, scal_x);
+  EXPECT_THAT(api->Scal(handle, static_cast<XlaMusaMuBlasScalType>(99), 1,
+                        &scal_alpha, scal_x, 1),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("unknown normalized")));
+  EXPECT_EQ(calls_.scal, 1);
 
   float scalar = 1.0f;
   ASSERT_TRUE(api->GemmWithAlgorithm(handle, XLA_MUSA_MUBLAS_DATA_TYPE_F32,
@@ -384,6 +423,71 @@ TEST_F(MusaMuBlasApiTest, PrefersV2AndDispatchesAdvancedOperations) {
   EXPECT_EQ(calls_.gemm_with_algorithm, 1);
 }
 
+TEST_F(MusaMuBlasApiTest, OldSizeV2RemainsValidWithoutReadingScalTail) {
+  api_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE;
+  api_v2_.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2;
+  // The physical test object has a tail, but its logical C16 table ends at
+  // byte 96. A compatible loader must ignore this value.
+  api_v2_.scal = FakeScal;
+  auto loader = std::make_unique<FakeSymbolLoader>(
+      reinterpret_cast<void*>(&FakeGetterV1),
+      reinterpret_cast<void*>(&FakeGetterV2));
+  std::unique_ptr<MusaMuBlasApi> api =
+      MusaMuBlasApi::CreateForTesting(std::move(loader));
+
+  ASSERT_TRUE(api->Init().ok());
+  EXPECT_EQ(api->abi_version(), XLA_MUSA_MUBLAS_ABI_VERSION_2);
+  EXPECT_EQ(api->advanced_capabilities(),
+            XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2);
+  EXPECT_EQ(api->advanced_abi_fingerprint(),
+            kMusaMuBlasAdvancedAbiFingerprintV2);
+  EXPECT_FALSE(api->SupportsScal());
+  EXPECT_TRUE(api->scal_abi_fingerprint().empty());
+  float scalar = 1.0f;
+  EXPECT_THAT(api->Scal(reinterpret_cast<void*>(0x1234),
+                        XLA_MUSA_MUBLAS_SCAL_TYPE_F32, 1, &scalar, &scalar, 1),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(calls_.scal, 0);
+}
+
+TEST_F(MusaMuBlasApiTest, ScalIdentityRequiresSizeCapabilityAndPointer) {
+  auto supports_scal = [this]() {
+    auto loader = std::make_unique<FakeSymbolLoader>(
+        reinterpret_cast<void*>(&FakeGetterV1),
+        reinterpret_cast<void*>(&FakeGetterV2));
+    std::unique_ptr<MusaMuBlasApi> api =
+        MusaMuBlasApi::CreateForTesting(std::move(loader));
+    EXPECT_TRUE(api->Init().ok());
+    EXPECT_TRUE(api->advanced_abi_fingerprint() ==
+                kMusaMuBlasAdvancedAbiFingerprintV2);
+    return api->SupportsScal() &&
+           api->scal_abi_fingerprint() == kMusaMuBlasScalAbiFingerprintV1;
+  };
+
+  api_v2_.advanced_capabilities &= ~XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
+  EXPECT_FALSE(supports_scal());
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.scal = nullptr;
+  EXPECT_FALSE(supports_scal());
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE;
+  EXPECT_FALSE(supports_scal());
+
+  api_v2_ = CompleteApiV2();
+  EXPECT_TRUE(supports_scal());
+  EXPECT_STREQ(kMusaMuBlasScalAbiContractV1,
+               "xla-musa-mublas-scal;abi=1;routes=sscal,dscal,cscal,zscal,"
+               "csscal,zdscal");
+  EXPECT_STREQ(
+      kMusaMuBlasScalAbiFingerprintV1,
+      "aee8bd3fc6ac91980f38d634b83a7789633d2573eb962de231ab5f129ae22560");
+  EXPECT_STREQ(
+      kMusaMuBlasAdvancedAbiFingerprintV2,
+      "097f516c7b70c49b3873926b6b20e39bafd74a80687a5e9e66a2927433dc1a68");
+}
+
 TEST_F(MusaMuBlasApiTest, V1FallbackRejectsAdvancedOperations) {
   auto loader = std::make_unique<FakeSymbolLoader>(
       reinterpret_cast<void*>(&FakeGetterV1));
@@ -394,9 +498,15 @@ TEST_F(MusaMuBlasApiTest, V1FallbackRejectsAdvancedOperations) {
   EXPECT_EQ(api->abi_version(), XLA_MUSA_MUBLAS_ABI_VERSION_1);
   EXPECT_EQ(api->advanced_capabilities(), 0);
   EXPECT_TRUE(api->advanced_abi_fingerprint().empty());
+  EXPECT_FALSE(api->SupportsScal());
+  EXPECT_TRUE(api->scal_abi_fingerprint().empty());
   EXPECT_THAT(api->SetAtomicsMode(handle, false),
               StatusIs(absl::StatusCode::kUnimplemented));
   float scalar = 1.0f;
+  EXPECT_THAT(
+      api->Scal(handle, XLA_MUSA_MUBLAS_SCAL_TYPE_F32, 1, &scalar, &scalar, 1),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("optional V2 SCAL")));
   EXPECT_THAT(
       api->GemmWithAlgorithm(
           handle, XLA_MUSA_MUBLAS_DATA_TYPE_F32, XLA_MUSA_MUBLAS_DATA_TYPE_F32,

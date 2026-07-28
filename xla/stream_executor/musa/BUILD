@@ -103,6 +103,138 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "musa_mufft_api",
+    srcs = ["musa_mufft_api.cc"],
+    hdrs = ["musa_mufft_api.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_optional_library_abi",
+        "//xla/stream_executor/musa/mufft_shim:mufft_shim_abi",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_mufft_api_test",
+    srcs = ["musa_mufft_api_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_mufft_api",
+        "//xla/stream_executor/musa/mufft_shim:mufft_shim_abi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_optional_libraries",
+    srcs = ["musa_optional_libraries.cc"],
+    hdrs = ["musa_optional_libraries.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mublas_api",
+        ":musa_mufft_api",
+        ":musa_optional_library_abi",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_optional_libraries_test",
+    srcs = ["musa_optional_libraries_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_optional_libraries",
+        ":musa_optional_library_abi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_fft",
+    srcs = ["musa_fft.cc"],
+    hdrs = ["musa_fft.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mufft_api",
+        ":musa_platform_id",
+        "//xla/stream_executor/musa/mufft_shim:mufft_shim_abi",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:fft",
+        "//xla/stream_executor:plugin_registry",
+        "//xla/stream_executor:scratch_allocator",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+    alwayslink = True,
+)
+
+xla_cc_test(
+    name = "musa_fft_test",
+    srcs = ["musa_fft_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_fft",
+        ":musa_mufft_api",
+        "//xla/stream_executor/musa/mufft_shim:mufft_shim_abi",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:fft",
+        "//xla/stream_executor:mock_stream",
+        "//xla/stream_executor:mock_stream_executor",
+        "//xla/stream_executor:scratch_allocator",
+        "//xla/stream_executor:stream",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "musa_blas",
     srcs = ["musa_blas.cc"],
     hdrs = ["musa_blas.h"],
@@ -768,6 +900,7 @@ cc_library(
         ":musa_device_properties",
         ":musa_driver",
         ":musa_event",
+        ":musa_fft",
         ":musa_kernel",
         ":musa_module",
         ":musa_module_reaper",
@@ -926,7 +1059,7 @@ cc_library(
     deps = [
         ":musa_driver",
         ":musa_executor",
-        ":musa_mublas_api",
+        ":musa_optional_libraries",
         ":musa_platform_id",
         ":musa_runtime",
         ":musa_runtime_abi_version",

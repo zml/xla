@@ -156,5 +156,22 @@ TEST(MusaExecutorTest, DeviceAllocationRetainsContextPastExecutorLifetime) {
   EXPECT_TRUE(MusaDriver::Instance().CurrentContext().ok());
 }
 
+TEST(MusaExecutorTest, HostMemoryAllocatorReturnsBfcAlignedMemory) {
+  MusaExecutor executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+  ASSERT_TRUE(executor.Init().ok());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<MemoryAllocator> allocator,
+                          executor.CreateMemoryAllocator(MemorySpace::kHost));
+
+  for (uint64_t size : {UINT64_C(1), UINT64_C(4096), UINT64_C(1) << 20}) {
+    TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<MemoryAllocation> allocation,
+                            allocator->Allocate(size));
+    ASSERT_FALSE(allocation->address().is_null());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->address().opaque()) &
+                  (uintptr_t{256} - 1),
+              0);
+    EXPECT_EQ(allocation->address().size(), size);
+  }
+}
+
 }  // namespace
 }  // namespace stream_executor::musa
