@@ -1499,8 +1499,10 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
        compute_reservation = std::move(compute_reservation),
        send_device_memory = std::move(send_device_memory),
        recv_device_memory = std::move(recv_device_memory),
-       inputs = std::vector<PjRtRawBufferRef>(inputs.begin(), inputs.end()),
-       results = std::vector<PjRtRawBufferRef>(results.begin(), results.end()),
+       inputs = absl::InlinedVector<PjRtRawBufferRef, 8>(inputs.begin(),
+                                                         inputs.end()),
+       results = absl::InlinedVector<PjRtRawBufferRef, 8>(results.begin(),
+                                                          results.end()),
        executable = executable_, execution_profile = options.execution_profile,
        parameter_is_tupled_arguments =
            compile_options.parameter_is_tupled_arguments,
