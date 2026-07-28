@@ -889,14 +889,19 @@ struct VulkanExecutor::Impl {
   }
 
   absl::StatusOr<uint32_t> FindMemoryType(uint32_t memory_type_bits) const {
+    std::optional<uint32_t> host_visible;
     for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
       if ((memory_type_bits & (1u << i)) == 0) continue;
-      VkMemoryPropertyFlags flags = memory_properties.memoryTypes[i].propertyFlags;
+      VkMemoryPropertyFlags flags =
+          memory_properties.memoryTypes[i].propertyFlags;
       constexpr VkMemoryPropertyFlags required =
           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-      if ((flags & required) == required) return i;
+      if ((flags & required) != required) continue;
+      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) return i;
+      if (!host_visible.has_value()) host_visible = i;
     }
+    if (host_visible.has_value()) return *host_visible;
     return absl::NotFoundError(
         "Vulkan buffer has no HOST_VISIBLE | HOST_COHERENT compatible "
         "memory type");
@@ -1550,14 +1555,19 @@ bool VulkanExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t compatible_heaps = 0;
+  uint32_t device_local_heaps = 0;
   for (uint32_t i = 0;
        i < memory_properties.memoryProperties.memoryTypeCount; ++i) {
     const VkMemoryType& type =
         memory_properties.memoryProperties.memoryTypes[i];
     if ((type.propertyFlags & required) == required) {
       compatible_heaps |= 1u << type.heapIndex;
+      if ((type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        device_local_heaps |= 1u << type.heapIndex;
+      }
     }
   }
+  if (device_local_heaps != 0) compatible_heaps = device_local_heaps;
 
   uint64_t budget = 0;
   uint64_t available = 0;
@@ -1730,11 +1740,14 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
   }
   VkMemoryBarrier before = {};
   before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  before.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  before.srcAccessMask =
+      VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
   before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-  impl_->vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                              &before, 0, nullptr, 0, nullptr);
+  impl_->vkCmdPipelineBarrier(
+      command_buffer,
+      VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0,
+      nullptr);
   impl_->vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                            kernel.pipeline_);
   impl_->vkCmdBindDescriptorSets(
