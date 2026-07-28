@@ -152,8 +152,10 @@ absl::Status LoadDeviceProc(PFN_vkGetDeviceProcAddr get_device_proc_addr,
 
 struct VulkanShaderFeatures {
   bool shader_bfloat16 = false;
+  bool storage_buffer_8bit_access = false;
   bool storage_buffer_16bit_access = false;
   bool shader_int8 = false;
+  bool shader_int16 = false;
   bool shader_int64 = false;
   bool storage_buffer_array_dynamic_indexing = false;
 };
@@ -188,12 +190,16 @@ class VulkanDriver {
           return std::strcmp(extension.extensionName,
                              VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) == 0;
         });
+    VkPhysicalDevice8BitStorageFeatures storage_8bit_features = {};
+    storage_8bit_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
     VkPhysicalDevice16BitStorageFeatures storage_16bit_features = {};
     storage_16bit_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     VkPhysicalDeviceShaderFloat16Int8Features float16_int8_features = {};
     float16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    storage_8bit_features.pNext = &storage_16bit_features;
     storage_16bit_features.pNext = &float16_int8_features;
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
     if (has_extension) {
@@ -203,15 +209,18 @@ class VulkanDriver {
     }
     VkPhysicalDeviceFeatures2 features = {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features.pNext = &storage_16bit_features;
+    features.pNext = &storage_8bit_features;
     get_physical_device_features2(physical_device, &features);
     VulkanShaderFeatures shader_features;
     shader_features.shader_bfloat16 =
         has_extension && bfloat16_features.shaderBFloat16Type == VK_TRUE;
+    shader_features.storage_buffer_8bit_access =
+        storage_8bit_features.storageBuffer8BitAccess == VK_TRUE;
     shader_features.storage_buffer_16bit_access =
         storage_16bit_features.storageBuffer16BitAccess == VK_TRUE;
     shader_features.shader_int8 =
         float16_int8_features.shaderInt8 == VK_TRUE;
+    shader_features.shader_int16 = features.features.shaderInt16 == VK_TRUE;
     shader_features.shader_int64 = features.features.shaderInt64 == VK_TRUE;
     shader_features.storage_buffer_array_dynamic_indexing =
         features.features.shaderStorageBufferArrayDynamicIndexing == VK_TRUE;
@@ -677,6 +686,12 @@ struct VulkanExecutor::Impl {
     if (!shader_features.shader_int8) {
       add_missing_feature("shaderInt8");
     }
+    if (!shader_features.storage_buffer_8bit_access) {
+      add_missing_feature("storageBuffer8BitAccess");
+    }
+    if (!shader_features.shader_int16) {
+      add_missing_feature("shaderInt16");
+    }
     if (!shader_features.shader_int64) {
       add_missing_feature("shaderInt64");
     }
@@ -701,12 +716,17 @@ struct VulkanExecutor::Impl {
           "Vulkan timelineSemaphore support is required");
     }
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
+    VkPhysicalDevice8BitStorageFeatures storage_8bit_features = {};
+    storage_8bit_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    storage_8bit_features.storageBuffer8BitAccess = VK_TRUE;
     VkPhysicalDevice16BitStorageFeatures storage_16bit_features = {};
     VkPhysicalDeviceShaderFloat16Int8Features float16_int8_features = {};
     float16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
     float16_int8_features.shaderInt8 = VK_TRUE;
-    timeline_features.pNext = &float16_int8_features;
+    timeline_features.pNext = &storage_8bit_features;
+    storage_8bit_features.pNext = &float16_int8_features;
     if (shader_bfloat16) {
       bfloat16_features.sType =
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
@@ -748,6 +768,7 @@ struct VulkanExecutor::Impl {
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.pNext = &timeline_features;
     VkPhysicalDeviceFeatures enabled_features = {};
+    enabled_features.shaderInt16 = VK_TRUE;
     enabled_features.shaderInt64 = VK_TRUE;
     enabled_features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
     device_info.pEnabledFeatures = &enabled_features;
