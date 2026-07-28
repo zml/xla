@@ -88,6 +88,33 @@ limitations under the License.
 
 namespace xla {
 
+namespace {
+
+class SmallEventDeduplicator {
+ public:
+  bool Insert(void* event) {
+    if (large_seen_.has_value()) {
+      return large_seen_->insert(event).second;
+    }
+    if (absl::c_linear_search(small_seen_, event)) {
+      return false;
+    }
+    if (small_seen_.size() < small_seen_.capacity()) {
+      small_seen_.push_back(event);
+      return true;
+    }
+    large_seen_.emplace(small_seen_.begin(), small_seen_.end());
+    small_seen_.clear();
+    return large_seen_->insert(event).second;
+  }
+
+ private:
+  absl::InlinedVector<void*, 4> small_seen_;
+  std::optional<absl::flat_hash_set<void*>> large_seen_;
+};
+
+}  // namespace
+
 void CommonPjRtClient::TrackFuture(PjRtMemorySpace* memory_space,
                                    absl::string_view debug_info,
                                    const Future<>& future) {}
@@ -1028,8 +1055,8 @@ absl::Status CommonPjRtClient::PrepareArguments(
     PjRtDevice* device, int replica, int partition,
     absl::Span<const Shape> parameter_device_shapes, bool& is_error,
     bool allow_fallback_for_donation) {
-  absl::flat_hash_set<void*> extra_deps_seen;
-  absl::flat_hash_set<void*> control_deps_seen;
+  SmallEventDeduplicator extra_deps_seen;
+  SmallEventDeduplicator control_deps_seen;
   if (argument_handles.size() != parameter_device_shapes.size()) {
     return InvalidArgument(
         "Execution supplied %d arguments but compiled program expected %d",
@@ -1089,6 +1116,77 @@ absl::Status CommonPjRtClient::PrepareArguments(
             "`ExecuteOptions::non_donatable_input_indices`");
       }
       bool must_donate = donated_param && !donation_denied_at_runtime;
+
+      auto strip_dynamic_shape_metadata = [&](PjRtRawBufferRef actual_buffer)
+          -> absl::StatusOr<PjRtRawBufferRef> {
+        if (!on_device_shape.is_dynamic() || expected_shape.is_dynamic()) {
+          return actual_buffer;
+        }
+        ASSIGN_OR_RETURN(auto handle_logical_device_shape,
+                         handle->logical_on_device_shape());
+        auto* client = absl::down_cast<CommonPjRtClient*>(
+            actual_buffer->memory_space()->client());
+        auto ds_kind = client->GetDynamicShapeKind(
+            actual_buffer->memory_space()->kind_id());
+        auto status_or_buffer = xla::RemoveDynamicShapeMetadataIfPresent(
+            actual_buffer, on_device_shape, handle_logical_device_shape,
+            ds_kind);
+        if (!status_or_buffer.ok()) {
+          absl::Status status = status_or_buffer.status();
+          tsl::errors::AppendToMessage(
+              &status, absl::StrCat("; Error when preparing the input buffer "
+                                    "to Execute() as argument ",
+                                    i, " to replica ", replica));
+          return status;
+        }
+        return status_or_buffer;
+      };
+
+      auto accumulate_definition_events =
+          [&](absl::Span<const PjRtDeviceEventRef> events) {
+            for (const auto& ev : events) {
+              if (ev) {
+                switch (ev.ptr().state()) {
+                  case PJRT_DeviceEvent_State_Error:
+                    is_error = true;
+                    ABSL_FALLTHROUGH_INTENDED;
+                  case PJRT_DeviceEvent_State_Unavailable:
+                    if (extra_deps_seen.Insert(ev.ptr().ToC().device_event)) {
+                      extra_deps.push_back(ev);
+                    }
+                    break;
+                  default:
+                    break;
+                }
+              }
+            }
+          };
+
+      if (auto* undonatable =
+              dynamic_cast<UndonatableCommonPjRtBuffer*>(handle)) {
+        if (must_donate) {
+          return InvalidArgument(
+              "Donation requested on UndonatableCommonPjRtBuffer for argument "
+              "%d to replica %d.",
+              i, replica);
+        }
+        ASSIGN_OR_RETURN(
+            auto actual_buffer,
+            strip_dynamic_shape_metadata(
+                undonatable->AcquireRawBufferRef("PrepareArguments")));
+        // Extract definition events directly to enforce data dependencies
+        // (blocking or aborting on errors) since standard PjRt holds are
+        // bypassed.
+        accumulate_definition_events(undonatable->definition_events());
+        input_buffers.push_back(std::move(actual_buffer));
+        // Push empty ScopedHold to maintain index parity with input_buffers;
+        // this is ignored during usage event registration.
+        device_buffers.emplace_back(
+            CommonPjRtBuffer::ScopedHold::UninitializedTag{});
+        continue;
+      }
+
+      auto* tfrt_buffer = absl::down_cast<CommonPjRtBufferImpl*>(handle);
       RETURN_IF_ERROR(TestBufferDonationClashes(
           tfrt_buffer, donation_clashes, must_donate, i, replica, partition));
       if (allow_fallback_for_donation && must_donate) {
@@ -1181,7 +1279,7 @@ absl::Status CommonPjRtClient::PrepareArguments(
           if (ev.ptr().state() == PJRT_DeviceEvent_State_Ready) {
             continue;
           }
-          if (control_deps_seen.insert(ev.ptr().ToC().device_event).second) {
+          if (control_deps_seen.Insert(ev.ptr().ToC().device_event)) {
             control_deps.push_back(ev);
           }
         }
