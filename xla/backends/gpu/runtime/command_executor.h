@@ -216,6 +216,7 @@ class CommandExecutor {
     // to values valid during the execution we use a node hash map container.
     using Key = std::pair<const CommandExecutor*, RecordId>;
     absl::node_hash_map<Key, RecordedCommands> recorded_commands;
+    absl::node_hash_map<Key, std::vector<uint8_t>> command_update_marks;
   };
 
   CommandExecutor(SynchronizationMode synchronization_mode,
@@ -264,6 +265,9 @@ class CommandExecutor {
   // A mapping from command id to unique buffer allocations indices referenced
   // by the command (sorted by the buffer allocation index).
   std::vector<std::vector<BufferAllocation::Index>> cmd_allocs_indices_;
+
+  // A mapping from buffer allocation index to command ids that reference it.
+  std::vector<std::vector<CommandId>> alloc_to_cmds_;
 
   // Per-command extra resource uses passed at construction time (e.g.
   // control-dependency tokens from the emitter). Stored so that
