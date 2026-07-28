@@ -260,9 +260,12 @@ absl::Status ValidateMusaGemmBackendConfig(const GemmBackendConfig& config) {
     return absl::UnimplementedError(
         "basic MUSA GEMM requires the default epilogue");
   }
-  if (config.algorithm_case() != GemmBackendConfig::ALGORITHM_NOT_SET) {
-    return absl::UnimplementedError(
-        "basic MUSA GEMM does not support a selected algorithm");
+  if (config.algorithm_case() != GemmBackendConfig::ALGORITHM_NOT_SET &&
+      config.selected_algorithm() != 0 && config.selected_algorithm() != 1) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("MUSA GEMM selected algorithm must be 0 (default) or 1 "
+                     "(tensor-op); got ",
+                     config.selected_algorithm()));
   }
   if (config.precision_config().algorithm() != PrecisionConfig::ALG_UNSET) {
     return absl::UnimplementedError(
@@ -305,10 +308,26 @@ absl::Status ValidateMusaGemmCustomCall(
   RETURN_IF_ERROR(ValidateMusaGemmBackendConfig(config));
 
   const DotDimensionNumbers& dot_dims = config.dot_dimension_numbers();
-  if (!dot_dims.lhs_batch_dimensions().empty() ||
-      !dot_dims.rhs_batch_dimensions().empty()) {
-    return absl::UnimplementedError(
-        "basic MUSA GEMM does not support batched matrix multiplication");
+  if (dot_dims.lhs_batch_dimensions_size() !=
+      dot_dims.rhs_batch_dimensions_size()) {
+    return absl::InvalidArgumentError(
+        "MUSA GEMM requires the same number of lhs and rhs batch dimensions");
+  }
+  for (int i = 0; i < dot_dims.lhs_batch_dimensions_size(); ++i) {
+    const int64_t lhs_dim = dot_dims.lhs_batch_dimensions(i);
+    const int64_t rhs_dim = dot_dims.rhs_batch_dimensions(i);
+    if (lhs_dim < 0 ||
+        lhs_dim >= instr.operand(0)->shape().dimensions().size() ||
+        rhs_dim < 0 ||
+        rhs_dim >= instr.operand(1)->shape().dimensions().size()) {
+      return absl::InvalidArgumentError(
+          "MUSA GEMM batch dimension is outside its operand rank");
+    }
+    if (instr.operand(0)->shape().dimensions(lhs_dim) !=
+        instr.operand(1)->shape().dimensions(rhs_dim)) {
+      return absl::InvalidArgumentError(
+          "MUSA GEMM lhs and rhs batch dimensions must have equal sizes");
+    }
   }
   if (dot_dims.lhs_contracting_dimensions_size() != 1 ||
       dot_dims.rhs_contracting_dimensions_size() != 1) {
@@ -323,6 +342,11 @@ absl::Status ValidateMusaGemmCustomCall(
       output_type != lhs_type) {
     return absl::UnimplementedError(
         "basic MUSA GEMM requires homogeneous F32 or F64 operands and result");
+  }
+  if (config.algorithm_case() == GemmBackendConfig::kSelectedAlgorithm &&
+      config.selected_algorithm() == 1 && lhs_type != F32) {
+    return absl::UnimplementedError(
+        "MUSA tensor-op algorithm 1 is qualified only for F32 GEMM");
   }
   return absl::OkStatus();
 }

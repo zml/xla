@@ -108,20 +108,23 @@ AutotuneDecision ShouldAutotuneCustomCall(bool do_not_autotune_cublas,
                                           bool do_not_autotune_cudnn,
                                           const HloInstruction& instruction) {
   auto gpu_config = instruction.backend_config<GpuBackendConfig>();
-  if (IsCublasLtGemm(instruction)) {
+  if (IsCublasLtGemm(instruction) || IsMusaGemm(instruction)) {
+    const bool is_musa = IsMusaGemm(instruction);
+    const absl::string_view library_name = is_musa ? "muBLAS" : "cuBLAS";
     if (do_not_autotune_cublas) {
-      return AutotuneDecision::Forbid("Autotuning cuBLAS is disabled");
+      return AutotuneDecision::Forbid(
+          absl::StrCat("Autotuning ", library_name, " is disabled"));
     }
     if (gpu_config.ok()) {
       // Grouped matmul stores the selected algorithm in the nested
       // grouped_gemm_backend_config, not the top-level gemm_backend_config.
       const GemmBackendConfig& gemm_config =
-          IsCublasLtGroupedMatmul(instruction)
+          !is_musa && IsCublasLtGroupedMatmul(instruction)
               ? gpu_config->grouped_gemm_backend_config().gemm_backend_config()
               : gpu_config->gemm_backend_config();
       if (gemm_config.has_selected_algorithm()) {
-        return AutotuneDecision::Forbid(
-            "cuBLAS GEMM already has a selected algorithm");
+        return AutotuneDecision::Forbid(absl::StrCat(
+            library_name, " GEMM already has a selected algorithm"));
       }
     }
     return AutotuneDecision::Allow();
@@ -256,6 +259,22 @@ std::unique_ptr<AutotunerCacheInterface> CreateAutotunerCache(
     return std::make_unique<TieredCache>(std::move(local_cache),
                                          std::move(dir_cache));
   }
+  if (target_config.device_description.gpu_compute_capability().IsMusa()) {
+    if (!legacy_cache_dir.empty()) {
+      LOG(WARNING)
+          << "The legacy per-fusion autotune cache cannot encode MUSA "
+             "determinism or muBLAS runtime identity. Ignoring legacy cache "
+             "directory '"
+          << legacy_cache_dir
+          << "' and using a context-scoped in-memory cache. Configure "
+             "xla_gpu_experimental_autotuner_cache_dir for persistent MUSA "
+             "autotuning.";
+    }
+    AutotuneCacheContext cache_ctx = AutotuneCacheContext::Create(
+        target_config.device_description, backends);
+    return std::make_unique<LocalCache>(std::move(cache_ctx),
+                                        KeyMatchingMode::kStrict);
+  }
   return std::make_unique<LegacyCache>(
       legacy_cache_dir,
       debug_options.xla_gpu_experimental_autotune_cache_mode(),
@@ -324,6 +343,7 @@ ProfileOptions GetProfileOptions(
 InstructionFilterFn GetShouldAutotuneInstructionFn(
     const DebugOptions& debug_options,
     const se::GpuComputeCapability& gpu_version) {
+  const bool is_musa = gpu_version.IsMusa();
   bool do_not_autotune_cublas =
       debug_options.xla_gpu_experimental_disable_binary_libraries() ||
       debug_options.xla_gpu_autotune_level() == 0;
@@ -337,10 +357,15 @@ InstructionFilterFn GetShouldAutotuneInstructionFn(
       debug_options.xla_gpu_experimental_enable_fusion_autotuner();
 
   return [do_not_autotune_cublas, do_not_autotune_cudnn,
-          enable_fusion_autotuner](const HloInstruction& instruction) -> bool {
+          enable_fusion_autotuner,
+          is_musa](const HloInstruction& instruction) -> bool {
     AutotuneDecision decision =
-        ShouldAutotuneInstruction(do_not_autotune_cublas, do_not_autotune_cudnn,
-                                  enable_fusion_autotuner, instruction);
+        is_musa && instruction.opcode() == HloOpcode::kFusion
+            ? AutotuneDecision::Forbid(
+                  "MUSA fusion autotuning has no registered fusion backend")
+            : ShouldAutotuneInstruction(do_not_autotune_cublas,
+                                        do_not_autotune_cudnn,
+                                        enable_fusion_autotuner, instruction);
     if (!decision) {
       VLOG(3) << "Not autotuning " << instruction.name() << ": "
               << decision.Explain();
@@ -368,6 +393,7 @@ AutotunerPass::GetGpuAutotunerBackends(
     disabled_autotune_backends.push_back(autotuner::Backend::CUBLASLT);
     disabled_autotune_backends.push_back(autotuner::Backend::CUDNN);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT);
+    disabled_autotune_backends.push_back(autotuner::Backend::MUBLAS);
     disabled_autotune_backends.push_back(autotuner::Backend::MIOPEN);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT_FISSION);
   }
@@ -427,16 +453,24 @@ absl::StatusOr<std::unique_ptr<AutotunerPass>> AutotunerPass::Create(
 
   std::unique_ptr<Profiler> profiler = nullptr;
   if (!is_deviceless) {
-    if (stream_executor->GetPlatform()->id() ==
-        stream_executor::sycl::kSyclPlatformId) {
-      // TODO(intel-tf): Enable buffer checking for SYCL once
-      // BufferComparatorKernel and RedzoneAllocatorKernel are registered for
-      // SYCL platform.
+    const bool lacks_correctness_kernels =
+        stream_executor->GetPlatform()->id() ==
+            stream_executor::sycl::kSyclPlatformId ||
+        gpu_version.IsMusa();
+    if (lacks_correctness_kernels) {
+      // BufferComparatorKernel and RedzoneAllocatorKernel are not registered
+      // for SYCL or MUSA. Disable these checks explicitly instead of treating
+      // unavailable kernels as successful correctness validation.
       assigner_options.check_buffers = false;
     }
-    profiler = GpuProfiler::Create(
-        stream_executor, GetProfileOptions(debug_options, assigner_options),
-        allocator);
+    ProfileOptions profile_options =
+        GetProfileOptions(debug_options, assigner_options);
+    if (gpu_version.IsMusa()) {
+      // MUSA also lacks the redzone fill/check kernels. A zero padding size
+      // makes both allocation and checking no-ops until those kernels exist.
+      profile_options.redzone_padding_bytes = 0;
+    }
+    profiler = GpuProfiler::Create(stream_executor, profile_options, allocator);
   }
 
   VLOG(1) << "ConfigAssigner options: " << assigner_options.ToString();

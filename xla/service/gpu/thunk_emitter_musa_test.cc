@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <memory>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -40,16 +41,24 @@ using ::testing::HasSubstr;
 
 std::unique_ptr<HloComputation> MakeMusaGemmComputation(
     PrimitiveType lhs_type = F32, PrimitiveType rhs_type = F32,
-    PrimitiveType output_type = F32) {
+    PrimitiveType output_type = F32, bool batched = false) {
   HloComputation::Builder builder("main");
-  HloInstruction* lhs = builder.AddInstruction(HloInstruction::CreateParameter(
-      0, ShapeUtil::MakeShape(lhs_type, {2, 3}), "lhs"));
-  HloInstruction* rhs = builder.AddInstruction(HloInstruction::CreateParameter(
-      1, ShapeUtil::MakeShape(rhs_type, {3, 4}), "rhs"));
+  const Shape lhs_shape =
+      ShapeUtil::MakeShape(lhs_type, batched ? std::vector<int64_t>{5, 2, 3}
+                                             : std::vector<int64_t>{2, 3});
+  const Shape rhs_shape =
+      ShapeUtil::MakeShape(rhs_type, batched ? std::vector<int64_t>{5, 3, 4}
+                                             : std::vector<int64_t>{3, 4});
+  const Shape output_shape =
+      ShapeUtil::MakeShape(output_type, batched ? std::vector<int64_t>{5, 2, 4}
+                                                : std::vector<int64_t>{2, 4});
+  HloInstruction* lhs = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, lhs_shape, "lhs"));
+  HloInstruction* rhs = builder.AddInstruction(
+      HloInstruction::CreateParameter(1, rhs_shape, "rhs"));
   HloInstruction* call =
       builder.AddInstruction(HloInstruction::CreateCustomCall(
-          ShapeUtil::MakeShape(output_type, {2, 4}), {lhs, rhs},
-          "__mublas$gemm"));
+          output_shape, {lhs, rhs}, "__mublas$gemm"));
   return builder.Build(call);
 }
 
@@ -102,12 +111,22 @@ TEST(MusaGemmBackendConfigTest, RejectsNonDefaultEpilogue) {
       StatusIs(absl::StatusCode::kUnimplemented, HasSubstr("epilogue")));
 }
 
-TEST(MusaGemmBackendConfigTest, RejectsSelectedAlgorithm) {
+TEST(MusaGemmBackendConfigTest, AcceptsQualifiedSelectedAlgorithms) {
+  GemmBackendConfig config = BasicMusaGemmConfig();
+  config.set_selected_algorithm(0);
+  EXPECT_THAT(thunk_emitter_internal::ValidateMusaGemmBackendConfig(config),
+              IsOk());
+  config.set_selected_algorithm(1);
+  EXPECT_THAT(thunk_emitter_internal::ValidateMusaGemmBackendConfig(config),
+              IsOk());
+}
+
+TEST(MusaGemmBackendConfigTest, RejectsUnknownSelectedAlgorithm) {
   GemmBackendConfig config = BasicMusaGemmConfig();
   config.set_selected_algorithm(7);
   EXPECT_THAT(thunk_emitter_internal::ValidateMusaGemmBackendConfig(config),
-              StatusIs(absl::StatusCode::kUnimplemented,
-                       HasSubstr("selected algorithm")));
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("must be 0 (default) or 1")));
 }
 
 TEST(MusaGemmBackendConfigTest, RejectsNonDefaultPrecisionAlgorithm) {
@@ -179,14 +198,33 @@ TEST(MusaGemmCustomCallTest, RejectsOutputToOperandAliasing) {
                        HasSubstr("output-to-operand aliasing")));
 }
 
-TEST(MusaGemmCustomCallTest, RejectsBatchedSchema) {
-  std::unique_ptr<HloComputation> computation = MakeMusaGemmComputation();
+TEST(MusaGemmCustomCallTest, AcceptsMatchedBatchedSchema) {
+  std::unique_ptr<HloComputation> computation =
+      MakeMusaGemmComputation(F32, F32, F32, /*batched=*/true);
   GemmBackendConfig config = BasicMusaGemmConfig();
+  config.mutable_dot_dimension_numbers()->set_lhs_contracting_dimensions(0, 2);
+  config.mutable_dot_dimension_numbers()->set_rhs_contracting_dimensions(0, 1);
   config.mutable_dot_dimension_numbers()->add_lhs_batch_dimensions(0);
   config.mutable_dot_dimension_numbers()->add_rhs_batch_dimensions(0);
   EXPECT_THAT(ValidateCustomCall(*computation, MusaCapability(), config),
-              StatusIs(absl::StatusCode::kUnimplemented,
-                       HasSubstr("batched matrix multiplication")));
+              IsOk());
+}
+
+TEST(MusaGemmCustomCallTest, RejectsMismatchedBatchSizes) {
+  std::unique_ptr<HloComputation> computation =
+      MakeMusaGemmComputation(F32, F32, F32, /*batched=*/true);
+  computation->root_instruction()
+      ->mutable_operand(1)
+      ->mutable_shape()
+      ->set_dimensions(0, 7);
+  GemmBackendConfig config = BasicMusaGemmConfig();
+  config.mutable_dot_dimension_numbers()->set_lhs_contracting_dimensions(0, 2);
+  config.mutable_dot_dimension_numbers()->set_rhs_contracting_dimensions(0, 1);
+  config.mutable_dot_dimension_numbers()->add_lhs_batch_dimensions(0);
+  config.mutable_dot_dimension_numbers()->add_rhs_batch_dimensions(0);
+  EXPECT_THAT(ValidateCustomCall(*computation, MusaCapability(), config),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("batch dimensions must have equal sizes")));
 }
 
 }  // namespace

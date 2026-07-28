@@ -228,6 +228,10 @@ class BlasSupport {
  public:
   virtual ~BlasSupport() = default;
 
+  // Notifies the implementation before `stream`'s native handle is destroyed.
+  // Backends that cache stream-bound library handles can release them here.
+  virtual void NotifyStreamDestroyed(Stream *stream) {}
+
   virtual gpu::BlasLt *GetBlasLt() = 0;
 
   // For tests only: sets *is_main_stream to true if the underlying Blas library

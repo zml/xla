@@ -18,13 +18,13 @@ limitations under the License.
 #include <optional>
 #include <string>
 
-#include "google/protobuf/duration.pb.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "google/protobuf/duration.pb.h"
 #include "xla/autotune_results.pb.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/backends.pb.h"
@@ -41,8 +41,22 @@ namespace gpu {
 
 using autotuner::Backend;
 
+namespace {
+
+absl::Status MusaLegacyCacheUnsupported() {
+  return absl::FailedPreconditionError(
+      "LegacyCache cannot encode MUSA determinism or muBLAS runtime identity; "
+      "use the context-aware autotuner cache");
+}
+
+}  // namespace
+
 std::optional<LegacyCache::Config> LegacyCache::Lookup(
     const HloInstruction* instr) {
+  if (device_desc_.gpu_compute_capability().IsMusa()) {
+    stats_.misses++;
+    return std::nullopt;
+  }
   AutotuneCacheKey key = GetAutotuneCacheKey(*instr);
   absl::StatusOr<std::optional<AutotuneResult>> result =
       AutotunerCache::TryFindInCache(key, cache_dir_);
@@ -60,6 +74,9 @@ std::optional<LegacyCache::Config> LegacyCache::Lookup(
 
 absl::Status LegacyCache::Insert(const HloInstruction* instr,
                                  const Config& best_config) {
+  if (device_desc_.gpu_compute_capability().IsMusa()) {
+    return MusaLegacyCacheUnsupported();
+  }
   AutotuneCacheKey key = GetAutotuneCacheKey(*instr);
   AutotuneResult autotune_result = GetAutotuneResult(best_config);
   absl::StatusOr<AutotunerCache::ResultAndInserted> result_and_inserted =
@@ -77,6 +94,9 @@ void LegacyCache::ClearCache() { AutotunerCache::ClearAutotuneResults(); }
 
 absl::StatusOr<std::string> LegacyCache::Serialize(
     absl::Span<const HloInstruction* const> instructions_to_serialize) {
+  if (device_desc_.gpu_compute_capability().IsMusa()) {
+    return MusaLegacyCacheUnsupported();
+  }
   AutotuneCacheKeySet key_set;
   for (const HloInstruction* instr : instructions_to_serialize) {
     key_set.insert(GetAutotuneCacheKey(*instr));
@@ -94,6 +114,9 @@ absl::StatusOr<std::string> LegacyCache::Serialize(
 }
 
 absl::Status LegacyCache::Deserialize(absl::string_view serialized_cache) {
+  if (device_desc_.gpu_compute_capability().IsMusa()) {
+    return MusaLegacyCacheUnsupported();
+  }
   return AutotunerCache::LoadAutotuneResults(serialized_cache,
                                              /*as_textproto=*/true,
                                              /*allow_override=*/true);

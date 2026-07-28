@@ -3870,6 +3870,7 @@ cc_library(
     ],
     deps = [
         ":musa_gpu_compiler_impl",
+        "//xla/backends/gpu/autotuner:factory_musa",
         "//xla/service:compiler",
         "//xla/stream_executor/musa:musa_platform_id",
     ],
@@ -3914,6 +3915,7 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/musa:musa_mublas_api",
         "//xla/stream_executor/musa:musa_optional_library_abi",
         "//xla/stream_executor/musa:musa_platform_id",
         "@com_google_absl//absl/base:core_headers",
@@ -3949,6 +3951,7 @@ xla_cc_test(
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor/abi:executable_abi_version",
         "//xla/stream_executor/musa:musa_compute_capability",
+        "//xla/stream_executor/musa:musa_mublas_api",
         "//xla/stream_executor/musa:musa_optional_library_abi",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",

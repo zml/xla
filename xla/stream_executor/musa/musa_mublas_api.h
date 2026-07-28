@@ -35,6 +35,13 @@ namespace stream_executor::musa {
 inline constexpr char kMusaMuBlasShimEnvironment[] =
     "XLA_MUSA_MUBLAS_SHIM_PATH";
 inline constexpr char kMusaMuBlasShimSoname[] = "libxla_musa_mublas_shim.so.1";
+// Canonical readable identity for the normalized v2 contract and its
+// lower-case SHA-256. Executable ABI metadata stores the hash because the
+// shared MUSA envelope requires fingerprints to be exactly 64 hex digits.
+inline constexpr char kMusaMuBlasAdvancedAbiContractV2[] =
+    "xla-musa-mublas;abi=2;base=7;advanced=63;workspace=0";
+inline constexpr char kMusaMuBlasAdvancedAbiFingerprintV2[] =
+    "097f516c7b70c49b3873926b6b20e39bafd74a80687a5e9e66a2927433dc1a68";
 
 namespace internal {
 
@@ -72,12 +79,24 @@ class MusaMuBlasApi {
   bool IsLoaded() const { return Init().ok(); }
 
   uint64_t capabilities() const;
+  uint64_t advanced_capabilities() const;
+  uint32_t abi_version() const;
+  bool SupportsSetAtomicsMode() const;
+  bool SupportsGemmWithAlgorithm() const;
+  bool SupportsGemmBatched() const;
+  bool SupportsGemmStridedBatched() const;
+  bool SupportsTensorOpF32() const;
+  bool UsesZeroExternalWorkspace() const;
+  // Empty for a v1 shim. For v2 this is a deterministic cache/serialization
+  // identity for operations that depend on the advanced ABI contract.
+  std::string advanced_abi_fingerprint() const;
   absl::string_view loaded_path() const;
 
   absl::Status Create(void** handle) const;
   absl::Status Destroy(void* handle) const;
   absl::Status SetStream(void* handle, void* stream) const;
   absl::Status GetVersion(void* handle, int32_t* version) const;
+  absl::Status SetAtomicsMode(void* handle, bool allow_atomics) const;
   absl::Status Gemm(void* handle, XlaMusaMuBlasDataType input_type,
                     XlaMusaMuBlasDataType output_type,
                     XlaMusaMuBlasComputeType compute_type,
@@ -86,6 +105,31 @@ class MusaMuBlasApi {
                     int64_t k, const void* alpha, const void* a, int64_t lda,
                     const void* b, int64_t ldb, const void* beta, void* c,
                     int64_t ldc) const;
+  absl::Status GemmWithAlgorithm(
+      void* handle, XlaMusaMuBlasDataType input_type,
+      XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+      XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+      int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+      const void* b, int64_t ldb, const void* beta, void* c, int64_t ldc,
+      XlaMusaMuBlasAlgorithm algorithm) const;
+  absl::Status GemmBatched(void* handle, XlaMusaMuBlasDataType input_type,
+                           XlaMusaMuBlasDataType output_type,
+                           XlaMusaMuBlasComputeType compute_type,
+                           XlaMusaMuBlasOperation trans_a,
+                           XlaMusaMuBlasOperation trans_b, int64_t m, int64_t n,
+                           int64_t k, const void* alpha, const void* const* a,
+                           int64_t lda, const void* const* b, int64_t ldb,
+                           const void* beta, void* const* c, int64_t ldc,
+                           int64_t batch_count,
+                           XlaMusaMuBlasAlgorithm algorithm) const;
+  absl::Status GemmStridedBatched(
+      void* handle, XlaMusaMuBlasDataType input_type,
+      XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+      XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+      int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+      int64_t stride_a, const void* b, int64_t ldb, int64_t stride_b,
+      const void* beta, void* c, int64_t ldc, int64_t stride_c,
+      int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm) const;
 
  private:
   absl::Status Initialize() const;
@@ -94,7 +138,8 @@ class MusaMuBlasApi {
   mutable absl::once_flag load_once_;
   mutable absl::Status load_status_ =
       absl::UnknownError("muBLAS shim not loaded");
-  mutable const XlaMusaMuBlasApiV1* api_ = nullptr;
+  mutable const XlaMusaMuBlasApiV1* api_v1_ = nullptr;
+  mutable const XlaMusaMuBlasApiV2* api_v2_ = nullptr;
 };
 
 // Returns the process-wide API instance. Its DSO is intentionally pinned by

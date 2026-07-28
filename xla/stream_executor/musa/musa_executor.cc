@@ -301,6 +301,10 @@ void MusaExecutor::DeallocateStream(Stream* stream) {
   if (musa_stream == nullptr) {
     return;
   }
+  {
+    absl::MutexLock lock(&support_mu_);
+    if (blas_ != nullptr) blas_->NotifyStreamDestroyed(stream);
+  }
   absl::MutexLock lock(&alive_streams_mu_);
   alive_streams_.erase(musa_stream->stream_handle());
 }

@@ -79,6 +79,32 @@ TEST(AutotuneCacheContextTest, CreateWithDifferentDeviceSpec) {
   EXPECT_NE(context1, context2);
 }
 
+TEST(AutotuneCacheContextTest, MusaCapabilityProducesStableDeviceIdentity) {
+  auto make_context = [](int logical_subgroup_size) {
+    stream_executor::DeviceDescription device_description;
+    device_description.set_name("MTT S80");
+    device_description.set_core_count(32);
+    device_description.set_clock_rate_ghz(1.8);
+    device_description.set_memory_bandwidth(448000000000);
+    device_description.set_l2_cache_size(25165824);
+    device_description.set_gpu_compute_capability(
+        stream_executor::GpuComputeCapability(
+            stream_executor::MusaComputeCapability("mp_21", 2, 1,
+                                                   /*hardware_warp_size=*/128,
+                                                   logical_subgroup_size)));
+    std::vector<std::unique_ptr<CodegenBackend>> backends;
+    backends.push_back(std::make_unique<FakeCodegenBackend>(
+        autotuner::Backend::MUBLAS, "mublas-v1"));
+    return AutotuneCacheContext::Create(device_description, backends);
+  };
+
+  AutotuneCacheContext qualified = make_context(32);
+  AutotuneCacheContext incompatible_width = make_context(64);
+  EXPECT_EQ(qualified.device().size(), 16);
+  EXPECT_NE(qualified.device(), incompatible_width.device());
+  EXPECT_NE(qualified, incompatible_width);
+}
+
 TEST(AutotuneCacheContextTest, CreateWithDifferentExplicitVersion) {
   AutotuneCacheContext context1 = CreateCacheContext("v1.0");
   AutotuneCacheContext context2 = CreateCacheContext("v1.1");

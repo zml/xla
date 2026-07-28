@@ -48,6 +48,7 @@ limitations under the License.
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
+#include "xla/stream_executor/musa/musa_mublas_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
@@ -59,24 +60,48 @@ namespace xla::gpu {
 namespace {
 
 absl::Status ProviderUnavailable(const absl::Status& status) {
-  return absl::Status(
-      status.code(),
-      absl::StrCat("MUSA compilation provider is unavailable: ",
-                   status.message()));
+  return absl::Status(status.code(),
+                      absl::StrCat("MUSA compilation provider is unavailable: ",
+                                   status.message()));
 }
 
 std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
     const HloModule& module) {
+  bool requires_mublas = false;
+  // Deterministic execution configures the muBLAS atomics mode before every
+  // GEMM. That setter is part of the v2 table even when the HLO itself is an
+  // unbatched GEMM using the default algorithm.
+  bool requires_advanced_mublas =
+      module.config().debug_options().xla_gpu_deterministic_ops() ||
+      module.config().debug_options().xla_gpu_exclude_nondeterministic_ops();
   for (const HloComputation* computation : module.computations()) {
     for (const HloInstruction* instruction : computation->instructions()) {
-      if (IsMusaGemm(*instruction)) {
-        return {{
-            .name = stream_executor::musa::kMusaMuBlasLibraryAbiName,
-            .abi_version = stream_executor::musa::kMusaMuBlasLibraryAbiVersion,
-            .fingerprint = "",
-        }};
-      }
+      if (!IsMusaGemm(*instruction)) continue;
+      requires_mublas = true;
+
+      // C15 executables carried no fingerprint and remain loadable with either
+      // the v1 or v2 shim table. A selected algorithm or a batched call depends
+      // on the C16 v2 contract, so serialize its exact normalized capability
+      // fingerprint and reject stale or downgraded runtime shims at load time.
+      absl::StatusOr<GpuBackendConfig> gpu_config =
+          instruction->backend_config<GpuBackendConfig>();
+      if (!gpu_config.ok()) continue;
+      const GemmBackendConfig& gemm = gpu_config->gemm_backend_config();
+      const DotDimensionNumbers& dimensions = gemm.dot_dimension_numbers();
+      requires_advanced_mublas |= gemm.has_selected_algorithm() ||
+                                  dimensions.lhs_batch_dimensions_size() != 0 ||
+                                  dimensions.rhs_batch_dimensions_size() != 0;
     }
+  }
+  if (requires_mublas) {
+    return {{
+        .name = stream_executor::musa::kMusaMuBlasLibraryAbiName,
+        .abi_version = stream_executor::musa::kMusaMuBlasLibraryAbiVersion,
+        .fingerprint =
+            requires_advanced_mublas
+                ? stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2
+                : "",
+    }};
   }
   return {};
 }
@@ -161,10 +186,11 @@ void MusaGpuCompiler::AddGemmRewriterPasses(
     HloPassPipeline& pipeline, const DebugOptions& debug_options,
     const se::GpuComputeCapability& gpu_version,
     const se::SemanticVersion& toolkit_version) {
-  // The initial muBLAS route is deliberately narrower than CUDA/ROCm: it does
-  // not expose FP8, bias fusion, a workspace output, or an autotuner contract.
-  // GemmRewriter enforces the homogeneous, non-batched f16/bf16/f32/f64 subset
-  // before emitting the MUSA-specific custom-call target.
+  // The muBLAS route is deliberately narrower than CUDA/ROCm: it does not
+  // expose FP8, bias fusion, or a workspace output. GemmRewriter enforces the
+  // qualified type and epilogue subset before emitting the MUSA-specific
+  // custom-call target; the shared autotuner subsequently writes a normalized
+  // algorithm identifier into its backend config.
   (void)debug_options;
   pipeline.AddPass<DotAlgorithmRewriter>();
   pipeline.AddPass<GemmRewriter>(
@@ -196,21 +222,10 @@ absl::Status MusaGpuCompiler::AddAutotunerPass(
     mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
     const MultiProcessKeyValueStore& key_value_store) {
-  // The shared autotuner currently exposes CUDA and ROCm backends. The basic
-  // MUSA adapter supports only the explicit default algorithm, so preserve the
-  // generic emitter until MUSA algorithm discovery is available.
-  (void)pipeline;
-  (void)hlo_module;
-  (void)gpu_version;
-  (void)options;
-  (void)thread_pool;
-  (void)stream_executor;
-  (void)target_config;
-  (void)alias_info;
-  (void)mlir_context;
-  (void)shape_size_fn;
-  (void)key_value_store;
-  return absl::OkStatus();
+  return GpuCompiler::AddAutotunerPass(
+      pipeline, hlo_module, gpu_version, options, thread_pool, stream_executor,
+      target_config, alias_info, mlir_context, std::move(shape_size_fn),
+      key_value_store);
 }
 
 absl::StatusOr<GpuCompiler::BackendCompileResult>

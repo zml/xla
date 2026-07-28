@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/literal_util.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/statusor.h"
@@ -61,6 +62,21 @@ se::DeviceDescription CreateDummyDeviceDescription(
   desc.set_clock_rate_ghz(name == "test_device" ? 1.98 : 2.00);
   desc.set_memory_bandwidth(1000e9);
   desc.set_l2_cache_size(50 * 1024 * 1024);
+  return desc;
+}
+
+se::DeviceDescription CreateDummyMusaDeviceDescription() {
+  se::DeviceDescription desc;
+  desc.set_name("MTT S80");
+  desc.set_device_vendor("Moore Threads");
+  desc.set_platform_version("MUSA 4.0.1");
+  desc.set_gpu_compute_capability(se::GpuComputeCapability(
+      se::MusaComputeCapability("mp_21", 2, 1, /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)));
+  desc.set_core_count(32);
+  desc.set_clock_rate_ghz(1.8);
+  desc.set_memory_bandwidth(448e9);
+  desc.set_l2_cache_size(24 * 1024 * 1024);
   return desc;
 }
 
@@ -316,6 +332,28 @@ TEST_F(LegacyCacheTest, CacheStats) {
   EXPECT_THAT(cache.Lookup(instr2.get()), Eq(std::nullopt));
   EXPECT_EQ(cache.GetCacheStats().hits, 2);
   EXPECT_EQ(cache.GetCacheStats().misses, 2);
+}
+
+TEST_F(LegacyCacheTest, MusaDeviceFailsClosed) {
+  LegacyCache cache(test_dir_, mode_, CreateDummyMusaDeviceDescription());
+  std::unique_ptr<HloInstruction> instr = CreateDummyInstr("musa_cache");
+  Config config = CreateDummyBackendConfig();
+
+  EXPECT_THAT(cache.Lookup(instr.get()), Eq(std::nullopt));
+  EXPECT_EQ(cache.GetCacheStats().misses, 1);
+
+  absl::Status insert_status = cache.Insert(instr.get(), config);
+  EXPECT_EQ(insert_status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(insert_status.message(), testing::HasSubstr("MUSA"));
+
+  std::vector<const HloInstruction*> instructions = {instr.get()};
+  absl::StatusOr<std::string> serialized = cache.Serialize(instructions);
+  EXPECT_EQ(serialized.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(serialized.status().message(), testing::HasSubstr("MUSA"));
+
+  absl::Status deserialize_status = cache.Deserialize("");
+  EXPECT_EQ(deserialize_status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(deserialize_status.message(), testing::HasSubstr("MUSA"));
 }
 
 }  // namespace

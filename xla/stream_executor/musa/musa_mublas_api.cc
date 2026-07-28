@@ -38,10 +38,12 @@ limitations under the License.
 namespace stream_executor::musa {
 namespace {
 
-constexpr char kMuBlasGetterSymbol[] = "xla_musa_mublas_get_api_v1";
+constexpr char kMuBlasV1GetterSymbol[] = "xla_musa_mublas_get_api_v1";
+constexpr char kMuBlasV2GetterSymbol[] = "xla_musa_mublas_get_api_v2";
 constexpr size_t kMaxConfiguredPathBytes = 4096;
 
 using GetApiV1Fn = const XlaMusaMuBlasApiV1* (*)();
+using GetApiV2Fn = const XlaMusaMuBlasApiV2* (*)();
 
 absl::Status MuBlasStatus(int32_t status, absl::string_view operation) {
   const std::string message =
@@ -148,8 +150,8 @@ std::unique_ptr<internal::MusaSymbolLoader> CreateDefaultShimLoader() {
   return CreateShimLoader(configured_path, plugin_path);
 }
 
-absl::Status ValidateApi(const XlaMusaMuBlasApiV1* api,
-                         absl::string_view loaded_path) {
+absl::Status ValidateApiV1(const XlaMusaMuBlasApiV1* api,
+                           absl::string_view loaded_path) {
   if (api == nullptr) {
     return absl::FailedPreconditionError(absl::StrCat(
         "muBLAS shim ", loaded_path, " returned a null v1 API table"));
@@ -178,6 +180,72 @@ absl::Status ValidateApi(const XlaMusaMuBlasApiV1* api,
     return absl::FailedPreconditionError(
         absl::StrCat("muBLAS shim ", loaded_path,
                      " has a null required function in its v1 API table"));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateApiV2(const XlaMusaMuBlasApiV2* api,
+                           absl::string_view loaded_path) {
+  if (api == nullptr) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loaded_path, " returned a null v2 API table"));
+  }
+  if (api->struct_size < XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loaded_path,
+        " v2 table is too small: ", api->struct_size, "; expected at least ",
+        XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE));
+  }
+  if (api->abi_version != XLA_MUSA_MUBLAS_ABI_VERSION_2) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loaded_path, " has ABI version ", api->abi_version,
+        "; expected ", XLA_MUSA_MUBLAS_ABI_VERSION_2));
+  }
+  if ((api->capabilities & XLA_MUSA_MUBLAS_CAPABILITIES_V1) !=
+      XLA_MUSA_MUBLAS_CAPABILITIES_V1) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loaded_path,
+        " ABI v2 base capabilities are incomplete: ", api->capabilities,
+        "; required mask ", XLA_MUSA_MUBLAS_CAPABILITIES_V1));
+  }
+  if ((api->advanced_capabilities & XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2) !=
+      XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("muBLAS shim ", loaded_path,
+                     " ABI v2 advanced capabilities are incomplete: ",
+                     api->advanced_capabilities, "; required mask ",
+                     XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2));
+  }
+  if (api->create == nullptr || api->destroy == nullptr ||
+      api->set_stream == nullptr || api->get_version == nullptr ||
+      api->gemm == nullptr || api->set_atomics_mode == nullptr ||
+      api->gemm_with_algorithm == nullptr || api->gemm_batched == nullptr ||
+      api->gemm_strided_batched == nullptr) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("muBLAS shim ", loaded_path,
+                     " has a null required function in its v2 API table"));
+  }
+  return absl::OkStatus();
+}
+
+bool HasCapability(uint64_t capabilities, uint64_t capability) {
+  return (capabilities & capability) == capability;
+}
+
+absl::Status ValidateNormalizedAlgorithm(
+    XlaMusaMuBlasAlgorithm algorithm, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type) {
+  if (algorithm != XLA_MUSA_MUBLAS_ALGORITHM_DEFAULT &&
+      algorithm != XLA_MUSA_MUBLAS_ALGORITHM_TENSOR_OP) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("unknown normalized muBLAS algorithm ", algorithm));
+  }
+  if (algorithm == XLA_MUSA_MUBLAS_ALGORITHM_TENSOR_OP &&
+      (input_type != XLA_MUSA_MUBLAS_DATA_TYPE_F32 ||
+       output_type != XLA_MUSA_MUBLAS_DATA_TYPE_F32 ||
+       compute_type != XLA_MUSA_MUBLAS_COMPUTE_TYPE_F32)) {
+    return absl::UnimplementedError(
+        "muBLAS tensor-op algorithm is qualified only for homogeneous F32");
   }
   return absl::OkStatus();
 }
@@ -220,22 +288,84 @@ absl::Status MusaMuBlasApi::Initialize() const {
     return absl::InternalError("muBLAS shim symbol loader is null");
   }
   RETURN_IF_ERROR(loader_->Load());
-  absl::StatusOr<void*> getter = loader_->Resolve(kMuBlasGetterSymbol);
-  if (!getter.ok() || *getter == nullptr) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "muBLAS shim ", loader_->loaded_path(),
-        " is missing its only required export ", kMuBlasGetterSymbol,
-        getter.ok() ? "" : absl::StrCat(": ", getter.status())));
+  absl::StatusOr<void*> v2_getter = loader_->Resolve(kMuBlasV2GetterSymbol);
+  if (v2_getter.ok() && *v2_getter != nullptr) {
+    GetApiV2Fn get_api = reinterpret_cast<GetApiV2Fn>(*v2_getter);
+    const XlaMusaMuBlasApiV2* api = get_api();
+    RETURN_IF_ERROR(ValidateApiV2(api, loader_->loaded_path()));
+    api_v2_ = api;
+    return absl::OkStatus();
   }
-  GetApiV1Fn get_api = reinterpret_cast<GetApiV1Fn>(*getter);
+  if (!v2_getter.ok() && !absl::IsNotFound(v2_getter.status())) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loader_->loaded_path(), " could not resolve ",
+        kMuBlasV2GetterSymbol, ": ", v2_getter.status()));
+  }
+
+  absl::StatusOr<void*> v1_getter = loader_->Resolve(kMuBlasV1GetterSymbol);
+  if (!v1_getter.ok() || *v1_getter == nullptr) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "muBLAS shim ", loader_->loaded_path(), " exports neither a usable ",
+        kMuBlasV2GetterSymbol, " nor ", kMuBlasV1GetterSymbol,
+        v1_getter.ok() ? "" : absl::StrCat(": ", v1_getter.status())));
+  }
+  GetApiV1Fn get_api = reinterpret_cast<GetApiV1Fn>(*v1_getter);
   const XlaMusaMuBlasApiV1* api = get_api();
-  RETURN_IF_ERROR(ValidateApi(api, loader_->loaded_path()));
-  api_ = api;
+  RETURN_IF_ERROR(ValidateApiV1(api, loader_->loaded_path()));
+  api_v1_ = api;
   return absl::OkStatus();
 }
 
 uint64_t MusaMuBlasApi::capabilities() const {
-  return Init().ok() ? api_->capabilities : 0;
+  if (!Init().ok()) return 0;
+  return api_v2_ != nullptr ? api_v2_->capabilities : api_v1_->capabilities;
+}
+
+uint64_t MusaMuBlasApi::advanced_capabilities() const {
+  return Init().ok() && api_v2_ != nullptr ? api_v2_->advanced_capabilities : 0;
+}
+
+uint32_t MusaMuBlasApi::abi_version() const {
+  if (!Init().ok()) return 0;
+  return api_v2_ != nullptr ? XLA_MUSA_MUBLAS_ABI_VERSION_2
+                            : XLA_MUSA_MUBLAS_ABI_VERSION_1;
+}
+
+bool MusaMuBlasApi::SupportsSetAtomicsMode() const {
+  return HasCapability(advanced_capabilities(),
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SET_ATOMICS_MODE);
+}
+
+bool MusaMuBlasApi::SupportsGemmWithAlgorithm() const {
+  return HasCapability(advanced_capabilities(),
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_WITH_ALGORITHM);
+}
+
+bool MusaMuBlasApi::SupportsGemmBatched() const {
+  return HasCapability(advanced_capabilities(),
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_BATCHED);
+}
+
+bool MusaMuBlasApi::SupportsGemmStridedBatched() const {
+  return HasCapability(
+      advanced_capabilities(),
+      XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_STRIDED_BATCHED);
+}
+
+bool MusaMuBlasApi::SupportsTensorOpF32() const {
+  return HasCapability(advanced_capabilities(),
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32);
+}
+
+bool MusaMuBlasApi::UsesZeroExternalWorkspace() const {
+  return HasCapability(
+      advanced_capabilities(),
+      XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE);
+}
+
+std::string MusaMuBlasApi::advanced_abi_fingerprint() const {
+  if (abi_version() != XLA_MUSA_MUBLAS_ABI_VERSION_2) return {};
+  return kMusaMuBlasAdvancedAbiFingerprintV2;
 }
 
 absl::string_view MusaMuBlasApi::loaded_path() const {
@@ -248,7 +378,9 @@ absl::Status MusaMuBlasApi::Create(void** handle) const {
     return absl::InvalidArgumentError("muBLAS handle output is null");
   }
   *handle = nullptr;
-  RETURN_IF_ERROR(MuBlasStatus(api_->create(handle), "create"));
+  const XlaMusaMuBlasCreateFn create =
+      api_v2_ != nullptr ? api_v2_->create : api_v1_->create;
+  RETURN_IF_ERROR(MuBlasStatus(create(handle), "create"));
   if (*handle == nullptr) {
     return absl::InternalError("muBLAS create returned a null handle");
   }
@@ -258,7 +390,9 @@ absl::Status MusaMuBlasApi::Create(void** handle) const {
 absl::Status MusaMuBlasApi::Destroy(void* handle) const {
   RETURN_IF_ERROR(Init());
   if (handle == nullptr) return absl::OkStatus();
-  return MuBlasStatus(api_->destroy(handle), "destroy");
+  const XlaMusaMuBlasDestroyFn destroy =
+      api_v2_ != nullptr ? api_v2_->destroy : api_v1_->destroy;
+  return MuBlasStatus(destroy(handle), "destroy");
 }
 
 absl::Status MusaMuBlasApi::SetStream(void* handle, void* stream) const {
@@ -266,7 +400,9 @@ absl::Status MusaMuBlasApi::SetStream(void* handle, void* stream) const {
   if (handle == nullptr) {
     return absl::FailedPreconditionError("muBLAS handle is null");
   }
-  return MuBlasStatus(api_->set_stream(handle, stream), "set_stream");
+  const XlaMusaMuBlasSetStreamFn set_stream =
+      api_v2_ != nullptr ? api_v2_->set_stream : api_v1_->set_stream;
+  return MuBlasStatus(set_stream(handle, stream), "set_stream");
 }
 
 absl::Status MusaMuBlasApi::GetVersion(void* handle, int32_t* version) const {
@@ -275,7 +411,24 @@ absl::Status MusaMuBlasApi::GetVersion(void* handle, int32_t* version) const {
     return absl::InvalidArgumentError(
         "muBLAS get_version requires non-null handle and output");
   }
-  return MuBlasStatus(api_->get_version(handle, version), "get_version");
+  const XlaMusaMuBlasGetVersionFn get_version =
+      api_v2_ != nullptr ? api_v2_->get_version : api_v1_->get_version;
+  return MuBlasStatus(get_version(handle, version), "get_version");
+}
+
+absl::Status MusaMuBlasApi::SetAtomicsMode(void* handle,
+                                           bool allow_atomics) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  if (!SupportsSetAtomicsMode()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support the v2 atomics-mode contract");
+  }
+  return MuBlasStatus(api_v2_->set_atomics_mode(
+                          handle, allow_atomics ? UINT32_C(1) : UINT32_C(0)),
+                      "set_atomics_mode");
 }
 
 absl::Status MusaMuBlasApi::Gemm(
@@ -288,13 +441,93 @@ absl::Status MusaMuBlasApi::Gemm(
   if (handle == nullptr) {
     return absl::FailedPreconditionError("muBLAS handle is null");
   }
+  const XlaMusaMuBlasGemmFn gemm =
+      api_v2_ != nullptr ? api_v2_->gemm : api_v1_->gemm;
   return MuBlasStatus(
-      api_->gemm(handle, static_cast<uint32_t>(input_type),
-                 static_cast<uint32_t>(output_type),
-                 static_cast<uint32_t>(compute_type),
-                 static_cast<uint32_t>(trans_a), static_cast<uint32_t>(trans_b),
-                 m, n, k, alpha, a, lda, b, ldb, beta, c, ldc),
+      gemm(handle, static_cast<uint32_t>(input_type),
+           static_cast<uint32_t>(output_type),
+           static_cast<uint32_t>(compute_type), static_cast<uint32_t>(trans_a),
+           static_cast<uint32_t>(trans_b), m, n, k, alpha, a, lda, b, ldb, beta,
+           c, ldc),
       "gemm");
+}
+
+absl::Status MusaMuBlasApi::GemmWithAlgorithm(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+    const void* b, int64_t ldb, const void* beta, void* c, int64_t ldc,
+    XlaMusaMuBlasAlgorithm algorithm) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  RETURN_IF_ERROR(ValidateNormalizedAlgorithm(algorithm, input_type,
+                                              output_type, compute_type));
+  if (!SupportsGemmWithAlgorithm()) {
+    if (algorithm == XLA_MUSA_MUBLAS_ALGORITHM_DEFAULT) {
+      return Gemm(handle, input_type, output_type, compute_type, trans_a,
+                  trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    }
+    return absl::UnimplementedError(
+        "muBLAS ABI v1 supports only the default GEMM algorithm");
+  }
+  return MuBlasStatus(
+      api_v2_->gemm_with_algorithm(
+          handle, input_type, output_type, compute_type, trans_a, trans_b, m, n,
+          k, alpha, a, lda, b, ldb, beta, c, ldc, algorithm),
+      "gemm_with_algorithm");
+}
+
+absl::Status MusaMuBlasApi::GemmBatched(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* const* a, int64_t lda,
+    const void* const* b, int64_t ldb, const void* beta, void* const* c,
+    int64_t ldc, int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  RETURN_IF_ERROR(ValidateNormalizedAlgorithm(algorithm, input_type,
+                                              output_type, compute_type));
+  if (!SupportsGemmBatched()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support pointer-array batched GEMM");
+  }
+  return MuBlasStatus(
+      api_v2_->gemm_batched(handle, input_type, output_type, compute_type,
+                            trans_a, trans_b, m, n, k, alpha, a, lda, b, ldb,
+                            beta, c, ldc, batch_count, algorithm),
+      "gemm_batched");
+}
+
+absl::Status MusaMuBlasApi::GemmStridedBatched(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+    int64_t stride_a, const void* b, int64_t ldb, int64_t stride_b,
+    const void* beta, void* c, int64_t ldc, int64_t stride_c,
+    int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  RETURN_IF_ERROR(ValidateNormalizedAlgorithm(algorithm, input_type,
+                                              output_type, compute_type));
+  if (!SupportsGemmStridedBatched()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support strided-batched GEMM");
+  }
+  return MuBlasStatus(
+      api_v2_->gemm_strided_batched(
+          handle, input_type, output_type, compute_type, trans_a, trans_b, m, n,
+          k, alpha, a, lda, stride_a, b, ldb, stride_b, beta, c, ldc, stride_c,
+          batch_count, algorithm),
+      "gemm_strided_batched");
 }
 
 MusaMuBlasApi* GetMusaMuBlasApi() {
@@ -310,10 +543,12 @@ GetAvailableMusaOptionalLibraryAbis() {
     return std::vector<MusaOptionalLibraryAbi>{};
   }
   RETURN_IF_ERROR(status);
-  // ABI v1 is the compatibility boundary. The concrete vendor DSO hash is
-  // recorded as artifact provenance, but is intentionally not an ABI key.
-  return std::vector<MusaOptionalLibraryAbi>{
-      {kMusaMuBlasLibraryAbiName, kMusaMuBlasLibraryAbiVersion, ""}};
+  // The public optional-library ABI remains v1. Advanced executables opt into
+  // the nonempty v2 contract fingerprint; basic v1 executables require no
+  // fingerprint and remain compatible with either table.
+  return std::vector<MusaOptionalLibraryAbi>{{kMusaMuBlasLibraryAbiName,
+                                              kMusaMuBlasLibraryAbiVersion,
+                                              api->advanced_abi_fingerprint()}};
 }
 
 }  // namespace stream_executor::musa

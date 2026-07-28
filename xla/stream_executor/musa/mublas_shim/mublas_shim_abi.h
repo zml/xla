@@ -24,6 +24,7 @@ limitations under the License.
 // of MUSA or muBLAS types. Handles, streams, and device addresses are opaque.
 
 #define XLA_MUSA_MUBLAS_ABI_VERSION_1 UINT32_C(1)
+#define XLA_MUSA_MUBLAS_ABI_VERSION_2 UINT32_C(2)
 
 typedef int32_t XlaMusaMuBlasStatus;
 enum {
@@ -71,6 +72,36 @@ enum {
   (XLA_MUSA_MUBLAS_CAPABILITY_GEMM_F16 | XLA_MUSA_MUBLAS_CAPABILITY_GEMM_F32 | \
    XLA_MUSA_MUBLAS_CAPABILITY_GEMM_F64)
 
+// Algorithms are normalized at the SDK-free boundary. Their numeric values
+// are part of this ABI and must not be replaced by vendor enum values.
+typedef uint32_t XlaMusaMuBlasAlgorithm;
+enum {
+  XLA_MUSA_MUBLAS_ALGORITHM_DEFAULT = 0,
+  XLA_MUSA_MUBLAS_ALGORITHM_TENSOR_OP = 1,
+};
+
+typedef uint64_t XlaMusaMuBlasAdvancedCapabilities;
+enum {
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SET_ATOMICS_MODE = UINT64_C(1) << 0,
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_WITH_ALGORITHM = UINT64_C(1) << 1,
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_BATCHED = UINT64_C(1) << 2,
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_STRIDED_BATCHED = UINT64_C(1) << 3,
+  // All v2 algorithms use no caller-provided workspace. A future ABI must add
+  // an explicit workspace argument before advertising nonzero workspace.
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE = UINT64_C(1)
+                                                                << 4,
+  // The normalized tensor-op algorithm is qualified only for homogeneous F32.
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32 = UINT64_C(1) << 5,
+};
+
+#define XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2                 \
+  (XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SET_ATOMICS_MODE |        \
+   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_WITH_ALGORITHM |     \
+   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_BATCHED |            \
+   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_STRIDED_BATCHED |    \
+   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE | \
+   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32)
+
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasCreateFn)(void** handle);
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasDestroyFn)(void* handle);
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasSetStreamFn)(void* handle,
@@ -95,6 +126,35 @@ typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasGemmFn)(
     int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
     const void* b, int64_t ldb, const void* beta, void* c, int64_t ldc);
 
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasSetAtomicsModeFn)(
+    void* handle, uint32_t allow_atomics);
+
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasGemmWithAlgorithmFn)(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+    const void* b, int64_t ldb, const void* beta, void* c, int64_t ldc,
+    XlaMusaMuBlasAlgorithm algorithm);
+
+// `a`, `b`, and `c` are opaque addresses of vendor-visible pointer arrays.
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasGemmBatchedFn)(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* const* a, int64_t lda,
+    const void* const* b, int64_t ldb, const void* beta, void* const* c,
+    int64_t ldc, int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm);
+
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasGemmStridedBatchedFn)(
+    void* handle, XlaMusaMuBlasDataType input_type,
+    XlaMusaMuBlasDataType output_type, XlaMusaMuBlasComputeType compute_type,
+    XlaMusaMuBlasOperation trans_a, XlaMusaMuBlasOperation trans_b, int64_t m,
+    int64_t n, int64_t k, const void* alpha, const void* a, int64_t lda,
+    int64_t stride_a, const void* b, int64_t ldb, int64_t stride_b,
+    const void* beta, void* c, int64_t ldc, int64_t stride_c,
+    int64_t batch_count, XlaMusaMuBlasAlgorithm algorithm);
+
 typedef struct XlaMusaMuBlasApiV1 {
   // Callers must check both fields before reading function pointers. Newer
   // compatible shims may append fields and increase `struct_size`.
@@ -114,6 +174,31 @@ typedef struct XlaMusaMuBlasApiV1 {
 
 typedef const XlaMusaMuBlasApiV1* (*XlaMusaMuBlasGetApiV1Fn)(void);
 
+// ABI v2 is a separate table rather than an extension of V1. The v1 getter
+// and exact v1 layout remain available to old plugins.
+typedef struct XlaMusaMuBlasApiV2 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  XlaMusaMuBlasCapabilities capabilities;
+  XlaMusaMuBlasAdvancedCapabilities advanced_capabilities;
+
+  XlaMusaMuBlasCreateFn create;
+  XlaMusaMuBlasDestroyFn destroy;
+  XlaMusaMuBlasSetStreamFn set_stream;
+  XlaMusaMuBlasGetVersionFn get_version;
+  XlaMusaMuBlasGemmFn gemm;
+  XlaMusaMuBlasSetAtomicsModeFn set_atomics_mode;
+  XlaMusaMuBlasGemmWithAlgorithmFn gemm_with_algorithm;
+  XlaMusaMuBlasGemmBatchedFn gemm_batched;
+  XlaMusaMuBlasGemmStridedBatchedFn gemm_strided_batched;
+} XlaMusaMuBlasApiV2;
+
+#define XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE          \
+  (offsetof(XlaMusaMuBlasApiV2, gemm_strided_batched) + \
+   sizeof(((XlaMusaMuBlasApiV2*)0)->gemm_strided_batched))
+
+typedef const XlaMusaMuBlasApiV2* (*XlaMusaMuBlasGetApiV2Fn)(void);
+
 #if defined(_WIN32)
 #define XLA_MUSA_MUBLAS_SHIM_EXPORT __declspec(dllexport)
 #elif defined(__GNUC__)
@@ -128,6 +213,8 @@ extern "C" {
 
 XLA_MUSA_MUBLAS_SHIM_EXPORT const XlaMusaMuBlasApiV1*
 xla_musa_mublas_get_api_v1(void);
+XLA_MUSA_MUBLAS_SHIM_EXPORT const XlaMusaMuBlasApiV2*
+xla_musa_mublas_get_api_v2(void);
 
 #ifdef __cplusplus
 }  // extern "C"

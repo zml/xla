@@ -112,20 +112,18 @@ bool IsF8Type(const HloInstruction* instr) {
   return primitive_util::IsF8Type(instr->shape().element_type());
 }
 
-// The initial MUSA route exposes only the non-batched subset implemented by
-// the first muBLAS adapter. F16 and BF16 inputs are widened to F32 around the
-// call so muBLAS always sees homogeneous inputs and F32 accumulation/output;
-// low-precision results are converted back after the call. Keeping this gate
-// in the target-independent rewriter prevents a MUSA executable from
-// containing a CUDA call target or an unsupported muBLAS call.
+// The MUSA route exposes the homogeneous GEMM and strided-batched GEMM subset
+// implemented by the muBLAS adapter. F16 and BF16 inputs are widened to F32
+// around the call so muBLAS always sees homogeneous inputs and F32
+// accumulation/output; low-precision results are converted back after the
+// call. Keeping this gate in the target-independent rewriter prevents a MUSA
+// executable from containing a CUDA call target or an unsupported muBLAS call.
 absl::StatusOr<bool> IsMusaSupportedMatMul(const HloInstruction& dot) {
   ASSIGN_OR_RETURN(
       bool is_supported_shape,
       IsCublasSupportedMatMul(dot,
                               /*allow_matrix_vector_multiplication=*/true));
   if (!is_supported_shape ||
-      !dot.dot_dimension_numbers().lhs_batch_dimensions().empty() ||
-      !dot.dot_dimension_numbers().rhs_batch_dimensions().empty() ||
       dot.precision_config().algorithm() != PrecisionConfig::ALG_UNSET) {
     return false;
   }

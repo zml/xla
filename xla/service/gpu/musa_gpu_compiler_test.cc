@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
+#include "xla/stream_executor/musa/musa_mublas_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 
 namespace xla::gpu {
@@ -187,6 +188,96 @@ ENTRY main {
   EXPECT_EQ(musa.required_optional_library_abis(0).abi_version(),
             stream_executor::musa::kMusaMuBlasLibraryAbiVersion);
   EXPECT_TRUE(musa.required_optional_library_abis(0).fingerprint().empty());
+}
+
+TEST(MusaGpuCompilerTest, SelectedMublasAlgorithmRequiresAdvancedFingerprint) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mublas_selected_algorithm_envelope
+
+ENTRY main {
+  lhs = f32[8,16]{1,0} parameter(0)
+  rhs = f32[16,4]{1,0} parameter(1)
+  ROOT result = f32[8,4]{1,0} custom-call(lhs, rhs),
+    custom_call_target="__mublas$gemm",
+    backend_config={"gemm_backend_config":{
+      "selected_algorithm":"1",
+      "dot_dimension_numbers":{
+        "lhs_contracting_dimensions":["1"],
+        "rhs_contracting_dimensions":["0"]
+      }
+    }}
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 1);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2);
+}
+
+TEST(MusaGpuCompilerTest, BatchedMublasRequiresAdvancedFingerprint) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mublas_batched_envelope
+
+ENTRY main {
+  lhs = f32[2,8,16]{2,1,0} parameter(0)
+  rhs = f32[2,16,4]{2,1,0} parameter(1)
+  ROOT result = f32[2,8,4]{2,1,0} custom-call(lhs, rhs),
+    custom_call_target="__mublas$gemm",
+    backend_config={"gemm_backend_config":{
+      "dot_dimension_numbers":{
+        "lhs_contracting_dimensions":["2"],
+        "rhs_contracting_dimensions":["1"],
+        "lhs_batch_dimensions":["0"],
+        "rhs_batch_dimensions":["0"]
+      }
+    }}
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 1);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2);
+}
+
+TEST(MusaGpuCompilerTest, DeterministicMublasRequiresAdvancedFingerprint) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule deterministic_mublas_envelope
+
+ENTRY main {
+  lhs = f32[8,16]{1,0} parameter(0)
+  rhs = f32[16,4]{1,0} parameter(1)
+  ROOT result = f32[8,4]{1,0} custom-call(lhs, rhs),
+    custom_call_target="__mublas$gemm"
+}
+)"));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_deterministic_ops(true);
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 1);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuBlasAdvancedAbiFingerprintV2);
 }
 
 TEST(MusaGpuCompilerTest, PersistentKernelCacheFailsClosed) {

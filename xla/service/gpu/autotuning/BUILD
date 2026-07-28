@@ -69,6 +69,27 @@ xla_test(
     ],
 )
 
+xla_cc_test(
+    name = "autotuner_pass_musa_test",
+    srcs = ["autotuner_pass_musa_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":autotuner_pass",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:hlo_extractor",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "//xla/tsl/platform:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "autotuner_status_key",
     srcs = ["autotuner_status_key.cc"],

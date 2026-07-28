@@ -106,6 +106,12 @@ TEST(AutotuneCacheKeyTest, DeviceDescriptionToCacheKey) {
                 device_description("rtx6000pro.txtpb")),
             "CUDA: 12.0, Cores: 188, GPU clock: 2.6 GHz, Memory bandwidth: "
             "1792 GB/s, L2 cache: 128 MB, DNN version: 0.0.0");
+
+  EXPECT_EQ(AutotuneCacheKey::DeviceDescriptionToCacheKey(
+                device_description("s80.txtpb")),
+            "MUSA: mp_21 (2.1, hardware warp: 128, logical subgroup: 32), "
+            "Cores: 32, GPU clock: 1.8 GHz, Memory bandwidth: 448 GB/s, L2 "
+            "cache: 24 MB, DNN version: 0.0.0");
 }
 
 TEST(AutotuneCacheKeyTest, VersionIsIncludedInCacheKey) {

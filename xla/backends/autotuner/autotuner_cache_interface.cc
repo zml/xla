@@ -53,6 +53,12 @@ std::string ComputeDeviceName(
   } else if (auto* oneapi_cc = device_description.gpu_compute_capability()
                                    .oneapi_compute_capability()) {
     compute_capability = absl::StrCat("oneAPI: ", oneapi_cc->ToString());
+  } else if (auto* musa_cc = device_description.gpu_compute_capability()
+                                 .musa_compute_capability()) {
+    compute_capability = absl::StrCat(
+        "MUSA: ", musa_cc->architecture(), " (", musa_cc->major(), ".",
+        musa_cc->minor(), ", hardware warp: ", musa_cc->hardware_warp_size(),
+        ", logical subgroup: ", musa_cc->logical_subgroup_size(), ")");
   } else {
     LOG(FATAL) << "Unknown compute capability type";
   }

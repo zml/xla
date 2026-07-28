@@ -37,7 +37,10 @@ static_assert(sizeof(XlaMusaMuBlasStatus) == 4);
 static_assert(sizeof(XlaMusaMuBlasDataType) == 4);
 static_assert(sizeof(XlaMusaMuBlasOperation) == 4);
 static_assert(sizeof(XlaMusaMuBlasCapabilities) == 8);
+static_assert(sizeof(XlaMusaMuBlasAlgorithm) == 4);
+static_assert(sizeof(XlaMusaMuBlasAdvancedCapabilities) == 8);
 static_assert(std::is_standard_layout_v<XlaMusaMuBlasApiV1>);
+static_assert(std::is_standard_layout_v<XlaMusaMuBlasApiV2>);
 
 TEST(MuBlasShimAbiTest, HasStableElf64Layout) {
   static_assert(sizeof(void*) == 8, "the qualified MUSA host ABI is ELF64");
@@ -51,6 +54,25 @@ TEST(MuBlasShimAbiTest, HasStableElf64Layout) {
   EXPECT_EQ(offsetof(XlaMusaMuBlasApiV1, gemm), 48);
   EXPECT_EQ(sizeof(XlaMusaMuBlasApiV1), 56);
   EXPECT_EQ(XLA_MUSA_MUBLAS_API_V1_MIN_STRUCT_SIZE, sizeof(XlaMusaMuBlasApiV1));
+}
+
+TEST(MuBlasShimAbiTest, V2HasStableElf64LayoutWithoutChangingV1) {
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, struct_size), 0);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, abi_version), 4);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, capabilities), 8);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, advanced_capabilities), 16);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, create), 24);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, destroy), 32);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, set_stream), 40);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, get_version), 48);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm), 56);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, set_atomics_mode), 64);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_with_algorithm), 72);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_batched), 80);
+  EXPECT_EQ(offsetof(XlaMusaMuBlasApiV2, gemm_strided_batched), 88);
+  EXPECT_EQ(sizeof(XlaMusaMuBlasApiV2), 96);
+  EXPECT_EQ(XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE, sizeof(XlaMusaMuBlasApiV2));
+  EXPECT_EQ(sizeof(XlaMusaMuBlasApiV1), 56);
 }
 
 TEST(MuBlasShimAbiTest, CapabilityBitsAreAppendOnlyAndDisjoint) {
@@ -69,6 +91,22 @@ TEST(MuBlasShimAbiTest, CapabilityBitsAreAppendOnlyAndDisjoint) {
       XLA_MUSA_MUBLAS_CAPABILITIES_V1 & XLA_MUSA_MUBLAS_CAPABILITY_GEMM_BF16,
       0);
   EXPECT_EQ(XLA_MUSA_MUBLAS_ABI_VERSION_1, UINT32_C(1));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ABI_VERSION_2, UINT32_C(2));
+}
+
+TEST(MuBlasShimAbiTest, V2AlgorithmsAndCapabilitiesAreNormalized) {
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ALGORITHM_DEFAULT, UINT32_C(0));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ALGORITHM_TENSOR_OP, UINT32_C(1));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SET_ATOMICS_MODE, UINT64_C(1));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_WITH_ALGORITHM,
+            UINT64_C(2));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_BATCHED, UINT64_C(4));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_GEMM_STRIDED_BATCHED,
+            UINT64_C(8));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_ZERO_EXTERNAL_WORKSPACE,
+            UINT64_C(16));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TENSOR_OP_F32, UINT64_C(32));
+  EXPECT_EQ(XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2, UINT64_C(63));
 }
 
 TEST(MuBlasShimAbiTest, ConvertsF32ScalarsToF16WithIeeeRounding) {

@@ -79,7 +79,7 @@ ENTRY main {
 )");
 }
 
-TEST_F(MusaGemmRewriterTest, KeepsF16ToF32OutputAndLeavesBatchUnchanged) {
+TEST_F(MusaGemmRewriterTest, RewritesBatchAndKeepsF16ToF32Output) {
   constexpr absl::string_view hlo = R"(
 HloModule UnsupportedMusaGemms
 
@@ -104,7 +104,7 @@ ENTRY main {
                    GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only,
                                        GemmRewriterOptions::BiasMode::kNoBias}),
       R"(
-// CHECK-DAG: f32[2,8,4]{2,1,0} dot(
+// CHECK-DAG: f32[2,8,4]{2,1,0} custom-call({{.*}}), custom_call_target="__mublas$gemm"
 // CHECK-DAG: [[MIXED_LHS:%[^ ]+]] = f32[8,16]{1,0} convert({{.*}})
 // CHECK-DAG: [[MIXED_RHS:%[^ ]+]] = f32[16,4]{1,0} convert({{.*}})
 // CHECK-DAG: [[MIXED_GEMM:%[^ ]+]] = f32[8,4]{1,0} custom-call([[MIXED_LHS]], [[MIXED_RHS]]), custom_call_target="__mublas$gemm"
