@@ -405,6 +405,7 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
   // packed arguments as we don't know how many of them we'll see.
   explicit KernelArgsPackedArray(size_t num_args) {
     device_addr_args_.reserve(num_args);
+    device_addresses_.reserve(num_args);
     argument_addresses_.reserve(num_args);
   }
 
@@ -432,6 +433,7 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
   void add_argument(const DeviceAddressBase& arg) {
     DCHECK_LT(device_addr_args_.size(), device_addr_args_.capacity());
     device_addr_args_.emplace_back(arg.opaque());
+    device_addresses_.push_back(arg);
 
     auto& emplaced = packed_args_.emplace_back(new internal::PackedArg(
         KernelArgPacking<const DeviceAddressBase*>::Pack(&arg)));
@@ -448,6 +450,10 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
 
   absl::Span<void*> device_addr_args() {
     return absl::MakeSpan(device_addr_args_);
+  }
+
+  absl::Span<const DeviceAddressBase> device_addresses() const {
+    return device_addresses_;
   }
 
   // Gets the number of arguments added so far, including shared memory
@@ -473,6 +479,9 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
  private:
   // A storage for device address arguments added to this array.
   absl::InlinedVector<void*, 8> device_addr_args_;
+
+  // Device address ranges retained for backends that require argument sizes.
+  absl::InlinedVector<DeviceAddressBase, 8> device_addresses_;
 
   // A storage for packed POD arguments added to this array.
   absl::InlinedVector<std::unique_ptr<PackedArgBase>, 8> packed_args_;
