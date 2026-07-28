@@ -1102,6 +1102,15 @@ absl::StatusOr<std::vector<DeviceAddressBase>> GetDeviceArguments(
                                           device_args->device_addr_args().end());
   }
   if (const auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {
+    if (const auto* packed_array =
+            dynamic_cast<const KernelArgsPackedArray*>(packed);
+        packed_array != nullptr &&
+        packed_array->device_addresses().size() ==
+            packed->argument_addresses().size()) {
+      return std::vector<DeviceAddressBase>(
+          packed_array->device_addresses().begin(),
+          packed_array->device_addresses().end());
+    }
     std::vector<DeviceAddressBase> addresses;
     addresses.reserve(packed->argument_addresses().size());
     for (const void* argument_address : packed->argument_addresses()) {
