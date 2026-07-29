@@ -70,8 +70,20 @@ class GpuProfiler : public Profiler {
         allocator_(allocator),
         owned_allocator_(std::move(owned_allocator)),
         stream_(stream),
-        options_(options) {}
+        options_(options) {
+    if (stream_executor_ != nullptr) {
+      stream_executor_->SetDeferModuleUnloads(true);
+    }
+  }
 
+ public:
+  ~GpuProfiler() override {
+    if (stream_executor_ != nullptr) {
+      stream_executor_->SetDeferModuleUnloads(false);
+    }
+  }
+
+ private:
   absl::StatusOr<ExecutionOutput> Execute(
       Executable* executable, std::vector<ExecutionInput> inputs,
       ExecutionProfile* profile, se::DeviceAddressAllocator* allocator);

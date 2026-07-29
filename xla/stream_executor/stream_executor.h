@@ -158,6 +158,8 @@ class StreamExecutor {
   // Unloads the module with handle `module_handle`.
   virtual bool UnloadModule(ModuleHandle module_handle) { return false; }
 
+  virtual void SetDeferModuleUnloads(bool defer) {}
+
   // Loads a module for the platform this StreamExecutor is acting upon.
   //
   // `spec` describes the module to be loaded.  On success returns the handle

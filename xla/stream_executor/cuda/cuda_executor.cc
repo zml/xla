@@ -26,7 +26,9 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <tuple>
+#include <atomic>
 #include <utility>
+#include <vector>
 #include <variant>
 
 #include "cub/version.cuh"
@@ -46,6 +48,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/base/no_destructor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
@@ -119,6 +122,22 @@ namespace stream_executor {
 namespace gpu {
 
 namespace {
+
+absl::Mutex& DeferredUnloadMutex() {
+  static absl::NoDestructor<absl::Mutex> mu;
+  return *mu;
+}
+
+std::atomic<int>& DeferModuleUnloadDepth() {
+  static absl::NoDestructor<std::atomic<int>> depth(0);
+  return *depth;
+}
+
+std::vector<std::pair<Context*, CUmodule>>& DeferredUnloads() {
+  static absl::NoDestructor<std::vector<std::pair<Context*, CUmodule>>> v;
+  return *v;
+}
+
 std::string FabricInforStateToString(nvmlGpuFabricState_t state) {
   switch (state) {
     case NVML_GPU_FABRIC_STATE_NOT_SUPPORTED:
@@ -307,6 +326,11 @@ absl::Status GetModuleSymbol(Context* context, CUmodule module,
 
 // Unloads module from the current context via cuModuleUnload.
 void UnloadCudaModule(Context* context, CUmodule module) {
+  if (DeferModuleUnloadDepth().load(std::memory_order_relaxed) > 0) {
+    absl::MutexLock lock(&DeferredUnloadMutex());
+    DeferredUnloads().push_back({context, module});
+    return;
+  }
   ScopedActivateContext activated{context};
   auto status = cuda::ToStatus(cuModuleUnload(module));
   if (!status.ok()) {
@@ -1271,6 +1295,31 @@ absl::StatusOr<ModuleHandle> CudaExecutor::LoadModule(
 bool CudaExecutor::UnloadModule(ModuleHandle module_handle) {
   absl::MutexLock lock{in_memory_modules_mu_};
   return UnloadGpuBinary(module_handle);
+}
+
+void CudaExecutor::SetDeferModuleUnloads(bool defer) {
+  if (defer) {
+    DeferModuleUnloadDepth().fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (DeferModuleUnloadDepth().fetch_sub(1, std::memory_order_relaxed) != 1) {
+    return;
+  }
+  std::vector<std::pair<Context*, CUmodule>> pending;
+  {
+    absl::MutexLock lock(&DeferredUnloadMutex());
+    pending.swap(DeferredUnloads());
+  }
+  for (const auto& [context, module] : pending) {
+    ScopedActivateContext activated{context};
+    absl::Status status = cuda::ToStatus(cuModuleUnload(module));
+    if (!status.ok()) {
+      XLA_LOG_DEVICE(ERROR, context->device_ordinal())
+          << "failed to unload deferred module " << module
+          << "; leaking: " << status;
+    }
+  }
+  VLOG(2) << "Released " << pending.size() << " deferred CUDA module(s).";
 }
 
 namespace {
