@@ -64,6 +64,23 @@ namespace {
 const int kDefaultInlineThreshold = 1100;
 constexpr char kXlaVulkanBufferElementTypesMetadata[] =
     "xla.vulkan.buffer_element_types";
+constexpr uint32_t kSpirvHeaderWordCount = 5;
+constexpr uint32_t kSpirvOpCapability = 17;
+constexpr uint32_t kSpirvVariablePointersStorageBufferCapability = 4441;
+
+void AddVariablePointersStorageBufferCapability(std::string* spirv_binary) {
+  // LLVM can emit OpPhi for StorageBuffer pointers without declaring the
+  // capability required by Vulkan. Add the narrower storage-buffer-only
+  // capability to every Vulkan shader. VulkanExecutor enables the matching
+  // variablePointersStorageBuffer device feature.
+  constexpr uint32_t capability[] = {
+      (2u << 16) | kSpirvOpCapability,
+      kSpirvVariablePointersStorageBufferCapability,
+  };
+  spirv_binary->insert(
+      kSpirvHeaderWordCount * sizeof(uint32_t),
+      reinterpret_cast<const char*>(capability), sizeof(capability));
+}
 
 std::string PrintLlvmValue(const llvm::Value& value) {
   std::string result;
@@ -1032,8 +1049,12 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   LegalizeVulkanShaderComparisons(module);
   ExpandSubByteBitReverse(module);
   RETURN_IF_ERROR(ValidateVulkanModule(*module));
-  return EmitModuleToSPIRV(module, target_machine.get(),
-                           /*normalize_vulkan_buffers=*/true);
+  TF_ASSIGN_OR_RETURN(
+      std::string spirv_binary,
+      EmitModuleToSPIRV(module, target_machine.get(),
+                        /*normalize_vulkan_buffers=*/true));
+  AddVariablePointersStorageBufferCapability(&spirv_binary);
+  return spirv_binary;
 }
 
 }  // namespace xla::gpu::spirv
