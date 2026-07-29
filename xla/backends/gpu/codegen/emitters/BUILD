@@ -1,3 +1,7 @@
+load(
+    "@local_config_rocm//rocm:build_defs.bzl",
+    "if_rocm_is_configured",
+)
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 
@@ -140,7 +144,9 @@ cc_library(
         "@llvm-project//mlir:Transforms",
         "@llvm-project//mlir:VectorDialect",
         "@stablehlo//:stablehlo_passes",
-    ],
+    ] + if_rocm_is_configured([
+        "//xla/backends/gpu/codegen/flydsl:compiler",
+    ]),
 )
 
 xla_cc_test(

@@ -121,6 +121,8 @@ cc_library(
         ":config_selector",
         ":hlo_extractor",
         ":profiler",
+        "//xla:autotune_results_proto_cc",
+        "//xla:autotuning_proto_cc",
         "//xla:status_macros",
         "//xla/hlo/ir:hlo",
         "//xla/tsl/concurrency:executor",
@@ -134,6 +136,8 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 

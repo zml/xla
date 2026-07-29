@@ -28,6 +28,9 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/reduction.h"
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
+#if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/xtile_gemm.h"
+#endif
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/sort.h"
 #include "xla/backends/gpu/codegen/triton/fusion.h"
@@ -67,6 +70,21 @@ bool HloFusionInfo::CanEmitDynamicUpdateSliceInPlace() const {
 std::unique_ptr<FusionInterface> GetFusionEmitter(
     const FusionInfo& fusion_info) {
   const auto& analysis = fusion_info.analysis();
+#if TENSORFLOW_USE_ROCM
+  if (analysis.fusion_backend_config().kind() == kFlyGemmFusionKind) {
+    return std::make_unique<MlirKernelFusion>(
+        flydsl::CreateFlyXTileGemmEmitter(analysis));
+  }
+  if (analysis.fusion_backend_config().kind() == kFlyGemvFusionKind) {
+    const HloInstruction& root = analysis.fusion_root(0).instruction();
+    if (root.shape().dimensions(0) == 1) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileGemmEmitter(analysis));
+    }
+    return std::make_unique<MlirKernelFusion>(
+        flydsl::CreateFlyXTileGemvEmitter(analysis));
+  }
+#endif
   switch (analysis.emitter_fusion_kind()) {
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
       return std::make_unique<CustomFusion>();
@@ -104,6 +122,10 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
     }
     case HloFusionAnalysis::EmitterFusionKind::kTriton:
       return std::make_unique<TritonFusion>(analysis);
+    case HloFusionAnalysis::EmitterFusionKind::kFly:
+      // Fly fusions are dispatched above so the ROCm-only dependency remains
+      // conditionally compiled.
+      return nullptr;
     case HloFusionAnalysis::EmitterFusionKind::kCuDnn:
       return std::make_unique<CuDnnFusion>(analysis);
   }

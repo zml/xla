@@ -94,6 +94,8 @@ AutotuneDecision AllowRegSpillsForGpuInstruction(
       const FusionBackendConfig& backend_config =
           gpu_config->fusion_backend_config();
       if (backend_config.kind() == kTritonGemmFusionKind ||
+          backend_config.kind() == kFlyGemmFusionKind ||
+          backend_config.kind() == kFlyGemvFusionKind ||
           backend_config.kind() == kCuDnnFusionKind ||
           backend_config.kind() == kCustomFusionKind) {
         return AutotuneDecision::Forbid(
@@ -156,6 +158,13 @@ AutotuneDecision ShouldAutotuneGemmFusion(const HloInstruction& instruction) {
     }
     return AutotuneDecision::Allow();
   }
+  if (backend_config.kind() == kFlyGemmFusionKind ||
+      backend_config.kind() == kFlyGemvFusionKind) {
+    if (backend_config.has_fly_gemm_config()) {
+      return AutotuneDecision::Forbid("Fly GEMM fusion already has a config");
+    }
+    return AutotuneDecision::Allow();
+  }
   if (backend_config.kind() == kCuDnnFusionKind) {
     if (backend_config.has_cudnn_fusion_config()) {
       return AutotuneDecision::Forbid("cuDNN fusion already has a config");
@@ -208,6 +217,8 @@ AutotuneDecision ShouldAutotuneInstruction(bool do_not_autotune_cublas,
     const FusionBackendConfig& backend_config =
         gpu_config->fusion_backend_config();
     if (backend_config.kind() == kTritonGemmFusionKind ||
+        backend_config.kind() == kFlyGemmFusionKind ||
+        backend_config.kind() == kFlyGemvFusionKind ||
         backend_config.kind() == kCuDnnFusionKind ||
         backend_config.kind() == kCustomFusionKind) {
       return ShouldAutotuneGemmFusion(instruction);

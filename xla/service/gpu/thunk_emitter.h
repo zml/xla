@@ -221,6 +221,9 @@ class ThunkEmitter {
   AsyncThunkSequence EmitTritonCustomCall(
       const HloCustomCallInstruction* instr);
 
+  AsyncThunkSequence EmitFlyCustomCall(
+      const HloCustomCallInstruction* instr);
+
   AsyncThunkSequence EmitWhile(const HloInstruction* instr);
 
   absl::Status AssertNonDeterminismIsOkay(const std::string& op_name);

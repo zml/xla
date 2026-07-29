@@ -274,6 +274,74 @@ func.func @vector_transfer_read(%arg0: tensor<64x66xbf16>, %i: index, %j: index)
 
 // -----
 
+func.func @vector_transfer_write(
+    %arg0: tensor<64x66xbf16>, %v: vector<2xbf16>, %i: index, %j: index)
+    -> tensor<64x66xbf16> {
+  %out = vector.transfer_write %v, %arg0[%i, %j] {in_bounds = [true]}
+    : vector<2xbf16>, tensor<64x66xbf16>
+  func.return %out : tensor<64x66xbf16>
+}
+// CHECK: #[[$MAP:.+]] = #xla.indexing_map<"(d0, d1) -> (d0 * 66 + d1)
+// CHECK-SAME: domain: d0 in [0, 63], d1 in [0, 65]
+
+// CHECK-LABEL: func.func @vector_transfer_write(
+// CHECK-SAME:      %[[DST:.*]]: tensor<4224xbf16>,
+// CHECK-SAME:      %[[V:.*]]: vector<2xbf16>,
+// CHECK-SAME:      %[[I:.*]]: index, %[[J:.*]]: index)
+// CHECK:        %[[INDEX:.*]] = xla.apply_indexing #[[$MAP]](%[[I]], %[[J]])
+// CHECK:        %[[OUT:.*]] = vector.transfer_write %[[V]], %[[DST]][%[[INDEX]]]
+// CHECK:        return %[[OUT]] : tensor<4224xbf16>
+
+// -----
+
+#k_vector = affine_map<(d0, d1) -> (d0)>
+
+func.func @encoded_vector_transfer_read(
+    %arg0: tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>>,
+    %i: index, %j: index) -> vector<2xbf16> {
+  %cst = arith.constant 0.0 : bf16
+  %v = vector.transfer_read %arg0[%i, %j], %cst
+      {in_bounds = [true], permutation_map = #k_vector}
+    : tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>>, vector<2xbf16>
+  func.return %v : vector<2xbf16>
+}
+// CHECK: #[[$MAP:.+]] = #xla.indexing_map<"(d0, d1) -> (d1 * 64 + d0)
+// CHECK-SAME: domain: d0 in [0, 63], d1 in [0, 65]
+
+// CHECK-LABEL: func.func @encoded_vector_transfer_read(
+// CHECK-SAME:      %[[SRC:.*]]: tensor<4224xbf16>,
+// CHECK-SAME:      %[[I:.*]]: index, %[[J:.*]]: index)
+// CHECK:        %[[INDEX:.*]] = xla.apply_indexing #[[$MAP]](%[[I]], %[[J]])
+// CHECK:        vector.transfer_read %[[SRC]][%[[INDEX]]]
+
+// -----
+
+#k_vector = affine_map<(d0, d1) -> (d0)>
+
+func.func @encoded_vector_transfer_write(
+    %arg0: tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>>,
+    %v: vector<2xbf16>, %i: index, %j: index)
+    -> tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>> {
+  %out = vector.transfer_write %v, %arg0[%i, %j]
+      {in_bounds = [true], permutation_map = #k_vector}
+    : vector<2xbf16>,
+      tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>>
+  func.return %out
+      : tensor<64x66xbf16, dense<[0, 1]> : tensor<2xi64>>
+}
+// CHECK: #[[$MAP:.+]] = #xla.indexing_map<"(d0, d1) -> (d1 * 64 + d0)
+// CHECK-SAME: domain: d0 in [0, 63], d1 in [0, 65]
+
+// CHECK-LABEL: func.func @encoded_vector_transfer_write(
+// CHECK-SAME:      %[[DST:.*]]: tensor<4224xbf16>,
+// CHECK-SAME:      %[[V:.*]]: vector<2xbf16>,
+// CHECK-SAME:      %[[I:.*]]: index, %[[J:.*]]: index)
+// CHECK:        %[[INDEX:.*]] = xla.apply_indexing #[[$MAP]](%[[I]], %[[J]])
+// CHECK:        %[[OUT:.*]] = vector.transfer_write %[[V]], %[[DST]][%[[INDEX]]]
+// CHECK:        return %[[OUT]] : tensor<4224xbf16>
+
+// -----
+
 func.func @vector_insert(%arg0: vector<10x24xf32>, %i: index)
     -> vector<10x24xf32> {
   %scalar = arith.constant 3.0 : f32

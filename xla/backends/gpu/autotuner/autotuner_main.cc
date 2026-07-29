@@ -229,6 +229,7 @@ absl::StatusOr<AutotunerEnvironment> CreateAutotunerEnvironment(
       assigner_options.relative_tolerance;
   autotuner_options.correctness_check_options.crash_on_failure =
       assigner_options.crash_on_check_failure;
+  autotuner_options.dump_logs_to = assigner_options.dump_logs_to;
 
   ASSIGN_OR_RETURN(auto autotuner,
                    Autotuner::Create(std::move(autotuner_orchestrator),

@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/block_level_emitter.h"
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/backends/gpu/autotuner/fission_backend.h"
+#include "xla/backends/gpu/autotuner/fly.h"
 #include "xla/backends/gpu/autotuner/hipblaslt.h"
 #include "xla/backends/gpu/autotuner/miopen.h"
 #include "xla/backends/gpu/autotuner/native_emitter.h"
@@ -86,6 +87,8 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForROCm(
   std::vector<std::unique_ptr<CodegenBackend>> backends;
   backends.push_back(std::make_unique<TritonBackend>(
       debug_options, compiler, target_config, alias_info, mlir_context));
+  backends.push_back(
+      std::make_unique<FlyBackend>(debug_options, compiler, target_config));
   backends.push_back(
       std::make_unique<MIOpenBackend>(stream_executor, debug_options, compiler,
                                       target_config, device_allocator));

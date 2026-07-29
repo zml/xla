@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm_is_configured")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tests:build_defs.bzl", "xla_test")
 
@@ -160,6 +161,9 @@ cc_library(
         "//xla/backends/gpu/codegen:__subpackages__",
         "//xla/service/gpu:__subpackages__",
     ],
+    local_defines = if_rocm_is_configured([
+        "TENSORFLOW_USE_ROCM=1",
+    ]),
     deps = [
         ":copy",
         ":cudnn",
@@ -182,7 +186,9 @@ cc_library(
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emission_utils",
         "@com_google_absl//absl/status:statusor",
-    ],
+    ] + if_rocm_is_configured([
+        "//xla/backends/gpu/codegen/flydsl:xtile_gemm",
+    ]),
 )
 
 cc_library(

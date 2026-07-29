@@ -1345,6 +1345,7 @@ HloInstruction::FusionKind PriorityFusion::ChooseKind(
     case HloFusionAnalysis::EmitterFusionKind::kLoop:
       return HloInstruction::FusionKind::kLoop;
     case HloFusionAnalysis::EmitterFusionKind::kTriton:
+    case HloFusionAnalysis::EmitterFusionKind::kFly:
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
     case HloFusionAnalysis::EmitterFusionKind::kCuDnn:
     case HloFusionAnalysis::EmitterFusionKind::kSort:
