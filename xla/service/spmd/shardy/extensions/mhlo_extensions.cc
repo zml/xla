@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 
 #include "absl/log/check.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -188,6 +189,116 @@ struct RaggedDotShardingRuleOpInterface
       case RaggedDotMode::kBatch: {
         break;
       }
+    }
+
+    return builder.build();
+  }
+};
+
+struct ScaledDotShardingRuleOpInterface
+    : public mlir::sdy::ShardingRuleOpInterface::ExternalModel<
+          ScaledDotShardingRuleOpInterface, mhlo::ScaledDotOp> {
+  mlir::sdy::OpShardingRuleAttr getShardingRule(mlir::Operation* op) const {
+    mhlo::ScaledDotOp scaledDot = llvm::cast<mhlo::ScaledDotOp>(op);
+    mhlo::DotDimensionNumbersAttr dimNumbers =
+        scaledDot.getDotDimensionNumbers();
+    ArrayRef<int64_t> lhsBatchingDims = dimNumbers.getLhsBatchingDimensions();
+    ArrayRef<int64_t> rhsBatchingDims = dimNumbers.getRhsBatchingDimensions();
+    ArrayRef<int64_t> lhsContractingDims =
+        dimNumbers.getLhsContractingDimensions();
+    ArrayRef<int64_t> rhsContractingDims =
+        dimNumbers.getRhsContractingDimensions();
+
+    mlir::RankedTensorType lhsType = scaledDot.getLhs().getType();
+    mlir::RankedTensorType rhsType = scaledDot.getRhs().getType();
+    auto lhsScaleType = llvm::dyn_cast<mlir::RankedTensorType>(
+        scaledDot.getLhsScale().getType());
+    auto rhsScaleType = llvm::dyn_cast<mlir::RankedTensorType>(
+        scaledDot.getRhsScale().getType());
+
+    const int64_t lhsRank = lhsType.getRank();
+    const int64_t rhsRank = rhsType.getRank();
+
+    OpShardingRuleBuilder builder(scaledDot);
+
+    auto operandDims = [](int64_t lhsDim, int64_t rhsDim, int64_t lhsScaleDim,
+                          int64_t rhsScaleDim) -> llvm::SmallVector<int64_t> {
+      return {lhsDim, rhsDim, lhsScaleDim, rhsScaleDim};
+    };
+
+    auto addScaledFactor = [&](int64_t lhsDim, int64_t rhsDim, int64_t outDim,
+                               int64_t dataSize, bool reduce) {
+      int64_t groupSize = dataSize;
+      int64_t lhsScaleDim = kNullDim;
+      int64_t rhsScaleDim = kNullDim;
+      auto consider = [&](mlir::RankedTensorType scaleType, int64_t dim,
+                          int64_t& scaleSlot) {
+        if (!scaleType || dim == kNullDim || dim >= scaleType.getRank()) {
+          return;
+        }
+        int64_t s = scaleType.getDimSize(dim);
+        if (s > 1 && dataSize % s == 0) {
+          groupSize = std::gcd(groupSize, s);
+          scaleSlot = dim;
+        }
+      };
+      consider(lhsScaleType, lhsDim, lhsScaleDim);
+      consider(rhsScaleType, rhsDim, rhsScaleDim);
+
+      FactorType groupType =
+          reduce ? FactorType::kReduction : FactorType::kPassThrough;
+      int64_t resultDim = reduce ? kNullDim : outDim;
+
+      builder.addFactor(operandDims(lhsDim, rhsDim, lhsScaleDim, rhsScaleDim),
+                        resultDim, groupSize, groupType);
+
+      auto addScaleRefinement = [&](mlir::RankedTensorType scaleType,
+                                    int64_t dim, bool isLhs) {
+        if (!scaleType || dim == kNullDim || dim >= scaleType.getRank()) return;
+        const int64_t s = scaleType.getDimSize(dim);
+        if (s <= groupSize || s % groupSize != 0) return;
+        builder.addFactor(
+            operandDims(/*lhsDim=*/kNullDim, /*rhsDim=*/kNullDim,
+                        isLhs ? dim : kNullDim, isLhs ? kNullDim : dim),
+            /*resultDim=*/kNullDim, s / groupSize,
+            FactorType::kNeedReplication,
+            /*isBlocked=*/true);
+      };
+      addScaleRefinement(lhsScaleType, lhsScaleDim, /*isLhs=*/true);
+      addScaleRefinement(rhsScaleType, rhsScaleDim, /*isLhs=*/false);
+
+      if (dataSize > groupSize) {
+        builder.addFactor(operandDims(lhsDim, rhsDim, kNullDim, kNullDim),
+                          resultDim, dataSize / groupSize,
+                          FactorType::kNeedReplication,
+                          /*isBlocked=*/true);
+      }
+    };
+
+    int64_t outputDim = 0;
+    for (auto [lhsDim, rhsDim] :
+         llvm::zip_equal(lhsBatchingDims, rhsBatchingDims)) {
+      addScaledFactor(lhsDim, rhsDim, outputDim++, lhsType.getDimSize(lhsDim),
+                      /*reduce=*/false);
+    }
+    for (int64_t i = 0; i < lhsRank; ++i) {
+      if (!llvm::is_contained(lhsContractingDims, i) &&
+          !llvm::is_contained(lhsBatchingDims, i)) {
+        addScaledFactor(/*lhsDim=*/i, /*rhsDim=*/kNullDim, outputDim++,
+                        lhsType.getDimSize(i), /*reduce=*/false);
+      }
+    }
+    for (int64_t i = 0; i < rhsRank; ++i) {
+      if (!llvm::is_contained(rhsContractingDims, i) &&
+          !llvm::is_contained(rhsBatchingDims, i)) {
+        addScaledFactor(/*lhsDim=*/kNullDim, /*rhsDim=*/i, outputDim++,
+                        rhsType.getDimSize(i), /*reduce=*/false);
+      }
+    }
+    for (auto [lhsDim, rhsDim] :
+         llvm::zip_equal(lhsContractingDims, rhsContractingDims)) {
+      addScaledFactor(lhsDim, rhsDim, /*outDim=*/kNullDim,
+                      lhsType.getDimSize(lhsDim), /*reduce=*/true);
     }
 
     return builder.build();
@@ -445,6 +556,7 @@ void registerMhloExtensions(mlir::DialectRegistry& registry) {
   registry.addExtension(+[](mlir::MLIRContext* ctx, mhlo::MhloDialect*) {
     mhlo::CopyOp::attachInterface<CopyShardingRuleOpInterface>(*ctx);
     mhlo::RaggedDotOp::attachInterface<RaggedDotShardingRuleOpInterface>(*ctx);
+    mhlo::ScaledDotOp::attachInterface<ScaledDotShardingRuleOpInterface>(*ctx);
     mhlo::ScanOp::attachInterface<ScanShardingRuleOpInterface>(*ctx);
     mhlo::TopKOp::attachInterface<TopKShardingRuleOpInterface>(*ctx);
   });
