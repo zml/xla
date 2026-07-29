@@ -261,6 +261,9 @@ class ThunkEmitter {
       const HloCustomCallInstruction* instr,
       NativeCustomCallHandlerRef handler);
 
+  absl::StatusOr<ThunkSequence> EmitVulkanPrintThunk(
+      const HloCustomCallInstruction* instr);
+
   Future<ThunkSequence> EmitFusion(const HloFusionInstruction* instr);
 
   Future<ThunkSequence> EmitDynamicSliceCopyFusion(

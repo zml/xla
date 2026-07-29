@@ -106,6 +106,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/topk.h"
 #include "xla/backends/gpu/runtime/triangular_solve_thunk.h"
+#include "xla/backends/gpu/runtime/vulkan_print_thunk.h"
 #include "xla/backends/gpu/runtime/while_thunk.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_copy.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_fusion.h"
@@ -385,6 +386,14 @@ Future<ThunkSequence> ThunkEmitter::DispatchCustomCall(
     const HloInstruction* hlo) {
   auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
 
+  // TODO(reese): Register zml$print (and other Vulkan-only targets) through
+  // NativeCustomCallHandlerRegistry instead of extending this vendor-specific
+  // if-chain; see EmitNativeCustomCallThunks below.
+  if (ir_emitter_context_->platform_name() == "VULKAN" &&
+      custom_call->custom_call_target() == "zml$print") {
+    return EmitVulkanPrintThunk(custom_call);
+  }
+
   if (IsCublasLtMatmul(*hlo)) {
     return EmitCublasLtMatmul(custom_call);
   }
@@ -579,6 +588,22 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
 
   ir_emitter_context_->constants().push_back(std::move(info));
   return ThunkSequence::Empty();
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitVulkanPrintThunk(
+    const HloCustomCallInstruction* instr) {
+  const HloInstruction* operand = instr->operand(0);
+  ABSL_ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
+                   GetAllocationSlice(operand, {}));
+  std::string label = instr->metadata().op_name().empty()
+                          ? std::string(instr->name())
+                          : instr->metadata().op_name();
+  ThunkSequence thunks;
+  thunks.push_back(std::make_unique<VulkanPrintThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      std::move(label), slice, operand->shape()));
+  return thunks;
 }
 
 Future<ThunkSequence> ThunkEmitter::EmitConditional(
