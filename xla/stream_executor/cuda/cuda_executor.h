@@ -67,6 +67,8 @@ limitations under the License.
 
 namespace stream_executor::gpu {
 
+// Defer cuModuleUnload during autotune to avoid launch races.
+
 class CudaStream;
 enum class CudaStreamType;
 
@@ -109,6 +111,7 @@ class CudaExecutor : public GpuExecutor {
   absl::StatusOr<ModuleHandle> LoadModule(
       const MultiModuleLoaderSpec& spec) override;
   bool UnloadModule(ModuleHandle module_handle) override;
+  void SetDeferModuleUnloads(bool defer) override;
   absl::StatusOr<std::shared_ptr<DeviceAddressBase>> CreateOrShareConstant(
       Stream* stream, absl::Span<const uint8_t> content) override;
   DeviceAddressBase Allocate(uint64_t size, int64_t memory_space) override;
