@@ -1,0 +1,49 @@
+Backport of triton-lang/triton 2ddb39586b ("[SM120] Fallback MN-packed FP4 MMA
+to the decomposition path", #10726), which lands after the revision pinned in
+third_party/triton/workspace.bzl.
+
+sm120's block-scaled MMA requires K-packed operands. ScaledBlockedToMMA does not
+check that for fp4xfp4, so an MN-packed fp4 operand reaches
+mma.sync.m16n8k64.mxf4nvf4 and is miscompiled rather than declined -- the packed
+K-elements land on the wrong lanes. Measured on an RTX 5090 with a K=128 dot
+whose operands both carry v_k = (k even ? 1 : 2) and unit block scales, so the
+correct result is sum_k v_k^2 = 320: XLA's canonical rhs ([K,N], contracting=0)
+gives 288 under ExperimentalTiling and aborts under SymbolicTiling.
+
+XLA reaches this because a canonical rhs makes K the major dimension, so
+dot_algorithms.cc sets rhs_k_pack=false, which faithfully describes the layout:
+
+  tt.dot_scaled ... {fastMath = true, rhs_k_pack = false}
+    : tensor<16x64xi8>, ... * tensor<128x8xi8>, ...
+
+Declining sends it to DecomposeScaledBlocked, which upcasts to bf16 and is
+correct. Note this is deliberately NARROW: K-packed fp4xfp4 is fine on sm120 --
+verified against both this pinned revision and upstream main with a native
+Triton kernel, and every other fp4 golden probe passes on the native path --
+so a blanket fp4xfp4 decline would give up working W4A4 tensor-core throughput.
+
+DELETE THIS when the pin moves past 2ddb39586b. Bumping was tried and reverted:
+tmemfix.patch, an unrelated CUDA 12.8/13.2 TMEM shim, no longer applies across
+that range.
+
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -746,12 +746,16 @@ public:
+       return elemType == ScaleDotElemType::E2M1;
+     };
+
++    bool isFP4xFP4 = isFP4(aElemType) && isFP4(bElemType);
+     // TODO: Enable mixed-precision mxfp for sm120
+-    if (!((isFP8(aElemType) && isFP8(bElemType)) ||
+-          (isFP4(aElemType) && isFP4(bElemType)))) {
++    if (!((isFP8(aElemType) && isFP8(bElemType)) || isFP4xFP4)) {
+       return rewriter.notifyMatchFailure(
+           dotOp, "only FP8xFP8 and FP4xFP4 are supported on sm120");
+     }
++    if (isFP4xFP4 && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack())) {
++      return rewriter.notifyMatchFailure(
++          dotOp, "SM120 native FP4xFP4 requires K-packed operands");
++    }
+
+     auto scaleElemType = dotOp.getAScale().getType().getElementType();
+     if (scaleElemType != dotOp.getBScale().getType().getElementType()) {
