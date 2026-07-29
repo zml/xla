@@ -148,13 +148,20 @@ bool IsSupportedCudnnFusion(const HloInstruction& instr,
   }
 
   if (hero->opcode() == HloOpcode::kConvolution ||
-      hero->opcode() == HloOpcode::kRaggedDot ||
-      hero->opcode() == HloOpcode::kScaledDot) {
+      hero->opcode() == HloOpcode::kRaggedDot) {
     return true;
   }
 
   stream_executor::CudaComputeCapability compute_capability =
       stream_executor->GetDeviceDescription().cuda_compute_capability();
+
+  // cuDNN block-scaled graph segfaults on sm_120 (topologicalSortBFS).
+  // Use major==12 only — IsAtLeastBlackwell would also skip sm_100.
+  if (hero->opcode() == HloOpcode::kScaledDot) {
+    return compute_capability.major !=
+           se::CudaComputeCapability::kBlackwell_12;
+  }
+
   if ((compute_capability.IsAtLeastAmpere() &&
        debug_options.xla_gpu_cudnn_gemm_fusion_level() > 1) ||
       (compute_capability.IsAtLeastBlackwell() &&
