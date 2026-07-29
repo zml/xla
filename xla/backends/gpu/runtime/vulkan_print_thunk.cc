@@ -119,8 +119,44 @@ VulkanPrintThunk::VulkanPrintThunk(ThunkInfo thunk_info, std::string label,
       operand_shape_(std::move(operand_shape)) {}
 
 absl::Status VulkanPrintThunk::ExecuteOnStream(
-    const ExecuteParams& /*params*/) {
-  static_cast<void>(&DecodeElement);
+    const ExecuteParams& params) {
+  stream_executor::Stream* stream = params.stream;
+  stream_executor::DeviceAddressBase source =
+      params.buffer_allocations->GetDeviceAddress(operand_);
+
+  const PrimitiveType type = operand_shape_.element_type();
+  const int64_t element_count = ShapeUtil::ElementsIn(operand_shape_);
+  const uint64_t byte_count = source.size();
+  std::vector<uint8_t> host(byte_count);
+  TF_RETURN_IF_ERROR(stream->Memcpy(host.data(), source, byte_count));
+  TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+
+  constexpr int64_t kMaxValues = 32;
+  std::string values;
+  double minimum = 0;
+  double maximum = 0;
+  int64_t nonzero_count = 0;
+  for (int64_t index = 0; index < element_count; ++index) {
+    double value = DecodeElement(host.data(), index, type);
+    if (index == 0 || value < minimum) minimum = value;
+    if (index == 0 || value > maximum) maximum = value;
+    if (value != 0.0) ++nonzero_count;
+    if (index < kMaxValues) {
+      absl::StrAppend(&values, index == 0 ? "" : ", ",
+                      absl::StrCat(value));
+    }
+  }
+
+  std::fprintf(
+      stderr,
+      "ZMLPRINT[%s] %s n=%lld first%lld=[%s] min=%g max=%g "
+      "nonzero=%lld/%lld\n",
+      label_.c_str(), operand_shape_.ToString().c_str(),
+      static_cast<long long>(element_count),
+      static_cast<long long>(kMaxValues), values.c_str(), minimum, maximum,
+      static_cast<long long>(nonzero_count),
+      static_cast<long long>(element_count));
+  std::fflush(stderr);
   return absl::OkStatus();
 }
 
