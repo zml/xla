@@ -120,8 +120,9 @@ struct HloLegalizeToStablehloPass
       target.addLegalOp<
           mhlo::AsyncDoneOp, mhlo::AsyncStartOp, mhlo::AsyncUpdateOp,
           mhlo::BitcastOp, mhlo::CopyOp, mhlo::DomainOp, mhlo::FusionOp,
-          mhlo::MinimumBroadcastShapesOp, mhlo::StochasticConvertOp,
-          mhlo::TraceOp, mhlo::XlaRngGetAndUpdateStateOp>();
+          mhlo::MinimumBroadcastShapesOp, mhlo::ScaledDotOp,
+          mhlo::StochasticConvertOp, mhlo::TraceOp,
+          mhlo::XlaRngGetAndUpdateStateOp>();
 
       target.addDynamicallyLegalOp<mhlo::AddDependencyOp>(
           [](mhlo::AddDependencyOp op) {
