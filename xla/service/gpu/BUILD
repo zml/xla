@@ -553,6 +553,7 @@ cc_library(
         "//xla/backends/gpu/runtime:thunk",
         "//xla/backends/gpu/runtime:topk",
         "//xla/backends/gpu/runtime:triangular_solve_thunk",
+        "//xla/backends/gpu/runtime:vulkan_print_thunk",
         "//xla/backends/gpu/runtime:while_thunk",
         "//xla/backends/gpu/transforms:dynamic_slice_copy",
         "//xla/backends/gpu/transforms:dynamic_slice_fusion",

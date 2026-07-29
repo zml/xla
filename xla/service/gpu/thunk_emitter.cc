@@ -106,6 +106,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/topk.h"
 #include "xla/backends/gpu/runtime/triangular_solve_thunk.h"
+#include "xla/backends/gpu/runtime/vulkan_print_thunk.h"
 #include "xla/backends/gpu/runtime/while_thunk.h"
 #include "xla/backends/gpu/transforms/collectives/collective_ops_utils.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_copy.h"
@@ -434,6 +435,21 @@ ThunkSequence GetThunkSequence(std::unique_ptr<Thunk> ir_emitter) {
   ThunkSequence thunk_sequence;
   thunk_sequence.push_back(std::move(ir_emitter));
   return thunk_sequence;
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitVulkanPrintThunk(
+    const HloCustomCallInstruction* instr) {
+  const HloInstruction* operand = instr->operand(0);
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
+                      GetAllocationSliceForHlo(operand, {}));
+  std::string label = instr->metadata().op_name().empty()
+                          ? std::string(instr->name())
+                          : instr->metadata().op_name();
+  auto thunk = std::make_unique<VulkanPrintThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      std::move(label), slice, operand->shape());
+  return GetThunkSequence(std::move(thunk));
 }
 
 AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
@@ -2820,6 +2836,11 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncStart(const HloInstruction* instr) {
 AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
     const HloInstruction* hlo) {
   auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
+
+  if (ir_emitter_context_->platform_name() == "VULKAN" &&
+      custom_call->custom_call_target() == "zml$print") {
+    return EmitVulkanPrintThunk(custom_call);
+  }
 
   if (IsCublasLtMatmul(*hlo)) {
     return EmitCublasLtMatmulThunk(custom_call);

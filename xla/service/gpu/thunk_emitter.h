@@ -153,6 +153,9 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitCustomCallThunk(
       const HloCustomCallInstruction* instr);
 
+  absl::StatusOr<ThunkSequence> EmitVulkanPrintThunk(
+      const HloCustomCallInstruction* instr);
+
   template <typename HloInstType>
   absl::StatusOr<ThunkSequence> EmitDegeneratedCollectiveThunk(
       std::vector<CollectiveThunk::Buffer>& buffers,

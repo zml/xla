@@ -5175,6 +5175,26 @@ xla_test(
 )
 
 cc_library(
+    name = "vulkan_print_thunk",
+    srcs = ["vulkan_print_thunk.cc"],
+    hdrs = ["vulkan_print_thunk.h"],
+    tags = ["gpu"],
+    deps = [
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:stream",
+        "//xla/tsl/platform:errors",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "custom_kernel_thunk",
     srcs = ["custom_kernel_thunk.cc"],
     hdrs = ["custom_kernel_thunk.h"],
