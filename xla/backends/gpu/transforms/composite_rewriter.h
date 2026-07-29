@@ -26,7 +26,7 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// This pass rewrites the composite a specific instruction.
+// xla.scaled_dot composite -> kScaledDot.
 class CompositeRewriter : public HloModulePass {
  public:
   absl::string_view name() const override { return "composite-rewriter"; }
