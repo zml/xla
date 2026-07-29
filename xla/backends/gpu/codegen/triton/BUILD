@@ -266,6 +266,7 @@ cc_library(
         "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
         "//xla/backends/gpu/codegen/triton/ir:triton_xla",
         "//xla/backends/gpu/codegen/triton/transforms:passes",
+        "//xla/backends/gpu/codegen/xtile:xtile_module",
         "//xla/codegen:ir_printing",
         "//xla/codegen:llvm_kernel_source",
         "//xla/codegen/emitters/ir:xla",
