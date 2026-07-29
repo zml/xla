@@ -274,6 +274,22 @@ message BlockLevelFusionConfig {
   int32 num_tiles_per_pid = 9;
 }
 
+// Autotuner config for the CUDA Tile IR emitter.
+//
+// A Tile IR gemm has two independent tilings stored in different places: the
+// output tile on the fusion, and the dot's contracting tile on the dot itself.
+// This pairs them so the autotuner can search both together. Only used as an
+// autotuner config, never stored on an instruction -- ApplyConfig splits it back
+// into the two places the emitter reads it from.
+message TileIrFusionConfig {
+  // Written to the fusion's `block_level_fusion_config`.
+  BlockLevelFusionConfig block_level_fusion_config = 1;
+
+  // Written to the dot's backend config as `Tile{sizes: [...]}`. Must be a
+  // multiple of the block-scaling factor block size (16 for NVFP4).
+  int64 contracting_tile_size = 2;
+}
+
 // A backend config for dynamic-slice and dynamic-update-slice instructions
 // whose runtime offset is a simple function of the parent loop iteration.
 // Only set on instructions where offset analysis succeeds; absence of this
