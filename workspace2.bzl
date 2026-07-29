@@ -16,6 +16,7 @@ load("//third_party/brotli:workspace.bzl", brotli = "repo")
 load("//third_party/clang_toolchain:cc_configure_clang.bzl", "cc_download_clang_toolchain")
 load("//third_party/compute_library:workspace.bzl", compute_library = "repo")
 load("//third_party/cpuinfo:workspace.bzl", cpuinfo = "repo")
+load("//third_party/cuda_tile:workspace.bzl", cuda_tile = "repo")
 load("//third_party/cudnn_frontend:workspace.bzl", cudnn_frontend = "repo")
 load("//third_party/cutlass:workspace.bzl", cutlass = "repo")
 load("//third_party/dlpack:workspace.bzl", dlpack = "repo")
@@ -129,6 +130,7 @@ def _initialize_third_party():
     uv()
     xnnpack()
     cutlass()
+    cuda_tile()
 
     # copybara: tsl vendor
 

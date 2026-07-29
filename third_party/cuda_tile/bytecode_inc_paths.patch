@@ -1,0 +1,41 @@
+Rewrite the four "../Writer/<X>.inc" includes to be unqualified.
+
+The CMake build emits the bytecode .inc files into per-directory build trees
+(lib/Bytecode/Writer/, lib/Bytecode/Reader/) and reaches across them with a
+relative "../Writer/..." include. Under Bazel every bytecode .inc lands in a
+single generated directory that is put on the include path via
+strip_include_prefix, and a quoted relative include of the form
+"../Writer/X.inc" cannot be resolved across the source/genfiles split. Making
+the includes unqualified lets the -I of the generated-header root resolve them.
+
+diff --git a/lib/Bytecode/BytecodeEnums.h b/lib/Bytecode/BytecodeEnums.h
+--- a/lib/Bytecode/BytecodeEnums.h
++++ b/lib/Bytecode/BytecodeEnums.h
+@@ -45,4 +45,4 @@
+ /// This enum is auto-generated from BytecodeTypeOpcodes.td.
+ #define GEN_TYPE_TAG_ENUM
+-#include "../Writer/TypeBytecode.inc"
++#include "TypeBytecode.inc"
+ #undef GEN_TYPE_TAG_ENUM
+@@ -76,4 +76,4 @@
+ /// This enum is auto-generated from BytecodeAttrOpcodes.td.
+ #define GEN_ATTR_TAG_ENUM
+-#include "../Writer/AttrBytecode.inc"
++#include "AttrBytecode.inc"
+ #undef GEN_ATTR_TAG_ENUM
+diff --git a/lib/Bytecode/Reader/BytecodeReader.cpp b/lib/Bytecode/Reader/BytecodeReader.cpp
+--- a/lib/Bytecode/Reader/BytecodeReader.cpp
++++ b/lib/Bytecode/Reader/BytecodeReader.cpp
+@@ -436,10 +436,10 @@
+ // Auto-generated is_cuda_tile_enum_attr type trait and symbolizeEnum
+ // specializations.
+ #define GEN_ENUM_ATTR_TYPE_TRAIT
+-#include "../Writer/AttrBytecode.inc"
++#include "AttrBytecode.inc"
+
+ // Auto-generated enum attr version checking.
+ #define GEN_ENUM_ATTR_VERSION_CHECK
+-#include "../Writer/AttrBytecode.inc"
++#include "AttrBytecode.inc"
+
+ /// Generic helper to parse an enum attribute.
