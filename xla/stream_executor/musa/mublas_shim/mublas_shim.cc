@@ -150,6 +150,57 @@ XlaMusaMuBlasStatus ToOperation(XlaMusaMuBlasOperation operation,
   }
 }
 
+XlaMusaMuBlasStatus ToSide(XlaMusaMuBlasSide side,
+                           mublasSideMode_t* native_side) {
+  if (native_side == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  switch (side) {
+    case XLA_MUSA_MUBLAS_SIDE_LEFT:
+      *native_side = MUBLAS_SIDE_LEFT;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    case XLA_MUSA_MUBLAS_SIDE_RIGHT:
+      *native_side = MUBLAS_SIDE_RIGHT;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+}
+
+XlaMusaMuBlasStatus ToFill(XlaMusaMuBlasFill fill,
+                           mublasFillMode_t* native_fill) {
+  if (native_fill == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  switch (fill) {
+    case XLA_MUSA_MUBLAS_FILL_UPPER:
+      *native_fill = MUBLAS_FILL_MODE_UPPER;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    case XLA_MUSA_MUBLAS_FILL_LOWER:
+      *native_fill = MUBLAS_FILL_MODE_LOWER;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+}
+
+XlaMusaMuBlasStatus ToDiagonal(XlaMusaMuBlasDiagonal diagonal,
+                               mublasDiagType_t* native_diagonal) {
+  if (native_diagonal == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  switch (diagonal) {
+    case XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT:
+      *native_diagonal = MUBLAS_DIAG_NON_UNIT;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    case XLA_MUSA_MUBLAS_DIAGONAL_UNIT:
+      *native_diagonal = MUBLAS_DIAG_UNIT;
+      return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+}
+
 XlaMusaMuBlasStatus ToDataType(XlaMusaMuBlasDataType data_type,
                                musaDataType_t* native_data_type) {
   if (native_data_type == nullptr) {
@@ -532,11 +583,174 @@ XlaMusaMuBlasStatus Scal(void* handle, XlaMusaMuBlasScalType scal_type,
   }
 }
 
+XlaMusaMuBlasStatus ValidateTrsmDimensions(XlaMusaMuBlasSide side, int64_t m,
+                                           int64_t n, int64_t lda,
+                                           int64_t ldb) {
+  if (!FitsNonNegativeInt32(m) || !FitsNonNegativeInt32(n) ||
+      !FitsPositiveInt32(lda) || !FitsPositiveInt32(ldb)) {
+    return XLA_MUSA_MUBLAS_STATUS_OUT_OF_RANGE;
+  }
+  const int64_t required_lda =
+      side == XLA_MUSA_MUBLAS_SIDE_LEFT ? (m > 1 ? m : 1) : (n > 1 ? n : 1);
+  const int64_t required_ldb = m > 1 ? m : 1;
+  if (lda < required_lda || ldb < required_ldb) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
+
+XlaMusaMuBlasStatus Trsm(void* handle, XlaMusaMuBlasTrsmType trsm_type,
+                         XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                         XlaMusaMuBlasOperation trans_a,
+                         XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n,
+                         const void* alpha, const void* a, int64_t lda, void* b,
+                         int64_t ldb) {
+  if (handle == nullptr || alpha == nullptr || a == nullptr || b == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  XlaMusaMuBlasStatus status = ValidateTrsmDimensions(side, m, n, lda, ldb);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+
+  mublasSideMode_t native_side;
+  mublasFillMode_t native_fill;
+  mublasOperation_t native_trans_a;
+  mublasDiagType_t native_diagonal;
+  status = ToSide(side, &native_side);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToFill(fill, &native_fill);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToOperation(trans_a, &native_trans_a);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToDiagonal(diagonal, &native_diagonal);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+
+  mublasHandle_t native_handle = static_cast<mublasHandle_t>(handle);
+  const mublas_int native_m = static_cast<mublas_int>(m);
+  const mublas_int native_n = static_cast<mublas_int>(n);
+  const mublas_int native_lda = static_cast<mublas_int>(lda);
+  const mublas_int native_ldb = static_cast<mublas_int>(ldb);
+  switch (trsm_type) {
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F32:
+      return ToShimStatus(mublasStrsm(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n, static_cast<const float*>(alpha),
+          static_cast<const float*>(a), native_lda, static_cast<float*>(b),
+          native_ldb));
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F64:
+      return ToShimStatus(mublasDtrsm(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n,
+          static_cast<const double*>(alpha), static_cast<const double*>(a),
+          native_lda, static_cast<double*>(b), native_ldb));
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C64: {
+      muComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(float));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(
+          mublasCtrsm(native_handle, native_side, native_fill, native_trans_a,
+                      native_diagonal, native_m, native_n, &native_alpha,
+                      static_cast<const muComplex*>(a), native_lda,
+                      static_cast<muComplex*>(b), native_ldb));
+    }
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C128: {
+      muDoubleComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(double));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(
+          mublasZtrsm(native_handle, native_side, native_fill, native_trans_a,
+                      native_diagonal, native_m, native_n, &native_alpha,
+                      static_cast<const muDoubleComplex*>(a), native_lda,
+                      static_cast<muDoubleComplex*>(b), native_ldb));
+    }
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_NOT_SUPPORTED;
+  }
+}
+
+XlaMusaMuBlasStatus TrsmBatched(void* handle, XlaMusaMuBlasTrsmType trsm_type,
+                                XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                                XlaMusaMuBlasOperation trans_a,
+                                XlaMusaMuBlasDiagonal diagonal, int64_t m,
+                                int64_t n, const void* alpha,
+                                const void* const* a, int64_t lda,
+                                void* const* b, int64_t ldb,
+                                int64_t batch_count) {
+  if (handle == nullptr || alpha == nullptr || a == nullptr || b == nullptr) {
+    return XLA_MUSA_MUBLAS_STATUS_INVALID_ARGUMENT;
+  }
+  XlaMusaMuBlasStatus status = ValidateTrsmDimensions(side, m, n, lda, ldb);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  if (!FitsNonNegativeInt32(batch_count)) {
+    return XLA_MUSA_MUBLAS_STATUS_OUT_OF_RANGE;
+  }
+
+  mublasSideMode_t native_side;
+  mublasFillMode_t native_fill;
+  mublasOperation_t native_trans_a;
+  mublasDiagType_t native_diagonal;
+  status = ToSide(side, &native_side);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToFill(fill, &native_fill);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToOperation(trans_a, &native_trans_a);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+  status = ToDiagonal(diagonal, &native_diagonal);
+  if (status != XLA_MUSA_MUBLAS_STATUS_SUCCESS) return status;
+
+  mublasHandle_t native_handle = static_cast<mublasHandle_t>(handle);
+  const mublas_int native_m = static_cast<mublas_int>(m);
+  const mublas_int native_n = static_cast<mublas_int>(n);
+  const mublas_int native_lda = static_cast<mublas_int>(lda);
+  const mublas_int native_ldb = static_cast<mublas_int>(ldb);
+  const mublas_int native_batch_count = static_cast<mublas_int>(batch_count);
+  switch (trsm_type) {
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F32:
+      return ToShimStatus(mublasStrsmBatched(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n, static_cast<const float*>(alpha),
+          reinterpret_cast<const float* const*>(a), native_lda,
+          reinterpret_cast<float* const*>(b), native_ldb, native_batch_count));
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F64:
+      return ToShimStatus(mublasDtrsmBatched(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n,
+          static_cast<const double*>(alpha),
+          reinterpret_cast<const double* const*>(a), native_lda,
+          reinterpret_cast<double* const*>(b), native_ldb, native_batch_count));
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C64: {
+      muComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(float));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(mublasCtrsmBatched(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n, &native_alpha,
+          reinterpret_cast<const muComplex* const*>(a), native_lda,
+          reinterpret_cast<muComplex* const*>(b), native_ldb,
+          native_batch_count));
+    }
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C128: {
+      muDoubleComplex native_alpha;
+      static_assert(sizeof(native_alpha) == 2 * sizeof(double));
+      std::memcpy(&native_alpha, alpha, sizeof(native_alpha));
+      return ToShimStatus(mublasZtrsmBatched(
+          native_handle, native_side, native_fill, native_trans_a,
+          native_diagonal, native_m, native_n, &native_alpha,
+          reinterpret_cast<const muDoubleComplex* const*>(a), native_lda,
+          reinterpret_cast<muDoubleComplex* const*>(b), native_ldb,
+          native_batch_count));
+    }
+    default:
+      return XLA_MUSA_MUBLAS_STATUS_NOT_SUPPORTED;
+  }
+}
+
 constexpr XlaMusaMuBlasCapabilities kCapabilities =
     XLA_MUSA_MUBLAS_CAPABILITIES_V1;
 constexpr XlaMusaMuBlasAdvancedCapabilities kAdvancedCapabilities =
     XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
-    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
+    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL |
+    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM |
+    XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED;
 
 const XlaMusaMuBlasApiV1 kApiV1 = {sizeof(XlaMusaMuBlasApiV1),
                                    XLA_MUSA_MUBLAS_ABI_VERSION_1,
@@ -560,7 +774,9 @@ const XlaMusaMuBlasApiV2 kApiV2 = {sizeof(XlaMusaMuBlasApiV2),
                                    GemmWithAlgorithm,
                                    GemmBatched,
                                    GemmStridedBatched,
-                                   Scal};
+                                   Scal,
+                                   Trsm,
+                                   TrsmBatched};
 
 }  // namespace
 

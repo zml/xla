@@ -30,6 +30,7 @@ limitations under the License.
 #include "llvm/IR/Module.h"
 #include "xla/backends/gpu/transforms/dot_algorithm_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_rewriter.h"
+#include "xla/backends/gpu/transforms/triangular_solve_rewriter.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -71,6 +72,7 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
   bool requires_mublas = false;
   bool requires_mufft = false;
   bool requires_mublas_scal = false;
+  bool requires_mublas_trsm = false;
   // Deterministic execution configures the muBLAS atomics mode before every
   // GEMM. That setter is part of the v2 table even when the HLO itself is an
   // unbatched GEMM using the default algorithm.
@@ -83,6 +85,10 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
         requires_mufft = true;
         requires_mublas_scal |= instruction->fft_type() == FftType::IFFT ||
                                 instruction->fft_type() == FftType::IRFFT;
+      }
+      if (IsTriangularSolve(*instruction)) {
+        requires_mublas = true;
+        requires_mublas_trsm = true;
       }
       if (!IsMusaGemm(*instruction)) continue;
       requires_mublas = true;
@@ -117,6 +123,13 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
         .name = stream_executor::musa::kMusaMuBlasScalLibraryAbiName,
         .abi_version = stream_executor::musa::kMusaMuBlasScalLibraryAbiVersion,
         .fingerprint = stream_executor::musa::kMusaMuBlasScalAbiFingerprintV1,
+    });
+  }
+  if (requires_mublas_trsm) {
+    requirements.push_back({
+        .name = stream_executor::musa::kMusaMuBlasTrsmLibraryAbiName,
+        .abi_version = stream_executor::musa::kMusaMuBlasTrsmLibraryAbiVersion,
+        .fingerprint = stream_executor::musa::kMusaMuBlasTrsmAbiFingerprintV1,
     });
   }
   if (requires_mufft) {
@@ -240,6 +253,24 @@ absl::Status MusaGpuCompiler::OptimizeHloConvolutionCanonicalization(
   (void)toolkit_version;
   (void)compilation_stats;
   return absl::OkStatus();
+}
+
+absl::Status MusaGpuCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+    CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats, mlir_context));
+
+  HloPassPipeline pipeline("MUSA post-layout_assignment part 2",
+                           compilation_stats);
+  pipeline.AddPass<TriangularSolveRewriter>();
+  return pipeline
+      .Run(hlo_module,
+           /*execution_threads=*/{HloInstruction::kMainExecutionThread})
+      .status();
 }
 
 absl::Status MusaGpuCompiler::AddAutotunerPass(

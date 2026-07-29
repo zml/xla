@@ -66,6 +66,37 @@ absl::StatusOr<XlaMusaMuBlasOperation> AsMuBlasOperation(
   return absl::InvalidArgumentError("unknown BLAS transpose operation");
 }
 
+absl::StatusOr<XlaMusaMuBlasSide> AsMuBlasSide(blas::Side side) {
+  switch (side) {
+    case blas::Side::kLeft:
+      return XLA_MUSA_MUBLAS_SIDE_LEFT;
+    case blas::Side::kRight:
+      return XLA_MUSA_MUBLAS_SIDE_RIGHT;
+  }
+  return absl::InvalidArgumentError("unknown BLAS side");
+}
+
+absl::StatusOr<XlaMusaMuBlasFill> AsMuBlasFill(blas::UpperLower uplo) {
+  switch (uplo) {
+    case blas::UpperLower::kUpper:
+      return XLA_MUSA_MUBLAS_FILL_UPPER;
+    case blas::UpperLower::kLower:
+      return XLA_MUSA_MUBLAS_FILL_LOWER;
+  }
+  return absl::InvalidArgumentError("unknown BLAS triangular fill mode");
+}
+
+absl::StatusOr<XlaMusaMuBlasDiagonal> AsMuBlasDiagonal(
+    blas::Diagonal diagonal) {
+  switch (diagonal) {
+    case blas::Diagonal::kNonUnit:
+      return XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT;
+    case blas::Diagonal::kUnit:
+      return XLA_MUSA_MUBLAS_DIAGONAL_UNIT;
+  }
+  return absl::InvalidArgumentError("unknown BLAS diagonal mode");
+}
+
 struct MuBlasGemmTypes {
   XlaMusaMuBlasDataType input_type;
   XlaMusaMuBlasDataType output_type;
@@ -317,6 +348,68 @@ absl::StatusOr<size_t> DataTypeSize(blas::DataType type) {
           absl::StrCat("MUSA muBLAS has no qualified element size for ",
                        blas::DataTypeString(type)));
   }
+}
+
+absl::Status ValidateTrsmDimensions(blas::Side side, uint64_t m, uint64_t n,
+                                    int lda, int ldb) {
+  constexpr uint64_t kMax =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  if (m > kMax || n > kMax) {
+    return absl::OutOfRangeError(
+        "muBLAS TRSM dimensions exceed the shim's signed 64-bit ABI");
+  }
+  if (lda <= 0 || ldb <= 0) {
+    return absl::InvalidArgumentError(
+        "muBLAS TRSM leading dimensions must be positive");
+  }
+  const uint64_t order = side == blas::Side::kLeft ? m : n;
+  if (static_cast<uint64_t>(lda) < std::max<uint64_t>(1, order) ||
+      static_cast<uint64_t>(ldb) < std::max<uint64_t>(1, m)) {
+    return absl::InvalidArgumentError(
+        "muBLAS TRSM leading dimension is smaller than its stored row count");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateTrsmBufferExtent(const DeviceAddressBase& buffer,
+                                      uint64_t matrix_elements,
+                                      size_t element_size,
+                                      absl::string_view name) {
+  if (buffer.is_null()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("muBLAS TRSM ", name, " matrix pointer is null"));
+  }
+  if (buffer.size() == 0) return absl::OkStatus();
+  if (matrix_elements >
+      std::numeric_limits<uint64_t>::max() / element_size) {
+    return absl::OutOfRangeError(
+        absl::StrCat("muBLAS TRSM ", name, " byte extent overflows"));
+  }
+  const uint64_t required_bytes = matrix_elements * element_size;
+  if (buffer.size() < required_bytes) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("muBLAS TRSM ", name, " buffer has ", buffer.size(),
+                     " bytes; needs at least ", required_bytes));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateTrsmPointerArray(const DeviceAddressBase& buffer,
+                                      int batch_count,
+                                      absl::string_view name) {
+  if (buffer.is_null()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "muBLAS batched TRSM ", name, " pointer array is null"));
+  }
+  if (buffer.size() == 0) return absl::OkStatus();
+  const uint64_t required_bytes =
+      static_cast<uint64_t>(batch_count) * sizeof(void*);
+  if (buffer.size() < required_bytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "muBLAS batched TRSM ", name, " pointer array has ", buffer.size(),
+        " bytes; needs at least ", required_bytes));
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -1173,62 +1266,136 @@ absl::Status MusaBlas::DoBlasGemmStridedBatchedWithAlgorithm(
       computation_type, algorithm, engine_options, output_profile_result);
 }
 
-bool MusaBlas::DoBlasTrsm(Stream*, blas::Side, blas::UpperLower,
-                          blas::Transpose, blas::Diagonal, uint64_t, uint64_t,
-                          float, const DeviceAddress<float>&, int,
-                          DeviceAddress<float>*, int) {
-  return UnsupportedBool("TRSM f32");
-}
-bool MusaBlas::DoBlasTrsm(Stream*, blas::Side, blas::UpperLower,
-                          blas::Transpose, blas::Diagonal, uint64_t, uint64_t,
-                          double, const DeviceAddress<double>&, int,
-                          DeviceAddress<double>*, int) {
-  return UnsupportedBool("TRSM f64");
-}
-bool MusaBlas::DoBlasTrsm(Stream*, blas::Side, blas::UpperLower,
-                          blas::Transpose, blas::Diagonal, uint64_t, uint64_t,
-                          std::complex<float>,
-                          const DeviceAddress<std::complex<float>>&, int,
-                          DeviceAddress<std::complex<float>>*, int) {
-  return UnsupportedBool("TRSM complex-f32");
-}
-bool MusaBlas::DoBlasTrsm(Stream*, blas::Side, blas::UpperLower,
-                          blas::Transpose, blas::Diagonal, uint64_t, uint64_t,
-                          std::complex<double>,
-                          const DeviceAddress<std::complex<double>>&, int,
-                          DeviceAddress<std::complex<double>>*, int) {
-  return UnsupportedBool("TRSM complex-f64");
+absl::Status MusaBlas::DoBlasTrsmInternal(
+    Stream* stream, blas::Side side, blas::UpperLower uplo,
+    blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,
+    const void* alpha, const DeviceAddressBase& a, int lda,
+    DeviceAddressBase* b, int ldb, XlaMusaMuBlasTrsmType trsm_type,
+    size_t element_size) {
+  if (!api_->SupportsTrsm()) {
+    return absl::UnimplementedError(
+        "loaded muBLAS shim does not advertise the optional TRSM contract");
+  }
+  RETURN_IF_ERROR(ValidateTrsmDimensions(side, m, n, lda, ldb));
+  if (m == 0 || n == 0) return absl::OkStatus();
+  if (alpha == nullptr || b == nullptr) {
+    return absl::InvalidArgumentError(
+        "muBLAS TRSM scalar or output pointer is null");
+  }
+
+  const uint64_t order = side == blas::Side::kLeft ? m : n;
+  ASSIGN_OR_RETURN(
+      uint64_t a_elements,
+      RequiredMatrixElements(blas::Transpose::kNoTranspose, order, order,
+                             lda));
+  ASSIGN_OR_RETURN(
+      uint64_t b_elements,
+      RequiredMatrixElements(blas::Transpose::kNoTranspose, m, n, ldb));
+  RETURN_IF_ERROR(
+      ValidateTrsmBufferExtent(a, a_elements, element_size, "A"));
+  RETURN_IF_ERROR(
+      ValidateTrsmBufferExtent(*b, b_elements, element_size, "B"));
+
+  ASSIGN_OR_RETURN(XlaMusaMuBlasSide normalized_side, AsMuBlasSide(side));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasFill normalized_fill, AsMuBlasFill(uplo));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasOperation normalized_transpose,
+                   AsMuBlasOperation(transa));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasDiagonal normalized_diagonal,
+                   AsMuBlasDiagonal(diag));
+  ASSIGN_OR_RETURN(std::shared_ptr<HandleState> state,
+                   GetOrCreateHandle(stream));
+  std::unique_ptr<ActivateContext> activation = parent_->Activate();
+  absl::MutexLock state_lock(&state->mu);
+  RETURN_IF_ERROR(api_->Trsm(
+      state->handle, trsm_type, normalized_side, normalized_fill,
+      normalized_transpose, normalized_diagonal, static_cast<int64_t>(m),
+      static_cast<int64_t>(n), alpha, a.opaque(), lda, b->opaque(), ldb));
+  {
+    absl::MutexLock lock(&handles_mu_);
+    last_stream_ = state->native_stream;
+  }
+  return absl::OkStatus();
 }
 
-bool MusaBlas::DoBlasTrsmBatched(Stream*, blas::Side, blas::UpperLower,
-                                 blas::Transpose, blas::Diagonal, uint64_t,
-                                 uint64_t, float, const DeviceAddress<float*>&,
-                                 int, DeviceAddress<float*>*, int, int) {
-  return UnsupportedBool("batched TRSM f32");
+absl::Status MusaBlas::DoBlasTrsmBatchedInternal(
+    Stream* stream, blas::Side side, blas::UpperLower uplo,
+    blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,
+    const void* alpha, const DeviceAddressBase& as, int lda,
+    DeviceAddressBase* bs, int ldb, int batch_count,
+    XlaMusaMuBlasTrsmType trsm_type) {
+  if (!api_->SupportsTrsmBatched()) {
+    return absl::UnimplementedError(
+        "loaded muBLAS shim does not advertise the optional batched TRSM "
+        "contract");
+  }
+  RETURN_IF_ERROR(ValidateTrsmDimensions(side, m, n, lda, ldb));
+  if (batch_count < 0) {
+    return absl::InvalidArgumentError(
+        "muBLAS batched TRSM batch count must be non-negative");
+  }
+  if (batch_count == 0 || m == 0 || n == 0) return absl::OkStatus();
+  if (alpha == nullptr || bs == nullptr) {
+    return absl::InvalidArgumentError(
+        "muBLAS batched TRSM scalar or output pointer is null");
+  }
+  RETURN_IF_ERROR(ValidateTrsmPointerArray(as, batch_count, "A"));
+  RETURN_IF_ERROR(ValidateTrsmPointerArray(*bs, batch_count, "B"));
+
+  ASSIGN_OR_RETURN(XlaMusaMuBlasSide normalized_side, AsMuBlasSide(side));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasFill normalized_fill, AsMuBlasFill(uplo));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasOperation normalized_transpose,
+                   AsMuBlasOperation(transa));
+  ASSIGN_OR_RETURN(XlaMusaMuBlasDiagonal normalized_diagonal,
+                   AsMuBlasDiagonal(diag));
+  ASSIGN_OR_RETURN(std::shared_ptr<HandleState> state,
+                   GetOrCreateHandle(stream));
+  std::unique_ptr<ActivateContext> activation = parent_->Activate();
+  absl::MutexLock state_lock(&state->mu);
+  RETURN_IF_ERROR(api_->TrsmBatched(
+      state->handle, trsm_type, normalized_side, normalized_fill,
+      normalized_transpose, normalized_diagonal, static_cast<int64_t>(m),
+      static_cast<int64_t>(n), alpha,
+      reinterpret_cast<const void* const*>(as.opaque()), lda,
+      reinterpret_cast<void* const*>(bs->opaque()), ldb, batch_count));
+  {
+    absl::MutexLock lock(&handles_mu_);
+    last_stream_ = state->native_stream;
+  }
+  return absl::OkStatus();
 }
-bool MusaBlas::DoBlasTrsmBatched(Stream*, blas::Side, blas::UpperLower,
-                                 blas::Transpose, blas::Diagonal, uint64_t,
-                                 uint64_t, double,
-                                 const DeviceAddress<double*>&, int,
-                                 DeviceAddress<double*>*, int, int) {
-  return UnsupportedBool("batched TRSM f64");
-}
-bool MusaBlas::DoBlasTrsmBatched(Stream*, blas::Side, blas::UpperLower,
-                                 blas::Transpose, blas::Diagonal, uint64_t,
-                                 uint64_t, std::complex<float>,
-                                 const DeviceAddress<std::complex<float>*>&,
-                                 int, DeviceAddress<std::complex<float>*>*, int,
-                                 int) {
-  return UnsupportedBool("batched TRSM complex-f32");
-}
-bool MusaBlas::DoBlasTrsmBatched(Stream*, blas::Side, blas::UpperLower,
-                                 blas::Transpose, blas::Diagonal, uint64_t,
-                                 uint64_t, std::complex<double>,
-                                 const DeviceAddress<std::complex<double>*>&,
-                                 int, DeviceAddress<std::complex<double>*>*,
-                                 int, int) {
-  return UnsupportedBool("batched TRSM complex-f64");
-}
+
+#define XLA_MUSA_TRSM_OVERLOAD(TYPE, TRSM_TYPE)                              \
+  bool MusaBlas::DoBlasTrsm(                                                \
+      Stream* stream, blas::Side side, blas::UpperLower uplo,               \
+      blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,  \
+      TYPE alpha, const DeviceAddress<TYPE>& a, int lda,                    \
+      DeviceAddress<TYPE>* b, int ldb) {                                    \
+    absl::Status status = DoBlasTrsmInternal(                               \
+        stream, side, uplo, transa, diag, m, n, &alpha, a, lda, b, ldb,    \
+        TRSM_TYPE, sizeof(TYPE));                                           \
+    if (!status.ok()) LOG(ERROR) << status;                                 \
+    return status.ok();                                                     \
+  }                                                                         \
+  bool MusaBlas::DoBlasTrsmBatched(                                         \
+      Stream* stream, blas::Side side, blas::UpperLower uplo,               \
+      blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,  \
+      TYPE alpha, const DeviceAddress<TYPE*>& as, int lda,                  \
+      DeviceAddress<TYPE*>* bs, int ldb, int batch_count) {                 \
+    absl::Status status = DoBlasTrsmBatchedInternal(                        \
+        stream, side, uplo, transa, diag, m, n, &alpha, as, lda, bs, ldb,  \
+        batch_count, TRSM_TYPE);                                            \
+    if (!status.ok()) LOG(ERROR) << status;                                 \
+    return status.ok();                                                     \
+  }
+
+XLA_MUSA_TRSM_OVERLOAD(float, XLA_MUSA_MUBLAS_TRSM_TYPE_F32)
+XLA_MUSA_TRSM_OVERLOAD(double, XLA_MUSA_MUBLAS_TRSM_TYPE_F64)
+using ComplexFloat = std::complex<float>;
+using ComplexDouble = std::complex<double>;
+XLA_MUSA_TRSM_OVERLOAD(ComplexFloat, XLA_MUSA_MUBLAS_TRSM_TYPE_C64)
+XLA_MUSA_TRSM_OVERLOAD(ComplexDouble, XLA_MUSA_MUBLAS_TRSM_TYPE_C128)
+
+#undef XLA_MUSA_TRSM_OVERLOAD
 
 void InitializeMusaBlas() {
   PluginRegistry* registry = PluginRegistry::Instance();

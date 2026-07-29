@@ -50,6 +50,8 @@ struct FakeCalls {
   int gemm_batched = 0;
   int gemm_strided_batched = 0;
   int scal = 0;
+  int trsm = 0;
+  int trsm_batched = 0;
   void* stream = nullptr;
   bool allow_atomics = false;
   XlaMusaMuBlasDataType input_type = 0;
@@ -65,6 +67,18 @@ struct FakeCalls {
   int64_t scal_incx = 0;
   const void* scal_alpha = nullptr;
   void* scal_x = nullptr;
+  XlaMusaMuBlasTrsmType trsm_type = 0;
+  XlaMusaMuBlasSide trsm_side = 0;
+  XlaMusaMuBlasFill trsm_fill = 0;
+  XlaMusaMuBlasOperation trsm_trans_a = 0;
+  XlaMusaMuBlasDiagonal trsm_diagonal = 0;
+  int64_t trsm_m = 0;
+  int64_t trsm_n = 0;
+  int64_t trsm_lda = 0;
+  int64_t trsm_ldb = 0;
+  const void* trsm_alpha = nullptr;
+  const void* trsm_a = nullptr;
+  const void* trsm_b = nullptr;
 };
 
 FakeCalls* g_calls = nullptr;
@@ -167,6 +181,51 @@ XlaMusaMuBlasStatus FakeScal(void*, XlaMusaMuBlasScalType scal_type, int64_t n,
   return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
 }
 
+XlaMusaMuBlasStatus FakeTrsm(void*, XlaMusaMuBlasTrsmType trsm_type,
+                             XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                             XlaMusaMuBlasOperation trans_a,
+                             XlaMusaMuBlasDiagonal diagonal, int64_t m,
+                             int64_t n, const void* alpha, const void* a,
+                             int64_t lda, void* b, int64_t ldb) {
+  ++g_calls->trsm;
+  g_calls->trsm_type = trsm_type;
+  g_calls->trsm_side = side;
+  g_calls->trsm_fill = fill;
+  g_calls->trsm_trans_a = trans_a;
+  g_calls->trsm_diagonal = diagonal;
+  g_calls->trsm_m = m;
+  g_calls->trsm_n = n;
+  g_calls->trsm_lda = lda;
+  g_calls->trsm_ldb = ldb;
+  g_calls->trsm_alpha = alpha;
+  g_calls->trsm_a = a;
+  g_calls->trsm_b = b;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
+
+XlaMusaMuBlasStatus FakeTrsmBatched(
+    void*, XlaMusaMuBlasTrsmType trsm_type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation trans_a,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void* alpha,
+    const void* const* a, int64_t lda, void* const* b, int64_t ldb,
+    int64_t batch_count) {
+  ++g_calls->trsm_batched;
+  g_calls->trsm_type = trsm_type;
+  g_calls->trsm_side = side;
+  g_calls->trsm_fill = fill;
+  g_calls->trsm_trans_a = trans_a;
+  g_calls->trsm_diagonal = diagonal;
+  g_calls->trsm_m = m;
+  g_calls->trsm_n = n;
+  g_calls->trsm_lda = lda;
+  g_calls->trsm_ldb = ldb;
+  g_calls->trsm_alpha = alpha;
+  g_calls->trsm_a = a;
+  g_calls->trsm_b = b;
+  g_calls->batch_count = batch_count;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
+
 const XlaMusaMuBlasApiV1* FakeGetterV1() { return g_api_v1; }
 const XlaMusaMuBlasApiV2* FakeGetterV2() { return g_api_v2; }
 
@@ -189,7 +248,9 @@ XlaMusaMuBlasApiV2 CompleteApiV2() {
   api.abi_version = XLA_MUSA_MUBLAS_ABI_VERSION_2;
   api.capabilities = XLA_MUSA_MUBLAS_CAPABILITIES_V1;
   api.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
-                              XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
+                              XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL |
+                              XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM |
+                              XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED;
   api.create = FakeCreate;
   api.destroy = FakeDestroy;
   api.set_stream = FakeSetStream;
@@ -200,6 +261,8 @@ XlaMusaMuBlasApiV2 CompleteApiV2() {
   api.gemm_batched = FakeGemmBatched;
   api.gemm_strided_batched = FakeGemmStridedBatched;
   api.scal = FakeScal;
+  api.trsm = FakeTrsm;
+  api.trsm_batched = FakeTrsmBatched;
   return api;
 }
 
@@ -329,7 +392,9 @@ TEST_F(MusaMuBlasApiTest, PrefersV2AndDispatchesAdvancedOperations) {
   EXPECT_EQ(api->abi_version(), XLA_MUSA_MUBLAS_ABI_VERSION_2);
   EXPECT_EQ(api->advanced_capabilities(),
             XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
-                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL);
+                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL |
+                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM |
+                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED);
   EXPECT_TRUE(api->SupportsSetAtomicsMode());
   EXPECT_TRUE(api->SupportsGemmWithAlgorithm());
   EXPECT_TRUE(api->SupportsGemmBatched());
@@ -337,9 +402,12 @@ TEST_F(MusaMuBlasApiTest, PrefersV2AndDispatchesAdvancedOperations) {
   EXPECT_TRUE(api->SupportsTensorOpF32());
   EXPECT_TRUE(api->UsesZeroExternalWorkspace());
   EXPECT_TRUE(api->SupportsScal());
+  EXPECT_TRUE(api->SupportsTrsm());
+  EXPECT_TRUE(api->SupportsTrsmBatched());
   EXPECT_EQ(api->advanced_abi_fingerprint(),
             kMusaMuBlasAdvancedAbiFingerprintV2);
   EXPECT_EQ(api->scal_abi_fingerprint(), kMusaMuBlasScalAbiFingerprintV1);
+  EXPECT_EQ(api->trsm_abi_fingerprint(), kMusaMuBlasTrsmAbiFingerprintV1);
 
   void* handle = nullptr;
   ASSERT_TRUE(api->Create(&handle).ok());
@@ -423,12 +491,14 @@ TEST_F(MusaMuBlasApiTest, PrefersV2AndDispatchesAdvancedOperations) {
   EXPECT_EQ(calls_.gemm_with_algorithm, 1);
 }
 
-TEST_F(MusaMuBlasApiTest, OldSizeV2RemainsValidWithoutReadingScalTail) {
+TEST_F(MusaMuBlasApiTest, OldSizeV2RemainsValidWithoutReadingOptionalTails) {
   api_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE;
   api_v2_.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2;
   // The physical test object has a tail, but its logical C16 table ends at
   // byte 96. A compatible loader must ignore this value.
   api_v2_.scal = FakeScal;
+  api_v2_.trsm = FakeTrsm;
+  api_v2_.trsm_batched = FakeTrsmBatched;
   auto loader = std::make_unique<FakeSymbolLoader>(
       reinterpret_cast<void*>(&FakeGetterV1),
       reinterpret_cast<void*>(&FakeGetterV2));
@@ -442,12 +512,23 @@ TEST_F(MusaMuBlasApiTest, OldSizeV2RemainsValidWithoutReadingScalTail) {
   EXPECT_EQ(api->advanced_abi_fingerprint(),
             kMusaMuBlasAdvancedAbiFingerprintV2);
   EXPECT_FALSE(api->SupportsScal());
+  EXPECT_FALSE(api->SupportsTrsm());
+  EXPECT_FALSE(api->SupportsTrsmBatched());
   EXPECT_TRUE(api->scal_abi_fingerprint().empty());
+  EXPECT_TRUE(api->trsm_abi_fingerprint().empty());
   float scalar = 1.0f;
   EXPECT_THAT(api->Scal(reinterpret_cast<void*>(0x1234),
                         XLA_MUSA_MUBLAS_SCAL_TYPE_F32, 1, &scalar, &scalar, 1),
               StatusIs(absl::StatusCode::kUnimplemented));
   EXPECT_EQ(calls_.scal, 0);
+  EXPECT_THAT(
+      api->Trsm(reinterpret_cast<void*>(0x1234), XLA_MUSA_MUBLAS_TRSM_TYPE_F32,
+                XLA_MUSA_MUBLAS_SIDE_LEFT, XLA_MUSA_MUBLAS_FILL_LOWER,
+                XLA_MUSA_MUBLAS_OPERATION_NONE,
+                XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT, 1, 1, &scalar, &scalar, 1,
+                &scalar, 1),
+      StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(calls_.trsm, 0);
 }
 
 TEST_F(MusaMuBlasApiTest, ScalIdentityRequiresSizeCapabilityAndPointer) {
@@ -488,6 +569,138 @@ TEST_F(MusaMuBlasApiTest, ScalIdentityRequiresSizeCapabilityAndPointer) {
       "097f516c7b70c49b3873926b6b20e39bafd74a80687a5e9e66a2927433dc1a68");
 }
 
+TEST_F(MusaMuBlasApiTest, TrsmIdentityRequiresCompleteTail) {
+  auto check_support = [this](bool supports_trsm, bool supports_batched,
+                              bool has_identity) {
+    auto loader = std::make_unique<FakeSymbolLoader>(
+        reinterpret_cast<void*>(&FakeGetterV1),
+        reinterpret_cast<void*>(&FakeGetterV2));
+    std::unique_ptr<MusaMuBlasApi> api =
+        MusaMuBlasApi::CreateForTesting(std::move(loader));
+    ASSERT_TRUE(api->Init().ok());
+    EXPECT_EQ(api->SupportsTrsm(), supports_trsm);
+    EXPECT_EQ(api->SupportsTrsmBatched(), supports_batched);
+    EXPECT_EQ(!api->trsm_abi_fingerprint().empty(), has_identity);
+  };
+
+  api_v2_.advanced_capabilities &= ~XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM;
+  check_support(false, true, false);
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.advanced_capabilities &=
+      ~XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED;
+  check_support(true, false, false);
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.trsm = nullptr;
+  check_support(false, true, false);
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.trsm_batched = nullptr;
+  check_support(true, false, false);
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE;
+  check_support(false, false, false);
+
+  api_v2_ = CompleteApiV2();
+  api_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_TRSM_STRUCT_SIZE;
+  check_support(true, false, false);
+
+  api_v2_ = CompleteApiV2();
+  check_support(true, true, true);
+  EXPECT_STREQ(kMusaMuBlasTrsmAbiContractV1,
+               "xla-musa-mublas-trsm;abi=1;routes=strsm,dtrsm,ctrsm,ztrsm,"
+               "strsm-batched,dtrsm-batched,ctrsm-batched,ztrsm-batched;"
+               "workspace=internal;stream=bound");
+  EXPECT_STREQ(
+      kMusaMuBlasTrsmAbiFingerprintV1,
+      "cce7da268bd7096df25f1d1c8a7ef2d1b33b5756df7693d9f3022d188739f8e6");
+  EXPECT_STREQ(kMusaMuBlasTrsmLibraryAbiName, "mublas-trsm");
+  EXPECT_STREQ(kMusaMuBlasTrsmLibraryAbiVersion, "1");
+}
+
+TEST_F(MusaMuBlasApiTest, DispatchesTypedTrsmCallsAndRejectsUnknownOptions) {
+  auto loader = std::make_unique<FakeSymbolLoader>(
+      reinterpret_cast<void*>(&FakeGetterV1),
+      reinterpret_cast<void*>(&FakeGetterV2));
+  std::unique_ptr<MusaMuBlasApi> api =
+      MusaMuBlasApi::CreateForTesting(std::move(loader));
+  void* handle = nullptr;
+  ASSERT_TRUE(api->Create(&handle).ok());
+
+  double alpha = 1.0;
+  const void* a = reinterpret_cast<const void*>(0x1000);
+  void* b = reinterpret_cast<void*>(0x2000);
+  ASSERT_TRUE(api->Trsm(handle, XLA_MUSA_MUBLAS_TRSM_TYPE_F64,
+                        XLA_MUSA_MUBLAS_SIDE_RIGHT, XLA_MUSA_MUBLAS_FILL_LOWER,
+                        XLA_MUSA_MUBLAS_OPERATION_TRANSPOSE,
+                        XLA_MUSA_MUBLAS_DIAGONAL_UNIT, 5, 7, &alpha, a, 7, b, 5)
+                  .ok());
+  EXPECT_EQ(calls_.trsm, 1);
+  EXPECT_EQ(calls_.trsm_type, XLA_MUSA_MUBLAS_TRSM_TYPE_F64);
+  EXPECT_EQ(calls_.trsm_side, XLA_MUSA_MUBLAS_SIDE_RIGHT);
+  EXPECT_EQ(calls_.trsm_fill, XLA_MUSA_MUBLAS_FILL_LOWER);
+  EXPECT_EQ(calls_.trsm_trans_a, XLA_MUSA_MUBLAS_OPERATION_TRANSPOSE);
+  EXPECT_EQ(calls_.trsm_diagonal, XLA_MUSA_MUBLAS_DIAGONAL_UNIT);
+  EXPECT_EQ(calls_.trsm_m, 5);
+  EXPECT_EQ(calls_.trsm_n, 7);
+  EXPECT_EQ(calls_.trsm_lda, 7);
+  EXPECT_EQ(calls_.trsm_ldb, 5);
+  EXPECT_EQ(calls_.trsm_alpha, &alpha);
+  EXPECT_EQ(calls_.trsm_a, a);
+  EXPECT_EQ(calls_.trsm_b, b);
+
+  auto* batched_a = reinterpret_cast<const void* const*>(0x3000);
+  auto* batched_b = reinterpret_cast<void* const*>(0x4000);
+  ASSERT_TRUE(api->TrsmBatched(handle, XLA_MUSA_MUBLAS_TRSM_TYPE_C128,
+                               XLA_MUSA_MUBLAS_SIDE_LEFT,
+                               XLA_MUSA_MUBLAS_FILL_UPPER,
+                               XLA_MUSA_MUBLAS_OPERATION_CONJUGATE_TRANSPOSE,
+                               XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT, 3, 4, &alpha,
+                               batched_a, 3, batched_b, 3, 9)
+                  .ok());
+  EXPECT_EQ(calls_.trsm_batched, 1);
+  EXPECT_EQ(calls_.trsm_type, XLA_MUSA_MUBLAS_TRSM_TYPE_C128);
+  EXPECT_EQ(calls_.trsm_side, XLA_MUSA_MUBLAS_SIDE_LEFT);
+  EXPECT_EQ(calls_.trsm_fill, XLA_MUSA_MUBLAS_FILL_UPPER);
+  EXPECT_EQ(calls_.trsm_trans_a, XLA_MUSA_MUBLAS_OPERATION_CONJUGATE_TRANSPOSE);
+  EXPECT_EQ(calls_.trsm_diagonal, XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  EXPECT_EQ(calls_.batch_count, 9);
+  EXPECT_EQ(calls_.trsm_a, static_cast<const void*>(batched_a));
+  EXPECT_EQ(calls_.trsm_b, static_cast<const void*>(batched_b));
+
+  auto expect_invalid = [&](XlaMusaMuBlasTrsmType type, XlaMusaMuBlasSide side,
+                            XlaMusaMuBlasFill fill,
+                            XlaMusaMuBlasOperation operation,
+                            XlaMusaMuBlasDiagonal diagonal) {
+    EXPECT_THAT(api->Trsm(handle, type, side, fill, operation, diagonal, 1, 1,
+                          &alpha, a, 1, b, 1),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("unknown normalized")));
+  };
+  expect_invalid(static_cast<XlaMusaMuBlasTrsmType>(99),
+                 XLA_MUSA_MUBLAS_SIDE_LEFT, XLA_MUSA_MUBLAS_FILL_LOWER,
+                 XLA_MUSA_MUBLAS_OPERATION_NONE,
+                 XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  expect_invalid(XLA_MUSA_MUBLAS_TRSM_TYPE_F32,
+                 static_cast<XlaMusaMuBlasSide>(99), XLA_MUSA_MUBLAS_FILL_LOWER,
+                 XLA_MUSA_MUBLAS_OPERATION_NONE,
+                 XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  expect_invalid(XLA_MUSA_MUBLAS_TRSM_TYPE_F32, XLA_MUSA_MUBLAS_SIDE_LEFT,
+                 static_cast<XlaMusaMuBlasFill>(99),
+                 XLA_MUSA_MUBLAS_OPERATION_NONE,
+                 XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  expect_invalid(XLA_MUSA_MUBLAS_TRSM_TYPE_F32, XLA_MUSA_MUBLAS_SIDE_LEFT,
+                 XLA_MUSA_MUBLAS_FILL_LOWER,
+                 static_cast<XlaMusaMuBlasOperation>(99),
+                 XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  expect_invalid(XLA_MUSA_MUBLAS_TRSM_TYPE_F32, XLA_MUSA_MUBLAS_SIDE_LEFT,
+                 XLA_MUSA_MUBLAS_FILL_LOWER, XLA_MUSA_MUBLAS_OPERATION_NONE,
+                 static_cast<XlaMusaMuBlasDiagonal>(99));
+  EXPECT_EQ(calls_.trsm, 1);
+}
+
 TEST_F(MusaMuBlasApiTest, V1FallbackRejectsAdvancedOperations) {
   auto loader = std::make_unique<FakeSymbolLoader>(
       reinterpret_cast<void*>(&FakeGetterV1));
@@ -499,7 +712,10 @@ TEST_F(MusaMuBlasApiTest, V1FallbackRejectsAdvancedOperations) {
   EXPECT_EQ(api->advanced_capabilities(), 0);
   EXPECT_TRUE(api->advanced_abi_fingerprint().empty());
   EXPECT_FALSE(api->SupportsScal());
+  EXPECT_FALSE(api->SupportsTrsm());
+  EXPECT_FALSE(api->SupportsTrsmBatched());
   EXPECT_TRUE(api->scal_abi_fingerprint().empty());
+  EXPECT_TRUE(api->trsm_abi_fingerprint().empty());
   EXPECT_THAT(api->SetAtomicsMode(handle, false),
               StatusIs(absl::StatusCode::kUnimplemented));
   float scalar = 1.0f;
@@ -507,6 +723,13 @@ TEST_F(MusaMuBlasApiTest, V1FallbackRejectsAdvancedOperations) {
       api->Scal(handle, XLA_MUSA_MUBLAS_SCAL_TYPE_F32, 1, &scalar, &scalar, 1),
       StatusIs(absl::StatusCode::kUnimplemented,
                HasSubstr("optional V2 SCAL")));
+  EXPECT_THAT(api->Trsm(handle, XLA_MUSA_MUBLAS_TRSM_TYPE_F32,
+                        XLA_MUSA_MUBLAS_SIDE_LEFT, XLA_MUSA_MUBLAS_FILL_LOWER,
+                        XLA_MUSA_MUBLAS_OPERATION_NONE,
+                        XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT, 1, 1, &scalar,
+                        &scalar, 1, &scalar, 1),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("optional V2 TRSM")));
   EXPECT_THAT(
       api->GemmWithAlgorithm(
           handle, XLA_MUSA_MUBLAS_DATA_TYPE_F32, XLA_MUSA_MUBLAS_DATA_TYPE_F32,

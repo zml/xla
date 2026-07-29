@@ -34,12 +34,15 @@ limitations under the License.
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/SourceMgr.h"
+#include "mlir/IR/MLIRContext.h"
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
+#include "xla/service/compilation_stats.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 #include "xla/service/gpu/musa/musa_shim_abi.h"
@@ -106,6 +109,7 @@ class TestMusaGpuCompiler : public MusaGpuCompiler {
   using MusaGpuCompiler::CompileTargetBinary;
   using MusaGpuCompiler::CreateExecutableAbiVersion;
   using MusaGpuCompiler::MusaGpuCompiler;
+  using MusaGpuCompiler::OptimizeHloPostLayoutAssignment;
   using MusaGpuCompiler::UseAotCompiledThunks;
   using MusaGpuCompiler::ValidatePersistentKernelCache;
 };
@@ -464,6 +468,69 @@ ENTRY main {
   ASSERT_EQ(root->opcode(), HloOpcode::kCustomCall);
   EXPECT_EQ(root->custom_call_target(), "__mublas$gemm");
   EXPECT_TRUE(root->shape().IsArray());
+}
+
+TEST(MusaGpuCompilerTest,
+     RewritesTriangularSolveAndRequiresExactMublasTrsmAbi) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule musa_triangular_solve_rewrite
+
+ENTRY main {
+  a = f32[4,4]{0,1} parameter(0)
+  b = f32[3,4]{0,1} parameter(1)
+  ROOT solve = f32[3,4]{0,1} triangular-solve(a, b), lower=true,
+    transpose_a=TRANSPOSE
+}
+)"));
+
+  stream_executor::GpuTargetConfigProto target_proto;
+  *target_proto.mutable_gpu_device_info() = MusaDevice().ToProto();
+  target_proto.set_platform_name("MUSA");
+  target_proto.set_device_description_str("MTT S80");
+  ASSERT_OK_AND_ASSIGN(GpuTargetConfig target_config,
+                       GpuTargetConfig::FromProto(target_proto));
+
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  Compiler::CompileOptions options;
+  GpuAliasInfo alias_info(MusaDevice());
+  mlir::MLIRContext mlir_context;
+  std::unique_ptr<CompilationStats> compilation_stats =
+      CompilationStats::MakeNoopStats();
+  ASSERT_OK(compiler.OptimizeHloPostLayoutAssignment(
+      module.get(), /*stream_exec=*/nullptr, options, target_config,
+      &alias_info, /*thread_pool=*/nullptr, compilation_stats.get(),
+      &mlir_context));
+
+  const HloInstruction* triangular_solve = nullptr;
+  for (const HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    if (instruction->opcode() == HloOpcode::kCustomCall &&
+        instruction->custom_call_target() == "__cublas$triangularSolve") {
+      triangular_solve = instruction;
+      break;
+    }
+  }
+  ASSERT_NE(triangular_solve, nullptr);
+  EXPECT_TRUE(triangular_solve->shape().IsTuple());
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 2);
+  EXPECT_EQ(libraries[0].name(),
+            stream_executor::musa::kMusaMuBlasLibraryAbiName);
+  EXPECT_EQ(libraries[0].abi_version(),
+            stream_executor::musa::kMusaMuBlasLibraryAbiVersion);
+  EXPECT_TRUE(libraries[0].fingerprint().empty());
+  EXPECT_EQ(libraries[1].name(),
+            stream_executor::musa::kMusaMuBlasTrsmLibraryAbiName);
+  EXPECT_EQ(libraries[1].abi_version(),
+            stream_executor::musa::kMusaMuBlasTrsmLibraryAbiVersion);
+  EXPECT_EQ(libraries[1].fingerprint(),
+            stream_executor::musa::kMusaMuBlasTrsmAbiFingerprintV1);
 }
 
 TEST(MusaGpuCompilerTest, LeavesStandardScanAndSortOnSharedHloFallbacks) {

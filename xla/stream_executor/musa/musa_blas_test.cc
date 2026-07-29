@@ -66,6 +66,8 @@ struct GemmCall {
   int batched_gemms = 0;
   int strided_batched_gemms = 0;
   int scals = 0;
+  int trsms = 0;
+  int batched_trsms = 0;
   int atomics_calls = 0;
   bool allow_atomics = true;
   int64_t batch_count = 0;
@@ -83,6 +85,11 @@ struct GemmCall {
   int64_t n = 0;
   int64_t k = 0;
   std::vector<XlaMusaMuBlasScalType> scal_types;
+  std::vector<XlaMusaMuBlasTrsmType> trsm_types;
+  XlaMusaMuBlasSide trsm_side = 0;
+  XlaMusaMuBlasFill trsm_fill = 0;
+  XlaMusaMuBlasOperation trsm_transpose = 0;
+  XlaMusaMuBlasDiagonal trsm_diagonal = 0;
   int64_t scal_n = 0;
   int64_t scal_incx = 0;
   void* scal_x = nullptr;
@@ -182,6 +189,38 @@ XlaMusaMuBlasStatus Scal(void*, XlaMusaMuBlasScalType scal_type, int64_t n,
   g_call->scal_x = x;
   return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
 }
+XlaMusaMuBlasStatus Trsm(
+    void*, XlaMusaMuBlasTrsmType trsm_type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation transpose,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void*,
+    const void*, int64_t, void*, int64_t) {
+  ++g_call->trsms;
+  g_call->trsm_types.push_back(trsm_type);
+  g_call->trsm_side = side;
+  g_call->trsm_fill = fill;
+  g_call->trsm_transpose = transpose;
+  g_call->trsm_diagonal = diagonal;
+  g_call->m = m;
+  g_call->n = n;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
+XlaMusaMuBlasStatus TrsmBatched(
+    void*, XlaMusaMuBlasTrsmType trsm_type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation transpose,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void*,
+    const void* const*, int64_t, void* const*, int64_t,
+    int64_t batch_count) {
+  ++g_call->batched_trsms;
+  g_call->trsm_types.push_back(trsm_type);
+  g_call->trsm_side = side;
+  g_call->trsm_fill = fill;
+  g_call->trsm_transpose = transpose;
+  g_call->trsm_diagonal = diagonal;
+  g_call->m = m;
+  g_call->n = n;
+  g_call->batch_count = batch_count;
+  return XLA_MUSA_MUBLAS_STATUS_SUCCESS;
+}
 const XlaMusaMuBlasApiV1* Getter() { return g_table; }
 const XlaMusaMuBlasApiV2* GetterV2() { return g_table_v2; }
 
@@ -223,7 +262,9 @@ XlaMusaMuBlasApiV2 TableV2() {
   table.abi_version = XLA_MUSA_MUBLAS_ABI_VERSION_2;
   table.capabilities = XLA_MUSA_MUBLAS_CAPABILITIES_V1;
   table.advanced_capabilities = XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
-                                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
+                                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL |
+                                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM |
+                                XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED;
   table.create = Create;
   table.destroy = Destroy;
   table.set_stream = SetStream;
@@ -234,6 +275,8 @@ XlaMusaMuBlasApiV2 TableV2() {
   table.gemm_batched = GemmBatched;
   table.gemm_strided_batched = GemmStridedBatched;
   table.scal = Scal;
+  table.trsm = Trsm;
+  table.trsm_batched = TrsmBatched;
   return table;
 }
 
@@ -522,6 +565,172 @@ TEST_F(MusaBlasTest, OldSizeV2RejectsScalWithoutBreakingInitialization) {
       reinterpret_cast<void*>(0x3000), 0);
   EXPECT_FALSE(blas.DoBlasScal(&stream, 1, 1.0f, &x, 1));
   EXPECT_EQ(call_.scals, 0);
+}
+
+TEST_F(MusaBlasTest, DispatchesAllTrsmTypesAndBatchedOptions) {
+  NiceMock<MockStreamExecutor> executor;
+  NiceMock<MockStream> stream;
+  ON_CALL(executor, Activate()).WillByDefault([] {
+    return std::make_unique<ActivateContext>();
+  });
+  ON_CALL(stream, parent()).WillByDefault(Return(&executor));
+  ON_CALL(stream, platform_specific_handle())
+      .WillByDefault(Return(
+          Stream::PlatformSpecificHandle{reinterpret_cast<void*>(0x2222)}));
+  auto api = MusaMuBlasApi::CreateForTesting(std::make_unique<FakeLoader>());
+  MusaBlas blas(&executor, api.get());
+  ASSERT_TRUE(blas.Init());
+
+  DeviceAddress<float> a_f32 = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x3000), 36);
+  DeviceAddress<float> b_f32 = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x4000), 24);
+  DeviceAddress<double> a_f64 = DeviceAddress<double>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x5000), 72);
+  DeviceAddress<double> b_f64 = DeviceAddress<double>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x6000), 48);
+  DeviceAddress<std::complex<float>> a_c64 =
+      DeviceAddress<std::complex<float>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0x7000), 32);
+  DeviceAddress<std::complex<float>> b_c64 =
+      DeviceAddress<std::complex<float>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0x8000), 48);
+  DeviceAddress<std::complex<double>> a_c128 =
+      DeviceAddress<std::complex<double>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0x9000), 64);
+  DeviceAddress<std::complex<double>> b_c128 =
+      DeviceAddress<std::complex<double>>::MakeFromByteSize(
+          reinterpret_cast<void*>(0xa000), 96);
+
+  EXPECT_TRUE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 3, 2, 1.0f,
+      a_f32, 3, &b_f32, 3));
+  EXPECT_TRUE(blas.DoBlasTrsm(
+      &stream, blas::Side::kRight, blas::UpperLower::kUpper,
+      blas::Transpose::kTranspose, blas::Diagonal::kUnit, 2, 3, 1.0, a_f64,
+      3, &b_f64, 2));
+  EXPECT_TRUE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kUpper,
+      blas::Transpose::kConjugateTranspose, blas::Diagonal::kNonUnit, 2, 3,
+      std::complex<float>(1.0f, 0.5f), a_c64, 2, &b_c64, 2));
+  EXPECT_TRUE(blas.DoBlasTrsm(
+      &stream, blas::Side::kRight, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kUnit, 3, 2,
+      std::complex<double>(1.0, -0.25), a_c128, 2, &b_c128, 3));
+
+  DeviceAddress<float*> as = DeviceAddress<float*>::MakeFromByteSize(
+      reinterpret_cast<void*>(0xb000), 2 * sizeof(void*));
+  DeviceAddress<float*> bs = DeviceAddress<float*>::MakeFromByteSize(
+      reinterpret_cast<void*>(0xc000), 2 * sizeof(void*));
+  EXPECT_TRUE(blas.DoBlasTrsmBatched(
+      &stream, blas::Side::kRight, blas::UpperLower::kLower,
+      blas::Transpose::kConjugateTranspose, blas::Diagonal::kNonUnit, 2, 2,
+      1.0f, as, 2, &bs, 2, 2));
+
+  EXPECT_EQ(call_.trsms, 4);
+  EXPECT_EQ(call_.batched_trsms, 1);
+  EXPECT_THAT(call_.trsm_types,
+              ElementsAre(XLA_MUSA_MUBLAS_TRSM_TYPE_F32,
+                          XLA_MUSA_MUBLAS_TRSM_TYPE_F64,
+                          XLA_MUSA_MUBLAS_TRSM_TYPE_C64,
+                          XLA_MUSA_MUBLAS_TRSM_TYPE_C128,
+                          XLA_MUSA_MUBLAS_TRSM_TYPE_F32));
+  EXPECT_EQ(call_.trsm_side, XLA_MUSA_MUBLAS_SIDE_RIGHT);
+  EXPECT_EQ(call_.trsm_fill, XLA_MUSA_MUBLAS_FILL_LOWER);
+  EXPECT_EQ(call_.trsm_transpose,
+            XLA_MUSA_MUBLAS_OPERATION_CONJUGATE_TRANSPOSE);
+  EXPECT_EQ(call_.trsm_diagonal, XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT);
+  EXPECT_EQ(call_.m, 2);
+  EXPECT_EQ(call_.n, 2);
+  EXPECT_EQ(call_.batch_count, 2);
+  EXPECT_EQ(call_.creates, 2);
+  EXPECT_EQ(call_.set_streams, 2);
+  EXPECT_EQ(call_.stream, reinterpret_cast<void*>(0x2222));
+}
+
+TEST_F(MusaBlasTest, ValidatesTrsmExtentsDimensionsAndPointerArrays) {
+  NiceMock<MockStreamExecutor> executor;
+  NiceMock<MockStream> stream;
+  ON_CALL(executor, Activate()).WillByDefault([] {
+    return std::make_unique<ActivateContext>();
+  });
+  ON_CALL(stream, parent()).WillByDefault(Return(&executor));
+  ON_CALL(stream, platform_specific_handle())
+      .WillByDefault(Return(
+          Stream::PlatformSpecificHandle{reinterpret_cast<void*>(0x2222)}));
+  auto api = MusaMuBlasApi::CreateForTesting(std::make_unique<FakeLoader>());
+  MusaBlas blas(&executor, api.get());
+  ASSERT_TRUE(blas.Init());
+
+  DeviceAddress<float> matrix = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x3000), 16);
+  DeviceAddress<float> short_matrix = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x4000), 12);
+  DeviceAddress<float> null_matrix;
+  EXPECT_TRUE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 0, 2, 1.0f,
+      null_matrix, 1, &null_matrix, 1));
+  EXPECT_FALSE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      short_matrix, 2, &matrix, 2));
+  EXPECT_FALSE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      matrix, 1, &matrix, 2));
+  EXPECT_FALSE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit,
+      std::numeric_limits<uint64_t>::max(), 1, 1.0f, matrix, 2, &matrix, 2));
+  EXPECT_FALSE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      matrix, 2, nullptr, 2));
+
+  DeviceAddress<float*> short_as = DeviceAddress<float*>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x5000), sizeof(void*));
+  DeviceAddress<float*> bs = DeviceAddress<float*>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x6000), 2 * sizeof(void*));
+  EXPECT_FALSE(blas.DoBlasTrsmBatched(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      short_as, 2, &bs, 2, 2));
+  EXPECT_FALSE(blas.DoBlasTrsmBatched(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      short_as, 2, &bs, 2, -1));
+  EXPECT_EQ(call_.trsms, 0);
+  EXPECT_EQ(call_.batched_trsms, 0);
+}
+
+TEST_F(MusaBlasTest, PreTrsmV2TableRemainsLoadableButCannotRunTrsm) {
+  table_v2_.struct_size = XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE;
+  table_v2_.advanced_capabilities =
+      XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 |
+      XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL;
+  NiceMock<MockStreamExecutor> executor;
+  NiceMock<MockStream> stream;
+  ON_CALL(executor, Activate()).WillByDefault([] {
+    return std::make_unique<ActivateContext>();
+  });
+  ON_CALL(stream, parent()).WillByDefault(Return(&executor));
+  ON_CALL(stream, platform_specific_handle())
+      .WillByDefault(Return(
+          Stream::PlatformSpecificHandle{reinterpret_cast<void*>(0x2222)}));
+  auto api = MusaMuBlasApi::CreateForTesting(std::make_unique<FakeLoader>());
+  MusaBlas blas(&executor, api.get());
+  ASSERT_TRUE(blas.Init());
+  EXPECT_FALSE(api->SupportsTrsm());
+  EXPECT_FALSE(api->SupportsTrsmBatched());
+  DeviceAddress<float> matrix = DeviceAddress<float>::MakeFromByteSize(
+      reinterpret_cast<void*>(0x3000), 16);
+  EXPECT_FALSE(blas.DoBlasTrsm(
+      &stream, blas::Side::kLeft, blas::UpperLower::kLower,
+      blas::Transpose::kNoTranspose, blas::Diagonal::kNonUnit, 2, 2, 1.0f,
+      matrix, 2, &matrix, 2));
+  EXPECT_EQ(call_.trsms, 0);
 }
 
 TEST_F(MusaBlasTest, RejectsUnsupportedTypeAndCommandBufferClearly) {

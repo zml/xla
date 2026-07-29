@@ -3895,6 +3895,7 @@ cc_library(
         ":target_constants",
         "//xla/backends/gpu/transforms:dot_algorithm_rewriter",
         "//xla/backends/gpu/transforms:gemm_rewriter",
+        "//xla/backends/gpu/transforms:triangular_solve_rewriter",
         "//xla/hlo/analysis:alias_info",
         "//xla/service:hlo_cost_analysis",
         "//xla/hlo/ir:hlo",
@@ -3935,6 +3936,7 @@ xla_cc_test(
         "musa-only",
     ],
     deps = [
+        ":alias_info",
         ":musa_gpu_compiler_impl",
         ":target_constants",
         "//xla/backends/gpu/target_config",
@@ -3942,6 +3944,7 @@ xla_cc_test(
         "//xla/hlo/parser:hlo_parser",
         "//xla/hlo/pass:hlo_pass_pipeline",
         "//xla/service:compiler",
+        "//xla/service:compilation_stats",
         "//xla/service:gpu_topology",
         "//xla/service:hlo_module_config",
         "//xla/service/gpu/musa:musa_compilation_provider",
@@ -3964,6 +3967,7 @@ xla_cc_test(
         "@llvm-project//llvm:AsmParser",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
     ],
 )
 

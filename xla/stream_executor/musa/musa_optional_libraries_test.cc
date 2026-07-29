@@ -35,12 +35,15 @@ using ::testing::HasSubstr;
 TEST(MusaOptionalLibrariesTest, MergesInCanonicalNameOrder) {
   const std::vector<std::vector<MusaOptionalLibraryAbi>> providers = {
       {{"mufft", "1", std::string(64, 'f')}},
-      {{"mublas", "1", ""}, {"mublas-scal", "1", std::string(64, 's')}}};
+      {{"mublas", "1", ""},
+       {"mublas-scal", "1", std::string(64, 's')},
+       {"mublas-trsm", "1", std::string(64, 't')}}};
   ASSERT_OK_AND_ASSIGN(std::vector<MusaOptionalLibraryAbi> merged,
                        internal::MergeMusaOptionalLibraryAbis(providers));
   EXPECT_THAT(merged,
               ElementsAre(Field(&MusaOptionalLibraryAbi::name, "mublas"),
                           Field(&MusaOptionalLibraryAbi::name, "mublas-scal"),
+                          Field(&MusaOptionalLibraryAbi::name, "mublas-trsm"),
                           Field(&MusaOptionalLibraryAbi::name, "mufft")));
 }
 

@@ -84,6 +84,18 @@ class MusaBlas final : public blas::BlasSupport {
                                   DeviceAddressBase* x, int incx,
                                   XlaMusaMuBlasScalType scal_type,
                                   size_t element_size);
+  absl::Status DoBlasTrsmInternal(
+      Stream* stream, blas::Side side, blas::UpperLower uplo,
+      blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,
+      const void* alpha, const DeviceAddressBase& a, int lda,
+      DeviceAddressBase* b, int ldb, XlaMusaMuBlasTrsmType trsm_type,
+      size_t element_size);
+  absl::Status DoBlasTrsmBatchedInternal(
+      Stream* stream, blas::Side side, blas::UpperLower uplo,
+      blas::Transpose transa, blas::Diagonal diag, uint64_t m, uint64_t n,
+      const void* alpha, const DeviceAddressBase& as, int lda,
+      DeviceAddressBase* bs, int ldb, int batch_count,
+      XlaMusaMuBlasTrsmType trsm_type);
   absl::Status DoBlasGemmInternal(
       Stream* stream, blas::Transpose transa, blas::Transpose transb,
       uint64_t m, uint64_t n, uint64_t k, const void* alpha,

@@ -1603,9 +1603,8 @@ absl::StatusOr<std::optional<DecimalFloatLiteral>> ParseSpecialFloatLiteral(
     uint32_t single_bits;
   };
   constexpr SpecialValue kSpecialValues[] = {
-      {"+inf", 0x7f800000},
-      {"-inf", 0xff800000},
-      {"nan", 0x7fc00000},
+      {"+inf", 0x7f800000},  {"-inf", 0xff800000}, {"+qnan", 0x7fc00000},
+      {"-qnan", 0xffc00000}, {"nan", 0x7fc00000},
   };
   for (const SpecialValue& special : kSpecialValues) {
     const size_t end = literal_start + special.spelling.size();

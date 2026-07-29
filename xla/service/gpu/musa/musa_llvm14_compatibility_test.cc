@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -33,7 +34,9 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -653,6 +656,9 @@ TEST(MusaLlvm14CompatibilityTest, RewritesCurrentSpecialFloatTokensForLlvm14) {
   const std::string text = Module(
       "  %positive = fcmp one float 1.0, +inf\n"
       "  %negative = fcmp one float 1.0, -inf\n"
+      "  %positive_nan = select i1 %positive, float +qnan, float 0.0\n"
+      "  %negative_nan = select i1 %negative, float -qnan, float "
+      "%positive_nan\n"
       "  %result = and i1 %positive, %negative\n"
       "  store i1 %result, ptr addrspace(1) %out, align 1");
   absl::StatusOr<MusaLlvm14CompatibilityResult> normalized =
@@ -660,8 +666,43 @@ TEST(MusaLlvm14CompatibilityTest, RewritesCurrentSpecialFloatTokensForLlvm14) {
   ASSERT_TRUE(normalized.ok()) << normalized.status();
   EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0x7FF0000000000000"));
   EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0xFFF0000000000000"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0x7FF8000000000000"));
+  EXPECT_THAT(normalized->normalized_llvm, HasSubstr("0xFFF8000000000000"));
   EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "+inf"));
   EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "-inf"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "+qnan"));
+  EXPECT_FALSE(absl::StrContains(normalized->normalized_llvm, "-qnan"));
+
+  llvm::LLVMContext context;
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> reparsed = llvm::parseAssemblyString(
+      normalized->normalized_llvm, diagnostic, context);
+  ASSERT_NE(reparsed, nullptr);
+  const llvm::Function* kernel = reparsed->getFunction("kernel");
+  ASSERT_NE(kernel, nullptr);
+  const llvm::SelectInst* positive_nan = nullptr;
+  const llvm::SelectInst* negative_nan = nullptr;
+  for (const llvm::BasicBlock& block : *kernel) {
+    for (const llvm::Instruction& instruction : block) {
+      if (instruction.getName() == "positive_nan") {
+        positive_nan = llvm::dyn_cast<llvm::SelectInst>(&instruction);
+      } else if (instruction.getName() == "negative_nan") {
+        negative_nan = llvm::dyn_cast<llvm::SelectInst>(&instruction);
+      }
+    }
+  }
+  ASSERT_NE(positive_nan, nullptr);
+  ASSERT_NE(negative_nan, nullptr);
+  const auto* positive_value =
+      llvm::dyn_cast<llvm::ConstantFP>(positive_nan->getTrueValue());
+  const auto* negative_value =
+      llvm::dyn_cast<llvm::ConstantFP>(negative_nan->getTrueValue());
+  ASSERT_NE(positive_value, nullptr);
+  ASSERT_NE(negative_value, nullptr);
+  EXPECT_EQ(positive_value->getValueAPF().bitcastToAPInt().getZExtValue(),
+            UINT64_C(0x7fc00000));
+  EXPECT_EQ(negative_value->getValueAPF().bitcastToAPInt().getZExtValue(),
+            UINT64_C(0xffc00000));
   EXPECT_THAT(
       ValidateMusaBridgeIr(normalized->normalized_llvm, normalized->metadata),
       IsOk());

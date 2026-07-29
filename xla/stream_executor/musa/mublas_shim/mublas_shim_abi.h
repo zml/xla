@@ -95,6 +95,8 @@ enum {
   // Optional append-only V2 tail. It is deliberately excluded from
   // XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2 so old V2 shims remain valid.
   XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_SCAL = UINT64_C(1) << 6,
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM = UINT64_C(1) << 7,
+  XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED = UINT64_C(1) << 8,
 };
 
 #define XLA_MUSA_MUBLAS_ADVANCED_CAPABILITIES_V2                 \
@@ -116,6 +118,34 @@ enum {
   XLA_MUSA_MUBLAS_SCAL_TYPE_C128 = 4,
   XLA_MUSA_MUBLAS_SCAL_TYPE_C64_F32 = 5,
   XLA_MUSA_MUBLAS_SCAL_TYPE_C128_F64 = 6,
+};
+
+// Normalized triangular-solve types and options. Numeric values are part of
+// the SDK-free ABI and deliberately do not expose vendor enum values.
+typedef uint32_t XlaMusaMuBlasTrsmType;
+enum {
+  XLA_MUSA_MUBLAS_TRSM_TYPE_F32 = 1,
+  XLA_MUSA_MUBLAS_TRSM_TYPE_F64 = 2,
+  XLA_MUSA_MUBLAS_TRSM_TYPE_C64 = 3,
+  XLA_MUSA_MUBLAS_TRSM_TYPE_C128 = 4,
+};
+
+typedef uint32_t XlaMusaMuBlasSide;
+enum {
+  XLA_MUSA_MUBLAS_SIDE_LEFT = 1,
+  XLA_MUSA_MUBLAS_SIDE_RIGHT = 2,
+};
+
+typedef uint32_t XlaMusaMuBlasFill;
+enum {
+  XLA_MUSA_MUBLAS_FILL_UPPER = 1,
+  XLA_MUSA_MUBLAS_FILL_LOWER = 2,
+};
+
+typedef uint32_t XlaMusaMuBlasDiagonal;
+enum {
+  XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT = 1,
+  XLA_MUSA_MUBLAS_DIAGONAL_UNIT = 2,
 };
 
 typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasCreateFn)(void** handle);
@@ -178,6 +208,25 @@ typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasScalFn)(
     void* handle, XlaMusaMuBlasScalType scal_type, int64_t n, const void* alpha,
     void* x, int64_t incx);
 
+// Solves op(A) * X = alpha * B (left side) or
+// X * op(A) = alpha * B (right side), overwriting B with X. A and B are
+// column-major. Dimensions use signed 64-bit values at this boundary and are
+// range-checked before entering the vendor LP64 API. The qualified vendor
+// implementation uses handle-owned internal workspace.
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasTrsmFn)(
+    void* handle, XlaMusaMuBlasTrsmType type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation trans_a,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void* alpha,
+    const void* a, int64_t lda, void* b, int64_t ldb);
+
+// `a` and `b` are opaque addresses of vendor-visible pointer arrays.
+typedef XlaMusaMuBlasStatus (*XlaMusaMuBlasTrsmBatchedFn)(
+    void* handle, XlaMusaMuBlasTrsmType type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation trans_a,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void* alpha,
+    const void* const* a, int64_t lda, void* const* b, int64_t ldb,
+    int64_t batch_count);
+
 typedef struct XlaMusaMuBlasApiV1 {
   // Callers must check both fields before reading function pointers. Newer
   // compatible shims may append fields and increase `struct_size`.
@@ -216,6 +265,8 @@ typedef struct XlaMusaMuBlasApiV2 {
   XlaMusaMuBlasGemmStridedBatchedFn gemm_strided_batched;
   // Optional tail. Callers must check struct_size, capability, and pointer.
   XlaMusaMuBlasScalFn scal;
+  XlaMusaMuBlasTrsmFn trsm;
+  XlaMusaMuBlasTrsmBatchedFn trsm_batched;
 } XlaMusaMuBlasApiV2;
 
 #define XLA_MUSA_MUBLAS_API_V2_MIN_STRUCT_SIZE          \
@@ -224,6 +275,14 @@ typedef struct XlaMusaMuBlasApiV2 {
 
 #define XLA_MUSA_MUBLAS_API_V2_SCAL_STRUCT_SIZE \
   (offsetof(XlaMusaMuBlasApiV2, scal) + sizeof(((XlaMusaMuBlasApiV2*)0)->scal))
+
+#define XLA_MUSA_MUBLAS_API_V2_TRSM_STRUCT_SIZE \
+  (offsetof(XlaMusaMuBlasApiV2, trsm) + \
+   sizeof(((XlaMusaMuBlasApiV2*)0)->trsm))
+
+#define XLA_MUSA_MUBLAS_API_V2_TRSM_BATCHED_STRUCT_SIZE \
+  (offsetof(XlaMusaMuBlasApiV2, trsm_batched) + \
+   sizeof(((XlaMusaMuBlasApiV2*)0)->trsm_batched))
 
 typedef const XlaMusaMuBlasApiV2* (*XlaMusaMuBlasGetApiV2Fn)(void);
 

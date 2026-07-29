@@ -24,6 +24,8 @@ inline constexpr char kMusaMuBlasLibraryAbiName[] = "mublas";
 inline constexpr char kMusaMuBlasLibraryAbiVersion[] = "1";
 inline constexpr char kMusaMuBlasScalLibraryAbiName[] = "mublas-scal";
 inline constexpr char kMusaMuBlasScalLibraryAbiVersion[] = "1";
+inline constexpr char kMusaMuBlasTrsmLibraryAbiName[] = "mublas-trsm";
+inline constexpr char kMusaMuBlasTrsmLibraryAbiVersion[] = "1";
 
 // Runtime identity of an optional vendor-library adapter. The ABI version is
 // the compatibility key; a nonempty fingerprint can additionally constrain a

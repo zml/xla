@@ -5,6 +5,7 @@ load(
     "if_musa",
     "musa_config",
 )
+load(":musa_kernel_rules.bzl", "musa_device_binary")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load(
     "//xla/stream_executor:build_defs.bzl",
@@ -13,6 +14,7 @@ load(
 load("//xla/tsl:tsl.bzl", "internal_visibility", "tsl_copts")
 load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
+load("//xla/tsl/util:cc_embed_data.bzl", "cc_embed_data")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -389,6 +391,65 @@ cc_library(
     srcs = ["musa_platform_id.cc"],
     hdrs = ["musa_platform_id.h"],
     deps = ["//xla/stream_executor:platform_id"],
+)
+
+musa_device_binary(
+    name = "make_batch_pointers_kernel_musa_device",
+    src = "make_batch_pointers_kernel_musa.mu.cc",
+    out = "make_batch_pointers_kernel_musa.mubin",
+    architectures = musa_config().gpu_architectures,
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+)
+
+cc_embed_data(
+    name = "make_batch_pointers_kernel_musa_mubin",
+    srcs = [":make_batch_pointers_kernel_musa_device"],
+    outs = [
+        "make_batch_pointers_kernel_musa_mubin.cc",
+        "make_batch_pointers_kernel_musa_mubin.h",
+    ],
+    alwayslink = True,
+    embedopts = ["--namespace=stream_executor::musa"],
+    flatten = True,
+)
+
+cc_library(
+    name = "make_batch_pointers_kernel_musa",
+    srcs = ["make_batch_pointers_kernel_musa.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":make_batch_pointers_kernel_musa_mubin",
+        ":musa_platform_id",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor/gpu:gpu_kernel_registry",
+        "//xla/stream_executor/gpu:make_batch_pointers_kernel",
+        "@com_google_absl//absl/types:span",
+    ],
+    alwayslink = True,
+)
+
+xla_cc_test(
+    name = "make_batch_pointers_kernel_musa_test",
+    srcs = ["make_batch_pointers_kernel_musa_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":make_batch_pointers_kernel_musa",
+        ":musa_platform_id",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor/gpu:gpu_kernel_registry",
+        "//xla/stream_executor/gpu:make_batch_pointers_kernel",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(
@@ -1086,6 +1147,7 @@ cc_library(
     copts = tsl_copts(),
     visibility = ["//visibility:public"],
     deps = if_musa([
+        ":make_batch_pointers_kernel_musa",
         ":musa_platform",
     ]),
     alwayslink = True,

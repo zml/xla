@@ -265,6 +265,44 @@ absl::Status ValidateNormalizedScalType(XlaMusaMuBlasScalType scal_type) {
   }
 }
 
+absl::Status ValidateNormalizedTrsmOptions(XlaMusaMuBlasTrsmType trsm_type,
+                                           XlaMusaMuBlasSide side,
+                                           XlaMusaMuBlasFill fill,
+                                           XlaMusaMuBlasOperation trans_a,
+                                           XlaMusaMuBlasDiagonal diagonal) {
+  switch (trsm_type) {
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F32:
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_F64:
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C64:
+    case XLA_MUSA_MUBLAS_TRSM_TYPE_C128:
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          absl::StrCat("unknown normalized muBLAS TRSM type ", trsm_type));
+  }
+  if (side != XLA_MUSA_MUBLAS_SIDE_LEFT && side != XLA_MUSA_MUBLAS_SIDE_RIGHT) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("unknown normalized muBLAS TRSM side ", side));
+  }
+  if (fill != XLA_MUSA_MUBLAS_FILL_UPPER &&
+      fill != XLA_MUSA_MUBLAS_FILL_LOWER) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("unknown normalized muBLAS TRSM fill ", fill));
+  }
+  if (trans_a != XLA_MUSA_MUBLAS_OPERATION_NONE &&
+      trans_a != XLA_MUSA_MUBLAS_OPERATION_TRANSPOSE &&
+      trans_a != XLA_MUSA_MUBLAS_OPERATION_CONJUGATE_TRANSPOSE) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "unknown normalized muBLAS TRSM transpose operation ", trans_a));
+  }
+  if (diagonal != XLA_MUSA_MUBLAS_DIAGONAL_NON_UNIT &&
+      diagonal != XLA_MUSA_MUBLAS_DIAGONAL_UNIT) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "unknown normalized muBLAS TRSM diagonal option ", diagonal));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 namespace internal {
@@ -388,6 +426,27 @@ bool MusaMuBlasApi::SupportsScal() const {
          api_v2_->scal != nullptr;
 }
 
+bool MusaMuBlasApi::SupportsTrsm() const {
+  if (!Init().ok() || api_v2_ == nullptr ||
+      api_v2_->struct_size < XLA_MUSA_MUBLAS_API_V2_TRSM_STRUCT_SIZE) {
+    return false;
+  }
+  return HasCapability(api_v2_->advanced_capabilities,
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM) &&
+         api_v2_->trsm != nullptr;
+}
+
+bool MusaMuBlasApi::SupportsTrsmBatched() const {
+  if (!Init().ok() || api_v2_ == nullptr ||
+      api_v2_->struct_size <
+          XLA_MUSA_MUBLAS_API_V2_TRSM_BATCHED_STRUCT_SIZE) {
+    return false;
+  }
+  return HasCapability(api_v2_->advanced_capabilities,
+                       XLA_MUSA_MUBLAS_ADVANCED_CAPABILITY_TRSM_BATCHED) &&
+         api_v2_->trsm_batched != nullptr;
+}
+
 std::string MusaMuBlasApi::advanced_abi_fingerprint() const {
   if (abi_version() != XLA_MUSA_MUBLAS_ABI_VERSION_2) return {};
   return kMusaMuBlasAdvancedAbiFingerprintV2;
@@ -395,6 +454,12 @@ std::string MusaMuBlasApi::advanced_abi_fingerprint() const {
 
 std::string MusaMuBlasApi::scal_abi_fingerprint() const {
   return SupportsScal() ? kMusaMuBlasScalAbiFingerprintV1 : std::string();
+}
+
+std::string MusaMuBlasApi::trsm_abi_fingerprint() const {
+  return SupportsTrsm() && SupportsTrsmBatched()
+             ? kMusaMuBlasTrsmAbiFingerprintV1
+             : std::string();
 }
 
 absl::string_view MusaMuBlasApi::loaded_path() const {
@@ -478,6 +543,58 @@ absl::Status MusaMuBlasApi::Scal(void* handle, XlaMusaMuBlasScalType scal_type,
   }
   return MuBlasStatus(api_v2_->scal(handle, scal_type, n, alpha, x, incx),
                       "scal");
+}
+
+absl::Status MusaMuBlasApi::Trsm(void* handle, XlaMusaMuBlasTrsmType trsm_type,
+                                 XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                                 XlaMusaMuBlasOperation trans_a,
+                                 XlaMusaMuBlasDiagonal diagonal, int64_t m,
+                                 int64_t n, const void* alpha, const void* a,
+                                 int64_t lda, void* b, int64_t ldb) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  if (alpha == nullptr || a == nullptr || b == nullptr) {
+    return absl::InvalidArgumentError(
+        "muBLAS TRSM requires non-null scalar and matrix pointers");
+  }
+  RETURN_IF_ERROR(
+      ValidateNormalizedTrsmOptions(trsm_type, side, fill, trans_a, diagonal));
+  if (!SupportsTrsm()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support the optional V2 TRSM contract");
+  }
+  return MuBlasStatus(api_v2_->trsm(handle, trsm_type, side, fill, trans_a,
+                                    diagonal, m, n, alpha, a, lda, b, ldb),
+                      "trsm");
+}
+
+absl::Status MusaMuBlasApi::TrsmBatched(
+    void* handle, XlaMusaMuBlasTrsmType trsm_type, XlaMusaMuBlasSide side,
+    XlaMusaMuBlasFill fill, XlaMusaMuBlasOperation trans_a,
+    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n, const void* alpha,
+    const void* const* a, int64_t lda, void* const* b, int64_t ldb,
+    int64_t batch_count) const {
+  RETURN_IF_ERROR(Init());
+  if (handle == nullptr) {
+    return absl::FailedPreconditionError("muBLAS handle is null");
+  }
+  if (alpha == nullptr || a == nullptr || b == nullptr) {
+    return absl::InvalidArgumentError(
+        "muBLAS batched TRSM requires non-null scalar and matrix-array "
+        "pointers");
+  }
+  RETURN_IF_ERROR(
+      ValidateNormalizedTrsmOptions(trsm_type, side, fill, trans_a, diagonal));
+  if (!SupportsTrsmBatched()) {
+    return absl::UnimplementedError(
+        "muBLAS shim does not support the optional V2 batched TRSM contract");
+  }
+  return MuBlasStatus(
+      api_v2_->trsm_batched(handle, trsm_type, side, fill, trans_a, diagonal, m,
+                            n, alpha, a, lda, b, ldb, batch_count),
+      "trsm_batched");
 }
 
 absl::Status MusaMuBlasApi::Gemm(
@@ -602,6 +719,11 @@ GetAvailableMusaMuBlasOptionalLibraryAbis() {
     libraries.push_back({kMusaMuBlasScalLibraryAbiName,
                          kMusaMuBlasScalLibraryAbiVersion,
                          api->scal_abi_fingerprint()});
+  }
+  if (api->SupportsTrsm() && api->SupportsTrsmBatched()) {
+    libraries.push_back({kMusaMuBlasTrsmLibraryAbiName,
+                         kMusaMuBlasTrsmLibraryAbiVersion,
+                         api->trsm_abi_fingerprint()});
   }
   return libraries;
 }

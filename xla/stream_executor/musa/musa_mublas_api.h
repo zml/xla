@@ -46,6 +46,12 @@ inline constexpr char kMusaMuBlasScalAbiContractV1[] =
     "xla-musa-mublas-scal;abi=1;routes=sscal,dscal,cscal,zscal,csscal,zdscal";
 inline constexpr char kMusaMuBlasScalAbiFingerprintV1[] =
     "aee8bd3fc6ac91980f38d634b83a7789633d2573eb962de231ab5f129ae22560";
+inline constexpr char kMusaMuBlasTrsmAbiContractV1[] =
+    "xla-musa-mublas-trsm;abi=1;routes=strsm,dtrsm,ctrsm,ztrsm,"
+    "strsm-batched,dtrsm-batched,ctrsm-batched,ztrsm-batched;"
+    "workspace=internal;stream=bound";
+inline constexpr char kMusaMuBlasTrsmAbiFingerprintV1[] =
+    "cce7da268bd7096df25f1d1c8a7ef2d1b33b5756df7693d9f3022d188739f8e6";
 
 namespace internal {
 
@@ -92,12 +98,17 @@ class MusaMuBlasApi {
   bool SupportsTensorOpF32() const;
   bool UsesZeroExternalWorkspace() const;
   bool SupportsScal() const;
+  bool SupportsTrsm() const;
+  bool SupportsTrsmBatched() const;
   // Empty for a v1 shim. For v2 this is a deterministic cache/serialization
   // identity for operations that depend on the advanced ABI contract.
   std::string advanced_abi_fingerprint() const;
   // Empty unless the optional V2 SCAL tail is complete. Kept separate from
   // the C16 fingerprint so old V2 shims and executables remain compatible.
   std::string scal_abi_fingerprint() const;
+  // Empty unless both optional V2 TRSM functions and their capability bits
+  // are present. Kept separate from the C16 and C17 identities.
+  std::string trsm_abi_fingerprint() const;
   absl::string_view loaded_path() const;
 
   absl::Status Create(void** handle) const;
@@ -107,6 +118,19 @@ class MusaMuBlasApi {
   absl::Status SetAtomicsMode(void* handle, bool allow_atomics) const;
   absl::Status Scal(void* handle, XlaMusaMuBlasScalType scal_type, int64_t n,
                     const void* alpha, void* x, int64_t incx) const;
+  absl::Status Trsm(void* handle, XlaMusaMuBlasTrsmType trsm_type,
+                    XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                    XlaMusaMuBlasOperation trans_a,
+                    XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n,
+                    const void* alpha, const void* a, int64_t lda, void* b,
+                    int64_t ldb) const;
+  absl::Status TrsmBatched(void* handle, XlaMusaMuBlasTrsmType trsm_type,
+                           XlaMusaMuBlasSide side, XlaMusaMuBlasFill fill,
+                           XlaMusaMuBlasOperation trans_a,
+                           XlaMusaMuBlasDiagonal diagonal, int64_t m, int64_t n,
+                           const void* alpha, const void* const* a, int64_t lda,
+                           void* const* b, int64_t ldb,
+                           int64_t batch_count) const;
   absl::Status Gemm(void* handle, XlaMusaMuBlasDataType input_type,
                     XlaMusaMuBlasDataType output_type,
                     XlaMusaMuBlasComputeType compute_type,
