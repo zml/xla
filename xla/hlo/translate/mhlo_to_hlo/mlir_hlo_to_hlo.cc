@@ -4106,6 +4106,43 @@ LogicalResult ExportXlaOp(RaggedDotOp op, OpLoweringContext ctx) {
   return mlir::success();
 }
 
+LogicalResult ExportXlaOp(ScaledDotOp op, OpLoweringContext ctx) {
+  auto& value_map = *ctx.values;
+  xla::XlaOp lhs, rhs, lhs_scale, rhs_scale;
+  if (failed(GetXlaOp(op.getLhs(), value_map, &lhs, op))) {
+    return mlir::failure();
+  }
+  if (failed(GetXlaOp(op.getRhs(), value_map, &rhs, op))) {
+    return mlir::failure();
+  }
+  if (failed(GetXlaOp(op.getLhsScale(), value_map, &lhs_scale, op))) {
+    return mlir::failure();
+  }
+  if (failed(GetXlaOp(op.getRhsScale(), value_map, &rhs_scale, op))) {
+    return mlir::failure();
+  }
+  xla::PrimitiveType preferred_element_type =
+      xla::ConvertMlirTypeToPrimitiveType(getElementTypeOrSelf(op.getType()));
+
+  // Precision Config
+  auto precision_config = Convert_precision_config(op.getPrecisionConfig());
+  if (precision_config == nullptr) {
+    precision_config = std::make_unique<xla::PrecisionConfig>();
+  }
+  auto xlaOp = xla::ScaledDot(
+      /*lhs=*/lhs,
+      /*rhs=*/rhs,
+      /*lhs_scale=*/lhs_scale,
+      /*rhs_scale=*/rhs_scale,
+      /*dimension_numbers=*/
+      Convert_dot_dimension_numbers(op.getDotDimensionNumbers()),
+      /*precision_config=*/Unwrap(precision_config),
+      /*preferred_element_type=*/preferred_element_type);
+
+  value_map[op] = xlaOp;
+  return mlir::success();
+}
+
 LogicalResult ExportXlaOp(DomainOp op, OpLoweringContext ctx) {
   auto& valueMap = *ctx.values;
 

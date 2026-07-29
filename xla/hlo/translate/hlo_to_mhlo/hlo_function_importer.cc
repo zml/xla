@@ -992,6 +992,19 @@ absl::StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
                                              operands, attributes)
           .getOperation();
     }
+    case HloOpcode::kScaledDot: {
+      attributes.push_back(builder_->getNamedAttr(
+          "precision_config",
+          ConvertPrecisionConfig(&instruction->precision_config(), builder_)));
+      attributes.push_back(builder_->getNamedAttr(
+          "dot_dimension_numbers",
+          ConvertDotDimensionNumbers(instruction->dot_dimension_numbers(),
+                                     builder_)));
+      // XLA Feature -- MHLO Only
+      return mlir::mhlo::ScaledDotOp::create(*func_builder, loc, result_type,
+                                             operands, attributes)
+          .getOperation();
+    }
     case HloOpcode::kCall: {
       ASSIGN_OR_RETURN(FuncOp function, ImportAsFunc(*instruction->to_apply(),
                                                      /*is_main=*/false));

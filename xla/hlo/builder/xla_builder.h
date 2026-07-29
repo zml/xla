@@ -2596,6 +2596,12 @@ XlaOp RaggedDot(
     const PrecisionConfig* precision_config = nullptr,
     std::optional<PrimitiveType> preferred_element_type = std::nullopt);
 
+XlaOp ScaledDot(
+    XlaOp lhs, XlaOp rhs, XlaOp lhs_scale, XlaOp rhs_scale,
+    const DotDimensionNumbers& dimension_number,
+    const PrecisionConfig* precision_config = nullptr,
+    std::optional<PrimitiveType> preferred_element_type = std::nullopt);
+
 // Enqueues a convolution instruction onto the computation, which uses the
 // default convolution dimension numbers.
 XlaOp Conv(XlaOp lhs, XlaOp rhs, absl::Span<const int64_t> window_strides,
