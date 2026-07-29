@@ -48,6 +48,8 @@ RocmDeviceAddressVmmAllocator::RocmDeviceAddressVmmAllocator(
     const Platform* platform)
     : DeviceAddressVmmAllocator(platform) {}
 
+RocmDeviceAddressVmmAllocator::~RocmDeviceAddressVmmAllocator() = default;
+
 absl::StatusOr<std::unique_ptr<RocmDeviceAddressVmmAllocator>>
 RocmDeviceAddressVmmAllocator::Create(const Platform* platform,
                                       absl::Span<const DeviceConfig> devices) {
