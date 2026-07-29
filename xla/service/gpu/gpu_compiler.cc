@@ -2092,6 +2092,8 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
 
+    pipeline.AddPass<ScaledDotRewriter>();
+
     // Rewrite GEMMs into custom calls.
     AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
     AddGemmRewriterPasses(

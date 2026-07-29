@@ -29,8 +29,7 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// This pass rewrites ScaledDot instructions into a sequence of other HLO
-// instructions, including Convert, Broadcast, Reshape, Multiply, and Dot.
+// Dequantize-and-Dot expansion for kScaledDot.
 class ScaledDotRewriter : public HloModulePass {
  public:
   // If `extra_filter` is provided, only ScaledDot instructions for which
