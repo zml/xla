@@ -1,0 +1,29 @@
+// RUN: hlo-translate -hlo-to-mlir -emit-mhlo -split-input-file %s | FileCheck %s
+
+// kScaledDot must import as mhlo.scaled_dot (not mhlo.unknown) for Shardy.
+HloModule scaled_dot_weight_only, entry_computation_layout={(bf16[512,3840]{1,0}, f4e2m1fn[4096,3840]{1,0}, bf16[1,1]{1,0}, f8e4m3fn[4096,240]{1,0})->bf16[512,4096]{1,0}}
+
+// CHECK: mhlo.scaled_dot
+// CHECK-SAME: dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1]>
+ENTRY %main.6 (Arg_0.1: bf16[512,3840], Arg_1.2: f4e2m1fn[4096,3840], Arg_2.3: bf16[1,1], Arg_3.4: f8e4m3fn[4096,240]) -> bf16[512,4096] {
+  %Arg_0.1 = bf16[512,3840] parameter(0)
+  %Arg_1.2 = f4e2m1fn[4096,3840] parameter(1)
+  %Arg_2.3 = bf16[1,1] parameter(2)
+  %Arg_3.4 = f8e4m3fn[4096,240] parameter(3)
+  ROOT %scaled-dot.5 = bf16[512,4096] scaled-dot(bf16[512,3840] %Arg_0.1, f4e2m1fn[4096,3840] %Arg_1.2, bf16[1,1] %Arg_2.3, f8e4m3fn[4096,240] %Arg_3.4), lhs_contracting_dims={1}, rhs_contracting_dims={1}
+}
+
+// -----
+
+// Batch + contracting dims, to exercise dot_dimension_numbers round-trip.
+HloModule scaled_dot_batch, entry_computation_layout={(f8e4m3fn[4,8,64]{2,1,0}, f8e4m3fn[4,16,64]{2,1,0}, f8e8m0fnu[4,8,4]{2,1,0}, f8e8m0fnu[4,16,4]{2,1,0})->f32[4,8,16]{2,1,0}}
+
+// CHECK: mhlo.scaled_dot
+// CHECK-SAME: dot_dimension_numbers = #mhlo.dot<lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [2]>
+ENTRY %main.6 (Arg_0.1: f8e4m3fn[4,8,64], Arg_1.2: f8e4m3fn[4,16,64], Arg_2.3: f8e8m0fnu[4,8,4], Arg_3.4: f8e8m0fnu[4,16,4]) -> f32[4,8,16] {
+  %Arg_0.1 = f8e4m3fn[4,8,64] parameter(0)
+  %Arg_1.2 = f8e4m3fn[4,16,64] parameter(1)
+  %Arg_2.3 = f8e8m0fnu[4,8,4] parameter(2)
+  %Arg_3.4 = f8e8m0fnu[4,16,4] parameter(3)
+  ROOT %scaled-dot.5 = f32[4,8,16] scaled-dot(f8e4m3fn[4,8,64] %Arg_0.1, f8e4m3fn[4,16,64] %Arg_1.2, f8e8m0fnu[4,8,4] %Arg_2.3, f8e8m0fnu[4,16,4] %Arg_3.4), lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={2}
+}
