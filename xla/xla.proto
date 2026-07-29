@@ -1759,9 +1759,9 @@ message DebugOptions {
   // layouts.
   optional bool xla_early_exit_with_layouts = 397;
 
-  // If true, the triton fusion emitter will ignore IsTritonSupportedInstruction
-  // We need this to enable triton scaled dot emitter for testing.
   optional bool xla_gpu_experimental_scaled_dot_with_triton = 410;
+
+  optional bool xla_gpu_experimental_scaled_dot_with_tile_ir = 900;
 
   // If true, use MultiGpuBarrierWithNcclKernel in one-shot RaggedAllToAll
   // thunk.
