@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/literal.h"
 #include "xla/map_util.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/ir_emission_utils.h"
@@ -600,6 +601,17 @@ HlosAndRequirements FuseTowardUsers(
     return existing_hlos_and_requirements;
   }
   HloInstruction& user = *hlo.users()[0];
+
+  // A sub-byte result cannot be written out from here: the Triton gemm emitter
+  // has no config for a packed store, so a fusion rooted at such a user does
+  // not fall back -- it fails autotuning outright with "no configs could be
+  // compiled" and takes the whole module with it. Leaving it outside makes it
+  // its own fusion, which is where e.g. an activation quantize belongs anyway.
+  if (primitive_util::IsSubByteNonPredType(user.shape().element_type())) {
+    VLOG(5) << "Not fusing " << user.ToString()
+            << " into a gemm fusion: sub-byte results cannot be stored.";
+    return existing_hlos_and_requirements;
+  }
 
   // Get the dim orders for the user.
   auto opt_user_result = GetUserDimOrdersAndCombinedReqsIfProfitable(

@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "google/protobuf/any.pb.h"
+#include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -202,28 +203,52 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
 
   const bool exhaustive_search =
       debug_options().xla_gpu_exhaustive_tiling_search();
-  for (int block_m = 128; block_m <= 256; block_m *= 2) {
+
+  const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
+  const Shape& lhs_shape = instr->operand(0)->shape();
+  int64_t m = 1;
+  for (int64_t d = 0; d < lhs_shape.dimensions().size(); ++d) {
+    if (!absl::c_linear_search(dnums.lhs_contracting_dimensions(), d) &&
+        !absl::c_linear_search(dnums.lhs_batch_dimensions(), d)) {
+      m *= lhs_shape.dimensions(d);
+    }
+  }
+  const bool is_thin_m = m < 128;
+
+  // Thin-M decode: search block_m from mma.sync m16, not past padded M.
+  const int min_block_m = is_thin_m ? 16 : 128;
+  const int max_block_m = is_thin_m ? 64 : 256;
+
+  for (int block_m = min_block_m; block_m <= max_block_m; block_m *= 2) {
     for (int block_n = 16; block_n <= 256; block_n *= 2) {
       for (int block_k = 128; block_k <= 256; block_k *= 2) {
-        // TODO(b/436988479): fine tune the search space.
-        const int elements_per_thread = (block_m * block_n) / (4 * 32);
-        if (!exhaustive_search &&
-            (elements_per_thread > 64 ||
-             (block_k >= 256 && elements_per_thread >= 32))) {
-          VLOG(3) << "Ignoring spill over config: block_m=" << block_m
-                  << " block_n=" << block_n << " block_k=" << block_k;
-          continue;
+        const int max_stages = is_thin_m ? 4 : 1;
+        const int max_warps = is_thin_m ? 8 : 4;
+        for (int num_stages = 1; num_stages <= max_stages; ++num_stages) {
+          for (int num_warps = 4; num_warps <= max_warps; num_warps *= 2) {
+            // TODO(b/436988479): fine tune the search space.
+            // Registers held per thread. Depends on num_warps -- the old form
+            // hardcoded 4 and so mis-scored every 8-warp config.
+            const int elements_per_thread =
+                (block_m * block_n) / (num_warps * 32);
+            if (!exhaustive_search &&
+                (elements_per_thread > 64 ||
+                 (block_k >= 256 && elements_per_thread >= 32))) {
+              VLOG(3) << "Ignoring spill over config: block_m=" << block_m
+                      << " block_n=" << block_n << " block_k=" << block_k
+                      << " num_warps=" << num_warps;
+              continue;
+            }
+            auto config = std::make_unique<BackendConfig>();
+            *config->mutable_triton() =
+                TritonGemmConfig(block_m, block_n,
+                                 /*block_k=*/block_k, num_stages, num_warps,
+                                 /*num_ctas=*/1,
+                                 /*is_tma_allowed=*/false)
+                    .ToProto();
+            configs.push_back(std::move(config));
+          }
         }
-
-        auto config = std::make_unique<BackendConfig>();
-        *config->mutable_triton() = TritonGemmConfig(block_m, block_n,
-                                                     /*block_k=*/block_k,
-                                                     /*num_stages=*/1,
-                                                     /*num_warps=*/4,
-                                                     /*num_ctas=*/1,
-                                                     /*is_tma_allowed=*/false)
-                                        .ToProto();
-        configs.push_back(std::move(config));
       }
     }
   }

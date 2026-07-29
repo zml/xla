@@ -2545,6 +2545,569 @@ INSTANTIATE_TEST_SUITE_P(TritonScaledDotTestSuite, TritonScaledDotTest,
                            return TilingParametersToString(info.param);
                          });
 
+// DETERMINISTIC GROUND TRUTH: all-ones fp4 operands + all-ones e4m3 scales.
+// out[m,n] = sum_{k=0..127} (1*1)*(1*1) = 128. bf16 128 is exact. Compares the
+// Triton native sm120 fp4xfp4 block-scaled MMA against the HLO interpreter
+// (which evaluates the scaled-dot semantics directly). CANONICAL rhs ([K,N]).
+TEST_P(TritonScaledDotTest, Fp4ScaledDotCanonicalRhsAllOnes) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4CanonicalRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// Same all-ones ground truth, NON-CANONICAL rhs ([N,K], contracting=1) -- the
+// exact weight orientation gemma-12B-NVFP4 produces in production.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNonCanonicalRhsAllOnes) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NonCanonicalRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[256,128] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[256,8] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={1}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {256, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC D (scale-group mapping): all-ones except lhs_scale column 0 = 2.
+// Correct: out = sum_g 16*ls[g] = 16*(2 + 7*1) = 144 everywhere. A wrong group
+// size / scale-to-element mapping yields a different constant (e.g. 160 if a
+// scale covers 32 elems, 136 if 8). Reads out the scale granularity directly.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotScaleGroupProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ScaleGroupProbe
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  Literal ls = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f));
+  for (int m = 0; m < 128; ++m) {
+    ls.Set<tsl::float8_e4m3fn>({m, 0}, tsl::float8_e4m3fn(2.0f));
+  }
+  args.push_back(std::move(ls));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC E (K-pairing): lhs[m,k]=rhs[k,n]=(k even?1:2), scales all 1.
+// Correct: out = sum_k v_k^2 = 64*1 + 64*4 = 320 everywhere. If lhs/rhs K
+// indices are misaligned (even<->odd swapped between operands), out = 256.
+// Catches operand K-order mismatch that is invisible to uniform inputs.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4KPairingProbe
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC E2 (K-pairing, NON-CANONICAL rhs [N,K] contracting=1 -- the exact
+// orientation gemma-12B-NVFP4 uses). lhs[m,k]=rhs[n,k]=(k even?1:2), scales all
+// 1. Correct out = sum_k v_k^2 = 320. This is the configuration the model runs
+// but which the canonical KPairingProbe never exercised.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNonCanonicalKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NonCanonicalKPairing
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[256,128] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[256,8] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={1}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {256, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int n = 0; n < 256; ++n) {
+    for (int k = 1; k < 128; k += 2) {
+      rhs.Set<tsl::float4_e2m1fn>({n, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// SIDESTEP TEST: present the rhs canonically ([K,N] c=0) via an EXPLICIT
+// transpose op of a [N,K] input (a different, likely-correct code path than the
+// internal CanonicalizeDotOperand that bug #2 lives in). Same varied K-pattern
+// as the non-canonical KPairing probe. If this passes (320), transposing the
+// weight to canonical orientation in ZML sidesteps the non-canonical bug and
+// makes the model correct.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotExplicitTransposedRhsKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ExplicitTransposedRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs_nk = f4e2m1fn[256,128] parameter(1)
+  rhs = f4e2m1fn[128,256] transpose(rhs_nk), dimensions={1,0}
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale_nk = f8e4m3fn[256,8] parameter(3)
+  rhs_scale = f8e4m3fn[8,256] transpose(rhs_scale_nk), dimensions={1,0}
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs_nk =
+      LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+          {256, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int n = 0; n < 256; ++n) {
+    for (int k = 1; k < 128; k += 2) {
+      rhs_nk.Set<tsl::float4_e2m1fn>({n, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs_nk));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (RHS/weight scale group): canonical rhs, all-ones except
+// rhs_scale ROW 0 (group 0) = 2. Correct out = sum_g 16*rs[g] = 16*(2+7) = 144.
+// The rhs_scale is transposed in dot_algorithms; if that corrupts a VARIED
+// weight scale (the model has varied weight scales -- never tested before), this
+// fails. This is the untested case matching the real model.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotRhsScaleGroupProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4RhsScaleGroup
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  Literal rs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f));
+  for (int n = 0; n < 256; ++n) {
+    rs.Set<tsl::float8_e4m3fn>({0, n}, tsl::float8_e4m3fn(2.0f));
+  }
+  args.push_back(std::move(rs));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (M=1 DECODE): canonical fp4xfp4 with M=1 (the decode shape). Same
+// K-pattern as KPairing (lhs[0,k]=rhs[k,n]=(k even?1:2)) -> out[0,n]=320. The
+// model degrades "coherent-then-pad" which points at decode (M=1); all prior
+// probes used M=128/16 (prefill-like). If this fails, M=1 decode is the bug.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotM1DecodeKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4M1Decode
+ENTRY e {
+  lhs = f4e2m1fn[1,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[1,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[1,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {1, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int k = 1; k < 128; k += 2) {
+    lhs.Set<tsl::float4_e2m1fn>({0, k}, tsl::float4_e2m1fn(2.0f));
+  }
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {1, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (COMPUTED/RESHAPED fp4 lhs): the model's activation q is built by
+// quantizeNvfp4 as convert(...)->merge([sc,kb]->k), NOT a param. dequant reads it
+// logically (works) but the scaled-dot reads it as PACKED fp4; a reshape of a
+// sub-byte tensor can yield a layout the packed read mishandles. lhs here is
+// convert(bf16[128,8,16])->f4 then reshape->[128,128], KPattern v_k=(k even?1:2),
+// rhs same. Correct out = sum_k v_k^2 = 320. If this fails, the computed/reshaped
+// fp4 lhs is the model-level bug.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotComputedReshapedLhsProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ComputedReshapedLhs
+ENTRY e {
+  x = bf16[128,8,16] parameter(0)
+  xf4 = f4e2m1fn[128,8,16] convert(x)
+  lhs = f4e2m1fn[128,128] reshape(xf4)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  // x[m, sc, kb] = v_{sc*16+kb} = (k even?1:2)
+  Literal x = LiteralUtil::CreateFullWithDescendingLayout<tsl::bfloat16>(
+      {128, 8, 16}, tsl::bfloat16{1.0f});
+  for (int m = 0; m < 128; ++m) {
+    for (int sc = 0; sc < 8; ++sc) {
+      for (int kb = 0; kb < 16; ++kb) {
+        int k = sc * 16 + kb;
+        if (k % 2 == 1) x.Set<tsl::bfloat16>({m, sc, kb}, tsl::bfloat16{2.0f});
+      }
+    }
+  }
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(x));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (FUSED global-multiply epilogue): the model fuses scaled-dot +
+// multiply(global scalar) + convert into ONE __triton_nested_gemm_fusion (dump
+// shows fusion_scaled-dot with a multiply). All prior probes were standalone
+// scaled-dots. KPairing operands (->320), global=0.5 => out=160. If this fails,
+// fusing the epilogue into the scaled-dot fusion is the model-level bug.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotFusedGlobalMultiplyProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4FusedGlobalMul
+
+fusion_sd {
+  p0 = f4e2m1fn[128,128] parameter(0)
+  p1 = f4e2m1fn[128,256] parameter(1)
+  p2 = f8e4m3fn[128,8] parameter(2)
+  p3 = f8e4m3fn[8,256] parameter(3)
+  p4 = f32[] parameter(4)
+  sd = f32[128,256]{1,0} scaled-dot(p0, p1, p2, p3),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0},
+    backend_config={sizes:[128]}
+  b = f32[128,256]{1,0} broadcast(p4), dimensions={}
+  m = f32[128,256]{1,0} multiply(sd, b)
+  ROOT r = bf16[128,256]{1,0} convert(m)
+}
+
+ENTRY e {
+  p0 = f4e2m1fn[128,128] parameter(0)
+  p1 = f4e2m1fn[128,256] parameter(1)
+  p2 = f8e4m3fn[128,8] parameter(2)
+  p3 = f8e4m3fn[8,256] parameter(3)
+  p4 = f32[] parameter(4)
+  ROOT r = bf16[128,256]{1,0} fusion(p0, p1, p2, p3, p4), kind=kCustom,
+    calls=fusion_sd,
+    backend_config={"fusion_backend_config":{"kind":"__triton_nested_gemm_fusion",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["32","128"]}],
+      "num_warps":"4","num_stages":"1","num_ctas":"1"}}}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i)
+    for (int k = 1; k < 128; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+  for (int k = 1; k < 128; k += 2)
+    for (int n = 0; n < 256; ++n)
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateR0<float>(0.5f));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (NEGATIVE fp4 -- the untested dimension): EVERY prior probe used
+// only positive fp4 (1,2). Real weights/activations are signed. If the sm120 fp4
+// path mishandles the sign bit, real data breaks while positive-only tests pass.
+// lhs[m,k]=(k even?1:-2), rhs=all 1, scales=all 1. out=sum_k lhs = 64*1 + 64*(-2)
+// = -64. If sign is dropped/mishandled -> +192 or other. Canonical rhs.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNegativeLhsProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NegativeLhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i)
+    for (int k = 1; k < 128; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(-2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+// DIAGNOSTIC (LARGE K / MANY groups): the model uses K=3840 (240 scale groups);
+// all prior probes used K=128 (8 groups). dequant-both (same math) is coherent in
+// the model but the fused fp4 scaled-dot is garbage -> the fused upcast's
+// scale-across-many-K-tiles handling is the suspect. M=16, K=3840, N=256, KPattern
+// v_k=(k even?1:2) -> out = 1920*1 + 1920*4 = 9600.
+TEST_P(TritonScaledDotTest, Fp4ScaledDotLargeKProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4LargeK
+ENTRY e {
+  lhs = f4e2m1fn[16,3840] parameter(0)
+  rhs = f4e2m1fn[3840,256] parameter(1)
+  lhs_scale = f8e4m3fn[16,240] parameter(2)
+  rhs_scale = f8e4m3fn[240,256] parameter(3)
+  ROOT _ = bf16[16,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {16, 3840}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {3840, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int m = 0; m < 16; ++m)
+    for (int k = 1; k < 3840; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({m, k}, tsl::float4_e2m1fn(-2.0f));
+  for (int k = 1; k < 3840; k += 2)
+    for (int n = 0; n < 256; ++n)
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  // VARIED per-group scales across all 240 groups (model-like).
+  Literal ls = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {16, 240}, tsl::float8_e4m3fn(1.0f));
+  for (int m = 0; m < 16; ++m)
+    for (int g = 0; g < 240; ++g)
+      if (g % 2 == 1) ls.Set<tsl::float8_e4m3fn>({m, g}, tsl::float8_e4m3fn(2.0f));
+  Literal rs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {240, 256}, tsl::float8_e4m3fn(1.0f));
+  for (int g = 0; g < 240; ++g)
+    if (g % 3 == 0)
+      for (int n = 0; n < 256; ++n)
+        rs.Set<tsl::float8_e4m3fn>({g, n}, tsl::float8_e4m3fn(3.0f));
+  args.push_back(std::move(ls));
+  args.push_back(std::move(rs));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/2.0, /*arel=*/1e-2}));
+}
+
 TEST_P(TritonScaledDotTest,
        ScaledDotWithOmmittedLhsScaleGetFusedAndExecutedCorrectly) {
   if (auto cc = GpuComputeCapability().cuda_compute_capability();
