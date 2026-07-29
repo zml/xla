@@ -372,6 +372,26 @@ bool TritonBackend::IsSupported(const HloInstruction& instr) {
   const FusionBackendConfig& backend_config =
       gpu_config->fusion_backend_config();
 
+  // A scaled-dot fusion is the one thing this backend and TileIrBackend both bid
+  // on, and GemmFusion stamps kTritonGemmFusionKind regardless of which backend
+  // asked for the fusion. Without this, "Tile IR only" does not mean it: Triton
+  // keeps bidding and wins the fusions Tile IR is slower on.
+  //
+  // This also makes a Tile IR decline visible rather than silently absorbed --
+  // with neither backend bidding the fusion keeps a Triton kind that
+  // ConvertTritonGemmConfig then skips. Failing loudly is the point of a
+  // backend-exclusive flag, but it does mean the combination is only as good as
+  // Tile IR's coverage.
+  if (hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(), HloOpcode::kScaledDot) !=
+          nullptr &&
+      !instr.GetModule()
+           ->config()
+           .debug_options()
+           .xla_gpu_experimental_scaled_dot_with_triton()) {
+    return false;
+  }
+
   // TODO: b/487920266 - sometimes we create fusions that can't be tiled.
   // Bail out here if that's the case.
   if (backend_config.kind() == kTritonGemmFusionKind) {

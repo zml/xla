@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/backends/gpu/autotuner/fission_backend.h"
 #include "xla/backends/gpu/autotuner/native_emitter.h"
+#include "xla/backends/gpu/autotuner/tile_ir.h"
 #include "xla/backends/gpu/autotuner/triton.h"
 #include "xla/backends/gpu/transforms/dot_algorithm_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_rewriter.h"
@@ -98,6 +99,10 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForCuda(
       debug_options, compiler, target_config));
   backends.push_back(std::make_unique<BlockLevelEmitterBackend>(
       debug_options, compiler, shape_size_fn, target_config));
+  // Offers configs only when --xla_gpu_experimental_scaled_dot_with_tile_ir is
+  // set; otherwise it returns an empty list and costs nothing.
+  backends.push_back(std::make_unique<TileIrBackend>(
+      debug_options, compiler, target_config, mlir_context));
 
   if (!backend_allowlist.empty()) {
     backends.erase(
