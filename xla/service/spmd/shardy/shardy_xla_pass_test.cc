@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/service/spmd/sharding_format_picker.h"
 #include "xla/service/spmd/shardy/constants.h"
 #include "xla/shape.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
 
@@ -425,8 +426,34 @@ TEST_P(ShardyXLATest, CostantSplitter) {
   // EXPECT_EQ(dot->operand(0)->operand(0), dot->operand(1)->operand(0));
 }
 
-TEST_P(ShardyXLATest, Dot) {
+TEST_F(ShardyXLATestV2Only, ScaledDot) {
   const char* const hloString = R"(
+    HloModule module
+    ENTRY %main {
+      %lhs = bf16[512,3840] parameter(0)
+      %rhs = f4e2m1fn[4096,3840] parameter(1)
+      %lhs_scale = bf16[1,1] parameter(2)
+      %rhs_scale = f8e4m3fn[4096,240] parameter(3)
+      ROOT %sd = bf16[512,4096] scaled-dot(%lhs, %rhs, %lhs_scale, %rhs_scale),
+        lhs_contracting_dims={1}, rhs_contracting_dims={1},
+        sharding={devices=[1,2]<=[2]}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hloString));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_enable_hlo_sharding_v3(false);
+  module->add_frontend_attribute(std::string(xla::sdy::kImportMhloShardings),
+                                 "t");
+
+  TF_ASSERT_OK(
+      ShardyXLA(/*runSdyShardingPropagation=*/true).Run(module.get()).status());
+
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kScaledDot);
+}
+
+TEST_P(ShardyXLATest, Dot) {  const char* const hloString = R"(
     HloModule module
     ENTRY %conv {
       %p0 = f32[8,256,128] parameter(0)
