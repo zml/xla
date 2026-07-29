@@ -65,13 +65,17 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  mlir::PassManager pm(&context);
-  pm.addPass(xla::emitters::createSimplifyAffinePass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(xla::gpu::tile_ir::createXTileLowerToCudaTilePass());
-  if (mlir::failed(pm.run(*module))) {
-    llvm::errs() << "lowering failed\n";
-    return 1;
+  bool already_lowered = false;
+  module->walk([&](mlir::cuda_tile::ModuleOp) { already_lowered = true; });
+  if (!already_lowered) {
+    mlir::PassManager pm(&context);
+    pm.addPass(xla::emitters::createSimplifyAffinePass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(xla::gpu::tile_ir::createXTileLowerToCudaTilePass());
+    if (mlir::failed(pm.run(*module))) {
+      llvm::errs() << "lowering failed\n";
+      return 1;
+    }
   }
 
   module->print(llvm::outs());
