@@ -158,6 +158,7 @@ struct VulkanShaderFeatures {
   bool shader_int16 = false;
   bool shader_int64 = false;
   bool storage_buffer_array_dynamic_indexing = false;
+  bool variable_pointers_storage_buffer = false;
 };
 
 class VulkanDriver {
@@ -199,13 +200,17 @@ class VulkanDriver {
     VkPhysicalDeviceShaderFloat16Int8Features float16_int8_features = {};
     float16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    VkPhysicalDeviceVariablePointersFeatures variable_pointer_features = {};
+    variable_pointer_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES;
     storage_8bit_features.pNext = &storage_16bit_features;
     storage_16bit_features.pNext = &float16_int8_features;
+    float16_int8_features.pNext = &variable_pointer_features;
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
     if (has_extension) {
       bfloat16_features.sType =
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
-      float16_int8_features.pNext = &bfloat16_features;
+      variable_pointer_features.pNext = &bfloat16_features;
     }
     VkPhysicalDeviceFeatures2 features = {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -224,6 +229,8 @@ class VulkanDriver {
     shader_features.shader_int64 = features.features.shaderInt64 == VK_TRUE;
     shader_features.storage_buffer_array_dynamic_indexing =
         features.features.shaderStorageBufferArrayDynamicIndexing == VK_TRUE;
+    shader_features.variable_pointers_storage_buffer =
+        variable_pointer_features.variablePointersStorageBuffer == VK_TRUE;
     return shader_features;
   }
 
@@ -698,6 +705,9 @@ struct VulkanExecutor::Impl {
     if (!shader_features.storage_buffer_array_dynamic_indexing) {
       add_missing_feature("shaderStorageBufferArrayDynamicIndexing");
     }
+    if (!shader_features.variable_pointers_storage_buffer) {
+      add_missing_feature("variablePointersStorageBuffer");
+    }
     if (!missing_features.empty()) {
       return absl::FailedPreconditionError(absl::StrFormat(
           "Vulkan device %s does not support required features: %s",
@@ -725,8 +735,13 @@ struct VulkanExecutor::Impl {
     float16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
     float16_int8_features.shaderInt8 = VK_TRUE;
+    VkPhysicalDeviceVariablePointersFeatures variable_pointer_features = {};
+    variable_pointer_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES;
+    variable_pointer_features.variablePointersStorageBuffer = VK_TRUE;
     timeline_features.pNext = &storage_8bit_features;
     storage_8bit_features.pNext = &float16_int8_features;
+    float16_int8_features.pNext = &variable_pointer_features;
     if (shader_bfloat16) {
       bfloat16_features.sType =
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
@@ -738,9 +753,9 @@ struct VulkanExecutor::Impl {
       storage_16bit_features.storageBuffer16BitAccess = VK_TRUE;
       storage_16bit_features.pNext =
           shader_bfloat16 ? &bfloat16_features : nullptr;
-      float16_int8_features.pNext = &storage_16bit_features;
+      variable_pointer_features.pNext = &storage_16bit_features;
     } else if (shader_bfloat16) {
-      float16_int8_features.pNext = &bfloat16_features;
+      variable_pointer_features.pNext = &bfloat16_features;
     }
 
     uint32_t family_count = 0;
