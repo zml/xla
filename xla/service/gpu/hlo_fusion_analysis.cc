@@ -127,6 +127,11 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
     return HloFusionAnalysis::EmitterFusionKind::kTriton;
   }
 
+  if (fusion_backend_config.kind() == kFlyGemmFusionKind ||
+      fusion_backend_config.kind() == kFlyGemvFusionKind) {
+    return HloFusionAnalysis::EmitterFusionKind::kFly;
+  }
+
   if (fusion_backend_config.kind() == kCuDnnFusionKind) {
     return HloFusionAnalysis::EmitterFusionKind::kCuDnn;
   }

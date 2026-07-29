@@ -429,6 +429,32 @@ TEST_F(HloFusionAnalysisTest, ExtractValidGpuBackendConfig) {
             kTritonFusionKind);
 }
 
+TEST_F(HloFusionAnalysisTest, ClassifiesFlyFusionSeparatelyFromLoopFusion) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+    HloModule module
+
+    fly_computation {
+      lhs = bf16[64,64] parameter(0)
+      rhs = bf16[64,64] parameter(1)
+      ROOT dot = bf16[64,64] dot(lhs, rhs),
+        lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    }
+
+    ENTRY entry {
+      lhs = bf16[64,64] parameter(0)
+      rhs = bf16[64,64] parameter(1)
+      ROOT fusion = bf16[64,64] fusion(lhs, rhs), kind=kCustom,
+        calls=fly_computation,
+        backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+    })"));
+
+  auto device_info = TestGpuDeviceInfo::RTXA6000DeviceInfo();
+  auto analysis = HloFusionAnalysis::Create(
+      *module->entry_computation()->root_instruction(), device_info);
+  EXPECT_EQ(analysis.emitter_fusion_kind(),
+            HloFusionAnalysis::EmitterFusionKind::kFly);
+}
+
 TEST_F(HloFusionAnalysisTest,
        InvalidGpuBackendConfig_SingleInstruction_Ignored) {
   ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(

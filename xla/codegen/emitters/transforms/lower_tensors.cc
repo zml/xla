@@ -118,6 +118,12 @@ Value GetDestinationBuffer(Value dest) {
           result_number);
     } else if (auto scf_for = dest.getDefiningOp<scf::ForOp>()) {
       dest = scf_for.getInitArgs()[result_number];
+    } else if (auto sync_threads =
+                   dest.getDefiningOp<gpu::SyncThreadsOp>()) {
+      dest = sync_threads.getOperand(result_number);
+    } else if (auto async_copy =
+                   dest.getDefiningOp<gpu::AsyncCopyGlobalToSharedOp>()) {
+      dest = async_copy.getDestination();
     } else if (dest.getDefiningOp<UnrealizedConversionCastOp>() ||
                dest.getDefiningOp<gpu::AllocateSharedOp>()) {
       break;
@@ -432,6 +438,107 @@ struct RewriteTensorExtract : OpRewritePattern<mlir::tensor::ExtractOp> {
       rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, op.getType(),
                                                               load);
     }
+    return success();
+  }
+};
+
+struct RewriteAsyncCopyGlobalToShared
+    : OpRewritePattern<gpu::AsyncCopyGlobalToSharedOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::AsyncCopyGlobalToSharedOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto source =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(op.getSource());
+    auto destination = mlir::cast<TypedValue<mlir::RankedTensorType>>(
+        GetDestinationBuffer(op.getDestination()));
+
+    auto generic_ptr = ml::LLVMPointerType::get(b.getContext());
+    Value source_ptr =
+        UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
+    Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
+    Value num_records = ml::ConstantOp::create(
+        b, b.getI64Type(), source.getType().getNumElements() *
+                                 source.getType()
+                                     .getElementType()
+                                     .getIntOrFloatBitWidth() /
+                                 8);
+    // CDNA buffer descriptor: DATA_FORMAT=7 and NUM_FORMAT=4.
+    Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x20070);
+    auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
+    Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
+        b, resource_ptr, source_ptr, stride, num_records, flags);
+
+    Value source_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getSourceIndex()}, b);
+    Value source_byte_offset = arith::MulIOp::create(
+        b, source_linear_index,
+        arith::ConstantIndexOp::create(
+            b, source.getType().getElementType().getIntOrFloatBitWidth() / 8));
+    source_byte_offset =
+        arith::IndexCastOp::create(b, b.getI32Type(), source_byte_offset);
+
+    Value destination_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getDestinationIndex()}, b);
+    Value destination_ptr =
+        CreateGep(destination, destination_linear_index, b);
+    auto shared_ptr = ml::LLVMPointerType::get(b.getContext(), 3);
+    destination_ptr =
+        ml::AddrSpaceCastOp::create(b, shared_ptr, destination_ptr);
+
+    Value copy_bytes =
+        ml::ConstantOp::create(b, b.getI32Type(), op.getCopyBytes());
+    Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
+    mlir::ROCDL::RawPtrBufferLoadAsyncLdsOp::create(
+        b, resource, destination_ptr, copy_bytes, source_byte_offset, zero,
+        zero, b.getI32IntegerAttr(0), mlir::ArrayAttr{}, mlir::ArrayAttr{},
+        mlir::ArrayAttr{});
+    rewriter.replaceOp(op, op.getDestination());
+    return success();
+  }
+};
+
+struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::BufferLoadOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto source =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(op.getSource());
+
+    auto generic_ptr = ml::LLVMPointerType::get(b.getContext());
+    Value source_ptr =
+        UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
+    Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
+    Value num_records = ml::ConstantOp::create(
+        b, b.getI64Type(), source.getType().getNumElements() *
+                                 source.getType()
+                                     .getElementType()
+                                     .getIntOrFloatBitWidth() /
+                                 8);
+    Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x20070);
+    auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
+    Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
+        b, resource_ptr, source_ptr, stride, num_records, flags);
+
+    Value source_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getSourceIndex()}, b);
+    Value source_byte_offset = arith::MulIOp::create(
+        b, source_linear_index,
+        arith::ConstantIndexOp::create(
+            b, source.getType().getElementType().getIntOrFloatBitWidth() / 8));
+    source_byte_offset =
+        arith::IndexCastOp::create(b, b.getI32Type(), source_byte_offset);
+    Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
+    Value loaded = mlir::ROCDL::RawPtrBufferLoadOp::create(
+        b, op.getResult().getType(), resource, source_byte_offset, zero,
+        b.getI32IntegerAttr(0), mlir::ArrayAttr{}, mlir::ArrayAttr{},
+        mlir::ArrayAttr{});
+    rewriter.replaceOp(op, loaded);
     return success();
   }
 };
@@ -1416,11 +1523,11 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
     mlir::RewritePatternSet tensor_patterns(mlir_context);
 
     tensor_patterns.add<RewriteAtomicRMW>(mlir_context, device_spec_);
-    tensor_patterns.add<RewriteAllocateShared, RewriteGetDynamicDimSize,
-                        RewriteNonScalarConstants, RewriteSyncThreads,
-                        RewriteTensorExtract, RewriteTensorInsert,
-                        RewriteTransferRead, RewriteTransferWrite>(
-        mlir_context);
+    tensor_patterns.add<
+        RewriteAllocateShared, RewriteAsyncCopyGlobalToShared,
+        RewriteBufferLoad, RewriteGetDynamicDimSize, RewriteNonScalarConstants,
+        RewriteSyncThreads, RewriteTensorExtract, RewriteTensorInsert,
+        RewriteTransferRead, RewriteTransferWrite>(mlir_context);
     if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),
                                                  std::move(tensor_patterns)))) {
       signalPassFailure();

@@ -2006,7 +2006,8 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     // AlgebraicSimplifier will simplify it away again.
     // TODO(b/375566188): Figure out whether we can get rid of this pass.
     pipeline.AddPass<DotNormalizer>();
-    if (debug_options.xla_gpu_enable_triton_gemm() &&
+    if ((debug_options.xla_gpu_enable_triton_gemm() ||
+         debug_options.xla_gpu_enable_flydsl_gemm()) &&
         ((cuda_cc != nullptr &&
           cuda_cc->IsAtLeast(se::CudaComputeCapability::kAmpere)) ||
          rocm_cc != nullptr)) {

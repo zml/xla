@@ -46,6 +46,7 @@ class HloFusionAnalysis {
     kLoop,
     kCustomFusion,
     kTriton,
+    kFly,
     kReduction,
     kTranspose,
     kConcatenate,

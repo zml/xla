@@ -797,6 +797,11 @@ message DebugOptions {
 
   optional bool xla_gpu_enable_triton_gemm = 188;
 
+  // Enables FlyDSL as an xTile GEMM code generation and autotuning backend on
+  // ROCm. GEMM fusion formation runs when either this flag or
+  // xla_gpu_enable_triton_gemm is enabled.
+  optional bool xla_gpu_enable_flydsl_gemm = 515;
+
   // Enable double buffering for loops.
   optional bool xla_gpu_enable_while_loop_double_buffering = 248;
 

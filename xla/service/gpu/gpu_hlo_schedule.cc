@@ -571,7 +571,7 @@ bool NeedAccuracyChecker(const DebugOptions& options,
          level == DebugOptions::PGLE_STRICTNESS_LEVEL_ERROR;
 }
 
-// For now, only allow cublas gemm custom calls and triton gemm fusions to
+// For now, only allow GPU BLAS custom calls and tuned GEMM fusions to
 // be overlapped as the compute ops in the annotated scheduling groups.
 LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
   LegalizeSchedulingAnnotations::Config annotation_config;
@@ -583,7 +583,9 @@ LegalizeSchedulingAnnotations::Config SchedulingAnnotationsConfig() {
       return true;
     }
     if (hlo->opcode() == HloOpcode::kFusion) {
-      return IsGpuFusionKind(*hlo, kTritonGemmFusionKind);
+      return IsGpuFusionKind(*hlo, kTritonGemmFusionKind) ||
+             IsGpuFusionKind(*hlo, kFlyGemmFusionKind) ||
+             IsGpuFusionKind(*hlo, kFlyGemvFusionKind);
     }
     return false;
   };

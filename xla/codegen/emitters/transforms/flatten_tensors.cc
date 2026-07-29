@@ -329,14 +329,14 @@ struct RewriteVectorTransferRead : OpRewritePattern<mv::TransferReadOp> {
       return rewriter.notifyMatchFailure(op, "the vector should be 1D");
     }
     auto tensor = op.getBase();
-    auto tensor_type = tensor.getType();
+    auto tensor_type = mlir::cast<RankedTensorType>(tensor.getType());
     if (tensor_type.getRank() < 2) {
       return rewriter.notifyMatchFailure(op,
                                          "the source tensore is already flat");
     }
     auto loc = op.getLoc();
-    auto linear_index =
-        LinearizeIndex(loc, tensor_type, op.getIndices(), rewriter);
+    auto linear_index = LinearizeIndex(loc, tensor_type, op.getIndices(),
+                                       rewriter, tensor_type.getEncoding());
     auto tensor_1D = UnrealizedConversionCastOp::create(
                          rewriter, loc, GetFlattenedType(tensor_type), tensor)
                          .getResult(0);
@@ -346,6 +346,40 @@ struct RewriteVectorTransferRead : OpRewritePattern<mv::TransferReadOp> {
     return mlir::success();
   }
 };
+
+struct RewriteVectorTransferWrite : OpRewritePattern<mv::TransferWriteOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mv::TransferWriteOp op,
+                                PatternRewriter& rewriter) const override {
+    auto vector_type = op.getVectorType();
+    if (vector_type.getRank() != 1) {
+      return rewriter.notifyMatchFailure(op, "the vector should be 1D");
+    }
+    auto tensor = op.getBase();
+    auto tensor_type =
+        mlir::dyn_cast<RankedTensorType>(tensor.getType());
+    if (!tensor_type || tensor_type.getRank() < 2) {
+      return rewriter.notifyMatchFailure(
+          op, "the destination tensor is already flat");
+    }
+    auto loc = op.getLoc();
+    auto linear_index = LinearizeIndex(loc, tensor_type, op.getIndices(),
+                                       rewriter, tensor_type.getEncoding());
+    mlir::ImplicitLocOpBuilder b(loc, rewriter);
+    auto tensor_1D = UnrealizedConversionCastOp::create(
+                         b, GetFlattenedType(tensor_type), tensor)
+                         .getResult(0);
+    auto new_write = mv::TransferWriteOp::create(
+        b, op.getVector(), tensor_1D, linear_index,
+        llvm::ArrayRef<bool>{true});
+    auto cast_to_orig_type = UnrealizedConversionCastOp::create(
+        b, tensor_type, new_write.getResult());
+    rewriter.replaceOp(op, cast_to_orig_type.getResult(0));
+    return mlir::success();
+  }
+};
+
 struct RewriteVectorExtract : OpRewritePattern<mv::ExtractOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -744,6 +778,53 @@ struct RewriteSyncThreads : OpRewritePattern<gpu::SyncThreadsOp> {
   }
 };
 
+struct RewriteAsyncCopyGlobalToShared
+    : OpRewritePattern<gpu::AsyncCopyGlobalToSharedOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::AsyncCopyGlobalToSharedOp op,
+      PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getSource().getType()) &&
+        IsScalarOrFlat(op.getDestination().getType())) {
+      return rewriter.notifyMatchFailure(op, "the tensors are already flat");
+    }
+
+    Location loc = op.getLoc();
+    Value flat_source = Flatten(op.getSource(), rewriter);
+    Value flat_destination = Flatten(op.getDestination(), rewriter);
+    auto new_op = gpu::AsyncCopyGlobalToSharedOp::create(
+        rewriter, loc, flat_destination.getType(), flat_source,
+        op.getSourceIndex(), flat_destination, op.getDestinationIndex(),
+        op.getCopyBytesAttr());
+
+    Value result = new_op.getResult();
+    if (result.getType() != op.getResult().getType()) {
+      result = UnrealizedConversionCastOp::create(
+                   rewriter, loc, op.getResult().getType(), result)
+                   .getResult(0);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
+struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::BufferLoadOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getSource().getType())) {
+      return rewriter.notifyMatchFailure(op, "the source is already flat");
+    }
+
+    Value flat_source = Flatten(op.getSource(), rewriter);
+    rewriter.replaceOpWithNewOp<gpu::BufferLoadOp>(
+        op, op.getResult().getType(), flat_source, op.getSourceIndex());
+    return mlir::success();
+  }
+};
+
 struct RewriteGetDynamicDimSizeOp : OpRewritePattern<GetDynamicDimSizeOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -776,6 +857,8 @@ class FlattenTensorsPass
     // clang-format off
     patterns.add<
         RewriteAllocateShared,
+        RewriteAsyncCopyGlobalToShared,
+        RewriteBufferLoad,
         RewriteAtomicRMW,
         RewriteConstant,
         RewriteCpuLoad,
@@ -791,7 +874,8 @@ class FlattenTensorsPass
         RewriteVectorExtract,
         RewriteVectorFromElements,
         RewriteVectorInsert,
-        RewriteVectorTransferRead
+        RewriteVectorTransferRead,
+        RewriteVectorTransferWrite
     >(mlir_context);
     // clang-format on
     ApplyIndexingOp::getCanonicalizationPatterns(patterns, mlir_context);

@@ -43,6 +43,8 @@ limitations under the License.
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -58,6 +60,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
+#include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/llvm/llvm_emitter.h"
@@ -112,13 +115,17 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/dynamic_slice_copy.h"
 #include "xla/backends/gpu/transforms/dynamic_slice_fusion.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
+#include "xla/codegen/emitters/kernel_api_builder.h"
+#include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/codegen/kernel_definition.h"
 #include "xla/codegen/kernel_spec.h"
 #include "xla/codegen/llvm_kernel_source.h"
+#include "xla/codegen/mlir_kernel_source.h"
 #include "xla/core/host_offloading/host_offloading_executable.pb.h"
 #include "xla/ffi/attribute_map.h"
 #include "xla/future.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/hlo/analysis/symbolic_expr.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instruction_utils.h"
@@ -143,6 +150,7 @@ limitations under the License.
 #include "xla/service/gpu/custom_kernel_emitter.h"
 #include "xla/service/gpu/dense_data_intermediate.h"
 #include "xla/service/gpu/execution_stream_assignment.h"
+#include "xla/service/gpu/fly_call.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_conv_runner.h"
 #include "xla/service/gpu/gpu_executable.h"
@@ -156,6 +164,7 @@ limitations under the License.
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/service/gpu/stream_executor_util.h"
+#include "xla/service/gpu/target_util.h"
 #include "xla/service/gpu/triton_call.h"
 #include "xla/service/gpu_topology.h"
 #include "xla/service/hlo.pb.h"
@@ -206,6 +215,79 @@ absl::StatusOr<TritonKernelSource> EmitTritonFrom(
   triton_fn.setName(kernel_name);
 
   return TritonKernelSource(std::move(triton_module));
+}
+
+absl::StatusOr<MlirKernelSource> EmitFlyFrom(
+    const FlyCall& call, const std::string& kernel_name,
+    const HloCustomCallInstruction& instr,
+    const BufferAssignment& buffer_assignment,
+    mlir::MLIRContext& mlir_context) {
+  VLOG(3) << "Generating Fly custom call: " << kernel_name;
+
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  {
+    mlir::BaseScopedDiagnosticHandler diagnostic_handler(&mlir_context);
+    module = mlir::parseSourceString<mlir::ModuleOp>(call.ir, &mlir_context);
+    if (!module) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Failed to parse Fly module: ",
+                       diagnostic_handler.ConsumeStatus().message(),
+                       "\ninput ir: \"", absl::CHexEscape(call.ir), "\""));
+    }
+  }
+
+  if (mlir::func::FuncOp source_fn =
+          module->lookupSymbol<mlir::func::FuncOp>(call.name)) {
+    // Build the canonical XLA kernel ABI from the custom call, then transplant
+    // the user-provided body after verifying its tensor signature. This
+    // attaches slice, alignment, aliasing, and invariant metadata consistently
+    // with all other XLA MLIR kernels.
+    source_fn.setName(absl::StrCat(kernel_name, "_source"));
+    TF_ASSIGN_OR_RETURN(
+        mlir::func::FuncOp entry_fn,
+        emitters::EmitKernelApi(*module, instr, &buffer_assignment,
+                                GetDefaultBufferAlignment(), kernel_name));
+    if (source_fn.getFunctionType() != entry_fn.getFunctionType()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Fly custom call function type does not match XLA kernel ABI; got ",
+          mlir::debugString(source_fn.getFunctionType()), ", expected ",
+          mlir::debugString(entry_fn.getFunctionType())));
+    }
+    entry_fn.getBody().takeBody(source_fn.getBody());
+    source_fn.erase();
+
+    SetBackendKind(&mlir_context, entry_fn, BackendKind::kGpu);
+    emitters::SetIndexDataLayout(*module, instr);
+    return MlirKernelSource(std::move(module));
+  }
+
+  mlir::gpu::GPUFuncOp kernel_fn;
+  module->walk([&](mlir::gpu::GPUFuncOp fn) {
+    if (!kernel_fn && fn.getName() == call.name) {
+      kernel_fn = fn;
+    }
+  });
+  if (!kernel_fn) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Call name '", call.name,
+        "' was not found as a top-level func.func or gpu.func in the Fly "
+        "module"));
+  }
+  if (!kernel_fn.isKernel()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Fly gpu.func '", call.name, "' is not a kernel"));
+  }
+  TF_ASSIGN_OR_RETURN(
+      emitters::KernelArguments kernel_arguments,
+      emitters::KernelArguments::Create(
+          buffer_assignment, GetDefaultBufferAlignment(), &instr));
+  if (kernel_fn.getNumArguments() != kernel_arguments.args().size()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Fly gpu.func has ", kernel_fn.getNumArguments(),
+        " arguments, but XLA assigned ", kernel_arguments.args().size()));
+  }
+  kernel_fn.setName(kernel_name);
+  return MlirKernelSource(std::move(module));
 }
 
 // TODO: move into a host_execute specific file.
@@ -1411,6 +1493,132 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
                              entry->launch_dimensions.block_counts(),
                              entry->launch_dimensions.thread_counts_per_block(),
                              entry->shmem_bytes));
+        return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
+            thunk_info, std::move(custom_kernel), kernel_arguments,
+            entry->use_pdl, call_zeroed_outputs, entry->tma_metadata));
+      });
+}
+
+AsyncThunkSequence ThunkEmitter::EmitFlyCustomCall(
+    const HloCustomCallInstruction* instr) {
+  if (!ir_emitter_context_->gpu_device_info()
+           .gpu_compute_capability()
+           .IsRocm()) {
+    return absl::UnimplementedError(
+        "__gpu$xla.gpu.fly custom calls require ROCm");
+  }
+
+  BorrowedMlirContext borrowed_context =
+      ir_emitter_context_->BorrowMlirContext();
+  borrowed_context->get()->appendDialectRegistry(
+      MlirKernelEmitter::GetDialectRegistry());
+  borrowed_context->get()->loadAllAvailableDialects();
+  RegisterSymbolicExprStorage(borrowed_context->get());
+
+  TF_ASSIGN_OR_RETURN(
+      FlyCall call,
+      FlyCall::Parse(instr->raw_backend_config_string(),
+                     borrowed_context->get()));
+  auto call_zeroed_outputs = call.zeroed_outputs;
+  auto generate =
+      [this, instr, borrowed_context = std::move(borrowed_context),
+       call =
+           std::move(call)]() mutable -> xla::Future<KernelReuseCache::Entry> {
+    std::string kernel_name =
+        ir_emitter_context_->GetSanitizedUniqueName(call.name);
+    TF_ASSIGN_OR_RETURN(
+        MlirKernelSource fly_source,
+        EmitFlyFrom(call, kernel_name, *instr,
+                    ir_emitter_context_->buffer_assignment(),
+                    **borrowed_context));
+
+    HloModule* hlo_module = instr->GetModule();
+    return ir_emitter_context_->kernel_compiler()
+        ->CompileMlirToLlvm(ir_emitter_context_->gpu_device_info(), *hlo_module,
+                            kernel_name, /*unroll_factor=*/0,
+                            std::move(fly_source),
+                            std::move(borrowed_context))
+        .Map([kernel_name, instr, call = std::move(call),
+              kernel_compiler = ir_emitter_context_->kernel_compiler(),
+              buffer_assignment = &ir_emitter_context_->buffer_assignment(),
+              target_triple = ir_emitter_context_->target_triple(),
+              data_layout = ir_emitter_context_->data_layout(),
+              gpu_device_info = ir_emitter_context_->gpu_device_info()](
+                 LlvmKernelSource source)
+                 -> xla::Future<KernelReuseCache::Entry> {
+          llvm::orc::ThreadSafeModule local_module =
+              std::move(source).thread_safe_module();
+          llvm::Module* module = local_module.getModuleUnlocked();
+          llvm::Function* kernel = module->getFunction(kernel_name);
+          TF_RET_CHECK(kernel != nullptr);
+
+          TF_ASSIGN_OR_RETURN(
+              auto kernel_arguments,
+              emitters::KernelArguments::Create(
+                  *buffer_assignment, GetDefaultBufferAlignment(), instr));
+          TF_RET_CHECK(kernel->arg_size() == kernel_arguments.args().size())
+              << "Fly custom call LLVM ABI has " << kernel->arg_size()
+              << " arguments, but XLA assigned "
+              << kernel_arguments.args().size();
+
+          LaunchDimensions launch_dimensions(
+              se::BlockDim(call.grid_x, call.grid_y, call.grid_z),
+              se::ThreadDim(call.num_warps *
+                            gpu_device_info.threads_per_warp()));
+
+          module->setDataLayout(data_layout);
+          module->setTargetTriple(target_triple);
+          llvm::IRBuilder<> builder(module->getContext());
+          AnnotateFunctionAsGpuKernel(module, kernel, &builder);
+          AnnotateAttrsIfUnset(kernel_arguments, *kernel);
+          RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(
+              gpu_device_info, launch_dimensions, kernel, module));
+          if (call.waves_per_eu > 0) {
+            kernel->addFnAttr(
+                "amdgpu-waves-per-eu",
+                absl::StrCat(call.waves_per_eu, ", ", call.waves_per_eu));
+          }
+
+          return kernel_compiler
+              ->CompileToTargetBinary(
+                  LlvmKernelSource{std::move(local_module)})
+              .Map([kernel_name,
+                    launch_dimensions = std::move(launch_dimensions),
+                    shared_mem_bytes = call.shared_mem_bytes](
+                       const std::vector<uint8_t>& binary) {
+                return KernelReuseCache::Entry{
+                    kernel_name, launch_dimensions,
+                    /*cluster_dim=*/std::nullopt,
+                    shared_mem_bytes, binary};
+              });
+        });
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      emitters::KernelArguments kernel_arguments,
+      emitters::KernelArguments::Create(
+          ir_emitter_context_->buffer_assignment(),
+          GetDefaultBufferAlignment(), instr));
+  auto [status_or_entry, was_cached] =
+      ir_emitter_context_->kernel_cache().GetWithStatus(
+          absl::StrCat("fly:", instr->raw_backend_config_string()), generate);
+
+  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
+      instr, ir_emitter_context_->GetNextThunkId());
+  return status_or_entry.Map(
+      [thunk_info = std::move(thunk_info),
+       kernel_arguments = std::move(kernel_arguments),
+       call_zeroed_outputs =
+           std::move(call_zeroed_outputs)](const KernelReuseCache::Entry* entry)
+          -> absl::StatusOr<ThunkSequence> {
+        TF_ASSIGN_OR_RETURN(
+            CustomKernel custom_kernel,
+            kernel::CreateOwnedCubinCustomKernel(
+                entry->kernel_name, entry->binary,
+                kernel_arguments.args().size(),
+                entry->launch_dimensions.block_counts(),
+                entry->launch_dimensions.thread_counts_per_block(),
+                entry->shmem_bytes));
         return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
             thunk_info, std::move(custom_kernel), kernel_arguments,
             entry->use_pdl, call_zeroed_outputs, entry->tma_metadata));
@@ -2869,6 +3077,9 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   if (hlo->custom_call_target() == "__gpu$xla.gpu.triton") {
     // TODO(slebedev): Remove this after June 15th 2025.
     return EmitTritonCustomCall(custom_call);
+  }
+  if (hlo->custom_call_target() == "__gpu$xla.gpu.fly") {
+    return EmitFlyCustomCall(custom_call);
   }
   if (hlo->custom_call_target() == kNopCustomCallTarget) {
     return ThunkSequence{};

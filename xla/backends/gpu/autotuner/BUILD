@@ -340,6 +340,32 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fly",
+    srcs = ["fly.cc"],
+    hdrs = ["fly.h"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        ":gpu_codegen_backend",
+        "//xla:autotuning_proto_cc",
+        "//xla:xla_data_proto_cc",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
 xla_test(
     name = "triton_test",
     srcs = ["triton_test.cc"],
@@ -646,6 +672,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":fly",
         ":block_level_emitter",
         ":factory",
         ":fission_backend",
@@ -905,9 +932,16 @@ xla_cc_test(
 xla_cc_binary(
     name = "autotuner_main",
     srcs = ["autotuner_main.cc"],
+    linkopts = if_rocm_is_configured([
+        # The hermetic glibc 2.27 toolchain supplies C++17 filesystem through
+        # libstdc++fs.a. Keep its symbols local so that ROCm DSOs use the
+        # matching filesystem implementation from their own libstdc++.so.
+        "-Wl,--exclude-libs,libstdc++fs.a",
+    ]),
     tags = [
         "gpu",
     ],
+    visibility = ["//xla/backends/gpu/codegen/flydsl:__pkg__"],
     deps = [
         ":factory",
         ":gpu_profiler",

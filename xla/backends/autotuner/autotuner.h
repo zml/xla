@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_BACKENDS_AUTOTUNER_AUTOTUNER_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -39,6 +40,7 @@ class Autotuner {
   struct Options {
     int scratch_bytes_window_size_us = 2;
     ConfigRunner::CorrectnessCheckOptions correctness_check_options;
+    std::string dump_logs_to;
   };
 
   using Config = CodegenOrchestrator::Config;

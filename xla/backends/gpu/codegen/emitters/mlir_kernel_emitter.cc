@@ -32,6 +32,9 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
+#if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/compiler.h"
+#endif
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
@@ -344,6 +347,23 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
 
         AddRanges(kernel_func, launch_dims, module);
 
+        // Block-level MLIR emitters share XLA's occupancy contract. Triton
+        // applies this attribute in its standalone compiler; apply the same
+        // contract here for FlyDSL and other MLIR kernel emitters.
+        ASSIGN_OR_RETURN(
+            GpuBackendConfig gpu_backend_config,
+            fusion->backend_config<GpuBackendConfig>());
+        const FusionBackendConfig& fusion_backend_config =
+            gpu_backend_config.fusion_backend_config();
+        const int waves_per_eu =
+            fusion_backend_config.block_level_fusion_config().waves_per_eu();
+        if (gpu_device_info.gpu_compute_capability().IsRocm() &&
+            waves_per_eu > 0) {
+          kernel_func->addFnAttr(
+              "amdgpu-waves-per-eu",
+              absl::StrCat(waves_per_eu, ", ", waves_per_eu));
+        }
+
         module->setDataLayout(data_layout);
         module->setTargetTriple(target_triple);
 
@@ -518,6 +538,9 @@ mlir::DialectRegistry MlirKernelEmitter::GetDialectRegistry() {
       mlir::gpu::GPUDialect, mlir::math::MathDialect, mlir::mhlo::MhloDialect,
       mlir::scf::SCFDialect, mlir::tensor::TensorDialect,
       mlir::vector::VectorDialect, xla::XlaDialect, xla::gpu::XlaGpuDialect>();
+#if TENSORFLOW_USE_ROCM
+  flydsl::RegisterDialects(registry);
+#endif
   mlir::LLVM::registerInlinerInterface(registry);
   mlir::func::registerInlinerExtension(registry);
   mlir::registerBuiltinDialectTranslation(registry);
@@ -671,18 +694,68 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
 #endif
   pm.enableVerifier(should_verify);
 
-  emitters::RegisterOptimizationPasses(pm);
-  AddLoopTransformationPasses(pm, device, unroll_factor);
-  if (IsPdlEnabled(hlo_module.config().debug_options(),
-                   device.gpu_compute_capability())) {
-    pm.addPass(createInsertPDLPass());
+  bool has_native_gpu_entry =
+      !module->lookupSymbol<mlir::func::FuncOp>(entry_function_name);
+  if (has_native_gpu_entry) {
+    has_native_gpu_entry = false;
+    module->walk([&](mlir::gpu::GPUFuncOp fn) {
+      if (fn.getName() == entry_function_name && fn.isKernel()) {
+        has_native_gpu_entry = true;
+      }
+    });
   }
+
+  // Native Fly frontend IR uses gpu.module/gpu.func and already expresses its
+  // indexing, tiling, and memory accesses. XLA's tensor and loop transforms
+  // require a top-level func.func and are only applicable to XLA-emitted IR.
+  if (!has_native_gpu_entry) {
+    emitters::RegisterOptimizationPasses(pm);
+    AddLoopTransformationPasses(pm, device, unroll_factor);
+    if (IsPdlEnabled(hlo_module.config().debug_options(),
+                     device.gpu_compute_capability())) {
+      pm.addPass(createInsertPDLPass());
+    }
+  }
+#if TENSORFLOW_USE_ROCM
+  if (flydsl::HasOperations(module.get())) {
+    flydsl::AddLoweringPasses(pm);
+  }
+#endif
   AddLoweringPasses(pm, device);
 
   RETURN_IF_ERROR(
       RunPassPipeline(module.get(), hlo_module, pm, entry_function_name));
 
-  auto llvm_module = mlir::translateModuleToLLVMIR(module.get(), *llvm_context);
+  mlir::Operation* translation_root = module.get();
+  mlir::OwningOpRef<mlir::ModuleOp> flattened_gpu_module;
+  if (has_native_gpu_entry) {
+    mlir::gpu::GPUModuleOp gpu_module;
+    module->walk([&](mlir::gpu::GPUModuleOp candidate) {
+      if (candidate.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+              entry_function_name)) {
+        gpu_module = candidate;
+      }
+    });
+    TF_RET_CHECK(gpu_module)
+        << "Native GPU entry was not lowered inside a gpu.module.";
+
+    // LLVM translation accepts builtin.module, not gpu.module. The nested GPU
+    // conversion has already replaced gpu.func and its device operations with
+    // LLVM/ROCDL operations, so clone that lowered body into a temporary
+    // builtin module for translation.
+    flattened_gpu_module =
+        mlir::ModuleOp::create(gpu_module.getLoc(), gpu_module.getName());
+    mlir::OpBuilder builder(module->getContext());
+    builder.setInsertionPointToStart(flattened_gpu_module->getBody());
+    for (mlir::Operation& op :
+         gpu_module->getRegion(0).front().without_terminator()) {
+      builder.clone(op);
+    }
+    translation_root = flattened_gpu_module.get();
+  }
+
+  auto llvm_module =
+      mlir::translateModuleToLLVMIR(translation_root, *llvm_context);
   TF_RET_CHECK(llvm_module != nullptr)
       << "Failed to translate module to LLVM IR.";
 

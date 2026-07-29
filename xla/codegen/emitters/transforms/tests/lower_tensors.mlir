@@ -257,6 +257,23 @@ func.func @transpose_shared(%in: tensor<1024xf32>,
 
 // -----
 
+func.func @transfer_write_after_sync(
+    %out: tensor<16xf32>, %value: vector<4xf32>) -> tensor<16xf32> {
+  %c0 = arith.constant 0 : index
+  %synced = xla_gpu.sync_threads %out : tensor<16xf32>
+  %updated = vector.transfer_write %value, %synced[%c0]
+      {in_bounds = [true]} : vector<4xf32>, tensor<16xf32>
+  return %updated : tensor<16xf32>
+}
+// CHECK-LABEL: @transfer_write_after_sync(
+// CHECK-SAME:      %[[OUT:.*]]: !llvm.ptr
+// CHECK:         gpu.barrier
+// CHECK:         %[[ADDR:.*]] = llvm.getelementptr inbounds %[[OUT]]
+// CHECK:         llvm.store %{{.*}}, %[[ADDR]]
+// CHECK:         return
+
+// -----
+
 func.func @atomic_rmw_f32(%in: tensor<8xf32>, %i: index) -> (tensor<8xf32>) {
   %ret = xla.atomic_rmw %in[%i] : tensor<8xf32> {
     ^bb0(%current : f32):
@@ -1186,4 +1203,3 @@ func.func @get_dynamic_dim_size_unaligned(%arg0: tensor<7xf16>) -> i32 {
   %0 = xla.get_dynamic_dim_size %arg0 1 : tensor<7xf16>
   func.return %0 : i32
 }
-

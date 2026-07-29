@@ -33,6 +33,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
@@ -108,6 +109,97 @@ class CustomCallTest : public ClientLibraryTestRunnerMixin<
     LOG(FATAL) << TestName() << " was executed on an unsupported platform.";
   }
 };
+
+TEST_F(CustomCallTest, FlyMlirCustomCall) {
+  if (PlatformName() != "ROCM") {
+    GTEST_SKIP() << "Fly custom calls require ROCm";
+  }
+
+  constexpr absl::string_view kFlyIr = R"mlir(
+module {
+  func.func @add_one(%input: tensor<64xf32>, %output: tensor<64xf32>)
+      -> tensor<64xf32> {
+    %a = arith.constant dense<0.0> : vector<4xbf16>
+    %b = arith.constant dense<0.0> : vector<4xbf16>
+    %c = arith.constant dense<0.0> : vector<16xf32>
+    %atom = fly.make_mma_atom :
+      !fly.mma_atom<!fly_rocdl.cdna3.mfma<32x32x8, (bf16, bf16) -> f32>>
+    %unused = fly.mma_atom_call_ssa(%atom, %a, %b, %c) :
+      (!fly.mma_atom<!fly_rocdl.cdna3.mfma<32x32x8,
+       (bf16, bf16) -> f32>>, vector<4xbf16>, vector<4xbf16>,
+       vector<16xf32>) -> vector<16xf32>
+    %thread = gpu.thread_id x
+    %value = tensor.extract %input[%thread] : tensor<64xf32>
+    %one = arith.constant 1.0 : f32
+    %sum = arith.addf %value, %one : f32
+    %updated = tensor.insert %sum into %output[%thread] : tensor<64xf32>
+    return %updated : tensor<64xf32>
+  }
+}
+)mlir";
+  std::string backend_config = absl::StrFormat(
+      R"mlir({name = "add_one", ir = "%s", num_warps = 1 : i32,
+              grid_x = 1 : i32, grid_y = 1 : i32, grid_z = 1 : i32,
+              waves_per_eu = 2 : i32})mlir",
+      absl::CEscape(kFlyIr));
+
+  XlaBuilder builder(TestName());
+  Shape shape = ShapeUtil::MakeShape(F32, {64});
+  XlaOp input =
+      Broadcast(ConstantR0WithType(&builder, F32, 42.0), shape.dimensions());
+  CustomCall(&builder, "__gpu$xla.gpu.fly", {input}, shape, backend_config,
+             /*has_side_effect=*/false, /*output_operand_aliasing=*/{},
+             /*literal=*/nullptr,
+             /*schedule=*/CustomCallSchedule::SCHEDULE_NONE,
+             /*api_version=*/CustomCallApiVersion::API_VERSION_ORIGINAL);
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, ExecuteAndTransfer(&builder, {}));
+  EXPECT_THAT(result.data<float>(), ::testing::Each(43.0f));
+}
+
+TEST_F(CustomCallTest, NativeFlyGpuModuleCustomCall) {
+  if (PlatformName() != "ROCM") {
+    GTEST_SKIP() << "Fly custom calls require ROCm";
+  }
+
+  constexpr absl::string_view kFlyIr = R"mlir(
+module attributes {gpu.container_module} {
+  gpu.module @kernels {
+    gpu.func @native_noop(%input: !fly.ptr<f32, global>,
+                          %output: !fly.ptr<f32, global>) kernel {
+      %a = arith.constant dense<0.0> : vector<4xbf16>
+      %b = arith.constant dense<0.0> : vector<4xbf16>
+      %c = arith.constant dense<0.0> : vector<16xf32>
+      %atom = fly.make_mma_atom :
+        !fly.mma_atom<!fly_rocdl.cdna3.mfma<32x32x8, (bf16, bf16) -> f32>>
+      %unused = fly.mma_atom_call_ssa(%atom, %a, %b, %c) :
+        (!fly.mma_atom<!fly_rocdl.cdna3.mfma<32x32x8,
+         (bf16, bf16) -> f32>>, vector<4xbf16>, vector<4xbf16>,
+         vector<16xf32>) -> vector<16xf32>
+      gpu.return
+    }
+  }
+}
+)mlir";
+  std::string backend_config = absl::StrFormat(
+      R"mlir({name = "native_noop", ir = "%s", num_warps = 1 : i32,
+              grid_x = 1 : i32, grid_y = 1 : i32, grid_z = 1 : i32,
+              zeroed_outputs = [0 : i32]})mlir",
+      absl::CEscape(kFlyIr));
+
+  XlaBuilder builder(TestName());
+  Shape shape = ShapeUtil::MakeShape(F32, {64});
+  XlaOp input =
+      Broadcast(ConstantR0WithType(&builder, F32, 42.0), shape.dimensions());
+  CustomCall(&builder, "__gpu$xla.gpu.fly", {input}, shape, backend_config,
+             /*has_side_effect=*/false, /*output_operand_aliasing=*/{},
+             /*literal=*/nullptr,
+             /*schedule=*/CustomCallSchedule::SCHEDULE_NONE,
+             /*api_version=*/CustomCallApiVersion::API_VERSION_ORIGINAL);
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, ExecuteAndTransfer(&builder, {}));
+  EXPECT_THAT(result.data<float>(), ::testing::Each(0.0f));
+}
 
 // The test case for custom call with tokens encodes the arguments and result
 // type using a string with A(=Array), T(=Token) and {} for Tuples. It also

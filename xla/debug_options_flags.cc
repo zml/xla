@@ -353,6 +353,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::PARTITIONING_ALGORITHM_NOOP);
 
   opts.set_xla_gpu_enable_triton_gemm(true);
+  opts.set_xla_gpu_enable_flydsl_gemm(false);
   opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
   opts.set_xla_gpu_triton_gemm_any(true);
@@ -2406,6 +2407,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
                 bool_setter_for(&DebugOptions::set_xla_gpu_enable_triton_gemm),
                 debug_options->xla_gpu_enable_triton_gemm(),
                 "[Stable] Whether to use Triton-based matrix multiplication."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_enable_flydsl_gemm",
+      bool_setter_for(&DebugOptions::set_xla_gpu_enable_flydsl_gemm),
+      debug_options->xla_gpu_enable_flydsl_gemm(),
+      "Whether to enable the experimental FlyDSL xTile GEMM backend on ROCm."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_unsupported_enable_triton_multi_output_fusion",
       bool_setter_for(

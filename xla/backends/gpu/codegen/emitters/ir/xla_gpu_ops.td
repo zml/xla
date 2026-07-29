@@ -68,6 +68,51 @@ def XLAGPU_SyncThreadsOp : XLAGPU_Op<"sync_threads", [
   let assemblyFormat = "operands attr-dict `:` type($operands)";
 }
 
+def XLAGPU_AsyncCopyGlobalToSharedOp :
+    XLAGPU_Op<"async_copy_global_to_shared", [
+      TypesMatchWith<"result type matches destination type",
+                     "destination", "result", "$_self">
+    ]> {
+  let summary = "Copies one lane's contiguous bytes directly into LDS.";
+
+  let description = [{
+    Issues an architecture-specific asynchronous global-to-shared copy. The
+    destination index names the uniform base address for the current wave; the
+    hardware adds the lane's byte offset. This matches CDNA buffer-to-LDS copy
+    instructions and avoids staging data through vector registers.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source,
+                       Index:$source_index,
+                       AnyRankedTensor:$destination,
+                       Index:$destination_index,
+                       I32Attr:$copy_bytes);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $source `[` $source_index `]` `to` $destination
+    `[` $destination_index `]` `bytes` `=` $copy_bytes attr-dict
+    `:` type($source) `,` type($destination)
+  }];
+}
+
+def XLAGPU_BufferLoadOp : XLAGPU_Op<"buffer_load"> {
+  let summary = "Loads a contiguous vector through an AMD buffer descriptor.";
+
+  let description = [{
+    Loads a contiguous vector from a physical linear tensor offset using an
+    AMD raw buffer instruction. This preserves the BufferCopy128b operation
+    used by FlyDSL kernels instead of allowing a generic global vector load.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source, Index:$source_index);
+  let results = (outs AnyVectorOfNonZeroRank:$result);
+
+  let assemblyFormat = [{
+    $source `[` $source_index `]` attr-dict `:` type($source) `->` type($result)
+  }];
+}
+
 def XLAGPU_ShuffleReduceOp : XLAGPU_Op<"shuffle_reduce",
     [Pure,  CallOpInterface,
      TypesMatchWith<"result type matches type of operands",

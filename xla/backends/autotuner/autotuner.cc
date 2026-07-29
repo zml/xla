@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/autotuner/autotuner.h"
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -26,7 +27,11 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "google/protobuf/text_format.h"
+#include "xla/autotune_results.pb.h"
+#include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_orchestrator.h"
 #include "xla/backends/autotuner/config_runner.h"
 #include "xla/backends/autotuner/config_selector.h"
@@ -38,9 +43,36 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/tsl/concurrency/executor.h"
 #include "xla/tsl/concurrency/future.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/threadpool.h"
 
 namespace xla {
+namespace {
+
+absl::Status DumpConfigProfiles(
+    const HloInstruction& instr,
+    const std::vector<ConfigRunner::ConfigProfile>& profiles,
+    absl::string_view path) {
+  if (path.empty()) {
+    return absl::OkStatus();
+  }
+
+  AutotuningLogs logs;
+  AutotuningLog* log = logs.add_logs();
+  log->mutable_instr()->PackFrom(instr.ToProto());
+  for (const ConfigRunner::ConfigProfile& profile : profiles) {
+    *log->add_results() = profile.ToProto();
+  }
+
+  std::string textproto;
+  tsl::protobuf::TextFormat::PrintToString(logs, &textproto);
+  static absl::Mutex dump_mu;
+  absl::MutexLock lock(&dump_mu);
+  return tsl::AppendStringToFile(tsl::Env::Default(), std::string(path),
+                                 textproto);
+}
+
+}  // namespace
 
 absl::StatusOr<std::unique_ptr<Autotuner>> Autotuner::Create(
     absl_nonnull std::unique_ptr<CodegenOrchestrator> orchestrator,
@@ -160,6 +192,9 @@ tsl::Future<Autotuner::Config> Autotuner::GetTunedConfig(
 
         TF_RET_CHECK(!profiles.empty())
             << "No configs could be profiled." << instr->ToString();
+
+        RETURN_IF_ERROR(
+            DumpConfigProfiles(*instr, profiles, options_.dump_logs_to));
 
         ASSIGN_OR_RETURN(
             ConfigRunner::ConfigProfile best_profile,

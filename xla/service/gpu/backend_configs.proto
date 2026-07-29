@@ -271,6 +271,37 @@ message BlockLevelFusionConfig {
   int32 waves_per_eu = 8;
 }
 
+// FlyDSL-specific parameters for an xTile GEMM fusion.
+message FlyGemmConfig {
+  enum MfmaAtom {
+    FLY_MFMA_16X16X16 = 0;
+    FLY_MFMA_32X32X8 = 1;
+  }
+
+  int64 block_m = 1;
+  int64 block_n = 2;
+  int64 block_k = 3;
+  int64 num_warps = 4;
+  MfmaAtom mfma_atom = 5;
+  // Keep the next RHS tile in registers while the current tile executes.
+  // This raises register pressure, so the autotuner selects it per shape.
+  bool prefetch_rhs = 6;
+  // Reuse the LHS LDS allocation to transpose the accumulator tile, then
+  // write contiguous output vectors to global memory.
+  bool stage_output = 7;
+  // Request an exact number of resident waves per execution unit. Zero leaves
+  // occupancy unconstrained.
+  int32 waves_per_eu = 8;
+  // Emit ROCDL scheduling groups matching FlyDSL's tuned GEMM kernels.
+  bool schedule_instructions = 9;
+  // Stage a K-minor logical [K,N] RHS in LDS using FlyDSL's physical [N,K]
+  // tile layout.
+  bool stage_rhs = 10;
+  // Use FlyDSL's gfx942 B_TO_LDS=false pipeline: copy A directly to LDS while
+  // double-buffering 128-bit RHS fragments in VGPRs.
+  bool async_lhs = 11;
+}
+
 // A backend config for dynamic-slice and dynamic-update-slice instructions
 // whose runtime offset is a simple function of the parent loop iteration.
 // Only set on instructions where offset analysis succeeds; absence of this
@@ -296,7 +327,7 @@ message DynamicSliceConfig {
   int64 byte_stride = 3;
 }
 
-// Next id: 8
+// Next id: 9
 message FusionBackendConfig {
   // kLoop, kInput, or kOutput (from HloInstruction::FusionKind), or your own
   // custom string.
@@ -313,8 +344,8 @@ message FusionBackendConfig {
   // present, we use the default Triton config.
   AutotuneResult.TritonGemmKey triton_gemm_config = 2;
 
-  // Only valid when kind is "__triton" or "__triton_nested_gemm_fusion". Code
-  // generation of such fusions will fail if this field is not set.
+  // Valid for xTile-scheduled Triton and FlyDSL fusions. Code generation of
+  // such fusions will fail if this field is not set.
   BlockLevelFusionConfig block_level_fusion_config = 6;
 
   // Only valid when kind == "__custom_fusion".
@@ -323,6 +354,9 @@ message FusionBackendConfig {
   // Cost model prediction.
 
   CuDnnFusionConfig cudnn_fusion_config = 5;
+
+  // Only valid for FlyDSL GEMM and GEMV fusions.
+  FlyGemmConfig fly_gemm_config = 8;
 
   reserved 3, 7;
   reserved "dynamic_memcpy_config";
