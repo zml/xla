@@ -19,8 +19,10 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "xla/error_spec.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -28,7 +30,9 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/primitive_util.h"
+#include "xla/service/pattern_matcher.h"
 #include "xla/shape.h"
 #include "xla/tests/restricted/hlo_test_base_legacy.h"
 #include "xla/tsl/platform/statusor.h"
@@ -37,6 +41,8 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 namespace {
+
+namespace m = ::xla::match;
 
 struct ScaledDotRewriterTestCase {
   PrimitiveType operand_type;
@@ -198,6 +204,69 @@ TEST_F(ScaledDotRewriterElementSizeTest, FilterCallbackBehavior) {
   EXPECT_TRUE(changed_apply);
 }
 
+constexpr absl::string_view kUnclaimedScaledDot = R"(
+    HloModule m
+    ENTRY main {
+      lhs = bf16[32,64] parameter(0)
+      rhs = bf16[16,64] parameter(1)
+      lhs_scale = bf16[] parameter(2)
+      rhs_scale = bf16[16,2] parameter(3)
+      ROOT d = f32[32,16] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+          lhs_contracting_dims={1}, rhs_contracting_dims={1}
+    }
+  )";
+
+TEST_F(ScaledDotRewriterElementSizeTest, FailsAtTheFloorWhenAskedTo) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kUnclaimedScaledDot));
+  ScaledDotRewriter rewriter(/*extra_filter=*/nullptr,
+                             ScaledDotRewriter::OnFallback::kFail);
+  absl::Status status = rewriter.Run(module.get()).status();
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("post-layout dequantize floor"));
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("xla_gpu_scaled_dot_expand_on_fallback"));
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kScaledDot);
+}
+
+TEST_F(ScaledDotRewriterElementSizeTest, WarnAndExpandStillExpands) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(kUnclaimedScaledDot));
+  ScaledDotRewriter rewriter(/*extra_filter=*/nullptr,
+                             ScaledDotRewriter::OnFallback::kWarnAndExpand);
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              GmockMatch(m::Dot()));
+}
+
+TEST_F(ScaledDotRewriterElementSizeTest, ScalarScaleIsMultiplied) {
+  const char* hlo = R"(
+    HloModule m
+    ENTRY main {
+      lhs = bf16[32,64] parameter(0)
+      rhs = bf16[16,64] parameter(1)
+      lhs_scale = bf16[] parameter(2)
+      rhs_scale = bf16[16,2] parameter(3)
+      ROOT d = f32[32,16] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+          lhs_contracting_dims={1}, rhs_contracting_dims={1}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
+  ScaledDotRewriter rewriter;
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_THAT(
+      module->entry_computation()->root_instruction(),
+      GmockMatch(m::Dot(
+          m::Multiply(m::Parameter(0), m::Broadcast(m::Parameter(2))),
+          m::Multiply(m::Parameter(1),
+                      m::Reshape(m::Broadcast(m::Parameter(3)))))));
+}
+
 TEST_F(ScaledDotRewriterElementSizeTest, SelectiveFilterCallbackBehavior) {
   const std::string hlo_string = R"(
     HloModule module
@@ -253,6 +322,8 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::ValuesIn<ScaledDotRewriterTestCase>({
         {PrimitiveType::F8E4M3FN, PrimitiveType::F8E8M0FNU},
         {PrimitiveType::F8E5M2, PrimitiveType::F8E8M0FNU},
+        {PrimitiveType::F8E4M3FN, PrimitiveType::BF16},
+        {PrimitiveType::F4E2M1FN, PrimitiveType::F8E4M3FN},
         {PrimitiveType::BF16, PrimitiveType::BF16},
         {PrimitiveType::S4, PrimitiveType::BF16},
     }),

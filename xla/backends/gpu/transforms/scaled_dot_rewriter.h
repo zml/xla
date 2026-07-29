@@ -33,11 +33,14 @@ namespace gpu {
 // instructions, including Convert, Broadcast, Reshape, Multiply, and Dot.
 class ScaledDotRewriter : public HloModulePass {
  public:
+  enum class OnFallback { kExpand, kWarnAndExpand, kFail };
+
   // If `extra_filter` is provided, only ScaledDot instructions for which
   // `extra_filter(instr)` returns `true` are rewritten. Instructions for which
   // it returns `false` are preserved as ScaledDot.
-  explicit ScaledDotRewriter(HloPredicate extra_filter = nullptr)
-      : extra_filter_(std::move(extra_filter)) {}
+  explicit ScaledDotRewriter(HloPredicate extra_filter = nullptr,
+                             OnFallback on_fallback = OnFallback::kExpand)
+      : extra_filter_(std::move(extra_filter)), on_fallback_(on_fallback) {}
 
   absl::string_view name() const override { return "scaled-dot-rewriter"; }
 
@@ -50,6 +53,7 @@ class ScaledDotRewriter : public HloModulePass {
 
  private:
   HloPredicate extra_filter_;
+  OnFallback on_fallback_;
 };
 
 }  // namespace gpu
