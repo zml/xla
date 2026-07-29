@@ -1695,6 +1695,11 @@ message DebugOptions {
   // We need this to enable triton scaled dot emitter for testing.
   optional bool xla_gpu_experimental_scaled_dot_with_triton = 410;
 
+  // If true, a block-scaled matmul the Triton emitter would take is instead
+  // lowered from XTile to CUDA Tile IR and assembled by tileiras. A fusion the
+  // CUDA Tile IR backend cannot express falls back to Triton.
+  optional bool xla_gpu_experimental_scaled_dot_with_tile_ir = 524;
+
   // If true, use third-party library raft::matrix::select_k to implement TopK.
   // DEPRECATED: Use top_k(is_stable=False) instead. This flag will be no-op
   // in the future.
@@ -1747,7 +1752,7 @@ message DebugOptions {
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
 
-  // Next id: 524
+  // Next id: 525
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

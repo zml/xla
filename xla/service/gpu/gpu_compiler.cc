@@ -1715,7 +1715,15 @@ bool GpuCompiler::IsScaledDotSupportedByBackend(
       instr->GetModule()->config().debug_options();
   const se::GpuComputeCapability& gpu_version =
       gpu_target_config.device_description.gpu_compute_capability();
-  return debug_options.xla_gpu_experimental_scaled_dot_with_triton() &&
+  // Either fusion backend is reason enough to form the fusion -- they consume
+  // the same XTile module, so the structural check below is shared and the
+  // autotuner settles which one emits. Gating on the Triton flag alone made
+  // "Tile IR only" unreachable: with Triton off no fusion was formed, so the
+  // Tile IR backend never saw one and the op fell to the dequant floor.
+  const bool a_fusion_backend_wants_it =
+      debug_options.xla_gpu_experimental_scaled_dot_with_triton() ||
+      debug_options.xla_gpu_experimental_scaled_dot_with_tile_ir();
+  return a_fusion_backend_wants_it &&
          IsTritonSupportedInstruction(*instr, gpu_version).IsAllowed();
 }
 

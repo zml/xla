@@ -3454,6 +3454,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
           &DebugOptions::set_xla_gpu_experimental_scaled_dot_with_triton),
       debug_options->xla_gpu_experimental_scaled_dot_with_triton(),
       "If true, use the Triton emitter for scaled dot."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_scaled_dot_with_tile_ir",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_experimental_scaled_dot_with_tile_ir),
+      debug_options->xla_gpu_experimental_scaled_dot_with_tile_ir(),
+      "If true, lower a scaled dot from XTile to CUDA Tile IR and assemble it "
+      "with tileiras instead of going through Triton. Falls back to Triton for "
+      "any fusion the CUDA Tile IR backend cannot express."));
 
   flag_list->push_back(tsl::Flag(
       "xla_cpu_collective_call_warn_stuck_timeout_seconds",
