@@ -148,11 +148,20 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
   HloComputation* computation = dot->parent();
   HloInstruction* operand = dot->mutable_operand(operand_index);
   HloInstruction* scale = dot->mutable_operand(scale_index);
-  if (scale->shape().dimensions().empty()) {
-    // If the scale is a scalar, we don't need to do anything.
-    return operand;
-  }
   std::tie(operand, scale) = UpscaleBoth(operand, scale);
+  // A rank-0 scale is still a real scale and has to be applied.
+  if (scale->shape().dimensions().size() !=
+      operand->shape().dimensions().size()) {
+    HloInstruction* scalar_scale = scale;
+    if (!scale->shape().dimensions().empty()) {
+      scalar_scale = computation->AddInstruction(HloInstruction::CreateReshape(
+          ShapeUtil::MakeShape(scale->shape().element_type(), {}), scale));
+    }
+    HloInstruction* broadcasted_scale = computation->AddInstruction(
+        HloInstruction::CreateBroadcast(operand->shape(), scalar_scale, {}));
+    return computation->AddInstruction(HloInstruction::CreateBinary(
+        operand->shape(), HloOpcode::kMultiply, operand, broadcasted_scale));
+  }
   ABSL_RETURN_IF_ERROR(CheckOperandAndScaleShapes(side, operand, scale));
   HloInstruction* broadcasted_scale =
       BroadcastAndReshape(scale, operand->shape(), computation);
