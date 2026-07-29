@@ -398,6 +398,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_experimental_collective_cse_distance_threshold(0);
 
   opts.set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(false);
+  opts.set_xla_gpu_scaled_dot_expand_on_fallback(false);
   opts.set_xla_partitioning_algorithm(
       DebugOptions::PARTITIONING_ALGORITHM_NOOP);
 
@@ -2648,6 +2649,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "[x,z]param -> [x,y,z]broadcast -> [x*y,z]bitcast -> multiply -> dot. "
       "Performance can be worse, because some block sizes / split-k > 1 "
       "is not considered for subchannel dequant fusions."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_scaled_dot_expand_on_fallback",
+      bool_setter_for(&DebugOptions::set_xla_gpu_scaled_dot_expand_on_fallback),
+      debug_options->xla_gpu_scaled_dot_expand_on_fallback(),
+      "Expand a scaled dot that no backend claimed into a dequantize and a "
+      "plain dot at the post-layout floor, with a warning, instead of failing "
+      "the compile."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_triton_heroless_priority_fusion",
       bool_setter_for(

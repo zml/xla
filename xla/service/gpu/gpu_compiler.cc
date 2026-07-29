@@ -2144,6 +2144,12 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
 
+    pipeline.AddPass<ScaledDotRewriter>(
+        /*extra_filter=*/nullptr,
+        debug_options.xla_gpu_scaled_dot_expand_on_fallback()
+            ? ScaledDotRewriter::OnFallback::kWarnAndExpand
+            : ScaledDotRewriter::OnFallback::kFail);
+
     // Rewrite GEMMs into custom calls.
     AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
     AddGemmRewriterPasses(
