@@ -108,6 +108,14 @@ inline constexpr absl::string_view kTritonGemmFusionKind = "__triton_gemm";
 inline constexpr absl::string_view kTritonNestedGemmFusionKind =
     "__triton_nested_gemm_fusion";
 
+// Fusions the CUDA Tile IR backend claims. Carries a block_level_fusion_config
+// like the Triton kinds, but its tile sizes come from the Tile IR autotuner
+// backend, which wants much larger tiles -- a Tile IR tile is what one whole CTA
+// computes. TileIrBackend::ApplyConfig is the only thing that stamps it, so a
+// fusion carrying it that cannot be lowered is a bug in the bid-time CanLower
+// check, not a cue to try another backend.
+inline constexpr absl::string_view kTileIrFusionKind = "__tile_ir";
+
 // Fusions that use Triton have FusionBackendConfig.kind equal to this string.
 inline constexpr absl::string_view kCuDnnFusionKind = "__cudnn$fusion";
 
