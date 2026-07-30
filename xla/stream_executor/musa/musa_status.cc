@@ -115,6 +115,7 @@ absl::StatusCode DriverStatusCode(MUresult result) {
 
     case MUSA_ERROR_OUT_OF_MEMORY:
     case MUSA_ERROR_LAUNCH_OUT_OF_RESOURCES:
+    case MUSA_ERROR_TOO_MANY_PEERS:
       return absl::StatusCode::kResourceExhausted;
 
     case MUSA_ERROR_NO_BINARY_FOR_GPU:
@@ -132,7 +133,11 @@ absl::StatusCode DriverStatusCode(MUresult result) {
     case MUSA_ERROR_CONTEXT_IS_DESTROYED:
     case MUSA_ERROR_SYSTEM_DRIVER_MISMATCH:
     case MUSA_ERROR_STUB_LIBRARY:
+    case MUSA_ERROR_PEER_ACCESS_NOT_ENABLED:
       return absl::StatusCode::kFailedPrecondition;
+
+    case MUSA_ERROR_PEER_ACCESS_ALREADY_ENABLED:
+      return absl::StatusCode::kAlreadyExists;
 
     case MUSA_ERROR_PEER_ACCESS_UNSUPPORTED:
     case MUSA_ERROR_NOT_SUPPORTED:

@@ -817,6 +817,26 @@ cc_library(
 )
 
 xla_cc_test(
+    name = "se_gpu_pjrt_compiler_topology_test",
+    srcs = ["se_gpu_pjrt_compiler_topology_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    target_compatible_with = if_musa([], ["@platforms//:incompatible"]),
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        ":se_gpu_topology_description",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/service:gpu_topology",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
     name = "se_gpu_topology_description_test",
     srcs = ["se_gpu_topology_description_test.cc"],
     deps = [

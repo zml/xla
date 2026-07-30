@@ -28,7 +28,6 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_compiler.h"
@@ -43,11 +42,49 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/fingerprint.h"
 
 namespace xla {
+namespace {
+
+absl::StatusOr<GpuTopologyProto> EffectiveGpuTopologyProto(
+    const GpuTopology& gpu_topology,
+    const std::optional<stream_executor::GpuTargetConfigProto>&
+        target_config) {
+  GpuTopologyProto proto = gpu_topology.ToProto();
+  if (target_config.has_value()) {
+    *proto.mutable_gpu_target_config() = *target_config;
+  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<const GpuTopology> canonical_topology,
+                      GpuTopology::FromProto(proto));
+  return canonical_topology->ToProto();
+}
+
+}  // namespace
+
+bool StreamExecutorGpuTopologyDescription::operator==(
+    const StreamExecutorGpuTopologyDescription& other) const {
+  if (platform_id() != other.platform_id() ||
+      platform_name() != other.platform_name() ||
+      platform_version() != other.platform_version()) {
+    return false;
+  }
+  absl::StatusOr<GpuTopologyProto> topology =
+      EffectiveGpuTopologyProto(*gpu_topology_, target_config_);
+  absl::StatusOr<GpuTopologyProto> other_topology =
+      EffectiveGpuTopologyProto(*other.gpu_topology_, other.target_config_);
+  if (!topology.ok() || !other_topology.ok()) return false;
+
+  std::string serialized;
+  std::string other_serialized;
+  return tsl::SerializeToStringDeterministic(*topology, &serialized) &&
+         tsl::SerializeToStringDeterministic(*other_topology,
+                                             &other_serialized) &&
+         serialized == other_serialized;
+}
 
 /*static*/ void StreamExecutorGpuTopologyDescription::SetupDeviceDescription(
     PjRtStreamExecutorDeviceDescription& description,
@@ -134,28 +171,38 @@ StreamExecutorGpuTopologyDescription::CreateDeviceDescription(
       partition_index, std::string(platform_version()));
   if (target_config_.has_value()) {
     std::string compute_capability = "<unknown compute-capability>";
-    std::string gpu_vendor = "<unknown gpu vendor>";
-    if (target_config_->gpu_device_info().has_cuda_compute_capability()) {
+    const stream_executor::GpuDeviceInfoProto& device_info =
+        target_config_->gpu_device_info();
+    std::string gpu_vendor = device_info.device_vendor().empty()
+                                 ? "<unknown gpu vendor>"
+                                 : device_info.device_vendor();
+    if (device_info.has_cuda_compute_capability()) {
       const auto& cap =
-          target_config_->gpu_device_info().cuda_compute_capability();
+          device_info.cuda_compute_capability();
       compute_capability = absl::StrCat(cap.major(), ".", cap.minor());
-      gpu_vendor = "NVIDIA Corporation";
+      if (device_info.device_vendor().empty()) {
+        gpu_vendor = "NVIDIA Corporation";
+      }
+    } else if (device_info.has_musa_compute_capability()) {
+      compute_capability =
+          device_info.musa_compute_capability().architecture();
     }
 
     StreamExecutorGpuTopologyDescription::SetupDeviceDescription(
         *description, gpu_vendor, compute_capability,
-        target_config_->gpu_device_info().core_count(),
-        target_config_->gpu_device_info().device_memory_size(),
-        target_config_->gpu_device_info().shared_memory_per_block_optin(),
-        /*partition_index=*/0, /*fabric_uuid=*/"");
+        device_info.core_count(), device_info.device_memory_size(),
+        device_info.shared_memory_per_block_optin(),
+        partition_index, /*fabric_uuid=*/"");
   }
   return description;
 }
 
 absl::StatusOr<uint64_t> StreamExecutorGpuTopologyDescription::Fingerprint()
     const {
+  TF_ASSIGN_OR_RETURN(GpuTopologyProto topology_proto,
+                      EffectiveGpuTopologyProto(*gpu_topology_, target_config_));
   std::string result;
-  if (!tsl::SerializeToStringDeterministic(gpu_topology_->ToProto(), &result)) {
+  if (!tsl::SerializeToStringDeterministic(topology_proto, &result)) {
     return absl::InternalError("Failed to serialize gpu_topology");
   }
   return tsl::Fingerprint64(result);
@@ -279,7 +326,8 @@ StreamExecutorGpuTopologyDescription::ToProto() const {
   proto.set_platform_version(platform_version());
   proto.set_is_subslice_topology(is_subslice_topology());
 
-  GpuTopologyProto gpu_topology_proto = gpu_topology_->ToProto();
+  TF_ASSIGN_OR_RETURN(GpuTopologyProto gpu_topology_proto,
+                      EffectiveGpuTopologyProto(*gpu_topology_, target_config_));
   proto.mutable_platform_specific_topology()->PackFrom(gpu_topology_proto);
   return proto;
 }

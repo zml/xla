@@ -15,8 +15,11 @@ limitations under the License.
 
 #include "xla/pjrt/gpu/se_gpu_topology_description.h"
 
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -84,6 +87,100 @@ TEST(StreamExecutorGpuTopologyDescriptionTest, SymmetricTopology) {
   CheckDeviceDescription(*device_descs[21], 21, 5, {2, 1, 1});
   CheckDeviceDescription(*device_descs[22], 22, 5, {2, 1, 2});
   CheckDeviceDescription(*device_descs[23], 23, 5, {2, 1, 3});
+}
+
+
+TEST(StreamExecutorGpuTopologyDescriptionTest,
+     MusaTargetConfigPreservesMetadataAndAssignments) {
+  std::shared_ptr<xla::GpuTopology> gpu_topology =
+      std::make_shared<xla::GpuTopology>(
+          /*platform_version=*/"MUSA 4.0.1", /*num_partitions=*/2,
+          /*num_hosts_per_partition=*/1, /*num_devices_per_host=*/2);
+
+  stream_executor::GpuTargetConfigProto target_config;
+  stream_executor::GpuDeviceInfoProto* device_info =
+      target_config.mutable_gpu_device_info();
+  device_info->set_device_vendor("Moore Threads");
+  device_info->set_core_count(32);
+  device_info->set_threads_per_warp(128);
+  device_info->set_device_memory_size(INT64_C(17089384448));
+  device_info->set_shared_memory_per_block_optin(65536);
+  stream_executor::MusaComputeCapabilityProto* capability =
+      device_info->mutable_musa_compute_capability();
+  capability->set_architecture("mp_21");
+  capability->set_major(2);
+  capability->set_minor(1);
+  capability->set_hardware_warp_size(128);
+  capability->set_logical_subgroup_size(32);
+
+  StreamExecutorGpuTopologyDescription topology_desc(
+      xla::MusaId(), xla::MusaName(), gpu_topology,
+      /*attributes=*/{}, target_config);
+
+  const auto device_descs = topology_desc.DeviceDescriptions();
+  ASSERT_EQ(device_descs.size(), 4);
+  CheckDeviceDescription(*device_descs[0], 0, 0, {0, 0, 0});
+  CheckDeviceDescription(*device_descs[1], 1, 0, {0, 0, 1});
+  CheckDeviceDescription(*device_descs[2], 2, 1, {1, 0, 0});
+  CheckDeviceDescription(*device_descs[3], 3, 1, {1, 0, 1});
+
+  const auto& first_attributes = device_descs[0]->Attributes();
+  EXPECT_EQ(std::get<std::string>(first_attributes.at("device_vendor")),
+            "Moore Threads");
+  EXPECT_EQ(std::get<std::string>(first_attributes.at("compute_capability")),
+            "mp_21");
+  EXPECT_EQ(std::get<int64_t>(first_attributes.at("core_count")), 32);
+  EXPECT_EQ(std::get<int64_t>(
+                first_attributes.at("device_memory_bytes_limit")),
+            INT64_C(17089384448));
+  EXPECT_EQ(std::get<int64_t>(first_attributes.at("partition_index")), 0);
+  EXPECT_TRUE(
+      std::get<std::string>(first_attributes.at("fabric_uuid")).empty());
+
+  const auto& last_attributes = device_descs[3]->Attributes();
+  EXPECT_EQ(std::get<int64_t>(last_attributes.at("partition_index")), 1);
+  TF_ASSERT_OK_AND_ASSIGN(uint64_t first_fingerprint,
+                          topology_desc.Fingerprint());
+  TF_ASSERT_OK_AND_ASSIGN(uint64_t second_fingerprint,
+                          topology_desc.Fingerprint());
+  EXPECT_EQ(first_fingerprint, second_fingerprint);
+
+  TF_ASSERT_OK_AND_ASSIGN(PjRtTopologyDescriptionProto serialized,
+                          topology_desc.ToProto());
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StreamExecutorGpuTopologyDescription> roundtrip,
+      StreamExecutorGpuTopologyDescription::FromProto(serialized));
+  const auto roundtrip_devices = roundtrip->DeviceDescriptions();
+  ASSERT_EQ(roundtrip_devices.size(), 4);
+  const auto& roundtrip_attributes = roundtrip_devices[3]->Attributes();
+  EXPECT_EQ(std::get<std::string>(
+                roundtrip_attributes.at("compute_capability")),
+            "mp_21");
+  EXPECT_EQ(std::get<int64_t>(
+                roundtrip_attributes.at("partition_index")),
+            1);
+  TF_ASSERT_OK_AND_ASSIGN(uint64_t roundtrip_fingerprint,
+                          roundtrip->Fingerprint());
+  EXPECT_EQ(roundtrip_fingerprint, first_fingerprint);
+  EXPECT_EQ(*roundtrip, topology_desc);
+
+  stream_executor::GpuTargetConfigProto other_target_config = target_config;
+  other_target_config.mutable_gpu_device_info()
+      ->mutable_musa_compute_capability()
+      ->set_architecture("mp_31");
+  other_target_config.mutable_gpu_device_info()
+      ->mutable_musa_compute_capability()
+      ->set_major(3);
+  other_target_config.mutable_gpu_device_info()
+      ->mutable_musa_compute_capability()
+      ->set_minor(1);
+  StreamExecutorGpuTopologyDescription other_topology_desc(
+      xla::MusaId(), xla::MusaName(), gpu_topology,
+      /*attributes=*/{}, std::move(other_target_config));
+  TF_ASSERT_OK_AND_ASSIGN(uint64_t other_fingerprint,
+                          other_topology_desc.Fingerprint());
+  EXPECT_NE(other_fingerprint, first_fingerprint);
+  EXPECT_FALSE(other_topology_desc == topology_desc);
 }
 
 TEST(StreamExecutorGpuTopologyDescriptionTest, AsymmetricTopology) {

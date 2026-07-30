@@ -107,10 +107,6 @@ absl::Status MusaStream::WaitFor(Stream* other) {
   if (other_stream == nullptr) {
     return absl::InvalidArgumentError("Expected another MUSA stream.");
   }
-  if (other_stream->executor_ != executor_) {
-    return absl::FailedPreconditionError(
-        "Cross-executor MUSA stream dependencies are not supported");
-  }
   RETURN_IF_ERROR(other_stream->RecordCompletedEvent());
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
   return MusaRuntime::Get()->StreamWaitEvent(
@@ -156,9 +152,29 @@ absl::Status MusaStream::Memcpy(DeviceAddressBase* gpu_dst,
                                 const DeviceAddressBase& gpu_src,
                                 uint64_t size) {
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
-  return MusaRuntime::Get()->MemcpyAsync(gpu_dst->opaque(), gpu_src.opaque(),
-                                         size, MusaMemcpyKind::kDeviceToDevice,
-                                         stream_handle_);
+  if (size == 0 || gpu_dst->is_null() || gpu_src.is_null()) {
+    return MusaRuntime::Get()->MemcpyAsync(
+        gpu_dst->opaque(), gpu_src.opaque(), size,
+        MusaMemcpyKind::kDeviceToDevice, stream_handle_);
+  }
+
+  MusaDriver& driver = MusaDriver::Instance();
+  MUdeviceptr destination = absl::bit_cast<MUdeviceptr>(gpu_dst->opaque());
+  MUdeviceptr source = absl::bit_cast<MUdeviceptr>(gpu_src.opaque());
+  absl::StatusOr<MUcontext> destination_context =
+      driver.ContextForPointer(destination);
+  if (!destination_context.ok()) return destination_context.status();
+  absl::StatusOr<MUcontext> source_context = driver.ContextForPointer(source);
+  if (!source_context.ok()) return source_context.status();
+
+  if (*destination_context == *source_context) {
+    return MusaRuntime::Get()->MemcpyAsync(
+        gpu_dst->opaque(), gpu_src.opaque(), size,
+        MusaMemcpyKind::kDeviceToDevice, stream_handle_);
+  }
+  return driver.MemcpyPeerAsync(
+      destination, *destination_context, source, *source_context, size,
+      reinterpret_cast<MUstream>(stream_handle_));
 }
 
 absl::Status MusaStream::MemZero(DeviceAddressBase* location, uint64_t size) {

@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -48,6 +49,12 @@ using MuGetProcAddressFn = MUresult(MUSAAPI*)(const char* symbol,
 using MuDriverGetVersionFn = MUresult(MUSAAPI*)(int* version);
 using MuDeviceGetCountFn = MUresult(MUSAAPI*)(int* count);
 using MuDeviceGetFn = MUresult(MUSAAPI*)(MUdevice* device, int ordinal);
+using MuDeviceCanAccessPeerFn = MUresult(MUSAAPI*)(int* can_access_peer,
+                                                   MUdevice source,
+                                                   MUdevice peer);
+using MuDeviceGetP2PAttributeFn = MUresult(MUSAAPI*)(
+    int* value, MUdevice_P2PAttribute attribute, MUdevice source,
+    MUdevice peer);
 using MuDevicePrimaryCtxRetainFn = MUresult(MUSAAPI*)(MUcontext* context,
                                                       MUdevice device);
 using MuDevicePrimaryCtxReleaseV2Fn = MUresult(MUSAAPI*)(MUdevice device);
@@ -60,6 +67,13 @@ using MuCtxSetCurrentFn = MUresult(MUSAAPI*)(MUcontext context);
 using MuCtxGetCurrentFn = MUresult(MUSAAPI*)(MUcontext* context);
 using MuCtxGetDeviceFn = MUresult(MUSAAPI*)(MUdevice* device);
 using MuCtxSynchronizeFn = MUresult(MUSAAPI*)();
+using MuCtxEnablePeerAccessFn = MUresult(MUSAAPI*)(MUcontext peer_context,
+                                                   unsigned int flags);
+using MuPointerGetAttributeFn = MUresult(MUSAAPI*)(
+    void* value, MUpointer_attribute attribute, MUdeviceptr pointer);
+using MuMemcpyPeerAsyncFn = MUresult(MUSAAPI*)(
+    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
+    MUcontext source_context, size_t bytes, MUstream stream);
 using MuModuleLoadDataFn = MUresult(MUSAAPI*)(MUmodule* module,
                                               const void* image);
 using MuModuleUnloadFn = MUresult(MUSAAPI*)(MUmodule module);
@@ -149,6 +163,8 @@ struct MusaDriver::Api {
   MuDriverGetVersionFn driver_get_version = nullptr;
   MuDeviceGetCountFn device_get_count = nullptr;
   MuDeviceGetFn device_get = nullptr;
+  MuDeviceCanAccessPeerFn device_can_access_peer = nullptr;
+  MuDeviceGetP2PAttributeFn device_get_p2p_attribute = nullptr;
   MuDevicePrimaryCtxRetainFn primary_context_retain = nullptr;
   MuDevicePrimaryCtxReleaseV2Fn primary_context_release = nullptr;
   MuDevicePrimaryCtxGetStateFn primary_context_get_state = nullptr;
@@ -157,6 +173,9 @@ struct MusaDriver::Api {
   MuCtxGetCurrentFn context_get_current = nullptr;
   MuCtxGetDeviceFn context_get_device = nullptr;
   MuCtxSynchronizeFn context_synchronize = nullptr;
+  MuCtxEnablePeerAccessFn context_enable_peer_access = nullptr;
+  MuPointerGetAttributeFn pointer_get_attribute = nullptr;
+  MuMemcpyPeerAsyncFn memcpy_peer_async = nullptr;
   MuModuleLoadDataFn module_load_data = nullptr;
   MuModuleUnloadFn module_unload = nullptr;
   MuModuleGetFunctionFn module_get_function = nullptr;
@@ -245,6 +264,11 @@ absl::Status MusaDriver::Initialize() {
                         "muDeviceGetCount", "muDeviceGetCount");
   MUSA_RESOLVE_REQUIRED(device_get, MuDeviceGetFn, "muDeviceGet",
                         "muDeviceGet");
+  MUSA_RESOLVE_REQUIRED(device_can_access_peer, MuDeviceCanAccessPeerFn,
+                        "muDeviceCanAccessPeer", "muDeviceCanAccessPeer");
+  MUSA_RESOLVE_REQUIRED(device_get_p2p_attribute, MuDeviceGetP2PAttributeFn,
+                        "muDeviceGetP2PAttribute",
+                        "muDeviceGetP2PAttribute");
   MUSA_RESOLVE_REQUIRED(primary_context_retain, MuDevicePrimaryCtxRetainFn,
                         "muDevicePrimaryCtxRetain", "muDevicePrimaryCtxRetain");
   MUSA_RESOLVE_REQUIRED(primary_context_release, MuDevicePrimaryCtxReleaseV2Fn,
@@ -266,6 +290,12 @@ absl::Status MusaDriver::Initialize() {
                         "muCtxGetDevice");
   MUSA_RESOLVE_REQUIRED(context_synchronize, MuCtxSynchronizeFn,
                         "muCtxSynchronize", "muCtxSynchronize");
+  MUSA_RESOLVE_REQUIRED(context_enable_peer_access, MuCtxEnablePeerAccessFn,
+                        "muCtxEnablePeerAccess", "muCtxEnablePeerAccess");
+  MUSA_RESOLVE_REQUIRED(pointer_get_attribute, MuPointerGetAttributeFn,
+                        "muPointerGetAttribute", "muPointerGetAttribute");
+  MUSA_RESOLVE_REQUIRED(memcpy_peer_async, MuMemcpyPeerAsyncFn,
+                        "muMemcpyPeerAsync", "muMemcpyPeerAsync");
   MUSA_RESOLVE_REQUIRED(module_load_data, MuModuleLoadDataFn,
                         "muModuleLoadData", "muModuleLoadData");
   MUSA_RESOLVE_REQUIRED(module_unload, MuModuleUnloadFn, "muModuleUnload",
@@ -323,6 +353,95 @@ absl::StatusOr<MUdevice> MusaDriver::Device(int ordinal) {
   status = ResultStatus(api_->device_get(&device, ordinal), "muDeviceGet");
   if (!status.ok()) return status;
   return device;
+}
+
+absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
+    MUdevice source, MUdevice peer) {
+  if (source == peer) {
+    return absl::InvalidArgumentError(
+        "MUSA peer access requires two distinct devices");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+
+  int can_access_peer = -1;
+  status = ResultStatus(
+      api_->device_can_access_peer(&can_access_peer, source, peer),
+      "muDeviceCanAccessPeer");
+  if (!status.ok()) return status;
+  if (can_access_peer != 0 && can_access_peer != 1) {
+    return absl::InternalError(absl::StrCat(
+        "muDeviceCanAccessPeer returned success with a non-boolean value: ",
+        can_access_peer));
+  }
+  if (can_access_peer == 0) return MusaPeerAccessInfo{};
+
+  auto get_attribute =
+      [&](MUdevice_P2PAttribute attribute,
+          const char* attribute_name) -> absl::StatusOr<int> {
+    int value = -1;
+    absl::Status attribute_status = ResultStatus(
+        api_->device_get_p2p_attribute(&value, attribute, source, peer),
+        "muDeviceGetP2PAttribute");
+    if (!attribute_status.ok()) {
+      return absl::Status(
+          attribute_status.code(),
+          absl::StrCat(attribute_status.message(), " for ", attribute_name,
+                       " from device ", source, " to device ", peer));
+    }
+    return value;
+  };
+  auto without_link_attributes = [&](absl::string_view reason) {
+    LOG(WARNING) << "MUSA device " << source << " can access peer " << peer
+                 << ", but optional link telemetry is unavailable: "
+                 << reason;
+    return MusaPeerAccessInfo{.can_access_peer = true};
+  };
+
+  absl::StatusOr<int> performance_rank = get_attribute(
+      MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK, "performance rank");
+  if (!performance_rank.ok()) {
+    return without_link_attributes(performance_rank.status().message());
+  }
+  absl::StatusOr<int> native_atomic = get_attribute(
+      MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED,
+      "native atomic support");
+  if (!native_atomic.ok()) {
+    return without_link_attributes(native_atomic.status().message());
+  }
+  absl::StatusOr<int> musa_array = get_attribute(
+      MU_DEVICE_P2P_ATTRIBUTE_MUSA_ARRAY_ACCESS_SUPPORTED,
+      "MUSA array access support");
+  if (!musa_array.ok()) {
+    return without_link_attributes(musa_array.status().message());
+  }
+  absl::StatusOr<int> mtlink_ports = get_attribute(
+      MU_DEVICE_P2P_ATTRIBUTE_MTLINK_PORT_COUNT, "MTLink port count");
+  if (!mtlink_ports.ok()) {
+    return without_link_attributes(mtlink_ports.status().message());
+  }
+
+  if (*performance_rank < 0 || *mtlink_ports < 0) {
+    return without_link_attributes(absl::StrCat(
+        "muDeviceGetP2PAttribute returned success with a negative topology "
+        "value: performance_rank=",
+        *performance_rank, ", mtlink_port_count=", *mtlink_ports));
+  }
+  if ((*native_atomic != 0 && *native_atomic != 1) ||
+      (*musa_array != 0 && *musa_array != 1)) {
+    return without_link_attributes(absl::StrCat(
+        "muDeviceGetP2PAttribute returned success with a non-boolean support "
+        "value: native_atomic=",
+        *native_atomic, ", musa_array=", *musa_array));
+  }
+  return MusaPeerAccessInfo{
+      .can_access_peer = true,
+      .link_attributes_available = true,
+      .performance_rank = *performance_rank,
+      .native_atomic_supported = *native_atomic != 0,
+      .musa_array_access_supported = *musa_array != 0,
+      .mtlink_port_count = *mtlink_ports,
+  };
 }
 
 absl::StatusOr<MUcontext> MusaDriver::RetainPrimaryContext(MUdevice device) {
@@ -395,6 +514,60 @@ absl::Status MusaDriver::SynchronizeContext() {
   absl::Status status = Init();
   if (!status.ok()) return status;
   return ResultStatus(api_->context_synchronize(), "muCtxSynchronize");
+}
+
+absl::Status MusaDriver::EnablePeerAccess(MUcontext peer_context) {
+  if (peer_context == nullptr) {
+    return absl::InvalidArgumentError(
+        "muCtxEnablePeerAccess requires a non-null peer context");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  MUresult result =
+      api_->context_enable_peer_access(peer_context, MU_PEERACCESS_DEFAULT);
+  if (result == MUSA_ERROR_PEER_ACCESS_ALREADY_ENABLED) {
+    return absl::OkStatus();
+  }
+  return ResultStatus(result, "muCtxEnablePeerAccess");
+}
+
+absl::StatusOr<MUcontext> MusaDriver::ContextForPointer(MUdeviceptr pointer) {
+  if (pointer == 0) {
+    return absl::InvalidArgumentError(
+        "muPointerGetAttribute requires a non-null pointer");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  MUcontext context = nullptr;
+  status = ResultStatus(
+      api_->pointer_get_attribute(&context, MU_POINTER_ATTRIBUTE_CONTEXT,
+                                  pointer),
+      "muPointerGetAttribute");
+  if (!status.ok()) return status;
+  if (context == nullptr) {
+    return absl::InternalError(
+        "muPointerGetAttribute returned success with a null context");
+  }
+  return context;
+}
+
+absl::Status MusaDriver::MemcpyPeerAsync(
+    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
+    MUcontext source_context, uint64_t bytes, MUstream stream) {
+  if (destination == 0 || source == 0) {
+    return absl::InvalidArgumentError(
+        "muMemcpyPeerAsync requires non-null source and destination pointers");
+  }
+  if (destination_context == nullptr || source_context == nullptr) {
+    return absl::InvalidArgumentError(
+        "muMemcpyPeerAsync requires non-null source and destination contexts");
+  }
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  return ResultStatus(api_->memcpy_peer_async(
+                          destination, destination_context, source,
+                          source_context, bytes, stream),
+                      "muMemcpyPeerAsync");
 }
 
 absl::StatusOr<MUmodule> MusaDriver::LoadModuleData(const void* image) {

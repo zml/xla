@@ -129,6 +129,22 @@ StreamExecutorGpuCompiler::StreamExecutorGpuCompiler(
     PjRtPlatformId pjrt_platform_id, std::unique_ptr<Compiler> compiler)
     : compiler_(std::move(compiler)), pjrt_platform_id_(pjrt_platform_id) {}
 
+absl::StatusOr<std::unique_ptr<PjRtTopologyDescription>>
+StreamExecutorGpuCompiler::DeserializePjRtTopologyDescription(
+    const std::string& serialized_topology) {
+  PjRtTopologyDescriptionProto proto;
+  if (!proto.ParseFromString(serialized_topology)) {
+    return absl::InvalidArgumentError(
+        "Failed to parse StreamExecutor GPU topology from string.");
+  }
+  if (proto.platform_id() != pjrt_platform_id_) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Serialized topology platform id ", proto.platform_id(),
+        " does not match compiler platform id ", pjrt_platform_id_, "."));
+  }
+  return StreamExecutorGpuTopologyDescription::FromProto(proto);
+}
+
 absl::StatusOr<Compiler*> StreamExecutorGpuCompiler::GetOrCreateCompiler() {
   absl::MutexLock lock(compiler_mutex_);
   if (compiler_ == nullptr) {

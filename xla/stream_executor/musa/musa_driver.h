@@ -33,6 +33,30 @@ struct MusaPrimaryContextState {
   bool active;
 };
 
+// Directional facts for accesses issued by `source` to allocations owned by
+// `peer`. The link attributes are meaningful only when `can_access_peer` is
+// true. MUSA peer access is unidirectional, so callers must not reuse one
+// result for the reverse direction.
+struct MusaPeerAccessInfo {
+  bool can_access_peer = false;
+  bool link_attributes_available = false;
+  int performance_rank = 0;
+  bool native_atomic_supported = false;
+  bool musa_array_access_supported = false;
+  int mtlink_port_count = 0;
+
+  friend bool operator==(const MusaPeerAccessInfo& lhs,
+                         const MusaPeerAccessInfo& rhs) {
+    return lhs.can_access_peer == rhs.can_access_peer &&
+           lhs.link_attributes_available == rhs.link_attributes_available &&
+           lhs.performance_rank == rhs.performance_rank &&
+           lhs.native_atomic_supported == rhs.native_atomic_supported &&
+           lhs.musa_array_access_supported ==
+               rhs.musa_array_access_supported &&
+           lhs.mtlink_port_count == rhs.mtlink_port_count;
+  }
+};
+
 // Address and size of a named global owned by a loaded MUSA module. The
 // address remains valid only while the module remains loaded.
 struct MusaModuleGlobal {
@@ -60,6 +84,8 @@ class MusaDriver {
   virtual absl::StatusOr<int> DriverVersion();
   virtual absl::StatusOr<int> DeviceCount();
   virtual absl::StatusOr<MUdevice> Device(int ordinal);
+  virtual absl::StatusOr<MusaPeerAccessInfo> PeerAccessInfo(
+      MUdevice source, MUdevice peer);
 
   virtual absl::StatusOr<MUcontext> RetainPrimaryContext(MUdevice device);
   virtual absl::Status ReleasePrimaryContext(MUdevice device);
@@ -72,6 +98,14 @@ class MusaDriver {
   virtual absl::StatusOr<MUcontext> CurrentContext();
   virtual absl::StatusOr<MUdevice> CurrentDevice();
   virtual absl::Status SynchronizeContext();
+  // Enables the qualified default path from the current context to
+  // `peer_context`. An already-enabled mapping is successful.
+  virtual absl::Status EnablePeerAccess(MUcontext peer_context);
+  virtual absl::StatusOr<MUcontext> ContextForPointer(MUdeviceptr pointer);
+  virtual absl::Status MemcpyPeerAsync(
+      MUdeviceptr destination, MUcontext destination_context,
+      MUdeviceptr source, MUcontext source_context, uint64_t bytes,
+      MUstream stream);
 
   virtual absl::StatusOr<MUmodule> LoadModuleData(const void* image);
   virtual absl::Status UnloadModule(MUmodule module);

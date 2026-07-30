@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +33,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -44,6 +46,7 @@ limitations under the License.
 #include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
+#include "xla/stream_executor/gpu/read_numa_node.h"
 #include "xla/stream_executor/gpu/scoped_activate_context.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
@@ -70,6 +73,7 @@ limitations under the License.
 #include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream.h"
+#include "tsl/platform/numa.h"
 
 #ifndef XLA_MUSA_TOOLKIT_VERSION
 #define XLA_MUSA_TOOLKIT_VERSION 0
@@ -206,8 +210,25 @@ absl::Status MusaExecutor::Init() {
   std::unique_ptr<ActivateContext> activation = Activate();
   TF_RETURN_IF_ERROR(MusaRuntime::Get()->Init());
   TF_RETURN_IF_ERROR(MusaRuntime::Get()->SetDevice(device_ordinal()));
+
+  peer_access_cache_.clear();
+  TF_ASSIGN_OR_RETURN(int device_count, driver_->DeviceCount());
+  for (int peer_ordinal = 0; peer_ordinal < device_count; ++peer_ordinal) {
+    if (peer_ordinal == device_ordinal()) {
+      peer_access_cache_[peer_ordinal] = MusaPeerAccessInfo{
+          .can_access_peer = true,
+      };
+      continue;
+    }
+    TF_ASSIGN_OR_RETURN(MUdevice peer_device, driver_->Device(peer_ordinal));
+    TF_ASSIGN_OR_RETURN(
+        peer_access_cache_[peer_ordinal],
+        driver_->PeerAccessInfo(context_->device(), peer_device));
+  }
+
   TF_ASSIGN_OR_RETURN(std::unique_ptr<DeviceDescription> description,
                       CreateDeviceDescription());
+  numa_node_ = description->numa_node();
   const MusaComputeCapability* capability =
       description->gpu_compute_capability().musa_compute_capability();
   if (capability == nullptr || capability->architecture().empty()) {
@@ -388,12 +409,65 @@ void MusaExecutor::DeallocateStream(Stream* stream) {
 }
 
 absl::Status MusaExecutor::EnablePeerAccessTo(StreamExecutor* other) {
-  return absl::UnimplementedError(
-      "MUSA peer access is not implemented in PJRT GPU v1.");
+  auto* musa_other = dynamic_cast<MusaExecutor*>(other);
+  if (musa_other == nullptr) {
+    return absl::InvalidArgumentError(
+        "MUSA peer access requires another MUSA executor");
+  }
+  if (context_ == nullptr || musa_other->context_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Both MUSA executors must be initialized before enabling peer access");
+  }
+  if (device_ordinal() == musa_other->device_ordinal()) {
+    return absl::OkStatus();
+  }
+  if (!CanEnablePeerAccessTo(musa_other->device_ordinal())) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "MUSA device ", device_ordinal(), " cannot access peer device ",
+        musa_other->device_ordinal()));
+  }
+  gpu::ScopedActivateContext activation(context_.get());
+  return driver_->EnablePeerAccess(musa_other->context_->context());
 }
 
 bool MusaExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {
-  return false;
+  auto* musa_other = dynamic_cast<MusaExecutor*>(other);
+  return musa_other != nullptr &&
+         CanEnablePeerAccessTo(musa_other->device_ordinal());
+}
+
+bool MusaExecutor::CanEnablePeerAccessTo(int other_device_ordinal) {
+  auto peer = peer_access_cache_.find(other_device_ordinal);
+  return peer != peer_access_cache_.end() && peer->second.can_access_peer;
+}
+
+absl::StatusOr<std::string> MusaExecutor::GetInterconnectStatus() const {
+  if (context_ == nullptr || peer_access_cache_.empty()) {
+    return absl::FailedPreconditionError(
+        "MUSA executor must be initialized before querying interconnects");
+  }
+
+  std::vector<int> peer_ordinals;
+  peer_ordinals.reserve(peer_access_cache_.size());
+  for (const auto& peer : peer_access_cache_) {
+    peer_ordinals.push_back(peer.first);
+  }
+  std::sort(peer_ordinals.begin(), peer_ordinals.end());
+
+  std::string status =
+      absl::StrFormat("MUSA peer topology v1: source=%d", device_ordinal());
+  for (int peer_ordinal : peer_ordinals) {
+    const MusaPeerAccessInfo& peer = peer_access_cache_.at(peer_ordinal);
+    absl::StrAppendFormat(
+        &status,
+        "; peer=%d,access=%d,details=%d,performance_rank=%d,native_atomic=%d,"
+        "musa_array=%d,mtlink_ports=%d",
+        peer_ordinal, peer.can_access_peer ? 1 : 0,
+        peer.link_attributes_available ? 1 : 0, peer.performance_rank,
+        peer.native_atomic_supported ? 1 : 0,
+        peer.musa_array_access_supported ? 1 : 0, peer.mtlink_port_count);
+  }
+  return status;
 }
 
 bool MusaExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
@@ -446,6 +520,35 @@ MusaExecutor::CreateDeviceDescription(int device_ordinal) {
     };
     TF_ASSIGN_OR_RETURN(DeviceDescription description,
                         BuildMusaDeviceDescription(properties, versions));
+
+    std::optional<int> numa_node =
+        gpu::ReadNumaNode(properties.pci_bus_id, device_ordinal);
+    description.set_numa_node(numa_node.has_value()
+                                  ? std::max(0, *numa_node)
+                                  : tsl::port::kNUMANoAffinity);
+
+    TF_ASSIGN_OR_RETURN(MUdevice source_device,
+                        driver.Device(device_ordinal));
+    TF_ASSIGN_OR_RETURN(int device_count, driver.DeviceCount());
+    int active_mtlink_ports = 0;
+    for (int peer_ordinal = 0; peer_ordinal < device_count; ++peer_ordinal) {
+      if (peer_ordinal == device_ordinal) continue;
+      TF_ASSIGN_OR_RETURN(MUdevice peer_device, driver.Device(peer_ordinal));
+      TF_ASSIGN_OR_RETURN(MusaPeerAccessInfo peer,
+                          driver.PeerAccessInfo(source_device, peer_device));
+      if (!peer.can_access_peer || !peer.link_attributes_available) continue;
+      if (peer.mtlink_port_count >
+          std::numeric_limits<int>::max() - active_mtlink_ports) {
+        return absl::InternalError(
+            "MUSA MTLink port count exceeds DeviceDescription range");
+      }
+      active_mtlink_ports += peer.mtlink_port_count;
+    }
+    DeviceInterconnectInfo interconnect;
+    interconnect.active_links = active_mtlink_ports;
+    // MUSA 4.0.1 exposes no trustworthy fabric-domain identifier. Empty
+    // cluster/clique IDs prevent false PJRT partition grouping.
+    description.set_device_interconnect_info(std::move(interconnect));
     return std::make_unique<DeviceDescription>(std::move(description));
   }();
   absl::Status restore_status = driver.SetCurrentContext(previous_context);

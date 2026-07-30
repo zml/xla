@@ -95,6 +95,36 @@ struct FakeApiState {
   int primary_active = 1;
   MUcontext current_context = reinterpret_cast<MUcontext>(0x5678);
   MUdevice current_device = 11;
+  int peer_can_access = 1;
+  MUresult peer_can_access_result = MUSA_SUCCESS;
+  MUdevice last_peer_source = -1;
+  MUdevice last_peer_target = -1;
+  std::atomic<int> peer_can_access_calls{0};
+  std::unordered_map<int, int> p2p_attributes = {
+      {MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK, 7},
+      {MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED, 1},
+      {MU_DEVICE_P2P_ATTRIBUTE_MUSA_ARRAY_ACCESS_SUPPORTED, 0},
+      {MU_DEVICE_P2P_ATTRIBUTE_MTLINK_PORT_COUNT, 2},
+  };
+  std::vector<MUdevice_P2PAttribute> queried_p2p_attributes;
+  MUresult p2p_attribute_result = MUSA_SUCCESS;
+  MUcontext last_enabled_peer_context = nullptr;
+  unsigned int last_peer_flags = ~0u;
+  std::atomic<int> enable_peer_calls{0};
+  MUresult enable_peer_result = MUSA_SUCCESS;
+  MUcontext pointer_context = reinterpret_cast<MUcontext>(0x3344);
+  MUdeviceptr last_pointer = 0;
+  MUpointer_attribute last_pointer_attribute = MU_POINTER_ATTRIBUTE_CONTEXT;
+  std::atomic<int> pointer_attribute_calls{0};
+  MUresult pointer_attribute_result = MUSA_SUCCESS;
+  MUdeviceptr last_copy_destination = 0;
+  MUcontext last_copy_destination_context = nullptr;
+  MUdeviceptr last_copy_source = 0;
+  MUcontext last_copy_source_context = nullptr;
+  size_t last_copy_bytes = 0;
+  MUstream last_copy_stream = nullptr;
+  std::atomic<int> peer_copy_calls{0};
+  MUresult peer_copy_result = MUSA_SUCCESS;
   std::atomic<int> release_calls{0};
   MUresult release_result = MUSA_SUCCESS;
   MUresult set_flags_result = MUSA_SUCCESS;
@@ -247,6 +277,26 @@ MUresult MUSAAPI FakeMuDeviceGet(MUdevice* device, int ordinal) {
   return MUSA_SUCCESS;
 }
 
+MUresult MUSAAPI FakeMuDeviceCanAccessPeer(int* can_access_peer,
+                                           MUdevice source, MUdevice peer) {
+  ++g_state->peer_can_access_calls;
+  g_state->last_peer_source = source;
+  g_state->last_peer_target = peer;
+  *can_access_peer = g_state->peer_can_access;
+  return g_state->peer_can_access_result;
+}
+
+MUresult MUSAAPI FakeMuDeviceGetP2PAttribute(
+    int* value, MUdevice_P2PAttribute attribute, MUdevice source,
+    MUdevice peer) {
+  g_state->last_peer_source = source;
+  g_state->last_peer_target = peer;
+  g_state->queried_p2p_attributes.push_back(attribute);
+  auto found = g_state->p2p_attributes.find(attribute);
+  *value = found == g_state->p2p_attributes.end() ? -1 : found->second;
+  return g_state->p2p_attribute_result;
+}
+
 MUresult MUSAAPI FakeMuDevicePrimaryCtxRetain(MUcontext* context,
                                               MUdevice device) {
   EXPECT_EQ(device, 10);
@@ -292,6 +342,39 @@ MUresult MUSAAPI FakeMuCtxGetDevice(MUdevice* device) {
 }
 
 MUresult MUSAAPI FakeMuCtxSynchronize() { return MUSA_SUCCESS; }
+
+MUresult MUSAAPI FakeMuCtxEnablePeerAccess(MUcontext peer_context,
+                                            unsigned int flags) {
+  ++g_state->enable_peer_calls;
+  g_state->last_enabled_peer_context = peer_context;
+  g_state->last_peer_flags = flags;
+  return g_state->enable_peer_result;
+}
+
+MUresult MUSAAPI FakeMuPointerGetAttribute(void* value,
+                                           MUpointer_attribute attribute,
+                                           MUdeviceptr pointer) {
+  ++g_state->pointer_attribute_calls;
+  g_state->last_pointer = pointer;
+  g_state->last_pointer_attribute = attribute;
+  if (g_state->pointer_attribute_result == MUSA_SUCCESS) {
+    *static_cast<MUcontext*>(value) = g_state->pointer_context;
+  }
+  return g_state->pointer_attribute_result;
+}
+
+MUresult MUSAAPI FakeMuMemcpyPeerAsync(
+    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
+    MUcontext source_context, size_t bytes, MUstream stream) {
+  ++g_state->peer_copy_calls;
+  g_state->last_copy_destination = destination;
+  g_state->last_copy_destination_context = destination_context;
+  g_state->last_copy_source = source;
+  g_state->last_copy_source_context = source_context;
+  g_state->last_copy_bytes = bytes;
+  g_state->last_copy_stream = stream;
+  return g_state->peer_copy_result;
+}
 
 MUresult MUSAAPI FakeMuModuleLoadData(MUmodule* module, const void* image) {
   ++g_state->module_load_calls;
@@ -377,6 +460,8 @@ void InstallRequiredDlsymSymbols(FakeSymbolLoader& loader) {
   loader.Add("muDriverGetVersion", &FakeMuDriverGetVersion);
   loader.Add("muDeviceGetCount", &FakeMuDeviceGetCount);
   loader.Add("muDeviceGet", &FakeMuDeviceGet);
+  loader.Add("muDeviceCanAccessPeer", &FakeMuDeviceCanAccessPeer);
+  loader.Add("muDeviceGetP2PAttribute", &FakeMuDeviceGetP2PAttribute);
   loader.Add("muDevicePrimaryCtxRetain", &FakeMuDevicePrimaryCtxRetain);
   loader.Add("muDevicePrimaryCtxRelease_v2", &FakeMuDevicePrimaryCtxRelease);
   loader.Add("muDevicePrimaryCtxGetState", &FakeMuDevicePrimaryCtxGetState);
@@ -385,6 +470,9 @@ void InstallRequiredDlsymSymbols(FakeSymbolLoader& loader) {
   loader.Add("muCtxGetCurrent", &FakeMuCtxGetCurrent);
   loader.Add("muCtxGetDevice", &FakeMuCtxGetDevice);
   loader.Add("muCtxSynchronize", &FakeMuCtxSynchronize);
+  loader.Add("muCtxEnablePeerAccess", &FakeMuCtxEnablePeerAccess);
+  loader.Add("muPointerGetAttribute", &FakeMuPointerGetAttribute);
+  loader.Add("muMemcpyPeerAsync", &FakeMuMemcpyPeerAsync);
   loader.Add("muModuleLoadData", &FakeMuModuleLoadData);
   loader.Add("muModuleUnload", &FakeMuModuleUnload);
   loader.Add("muModuleGetFunction", &FakeMuModuleGetFunction);
@@ -402,6 +490,10 @@ void InstallGpaSymbols(FakeApiState& state) {
   state.gpa_symbols["muDeviceGetCount"] =
       reinterpret_cast<void*>(&FakeMuDeviceGetCount);
   state.gpa_symbols["muDeviceGet"] = reinterpret_cast<void*>(&FakeMuDeviceGet);
+  state.gpa_symbols["muDeviceCanAccessPeer"] =
+      reinterpret_cast<void*>(&FakeMuDeviceCanAccessPeer);
+  state.gpa_symbols["muDeviceGetP2PAttribute"] =
+      reinterpret_cast<void*>(&FakeMuDeviceGetP2PAttribute);
   state.gpa_symbols["muDevicePrimaryCtxRetain"] =
       reinterpret_cast<void*>(&FakeMuDevicePrimaryCtxRetain);
   state.gpa_symbols["muDevicePrimaryCtxRelease"] =
@@ -418,6 +510,12 @@ void InstallGpaSymbols(FakeApiState& state) {
       reinterpret_cast<void*>(&FakeMuCtxGetDevice);
   state.gpa_symbols["muCtxSynchronize"] =
       reinterpret_cast<void*>(&FakeMuCtxSynchronize);
+  state.gpa_symbols["muCtxEnablePeerAccess"] =
+      reinterpret_cast<void*>(&FakeMuCtxEnablePeerAccess);
+  state.gpa_symbols["muPointerGetAttribute"] =
+      reinterpret_cast<void*>(&FakeMuPointerGetAttribute);
+  state.gpa_symbols["muMemcpyPeerAsync"] =
+      reinterpret_cast<void*>(&FakeMuMemcpyPeerAsync);
   state.gpa_symbols["muModuleLoadData"] =
       reinterpret_cast<void*>(&FakeMuModuleLoadData);
   state.gpa_symbols["muModuleUnload"] =
@@ -466,6 +564,22 @@ TEST_F(MusaDriverTest, CompleteTableWithoutGetProcAddress) {
   absl::StatusOr<MUdevice> device = driver.Device(0);
   ASSERT_TRUE(device.ok());
   EXPECT_EQ(*device, 10);
+  absl::StatusOr<MusaPeerAccessInfo> peer = driver.PeerAccessInfo(10, 11);
+  ASSERT_TRUE(peer.ok()) << peer.status();
+  EXPECT_EQ(*peer, (MusaPeerAccessInfo{
+                       .can_access_peer = true,
+                       .link_attributes_available = true,
+                       .performance_rank = 7,
+                       .native_atomic_supported = true,
+                       .musa_array_access_supported = false,
+                       .mtlink_port_count = 2,
+                   }));
+  EXPECT_EQ(state_.last_peer_source, 10);
+  EXPECT_EQ(state_.last_peer_target, 11);
+  MUcontext peer_context = reinterpret_cast<MUcontext>(0x8888);
+  EXPECT_TRUE(driver.EnablePeerAccess(peer_context).ok());
+  EXPECT_EQ(state_.last_enabled_peer_context, peer_context);
+  EXPECT_EQ(state_.last_peer_flags, MU_PEERACCESS_DEFAULT);
   absl::StatusOr<MUcontext> retained = driver.RetainPrimaryContext(10);
   ASSERT_TRUE(retained.ok());
   EXPECT_EQ(*retained, state_.retained_context);
@@ -539,6 +653,176 @@ TEST_F(MusaDriverTest, CompleteTableWithoutGetProcAddress) {
   EXPECT_TRUE(driver.ReleasePrimaryContext(10).ok());
   EXPECT_EQ(state_.release_calls, 1);
   EXPECT_EQ(loader_ptr->load_calls, 1);
+}
+
+TEST_F(MusaDriverTest, PeerFactsAreDirectionalAndSkipInaccessibleAttributes) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  absl::StatusOr<MusaPeerAccessInfo> forward =
+      driver.PeerAccessInfo(/*source=*/10, /*peer=*/11);
+  ASSERT_TRUE(forward.ok()) << forward.status();
+  EXPECT_TRUE(forward->can_access_peer);
+  EXPECT_TRUE(forward->link_attributes_available);
+  EXPECT_EQ(forward->performance_rank, 7);
+  EXPECT_TRUE(forward->native_atomic_supported);
+  EXPECT_FALSE(forward->musa_array_access_supported);
+  EXPECT_EQ(forward->mtlink_port_count, 2);
+  EXPECT_EQ(state_.last_peer_source, 10);
+  EXPECT_EQ(state_.last_peer_target, 11);
+  EXPECT_EQ(state_.queried_p2p_attributes,
+            (std::vector<MUdevice_P2PAttribute>{
+                MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK,
+                MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED,
+                MU_DEVICE_P2P_ATTRIBUTE_MUSA_ARRAY_ACCESS_SUPPORTED,
+                MU_DEVICE_P2P_ATTRIBUTE_MTLINK_PORT_COUNT,
+            }));
+
+  state_.peer_can_access = 0;
+  state_.queried_p2p_attributes.clear();
+  absl::StatusOr<MusaPeerAccessInfo> reverse =
+      driver.PeerAccessInfo(/*source=*/11, /*peer=*/10);
+  ASSERT_TRUE(reverse.ok()) << reverse.status();
+  EXPECT_EQ(*reverse, MusaPeerAccessInfo{});
+  EXPECT_EQ(state_.last_peer_source, 11);
+  EXPECT_EQ(state_.last_peer_target, 10);
+  EXPECT_TRUE(state_.queried_p2p_attributes.empty());
+}
+
+TEST_F(MusaDriverTest, PeerQueriesRejectInvalidCapabilityAndDegradeTelemetry) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_EQ(driver.PeerAccessInfo(10, 10).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.peer_can_access_calls, 0);
+
+  state_.peer_can_access = 2;
+  absl::Status non_boolean = driver.PeerAccessInfo(10, 11).status();
+  EXPECT_EQ(non_boolean.code(), absl::StatusCode::kInternal);
+  EXPECT_TRUE(absl::StrContains(non_boolean.message(), "non-boolean"));
+
+  state_.peer_can_access = 1;
+  state_.p2p_attributes[MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK] = -1;
+  absl::StatusOr<MusaPeerAccessInfo> negative =
+      driver.PeerAccessInfo(10, 11);
+  ASSERT_TRUE(negative.ok()) << negative.status();
+  EXPECT_TRUE(negative->can_access_peer);
+  EXPECT_FALSE(negative->link_attributes_available);
+  EXPECT_EQ(negative->performance_rank, 0);
+  EXPECT_EQ(negative->mtlink_port_count, 0);
+
+  state_.p2p_attributes[MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK] = 7;
+  state_.p2p_attributes[MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED] = 2;
+  absl::StatusOr<MusaPeerAccessInfo> malformed_boolean =
+      driver.PeerAccessInfo(10, 11);
+  ASSERT_TRUE(malformed_boolean.ok()) << malformed_boolean.status();
+  EXPECT_TRUE(malformed_boolean->can_access_peer);
+  EXPECT_FALSE(malformed_boolean->link_attributes_available);
+}
+
+TEST_F(MusaDriverTest, PeerErrorsAreCanonicalAndEnableIsIdempotent) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  state_.peer_can_access_result = MUSA_ERROR_INVALID_DEVICE;
+  absl::Status query = driver.PeerAccessInfo(10, 11).status();
+  EXPECT_EQ(query.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(absl::StrContains(query.message(), "muDeviceCanAccessPeer"));
+
+  state_.peer_can_access_result = MUSA_SUCCESS;
+  state_.p2p_attribute_result = MUSA_ERROR_INVALID_VALUE;
+  absl::StatusOr<MusaPeerAccessInfo> attribute =
+      driver.PeerAccessInfo(10, 11);
+  ASSERT_TRUE(attribute.ok()) << attribute.status();
+  EXPECT_TRUE(attribute->can_access_peer);
+  EXPECT_FALSE(attribute->link_attributes_available);
+
+  EXPECT_EQ(driver.EnablePeerAccess(nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.enable_peer_calls, 0);
+
+  MUcontext source_context = reinterpret_cast<MUcontext>(0x1111);
+  MUcontext peer_context = reinterpret_cast<MUcontext>(0x2222);
+  ASSERT_TRUE(driver.SetCurrentContext(source_context).ok());
+  ASSERT_TRUE(driver.EnablePeerAccess(peer_context).ok());
+  EXPECT_EQ(state_.current_context, source_context);
+  EXPECT_EQ(state_.last_enabled_peer_context, peer_context);
+  EXPECT_EQ(state_.last_peer_flags, MU_PEERACCESS_DEFAULT);
+
+  state_.enable_peer_result = MUSA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
+  EXPECT_TRUE(driver.EnablePeerAccess(peer_context).ok());
+  EXPECT_EQ(state_.enable_peer_calls, 2);
+
+  state_.enable_peer_result = MUSA_ERROR_PEER_ACCESS_UNSUPPORTED;
+  absl::Status unsupported = driver.EnablePeerAccess(peer_context);
+  EXPECT_EQ(unsupported.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_TRUE(absl::StrContains(unsupported.message(),
+                                "muCtxEnablePeerAccess"));
+
+  state_.enable_peer_result = MUSA_ERROR_TOO_MANY_PEERS;
+  EXPECT_EQ(driver.EnablePeerAccess(peer_context).code(),
+            absl::StatusCode::kResourceExhausted);
+}
+
+TEST_F(MusaDriverTest, PointerContextsAndPeerCopiesPreserveExactAbi) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_EQ(driver.ContextForPointer(0).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.pointer_attribute_calls, 0);
+
+  constexpr MUdeviceptr kDestination = 0xaaaabbbb;
+  constexpr MUdeviceptr kSource = 0xccccdddd;
+  absl::StatusOr<MUcontext> pointer_context =
+      driver.ContextForPointer(kDestination);
+  ASSERT_TRUE(pointer_context.ok()) << pointer_context.status();
+  EXPECT_EQ(*pointer_context, state_.pointer_context);
+  EXPECT_EQ(state_.last_pointer, kDestination);
+  EXPECT_EQ(state_.last_pointer_attribute, MU_POINTER_ATTRIBUTE_CONTEXT);
+
+  state_.pointer_context = nullptr;
+  EXPECT_EQ(driver.ContextForPointer(kSource).status().code(),
+            absl::StatusCode::kInternal);
+  state_.pointer_attribute_result = MUSA_ERROR_INVALID_VALUE;
+  EXPECT_EQ(driver.ContextForPointer(kSource).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  state_.pointer_attribute_result = MUSA_SUCCESS;
+  state_.pointer_context = reinterpret_cast<MUcontext>(0x3344);
+
+  MUcontext destination_context = reinterpret_cast<MUcontext>(0x1111);
+  MUcontext source_context = reinterpret_cast<MUcontext>(0x2222);
+  MUstream stream = reinterpret_cast<MUstream>(0x3333);
+  EXPECT_EQ(driver
+                .MemcpyPeerAsync(0, destination_context, kSource,
+                                 source_context, 4096, stream)
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(driver
+                .MemcpyPeerAsync(kDestination, nullptr, kSource,
+                                 source_context, 4096, stream)
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(state_.peer_copy_calls, 0);
+
+  EXPECT_TRUE(driver
+                  .MemcpyPeerAsync(kDestination, destination_context, kSource,
+                                   source_context, 4096, stream)
+                  .ok());
+  EXPECT_EQ(state_.peer_copy_calls, 1);
+  EXPECT_EQ(state_.last_copy_destination, kDestination);
+  EXPECT_EQ(state_.last_copy_destination_context, destination_context);
+  EXPECT_EQ(state_.last_copy_source, kSource);
+  EXPECT_EQ(state_.last_copy_source_context, source_context);
+  EXPECT_EQ(state_.last_copy_bytes, 4096);
+  EXPECT_EQ(state_.last_copy_stream, stream);
+
+  state_.peer_copy_result = MUSA_ERROR_PEER_ACCESS_NOT_ENABLED;
+  absl::Status not_enabled = driver.MemcpyPeerAsync(
+      kDestination, destination_context, kSource, source_context, 4096, stream);
+  EXPECT_EQ(not_enabled.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(absl::StrContains(not_enabled.message(), "muMemcpyPeerAsync"));
 }
 
 TEST_F(MusaDriverTest, FourArgumentGetProcAddress) {
@@ -636,6 +920,8 @@ TEST_F(MusaDriverTest, EveryMissingRequiredCapabilityIsNamed) {
       {"muDriverGetVersion", {"muDriverGetVersion"}},
       {"muDeviceGetCount", {"muDeviceGetCount"}},
       {"muDeviceGet", {"muDeviceGet"}},
+      {"muDeviceCanAccessPeer", {"muDeviceCanAccessPeer"}},
+      {"muDeviceGetP2PAttribute", {"muDeviceGetP2PAttribute"}},
       {"muDevicePrimaryCtxRetain", {"muDevicePrimaryCtxRetain"}},
       {"muDevicePrimaryCtxRelease",
        {"muDevicePrimaryCtxRelease_v2", "muDevicePrimaryCtxRelease"}},
@@ -646,6 +932,9 @@ TEST_F(MusaDriverTest, EveryMissingRequiredCapabilityIsNamed) {
       {"muCtxGetCurrent", {"muCtxGetCurrent"}},
       {"muCtxGetDevice", {"muCtxGetDevice"}},
       {"muCtxSynchronize", {"muCtxSynchronize"}},
+      {"muCtxEnablePeerAccess", {"muCtxEnablePeerAccess"}},
+      {"muPointerGetAttribute", {"muPointerGetAttribute"}},
+      {"muMemcpyPeerAsync", {"muMemcpyPeerAsync"}},
       {"muModuleLoadData", {"muModuleLoadData"}},
       {"muModuleUnload", {"muModuleUnload"}},
       {"muModuleGetFunction", {"muModuleGetFunction"}},

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_executor.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/status/status_matchers.h"
 #include "xla/stream_executor/activate_context.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_allocator.h"
@@ -31,6 +33,8 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/semantic_version.h"
+#include "xla/stream_executor/stream.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor::musa {
@@ -49,6 +53,12 @@ TEST(MusaExecutorTest, S80DeviceDescriptionUsesLiveQueries) {
   EXPECT_EQ(description->name(), "MTT S80");
   EXPECT_EQ(description->device_vendor(), "Moore Threads");
   EXPECT_FALSE(description->pci_bus_id().empty());
+  // NUMA discovery returns -1 when sysfs topology is unavailable.
+  EXPECT_GE(description->numa_node(), -1);
+  EXPECT_GE(description->device_interconnect_info().active_links, 0);
+  EXPECT_TRUE(
+      description->device_interconnect_info().cluster_uuid.empty());
+  EXPECT_TRUE(description->device_interconnect_info().clique_id.empty());
   EXPECT_GT(description->runtime_version(), (SemanticVersion{0, 0, 0}));
   EXPECT_GT(description->driver_version(), (SemanticVersion{0, 0, 0}));
   EXPECT_EQ(description->compile_time_toolkit_version(),
@@ -135,6 +145,168 @@ TEST(MusaExecutorTest, S80PrimaryContextInitializesActivatesAndTearsDown) {
   // MusaContext tests verify the exact clear/release call balance; here we
   // verify that teardown leaves the driver usable.
   EXPECT_TRUE(driver.CurrentContext().ok());
+}
+
+TEST(MusaExecutorTest, SelfPeerTopologyIsStableAndIdempotent) {
+  MusaExecutor executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(int device_count,
+                          MusaDriver::Instance().DeviceCount());
+  TF_ASSERT_OK(executor.Init());
+
+  EXPECT_TRUE(executor.CanEnablePeerAccessTo(/*other_device_ordinal=*/0));
+  EXPECT_TRUE(executor.CanEnablePeerAccessTo(&executor));
+  EXPECT_FALSE(executor.CanEnablePeerAccessTo(/*other_device_ordinal=*/-1));
+  EXPECT_FALSE(executor.CanEnablePeerAccessTo(device_count));
+  TF_ASSERT_OK(executor.EnablePeerAccessTo(&executor));
+  TF_ASSERT_OK(executor.EnablePeerAccessTo(&executor));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::string status,
+                          executor.GetInterconnectStatus());
+  EXPECT_EQ(status.find("MUSA peer topology v1: source=0"), 0);
+  EXPECT_NE(status.find(
+                "; peer=0,access=1,details=0,performance_rank=0,"
+                "native_atomic=0,musa_array=0,mtlink_ports=0"),
+            std::string::npos);
+  EXPECT_EQ(executor.numa_node(),
+            executor.GetDeviceDescription().numa_node());
+}
+
+TEST(MusaExecutorTest, CrossExecutorEventOrdersSameDeviceD2DCopy) {
+  MusaExecutor source_executor(/*platform=*/nullptr, /*device_ordinal=*/0);
+  MusaExecutor destination_executor(/*platform=*/nullptr,
+                                    /*device_ordinal=*/0);
+  TF_ASSERT_OK(source_executor.Init());
+  TF_ASSERT_OK(destination_executor.Init());
+  TF_ASSERT_OK(destination_executor.EnablePeerAccessTo(&source_executor));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> producer,
+                          source_executor.CreateStream(std::nullopt));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> consumer,
+                          destination_executor.CreateStream(std::nullopt));
+
+  constexpr uint64_t kBytes = 8 * sizeof(uint32_t);
+  DeviceAddressBase source =
+      source_executor.Allocate(kBytes, /*memory_space=*/0);
+  DeviceAddressBase destination =
+      destination_executor.Allocate(kBytes, /*memory_space=*/0);
+  ASSERT_FALSE(source.is_null());
+  ASSERT_FALSE(destination.is_null());
+
+  const std::array<uint32_t, 8> input = {
+      0x01020304, 0x11121314, 0x21222324, 0x31323334,
+      0x41424344, 0x51525354, 0x61626364, 0x71727374,
+  };
+  TF_ASSERT_OK_AND_ASSIGN(MUcontext context_before,
+                          MusaDriver::Instance().CurrentContext());
+  TF_ASSERT_OK(producer->Memcpy(&source, input.data(), kBytes));
+  TF_ASSERT_OK(consumer->WaitFor(producer.get()));
+  TF_ASSERT_OK(consumer->Memcpy(&destination, source, kBytes));
+  TF_ASSERT_OK(consumer->BlockHostUntilDone());
+  TF_ASSERT_OK_AND_ASSIGN(MUcontext context_after,
+                          MusaDriver::Instance().CurrentContext());
+  EXPECT_EQ(context_after, context_before);
+
+  std::array<uint32_t, 8> output = {};
+  std::array<uint32_t, 8> preserved_source = {};
+  TF_ASSERT_OK(destination_executor.SynchronousMemcpy(
+      output.data(), destination, kBytes));
+  TF_ASSERT_OK(source_executor.SynchronousMemcpy(
+      preserved_source.data(), source, kBytes));
+  EXPECT_EQ(output, input);
+  EXPECT_EQ(preserved_source, input);
+
+  source_executor.Deallocate(&source);
+  destination_executor.Deallocate(&destination);
+}
+
+TEST(MusaExecutorTest, BidirectionalPeerCopyWhenTwoDevicesAvailable) {
+  MusaDriver& driver = MusaDriver::Instance();
+  TF_ASSERT_OK_AND_ASSIGN(int device_count, driver.DeviceCount());
+  if (device_count < 2) {
+    GTEST_SKIP() << "Two MUSA devices are required for physical peer-copy "
+                    "qualification";
+  }
+  {
+    MusaExecutor first(/*platform=*/nullptr, /*device_ordinal=*/0);
+    MusaExecutor second(/*platform=*/nullptr, /*device_ordinal=*/1);
+    TF_ASSERT_OK(first.Init());
+    TF_ASSERT_OK(second.Init());
+    std::unique_ptr<ActivateContext> anchor = first.Activate();
+    TF_ASSERT_OK_AND_ASSIGN(MUcontext anchor_context,
+                            driver.CurrentContext());
+
+    if (!first.CanEnablePeerAccessTo(&second) ||
+        !second.CanEnablePeerAccessTo(&first)) {
+      GTEST_SKIP() << "Visible MUSA devices do not expose bidirectional peer "
+                      "access";
+    }
+    TF_ASSERT_OK(first.EnablePeerAccessTo(&second));
+    TF_ASSERT_OK(first.EnablePeerAccessTo(&second));
+    TF_ASSERT_OK(second.EnablePeerAccessTo(&first));
+    TF_ASSERT_OK(second.EnablePeerAccessTo(&first));
+
+    TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> first_stream,
+                            first.CreateStream(std::nullopt));
+    TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> second_stream,
+                            second.CreateStream(std::nullopt));
+
+    constexpr uint64_t kBytes = 8 * sizeof(uint32_t);
+    DeviceAddressBase source_on_first = first.Allocate(kBytes, 0);
+    DeviceAddressBase destination_on_first = first.Allocate(kBytes, 0);
+    DeviceAddressBase source_on_second = second.Allocate(kBytes, 0);
+    DeviceAddressBase destination_on_second = second.Allocate(kBytes, 0);
+    ASSERT_FALSE(source_on_first.is_null());
+    ASSERT_FALSE(destination_on_first.is_null());
+    ASSERT_FALSE(source_on_second.is_null());
+    ASSERT_FALSE(destination_on_second.is_null());
+
+    const std::array<uint32_t, 8> first_pattern = {
+        0x00112233, 0x10213243, 0x20314253, 0x30415263,
+        0x40516273, 0x50617283, 0x60718293, 0x708192a3,
+    };
+    const std::array<uint32_t, 8> second_pattern = {
+        0xffeeddcc, 0xefdecdbc, 0xdfcebdac, 0xcfbead9c,
+        0xbfae9d8c, 0xaf9e8d7c, 0x9f8e7d6c, 0x8f7e6d5c,
+    };
+    TF_ASSERT_OK(
+        first_stream->Memcpy(&source_on_first, first_pattern.data(), kBytes));
+    TF_ASSERT_OK(second_stream->Memcpy(&source_on_second,
+                                       second_pattern.data(), kBytes));
+
+    TF_ASSERT_OK(first_stream->WaitFor(second_stream.get()));
+    TF_ASSERT_OK(first_stream->Memcpy(&destination_on_first, source_on_second,
+                                      kBytes));
+    TF_ASSERT_OK(second_stream->WaitFor(first_stream.get()));
+    TF_ASSERT_OK(second_stream->Memcpy(&destination_on_second, source_on_first,
+                                       kBytes));
+    TF_ASSERT_OK(first_stream->BlockHostUntilDone());
+    TF_ASSERT_OK(second_stream->BlockHostUntilDone());
+
+    std::array<uint32_t, 8> copied_to_first = {};
+    std::array<uint32_t, 8> copied_to_second = {};
+    std::array<uint32_t, 8> preserved_first = {};
+    std::array<uint32_t, 8> preserved_second = {};
+    TF_ASSERT_OK(first.SynchronousMemcpy(copied_to_first.data(),
+                                         destination_on_first, kBytes));
+    TF_ASSERT_OK(second.SynchronousMemcpy(copied_to_second.data(),
+                                          destination_on_second, kBytes));
+    TF_ASSERT_OK(first.SynchronousMemcpy(preserved_first.data(),
+                                         source_on_first, kBytes));
+    TF_ASSERT_OK(second.SynchronousMemcpy(preserved_second.data(),
+                                          source_on_second, kBytes));
+    EXPECT_EQ(copied_to_first, second_pattern);
+    EXPECT_EQ(copied_to_second, first_pattern);
+    EXPECT_EQ(preserved_first, first_pattern);
+    EXPECT_EQ(preserved_second, second_pattern);
+
+    first.Deallocate(&source_on_first);
+    first.Deallocate(&destination_on_first);
+    second.Deallocate(&source_on_second);
+    second.Deallocate(&destination_on_second);
+    TF_ASSERT_OK_AND_ASSIGN(MUcontext context_after_operations,
+                            driver.CurrentContext());
+    EXPECT_EQ(context_after_operations, anchor_context);
+  }
 }
 
 TEST(MusaExecutorTest, DeviceAllocationRetainsContextPastExecutorLifetime) {

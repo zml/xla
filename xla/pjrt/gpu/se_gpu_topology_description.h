@@ -53,12 +53,8 @@ class StreamExecutorGpuTopologyDescription : public PjRtTopologyDescription {
     CHECK(gpu_topology_ != nullptr);
   }
 
-  bool operator==(const StreamExecutorGpuTopologyDescription& other) const {
-    return this->platform_id() == other.platform_id() &&
-           this->platform_name() == other.platform_name() &&
-           this->platform_version() == other.platform_version() &&
-           this->gpu_topology() == other.gpu_topology();
-  }
+  bool operator==(
+      const StreamExecutorGpuTopologyDescription& other) const;
 
   PjRtPlatformId platform_id() const override { return platform_id_; }
 

@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -48,7 +49,6 @@ limitations under the License.
 namespace stream_executor::musa {
 
 class MusaContext;
-class MusaDriver;
 class MusaModule;
 class MusaModuleCache;
 class MusaModuleReaper;
@@ -63,6 +63,7 @@ class MusaExecutor : public gpu::GpuExecutor {
   std::unique_ptr<ActivateContext> Activate() override;
 
   absl::Status Init() override;
+  int numa_node() const override { return numa_node_; }
 
   absl::StatusOr<std::unique_ptr<Stream>> CreateStream(
       std::optional<std::variant<StreamPriority, int>> priority) override;
@@ -90,6 +91,8 @@ class MusaExecutor : public gpu::GpuExecutor {
 
   absl::Status EnablePeerAccessTo(StreamExecutor* other) override;
   bool CanEnablePeerAccessTo(StreamExecutor* other) override;
+  bool CanEnablePeerAccessTo(int other_device_ordinal) override;
+  absl::StatusOr<std::string> GetInterconnectStatus() const override;
 
   bool DeviceMemoryUsage(int64_t* free, int64_t* total) const override;
 
@@ -130,6 +133,10 @@ class MusaExecutor : public gpu::GpuExecutor {
   // Allocators and RAII allocations may outlive their executor. They retain
   // the primary context needed by their allocation/free callbacks.
   std::shared_ptr<MusaContext> context_;
+  int numa_node_ = -1;
+  // Peer capability is directional. This table is populated once during Init
+  // and read concurrently thereafter; self access is represented explicitly.
+  absl::flat_hash_map<int, MusaPeerAccessInfo> peer_access_cache_;
   // Declared after context_ so cached modules unload before the primary
   // context reference is released during executor teardown.
   std::unique_ptr<MusaModuleCache> module_cache_;
