@@ -538,7 +538,11 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_detect_unstable_reductions(DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_detect_unstable_reductions_post_optimizations(
       DebugOptions::DETECTION_MODE_NONE);
+  // Both fusion backends bid by default so the autotuner picks the faster of
+  // Triton and Tile IR (mmaf_scaled) per shape. Either flag can still be
+  // turned off to force a single path.
   opts.set_xla_gpu_experimental_scaled_dot_with_triton(true);
+  opts.set_xla_gpu_experimental_scaled_dot_with_tile_ir(true);
   opts.set_xla_gpu_experimental_use_raft_select_k(false);
   opts.set_xla_early_exit_with_layouts(false);
   opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
@@ -3453,15 +3457,17 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       bool_setter_for(
           &DebugOptions::set_xla_gpu_experimental_scaled_dot_with_triton),
       debug_options->xla_gpu_experimental_scaled_dot_with_triton(),
-      "If true, use the Triton emitter for scaled dot."));
+      "If true (default), use the Triton emitter for scaled dot. Together with "
+      "scaled_dot_with_tile_ir the autotuner profiles both backends."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_scaled_dot_with_tile_ir",
       bool_setter_for(
           &DebugOptions::set_xla_gpu_experimental_scaled_dot_with_tile_ir),
       debug_options->xla_gpu_experimental_scaled_dot_with_tile_ir(),
-      "If true, lower a scaled dot from XTile to CUDA Tile IR and assemble it "
-      "with tileiras instead of going through Triton. Falls back to Triton for "
-      "any fusion the CUDA Tile IR backend cannot express."));
+      "If true (default), lower a scaled dot from XTile to CUDA Tile IR and "
+      "assemble it with tileiras. Together with scaled_dot_with_triton the "
+      "autotuner profiles both backends; if neither can emit, the dequant "
+      "floor runs."));
 
   flag_list->push_back(tsl::Flag(
       "xla_cpu_collective_call_warn_stuck_timeout_seconds",
