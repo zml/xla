@@ -68,6 +68,40 @@ constexpr uint32_t kSpirvHeaderWordCount = 5;
 constexpr uint32_t kSpirvOpCapability = 17;
 constexpr uint32_t kSpirvVariablePointersStorageBufferCapability = 4441;
 
+struct PhysicalStorageBitLocation {
+  uint64_t element_index;
+  uint64_t bit_index;
+};
+
+PhysicalStorageBitLocation GetPhysicalStorageBitLocation(
+    const llvm::DataLayout& data_layout, uint64_t logical_element_index,
+    llvm::Type* logical_element_type, llvm::Type* storage_element_type) {
+  const uint64_t logical_element_bits =
+      data_layout.getTypeSizeInBits(logical_element_type).getFixedValue();
+  const uint64_t storage_element_bits =
+      data_layout.getTypeSizeInBits(storage_element_type).getFixedValue();
+  const uint64_t logical_bit_offset =
+      logical_element_index * logical_element_bits;
+  const uint64_t storage_element_index =
+      logical_bit_offset / storage_element_bits;
+  uint64_t bit_index = logical_bit_offset % storage_element_bits;
+  if (data_layout.isBigEndian()) {
+    bit_index = storage_element_bits - logical_element_bits - bit_index;
+  }
+  return {storage_element_index, bit_index};
+}
+
+uint64_t GetPhysicalStorageElementCount(
+    const llvm::DataLayout& data_layout, uint64_t logical_element_count,
+    llvm::Type* logical_element_type, llvm::Type* storage_element_type) {
+  const uint64_t logical_element_bits =
+      data_layout.getTypeSizeInBits(logical_element_type).getFixedValue();
+  const uint64_t storage_element_bits =
+      data_layout.getTypeSizeInBits(storage_element_type).getFixedValue();
+  const uint64_t logical_bits = logical_element_count * logical_element_bits;
+  return (logical_bits + storage_element_bits - 1) / storage_element_bits;
+}
+
 void AddVariablePointersStorageBufferCapability(std::string* spirv_binary) {
   // LLVM can emit OpPhi for StorageBuffer pointers without declaring the
   // capability required by Vulkan. Add the narrower storage-buffer-only
@@ -345,17 +379,47 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
         if (load->isSimple() && vector_type != nullptr &&
             vector_type->getElementType()->isIntegerTy(1) &&
             element_type->isIntegerTy(8)) {
+          llvm::Type* logical_element_type = vector_type->getElementType();
+          const uint64_t logical_element_count =
+              vector_type->getNumElements();
+          const uint64_t storage_element_count =
+              GetPhysicalStorageElementCount(
+                  data_layout, logical_element_count, logical_element_type,
+                  element_type);
+          llvm::SmallVector<llvm::Value*> storage_elements;
+          storage_elements.reserve(storage_element_count);
+          for (uint64_t storage_index = 0;
+               storage_index < storage_element_count; ++storage_index) {
+            llvm::LoadInst* storage_load = builder.CreateAlignedLoad(
+                element_type, element_pointer(storage_index),
+                llvm::commonAlignment(
+                    load->getAlign(),
+                    storage_index * type_size.getFixedValue()),
+                load->getName() + ".resource");
+            storage_load->copyMetadata(*load);
+            storage_elements.push_back(storage_load);
+          }
+
+          // LLVM vectors of i1 use packed memory semantics. A vector lane is a
+          // bit within a physical storage element, not a separate element.
           llvm::Value* predicate_vector =
               llvm::PoisonValue::get(vector_type);
-          for (unsigned lane = 0; lane < vector_type->getNumElements();
-               ++lane) {
-            llvm::LoadInst* lane_load = builder.CreateAlignedLoad(
-                element_type, element_pointer(lane),
-                llvm::commonAlignment(load->getAlign(), lane),
-                load->getName() + ".resource");
-            lane_load->copyMetadata(*load);
+          for (uint64_t lane = 0; lane < logical_element_count; ++lane) {
+            PhysicalStorageBitLocation location =
+                GetPhysicalStorageBitLocation(data_layout, lane,
+                                              logical_element_type,
+                                              element_type);
+            llvm::Value* storage_value =
+                storage_elements[location.element_index];
+            if (location.bit_index != 0) {
+              storage_value = builder.CreateLShr(
+                  storage_value,
+                  llvm::ConstantInt::get(element_type, location.bit_index),
+                  load->getName() + ".shifted");
+            }
             llvm::Value* predicate = builder.CreateTrunc(
-                lane_load, builder.getInt1Ty(), load->getName() + ".lane");
+                storage_value, logical_element_type,
+                load->getName() + ".lane");
             predicate_vector = builder.CreateInsertElement(
                 predicate_vector, predicate, builder.getInt32(lane),
                 load->getName());
@@ -415,16 +479,41 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
         if (store->isSimple() && vector_type != nullptr &&
             vector_type->getElementType()->isIntegerTy(1) &&
             element_type->isIntegerTy(8)) {
-          for (unsigned lane = 0; lane < vector_type->getNumElements();
-               ++lane) {
+          llvm::Type* logical_element_type = vector_type->getElementType();
+          const uint64_t logical_element_count =
+              vector_type->getNumElements();
+          const uint64_t storage_element_count =
+              GetPhysicalStorageElementCount(
+                  data_layout, logical_element_count, logical_element_type,
+                  element_type);
+          llvm::SmallVector<llvm::Value*> storage_elements(
+              storage_element_count, llvm::ConstantInt::get(element_type, 0));
+          for (uint64_t lane = 0; lane < logical_element_count; ++lane) {
+            PhysicalStorageBitLocation location =
+                GetPhysicalStorageBitLocation(data_layout, lane,
+                                              logical_element_type,
+                                              element_type);
             llvm::Value* predicate = builder.CreateExtractElement(
                 store->getValueOperand(), builder.getInt32(lane));
-            llvm::Value* byte =
+            llvm::Value* bit =
                 builder.CreateZExt(predicate, element_type);
-            llvm::StoreInst* lane_store = builder.CreateAlignedStore(
-                byte, element_pointer(lane),
-                llvm::commonAlignment(store->getAlign(), lane));
-            lane_store->copyMetadata(*store);
+            if (location.bit_index != 0) {
+              bit = builder.CreateShl(
+                  bit,
+                  llvm::ConstantInt::get(element_type, location.bit_index));
+            }
+            storage_elements[location.element_index] =
+                builder.CreateOr(storage_elements[location.element_index], bit);
+          }
+          for (uint64_t storage_index = 0;
+               storage_index < storage_element_count; ++storage_index) {
+            llvm::StoreInst* storage_store = builder.CreateAlignedStore(
+                storage_elements[storage_index],
+                element_pointer(storage_index),
+                llvm::commonAlignment(
+                    store->getAlign(),
+                    storage_index * type_size.getFixedValue()));
+            storage_store->copyMetadata(*store);
           }
           store->eraseFromParent();
           continue;
