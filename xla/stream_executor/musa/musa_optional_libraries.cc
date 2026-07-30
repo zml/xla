@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_mudnn_api.h"
 #include "xla/stream_executor/musa/musa_mufft_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 
@@ -66,8 +67,10 @@ GetAvailableMusaOptionalLibraryAbis() {
                       GetAvailableMusaMuBlasOptionalLibraryAbis());
   TF_ASSIGN_OR_RETURN(std::vector<MusaOptionalLibraryAbi> mufft,
                       GetAvailableMusaMuFftOptionalLibraryAbis());
+  TF_ASSIGN_OR_RETURN(std::vector<MusaOptionalLibraryAbi> mudnn,
+                      GetAvailableMusaMuDnnOptionalLibraryAbis());
   const std::vector<std::vector<MusaOptionalLibraryAbi>> providers = {
-      std::move(mublas), std::move(mufft)};
+      std::move(mublas), std::move(mudnn), std::move(mufft)};
   return internal::MergeMusaOptionalLibraryAbis(providers);
 }
 

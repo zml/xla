@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/generic_memory_allocation.h"
@@ -236,6 +237,24 @@ blas::BlasSupport* MusaExecutor::AsBlas() {
   return blas_.get();
 }
 
+dnn::DnnSupport* MusaExecutor::AsDnn() {
+  absl::MutexLock lock(&support_mu_);
+  if (dnn_ != nullptr) return dnn_.get();
+
+  PluginRegistry* registry = PluginRegistry::Instance();
+  absl::StatusOr<PluginRegistry::DnnFactory> factory =
+      registry->GetFactory<PluginRegistry::DnnFactory>(kMusaPlatformId);
+  if (!factory.ok()) {
+    VLOG(1) << "Optional MUSA DNN factory is unavailable: " << factory.status();
+    return nullptr;
+  }
+  dnn_.reset((*factory)(this));
+  if (dnn_ == nullptr) {
+    VLOG(1) << "Optional muDNN support is unavailable";
+  }
+  return dnn_.get();
+}
+
 fft::FftSupport* MusaExecutor::AsFft() {
   absl::MutexLock lock(&support_mu_);
   if (fft_ != nullptr) return fft_.get();
@@ -362,6 +381,7 @@ void MusaExecutor::DeallocateStream(Stream* stream) {
   {
     absl::MutexLock lock(&support_mu_);
     if (blas_ != nullptr) blas_->NotifyStreamDestroyed(stream);
+    if (dnn_ != nullptr) dnn_->NotifyStreamDestroyed(stream);
   }
   absl::MutexLock lock(&alive_streams_mu_);
   alive_streams_.erase(musa_stream->stream_handle());

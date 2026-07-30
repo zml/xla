@@ -24,6 +24,7 @@ limitations under the License.
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/backends/gpu/autotuner/mublas.h"
+#include "xla/backends/gpu/autotuner/mudnn.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/service/compiler.h"
 #include "xla/service/hlo_cost_analysis.h"
@@ -42,7 +43,6 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForMusa(
     mlir::MLIRContext* mlir_context,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
     absl::Span<const autotuner::Backend> backend_allowlist) {
-  (void)device_allocator;
   (void)alias_info;
   (void)mlir_context;
   (void)shape_size_fn;
@@ -50,6 +50,9 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForMusa(
   std::vector<std::unique_ptr<CodegenBackend>> backends;
   backends.push_back(std::make_unique<MublasBackend>(
       stream_executor, debug_options, compiler, target_config));
+  backends.push_back(
+      std::make_unique<MudnnBackend>(stream_executor, debug_options, compiler,
+                                     target_config, device_allocator));
 
   if (!backend_allowlist.empty()) {
     backends.erase(

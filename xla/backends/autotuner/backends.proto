@@ -40,4 +40,5 @@ enum Backend {
   CUSTOM_KERNEL_FISSION = 14;
   HIPBLASLT_FISSION = 16;
   MUBLAS = 17;
+  MUDNN = 18;
 }

@@ -1667,6 +1667,13 @@ bool RequiresCollectiveScheduleLinearizer(const HloModule* module,
   return false;
 }
 
+bool EnableConvOperandSwap(absl::string_view platform_name) {
+  // ROCm and MUSA convolution canonicalization both recognize backward-filter
+  // patterns before vendor-library routing. Swapping operands in the earlier
+  // layout-insensitive simplifier destroys those patterns.
+  return platform_name != "ROCM" && platform_name != "MUSA";
+}
+
 }  // namespace
 
 bool GpuCompiler::IsScaledDotSupportedByBackend(
@@ -1682,7 +1689,7 @@ bool GpuCompiler::IsScaledDotSupportedByBackend(
 
 AlgebraicSimplifierOptions GpuCompiler::GetAlgebraicSimplifierOptions(
     AlgebraicSimplifierMode mode, const DebugOptions& debug_options,
-    bool is_rocm) {
+    bool enable_conv_operand_swap) {
   AlgebraicSimplifierOptions opts;
 
   opts.set_enable_dot_strength_reduction(false);
@@ -1710,7 +1717,7 @@ AlgebraicSimplifierOptions GpuCompiler::GetAlgebraicSimplifierOptions(
       // the transpose.
       opts.set_rewrite_reshape_transpose_as_slice_concatenate(false);
       opts.set_enable_hoist_transpose_of_reshape(true);
-      if (is_rocm) {
+      if (!enable_conv_operand_swap) {
         opts.set_enable_conv_operand_swap(false);
       }
       break;
@@ -1781,7 +1788,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kLayoutInsensitive,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM");
+          EnableConvOperandSwap(
+              gpu_topology.gpu_target_config().platform_name));
 
   {
     HloPassPipeline pipeline("annotate-host-compute", compilation_stats);
@@ -1837,7 +1845,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
   RETURN_IF_ERROR(OptimizeHloConvolutionCanonicalization(
       hlo_module, gpu_version,
       gpu_topology.gpu_target_config().dnn_version_info,
-      device_description.runtime_version(), compilation_stats));
+      device_description.runtime_version(),
+      /*is_deviceless=*/stream_exec == nullptr, compilation_stats));
 
   RETURN_IF_ERROR(RunLayoutAssignmentPasses(
       hlo_module, gpu_version, device_description, compilation_stats));
@@ -1850,7 +1859,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kLayoutNormalization,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM"),
+          EnableConvOperandSwap(
+              gpu_topology.gpu_target_config().platform_name)),
       gpu_version, compilation_stats));
 
   // Run target-specific HLO optimization passes after layout assignment.
@@ -1874,7 +1884,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kPostFusionSimplification,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM"),
+          EnableConvOperandSwap(
+              gpu_topology.gpu_target_config().platform_name)),
       gpu_version, gpu_topology.gpu_target_config(), compilation_stats));
 
   RETURN_IF_ERROR(RunPostFusionVerificationPasses(
@@ -1971,7 +1982,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kPostLayoutAssignment,
           hlo_module->config().debug_options(),
-          gpu_target_config.platform_name == "ROCM");
+          EnableConvOperandSwap(gpu_target_config.platform_name));
   // Lambdas and related constants:
   const GpuFloatSupport bf16_support(gpu_version, BF16);
   const GpuFloatSupport f8e5m2_support(gpu_version, F8E5M2, F16);
@@ -2206,7 +2217,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
             "remove-no-op-reduce-precision-algebraic-simplifier");
     AlgebraicSimplifierOptions options = GetAlgebraicSimplifierOptions(
         AlgebraicSimplifierMode::kAfterSimplifyFPConversions, debug_options,
-        gpu_target_config.platform_name == "ROCM");
+        EnableConvOperandSwap(gpu_target_config.platform_name));
     remove_no_op_reduce_precision_pipeline
         .AddPass<HloPassFix<GpuAlgebraicSimplifier>>(options, gpu_version);
   }

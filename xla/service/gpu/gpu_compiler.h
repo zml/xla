@@ -147,7 +147,7 @@ class GpuCompiler : public LLVMCompiler {
 
   static AlgebraicSimplifierOptions GetAlgebraicSimplifierOptions(
       AlgebraicSimplifierMode mode, const DebugOptions& debug_options,
-      bool is_rocm);
+      bool enable_conv_operand_swap);
 
   absl::StatusOr<std::unique_ptr<Executable>> LoadExecutableFromLegacyAotResult(
       const CompiledModule& aot_result,
@@ -281,7 +281,7 @@ class GpuCompiler : public LLVMCompiler {
   virtual absl::Status OptimizeHloConvolutionCanonicalization(
       HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
       se::dnn::VersionInfo dnn_version,
-      const se::SemanticVersion& toolkit_version,
+      const se::SemanticVersion& toolkit_version, bool is_deviceless,
       CompilationStats* compilation_stats) = 0;
 
   // TODO(timshen): Replace `debug_module` with some portable debug information

@@ -66,7 +66,7 @@ class MusaGpuCompiler : public GpuCompiler {
   absl::Status OptimizeHloConvolutionCanonicalization(
       HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
       se::dnn::VersionInfo dnn_version,
-      const se::SemanticVersion& toolkit_version,
+      const se::SemanticVersion& toolkit_version, bool is_deviceless,
       CompilationStats* compilation_stats) override;
 
   absl::Status OptimizeHloPostLayoutAssignment(
@@ -103,9 +103,8 @@ class MusaGpuCompiler : public GpuCompiler {
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,
       const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,
-      se::StreamExecutor* stream_executor,
-      const GpuTargetConfig* target_config, const AliasInfo* alias_info,
-      mlir::MLIRContext* mlir_context,
+      se::StreamExecutor* stream_executor, const GpuTargetConfig* target_config,
+      const AliasInfo* alias_info, mlir::MLIRContext* mlir_context,
       HloCostAnalysis::ShapeSizeFunction shape_size_fn,
       const MultiProcessKeyValueStore& key_value_store) override;
 

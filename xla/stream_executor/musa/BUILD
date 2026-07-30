@@ -145,6 +145,46 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "musa_mudnn_api",
+    srcs = ["musa_mudnn_api.cc"],
+    hdrs = ["musa_mudnn_api.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_optional_library_abi",
+        "//xla/stream_executor/musa/mudnn_shim:mudnn_shim_abi",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_mudnn_api_test",
+    srcs = ["musa_mudnn_api_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dso_loader",
+        ":musa_mudnn_api",
+        "//xla/stream_executor/musa/mudnn_shim:mudnn_shim_abi",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "musa_optional_libraries",
     srcs = ["musa_optional_libraries.cc"],
     hdrs = ["musa_optional_libraries.h"],
@@ -154,6 +194,7 @@ cc_library(
     ],
     deps = [
         ":musa_mublas_api",
+        ":musa_mudnn_api",
         ":musa_mufft_api",
         ":musa_optional_library_abi",
         "//xla/tsl/platform:status_macros",
@@ -177,6 +218,67 @@ xla_cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "musa_dnn",
+    srcs = ["musa_dnn.cc"],
+    hdrs = ["musa_dnn.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_mudnn_api",
+        ":musa_platform_id",
+        "//xla/stream_executor/musa/mudnn_shim:mudnn_shim_abi",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:engine_options",
+        "//xla/stream_executor:event_based_timer",
+        "//xla/stream_executor:plugin_registry",
+        "//xla/stream_executor:scratch_allocator",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/platform:initialize",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+    alwayslink = True,
+)
+
+xla_cc_test(
+    name = "musa_dnn_test",
+    srcs = ["musa_dnn_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_dnn",
+        ":musa_dso_loader",
+        ":musa_mudnn_api",
+        "//xla/stream_executor/musa/mudnn_shim:mudnn_shim_abi",
+        "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:engine_options",
+        "//xla/stream_executor:event_based_timer",
+        "//xla/stream_executor:mock_stream",
+        "//xla/stream_executor:mock_stream_executor",
+        "//xla/stream_executor:stream",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -960,6 +1062,7 @@ cc_library(
         ":musa_device_description",
         ":musa_device_properties",
         ":musa_driver",
+        ":musa_dnn",
         ":musa_event",
         ":musa_fft",
         ":musa_kernel",
@@ -1023,6 +1126,7 @@ xla_cc_test(
         ":musa_executor",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:device_description",
+        "//xla/stream_executor:dnn",
         "//xla/stream_executor:semantic_version",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",

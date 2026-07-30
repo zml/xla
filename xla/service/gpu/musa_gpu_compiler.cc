@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/gpu/musa_gpu_compiler.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,9 @@ limitations under the License.
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/IR/Module.h"
+#include "xla/backends/gpu/transforms/algebraic_simplifier.h"
+#include "xla/backends/gpu/transforms/conv_padding_legalization.h"
+#include "xla/backends/gpu/transforms/conv_rewriter.h"
 #include "xla/backends/gpu/transforms/dot_algorithm_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_rewriter.h"
 #include "xla/backends/gpu/transforms/triangular_solve_rewriter.h"
@@ -35,7 +39,11 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/pass/hlo_pass_fix.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
+#include "xla/hlo/transforms/simplifiers/algebraic_simplifier.h"
+#include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
+#include "xla/service/call_inliner.h"
 #include "xla/service/compilation_stats.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/cublas_cudnn.h"
@@ -50,6 +58,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_mudnn_api.h"
 #include "xla/stream_executor/musa/musa_mufft_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
@@ -67,9 +76,129 @@ absl::Status ProviderUnavailable(const absl::Status& status) {
                                    status.message()));
 }
 
+bool IsQualifiedMuDnnType(PrimitiveType type) {
+  return type == F16 || type == F32;
+}
+
+bool HasQualifiedMuDnnDimensions(const Shape& shape) {
+  if (!shape.IsArray()) return false;
+  for (int64_t dimension = 0; dimension < shape.dimensions().size();
+       ++dimension) {
+    if (shape.dimensions(dimension) <= 0 ||
+        shape.is_dynamic_dimension(dimension)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsQualifiedMuDnnCustomCall(const HloInstruction& instruction) {
+  if (!IsCustomCallToDnnConvolution(instruction)) return true;
+  if (instruction.custom_call_target() != kCudnnConvForwardCallTarget &&
+      instruction.custom_call_target() != kCudnnConvBackwardInputCallTarget &&
+      instruction.custom_call_target() != kCudnnConvBackwardFilterCallTarget) {
+    return false;
+  }
+  if (instruction.operand_count() != 2 ||
+      instruction.batch_group_count() != 1 ||
+      instruction.feature_group_count() <= 0 ||
+      instruction.feature_group_count() > std::numeric_limits<int>::max() ||
+      !instruction.shape().IsTuple() ||
+      instruction.shape().tuple_shapes().size() != 2) {
+    return false;
+  }
+
+  const Shape& input = instruction.operand(0)->shape();
+  const Shape& filter = instruction.operand(1)->shape();
+  const Shape& output = instruction.shape().tuple_shapes(0);
+  const PrimitiveType type = input.element_type();
+  if (!IsQualifiedMuDnnType(type) || filter.element_type() != type ||
+      output.element_type() != type || !HasQualifiedMuDnnDimensions(input) ||
+      !HasQualifiedMuDnnDimensions(filter) ||
+      !HasQualifiedMuDnnDimensions(output)) {
+    return false;
+  }
+
+  const Window& window = instruction.window();
+  const int spatial_rank = window.dimensions_size();
+  if (spatial_rank < 2 || spatial_rank > 3 ||
+      input.dimensions().size() != spatial_rank + 2 ||
+      filter.dimensions().size() != spatial_rank + 2 ||
+      output.dimensions().size() != spatial_rank + 2) {
+    return false;
+  }
+  constexpr int64_t kMaxNativeGeometry =
+      static_cast<int64_t>(std::numeric_limits<int>::max());
+  for (const WindowDimension& dimension : window.dimensions()) {
+    if (dimension.size() <= 0 || dimension.size() > kMaxNativeGeometry ||
+        dimension.stride() <= 0 || dimension.stride() > kMaxNativeGeometry ||
+        dimension.base_dilation() != 1 || dimension.window_dilation() <= 0 ||
+        dimension.window_dilation() > kMaxNativeGeometry ||
+        dimension.padding_low() < 0 ||
+        dimension.padding_low() > kMaxNativeGeometry ||
+        dimension.padding_high() < 0 ||
+        dimension.padding_high() > kMaxNativeGeometry ||
+        dimension.padding_low() != dimension.padding_high() ||
+        dimension.window_reversal()) {
+      return false;
+    }
+  }
+  if (type == F16) {
+    // The qualified muDNN 2.8.0 f16 kernel is the contiguous, ungrouped 2D
+    // 3x3 tensor-core path with feature counts aligned to eight. Broader f16
+    // geometries and BF16 can pass workspace discovery but fail execution, so
+    // keep them on generated XLA kernels.
+    if (instruction.custom_call_target() != kCudnnConvForwardCallTarget ||
+        spatial_rank != 2 || instruction.feature_group_count() != 1) {
+      return false;
+    }
+    for (const WindowDimension& dimension : window.dimensions()) {
+      if (dimension.size() != 3 || dimension.stride() != 1 ||
+          dimension.window_dilation() != 1) {
+        return false;
+      }
+    }
+    const ConvolutionDimensionNumbers& dimensions =
+        instruction.convolution_dimension_numbers();
+    const int64_t input_features =
+        filter.dimensions(dimensions.kernel_input_feature_dimension());
+    const int64_t output_features =
+        filter.dimensions(dimensions.kernel_output_feature_dimension());
+    if (input_features % 8 != 0 || output_features % 8 != 0) return false;
+  }
+  return true;
+}
+
+bool HasOnlyQualifiedMuDnnCustomCalls(const HloModule& module) {
+  for (const HloComputation* computation : module.computations()) {
+    for (const HloInstruction* instruction : computation->instructions()) {
+      if (!IsQualifiedMuDnnCustomCall(*instruction)) return false;
+    }
+  }
+  return true;
+}
+
+absl::Status RunMuDnnConvolutionCanonicalization(
+    HloModule* module, const se::GpuComputeCapability& gpu_version,
+    const AlgebraicSimplifierOptions& options,
+    CompilationStats* compilation_stats) {
+  HloPassPipeline pipeline("musa-conv-canonicalization", compilation_stats);
+  pipeline.AddPass<ConvRewriter>(gpu_version);
+  pipeline.AddPass<ConvPaddingLegalization>();
+  pipeline.AddPass<CallInliner>();
+  pipeline.AddPass<TupleSimplifier>();
+
+  pipeline.AddPass<HloPassFix<GpuAlgebraicSimplifier>>(options, gpu_version);
+  return pipeline
+      .Run(module,
+           /*execution_threads=*/{HloInstruction::kMainExecutionThread})
+      .status();
+}
+
 std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
     const HloModule& module) {
   bool requires_mublas = false;
+  bool requires_mudnn = false;
   bool requires_mufft = false;
   bool requires_mublas_scal = false;
   bool requires_mublas_trsm = false;
@@ -81,6 +210,7 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
       module.config().debug_options().xla_gpu_exclude_nondeterministic_ops();
   for (const HloComputation* computation : module.computations()) {
     for (const HloInstruction* instruction : computation->instructions()) {
+      requires_mudnn |= IsCustomCallToDnnConvolution(*instruction);
       if (instruction->opcode() == HloOpcode::kFft) {
         requires_mufft = true;
         requires_mublas_scal |= instruction->fft_type() == FftType::IFFT ||
@@ -130,6 +260,13 @@ std::vector<musa::MusaOptionalLibraryAbi> RequiredMusaOptionalLibraries(
         .name = stream_executor::musa::kMusaMuBlasTrsmLibraryAbiName,
         .abi_version = stream_executor::musa::kMusaMuBlasTrsmLibraryAbiVersion,
         .fingerprint = stream_executor::musa::kMusaMuBlasTrsmAbiFingerprintV1,
+    });
+  }
+  if (requires_mudnn) {
+    requirements.push_back({
+        .name = stream_executor::musa::kMusaMuDnnLibraryAbiName,
+        .abi_version = stream_executor::musa::kMusaMuDnnLibraryAbiVersion,
+        .fingerprint = stream_executor::musa::kMusaMuDnnAbiFingerprintV1,
     });
   }
   if (requires_mufft) {
@@ -243,16 +380,47 @@ void MusaGpuCompiler::AddGemmRewriterPasses(
 absl::Status MusaGpuCompiler::OptimizeHloConvolutionCanonicalization(
     HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
     se::dnn::VersionInfo dnn_version,
-    const se::SemanticVersion& toolkit_version,
+    const se::SemanticVersion& toolkit_version, bool is_deviceless,
     CompilationStats* compilation_stats) {
-  // Convolutions remain on the generic HLO path until an optional muDNN
-  // adapter and its canonicalization contract are available.
-  (void)hlo_module;
-  (void)gpu_version;
-  (void)dnn_version;
+  // A missing or unqualified optional muDNN adapter is a supported
+  // configuration. Keep convolutions on the generic generated-kernel path
+  // unless the live StreamExecutor exposed the exact 2.8.0 contract. The v1
+  // shim does not expose algorithm determinism metadata, so deterministic
+  // modules must also remain generic.
+  const DebugOptions& debug_options = hlo_module->config().debug_options();
+  if (debug_options.xla_gpu_experimental_disable_binary_libraries() ||
+      debug_options.xla_gpu_deterministic_ops() ||
+      debug_options.xla_gpu_exclude_nondeterministic_ops() ||
+      dnn_version != se::dnn::VersionInfo(2, 8, 0) || is_deviceless) {
+    return absl::OkStatus();
+  }
+  if (!gpu_version.IsMusa()) {
+    return absl::InvalidArgumentError(
+        "MUSA convolution canonicalization requires a MUSA target");
+  }
   (void)toolkit_version;
-  (void)compilation_stats;
-  return absl::OkStatus();
+
+  // Use the same historical DNN convolution custom-call ABI, descriptor
+  // conversion, thunk, and AOT serialization as CUDA and ROCm. Fused and
+  // graph convolution rewriting remain disabled until the optional muDNN
+  // adapter advertises those contracts.
+  // Probe the fully normalized shared custom-call contract on a clone. This
+  // preserves ConvRewriter's backward-data and backward-filter pattern
+  // matching while keeping the original module generic if any rewritten call
+  // exceeds the narrower C19 muDNN contract.
+  std::unique_ptr<HloModule> probe = hlo_module->Clone();
+  std::unique_ptr<CompilationStats> probe_stats =
+      CompilationStats::MakeNoopStats();
+  AlgebraicSimplifierOptions options = GetAlgebraicSimplifierOptions(
+      AlgebraicSimplifierMode::kGpuConvoluationCanonicalization, debug_options,
+      /*enable_conv_operand_swap=*/false);
+  absl::Status probe_status = RunMuDnnConvolutionCanonicalization(
+      probe.get(), gpu_version, options, probe_stats.get());
+  if (absl::IsUnimplemented(probe_status)) return absl::OkStatus();
+  RETURN_IF_ERROR(probe_status);
+  if (!HasOnlyQualifiedMuDnnCustomCalls(*probe)) return absl::OkStatus();
+  return RunMuDnnConvolutionCanonicalization(hlo_module, gpu_version, options,
+                                             compilation_stats);
 }
 
 absl::Status MusaGpuCompiler::OptimizeHloPostLayoutAssignment(

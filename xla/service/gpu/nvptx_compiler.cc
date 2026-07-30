@@ -188,7 +188,7 @@ void NVPTXCompiler::AddPaddingForGpublasGemms(
 absl::Status NVPTXCompiler::OptimizeHloConvolutionCanonicalization(
     HloModule* hlo_module, const se::GpuComputeCapability& gpu_version,
     se::dnn::VersionInfo dnn_version,
-    const se::SemanticVersion& toolkit_version,
+    const se::SemanticVersion& toolkit_version, bool /*is_deviceless*/,
     CompilationStats* compilation_stats) {
   auto* cuda_compute_capability = gpu_version.cuda_compute_capability();
   // Convert convolutions into CustomCalls to cudnn, then canonicalize them
@@ -232,7 +232,7 @@ absl::Status NVPTXCompiler::OptimizeHloConvolutionCanonicalization(
   AlgebraicSimplifierOptions algsimp_options = GetAlgebraicSimplifierOptions(
       AlgebraicSimplifierMode::kGpuConvoluationCanonicalization,
       hlo_module->config().debug_options(),
-      /*is_rocm=*/false);
+      /*enable_conv_operand_swap=*/true);
   pipeline.AddPass<HloPassFix<GpuAlgebraicSimplifier>>(algsimp_options,
                                                        gpu_version);
 

@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/service/compilation_stats.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/alias_info.h"
+#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/musa/musa_compilation_provider.h"
 #include "xla/service/gpu/musa/musa_llvm14_compatibility.h"
 #include "xla/service/gpu/musa/musa_shim_abi.h"
@@ -53,6 +54,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/musa/musa_mublas_api.h"
+#include "xla/stream_executor/musa/musa_mudnn_api.h"
 #include "xla/stream_executor/musa/musa_mufft_api.h"
 #include "xla/stream_executor/musa/musa_optional_library_abi.h"
 
@@ -142,6 +144,50 @@ stream_executor::DeviceDescription MusaDevice() {
   return device;
 }
 
+constexpr absl::string_view kForwardConvolutionHlo = R"(
+HloModule musa_mudnn_forward
+
+ENTRY main {
+  input = f32[8,128,2,32]{3,2,1,0} parameter(0)
+  filter = f32[3,3,128,128]{3,2,1,0} parameter(1)
+  ROOT conv = f32[8,128,2,32]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=bf01_01io->bf01
+}
+)";
+
+constexpr absl::string_view kBackwardInputConvolutionHlo = R"(
+HloModule musa_mudnn_backward_input
+
+ENTRY main {
+  output = f32[4,5,16,16]{3,2,1,0} parameter(0)
+  kernel = f32[5,3,7,7]{3,2,1,0} parameter(1)
+  reverse = f32[5,3,7,7]{3,2,1,0} reverse(kernel), dimensions={2,3}
+  ROOT conv = f32[4,3,16,16]{3,2,1,0} convolution(output, reverse),
+    window={size=7x7 pad=3_3x3_3}, dim_labels=bf01_io01->bf01
+}
+)";
+
+constexpr absl::string_view kBackwardFilterConvolutionHlo = R"(
+HloModule musa_mudnn_backward_filter
+
+ENTRY main {
+  activations = f32[1,1,3,1]{3,2,1,0} parameter(0)
+  gradients = f32[1,1,2,1]{3,2,1,0} parameter(1)
+  ROOT conv = f32[1,1,1,1]{3,2,1,0}
+    convolution(activations, gradients),
+    window={size=1x2 rhs_dilate=1x2}, dim_labels=f01b_i01o->01bf
+}
+)";
+
+const HloInstruction* FindDnnConvolutionCustomCall(const HloModule& module) {
+  for (const HloComputation* computation : module.computations()) {
+    for (const HloInstruction* instruction : computation->instructions()) {
+      if (IsCustomCallToDnnConvolution(*instruction)) return instruction;
+    }
+  }
+  return nullptr;
+}
+
 TEST(MusaGpuCompilerTest, BuildsFullEnvelopeAndForcesCompiledThunkAot) {
   TestMusaGpuCompiler compiler(
       std::make_unique<RecordingCompilationProvider>());
@@ -167,6 +213,293 @@ ENTRY main {
                 .required_optional_library_abis_size(),
             0);
   EXPECT_TRUE(compiler.UseAotCompiledThunks(*module));
+}
+
+TEST(MusaGpuCompilerTest, MissingMudnnLeavesConvolutionOnGenericPath) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  EXPECT_THAT(compiler.OptimizeHloConvolutionCanonicalization(
+                  module.get(), device.gpu_compute_capability(),
+                  stream_executor::dnn::VersionInfo(),
+                  stream_executor::SemanticVersion(4, 0, 1),
+                  /*is_deviceless=*/false, stats.get()),
+              IsOk());
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kConvolution);
+  EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+}
+
+TEST(MusaGpuCompilerTest, QualifiedMudnnRewritesToSharedDnnCustomCall) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  EXPECT_THAT(compiler.OptimizeHloConvolutionCanonicalization(
+                  module.get(), device.gpu_compute_capability(),
+                  stream_executor::dnn::VersionInfo(2, 8, 0),
+                  stream_executor::SemanticVersion(4, 0, 1),
+                  /*is_deviceless=*/false, stats.get()),
+              IsOk());
+  const HloInstruction* custom_call = FindDnnConvolutionCustomCall(*module);
+  ASSERT_NE(custom_call, nullptr);
+  EXPECT_EQ(custom_call->custom_call_target(), kCudnnConvForwardCallTarget);
+  ASSERT_TRUE(custom_call->shape().IsTuple());
+  EXPECT_EQ(custom_call->shape().tuple_shapes(1).dimensions(0), 0);
+}
+
+TEST(MusaGpuCompilerTest, QualifiedAlignedF16MudnnRewritesToSharedDnnCall) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule musa_mudnn_f16_aligned
+ENTRY main {
+  input = f16[1,4,4,8]{3,2,1,0} parameter(0)
+  filter = f16[3,3,8,8]{3,2,1,0} parameter(1)
+  ROOT conv = f16[1,4,4,8]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)"));
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  ASSERT_OK(compiler.OptimizeHloConvolutionCanonicalization(
+      module.get(), device.gpu_compute_capability(),
+      stream_executor::dnn::VersionInfo(2, 8, 0),
+      stream_executor::SemanticVersion(4, 0, 1),
+      /*is_deviceless=*/false, stats.get()));
+  const HloInstruction* custom_call = FindDnnConvolutionCustomCall(*module);
+  ASSERT_NE(custom_call, nullptr);
+  EXPECT_EQ(custom_call->custom_call_target(), kCudnnConvForwardCallTarget);
+}
+
+TEST(MusaGpuCompilerTest, QualifiedMudnnRewritesBackwardDataAndFilter) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  for (const auto& [hlo, target] :
+       std::vector<std::pair<absl::string_view, absl::string_view>>{
+           {kBackwardInputConvolutionHlo, kCudnnConvBackwardInputCallTarget},
+           {kBackwardFilterConvolutionHlo,
+            kCudnnConvBackwardFilterCallTarget}}) {
+    ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+    std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+    ASSERT_OK(compiler.OptimizeHloConvolutionCanonicalization(
+        module.get(), device.gpu_compute_capability(),
+        stream_executor::dnn::VersionInfo(2, 8, 0),
+        stream_executor::SemanticVersion(4, 0, 1),
+        /*is_deviceless=*/false, stats.get()));
+    const HloInstruction* custom_call = FindDnnConvolutionCustomCall(*module);
+    ASSERT_NE(custom_call, nullptr);
+    EXPECT_EQ(custom_call->custom_call_target(), target);
+  }
+}
+
+TEST(MusaGpuCompilerTest, DevicelessCompilationKeepsGenericConvolution) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  ASSERT_OK(compiler.OptimizeHloConvolutionCanonicalization(
+      module.get(), device.gpu_compute_capability(),
+      stream_executor::dnn::VersionInfo(2, 8, 0),
+      stream_executor::SemanticVersion(4, 0, 1),
+      /*is_deviceless=*/true, stats.get()));
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kConvolution);
+  EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+}
+
+TEST(MusaGpuCompilerTest, UnsupportedMudnnContractsStayGeneric) {
+  constexpr absl::string_view kUnsupportedHlos[] = {
+      R"(
+HloModule musa_mudnn_f64_generic
+ENTRY main {
+  input = f64[2,4,4,3]{3,2,1,0} parameter(0)
+  filter = f64[3,3,3,5]{3,2,1,0} parameter(1)
+  ROOT conv = f64[2,4,4,5]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)",
+      R"(
+HloModule musa_mudnn_conv1d_generic
+ENTRY main {
+  input = f32[1,2,1]{2,1,0} parameter(0)
+  filter = f32[1,1,1]{2,1,0} parameter(1)
+  ROOT conv = f32[1,2,1]{2,1,0} convolution(input, filter),
+    window={size=1}, dim_labels=b0f_0io->b0f
+}
+)",
+      R"(
+HloModule musa_mudnn_reversed_generic
+ENTRY main {
+  input = f32[2,4,4,3]{3,2,1,0} parameter(0)
+  filter = f32[3,3,3,5]{3,2,1,0} parameter(1)
+  ROOT conv = f32[2,4,4,5]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1 rhs_reversal=1x1},
+    dim_labels=b01f_01io->b01f
+}
+)",
+      R"(
+HloModule musa_mudnn_fp8_generic
+ENTRY main {
+  input = f8e4m3fn[2,4,4,3]{3,2,1,0} parameter(0)
+  filter = f8e4m3fn[3,3,3,5]{3,2,1,0} parameter(1)
+  ROOT conv = f8e4m3fn[2,4,4,5]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)",
+      R"(
+HloModule musa_mudnn_complex_generic
+ENTRY main {
+  input = c64[2,4,4,3]{3,2,1,0} parameter(0)
+  filter = c64[3,3,3,5]{3,2,1,0} parameter(1)
+  ROOT conv = c64[2,4,4,5]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)",
+      R"(
+HloModule musa_mudnn_bf16_generic
+ENTRY main {
+  input = bf16[1,4,4,8]{3,2,1,0} parameter(0)
+  filter = bf16[3,3,8,8]{3,2,1,0} parameter(1)
+  ROOT conv = bf16[1,4,4,8]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)",
+      R"(
+HloModule musa_mudnn_f16_unaligned_generic
+ENTRY main {
+  input = f16[1,4,4,3]{3,2,1,0} parameter(0)
+  filter = f16[3,3,3,5]{3,2,1,0} parameter(1)
+  ROOT conv = f16[1,4,4,5]{3,2,1,0} convolution(input, filter),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_01io->b01f
+}
+)"};
+  const stream_executor::DeviceDescription device = MusaDevice();
+  for (absl::string_view hlo : kUnsupportedHlos) {
+    TestMusaGpuCompiler compiler(
+        std::make_unique<RecordingCompilationProvider>());
+    ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+    std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+    ASSERT_OK(compiler.OptimizeHloConvolutionCanonicalization(
+        module.get(), device.gpu_compute_capability(),
+        stream_executor::dnn::VersionInfo(2, 8, 0),
+        stream_executor::SemanticVersion(4, 0, 1),
+        /*is_deviceless=*/false, stats.get()));
+    EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+              HloOpcode::kConvolution);
+    EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+  }
+}
+
+TEST(MusaGpuCompilerTest, DisabledBinaryLibrariesKeepGenericConvolution) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_disable_binary_libraries(true);
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  EXPECT_THAT(compiler.OptimizeHloConvolutionCanonicalization(
+                  module.get(), device.gpu_compute_capability(),
+                  stream_executor::dnn::VersionInfo(2, 8, 0),
+                  stream_executor::SemanticVersion(4, 0, 1),
+                  /*is_deviceless=*/false, stats.get()),
+              IsOk());
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kConvolution);
+  EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+}
+
+TEST(MusaGpuCompilerTest, UnqualifiedMudnnVersionKeepsGenericConvolution) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  EXPECT_THAT(compiler.OptimizeHloConvolutionCanonicalization(
+                  module.get(), device.gpu_compute_capability(),
+                  stream_executor::dnn::VersionInfo(2, 8, 1),
+                  stream_executor::SemanticVersion(4, 0, 1),
+                  /*is_deviceless=*/false, stats.get()),
+              IsOk());
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kConvolution);
+  EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+}
+
+TEST(MusaGpuCompilerTest, DeterministicModeKeepsGenericConvolution) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnUnverifiedModule(kForwardConvolutionHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_deterministic_ops(true);
+  std::unique_ptr<CompilationStats> stats = CompilationStats::MakeNoopStats();
+  const stream_executor::DeviceDescription device = MusaDevice();
+
+  EXPECT_THAT(compiler.OptimizeHloConvolutionCanonicalization(
+                  module.get(), device.gpu_compute_capability(),
+                  stream_executor::dnn::VersionInfo(2, 8, 0),
+                  stream_executor::SemanticVersion(4, 0, 1),
+                  /*is_deviceless=*/false, stats.get()),
+              IsOk());
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kConvolution);
+  EXPECT_EQ(FindDnnConvolutionCustomCall(*module), nullptr);
+}
+
+TEST(MusaGpuCompilerTest, DnnConvolutionRequiresExactMudnnFingerprint) {
+  TestMusaGpuCompiler compiler(
+      std::make_unique<RecordingCompilationProvider>());
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(R"(
+HloModule mudnn_envelope
+
+ENTRY main {
+  input = f32[3,56,56,16]{2,1,0,3} parameter(0)
+  filter = f32[3,3,3,64]{2,1,0,3} parameter(1)
+  ROOT conv = (f32[54,54,16,64]{1,0,3,2}, u8[0]{0})
+    custom-call(input, filter), custom_call_target="__cudnn$convForward",
+    window={size=3x3}, dim_labels=f01b_i01o->01bf,
+    backend_config={"cudnn_conv_backend_config":{
+      "activation_mode":"kNone",
+      "conv_result_scale":1,
+      "side_input_scale":0,
+      "leakyrelu_alpha":0
+    }}
+}
+)"));
+
+  ASSERT_OK_AND_ASSIGN(
+      stream_executor::ExecutableAbiVersion version,
+      compiler.CreateExecutableAbiVersion(*module, MusaDevice(), {}));
+  const auto& libraries =
+      version.proto().musa_platform_version().required_optional_library_abis();
+  ASSERT_EQ(libraries.size(), 1);
+  EXPECT_EQ(libraries[0].name(),
+            stream_executor::musa::kMusaMuDnnLibraryAbiName);
+  EXPECT_EQ(libraries[0].abi_version(),
+            stream_executor::musa::kMusaMuDnnLibraryAbiVersion);
+  EXPECT_EQ(libraries[0].fingerprint(),
+            stream_executor::musa::kMusaMuDnnAbiFingerprintV1);
 }
 
 TEST(MusaGpuCompilerTest, RequiresMublasOnlyForDedicatedMusaGemmTarget) {
