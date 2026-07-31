@@ -1,3 +1,4 @@
+load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -32,6 +33,7 @@ cc_library(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_common",
         "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:env",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
@@ -63,4 +65,17 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
     ],
     alwayslink = True,
+)
+
+xla_cc_test(
+    name = "vulkan_platform_test",
+    srcs = ["vulkan_platform_test.cc"],
+    deps = [
+        ":vulkan_platform",
+        ":vulkan_platform_id",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
