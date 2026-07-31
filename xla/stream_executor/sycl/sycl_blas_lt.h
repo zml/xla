@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_SYCL_SYCL_BLAS_LT_H_
 #define XLA_STREAM_EXECUTOR_SYCL_SYCL_BLAS_LT_H_
 
+#include <memory>
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/gpu/gpu_blas_lt.h"
@@ -47,7 +48,7 @@ class BlasLt : public gpu::BlasLt {
     MatmulPlan(gpu::GemmConfig config, Epilogue epilogue)
         : config_(xla::gpu::GemmConfig(config)), epilogue_(epilogue) {}
 
-    ~MatmulPlan() override = default;
+    ~MatmulPlan() override;
 
     absl::Status ExecuteOnStream(
         Stream* stream, const gpu::BlasLt::MemoryArgs& args,
@@ -64,10 +65,21 @@ class BlasLt : public gpu::BlasLt {
     }
 
    private:
+    struct OneDnnMatmul;
+
+    absl::Status ExecuteTensorScaledFp8Matmul(
+        Stream* stream, const gpu::BlasLt::MemoryArgs& args,
+        const xla::gpu::GemmConfig::DescriptorsTuple& descs) const;
+
     std::optional<MatmulAlgorithm> algorithm_;  // selected algorithm
     xla::gpu::GemmConfig config_;
     Epilogue epilogue_;
     mutable absl::Mutex mu_;
+    // A MatmulPlan is tied to one StreamExecutor. Cache the oneDNN primitive
+    // descriptor because primitive creation is expensive and its layouts are
+    // fixed by the plan's GemmConfig.
+    mutable std::unique_ptr<OneDnnMatmul> one_dnn_matmul_
+        ABSL_GUARDED_BY(mu_);
   };
 
  private:

@@ -590,16 +590,20 @@ sycl_library(
         "@oneapi//:mkl/2026.0/lib/libmkl_sequential.so.3",
         "@oneapi//:mkl/2026.0/lib/libmkl_sycl_blas.so",
         "@oneapi//:mkl/2026.0/lib/libmkl_sycl_blas.so.6",
+        "@oneapi//:dnnl/2026.0/lib/libdnnl.so",
+        "@oneapi//:dnnl/2026.0/lib/libdnnl.so.3",
     ],
     hdrs = ["sycl_blas_lt.h"],
     textual_hdrs = ["@oneapi//:all"],
     copts = [
         "-isystemexternal/oneapi/mkl/2026.0/include",
+        "-isystemexternal/oneapi/dnnl/2026.0/include",
     ],
     tags = [
         "gpu",
         "oneapi-only",
     ],
+    linkopts = ["-Wl,-rpath,$ORIGIN"],
     visibility = ["//visibility:public"],
     deps = [
         ":sycl_platform_id",

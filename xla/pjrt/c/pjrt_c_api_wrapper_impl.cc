@@ -3008,6 +3008,10 @@ PJRT_Error* PJRT_Buffer_OpaqueDeviceMemoryDataPointer(
       std::unique_ptr<xla::PjRtBuffer::ExternalReference> external_reference,
       args->buffer->buffer->AcquireExternalReference());
   args->device_memory_ptr = external_reference->OpaqueDeviceMemoryDataPointer();
+  if (args->device_memory_ptr == nullptr) {
+    return StatusToPjRtError(absl::FailedPreconditionError(
+        "PJRT buffer has no opaque device memory pointer"));
+  }
   return nullptr;
 }
 

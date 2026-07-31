@@ -15,12 +15,15 @@ limitations under the License.
 
 #include "xla/stream_executor/sycl/sycl_blas_lt.h"
 
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <exception>
+#include <memory>
 
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #include "oneapi/mkl/blas.hpp"
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/stream_executor/platform/initialize.h"
@@ -382,15 +385,207 @@ absl::Status ApplyVectorBias(Stream* stream, const DeviceAddressBase& bias,
   return absl::OkStatus();
 }
 
+dnnl::memory::desc MakeDnnlMatrixDesc(
+    const gpu::MatrixDescriptor& matrix, int64_t rows, int64_t cols,
+    dnnl::memory::data_type data_type) {
+  const bool transposed = matrix.transpose == blas::Transpose::kTranspose;
+  return dnnl::memory::desc(
+      {rows, cols}, data_type,
+      transposed ? dnnl::memory::dims{matrix.leading_dim_stride, 1}
+                 : dnnl::memory::dims{1, matrix.leading_dim_stride});
+}
+
+dnnl::matmul::primitive_desc MakeTensorScaledFp8PrimitiveDesc(
+    const dnnl::engine& engine, const dnnl::memory::desc& lhs,
+    const dnnl::memory::desc& rhs, const dnnl::memory::desc& out,
+    float beta) {
+  dnnl::primitive_attr attr;
+  attr.set_scales(DNNL_ARG_SRC, 0, {}, dnnl::memory::data_type::f32,
+                  /*is_on_host=*/false);
+  attr.set_scales(DNNL_ARG_WEIGHTS, 0, {}, dnnl::memory::data_type::f32,
+                  /*is_on_host=*/false);
+  if (beta != 0.0f) {
+    dnnl::post_ops post_ops;
+    post_ops.append_sum(beta);
+    attr.set_post_ops(post_ops);
+  }
+  return dnnl::matmul::primitive_desc(engine, lhs, rhs, out, attr);
+}
+
+absl::Status DnnlErrorToStatus(const dnnl::error& error) {
+  const std::string message = absl::StrCat(
+      "SyclBlasLt oneDNN FP8 matmul failed (status ",
+      static_cast<int>(error.status), "): ", error.what());
+  if (error.status == dnnl_unimplemented) {
+    return absl::UnimplementedError(message);
+  }
+  if (error.status == dnnl_invalid_arguments) {
+    return absl::InvalidArgumentError(message);
+  }
+  return absl::InternalError(message);
+}
 }  // namespace
 
 absl::Status BlasLt::Init() { return absl::OkStatus(); }
+
+struct BlasLt::MatmulPlan::OneDnnMatmul {
+  OneDnnMatmul(::sycl::queue* queue, const gpu::MatrixDescriptor& lhs,
+               const gpu::MatrixDescriptor& rhs,
+               const gpu::OutputMatrixDescriptor& out, float beta)
+      : engine(dnnl::sycl_interop::make_engine(queue->get_device(),
+                                                queue->get_context())),
+        lhs_desc(MakeDnnlMatrixDesc(lhs, out.m, out.k,
+                                    dnnl::memory::data_type::f8_e4m3)),
+        rhs_desc(MakeDnnlMatrixDesc(rhs, out.k, out.n,
+                                    dnnl::memory::data_type::f8_e4m3)),
+        out_desc(MakeDnnlMatrixDesc(out, out.m, out.n,
+                                    dnnl::memory::data_type::bf16)),
+        scale_desc({1}, dnnl::memory::data_type::f32, {1}),
+        primitive_desc(
+            MakeTensorScaledFp8PrimitiveDesc(engine, lhs_desc, rhs_desc,
+                                              out_desc, beta)),
+        primitive(primitive_desc) {}
+
+  dnnl::engine engine;
+  dnnl::memory::desc lhs_desc;
+  dnnl::memory::desc rhs_desc;
+  dnnl::memory::desc out_desc;
+  dnnl::memory::desc scale_desc;
+  dnnl::matmul::primitive_desc primitive_desc;
+  dnnl::matmul primitive;
+};
+BlasLt::MatmulPlan::~MatmulPlan() = default;
 
 auto BlasLt::GetMatmulPlan(const gpu::GemmConfig& config,
                            Epilogue epilogue) const
     -> absl::StatusOr<MatmulPlanPtr> {
   absl::MutexLock lock(&mu_);
   return std::make_unique<MatmulPlan>(config, epilogue);
+}
+
+absl::Status BlasLt::MatmulPlan::ExecuteTensorScaledFp8Matmul(
+    Stream* stream, const gpu::BlasLt::MemoryArgs& args,
+    const xla::gpu::GemmConfig::DescriptorsTuple& descs) const {
+  if (config_.alpha.real() != 1.0 || config_.alpha.imag() != 0.0 ||
+      !std::isfinite(config_.beta) ||
+      !std::isfinite(static_cast<float>(config_.beta))) {
+    return absl::UnimplementedError(absl::StrCat(
+        "SyclBlasLt: tensor-scaled FP8 matmul requires alpha=1 and a finite "
+        "beta; "
+        "got alpha=", config_.alpha.real(), "+", config_.alpha.imag(),
+        "i, beta=", config_.beta));
+  }
+  if (args.a.opaque() == nullptr || args.b.opaque() == nullptr ||
+      args.d.opaque() == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclBlasLt: tensor-scaled FP8 matmul requires non-null A, B, and D");
+  }
+  if (config_.beta != 0.0 && args.c.opaque() == nullptr) {
+    return absl::InvalidArgumentError(
+        "SyclBlasLt: tensor-scaled FP8 matmul with beta requires non-null C");
+  }
+  if (config_.beta != 0.0 && args.c.size() != args.d.size()) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: beta != 0 requires C and D buffers of equal size");
+  }
+  if (args.aux.opaque() != nullptr || args.c_scale.opaque() != nullptr ||
+      args.d_scale.opaque() != nullptr || args.d_amax.opaque() != nullptr) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: FP8 auxiliary, output-scale, and amax outputs are not "
+        "supported");
+  }
+
+  const auto& lhs = descs.lhs;
+  const auto& rhs = descs.rhs;
+  const auto& out = descs.output;
+  if (out.batch_size != 1) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: batched tensor-scaled FP8 matmul is not supported");
+  }
+  if (lhs.type != blas::DataType::kF8E4M3FN ||
+      rhs.type != blas::DataType::kF8E4M3FN ||
+      out.type != blas::DataType::kBF16) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: only F8E4M3FN x F8E4M3FN -> BF16 tensor scaling is "
+        "supported");
+  }
+  if ((lhs.transpose != blas::Transpose::kNoTranspose &&
+       lhs.transpose != blas::Transpose::kTranspose) ||
+      (rhs.transpose != blas::Transpose::kNoTranspose &&
+       rhs.transpose != blas::Transpose::kTranspose) ||
+      out.transpose != blas::Transpose::kNoTranspose) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: unsupported tensor-scaled FP8 matrix layout");
+  }
+
+  // GetMatrixDescriptors changes a row-major output into an equivalent
+  // column-major GEMM by swapping its operands. Keep each device-side scale
+  // bound to the logical input buffer it was supplied with.
+  const DeviceAddressBase& lhs_scale =
+      descs.operands_swapped ? args.b_scale : args.a_scale;
+  const DeviceAddressBase& rhs_scale =
+      descs.operands_swapped ? args.a_scale : args.b_scale;
+  if (lhs_scale.opaque() == nullptr || rhs_scale.opaque() == nullptr ||
+      lhs_scale.size() < sizeof(float) || rhs_scale.size() < sizeof(float)) {
+    return absl::InvalidArgumentError(
+        "SyclBlasLt: tensor-scaled FP8 matmul requires device-side f32 A and "
+        "B scales");
+  }
+
+  ::sycl::queue* queue = static_cast<SyclStream*>(stream)->stream_handle();
+  if (queue == nullptr) {
+    return absl::InternalError(
+        "SyclBlasLt: tensor-scaled FP8 matmul stream has null queue");
+  }
+
+  OneDnnMatmul* matmul;
+  try {
+    {
+      absl::MutexLock lock(&mu_);
+      if (one_dnn_matmul_ == nullptr) {
+        one_dnn_matmul_ = std::make_unique<OneDnnMatmul>(
+            queue, lhs, rhs, out, static_cast<float>(config_.beta));
+      }
+      matmul = one_dnn_matmul_.get();
+    }
+
+    if (config_.beta != 0.0 && args.c.opaque() != args.d.opaque()) {
+      queue->memcpy(args.d.opaque(), args.c.opaque(), args.d.size())
+          .wait_and_throw();
+    }
+
+    dnnl::memory src = dnnl::sycl_interop::make_memory(
+        matmul->lhs_desc, matmul->engine, dnnl::sycl_interop::memory_kind::usm,
+        lhs.data.opaque());
+    dnnl::memory weights = dnnl::sycl_interop::make_memory(
+        matmul->rhs_desc, matmul->engine, dnnl::sycl_interop::memory_kind::usm,
+        rhs.data.opaque());
+    dnnl::memory dst = dnnl::sycl_interop::make_memory(
+        matmul->out_desc, matmul->engine, dnnl::sycl_interop::memory_kind::usm,
+        out.data.opaque());
+    dnnl::memory src_scale = dnnl::sycl_interop::make_memory(
+        matmul->scale_desc, matmul->engine,
+        dnnl::sycl_interop::memory_kind::usm, lhs_scale.opaque());
+    dnnl::memory weights_scale = dnnl::sycl_interop::make_memory(
+        matmul->scale_desc, matmul->engine,
+        dnnl::sycl_interop::memory_kind::usm, rhs_scale.opaque());
+    dnnl::stream dnnl_stream = dnnl::sycl_interop::make_stream(
+        matmul->engine, *queue);
+    dnnl::sycl_interop::execute(
+        matmul->primitive, dnnl_stream,
+        {{DNNL_ARG_SRC, src}, {DNNL_ARG_WEIGHTS, weights}, {DNNL_ARG_DST, dst},
+         {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_scale},
+         {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, weights_scale}});
+  } catch (const dnnl::error& error) {
+    return DnnlErrorToStatus(error);
+  } catch (const ::sycl::exception& error) {
+    return absl::InternalError(absl::StrCat(
+        "SyclBlasLt oneDNN FP8 matmul SYCL failure: ", error.what()));
+  } catch (const std::exception& error) {
+    return absl::InternalError(absl::StrCat(
+        "SyclBlasLt oneDNN FP8 matmul failure: ", error.what()));
+  }
+  return absl::OkStatus();
 }
 
 absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
@@ -409,9 +604,9 @@ absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
     return absl::InternalError("SyclBlasLt: kBias epilogue with null bias");
   }
 
-  // Scaling-mode / auxiliary-output / FP8 paths are not implemented.
-  if (config_.scale_mode != gpu::ScaleMode::kNone) {
-    return absl::UnimplementedError("SyclBlasLt: scaled matmul not supported");
+  if (config_.scale_mode == gpu::ScaleMode::kBlockScaling) {
+    return absl::UnimplementedError(
+        "SyclBlasLt: block-scaled matmul is not supported");
   }
 
   // Build matrix descriptors (handles row/column-major canonicalization and
@@ -421,6 +616,27 @@ absl::Status BlasLt::MatmulPlan::ExecuteOnStream(
       config_.GetMatrixDescriptors(
           args.a, args.b, args.d,
           stream->parent()->GetDeviceDescription().gpu_compute_capability()));
+
+  if (config_.scale_mode == gpu::ScaleMode::kTensorScaling) {
+    std::unique_ptr<EventBasedTimer> timer;
+    if (profile_result != nullptr) {
+      TF_ASSIGN_OR_RETURN(timer, stream->CreateEventBasedTimer(
+                                     profile_result->warmup_run_executed()));
+    }
+    TF_RETURN_IF_ERROR(ExecuteTensorScaledFp8Matmul(stream, args, descs));
+    if (epilogue_ == Epilogue::kBias) {
+      DeviceAddressBase out_buf = descs.output.data;
+      TF_RETURN_IF_ERROR(ApplyVectorBias(
+          stream, args.bias, descs.output.type, descs.output.m,
+          descs.output.n, descs.output.leading_dim_stride,
+          descs.output.batch_size, descs.output.batch_stride, &out_buf));
+    }
+    if (profile_result != nullptr) {
+      TF_RETURN_IF_ERROR(PopulateProfileFromTimer(
+          timer.get(), kOneDnnGemm, profile_result));
+    }
+    return absl::OkStatus();
+  }
 
   // We do the GEMM in-place on D. If beta != 0 and C is a distinct buffer
   // from D we copy C into D first so MKL can accumulate against it.
