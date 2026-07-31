@@ -296,7 +296,8 @@ absl::StatusOr<TritonKernelSource> CreateTritonModule(
     }
   }
 
-  if (fusion_kind == kTritonGemmFusionKind) {
+  if (fusion_kind == kTritonGemmFusionKind ||
+      fusion_kind == kScaledGemmFusionKind) {
     return Internal(
         "Attempted to emit a GEMM fusion through the legacy Triton "
         "emitter, but it has been deleted. This is a bug.");

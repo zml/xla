@@ -185,7 +185,7 @@ const HloInstruction* GetScaledDotFromFusion(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) return nullptr;
   auto gpu_config = instr.backend_config<GpuBackendConfig>();
   if (!gpu_config.ok()) return nullptr;
-  if (gpu_config->fusion_backend_config().kind() != kTritonGemmFusionKind) {
+  if (!IsGemmFusionAutotuneKind(gpu_config->fusion_backend_config().kind())) {
     return nullptr;
   }
   return hlo_query::GetFirstInstructionWithOpcode(

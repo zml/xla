@@ -428,8 +428,7 @@ FusionDecision ShouldProceedWithSymbolicTileDerivation(
   if (hlo->opcode() == HloOpcode::kPad &&
       !IsWithinFusion(*hlo, {gpu::kTritonNestedGemmFusionKind,
                              gpu::kTritonGemmFusionKind,
-                             // A Tile IR fusion is a gemm fusion another
-                             // backend claimed; pads in it are just as tileable.
+                             gpu::kScaledGemmFusionKind,
                              gpu::kTileIrFusionKind})) {
     return FusionDecision::Forbid("Bailing out on ") << hlo->ToString();
   }
