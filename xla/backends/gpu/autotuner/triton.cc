@@ -395,7 +395,7 @@ bool TritonBackend::IsSupported(const HloInstruction& instr) {
 
   // TODO: b/487920266 - sometimes we create fusions that can't be tiled.
   // Bail out here if that's the case.
-  if (backend_config.kind() == kTritonGemmFusionKind) {
+  if (IsGemmFusionAutotuneKind(backend_config.kind())) {
     auto fusion = Cast<HloFusionInstruction>(&instr);
     std::unique_ptr<HloFusionAdaptor> fusion_adaptor =
         HloFusionAdaptor::ForInstruction(fusion);

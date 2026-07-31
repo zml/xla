@@ -34,7 +34,7 @@ constexpr char kSameTypeScaledDotHlo[] = R"(
     p2 = f8e4m3fn[16,256] parameter(2)
     p3 = f8e4m3fn[256,3840] parameter(3)
     ROOT _ = f32[16,3840] fusion(p0, p1, p2, p3), kind=kCustom, calls=fusion1,
-      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+      backend_config={"fusion_backend_config":{"kind":"__scaled_gemm"}}
   })";
 
 constexpr char kMixedTypeScaledDotHlo[] = R"(
@@ -53,7 +53,7 @@ constexpr char kMixedTypeScaledDotHlo[] = R"(
     p2 = f8e4m3fn[16,256] parameter(2)
     p3 = f8e4m3fn[256,3840] parameter(3)
     ROOT _ = f32[16,3840] fusion(p0, p1, p2, p3), kind=kCustom, calls=fusion1,
-      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+      backend_config={"fusion_backend_config":{"kind":"__scaled_gemm"}}
   })";
 
 constexpr char kPlainDotHlo[] = R"(
