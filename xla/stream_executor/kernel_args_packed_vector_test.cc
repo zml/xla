@@ -63,6 +63,9 @@ TEST(KernelArgsPackedVectorTest, StoresArgumentAddresses) {
       absl::Span<const char>(
           absl::bit_cast<const char*>(args.argument_addresses().at(2)), 3),
       ElementsAre(30, 31, 32));
+  EXPECT_THAT(args.argument_storage(),
+              ElementsAre(ElementsAre(10), ElementsAre(20, 21),
+                          ElementsAre(30, 31, 32)));
 }
 
 TEST(KernelArgsPackedVectorTest,

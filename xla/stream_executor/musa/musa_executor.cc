@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_command_buffer.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/musa/musa_context.h"
 #include "xla/stream_executor/musa/musa_device_description.h"
@@ -311,6 +312,13 @@ absl::StatusOr<std::unique_ptr<Event>> MusaExecutor::CreateEvent() {
   return std::make_unique<MusaEvent>(std::move(event));
 }
 
+absl::StatusOr<std::unique_ptr<CommandBuffer>>
+MusaExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
+  VLOG(2) << "Create MUSA command buffer (MUSA graph)";
+  std::unique_ptr<ActivateContext> activation = Activate();
+  return MusaCommandBuffer::Create(mode, this);
+}
+
 DeviceAddressBase MusaExecutor::Allocate(uint64_t size, int64_t memory_space) {
   if (size == 0) {
     return DeviceAddressBase();
@@ -527,8 +535,7 @@ MusaExecutor::CreateDeviceDescription(int device_ordinal) {
                                   ? std::max(0, *numa_node)
                                   : tsl::port::kNUMANoAffinity);
 
-    TF_ASSIGN_OR_RETURN(MUdevice source_device,
-                        driver.Device(device_ordinal));
+    TF_ASSIGN_OR_RETURN(MUdevice source_device, driver.Device(device_ordinal));
     TF_ASSIGN_OR_RETURN(int device_count, driver.DeviceCount());
     int active_mtlink_ports = 0;
     for (int peer_ordinal = 0; peer_ordinal < device_count; ++peer_ordinal) {

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_driver.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -28,6 +30,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "musa.h"
 #include "xla/stream_executor/musa/musa_dso_loader.h"
 #include "xla/stream_executor/musa/musa_status.h"
@@ -52,9 +55,9 @@ using MuDeviceGetFn = MUresult(MUSAAPI*)(MUdevice* device, int ordinal);
 using MuDeviceCanAccessPeerFn = MUresult(MUSAAPI*)(int* can_access_peer,
                                                    MUdevice source,
                                                    MUdevice peer);
-using MuDeviceGetP2PAttributeFn = MUresult(MUSAAPI*)(
-    int* value, MUdevice_P2PAttribute attribute, MUdevice source,
-    MUdevice peer);
+using MuDeviceGetP2PAttributeFn =
+    MUresult(MUSAAPI*)(int* value, MUdevice_P2PAttribute attribute,
+                       MUdevice source, MUdevice peer);
 using MuDevicePrimaryCtxRetainFn = MUresult(MUSAAPI*)(MUcontext* context,
                                                       MUdevice device);
 using MuDevicePrimaryCtxReleaseV2Fn = MUresult(MUSAAPI*)(MUdevice device);
@@ -71,9 +74,11 @@ using MuCtxEnablePeerAccessFn = MUresult(MUSAAPI*)(MUcontext peer_context,
                                                    unsigned int flags);
 using MuPointerGetAttributeFn = MUresult(MUSAAPI*)(
     void* value, MUpointer_attribute attribute, MUdeviceptr pointer);
-using MuMemcpyPeerAsyncFn = MUresult(MUSAAPI*)(
-    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
-    MUcontext source_context, size_t bytes, MUstream stream);
+using MuMemcpyPeerAsyncFn = MUresult(MUSAAPI*)(MUdeviceptr destination,
+                                               MUcontext destination_context,
+                                               MUdeviceptr source,
+                                               MUcontext source_context,
+                                               size_t bytes, MUstream stream);
 using MuModuleLoadDataFn = MUresult(MUSAAPI*)(MUmodule* module,
                                               const void* image);
 using MuModuleUnloadFn = MUresult(MUSAAPI*)(MUmodule module);
@@ -97,6 +102,35 @@ using MuLaunchKernelFn = MUresult(MUSAAPI*)(
 using MuMemsetD32AsyncFn = MUresult(MUSAAPI*)(MUdeviceptr destination,
                                               unsigned int value, size_t count,
                                               MUstream stream);
+using MuGraphCreateFn = MUresult(MUSAAPI*)(MUgraph*, unsigned int);
+using MuGraphDestroyFn = MUresult(MUSAAPI*)(MUgraph);
+using MuGraphAddEmptyNodeFn = MUresult(MUSAAPI*)(MUgraphNode*, MUgraph,
+                                                 const MUgraphNode*, size_t);
+using MuGraphAddKernelNodeFn =
+    MUresult(MUSAAPI*)(MUgraphNode*, MUgraph, const MUgraphNode*, size_t,
+                       const MUSA_KERNEL_NODE_PARAMS*);
+using MuGraphKernelNodeSetParamsFn =
+    MUresult(MUSAAPI*)(MUgraphNode, const MUSA_KERNEL_NODE_PARAMS*);
+using MuGraphAddMemcpyNodeFn = MUresult(MUSAAPI*)(MUgraphNode*, MUgraph,
+                                                  const MUgraphNode*, size_t,
+                                                  const MUSA_MEMCPY3D*,
+                                                  MUcontext);
+using MuGraphMemcpyNodeSetParamsFn = MUresult(MUSAAPI*)(MUgraphNode,
+                                                        const MUSA_MEMCPY3D*);
+using MuGraphAddMemsetNodeFn =
+    MUresult(MUSAAPI*)(MUgraphNode*, MUgraph, const MUgraphNode*, size_t,
+                       const MUSA_MEMSET_NODE_PARAMS*, MUcontext);
+using MuGraphMemsetNodeSetParamsFn =
+    MUresult(MUSAAPI*)(MUgraphNode, const MUSA_MEMSET_NODE_PARAMS*);
+using MuGraphGetNodesFn = MUresult(MUSAAPI*)(MUgraph, MUgraphNode*, size_t*);
+using MuGraphInstantiateFn = MUresult(MUSAAPI*)(MUgraphExec*, MUgraph,
+                                                MUgraphNode*, char*, size_t);
+using MuGraphExecDestroyFn = MUresult(MUSAAPI*)(MUgraphExec);
+using MuGraphLaunchFn = MUresult(MUSAAPI*)(MUgraphExec, MUstream);
+using MuStreamSynchronizeFn = MUresult(MUSAAPI*)(MUstream);
+using MuStreamBeginCaptureFn = MUresult(MUSAAPI*)(MUstream,
+                                                  MUstreamCaptureMode);
+using MuStreamEndCaptureFn = MUresult(MUSAAPI*)(MUstream, MUgraph*);
 
 constexpr muuint64_t kProcAddressFlags =
     static_cast<muuint64_t>(MU_GET_PROC_ADDRESS_LEGACY_STREAM);
@@ -155,6 +189,17 @@ absl::StatusOr<Fn> ResolveRequired(internal::MusaSymbolLoader& loader,
       absl::StrJoin(dlsym_aliases, ", "), "]; DSO=", loader.loaded_path()));
 }
 
+template <typename Fn>
+Fn ResolveOptional(internal::MusaSymbolLoader& loader,
+                   const BootstrapApi& bootstrap,
+                   absl::string_view logical_name,
+                   std::vector<std::string> dlsym_aliases) {
+  absl::StatusOr<Fn> resolved = ResolveRequired<Fn>(
+      loader, bootstrap, logical_name, std::move(dlsym_aliases));
+  if (!resolved.ok()) return nullptr;
+  return *resolved;
+}
+
 }  // namespace
 
 struct MusaDriver::Api {
@@ -185,6 +230,23 @@ struct MusaDriver::Api {
       nullptr;
   MuLaunchKernelFn launch_kernel = nullptr;
   MuMemsetD32AsyncFn memset_d32_async = nullptr;
+  MuGraphCreateFn graph_create = nullptr;
+  MuGraphDestroyFn graph_destroy = nullptr;
+  MuGraphAddEmptyNodeFn graph_add_empty_node = nullptr;
+  MuGraphAddKernelNodeFn graph_add_kernel_node = nullptr;
+  MuGraphKernelNodeSetParamsFn graph_kernel_node_set_params = nullptr;
+  MuGraphAddMemcpyNodeFn graph_add_memcpy_node = nullptr;
+  MuGraphMemcpyNodeSetParamsFn graph_memcpy_node_set_params = nullptr;
+  MuGraphAddMemsetNodeFn graph_add_memset_node = nullptr;
+  MuGraphMemsetNodeSetParamsFn graph_memset_node_set_params = nullptr;
+  MuGraphGetNodesFn graph_get_nodes = nullptr;
+  MuGraphGetNodesFn graph_get_root_nodes = nullptr;
+  MuGraphInstantiateFn graph_instantiate = nullptr;
+  MuGraphExecDestroyFn graph_exec_destroy = nullptr;
+  MuGraphLaunchFn graph_launch = nullptr;
+  MuStreamSynchronizeFn stream_synchronize = nullptr;
+  MuStreamBeginCaptureFn stream_begin_capture = nullptr;
+  MuStreamEndCaptureFn stream_end_capture = nullptr;
 };
 
 MusaDriver::MusaDriver() : MusaDriver(internal::CreateMusaDriverDsoLoader()) {}
@@ -267,8 +329,7 @@ absl::Status MusaDriver::Initialize() {
   MUSA_RESOLVE_REQUIRED(device_can_access_peer, MuDeviceCanAccessPeerFn,
                         "muDeviceCanAccessPeer", "muDeviceCanAccessPeer");
   MUSA_RESOLVE_REQUIRED(device_get_p2p_attribute, MuDeviceGetP2PAttributeFn,
-                        "muDeviceGetP2PAttribute",
-                        "muDeviceGetP2PAttribute");
+                        "muDeviceGetP2PAttribute", "muDeviceGetP2PAttribute");
   MUSA_RESOLVE_REQUIRED(primary_context_retain, MuDevicePrimaryCtxRetainFn,
                         "muDevicePrimaryCtxRetain", "muDevicePrimaryCtxRetain");
   MUSA_RESOLVE_REQUIRED(primary_context_release, MuDevicePrimaryCtxReleaseV2Fn,
@@ -315,6 +376,51 @@ absl::Status MusaDriver::Initialize() {
   MUSA_RESOLVE_REQUIRED(memset_d32_async, MuMemsetD32AsyncFn,
                         "muMemsetD32Async", "muMemsetD32Async");
 
+#define MUSA_RESOLVE_OPTIONAL(field, type, logical_name, ...)                  \
+  api->field = ResolveOptional<type>(*symbol_loader_, bootstrap, logical_name, \
+                                     {__VA_ARGS__})
+
+  MUSA_RESOLVE_OPTIONAL(graph_create, MuGraphCreateFn, "muGraphCreate",
+                        "muGraphCreate");
+  MUSA_RESOLVE_OPTIONAL(graph_destroy, MuGraphDestroyFn, "muGraphDestroy",
+                        "muGraphDestroy");
+  MUSA_RESOLVE_OPTIONAL(graph_add_empty_node, MuGraphAddEmptyNodeFn,
+                        "muGraphAddEmptyNode", "muGraphAddEmptyNode");
+  MUSA_RESOLVE_OPTIONAL(graph_add_kernel_node, MuGraphAddKernelNodeFn,
+                        "muGraphAddKernelNode", "muGraphAddKernelNode");
+  MUSA_RESOLVE_OPTIONAL(
+      graph_kernel_node_set_params, MuGraphKernelNodeSetParamsFn,
+      "muGraphKernelNodeSetParams", "muGraphKernelNodeSetParams");
+  MUSA_RESOLVE_OPTIONAL(graph_add_memcpy_node, MuGraphAddMemcpyNodeFn,
+                        "muGraphAddMemcpyNode", "muGraphAddMemcpyNode");
+  MUSA_RESOLVE_OPTIONAL(
+      graph_memcpy_node_set_params, MuGraphMemcpyNodeSetParamsFn,
+      "muGraphMemcpyNodeSetParams", "muGraphMemcpyNodeSetParams");
+  MUSA_RESOLVE_OPTIONAL(graph_add_memset_node, MuGraphAddMemsetNodeFn,
+                        "muGraphAddMemsetNode", "muGraphAddMemsetNode");
+  MUSA_RESOLVE_OPTIONAL(
+      graph_memset_node_set_params, MuGraphMemsetNodeSetParamsFn,
+      "muGraphMemsetNodeSetParams", "muGraphMemsetNodeSetParams");
+  MUSA_RESOLVE_OPTIONAL(graph_get_nodes, MuGraphGetNodesFn, "muGraphGetNodes",
+                        "muGraphGetNodes");
+  MUSA_RESOLVE_OPTIONAL(graph_get_root_nodes, MuGraphGetNodesFn,
+                        "muGraphGetRootNodes", "muGraphGetRootNodes");
+  MUSA_RESOLVE_OPTIONAL(graph_instantiate, MuGraphInstantiateFn,
+                        "muGraphInstantiate", "muGraphInstantiate_v2",
+                        "muGraphInstantiate");
+  MUSA_RESOLVE_OPTIONAL(graph_exec_destroy, MuGraphExecDestroyFn,
+                        "muGraphExecDestroy", "muGraphExecDestroy");
+  MUSA_RESOLVE_OPTIONAL(graph_launch, MuGraphLaunchFn, "muGraphLaunch",
+                        "muGraphLaunch");
+  MUSA_RESOLVE_OPTIONAL(stream_synchronize, MuStreamSynchronizeFn,
+                        "muStreamSynchronize", "muStreamSynchronize");
+  MUSA_RESOLVE_OPTIONAL(stream_begin_capture, MuStreamBeginCaptureFn,
+                        "muStreamBeginCapture", "muStreamBeginCapture_v2",
+                        "muStreamBeginCapture");
+  MUSA_RESOLVE_OPTIONAL(stream_end_capture, MuStreamEndCaptureFn,
+                        "muStreamEndCapture", "muStreamEndCapture");
+
+#undef MUSA_RESOLVE_OPTIONAL
 #undef MUSA_RESOLVE_REQUIRED
 
   api_ = std::move(api);
@@ -355,8 +461,8 @@ absl::StatusOr<MUdevice> MusaDriver::Device(int ordinal) {
   return device;
 }
 
-absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
-    MUdevice source, MUdevice peer) {
+absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(MUdevice source,
+                                                              MUdevice peer) {
   if (source == peer) {
     return absl::InvalidArgumentError(
         "MUSA peer access requires two distinct devices");
@@ -365,9 +471,9 @@ absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
   if (!status.ok()) return status;
 
   int can_access_peer = -1;
-  status = ResultStatus(
-      api_->device_can_access_peer(&can_access_peer, source, peer),
-      "muDeviceCanAccessPeer");
+  status =
+      ResultStatus(api_->device_can_access_peer(&can_access_peer, source, peer),
+                   "muDeviceCanAccessPeer");
   if (!status.ok()) return status;
   if (can_access_peer != 0 && can_access_peer != 1) {
     return absl::InternalError(absl::StrCat(
@@ -376,9 +482,8 @@ absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
   }
   if (can_access_peer == 0) return MusaPeerAccessInfo{};
 
-  auto get_attribute =
-      [&](MUdevice_P2PAttribute attribute,
-          const char* attribute_name) -> absl::StatusOr<int> {
+  auto get_attribute = [&](MUdevice_P2PAttribute attribute,
+                           const char* attribute_name) -> absl::StatusOr<int> {
     int value = -1;
     absl::Status attribute_status = ResultStatus(
         api_->device_get_p2p_attribute(&value, attribute, source, peer),
@@ -393,8 +498,7 @@ absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
   };
   auto without_link_attributes = [&](absl::string_view reason) {
     LOG(WARNING) << "MUSA device " << source << " can access peer " << peer
-                 << ", but optional link telemetry is unavailable: "
-                 << reason;
+                 << ", but optional link telemetry is unavailable: " << reason;
     return MusaPeerAccessInfo{.can_access_peer = true};
   };
 
@@ -404,14 +508,13 @@ absl::StatusOr<MusaPeerAccessInfo> MusaDriver::PeerAccessInfo(
     return without_link_attributes(performance_rank.status().message());
   }
   absl::StatusOr<int> native_atomic = get_attribute(
-      MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED,
-      "native atomic support");
+      MU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED, "native atomic support");
   if (!native_atomic.ok()) {
     return without_link_attributes(native_atomic.status().message());
   }
-  absl::StatusOr<int> musa_array = get_attribute(
-      MU_DEVICE_P2P_ATTRIBUTE_MUSA_ARRAY_ACCESS_SUPPORTED,
-      "MUSA array access support");
+  absl::StatusOr<int> musa_array =
+      get_attribute(MU_DEVICE_P2P_ATTRIBUTE_MUSA_ARRAY_ACCESS_SUPPORTED,
+                    "MUSA array access support");
   if (!musa_array.ok()) {
     return without_link_attributes(musa_array.status().message());
   }
@@ -539,10 +642,9 @@ absl::StatusOr<MUcontext> MusaDriver::ContextForPointer(MUdeviceptr pointer) {
   absl::Status status = Init();
   if (!status.ok()) return status;
   MUcontext context = nullptr;
-  status = ResultStatus(
-      api_->pointer_get_attribute(&context, MU_POINTER_ATTRIBUTE_CONTEXT,
-                                  pointer),
-      "muPointerGetAttribute");
+  status = ResultStatus(api_->pointer_get_attribute(
+                            &context, MU_POINTER_ATTRIBUTE_CONTEXT, pointer),
+                        "muPointerGetAttribute");
   if (!status.ok()) return status;
   if (context == nullptr) {
     return absl::InternalError(
@@ -551,9 +653,11 @@ absl::StatusOr<MUcontext> MusaDriver::ContextForPointer(MUdeviceptr pointer) {
   return context;
 }
 
-absl::Status MusaDriver::MemcpyPeerAsync(
-    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
-    MUcontext source_context, uint64_t bytes, MUstream stream) {
+absl::Status MusaDriver::MemcpyPeerAsync(MUdeviceptr destination,
+                                         MUcontext destination_context,
+                                         MUdeviceptr source,
+                                         MUcontext source_context,
+                                         uint64_t bytes, MUstream stream) {
   if (destination == 0 || source == 0) {
     return absl::InvalidArgumentError(
         "muMemcpyPeerAsync requires non-null source and destination pointers");
@@ -564,10 +668,10 @@ absl::Status MusaDriver::MemcpyPeerAsync(
   }
   absl::Status status = Init();
   if (!status.ok()) return status;
-  return ResultStatus(api_->memcpy_peer_async(
-                          destination, destination_context, source,
-                          source_context, bytes, stream),
-                      "muMemcpyPeerAsync");
+  return ResultStatus(
+      api_->memcpy_peer_async(destination, destination_context, source,
+                              source_context, bytes, stream),
+      "muMemcpyPeerAsync");
 }
 
 absl::StatusOr<MUmodule> MusaDriver::LoadModuleData(const void* image) {
@@ -726,6 +830,333 @@ absl::Status MusaDriver::MemsetD32Async(MUdeviceptr destination, uint32_t value,
   if (!status.ok()) return status;
   return ResultStatus(api_->memset_d32_async(destination, value, count, stream),
                       "muMemsetD32Async");
+}
+
+bool MusaDriver::GraphsAvailable() {
+  if (!Init().ok()) return false;
+  return api_->graph_create != nullptr && api_->graph_destroy != nullptr &&
+         api_->graph_add_empty_node != nullptr &&
+         api_->graph_add_kernel_node != nullptr &&
+         api_->graph_kernel_node_set_params != nullptr &&
+         api_->graph_add_memcpy_node != nullptr &&
+         api_->graph_memcpy_node_set_params != nullptr &&
+         api_->graph_add_memset_node != nullptr &&
+         api_->graph_memset_node_set_params != nullptr &&
+         api_->graph_get_nodes != nullptr &&
+         api_->graph_get_root_nodes != nullptr &&
+         api_->graph_instantiate != nullptr &&
+         api_->graph_exec_destroy != nullptr && api_->graph_launch != nullptr &&
+         api_->stream_synchronize != nullptr &&
+         api_->stream_begin_capture != nullptr &&
+         api_->stream_end_capture != nullptr;
+}
+
+absl::StatusOr<MUgraph> MusaDriver::GraphCreate() {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_create == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphCreate in libmusa");
+  }
+  MUgraph graph = nullptr;
+  status =
+      ResultStatus(api_->graph_create(&graph, /*flags=*/0), "muGraphCreate");
+  if (!status.ok()) return status;
+  if (graph == nullptr) {
+    return absl::InternalError(
+        "muGraphCreate returned success with a null graph");
+  }
+  return graph;
+}
+
+absl::Status MusaDriver::GraphDestroy(MUgraph graph) {
+  if (graph == nullptr) return absl::OkStatus();
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_destroy == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphDestroy in libmusa");
+  }
+  return ResultStatus(api_->graph_destroy(graph), "muGraphDestroy");
+}
+
+absl::StatusOr<MUgraphNode> MusaDriver::GraphAddEmptyNode(
+    MUgraph graph, absl::Span<const MUgraphNode> dependencies) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_add_empty_node == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphAddEmptyNode in libmusa");
+  }
+  MUgraphNode node = nullptr;
+  status =
+      ResultStatus(api_->graph_add_empty_node(&node, graph, dependencies.data(),
+                                              dependencies.size()),
+                   "muGraphAddEmptyNode");
+  if (!status.ok()) return status;
+  if (node == nullptr) {
+    return absl::InternalError(
+        "muGraphAddEmptyNode returned success with a null node");
+  }
+  return node;
+}
+
+absl::StatusOr<MUgraphNode> MusaDriver::GraphAddKernelNode(
+    MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+    const MUSA_KERNEL_NODE_PARAMS& params) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_add_kernel_node == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphAddKernelNode in libmusa");
+  }
+  MUgraphNode node = nullptr;
+  status = ResultStatus(
+      api_->graph_add_kernel_node(&node, graph, dependencies.data(),
+                                  dependencies.size(), &params),
+      "muGraphAddKernelNode");
+  if (!status.ok()) return status;
+  if (node == nullptr) {
+    return absl::InternalError(
+        "muGraphAddKernelNode returned success with a null node");
+  }
+  return node;
+}
+
+absl::Status MusaDriver::GraphKernelNodeSetParams(
+    MUgraphNode node, const MUSA_KERNEL_NODE_PARAMS& params) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_kernel_node_set_params == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphKernelNodeSetParams in libmusa");
+  }
+  return ResultStatus(api_->graph_kernel_node_set_params(node, &params),
+                      "muGraphKernelNodeSetParams");
+}
+
+absl::StatusOr<MUgraphNode> MusaDriver::GraphAddMemcpyD2DNode(
+    MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+    MUdeviceptr destination, MUdeviceptr source, size_t bytes) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_add_memcpy_node == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphAddMemcpyNode in libmusa");
+  }
+  MUcontext context = nullptr;
+  status = ResultStatus(api_->context_get_current(&context), "muCtxGetCurrent");
+  if (!status.ok()) return status;
+  if (context == nullptr) {
+    return absl::FailedPreconditionError(
+        "muGraphAddMemcpyNode requires a current MUSA context");
+  }
+  MUSA_MEMCPY3D params = {};
+  params.srcMemoryType = MU_MEMORYTYPE_DEVICE;
+  params.srcDevice = source;
+  params.srcPitch = bytes;
+  params.srcHeight = 1;
+  params.dstMemoryType = MU_MEMORYTYPE_DEVICE;
+  params.dstDevice = destination;
+  params.dstPitch = bytes;
+  params.dstHeight = 1;
+  params.WidthInBytes = bytes;
+  params.Height = 1;
+  params.Depth = 1;
+  MUgraphNode node = nullptr;
+  status = ResultStatus(
+      api_->graph_add_memcpy_node(&node, graph, dependencies.data(),
+                                  dependencies.size(), &params, context),
+      "muGraphAddMemcpyNode");
+  if (!status.ok()) return status;
+  if (node == nullptr) {
+    return absl::InternalError(
+        "muGraphAddMemcpyNode returned success with a null node");
+  }
+  return node;
+}
+
+absl::Status MusaDriver::GraphMemcpyD2DNodeSetParams(MUgraphNode node,
+                                                     MUdeviceptr destination,
+                                                     MUdeviceptr source,
+                                                     size_t bytes) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_memcpy_node_set_params == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphMemcpyNodeSetParams in libmusa");
+  }
+  MUSA_MEMCPY3D params = {};
+  params.srcMemoryType = MU_MEMORYTYPE_DEVICE;
+  params.srcDevice = source;
+  params.srcPitch = bytes;
+  params.srcHeight = 1;
+  params.dstMemoryType = MU_MEMORYTYPE_DEVICE;
+  params.dstDevice = destination;
+  params.dstPitch = bytes;
+  params.dstHeight = 1;
+  params.WidthInBytes = bytes;
+  params.Height = 1;
+  params.Depth = 1;
+  return ResultStatus(api_->graph_memcpy_node_set_params(node, &params),
+                      "muGraphMemcpyNodeSetParams");
+}
+
+absl::StatusOr<MUgraphNode> MusaDriver::GraphAddMemsetNode(
+    MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+    const MUSA_MEMSET_NODE_PARAMS& params) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_add_memset_node == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphAddMemsetNode in libmusa");
+  }
+  MUcontext context = nullptr;
+  status = ResultStatus(api_->context_get_current(&context), "muCtxGetCurrent");
+  if (!status.ok()) return status;
+  if (context == nullptr) {
+    return absl::FailedPreconditionError(
+        "muGraphAddMemsetNode requires a current MUSA context");
+  }
+  MUgraphNode node = nullptr;
+  status = ResultStatus(
+      api_->graph_add_memset_node(&node, graph, dependencies.data(),
+                                  dependencies.size(), &params, context),
+      "muGraphAddMemsetNode");
+  if (!status.ok()) return status;
+  if (node == nullptr) {
+    return absl::InternalError(
+        "muGraphAddMemsetNode returned success with a null node");
+  }
+  return node;
+}
+
+absl::Status MusaDriver::GraphMemsetNodeSetParams(
+    MUgraphNode node, const MUSA_MEMSET_NODE_PARAMS& params) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_memset_node_set_params == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphMemsetNodeSetParams in libmusa");
+  }
+  return ResultStatus(api_->graph_memset_node_set_params(node, &params),
+                      "muGraphMemsetNodeSetParams");
+}
+
+absl::StatusOr<size_t> MusaDriver::GraphNodeCount(MUgraph graph) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_get_nodes == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphGetNodes in libmusa");
+  }
+  size_t count = 0;
+  status = ResultStatus(api_->graph_get_nodes(graph, nullptr, &count),
+                        "muGraphGetNodes");
+  if (!status.ok()) return status;
+  return count;
+}
+
+absl::StatusOr<size_t> MusaDriver::GraphRootNodeCount(MUgraph graph) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_get_root_nodes == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphGetRootNodes in libmusa");
+  }
+  size_t count = 0;
+  status = ResultStatus(api_->graph_get_root_nodes(graph, nullptr, &count),
+                        "muGraphGetRootNodes");
+  if (!status.ok()) return status;
+  return count;
+}
+
+absl::StatusOr<MUgraphExec> MusaDriver::GraphInstantiate(MUgraph graph) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_instantiate == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphInstantiate in libmusa");
+  }
+  MUgraphExec executable = nullptr;
+  MUgraphNode error_node = nullptr;
+  std::array<char, 1024> log = {};
+  status = ResultStatus(api_->graph_instantiate(&executable, graph, &error_node,
+                                                log.data(), log.size()),
+                        "muGraphInstantiate");
+  if (!status.ok()) {
+    return absl::Status(status.code(),
+                        absl::StrCat(status.message(), "; error_node=",
+                                     reinterpret_cast<uintptr_t>(error_node),
+                                     "; log=", log.data()));
+  }
+  if (executable == nullptr) {
+    return absl::InternalError(
+        "muGraphInstantiate returned success with a null executable");
+  }
+  return executable;
+}
+
+absl::Status MusaDriver::GraphExecDestroy(MUgraphExec executable) {
+  if (executable == nullptr) return absl::OkStatus();
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_exec_destroy == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphExecDestroy in libmusa");
+  }
+  return ResultStatus(api_->graph_exec_destroy(executable),
+                      "muGraphExecDestroy");
+}
+
+absl::Status MusaDriver::GraphLaunch(MUgraphExec executable, MUstream stream) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->graph_launch == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graphs require muGraphLaunch in libmusa");
+  }
+  return ResultStatus(api_->graph_launch(executable, stream), "muGraphLaunch");
+}
+
+absl::Status MusaDriver::StreamSynchronize(MUstream stream) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->stream_synchronize == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graph updates require muStreamSynchronize in libmusa");
+  }
+  return ResultStatus(api_->stream_synchronize(stream), "muStreamSynchronize");
+}
+
+absl::Status MusaDriver::StreamBeginCapture(MUstream stream) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->stream_begin_capture == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graph capture requires muStreamBeginCapture in libmusa");
+  }
+  return ResultStatus(
+      api_->stream_begin_capture(stream, MU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+      "muStreamBeginCapture");
+}
+
+absl::StatusOr<MUgraph> MusaDriver::StreamEndCapture(MUstream stream) {
+  absl::Status status = Init();
+  if (!status.ok()) return status;
+  if (api_->stream_end_capture == nullptr) {
+    return absl::UnimplementedError(
+        "MUSA graph capture requires muStreamEndCapture in libmusa");
+  }
+  MUgraph graph = nullptr;
+  status = ResultStatus(api_->stream_end_capture(stream, &graph),
+                        "muStreamEndCapture");
+  if (!status.ok()) return status;
+  if (graph == nullptr) {
+    return absl::InternalError(
+        "muStreamEndCapture returned success with a null graph");
+  }
+  return graph;
 }
 
 }  // namespace stream_executor::musa

@@ -425,6 +425,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
         "@local_config_musa//musa:musa_headers",
     ],
 )
@@ -685,7 +686,9 @@ cc_library(
         "musa-only",
     ],
     deps = [
+        "//xla/stream_executor:kernel_args",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -855,6 +858,62 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "musa_graph_arguments",
+    srcs = ["musa_graph_arguments.cc"],
+    hdrs = ["musa_graph_arguments.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:kernel_args_packed_vector",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "musa_command_buffer",
+    srcs = ["musa_command_buffer.cc"],
+    hdrs = ["musa_command_buffer.h"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_driver",
+        ":musa_graph_arguments",
+        ":musa_kernel",
+        ":musa_module",
+        ":musa_stream",
+        "//xla/stream_executor:bit_pattern",
+        "//xla/stream_executor:command_buffer",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:kernel_args_packed_vector",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/gpu:gpu_command_buffer",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+cc_library(
     name = "musa_runtime",
     srcs = ["musa_runtime.cc"],
     hdrs = ["musa_runtime.h"],
@@ -872,6 +931,23 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@local_config_musa//musa:musa_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_graph_arguments_test",
+    srcs = ["musa_graph_arguments_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":musa_graph_arguments",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:kernel_args_packed_vector",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -945,6 +1021,7 @@ cc_library(
     deps = [
         ":musa_driver",
         ":musa_event",
+        ":musa_graph_arguments",
         ":musa_module",
         ":musa_module_reaper",
         ":musa_module_use_tracker",
@@ -955,6 +1032,8 @@ cc_library(
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:event",
         "//xla/stream_executor:event_based_timer",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:kernel_args_packed_vector",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",
@@ -969,6 +1048,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -1058,6 +1138,7 @@ cc_library(
     ],
     deps = [
         ":musa_blas",
+        ":musa_command_buffer",
         ":musa_compute_capability",
         ":musa_context",
         ":musa_device_description",
@@ -1172,6 +1253,7 @@ xla_cc_test(
         "//xla/backends/gpu/runtime:kernel_thunk",
         "//xla/backends/gpu/runtime:thunk",
         "//xla/codegen/emitters:kernel_arguments",
+        "//xla/stream_executor:command_buffer",
         "//xla/service:buffer_assignment",
         "//xla/service:service_executable_run_options",
         "//xla/service/gpu:buffer_allocations",
@@ -1185,6 +1267,7 @@ xla_cc_test(
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:module_spec",
         "//xla/stream_executor:stream",
+        "//xla/stream_executor:trace_command_buffer_factory",
         "//xla/stream_executor/gpu:tma_metadata",
         "//xla/tsl/lib/core:status_test_util",
         "//xla/tsl/platform:status_macros",

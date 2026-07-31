@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "musa.h"
 #include "xla/stream_executor/musa/musa_dso_loader.h"
 
@@ -51,8 +52,7 @@ struct MusaPeerAccessInfo {
            lhs.link_attributes_available == rhs.link_attributes_available &&
            lhs.performance_rank == rhs.performance_rank &&
            lhs.native_atomic_supported == rhs.native_atomic_supported &&
-           lhs.musa_array_access_supported ==
-               rhs.musa_array_access_supported &&
+           lhs.musa_array_access_supported == rhs.musa_array_access_supported &&
            lhs.mtlink_port_count == rhs.mtlink_port_count;
   }
 };
@@ -84,8 +84,8 @@ class MusaDriver {
   virtual absl::StatusOr<int> DriverVersion();
   virtual absl::StatusOr<int> DeviceCount();
   virtual absl::StatusOr<MUdevice> Device(int ordinal);
-  virtual absl::StatusOr<MusaPeerAccessInfo> PeerAccessInfo(
-      MUdevice source, MUdevice peer);
+  virtual absl::StatusOr<MusaPeerAccessInfo> PeerAccessInfo(MUdevice source,
+                                                            MUdevice peer);
 
   virtual absl::StatusOr<MUcontext> RetainPrimaryContext(MUdevice device);
   virtual absl::Status ReleasePrimaryContext(MUdevice device);
@@ -102,10 +102,11 @@ class MusaDriver {
   // `peer_context`. An already-enabled mapping is successful.
   virtual absl::Status EnablePeerAccess(MUcontext peer_context);
   virtual absl::StatusOr<MUcontext> ContextForPointer(MUdeviceptr pointer);
-  virtual absl::Status MemcpyPeerAsync(
-      MUdeviceptr destination, MUcontext destination_context,
-      MUdeviceptr source, MUcontext source_context, uint64_t bytes,
-      MUstream stream);
+  virtual absl::Status MemcpyPeerAsync(MUdeviceptr destination,
+                                       MUcontext destination_context,
+                                       MUdeviceptr source,
+                                       MUcontext source_context, uint64_t bytes,
+                                       MUstream stream);
 
   virtual absl::StatusOr<MUmodule> LoadModuleData(const void* image);
   virtual absl::Status UnloadModule(MUmodule module);
@@ -130,6 +131,39 @@ class MusaDriver {
   // callers with a byte count must validate divisibility by four first.
   virtual absl::Status MemsetD32Async(MUdeviceptr destination, uint32_t value,
                                       size_t count, MUstream stream);
+
+  // Graph entry points are optional as a complete capability so older driver
+  // DSOs keep ordinary stream execution. Command buffers require all of them.
+  virtual bool GraphsAvailable();
+  virtual absl::StatusOr<MUgraph> GraphCreate();
+  virtual absl::Status GraphDestroy(MUgraph graph);
+  virtual absl::StatusOr<MUgraphNode> GraphAddEmptyNode(
+      MUgraph graph, absl::Span<const MUgraphNode> dependencies);
+  virtual absl::StatusOr<MUgraphNode> GraphAddKernelNode(
+      MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+      const MUSA_KERNEL_NODE_PARAMS& params);
+  virtual absl::Status GraphKernelNodeSetParams(
+      MUgraphNode node, const MUSA_KERNEL_NODE_PARAMS& params);
+  virtual absl::StatusOr<MUgraphNode> GraphAddMemcpyD2DNode(
+      MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+      MUdeviceptr destination, MUdeviceptr source, size_t bytes);
+  virtual absl::Status GraphMemcpyD2DNodeSetParams(MUgraphNode node,
+                                                   MUdeviceptr destination,
+                                                   MUdeviceptr source,
+                                                   size_t bytes);
+  virtual absl::StatusOr<MUgraphNode> GraphAddMemsetNode(
+      MUgraph graph, absl::Span<const MUgraphNode> dependencies,
+      const MUSA_MEMSET_NODE_PARAMS& params);
+  virtual absl::Status GraphMemsetNodeSetParams(
+      MUgraphNode node, const MUSA_MEMSET_NODE_PARAMS& params);
+  virtual absl::StatusOr<size_t> GraphNodeCount(MUgraph graph);
+  virtual absl::StatusOr<size_t> GraphRootNodeCount(MUgraph graph);
+  virtual absl::StatusOr<MUgraphExec> GraphInstantiate(MUgraph graph);
+  virtual absl::Status GraphExecDestroy(MUgraphExec executable);
+  virtual absl::Status GraphLaunch(MUgraphExec executable, MUstream stream);
+  virtual absl::Status StreamSynchronize(MUstream stream);
+  virtual absl::Status StreamBeginCapture(MUstream stream);
+  virtual absl::StatusOr<MUgraph> StreamEndCapture(MUstream stream);
 
  private:
   struct Api;

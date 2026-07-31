@@ -20,15 +20,19 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <variant>
+#include <vector>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/gpu/host_callback_registry.h"
+#include "xla/stream_executor/kernel_args.h"
+#include "xla/stream_executor/kernel_args_packed_vector.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/musa/musa_event.h"
 #include "xla/stream_executor/musa/musa_module_use_tracker.h"
@@ -41,6 +45,11 @@ namespace stream_executor::musa {
 
 class MusaModule;
 class MusaModuleReaper;
+
+struct MusaGraphCaptureResources {
+  std::vector<std::shared_ptr<MusaModule>> modules;
+  std::vector<std::shared_ptr<KernelArgsPackedVector>> kernel_arguments;
+};
 
 class MusaStream : public StreamCommon, public MusaModuleUseTracker {
  public:
@@ -67,6 +76,17 @@ class MusaStream : public StreamCommon, public MusaModuleUseTracker {
 
   absl::Status RecordModuleUse(std::shared_ptr<MusaModule> module) override;
   void OrphanModuleUse(std::shared_ptr<MusaModule> module) override;
+
+  // Kernel launches normally retire modules with an ordered host callback.
+  // Host callbacks must not be inserted while a stream is being captured, so
+  // capture transfers modules and packed arguments to the resulting command
+  // buffer.
+  absl::Status BeginGraphCaptureModuleTracking();
+  absl::StatusOr<const KernelArgsPackedArrayBase*>
+  RetainGraphCaptureKernelArguments(
+      const KernelArgsPackedArrayBase& arguments) override;
+  absl::StatusOr<MusaGraphCaptureResources> EndGraphCaptureModuleTracking();
+  void AbortGraphCaptureModuleTracking();
 
   Stream::PlatformSpecificHandle platform_specific_handle() const override {
     return {stream_handle_};
@@ -105,6 +125,12 @@ class MusaStream : public StreamCommon, public MusaModuleUseTracker {
   void* stream_handle_;
   std::unique_ptr<gpu::HostCallbackRegistry::RegistryHandle>
       callback_registry_handle_;
+  absl::Mutex graph_capture_mu_;
+  bool graph_capture_active_ ABSL_GUARDED_BY(graph_capture_mu_) = false;
+  std::vector<std::shared_ptr<MusaModule>> graph_capture_modules_
+      ABSL_GUARDED_BY(graph_capture_mu_);
+  std::vector<std::shared_ptr<KernelArgsPackedVector>>
+      graph_capture_kernel_arguments_ ABSL_GUARDED_BY(graph_capture_mu_);
 };
 
 }  // namespace stream_executor::musa

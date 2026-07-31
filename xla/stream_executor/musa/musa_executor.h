@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/blas.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/dnn.h"
@@ -69,6 +70,9 @@ class MusaExecutor : public gpu::GpuExecutor {
       std::optional<std::variant<StreamPriority, int>> priority) override;
 
   absl::StatusOr<std::unique_ptr<Event>> CreateEvent() override;
+
+  absl::StatusOr<std::unique_ptr<CommandBuffer>> CreateCommandBuffer(
+      CommandBuffer::Mode mode) override;
 
   DeviceAddressBase Allocate(uint64_t size, int64_t memory_space) override;
   void Deallocate(DeviceAddressBase* mem) override;

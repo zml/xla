@@ -59,6 +59,11 @@ class KernelArgsPackedVector : public KernelArgsPackedArrayBase {
     return argument_addresses_;
   }
 
+  // Returns owned argument bytes for serialization or a durable deep copy.
+  const std::vector<std::vector<char>>& argument_storage() const {
+    return argument_storage_;
+  }
+
  private:
   std::vector<std::vector<char>> argument_storage_;
   size_t shared_memory_bytes_ = 0;

@@ -174,6 +174,24 @@ struct FakeApiState {
   std::atomic<int> memset_calls{0};
   MUresult memset_result = MUSA_SUCCESS;
 
+  MUgraph graph = reinterpret_cast<MUgraph>(0x4100);
+  MUgraph captured_graph = reinterpret_cast<MUgraph>(0x4200);
+  MUgraphNode graph_node = reinterpret_cast<MUgraphNode>(0x4300);
+  MUgraphExec graph_executable = reinterpret_cast<MUgraphExec>(0x4400);
+  MUgraph last_graph = nullptr;
+  MUgraphNode last_graph_node = nullptr;
+  MUgraphExec last_graph_executable = nullptr;
+  MUcontext last_graph_context = nullptr;
+  MUstream last_graph_stream = nullptr;
+  std::vector<MUgraphNode> last_graph_dependencies;
+  MUSA_KERNEL_NODE_PARAMS last_graph_kernel_params = {};
+  MUSA_MEMCPY3D last_graph_memcpy_params = {};
+  MUSA_MEMSET_NODE_PARAMS last_graph_memset_params = {};
+  size_t graph_node_count = 3;
+  size_t graph_root_node_count = 1;
+  std::atomic<int> graph_launch_calls{0};
+  MUresult graph_launch_result = MUSA_SUCCESS;
+
   std::unordered_map<std::string, void*> gpa_symbols;
   bool gpa_success_null = false;
   std::atomic<int> gpa_calls{0};
@@ -286,9 +304,9 @@ MUresult MUSAAPI FakeMuDeviceCanAccessPeer(int* can_access_peer,
   return g_state->peer_can_access_result;
 }
 
-MUresult MUSAAPI FakeMuDeviceGetP2PAttribute(
-    int* value, MUdevice_P2PAttribute attribute, MUdevice source,
-    MUdevice peer) {
+MUresult MUSAAPI FakeMuDeviceGetP2PAttribute(int* value,
+                                             MUdevice_P2PAttribute attribute,
+                                             MUdevice source, MUdevice peer) {
   g_state->last_peer_source = source;
   g_state->last_peer_target = peer;
   g_state->queried_p2p_attributes.push_back(attribute);
@@ -344,7 +362,7 @@ MUresult MUSAAPI FakeMuCtxGetDevice(MUdevice* device) {
 MUresult MUSAAPI FakeMuCtxSynchronize() { return MUSA_SUCCESS; }
 
 MUresult MUSAAPI FakeMuCtxEnablePeerAccess(MUcontext peer_context,
-                                            unsigned int flags) {
+                                           unsigned int flags) {
   ++g_state->enable_peer_calls;
   g_state->last_enabled_peer_context = peer_context;
   g_state->last_peer_flags = flags;
@@ -363,9 +381,11 @@ MUresult MUSAAPI FakeMuPointerGetAttribute(void* value,
   return g_state->pointer_attribute_result;
 }
 
-MUresult MUSAAPI FakeMuMemcpyPeerAsync(
-    MUdeviceptr destination, MUcontext destination_context, MUdeviceptr source,
-    MUcontext source_context, size_t bytes, MUstream stream) {
+MUresult MUSAAPI FakeMuMemcpyPeerAsync(MUdeviceptr destination,
+                                       MUcontext destination_context,
+                                       MUdeviceptr source,
+                                       MUcontext source_context, size_t bytes,
+                                       MUstream stream) {
   ++g_state->peer_copy_calls;
   g_state->last_copy_destination = destination;
   g_state->last_copy_destination_context = destination_context;
@@ -448,6 +468,167 @@ MUresult MUSAAPI FakeMuMemsetD32Async(MUdeviceptr destination,
   g_state->last_memset_count = count;
   g_state->last_memset_stream = stream;
   return g_state->memset_result;
+}
+
+void RecordGraphCall(MUgraph graph, const MUgraphNode* dependencies,
+                     size_t dependency_count) {
+  g_state->last_graph = graph;
+  g_state->last_graph_dependencies.clear();
+  if (dependencies != nullptr) {
+    g_state->last_graph_dependencies.assign(dependencies,
+                                            dependencies + dependency_count);
+  }
+}
+
+MUresult MUSAAPI FakeMuGraphCreate(MUgraph* graph, unsigned int flags) {
+  EXPECT_EQ(flags, 0);
+  *graph = g_state->graph;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphDestroy(MUgraph graph) {
+  g_state->last_graph = graph;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphAddEmptyNode(MUgraphNode* node, MUgraph graph,
+                                         const MUgraphNode* dependencies,
+                                         size_t dependency_count) {
+  RecordGraphCall(graph, dependencies, dependency_count);
+  *node = g_state->graph_node;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphAddKernelNode(
+    MUgraphNode* node, MUgraph graph, const MUgraphNode* dependencies,
+    size_t dependency_count, const MUSA_KERNEL_NODE_PARAMS* params) {
+  RecordGraphCall(graph, dependencies, dependency_count);
+  g_state->last_graph_kernel_params = *params;
+  *node = g_state->graph_node;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphKernelNodeSetParams(
+    MUgraphNode node, const MUSA_KERNEL_NODE_PARAMS* params) {
+  g_state->last_graph_node = node;
+  g_state->last_graph_kernel_params = *params;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphAddMemcpyNode(MUgraphNode* node, MUgraph graph,
+                                          const MUgraphNode* dependencies,
+                                          size_t dependency_count,
+                                          const MUSA_MEMCPY3D* params,
+                                          MUcontext context) {
+  RecordGraphCall(graph, dependencies, dependency_count);
+  g_state->last_graph_memcpy_params = *params;
+  g_state->last_graph_context = context;
+  *node = g_state->graph_node;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphMemcpyNodeSetParams(MUgraphNode node,
+                                                const MUSA_MEMCPY3D* params) {
+  g_state->last_graph_node = node;
+  g_state->last_graph_memcpy_params = *params;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphAddMemsetNode(MUgraphNode* node, MUgraph graph,
+                                          const MUgraphNode* dependencies,
+                                          size_t dependency_count,
+                                          const MUSA_MEMSET_NODE_PARAMS* params,
+                                          MUcontext context) {
+  RecordGraphCall(graph, dependencies, dependency_count);
+  g_state->last_graph_memset_params = *params;
+  g_state->last_graph_context = context;
+  *node = g_state->graph_node;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphMemsetNodeSetParams(
+    MUgraphNode node, const MUSA_MEMSET_NODE_PARAMS* params) {
+  g_state->last_graph_node = node;
+  g_state->last_graph_memset_params = *params;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphGetNodes(MUgraph graph, MUgraphNode* nodes,
+                                     size_t* count) {
+  g_state->last_graph = graph;
+  if (nodes == nullptr) {
+    *count = g_state->graph_node_count;
+  }
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphGetRootNodes(MUgraph graph, MUgraphNode* nodes,
+                                         size_t* count) {
+  g_state->last_graph = graph;
+  if (nodes == nullptr) {
+    *count = g_state->graph_root_node_count;
+  }
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphInstantiate(MUgraphExec* executable, MUgraph graph,
+                                        MUgraphNode* error_node, char* log,
+                                        size_t log_size) {
+  g_state->last_graph = graph;
+  *error_node = nullptr;
+  if (log_size != 0) log[0] = '\0';
+  *executable = g_state->graph_executable;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphExecDestroy(MUgraphExec executable) {
+  g_state->last_graph_executable = executable;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuGraphLaunch(MUgraphExec executable, MUstream stream) {
+  ++g_state->graph_launch_calls;
+  g_state->last_graph_executable = executable;
+  g_state->last_graph_stream = stream;
+  return g_state->graph_launch_result;
+}
+
+MUresult MUSAAPI FakeMuStreamSynchronize(MUstream stream) {
+  g_state->last_graph_stream = stream;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuStreamBeginCapture(MUstream stream,
+                                          MUstreamCaptureMode mode) {
+  EXPECT_EQ(mode, MU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+  g_state->last_graph_stream = stream;
+  return MUSA_SUCCESS;
+}
+
+MUresult MUSAAPI FakeMuStreamEndCapture(MUstream stream, MUgraph* graph) {
+  g_state->last_graph_stream = stream;
+  *graph = g_state->captured_graph;
+  return MUSA_SUCCESS;
+}
+
+void InstallGraphDlsymSymbols(FakeSymbolLoader& loader) {
+  loader.Add("muGraphCreate", &FakeMuGraphCreate);
+  loader.Add("muGraphDestroy", &FakeMuGraphDestroy);
+  loader.Add("muGraphAddEmptyNode", &FakeMuGraphAddEmptyNode);
+  loader.Add("muGraphAddKernelNode", &FakeMuGraphAddKernelNode);
+  loader.Add("muGraphKernelNodeSetParams", &FakeMuGraphKernelNodeSetParams);
+  loader.Add("muGraphAddMemcpyNode", &FakeMuGraphAddMemcpyNode);
+  loader.Add("muGraphMemcpyNodeSetParams", &FakeMuGraphMemcpyNodeSetParams);
+  loader.Add("muGraphAddMemsetNode", &FakeMuGraphAddMemsetNode);
+  loader.Add("muGraphMemsetNodeSetParams", &FakeMuGraphMemsetNodeSetParams);
+  loader.Add("muGraphGetNodes", &FakeMuGraphGetNodes);
+  loader.Add("muGraphGetRootNodes", &FakeMuGraphGetRootNodes);
+  loader.Add("muGraphInstantiate_v2", &FakeMuGraphInstantiate);
+  loader.Add("muGraphExecDestroy", &FakeMuGraphExecDestroy);
+  loader.Add("muGraphLaunch", &FakeMuGraphLaunch);
+  loader.Add("muStreamSynchronize", &FakeMuStreamSynchronize);
+  loader.Add("muStreamBeginCapture_v2", &FakeMuStreamBeginCapture);
+  loader.Add("muStreamEndCapture", &FakeMuStreamEndCapture);
 }
 
 void InstallBootstrap(FakeSymbolLoader& loader) {
@@ -655,6 +836,118 @@ TEST_F(MusaDriverTest, CompleteTableWithoutGetProcAddress) {
   EXPECT_EQ(loader_ptr->load_calls, 1);
 }
 
+TEST_F(MusaDriverTest, MissingOptionalGraphSymbolsPreservesStreamExecution) {
+  auto loader = CompleteLoader();
+  MusaDriver driver(std::move(loader));
+
+  EXPECT_TRUE(driver.Init().ok());
+  EXPECT_FALSE(driver.GraphsAvailable());
+  EXPECT_EQ(driver.GraphCreate().status().code(),
+            absl::StatusCode::kUnimplemented);
+  EXPECT_TRUE(driver
+                  .LaunchKernel(state_.function, 1, 1, 1, 1, 1, 1, 0, nullptr,
+                                nullptr, nullptr)
+                  .ok());
+}
+
+TEST_F(MusaDriverTest, GraphLifecyclePreservesTypedDriverAbi) {
+  auto loader = CompleteLoader();
+  InstallGraphDlsymSymbols(*loader);
+  MusaDriver driver(std::move(loader));
+
+  ASSERT_TRUE(driver.GraphsAvailable());
+  absl::StatusOr<MUgraph> graph = driver.GraphCreate();
+  ASSERT_TRUE(graph.ok()) << graph.status();
+  EXPECT_EQ(*graph, state_.graph);
+
+  const MUgraphNode dependency = reinterpret_cast<MUgraphNode>(0x4500);
+  absl::StatusOr<MUgraphNode> empty =
+      driver.GraphAddEmptyNode(*graph, {&dependency, 1});
+  ASSERT_TRUE(empty.ok()) << empty.status();
+  EXPECT_EQ(*empty, state_.graph_node);
+  EXPECT_EQ(state_.last_graph_dependencies,
+            std::vector<MUgraphNode>({dependency}));
+
+  MUSA_KERNEL_NODE_PARAMS kernel = {};
+  kernel.func = state_.function;
+  kernel.gridDimX = 2;
+  kernel.gridDimY = 3;
+  kernel.gridDimZ = 4;
+  kernel.blockDimX = 32;
+  kernel.blockDimY = 2;
+  kernel.blockDimZ = 1;
+  kernel.sharedMemBytes = 128;
+  ASSERT_TRUE(driver.GraphAddKernelNode(*graph, {&dependency, 1}, kernel).ok());
+  EXPECT_EQ(state_.last_graph_kernel_params.func, state_.function);
+  EXPECT_EQ(state_.last_graph_kernel_params.gridDimZ, 4);
+  EXPECT_EQ(state_.last_graph_kernel_params.blockDimX, 32);
+  EXPECT_EQ(state_.last_graph_kernel_params.sharedMemBytes, 128);
+  EXPECT_TRUE(driver.GraphKernelNodeSetParams(*empty, kernel).ok());
+
+  constexpr MUdeviceptr kSource = static_cast<MUdeviceptr>(0x5100);
+  constexpr MUdeviceptr kDestination = static_cast<MUdeviceptr>(0x5200);
+  ASSERT_TRUE(driver
+                  .GraphAddMemcpyD2DNode(*graph, {&dependency, 1}, kDestination,
+                                         kSource, 256)
+                  .ok());
+  EXPECT_EQ(state_.last_graph_context, state_.current_context);
+  EXPECT_EQ(state_.last_graph_memcpy_params.srcMemoryType,
+            MU_MEMORYTYPE_DEVICE);
+  EXPECT_EQ(state_.last_graph_memcpy_params.srcDevice, kSource);
+  EXPECT_EQ(state_.last_graph_memcpy_params.dstDevice, kDestination);
+  EXPECT_EQ(state_.last_graph_memcpy_params.WidthInBytes, 256);
+  EXPECT_TRUE(
+      driver.GraphMemcpyD2DNodeSetParams(*empty, kDestination, kSource, 512)
+          .ok());
+  EXPECT_EQ(state_.last_graph_memcpy_params.WidthInBytes, 512);
+
+  MUSA_MEMSET_NODE_PARAMS memset = {};
+  memset.dst = kDestination;
+  memset.value = 0x5a;
+  memset.elementSize = 1;
+  memset.width = 64;
+  memset.height = 1;
+  ASSERT_TRUE(driver.GraphAddMemsetNode(*graph, {&dependency, 1}, memset).ok());
+  EXPECT_EQ(state_.last_graph_context, state_.current_context);
+  EXPECT_EQ(state_.last_graph_memset_params.dst, kDestination);
+  EXPECT_EQ(state_.last_graph_memset_params.value, 0x5a);
+  EXPECT_TRUE(driver.GraphMemsetNodeSetParams(*empty, memset).ok());
+
+  ASSERT_TRUE(driver.GraphNodeCount(*graph).ok());
+  EXPECT_EQ(*driver.GraphNodeCount(*graph), 3);
+  ASSERT_TRUE(driver.GraphRootNodeCount(*graph).ok());
+  EXPECT_EQ(*driver.GraphRootNodeCount(*graph), 1);
+
+  absl::StatusOr<MUgraphExec> executable = driver.GraphInstantiate(*graph);
+  ASSERT_TRUE(executable.ok()) << executable.status();
+  EXPECT_EQ(*executable, state_.graph_executable);
+  const MUstream stream = reinterpret_cast<MUstream>(0x5300);
+  EXPECT_TRUE(driver.GraphLaunch(*executable, stream).ok());
+  EXPECT_EQ(state_.graph_launch_calls, 1);
+  EXPECT_EQ(state_.last_graph_stream, stream);
+  EXPECT_TRUE(driver.StreamSynchronize(stream).ok());
+  EXPECT_EQ(state_.last_graph_stream, stream);
+  EXPECT_TRUE(driver.StreamBeginCapture(stream).ok());
+  absl::StatusOr<MUgraph> captured = driver.StreamEndCapture(stream);
+  ASSERT_TRUE(captured.ok()) << captured.status();
+  EXPECT_EQ(*captured, state_.captured_graph);
+  EXPECT_TRUE(driver.GraphExecDestroy(*executable).ok());
+  EXPECT_TRUE(driver.GraphDestroy(*graph).ok());
+}
+
+TEST_F(MusaDriverTest, GraphErrorsUseCanonicalStatus) {
+  auto loader = CompleteLoader();
+  InstallGraphDlsymSymbols(*loader);
+  MusaDriver driver(std::move(loader));
+  ASSERT_TRUE(driver.GraphsAvailable());
+
+  state_.graph_launch_result = MUSA_ERROR_INVALID_VALUE;
+  absl::Status launch = driver.GraphLaunch(state_.graph_executable,
+                                           reinterpret_cast<MUstream>(0x5300));
+  EXPECT_EQ(launch.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(absl::StrContains(launch.message(), "muGraphLaunch failed"));
+}
+
 TEST_F(MusaDriverTest, PeerFactsAreDirectionalAndSkipInaccessibleAttributes) {
   auto loader = CompleteLoader();
   MusaDriver driver(std::move(loader));
@@ -704,8 +997,7 @@ TEST_F(MusaDriverTest, PeerQueriesRejectInvalidCapabilityAndDegradeTelemetry) {
 
   state_.peer_can_access = 1;
   state_.p2p_attributes[MU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK] = -1;
-  absl::StatusOr<MusaPeerAccessInfo> negative =
-      driver.PeerAccessInfo(10, 11);
+  absl::StatusOr<MusaPeerAccessInfo> negative = driver.PeerAccessInfo(10, 11);
   ASSERT_TRUE(negative.ok()) << negative.status();
   EXPECT_TRUE(negative->can_access_peer);
   EXPECT_FALSE(negative->link_attributes_available);
@@ -732,8 +1024,7 @@ TEST_F(MusaDriverTest, PeerErrorsAreCanonicalAndEnableIsIdempotent) {
 
   state_.peer_can_access_result = MUSA_SUCCESS;
   state_.p2p_attribute_result = MUSA_ERROR_INVALID_VALUE;
-  absl::StatusOr<MusaPeerAccessInfo> attribute =
-      driver.PeerAccessInfo(10, 11);
+  absl::StatusOr<MusaPeerAccessInfo> attribute = driver.PeerAccessInfo(10, 11);
   ASSERT_TRUE(attribute.ok()) << attribute.status();
   EXPECT_TRUE(attribute->can_access_peer);
   EXPECT_FALSE(attribute->link_attributes_available);
@@ -757,8 +1048,8 @@ TEST_F(MusaDriverTest, PeerErrorsAreCanonicalAndEnableIsIdempotent) {
   state_.enable_peer_result = MUSA_ERROR_PEER_ACCESS_UNSUPPORTED;
   absl::Status unsupported = driver.EnablePeerAccess(peer_context);
   EXPECT_EQ(unsupported.code(), absl::StatusCode::kUnimplemented);
-  EXPECT_TRUE(absl::StrContains(unsupported.message(),
-                                "muCtxEnablePeerAccess"));
+  EXPECT_TRUE(
+      absl::StrContains(unsupported.message(), "muCtxEnablePeerAccess"));
 
   state_.enable_peer_result = MUSA_ERROR_TOO_MANY_PEERS;
   EXPECT_EQ(driver.EnablePeerAccess(peer_context).code(),
@@ -800,8 +1091,8 @@ TEST_F(MusaDriverTest, PointerContextsAndPeerCopiesPreserveExactAbi) {
                 .code(),
             absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(driver
-                .MemcpyPeerAsync(kDestination, nullptr, kSource,
-                                 source_context, 4096, stream)
+                .MemcpyPeerAsync(kDestination, nullptr, kSource, source_context,
+                                 4096, stream)
                 .code(),
             absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(state_.peer_copy_calls, 0);

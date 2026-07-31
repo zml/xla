@@ -15,12 +15,14 @@ limitations under the License.
 
 #include "xla/stream_executor/musa/musa_stream.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/base/casts.h"
 #include "absl/functional/any_invocable.h"
@@ -29,6 +31,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
@@ -36,6 +39,7 @@ limitations under the License.
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/musa/musa_driver.h"
 #include "xla/stream_executor/musa/musa_event.h"
+#include "xla/stream_executor/musa/musa_graph_arguments.h"
 #include "xla/stream_executor/musa/musa_module.h"
 #include "xla/stream_executor/musa/musa_module_reaper.h"
 #include "xla/stream_executor/musa/musa_runtime.h"
@@ -172,9 +176,9 @@ absl::Status MusaStream::Memcpy(DeviceAddressBase* gpu_dst,
         gpu_dst->opaque(), gpu_src.opaque(), size,
         MusaMemcpyKind::kDeviceToDevice, stream_handle_);
   }
-  return driver.MemcpyPeerAsync(
-      destination, *destination_context, source, *source_context, size,
-      reinterpret_cast<MUstream>(stream_handle_));
+  return driver.MemcpyPeerAsync(destination, *destination_context, source,
+                                *source_context, size,
+                                reinterpret_cast<MUstream>(stream_handle_));
 }
 
 absl::Status MusaStream::MemZero(DeviceAddressBase* location, uint64_t size) {
@@ -245,6 +249,20 @@ absl::Status MusaStream::RecordModuleUse(std::shared_ptr<MusaModule> module) {
   if (module == nullptr) {
     return absl::InvalidArgumentError("Cannot record a null MUSA module use");
   }
+  {
+    absl::MutexLock lock(&graph_capture_mu_);
+    if (graph_capture_active_) {
+      auto duplicate = std::find_if(
+          graph_capture_modules_.begin(), graph_capture_modules_.end(),
+          [&module](const std::shared_ptr<MusaModule>& captured) {
+            return captured.get() == module.get();
+          });
+      if (duplicate == graph_capture_modules_.end()) {
+        graph_capture_modules_.push_back(std::move(module));
+      }
+      return absl::OkStatus();
+    }
+  }
   std::shared_ptr<MusaModuleReaper::ModuleUse> use =
       module_reaper_->Track(std::move(module));
   return DoHostCallbackWithStatus(
@@ -253,6 +271,52 @@ absl::Status MusaStream::RecordModuleUse(std::shared_ptr<MusaModule> module) {
         return absl::OkStatus();
       },
       [use](absl::Status) { use->Orphan(); });
+}
+
+absl::Status MusaStream::BeginGraphCaptureModuleTracking() {
+  absl::MutexLock lock(&graph_capture_mu_);
+  if (graph_capture_active_) {
+    return absl::FailedPreconditionError(
+        "MUSA stream module capture is already active");
+  }
+  graph_capture_active_ = true;
+  graph_capture_modules_.clear();
+  graph_capture_kernel_arguments_.clear();
+  return absl::OkStatus();
+}
+
+absl::StatusOr<const KernelArgsPackedArrayBase*>
+MusaStream::RetainGraphCaptureKernelArguments(
+    const KernelArgsPackedArrayBase& arguments) {
+  absl::MutexLock lock(&graph_capture_mu_);
+  if (!graph_capture_active_) return &arguments;
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<KernelArgsPackedVector> cloned,
+                      CloneMusaGraphKernelArguments(arguments));
+  std::shared_ptr<KernelArgsPackedVector> retained(std::move(cloned));
+  const KernelArgsPackedArrayBase* result = retained.get();
+  graph_capture_kernel_arguments_.push_back(std::move(retained));
+  return result;
+}
+
+absl::StatusOr<MusaGraphCaptureResources>
+MusaStream::EndGraphCaptureModuleTracking() {
+  absl::MutexLock lock(&graph_capture_mu_);
+  if (!graph_capture_active_) {
+    return absl::FailedPreconditionError(
+        "MUSA stream module capture is not active");
+  }
+  graph_capture_active_ = false;
+  MusaGraphCaptureResources resources;
+  resources.modules.swap(graph_capture_modules_);
+  resources.kernel_arguments.swap(graph_capture_kernel_arguments_);
+  return resources;
+}
+
+void MusaStream::AbortGraphCaptureModuleTracking() {
+  absl::MutexLock lock(&graph_capture_mu_);
+  graph_capture_active_ = false;
+  graph_capture_modules_.clear();
+  graph_capture_kernel_arguments_.clear();
 }
 
 void MusaStream::OrphanModuleUse(std::shared_ptr<MusaModule> module) {

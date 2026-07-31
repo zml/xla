@@ -19,6 +19,8 @@ limitations under the License.
 #include <memory>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "xla/stream_executor/kernel_args.h"
 
 namespace stream_executor::musa {
 
@@ -34,6 +36,12 @@ class MusaModuleUseTracker {
 
   virtual absl::Status RecordModuleUse(std::shared_ptr<MusaModule> module) = 0;
   virtual void OrphanModuleUse(std::shared_ptr<MusaModule> module) = 0;
+
+  virtual absl::StatusOr<const KernelArgsPackedArrayBase*>
+  RetainGraphCaptureKernelArguments(
+      const KernelArgsPackedArrayBase& arguments) {
+    return &arguments;
+  }
 };
 
 }  // namespace stream_executor::musa

@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/service_executable_run_options.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
@@ -54,6 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/musa/musa_executor.h"
 #include "xla/stream_executor/musa/musa_platform.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/stream_executor/trace_command_buffer_factory.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
@@ -166,6 +168,154 @@ TEST(MusaLaunchSmokeTest, ExecutesKnownMubinAndStreamPrimitivesOnS80) {
   executor.Deallocate(&timer_buffer);
   executor.Deallocate(&pattern_buffer);
   executor.Deallocate(&output);
+  executor.Deallocate(&input);
+}
+
+TEST(MusaLaunchSmokeTest, ExecutesUpdatesAndCapturesMusaGraphsOnS80) {
+  std::vector<uint8_t> image = ReadExternalMubin("MUSA_TEST_MUBIN");
+  if (image.empty()) {
+    GTEST_SKIP() << "Set MUSA_TEST_MUBIN to the external add_one MUBIN";
+  }
+
+  MusaPlatform platform;
+  MusaExecutor executor(&platform, /*device_ordinal=*/0);
+  TF_ASSERT_OK(executor.Init());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor.CreateStream(/*priority=*/std::nullopt));
+
+  constexpr int64_t kLength = 4;
+  constexpr uint64_t kBytes = kLength * sizeof(float);
+  DeviceAddressBase input = executor.Allocate(kBytes, 0);
+  DeviceAddressBase input_updated = executor.Allocate(kBytes, 0);
+  DeviceAddressBase kernel_output = executor.Allocate(kBytes, 0);
+  DeviceAddressBase copied_output = executor.Allocate(kBytes, 0);
+  DeviceAddressBase updated_output = executor.Allocate(kBytes, 0);
+  DeviceAddressBase captured_output = executor.Allocate(kBytes, 0);
+  ASSERT_FALSE(input.is_null());
+  ASSERT_FALSE(input_updated.is_null());
+  ASSERT_FALSE(kernel_output.is_null());
+  ASSERT_FALSE(copied_output.is_null());
+  ASSERT_FALSE(updated_output.is_null());
+  ASSERT_FALSE(captured_output.is_null());
+
+  const std::array<float, kLength> host_input = {1.0f, 2.0f, 3.0f, 4.0f};
+  const std::array<float, kLength> host_updated = {10.0f, 20.0f, 30.0f, 40.0f};
+  TF_ASSERT_OK(stream->Memcpy(&input, host_input.data(), kBytes));
+  TF_ASSERT_OK(stream->Memcpy(&input_updated, host_updated.data(), kBytes));
+
+  KernelLoaderSpec kernel_spec = KernelLoaderSpec::CreateMusaMubinInMemorySpec(
+      image, "add_one", /*arity=*/3);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Kernel> kernel,
+                          executor.LoadKernel(kernel_spec));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<CommandBuffer> command_buffer,
+      executor.CreateCommandBuffer(CommandBuffer::Mode::kPrimary));
+  TF_ASSERT_OK_AND_ASSIGN(
+      const CommandBuffer::Command* memset,
+      command_buffer->CreateMemset(&kernel_output, uint32_t{0}, kLength, {}));
+  std::array<const CommandBuffer::Command*, 1> memset_dependency = {memset};
+  const CommandBuffer::Command* launch = nullptr;
+  {
+    KernelArgsPackedArray arguments(/*num_args=*/3);
+    arguments.add_argument(input);
+    arguments.add_argument(kernel_output);
+    arguments.add_argument(kLength);
+    TF_ASSERT_OK_AND_ASSIGN(
+        launch, command_buffer->CreateLaunch(
+                    ThreadDim(kLength), BlockDim(1), *kernel, arguments,
+                    memset_dependency, StreamPriority::Default));
+  }
+  std::array<const CommandBuffer::Command*, 1> launch_dependency = {launch};
+  TF_ASSERT_OK_AND_ASSIGN(
+      const CommandBuffer::Command* copy,
+      command_buffer->CreateMemcpyD2D(&copied_output, kernel_output, kBytes,
+                                      launch_dependency));
+  TF_ASSERT_OK(command_buffer->Finalize());
+  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+
+  std::array<float, kLength> host_result = {};
+  TF_ASSERT_OK(stream->Memcpy(host_result.data(), copied_output, kBytes));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  EXPECT_EQ(host_result, (std::array<float, kLength>{2.0f, 3.0f, 4.0f, 5.0f}));
+
+  TF_ASSERT_OK(command_buffer->Update());
+  TF_ASSERT_OK(command_buffer->UpdateMemset(memset, &kernel_output, uint32_t{0},
+                                            kLength));
+  {
+    KernelArgsPackedArray updated_arguments(/*num_args=*/3);
+    updated_arguments.add_argument(input_updated);
+    updated_arguments.add_argument(kernel_output);
+    updated_arguments.add_argument(kLength);
+    TF_ASSERT_OK(command_buffer->UpdateLaunch(
+        launch, ThreadDim(kLength), BlockDim(1), *kernel, updated_arguments));
+  }
+  TF_ASSERT_OK(command_buffer->UpdateMemcpyD2D(copy, &updated_output,
+                                               kernel_output, kBytes));
+  TF_ASSERT_OK(command_buffer->Finalize());
+
+  // The graph retains its kernel module independently of the Kernel object.
+  kernel.reset();
+  TF_ASSERT_OK(command_buffer->Submit(stream.get()));
+  host_result.fill(0.0f);
+  TF_ASSERT_OK(stream->Memcpy(host_result.data(), updated_output, kBytes));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  EXPECT_EQ(host_result,
+            (std::array<float, kLength>{11.0f, 21.0f, 31.0f, 41.0f}));
+
+  command_buffer.reset();
+  KernelLoaderSpec captured_kernel_spec =
+      KernelLoaderSpec::CreateMusaMubinInMemorySpec(image, "add_one",
+                                                    /*arity=*/3);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Kernel> captured_kernel,
+                          executor.LoadKernel(captured_kernel_spec));
+  std::unique_ptr<CommandBuffer> captured;
+  {
+    KernelArgsPackedArray captured_arguments(/*num_args=*/3);
+    captured_arguments.add_argument(input_updated);
+    captured_arguments.add_argument(kernel_output);
+    captured_arguments.add_argument(kLength);
+    TF_ASSERT_OK_AND_ASSIGN(
+        captured, TraceCommandBufferFactory::Create(
+                      &executor, stream.get(),
+                      [&](Stream* capture_stream) {
+                        absl::Status launch_status = captured_kernel->Launch(
+                            ThreadDim(kLength), BlockDim(1), capture_stream,
+                            captured_arguments);
+                        if (!launch_status.ok()) return launch_status;
+                        return capture_stream->Memcpy(&captured_output,
+                                                      kernel_output, kBytes);
+                      },
+                      CommandBuffer::Mode::kPrimary));
+  }
+  captured_kernel.reset();
+  TF_ASSERT_OK(captured->Submit(stream.get()));
+  host_result.fill(0.0f);
+  TF_ASSERT_OK(stream->Memcpy(host_result.data(), captured_output, kBytes));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  EXPECT_EQ(host_result,
+            (std::array<float, kLength>{11.0f, 21.0f, 31.0f, 41.0f}));
+
+  captured.reset();
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<CommandBuffer> nested,
+      executor.CreateCommandBuffer(CommandBuffer::Mode::kNested));
+  TF_ASSERT_OK(nested->Finalize());
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<CommandBuffer> parent,
+      executor.CreateCommandBuffer(CommandBuffer::Mode::kPrimary));
+  EXPECT_EQ(parent->CreateChildCommand(*nested, {}).status().code(),
+            absl::StatusCode::kUnimplemented);
+  EXPECT_EQ(nested->Update().code(), absl::StatusCode::kUnimplemented);
+  nested.reset();
+  parent.reset();
+
+  stream.reset();
+  executor.Deallocate(&captured_output);
+  executor.Deallocate(&updated_output);
+  executor.Deallocate(&copied_output);
+  executor.Deallocate(&kernel_output);
+  executor.Deallocate(&input_updated);
   executor.Deallocate(&input);
 }
 

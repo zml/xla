@@ -109,7 +109,6 @@ absl::Status MusaKernel::Launch(const ThreadDim& thread_dims,
         "MUSA kernel %s requires a stream with module lifetime tracking",
         name()));
   }
-
   auto launch = [this, stream, &thread_dims, &block_dims, &cluster_dims,
                  module_use_tracker](
                     const KernelArgsPackedArrayBase& packed) -> absl::Status {
@@ -143,7 +142,11 @@ absl::Status MusaKernel::Launch(const ThreadDim& thread_dims,
           shared_memory_limit));
     }
 
-    void** parameters = const_cast<void**>(packed.argument_addresses().data());
+    TF_ASSIGN_OR_RETURN(
+        const KernelArgsPackedArrayBase* retained,
+        module_use_tracker->RetainGraphCaptureKernelArguments(packed));
+    void** parameters =
+        const_cast<void**>(retained->argument_addresses().data());
     absl::Status launch_status = stream->LaunchKernel(
         thread_dims, block_dims, cluster_dims, function_, name(), parameters,
         packed.number_of_shared_bytes(), use_pdl());

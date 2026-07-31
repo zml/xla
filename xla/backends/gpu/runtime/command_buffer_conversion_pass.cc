@@ -69,6 +69,12 @@ namespace {
 
 using CommandBufferConfig = CommandBufferConversionPass::CommandBufferConfig;
 
+// MUSA 4.0.1 is initially qualified for one converted thunk per executable
+// graph. StreamExecutor's explicit command-buffer API can still build and
+// update multi-node graphs, but aggregation of independent runtime thunks is
+// kept on ordinary streams until complex graph sequences are qualified.
+constexpr size_t kMaxQualifiedMusaGraphThunks = 1;
+
 std::optional<DebugOptions::CollectiveOpType> GetCollectiveOpType(
     Thunk::Kind kind) {
   switch (kind) {
@@ -150,12 +156,23 @@ CommandBufferConfig GetCommandBufferConfig(
     }
   };
 
-  // MUSA command-buffer support is not implemented yet. Keep all thunks on
-  // the ordinary StreamExecutor path until the backend has a qualified graph
-  // implementation.
+  // MUSA 4.0.1 graph qualification covers direct kernel, custom-kernel,
+  // replica/partition-id, and device-copy nodes, all represented by the
+  // FUSION command type. Library tracing, dynamic-slice nesting, collectives,
+  // and on-device control flow remain on ordinary streams until their graph
+  // contracts are qualified independently.
   if (device_info.gpu_compute_capability().IsMusa()) {
-    VLOG(1) << "Command buffers are not supported by the MUSA backend";
-    config.enabled_commands.clear();
+    for (auto it = config.enabled_commands.begin();
+         it != config.enabled_commands.end();) {
+      if (*it == DebugOptions::FUSION) {
+        ++it;
+      } else {
+        VLOG(1) << "Removed unqualified MUSA command buffer type "
+                << DebugOptions::CommandBufferCmdType_Name(*it);
+        auto erased = it++;
+        config.enabled_commands.erase(erased);
+      }
+    }
   }
 
   // Check if CUDA/ROCM driver supports required features.
@@ -385,6 +402,12 @@ static bool IsConvertible(const AsyncStartThunk& async_start_thunk,
 // Returns true if the given Thunk is convertible to a command buffer operation
 // based on the provided `config`.
 bool IsConvertible(const Thunk& thunk, const CommandBufferConfig& config) {
+  if (config.device_description.gpu_compute_capability().IsMusa() &&
+      (thunk.kind() == Thunk::kAsyncStart ||
+       thunk.kind() == Thunk::kAsyncDone)) {
+    return false;
+  }
+
   // Async start thunks are convertible if all nested thunks are convertible.
   if (thunk.kind() == Thunk::kAsyncStart) {
     return IsConvertible(static_cast<const AsyncStartThunk&>(thunk), config);
@@ -707,6 +730,11 @@ absl::StatusOr<bool> CommandBufferConversionPass::Run(
       // can be only added to the current_command_buffer_thunks as part of a
       // valid async regions.
       current_command_buffer_thunks.push_back(std::move(thunk));
+      if (device_info.gpu_compute_capability().IsMusa() &&
+          current_command_buffer_thunks.size() ==
+              kMaxQualifiedMusaGraphThunks) {
+        RETURN_IF_ERROR(flush_command_buffer());
+      }
       continue;
     }
     if (thunk->kind() == Thunk::kWhile) {

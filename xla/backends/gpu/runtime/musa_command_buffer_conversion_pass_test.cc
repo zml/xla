@@ -43,8 +43,7 @@ class FailingAllocator : public ThunkPassBufferAllocator {
   }
 };
 
-TEST(MusaCommandBufferConversionPassTest,
-     KeepsThunksOnOrdinaryStreamExecutorPath) {
+TEST(MusaCommandBufferConversionPassTest, ConvertsQualifiedFusionCommands) {
   BufferAllocation allocation(/*index=*/0, /*size=*/1024, /*color=*/0);
   BufferAllocation::Slice slice(&allocation, /*offset=*/0, /*size=*/1024);
   Shape shape = ShapeUtil::MakeShape(S32, {256});
@@ -71,9 +70,79 @@ TEST(MusaCommandBufferConversionPassTest,
       &thunks, debug_options, /*hlo_module=*/nullptr, device_info, allocator);
 
   ASSERT_TRUE(changed.ok()) << changed.status();
+  EXPECT_TRUE(*changed);
+  ASSERT_EQ(thunks.size(), 1);
+  EXPECT_EQ(thunks.front()->kind(), Thunk::kCommandBuffer);
+}
+
+TEST(MusaCommandBufferConversionPassTest,
+     LeavesUnqualifiedLibraryCommandsOnStreams) {
+  BufferAllocation allocation(/*index=*/0, /*size=*/1024, /*color=*/0);
+  BufferAllocation::Slice slice(&allocation, /*offset=*/0, /*size=*/1024);
+  Shape shape = ShapeUtil::MakeShape(S32, {256});
+
+  ThunkSequence thunks;
+  thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{slice, shape}, ShapedSlice{slice, shape},
+      /*mem_size=*/1024));
+
+  DebugOptions debug_options = GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUBLAS);
+
+  se::DeviceDescription device_info;
+  device_info.set_gpu_compute_capability(se::GpuComputeCapability(
+      se::MusaComputeCapability("mp_21", /*major=*/2, /*minor=*/1,
+                                /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)));
+
+  FailingAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+  absl::StatusOr<bool> changed = pass.Run(
+      &thunks, debug_options, /*hlo_module=*/nullptr, device_info, allocator);
+
+  ASSERT_TRUE(changed.ok()) << changed.status();
   EXPECT_FALSE(*changed);
   ASSERT_EQ(thunks.size(), 1);
   EXPECT_EQ(thunks.front()->kind(), Thunk::kCopy);
+}
+
+TEST(MusaCommandBufferConversionPassTest,
+     DoesNotAggregateIndependentRuntimeThunks) {
+  BufferAllocation allocation(/*index=*/0, /*size=*/1024, /*color=*/0);
+  BufferAllocation::Slice slice(&allocation, /*offset=*/0, /*size=*/1024);
+  Shape shape = ShapeUtil::MakeShape(S32, {256});
+
+  ThunkSequence thunks;
+  thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{slice, shape}, ShapedSlice{slice, shape},
+      /*mem_size=*/1024));
+  thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{slice, shape}, ShapedSlice{slice, shape},
+      /*mem_size=*/1024));
+
+  DebugOptions debug_options = GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);
+
+  se::DeviceDescription device_info;
+  device_info.set_gpu_compute_capability(se::GpuComputeCapability(
+      se::MusaComputeCapability("mp_21", /*major=*/2, /*minor=*/1,
+                                /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)));
+
+  FailingAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+  absl::StatusOr<bool> changed = pass.Run(
+      &thunks, debug_options, /*hlo_module=*/nullptr, device_info, allocator);
+
+  ASSERT_TRUE(changed.ok()) << changed.status();
+  EXPECT_TRUE(*changed);
+  ASSERT_EQ(thunks.size(), 2);
+  EXPECT_EQ(thunks[0]->kind(), Thunk::kCommandBuffer);
+  EXPECT_EQ(thunks[1]->kind(), Thunk::kCommandBuffer);
 }
 
 }  // namespace
