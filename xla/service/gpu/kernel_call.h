@@ -27,12 +27,18 @@ limitations under the License.
 
 namespace xla::gpu {
 
+inline constexpr absl::string_view kPtxCustomCallTarget =
+    "__gpu$xla.gpu.ptx";
+inline constexpr absl::string_view kMusaLlvmCustomCallTarget =
+    "__gpu$xla.gpu.musa_llvm";
+
 struct KernelCall {
   std::string name;
   std::string kernel_data;
   enum class KernelType {
     kPtxSource,
     kCudaBinary,
+    kMusaLlvmSource,
   } kernel_type;
 
   stream_executor::BlockDim block_dim;
@@ -40,7 +46,7 @@ struct KernelCall {
   size_t shared_mem;
   std::vector<int32_t> output_indices;
 
-  // Parse the metadata of a __gpu$xla.gpu.ptx call.
+  // Parse the metadata of a structured GPU kernel custom call.
   static absl::StatusOr<KernelCall> Parse(absl::string_view backend_config,
                                           mlir::MLIRContext* mlir_context);
 };

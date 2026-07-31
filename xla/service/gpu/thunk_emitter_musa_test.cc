@@ -227,5 +227,20 @@ TEST(MusaGemmCustomCallTest, RejectsMismatchedBatchSizes) {
                        HasSubstr("batch dimensions must have equal sizes")));
 }
 
+TEST(MusaAdvancedEmitterPolicyTest, RejectsTritonBeforeLowering) {
+  EXPECT_THAT(
+      thunk_emitter_internal::ValidateTritonCustomCallPlatform(
+          MusaCapability()),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("not qualified for the MUSA backend")));
+}
+
+TEST(MusaAdvancedEmitterPolicyTest, PreservesOtherGpuBackends) {
+  stream_executor::GpuComputeCapability cuda(
+      stream_executor::CudaComputeCapability(9, 0));
+  EXPECT_THAT(
+      thunk_emitter_internal::ValidateTritonCustomCallPlatform(cuda), IsOk());
+}
+
 }  // namespace
 }  // namespace xla::gpu

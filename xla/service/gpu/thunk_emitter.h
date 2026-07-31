@@ -73,6 +73,9 @@ absl::Status ValidateMusaGemmCustomCall(
     const stream_executor::GpuComputeCapability& gpu_compute_capability,
     const GemmBackendConfig& config);
 
+absl::Status ValidateTritonCustomCallPlatform(
+    const stream_executor::GpuComputeCapability& gpu_compute_capability);
+
 }  // namespace thunk_emitter_internal
 
 // Emits Thunks for the given HLO module.
@@ -206,7 +209,7 @@ class ThunkEmitter {
 
   AsyncThunkSequence EmitPadToStatic(const HloCustomCallInstruction* instr);
 
-  absl::StatusOr<ThunkSequence> EmitPtxCustomCall(
+  AsyncThunkSequence EmitCustomKernelCall(
       const HloCustomCallInstruction* instr);
 
   absl::StatusOr<ThunkSequence> EmitRecvDoneThunk(

@@ -18,7 +18,7 @@ limitations under the License.
 
 #include <memory>
 
-#include "absl/status/statusor.h"
+#include "xla/future.h"
 
 namespace xla {
 
@@ -30,10 +30,10 @@ namespace gpu {
 class Thunk;
 class IrEmitterContext;
 
-// Emit a platform-specific custom kernel thunk for PTX custom calls.
-// This function has separate implementations for CUDA and ROCm backends,
-// selected at build time via conditional compilation in BUILD rules.
-absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(
+// Emits a platform-specific thunk for a structured GPU kernel custom call.
+// This function has separate implementations for GPU backends, selected at
+// build time via conditional compilation in BUILD rules.
+xla::Future<std::unique_ptr<Thunk>> EmitCustomKernelThunk(
     const HloCustomCallInstruction* instr, IrEmitterContext* context);
 
 }  // namespace gpu

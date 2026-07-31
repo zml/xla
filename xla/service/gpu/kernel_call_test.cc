@@ -240,5 +240,70 @@ TEST_F(KernelCallTest, ParseComplexkernel_data) {
   EXPECT_THAT(kernel_call.output_indices, ElementsAre(2, 4, 6, 8));
 }
 
+TEST_F(KernelCallTest, ParseMusaLlvmSource) {
+  absl::string_view backend_config = R"({
+    name = "musa_kernel",
+    kernel_type = "musa_llvm",
+    kernel_data = "define void @musa_kernel() { ret void }",
+    grid_x = 1,
+    grid_y = 1,
+    grid_z = 1,
+    block_x = 32,
+    block_y = 1,
+    block_z = 1,
+    shared_mem_bytes = 0,
+    output_indices = [2]
+  })";
+
+  absl::StatusOr<KernelCall> parsed =
+      KernelCall::Parse(backend_config, mlir_context_.get());
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  EXPECT_EQ(parsed->kernel_type, KernelCall::KernelType::kMusaLlvmSource);
+  EXPECT_EQ(parsed->name, "musa_kernel");
+  EXPECT_THAT(parsed->output_indices, ElementsAre(2));
+}
+
+TEST_F(KernelCallTest, RejectZeroLaunchDimension) {
+  absl::string_view backend_config = R"({
+    name = "bad_grid",
+    kernel_type = "musa_llvm",
+    kernel_data = "define void @bad_grid() { ret void }",
+    grid_x = 0,
+    grid_y = 1,
+    grid_z = 1,
+    block_x = 1,
+    block_y = 1,
+    block_z = 1,
+    shared_mem_bytes = 0
+  })";
+
+  absl::StatusOr<KernelCall> parsed =
+      KernelCall::Parse(backend_config, mlir_context_.get());
+  ASSERT_FALSE(parsed.ok());
+  EXPECT_THAT(parsed.status().message(),
+              HasSubstr("dimensions must be positive"));
+}
+
+TEST_F(KernelCallTest, RejectNegativeSharedMemory) {
+  absl::string_view backend_config = R"({
+    name = "bad_shared_memory",
+    kernel_type = "musa_llvm",
+    kernel_data = "define void @bad_shared_memory() { ret void }",
+    grid_x = 1,
+    grid_y = 1,
+    grid_z = 1,
+    block_x = 1,
+    block_y = 1,
+    block_z = 1,
+    shared_mem_bytes = -1
+  })";
+
+  absl::StatusOr<KernelCall> parsed =
+      KernelCall::Parse(backend_config, mlir_context_.get());
+  ASSERT_FALSE(parsed.ok());
+  EXPECT_THAT(parsed.status().message(),
+              HasSubstr("must be nonnegative"));
+}
+
 }  // namespace
 }  // namespace xla::gpu

@@ -24,7 +24,7 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(
+xla::Future<std::unique_ptr<Thunk>> EmitCustomKernelThunk(
     const HloCustomCallInstruction* /*instr*/, IrEmitterContext* /*context*/) {
   return absl::UnimplementedError(
       "Custom kernel emitter for PTX custom call is not yet implemented in "

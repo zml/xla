@@ -46,10 +46,12 @@ absl::StatusOr<KernelCall::KernelType> ParseKernelType(
     return KernelCall::KernelType::kPtxSource;
   } else if (kernel_type_str == "cubin") {
     return KernelCall::KernelType::kCudaBinary;
+  } else if (kernel_type_str == "musa_llvm") {
+    return KernelCall::KernelType::kMusaLlvmSource;
   } else {
     return absl::InvalidArgumentError(
         absl::StrCat("Unknown kernel type: ", kernel_type_str,
-                     ". Supported types: 'ptx', 'cubin'"));
+                     ". Supported types: 'ptx', 'cubin', 'musa_llvm'"));
   }
 }
 
@@ -111,6 +113,16 @@ absl::StatusOr<KernelCall> KernelCall::Parse(absl::string_view backend_config,
   ASSIGN_OR_RETURN(int32_t block_y, get_int32_attr("block_y"));
   ASSIGN_OR_RETURN(int32_t block_z, get_int32_attr("block_z"));
   ASSIGN_OR_RETURN(int32_t shared_mem, get_int32_attr("shared_mem_bytes"));
+
+  if (grid_x <= 0 || grid_y <= 0 || grid_z <= 0 || block_x <= 0 ||
+      block_y <= 0 || block_z <= 0) {
+    return absl::InvalidArgumentError(
+        "Grid and block dimensions must be positive");
+  }
+  if (shared_mem < 0) {
+    return absl::InvalidArgumentError(
+        "Shared memory size must be nonnegative");
+  }
 
   // Optional output_indices field
   mlir::ArrayAttr output_indices =

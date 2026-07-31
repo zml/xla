@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/kernel_call.h"
 #include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
@@ -1445,6 +1446,31 @@ TEST_F(IrEmissionUtilsTest, NoNonContractingDims) {
               absl_testing::IsOkAndHolds(false));
   EXPECT_THAT(IsCublasSupportedMatMul(*root, false),
               absl_testing::IsOkAndHolds(false));
+}
+
+TEST_F(IrEmissionUtilsTest, RecognizesStructuredGpuKernelTargets) {
+  auto make_custom_call = [](absl::string_view target) {
+    HloComputation::Builder builder("main");
+    Shape shape = ShapeUtil::MakeScalarShape(F32);
+    HloInstruction* operand = builder.AddInstruction(
+        HloInstruction::CreateParameter(0, shape, "operand"));
+    HloInstruction* call =
+        builder.AddInstruction(HloInstruction::CreateCustomCall(
+            shape, {operand}, std::string(target)));
+    return builder.Build(call);
+  };
+
+  std::unique_ptr<HloComputation> ptx =
+      make_custom_call(kPtxCustomCallTarget);
+  std::unique_ptr<HloComputation> musa =
+      make_custom_call(kMusaLlvmCustomCallTarget);
+  std::unique_ptr<HloComputation> other = make_custom_call("unrelated");
+
+  EXPECT_TRUE(IsCustomCallToPtxKernel(*ptx->root_instruction()));
+  EXPECT_TRUE(IsCustomCallToMusaLlvmKernel(*musa->root_instruction()));
+  EXPECT_TRUE(IsCustomCallToGpuKernel(*ptx->root_instruction()));
+  EXPECT_TRUE(IsCustomCallToGpuKernel(*musa->root_instruction()));
+  EXPECT_FALSE(IsCustomCallToGpuKernel(*other->root_instruction()));
 }
 
 }  // namespace gpu

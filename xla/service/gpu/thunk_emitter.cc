@@ -251,6 +251,15 @@ ShapeIndex GetDstShapeIndex(const HloInstruction* async_start,
 
 namespace thunk_emitter_internal {
 
+absl::Status ValidateTritonCustomCallPlatform(
+    const stream_executor::GpuComputeCapability& gpu_compute_capability) {
+  if (gpu_compute_capability.IsMusa()) {
+    return absl::UnimplementedError(
+        "Triton custom calls are not qualified for the MUSA backend");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateMusaGemmBackendConfig(const GemmBackendConfig& config) {
   if (config.beta() != 0.0) {
     return absl::UnimplementedError(absl::StrCat(
@@ -1107,11 +1116,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCuDnnThunk(
       /*should_memzero=*/IsCustomCallTofMHA(*instr), dropout_seed));
 }
 
-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitPtxCustomCall(
+AsyncThunkSequence ThunkEmitter::EmitCustomKernelCall(
     const HloCustomCallInstruction* instr) {
-  ASSIGN_OR_RETURN(auto thunk,
-                   EmitPtxCustomKernelThunk(instr, ir_emitter_context_));
-  return GetThunkSequence(std::move(thunk));
+  return EmitCustomKernelThunk(instr, ir_emitter_context_)
+      .Map([](std::unique_ptr<Thunk> thunk) {
+        return ThunkSequence::Of(std::move(thunk));
+      });
 }
 
 std::optional<BufferAllocation::Slice> ThunkEmitter::GetAllocationOverride(
@@ -1440,6 +1450,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
 
 AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
     const HloCustomCallInstruction* instr) {
+  RETURN_IF_ERROR(thunk_emitter_internal::ValidateTritonCustomCallPlatform(
+      ir_emitter_context_->gpu_compute_capability()));
+
   BorrowedMlirContext borrowed_context =
       ir_emitter_context_->BorrowMlirContext();
   LoadMlirDialectsForTriton(**borrowed_context);
@@ -2991,8 +3004,8 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
       IsCustomCallToBlockScaledDot(*hlo)) {
     return EmitCuDnnThunk(custom_call);
   }
-  if (IsCustomCallToPtxKernel(*hlo)) {
-    return EmitPtxCustomCall(custom_call);
+  if (IsCustomCallToGpuKernel(*hlo)) {
+    return EmitCustomKernelCall(custom_call);
   }
   if (IsCustomCallToTopK(*hlo)) {
     return EmitTopKCustomCall(custom_call);

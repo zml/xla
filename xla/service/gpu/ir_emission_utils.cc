@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/primitive_util.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/kernel_call.h"
 #include "xla/service/gpu/target_util.h"
 #include "xla/service/matmul_indexing_utils.h"
 #include "xla/shape.h"
@@ -155,7 +156,16 @@ bool IsCustomCallToTopK(const HloInstruction& hlo) {
 
 bool IsCustomCallToPtxKernel(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&
-         hlo.custom_call_target() == "__gpu$xla.gpu.ptx";
+         hlo.custom_call_target() == kPtxCustomCallTarget;
+}
+
+bool IsCustomCallToMusaLlvmKernel(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kMusaLlvmCustomCallTarget;
+}
+
+bool IsCustomCallToGpuKernel(const HloInstruction& hlo) {
+  return IsCustomCallToPtxKernel(hlo) || IsCustomCallToMusaLlvmKernel(hlo);
 }
 
 bool IsCustomCallToMosaicGpu(const HloInstruction& hlo) {

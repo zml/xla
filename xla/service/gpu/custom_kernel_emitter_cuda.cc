@@ -34,7 +34,7 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(
+xla::Future<std::unique_ptr<Thunk>> EmitCustomKernelThunk(
     const HloCustomCallInstruction* instr, IrEmitterContext* context) {
   absl::string_view backend_config_str = instr->raw_backend_config_string();
   if (backend_config_str.empty()) {
@@ -64,8 +64,9 @@ absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(
 
   Thunk::ThunkInfo thunk_info =
       Thunk::ThunkInfo::WithProfileAnnotation(instr, context->GetNextThunkId());
-  return std::make_unique<CustomKernelThunk>(
-      std::move(thunk_info), ptx_custom_kernel, kernel_arguments);
+  return xla::Future<std::unique_ptr<Thunk>>(
+      std::make_unique<CustomKernelThunk>(
+          std::move(thunk_info), ptx_custom_kernel, kernel_arguments));
 }
 
 }  // namespace gpu

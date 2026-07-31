@@ -279,6 +279,38 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "musa_custom_kernel_source",
+    srcs = ["musa_custom_kernel_source.cc"],
+    hdrs = ["musa_custom_kernel_source.h"],
+    deps = [
+        ":musa_llvm14_compatibility",
+        "//xla/codegen:llvm_kernel_source",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:AsmParser",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_custom_kernel_source_test",
+    srcs = ["musa_custom_kernel_source_test.cc"],
+    deps = [
+        ":musa_custom_kernel_source",
+        ":musa_shim_abi",
+        "//xla/codegen:llvm_kernel_source",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Core",
+    ],
+)
+
 filegroup(
     name = "musa_llvm14_compatibility_goldens",
     srcs = glob(["testdata/llvm14_compatibility/*.ll"]),

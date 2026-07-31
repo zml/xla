@@ -381,6 +381,7 @@ cc_library(
         ":gpu_constants",
         ":ir_emitter_context",
         ":kernel_call",
+        "//xla:future",
         "//xla/backends/gpu/codegen/kernels:custom_kernel",
         "//xla/backends/gpu/codegen/kernels:ptx_custom_kernel",
         "//xla/backends/gpu/runtime:custom_kernel_thunk",
@@ -404,6 +405,7 @@ cc_library(
     ],
     deps = [
         ":ir_emitter_context",
+        "//xla:future",
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -412,17 +414,29 @@ cc_library(
 
 cc_library(
     name = "ptx_custom_kernel_emitter_musa",
-    srcs = ["custom_kernel_emitter_musa_stub.cc"],
+    srcs = ["custom_kernel_emitter_musa.cc"],
     hdrs = ["custom_kernel_emitter.h"],
     tags = [
         "gpu",
         "musa-only",
     ],
     deps = [
+        ":gpu_constants",
         ":ir_emitter_context",
+        ":kernel_call",
+        ":launch_dimensions",
+        "//xla:future",
+        "//xla/backends/gpu/codegen:kernel_compiler",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/codegen:llvm_kernel_source",
+        "//xla/codegen/emitters:kernel_arguments",
         "//xla/hlo/ir:hlo",
+        "//xla/service/gpu/musa:musa_custom_kernel_source",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
     ],
 )
 
@@ -436,6 +450,7 @@ cc_library(
     ],
     deps = [
         ":ir_emitter_context",
+        "//xla:future",
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -1073,6 +1088,7 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     deps = [
         ":backend_configs_cc",
+        ":kernel_call",
         ":target_util",
         "//xla:permutation_util",
         "//xla:shape_util",
@@ -1112,6 +1128,7 @@ xla_cc_test(
     deps = [
         ":backend_configs_cc",
         ":ir_emission_utils",
+        ":kernel_call",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/hlo/utils:hlo_traversal",

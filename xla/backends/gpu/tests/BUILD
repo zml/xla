@@ -1174,6 +1174,24 @@ xla_test(
     ],
 )
 
+xla_cc_test(
+    name = "musa_custom_kernel_test",
+    srcs = ["musa_custom_kernel_test.cc"],
+    tags = ["musa-only"],
+    deps = [
+        "//xla:literal",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:gpu_plugin",
+        "//xla/service/gpu/musa:musa_shim_abi",
+        "//xla/stream_executor/musa:all_runtime",
+        "//xla/tests:hlo_pjrt_test_base",
+        "//xla/tests:pjrt_gpu_client_registry",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "collective_ops_e2e_test_base",
     testonly = True,
