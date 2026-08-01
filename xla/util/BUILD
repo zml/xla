@@ -71,6 +71,16 @@ cc_library(
 )
 
 cc_library(
+    name = "embedded_file",
+    hdrs = ["embedded_file.h"],
+    compatible_with = get_compatible_with_libtpu_portable(),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "embedded_constant_buffers",
     srcs = ["embedded_constant_buffers.cc"],
     hdrs = ["embedded_constant_buffers.h"],

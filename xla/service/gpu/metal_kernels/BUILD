@@ -1,5 +1,5 @@
 
-load("//xla/util:build_defs.bzl", "embed_files")
+load("//xla/util:build_defs.bzl", "embed_files", "embed_tree")
 
 package(
     default_visibility = [
@@ -11,10 +11,21 @@ package(
 
 embed_files(
     name = "metalblas_shaders",
-    srcs = glob([
-        "vendored/metalblas/*.h",
-        "vendored/mlx/*.h",
-    ]),
+    srcs = ["@metalblas//:compiled_shaders"],
+    cpp_namespace = "xla::gpu",
+)
+
+embed_tree(
+    name = "mlx_include_tree",
+    cpp_namespace = "xla::gpu",
+    root_sentinel = "@mlx//:metal_kernels_root_sentinel",
+    root_sentinel_path = "mlx/backend/metal/kernels/utils.h",
+    tree = "@mlx//:metal_kernel_headers",
+)
+
+embed_files(
+    name = "mlx_kernels",
+    srcs = glob(["mlx_entries/*.h"]),
     cpp_namespace = "xla::gpu",
 )
 
@@ -58,8 +69,8 @@ embed_files(
 )
 
 embed_files(
-    name = "fp8_gemm_tiled",
-    srcs = ["custom/fp8_gemm_tiled.metal"],
+    name = "fp8_gemv_pc",
+    srcs = ["custom/fp8_gemv_pc.metal"],
     cpp_namespace = "xla::gpu",
 )
 

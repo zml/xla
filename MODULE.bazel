@@ -351,3 +351,9 @@ use_repo(pjrt_rc_number, "rc_number")
 ### libdrm (dedicated extension to avoid Bzlmod merging issues)
 libdrm_ext = use_extension("//third_party/libdrm:extension.bzl", "libdrm_ext")
 use_repo(libdrm_ext, "libdrm")
+
+metalblas_ext = use_extension("//third_party/metalblas:extension.bzl", "metalblas_ext")
+use_repo(metalblas_ext, "metalblas")
+
+mlx_ext = use_extension("//third_party/mlx:extension.bzl", "mlx_ext")
+use_repo(mlx_ext, "mlx")

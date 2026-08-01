@@ -34,6 +34,7 @@ limitations under the License.
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/service/gpu/metal_include_root.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
@@ -260,6 +261,7 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallib(
     const std::vector<std::pair<std::string, std::string>>& subs) {
   TF_ASSIGN_OR_RETURN(std::string metal_c, FindMetalTool("metal"));
   TF_ASSIGN_OR_RETURN(std::string metallib_tool, FindMetalTool("metallib"));
+  TF_ASSIGN_OR_RETURN(std::string include_root, MetalIncludeRoot());
   const std::string src =
       subs.empty() ? std::string(source) : absl::StrReplaceAll(source, subs);
 
@@ -277,10 +279,10 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallib(
     env->DeleteFile(metallib_path).IgnoreError();
   };
   TF_RETURN_IF_ERROR(tsl::WriteStringToFile(env, metal_path, src));
-  TF_RETURN_IF_ERROR(
-      RunCommand({metal_c, "-std=metal4.0", "-c", metal_path, "-o", air_path},
-                 /*capture_stdout=*/false)
-          .status());
+  TF_RETURN_IF_ERROR(RunCommand({metal_c, "-std=metal4.0", "-I", include_root,
+                                 "-c", metal_path, "-o", air_path},
+                                /*capture_stdout=*/false)
+                         .status());
   TF_RETURN_IF_ERROR(
       RunCommand({metallib_tool, air_path, "-o", metallib_path},
                  /*capture_stdout=*/false)
@@ -293,8 +295,9 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallib(
 absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallibCached(
     absl::string_view source,
     const std::vector<std::pair<std::string, std::string>>& subs) {
-  std::string key =
+  const std::string src =
       subs.empty() ? std::string(source) : absl::StrReplaceAll(source, subs);
+  std::string key = absl::StrCat(MetalIncludeTreeHash(), "\n", src);
   static absl::Mutex mu(absl::kConstInit);
   static auto& cache =
       *new absl::flat_hash_map<std::string, std::vector<uint8_t>>();
@@ -304,7 +307,7 @@ absl::StatusOr<std::vector<uint8_t>> CompileMetalSourceToMetallibCached(
     if (it != cache.end()) return it->second;
   }
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
-                      CompileMetalSourceToMetallib(key));
+                      CompileMetalSourceToMetallib(src));
   absl::MutexLock lock(&mu);
   return cache.emplace(std::move(key), std::move(lib)).first->second;
 }
