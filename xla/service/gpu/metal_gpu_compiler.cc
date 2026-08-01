@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_sort_thunk.h"
 #include "xla/backends/gpu/runtime/metal_topk_thunk.h"
+#include "xla/backends/gpu/transforms/metal_workspace_rewriter.h"
 #include "xla/comparison_util.h"
 #include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/shape_util.h"
@@ -211,7 +212,7 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
         const int64_t kv_pos_stride = pos_major ? n_kv * hd : hd;
         if (fa_seen.insert({is_prefill, kv_pos_stride}).second) {
           MetalFlashAttnThunk::PrewarmPipeline(stream_exec, is_prefill,
-                                               kv_pos_stride, seqlen, hd);
+                                               kv_pos_stride, seqlen, hd, n_kv);
         }
       } else if (target == "zml$paged_attn") {
         if (instr->operand_count() != 6) continue;
@@ -752,6 +753,8 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
     HloModuleConfig cfg = module->config();
     cfg.mutable_debug_options().set_xla_gpu_dot_merger_threshold_mb(0);
     cfg.mutable_debug_options().set_xla_gpu_enable_cub_radix_sort(false);
+    cfg.mutable_debug_options().set_xla_gpu_experimental_scaled_dot_with_triton(
+        false);
     module->set_config(std::move(cfg));
   }
   TF_ASSIGN_OR_RETURN(
@@ -761,6 +764,22 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   TF_RETURN_IF_ERROR(RewriteSortToMetalThunk(optimized.get()).status());
   PrewarmMetalPipelines(optimized.get(), stream_exec);
   return optimized;
+}
+
+absl::Status MetalGpuCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+    CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats, mlir_context));
+  const se::MetalComputeCapability metal_arch =
+      gpu_target_config.device_description.metal_compute_capability();
+  return MetalWorkspaceRewriter(metal_arch.architecture_size(),
+                                metal_arch.architecture_gen())
+      .Run(hlo_module)
+      .status();
 }
 
 absl::Status MetalGpuCompiler::OptimizeHloConvolutionCanonicalization(

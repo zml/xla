@@ -14,7 +14,6 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test", "xla_internal")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/util:build_defs.bzl", "embed_files")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
@@ -510,16 +509,6 @@ cc_library(
         ":launch_dimensions",
         ":matmul_utils",
         ":metal_custom_calls",
-        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
-        "//xla/backends/gpu/runtime:metal_gemm_thunk",
-        "//xla/backends/gpu/runtime:metal_gdn_thunk",
-        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
-        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
-        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
-        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
-        "//xla/backends/gpu/runtime:metal_print_thunk",
-        "//xla/backends/gpu/runtime:metal_sort_thunk",
-        "//xla/backends/gpu/runtime:metal_topk_thunk",
         ":ptx_custom_kernel_emitter",
         ":stream_executor_util",
         ":triton_call",
@@ -568,6 +557,18 @@ cc_library(
         "//xla/backends/gpu/runtime:infeed_thunk",
         "//xla/backends/gpu/runtime:legacy_custom_call_thunk",
         "//xla/backends/gpu/runtime:memset_thunk",
+        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_gdn_thunk",
+        "//xla/backends/gpu/runtime:metal_gemm_thunk",
+        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
+        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_nvfp4_matmul_thunk",
+        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_print_thunk",
+        "//xla/backends/gpu/runtime:metal_sort_thunk",
+        "//xla/backends/gpu/runtime:metal_topk_thunk",
+        "//xla/backends/gpu/runtime:metal_workspace",
         "//xla/backends/gpu/runtime:norm_thunk",
         "//xla/backends/gpu/runtime:outfeed_thunk",
         "//xla/backends/gpu/runtime:ragged_all_to_all_thunk",
@@ -1201,6 +1202,8 @@ cc_library(
     hdrs = ["metal_custom_calls.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/strings",
     ],
@@ -1641,9 +1644,12 @@ cc_library(
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:numbers",
         "@tsl//tsl/platform:statusor",
-    ] + if_macos([], [
-        "//xla/stream_executor/cuda:cuda_platform_id",
-    ]),
+    ] + if_macos(
+        [],
+        [
+            "//xla/stream_executor/cuda:cuda_platform_id",
+        ],
+    ),
     alwayslink = True,  # Contains per-platform transfer manager registration
 )
 
@@ -1759,6 +1765,7 @@ cc_library(
     hdrs = ["fusion_pipeline.h"],
     deps = [
         ":alias_info",
+        ":gpu_fusible",
         "//xla:xla_proto_cc",
         "//xla/backends/gpu/transforms:conv_canonicalizer",
         "//xla/backends/gpu/transforms:conv_fusion_rewriter",
@@ -1767,7 +1774,6 @@ cc_library(
         "//xla/backends/gpu/transforms:ragged_dot_fusion_rewriter",
         "//xla/backends/gpu/transforms:sort_iota_fusion",
         "//xla/backends/gpu/transforms:variadic_op_splitter",
-        ":gpu_fusible",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/hlo/pass:hlo_pass_pipeline",
@@ -1900,6 +1906,7 @@ cc_library(
         "//xla/backends/gpu/transforms:estimate_cub_sort_scratch_size",
         "//xla/backends/gpu/transforms:explicit_collectives_group_async_wrapper",
         "//xla/backends/gpu/transforms:explicit_stream_annotation_async_wrapper",
+        "//xla/backends/gpu/transforms:fused_scaled_dot_rewriter",
         "//xla/backends/gpu/transforms:fusion_block_level_rewriter",
         "//xla/backends/gpu/transforms:fusion_wrapper",
         "//xla/backends/gpu/transforms:gemm_broadcast_folding_rewriter",
@@ -1924,7 +1931,6 @@ cc_library(
         "//xla/backends/gpu/transforms:rename_fusions",
         "//xla/backends/gpu/transforms:sanitize_constant_names",
         "//xla/backends/gpu/transforms:scalar_constant_sinker",
-        "//xla/backends/gpu/transforms:fused_scaled_dot_rewriter",
         "//xla/backends/gpu/transforms:scaled_dot_rewriter",
         "//xla/backends/gpu/transforms:scan_rewriter",
         "//xla/backends/gpu/transforms:scatter_determinism_expander",
@@ -3957,9 +3963,11 @@ cc_library(
     tags = ["gpu"],
     deps = [
         ":metal_air_toolchain",
+        ":metal_include_root",
         ":metalblas_dispatch",
-        "//xla/service/gpu/metal_kernels:metalblas_shaders",
         "//xla:xla_data_proto_cc",
+        "//xla/service/gpu/metal_kernels:metalblas_shaders",
+        "//xla/service/gpu/metal_kernels:mlx_kernels",
         "//xla/stream_executor:launch_dim",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
@@ -3990,6 +3998,29 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_include_root",
+    srcs = ["metal_include_root.cc"],
+    hdrs = ["metal_include_root.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "//xla/service/gpu/metal_kernels:mlx_include_tree",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "//xla/util:embedded_file",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@tsl//tsl/platform:fingerprint",
+    ],
+)
+
+cc_library(
     name = "metal_air_toolchain",
     srcs = ["metal_air_toolchain.cc"],
     hdrs = ["metal_air_toolchain.h"],
@@ -3998,6 +4029,7 @@ cc_library(
         "metal-only",
     ],
     deps = [
+        ":metal_include_root",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:status",
@@ -4026,17 +4058,15 @@ cc_library(
         "//xla/backends/gpu/transforms:fused_scaled_dot_arms_metal",
         ":metal_air_metadata",
         ":metal_air_toolchain",
+        ":target_constants",
+        "//xla:shape_util",
+        "//xla:xla_proto_cc",
         "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
-        "//xla/backends/gpu/runtime:metal_gdn_thunk",
-        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
-        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
         "//xla/backends/gpu/runtime:metal_kv_write_thunk",
         "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
         "//xla/backends/gpu/runtime:metal_sort_thunk",
         "//xla/backends/gpu/runtime:metal_topk_thunk",
-        ":target_constants",
-        "//xla:shape_util",
-        "//xla:xla_proto_cc",
+        "//xla/backends/gpu/transforms:metal_workspace_rewriter",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/transforms/simplifiers:hlo_dce",
         "//xla/service:compiler",
@@ -4052,8 +4082,8 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
-        "@llvm-project//llvm:ir_headers",
         "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:ir_headers",
     ],
 )
 

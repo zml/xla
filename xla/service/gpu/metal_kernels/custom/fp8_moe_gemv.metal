@@ -22,7 +22,7 @@ kernel void fp8_moe_gemv(
     uint  lane [[thread_index_in_simdgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
-    const int R = dims.x, K = dims.y, N = dims.z;
+    const int R = max(dims.x, 0), K = max(dims.y, 0), N = max(dims.z, 0);
     const int Nb = N / 128;     // scale rows per expert
     const int Kb = K / 128;     // scale cols per expert (= scale tiles over K)
     constexpr int TN = 8;       // simdgroups == output columns per threadgroup
@@ -36,7 +36,7 @@ kernel void fp8_moe_gemv(
     const int ri = int(tgid.y);
     if (ri >= R) return;
     const int ni = int(tgid.x) * TN + int(sgid);   // this simdgroup's column
-    const bool active = (ni < N);
+    const bool active = ni < N;
 
     const int e = expert_id[ri];
     const device bfloat *xrow = x + (long)ri * K;
@@ -59,5 +59,7 @@ kernel void fp8_moe_gemv(
     }
 
     acc = simd_sum(acc);
-    if (active && lane == 0) out[(long)ri * N + ni] = bfloat(acc);
+    if (ni < N && lane == 0) {
+        out[(long)ri * N + ni] = bfloat(acc);
+    }
 }

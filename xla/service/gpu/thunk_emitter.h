@@ -292,7 +292,13 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
       const HloCustomCallInstruction* hlo);
 
-  absl::StatusOr<ThunkSequence> EmitFp8GemvThunk(
+  absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalNvfp4MatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
       const HloCustomCallInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(

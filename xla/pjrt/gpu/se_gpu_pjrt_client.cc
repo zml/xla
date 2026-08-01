@@ -1364,11 +1364,6 @@ GetStreamExecutorGpuDeviceAllocator(
   const DebugOptions& debug_options = xla::GetDebugOptionsFromFlags();
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
   bool preallocate = allocator_config.preallocate;
-#if TENSORFLOW_USE_METAL
-  if (platform->id() == stream_executor::metal::kMetalPlatformId) {
-    preallocate = false;
-  }
-#endif  // TENSORFLOW_USE_METAL
   if (debug_options.xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
       effective_kind != GpuAllocatorConfig::Kind::kVmm) {
@@ -1407,6 +1402,11 @@ GetStreamExecutorGpuDeviceAllocator(
       shared_collective_pool =
           preallocate &&
           debug_options.xla_gpu_enable_allocator_spatial_partitioning();
+#if TENSORFLOW_USE_METAL
+      if (platform->id() == stream_executor::metal::kMetalPlatformId) {
+        shared_collective_pool = false;
+      }
+#endif  // TENSORFLOW_USE_METAL
       for (const auto& ordinal_and_device : addressable_devices) {
         ABSL_ASSIGN_OR_RETURN(
             auto bfc_allocator,

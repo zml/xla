@@ -12,7 +12,7 @@ kernel void bf16_moe_gemv(
     uint  lane [[thread_index_in_simdgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
-    const int R = dims.x, K = dims.y, N = dims.z;
+    const int R = max(dims.x, 0), K = max(dims.y, 0), N = max(dims.z, 0);
     constexpr int TN = 8;       // simdgroups == output columns per threadgroup
     constexpr int BK = 128;     // K tile
 
@@ -21,7 +21,7 @@ kernel void bf16_moe_gemv(
     const int ri = int(tgid.y);
     if (ri >= R) return;
     const int ni = int(tgid.x) * TN + int(sgid);   // this simdgroup's column
-    const bool active = (ni < N);
+    const bool active = ni < N;
 
     const int e = expert_id[ri];
     const device bfloat *xrow = x + (long)ri * K;
@@ -29,7 +29,11 @@ kernel void bf16_moe_gemv(
 
     float acc = 0.0f;
     for (int kt = 0; kt < K; kt += BK) {
-        if (tid < BK) Xs[tid] = (kt + int(tid) < K) ? xrow[kt + tid] : bfloat(0);
+        if (tid < BK) {
+            Xs[tid] = (kt + int(tid) < K)
+                          ? xrow[kt + tid]
+                          : bfloat(0);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
             const int k = int(lane) * 4;           // 32 lanes * 4 = 128 = BK
@@ -44,5 +48,7 @@ kernel void bf16_moe_gemv(
     }
 
     acc = simd_sum(acc);
-    if (active && lane == 0) out[(long)ri * N + ni] = bfloat(acc);
+    if (ni < N && lane == 0) {
+        out[(long)ri * N + ni] = bfloat(acc);
+    }
 }

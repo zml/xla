@@ -16,7 +16,6 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_fp8_gemv_thunk.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -24,9 +23,9 @@ limitations under the License.
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
-#include "xla/service/gpu/metal_kernels/fp8_gemm_tiled.h"
 #include "xla/service/gpu/metal_kernels/fp8_gemv.h"
-#include "xla/service/gpu/metal_kernels/metalblas_shaders.h"
+#include "xla/service/gpu/metal_kernels/fp8_gemv_pc.h"
+#include "xla/service/gpu/metal_kernels/mlx_kernels.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
@@ -46,7 +45,7 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
     ThunkInfo thunk_info, BufferAllocation::Slice x, Shape x_shape,
     BufferAllocation::Slice w, Shape w_shape, BufferAllocation::Slice scale,
     Shape scale_shape, BufferAllocation::Slice out, Shape out_shape, int64_t b,
-    int64_t k, int64_t n)
+    int64_t k, int64_t n, bool per_channel)
     : Thunk(Kind::kCustomCall, std::move(thunk_info)),
       x_(x),
       w_(w),
@@ -58,11 +57,15 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
       out_shape_(std::move(out_shape)),
       b_(b),
       k_(k),
-      n_(n) {}
+      n_(n),
+      per_channel_(per_channel) {}
 
 absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
-  if (kernel_ != nullptr && kernel_tiled_ != nullptr && kernel_steel_ != nullptr)
+  if (kernel_ != nullptr && kernel_steel_ != nullptr && kernel_pc_ != nullptr &&
+      kernel_steel64_ != nullptr && kernel_pc_qmm_ != nullptr &&
+      kernel_pc_qmm64_ != nullptr)
     return absl::OkStatus();
+
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
 
   {
@@ -75,18 +78,25 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   {
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
-        CompileMetalSourceToMetallibCached(get_fp8_gemm_tiled()));
-    TF_ASSIGN_OR_RETURN(kernel_tiled_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_gemm_tiled", /*arity=*/5, {}));
-  }
-  {
-    TF_ASSIGN_OR_RETURN(
-        std::vector<uint8_t> lib,
         CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
     TF_ASSIGN_OR_RETURN(kernel_steel_,
                         metal_exec->LoadKernelWithConstants(
                             lib, "fp8_qmm_t", /*arity=*/5, {}));
+    TF_ASSIGN_OR_RETURN(kernel_steel64_,
+                        metal_exec->LoadKernelWithConstants(
+                            lib, "fp8_qmm_t_bm64", /*arity=*/5, {}));
+    TF_ASSIGN_OR_RETURN(kernel_pc_qmm_,
+                        metal_exec->LoadKernelWithConstants(
+                            lib, "fp8_qmm_t_pc", /*arity=*/5, {}));
+    TF_ASSIGN_OR_RETURN(kernel_pc_qmm64_,
+                        metal_exec->LoadKernelWithConstants(
+                            lib, "fp8_qmm_t_pc_bm64", /*arity=*/5, {}));
+  }
+  {
+    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib_pc,
+                        CompileMetalSourceToMetallibCached(get_fp8_gemv_pc()));
+    TF_ASSIGN_OR_RETURN(kernel_pc_, metal_exec->LoadKernelWithConstants(
+                                        lib_pc, "fp8_gemv_pc", /*arity=*/5, {}));
   }
 
   const int32_t dims[4] = {static_cast<int32_t>(b_), static_cast<int32_t>(k_),
@@ -94,7 +104,8 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
                            static_cast<int32_t>(k_ / 128)};
   p_dims_ = executor->Allocate(sizeof(dims), 0);
   if (p_dims_.opaque() == nullptr) {
-    return absl::ResourceExhaustedError("zml$fp8_gemv: dims alloc failed.");
+    return absl::ResourceExhaustedError(
+        "zml$scaled_matmul (FP8): dims alloc failed.");
   }
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_dims_, dims, sizeof(dims)));
 
@@ -109,8 +120,11 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   absl::MutexLock lock(&mu_);
   if (executor_ != executor) {
     kernel_ = nullptr;
-    kernel_tiled_ = nullptr;
     kernel_steel_ = nullptr;
+    kernel_pc_ = nullptr;
+    kernel_steel64_ = nullptr;
+    kernel_pc_qmm_ = nullptr;
+    kernel_pc_qmm64_ = nullptr;
     TF_RETURN_IF_ERROR(EnsureLoaded(executor));
     executor_ = executor;
   }
@@ -122,13 +136,33 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(allocs.GetDeviceAddress(out_));    // 3  out
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
+  if (per_channel_) {
+    if (b_ == 1) {
+      return kernel_pc_->Launch(se::ThreadDim(256, 1, 1),
+                                se::BlockDim(static_cast<uint64_t>(n_), 1, 1),
+                                stream, args);
+    }
+    const bool large_m = b_ > 16;
+    se::Kernel* kpc = large_m ? kernel_pc_qmm64_.get() : kernel_pc_qmm_.get();
+    const int64_t kPcBM = large_m ? 64 : 16;
+    constexpr int64_t kPcBN = 64;
+    return kpc->Launch(
+        se::ThreadDim(32, 2, 2),
+        se::BlockDim(static_cast<uint64_t>((n_ + kPcBN - 1) / kPcBN),
+                     static_cast<uint64_t>((b_ + kPcBM - 1) / kPcBM), 1),
+        stream, args);
+  }
   if (b_ == 1) {
     return kernel_->Launch(se::ThreadDim(256, 1, 1),
                            se::BlockDim(static_cast<uint64_t>(n_), 1, 1), stream,
                            args);
   }
-  constexpr int64_t kSteelBM = 16, kSteelBN = 64;
-  return kernel_steel_->Launch(
+  const bool large_m = b_ > 16;
+  stream_executor::Kernel* ksteel =
+      large_m ? kernel_steel64_.get() : kernel_steel_.get();
+  const int64_t kSteelBM = large_m ? 64 : 16;
+  constexpr int64_t kSteelBN = 64;
+  return ksteel->Launch(
       se::ThreadDim(32, 2, 2),
       se::BlockDim(static_cast<uint64_t>((n_ + kSteelBN - 1) / kSteelBN),
                    static_cast<uint64_t>((b_ + kSteelBM - 1) / kSteelBM), 1),

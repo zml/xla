@@ -38,7 +38,7 @@ class MetalFp8GemvThunk : public Thunk {
                     Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice out, Shape out_shape, int64_t b,
-                    int64_t k, int64_t n);
+                    int64_t k, int64_t n, bool per_channel);
 
   MetalFp8GemvThunk(const MetalFp8GemvThunk&) = delete;
   MetalFp8GemvThunk& operator=(const MetalFp8GemvThunk&) = delete;
@@ -54,12 +54,16 @@ class MetalFp8GemvThunk : public Thunk {
   const BufferAllocation::Slice x_, w_, scale_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, out_shape_;
   const int64_t b_, k_, n_;
+  const bool per_channel_;
 
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_tiled_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_steel64_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm64_ ABSL_GUARDED_BY(mu_);
 
   stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
 };

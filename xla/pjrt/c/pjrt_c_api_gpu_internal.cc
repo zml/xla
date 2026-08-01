@@ -165,6 +165,9 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
       it != create_options.end()) {
     allocator_config.memory_fraction = std::get<float>(it->second);
   }
+#if TENSORFLOW_USE_METAL
+  allocator_config.preallocate = false;
+#endif  // TENSORFLOW_USE_METAL
   if (auto it = create_options.find("preallocate");
       it != create_options.end()) {
     allocator_config.preallocate = std::get<bool>(it->second);
