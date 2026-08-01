@@ -611,6 +611,25 @@ bool PjRtStreamExecutorClient::IsOnCpu(PjRtMemorySpace* memory_space) {
   return memory_space->kind() == PinnedHostMemorySpace::kKind;
 }
 
+void PjRtStreamExecutorClient::FlushBatchedWorkForHostTransfer(
+    PjRtMemorySpace* memory_space) {
+  // Submit any open (batched) command buffer on the producing device's compute
+  // stream so a definition event the host is about to wait on can resolve.
+  // se::Stream::FlushBatchedWork is a no-op for eager-submit backends, so this
+  // is free on CUDA/ROCm/CPU and only does work on Metal.
+  for (PjRtDevice* device : memory_space->devices()) {
+    auto* se_device = tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+    LocalDeviceState* local_device = se_device->local_device_state();
+    if (local_device == nullptr) continue;
+    se::Stream* stream = local_device->compute_stream();
+    if (stream == nullptr) continue;
+    absl::Status status = stream->FlushBatchedWork();
+    if (!status.ok()) {
+      LOG(ERROR) << "FlushBatchedWork failed during host transfer: " << status;
+    }
+  }
+}
+
 bool PjRtStreamExecutorClient::ShouldPerformZeroCopyLinearize(
     const void* data, const xla::Shape& device_shape, PrimitiveType type,
     absl::Span<int64_t const> dims,
@@ -1628,7 +1647,7 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
        parameter_is_tupled_arguments = parameter_is_tupled_arguments_,
        on_device_executable_parameter_shapes =
            on_device_executable_parameter_shapes_,
-       replica = replica_, partition = partition_,
+              replica = replica_, partition = partition_, fill_future,
        extra_deps = std::move(extra_deps),
        control_deps = std::move(control_deps)]() mutable -> PjRtDeviceEventRef {
     ExecutableRunOptions run_options;
@@ -1864,6 +1883,28 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
       definition_event.AndThen([exe = executable,
                                 reservation = compute_reservation,
                                 assignment = device_assignment]() {});
+    }
+    // When the caller requested a returned future (fill_future), the host will
+    // wait on the completion future chained off this definition event below. On
+    // a batching backend (Metal) an isolated host-awaited execute may have no
+    // following execute and no D2H readback, so the open command buffer carrying
+    // this execute's signal would never commit, the definition-event listener
+    // would never fire, and the host await would deadlock. Commit it now —
+    // WITHOUT waiting and WITHOUT touching the per-token batch cadence — so the
+    // listener fires and the future resolves. We are on the buffer-producing
+    // thread here (this lambda runs inline or on async_dispatch_thread), AFTER
+    // GetEventForComputeStreamSyncPoint encoded the signal and armed the
+    // listener, so the open buffer is guaranteed encoded and this is race-free.
+    // No-op on eager-submit backends (CUDA/ROCm/CPU). Decode steady-state uses
+    // .wait=false (no returned future) so fill_future is false and the per-token
+    // D2H readback flush stays the only commit trigger, preserving batching.
+    if (fill_future && result_buffer_or_status.ok()) {
+      absl::Status flush_status =
+          device_state->compute_stream()->CommitBatchedWorkNoWait();
+      if (!flush_status.ok()) {
+        LOG(ERROR) << "CommitBatchedWorkNoWait failed for host-awaited execute: "
+                   << flush_status;
+      }
     }
     return definition_event;
   };

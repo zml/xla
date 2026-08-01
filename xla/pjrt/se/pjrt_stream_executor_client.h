@@ -383,6 +383,12 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {
 
   bool IsOnCpu(PjRtMemorySpace* memory_space);
 
+  // Commits any open (batched) command buffer on the device's compute stream so
+  // a definition event a host transfer is about to wait on can resolve. No-op
+  // for backends whose streams submit eagerly (se::Stream::FlushBatchedWork
+  // default); only the Metal backend overrides FlushBatchedWork.
+  void FlushBatchedWorkForHostTransfer(PjRtMemorySpace* memory_space) override;
+
   AsyncWorkRunner* async_work_runner() const override {
     return async_work_runner_.get();
   }

@@ -15,7 +15,7 @@ load(
 load("//xla/service:xla_compile.bzl", "xla_aot_compile_cpu", "xla_aot_compile_gpu", "xla_aot_compile_gpu_runtime_autotuning")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_is_configured", "if_gpu_is_configured")
 load("//xla/tests:build_defs.bzl", "xla_test")
-load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "internal_visibility", "tsl_copts")
+load("//xla/tsl:tsl.bzl", "if_google", "if_libtpu", "if_macos", "internal_visibility", "tsl_copts")
 load("//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable")
 load("//xla/tsl/mkl:build_defs.bzl", "if_onednn")
 load(
@@ -1296,6 +1296,8 @@ cc_library(
     hdrs = ["platform_util.h"],
     local_defines = if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
+    ]) + if_macos([
+        "TENSORFLOW_USE_METAL=1",
     ]),
     deps = [
         ":compiler",
@@ -1307,9 +1309,8 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:platform_manager",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_compute_capability",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env",
@@ -1320,7 +1321,10 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
 )
 
 xla_cc_test(
@@ -1342,6 +1346,9 @@ cc_library(
     name = "backend",
     srcs = ["backend.cc"],
     hdrs = ["backend.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         ":compiler",
         ":computation_placer",
@@ -1356,7 +1363,6 @@ cc_library(
         "//xla/stream_executor:stream",
         "//xla/stream_executor:stream_executor_address_allocator",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
         "//xla/stream_executor/integrations:device_mem_allocator",
         "//xla/stream_executor/integrations:tf_allocator_adapter",
@@ -1378,7 +1384,9 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@eigen_archive//:eigen3",
         "@tsl//tsl/platform:platform_port",
-    ],
+    ] + if_macos([], [
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
 )
 
 cc_library(
@@ -1707,6 +1715,8 @@ cc_library(
         ":gpu_plugin_without_collectives",
     ] + if_gpu_is_configured([
         "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
+    ]) + if_macos([
+        "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
     ]),
 )
 
@@ -1726,7 +1736,24 @@ cc_library(
         "//xla/stream_executor/rocm:stream_executor_rocm",
     ]) + if_sycl_is_configured([
         "//xla/service/gpu:intel_gpu_compiler",
+    ]) + if_macos([
+        ":service",
+        "//xla/service/gpu:gpu_compiler",
+        "//xla/service/gpu:gpu_transfer_manager",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:all_runtime",
     ]),
+)
+
+cc_library(
+    name = "gpu_metal_plugin",
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        ":service",
+        "//xla/service/gpu:gpu_transfer_manager",
+        "//xla/service/gpu:metal_gpu_compiler",
+        "//xla/stream_executor/metal:all_runtime",
+    ],
 )
 
 cc_library(
@@ -3589,14 +3616,17 @@ cc_library(
     name = "computation_placer",
     srcs = ["computation_placer.cc"],
     hdrs = ["computation_placer.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         "//xla:array2d",
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla/runtime:device_id",
         "//xla/stream_executor:platform_id",
-        "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:status_macros",
@@ -3611,7 +3641,10 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
-    ],
+    ] + if_macos([], [
+        # macOS/Metal can't build the CUDA platform id; everywhere else keeps it.
+        "//xla/stream_executor/cuda:cuda_platform_id",
+    ]),
     alwayslink = True,  # Contains per-platform computation placer registration
 )
 

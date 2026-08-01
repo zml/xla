@@ -64,6 +64,9 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#if defined(TENSORFLOW_USE_METAL)
+#include "xla/stream_executor/metal/metal_platform_id.h"
+#endif
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
 #include "xla/tsl/util/proto/proto_utils.h"
@@ -396,6 +399,24 @@ absl::StatusOr<std::unique_ptr<se::Kernel>> CreateKernel(
     std::string kernel_name, uint64_t num_args,
     absl::Span<const uint8_t> cubin_data, se::StreamExecutor* stream_exec,
     uint32_t shared_mem_bytes, bool use_pdl) {
+#if defined(TENSORFLOW_USE_METAL)
+  // On the Metal backend the "cubin" bytes are an Apple .metallib;
+  // MetalExecutor::LoadKernel requires a metal_library_in_memory spec and
+  // rejects the CUDA PTX/CUBIN specs. Route metallib bytes accordingly.
+  if (stream_exec->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    se::KernelLoaderSpec metal_spec =
+        se::KernelLoaderSpec::CreateMetalLibraryInMemorySpec(
+            cubin_data, std::move(kernel_name), num_args);
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
+                        stream_exec->LoadKernel(metal_spec));
+    se::KernelMetadata m;
+    m.set_shared_memory_bytes(shared_mem_bytes);
+    kernel->set_metadata(m);
+    kernel->set_use_pdl(use_pdl);
+    return kernel;
+  }
+#endif  // TENSORFLOW_USE_METAL
   se::KernelLoaderSpec loader_spec =
       se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
           cubin_data, std::move(kernel_name), num_args);

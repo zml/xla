@@ -58,6 +58,13 @@ namespace {
 // Utility functions to obtain NVPTX/AMDGPU specific information.
 using absl::StrCat;
 
+bool IsMetalAir(llvm::Triple target_triple) {
+  // Apple AIR triples are versioned, e.g. "air64_v28-apple-macosx26.0.0", so
+  // match the "air64" arch family (no other backend uses it) rather than a
+  // fixed "air64-apple-" prefix.
+  return target_triple.getTriple().rfind("air64", 0) == 0;
+}
+
 // Wrapper structure for carrying llvm intrinsic ids for NVPTX/AMDGPU platforms.
 // On AMDGPU, some of these operations are made as device functions instead of
 // intrinsics. Therefore a variant type is used to wrap the lambda to call
@@ -467,6 +474,22 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
     llvm_intrinsic_or_function = gpu_intrinsic_id.amdgpu_intrinsic_or_function;
   } else if (target_triple.isSPIROrSPIRV()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.spir_intrinsic_or_function;
+  } else if (IsMetalAir(target_triple)) {
+    // Apple AIR has NO callable thread/block-id or barrier intrinsic (thread
+    // position is a kernel ARGUMENT, injected by the MLIR->AIR path's
+    // InjectAirThreadPositions). air64 was previously folded into the NVPTX arm,
+    // which silently emitted llvm.nvvm.* that air-as cannot assemble. The MLIR
+    // emitter path never reaches this function; the only callers are the legacy
+    // LLVM emitters (Sort -- now routed to metal$sort by RewriteSortToMetalThunk
+    // -- plus PadToStatic/SliceToDynamic, which static-shaped Metal programs do
+    // not emit). Reaching here means a legacy op slipped through: fail loudly and
+    // located rather than emit NVVM into AIR.
+    LOG(FATAL) << "Metal (air64) reached the legacy LLVM target-intrinsic path "
+                  "(intrinsic id "
+               << static_cast<int>(intrinsic_id)
+               << "); this op must be routed to a native Metal thunk (e.g. "
+                  "metal$sort) or lowered through the MLIR emitter -- refusing "
+                  "to emit NVVM into AIR.";
   } else {
     LOG(FATAL) << "Invalid triple " << target_triple.str();
   }
@@ -498,6 +521,9 @@ void AnnotateFunctionAsGpuKernel(llvm::Module* module, llvm::Function* func,
   } else if (target_triple.isSPIROrSPIRV()) {
     // Attach information so that it can be recognized as a SPIR kernel.
     func->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
+  } else if (IsMetalAir(target_triple)) {
+    // The Metal backend consumes LLVM IR directly and emits MSL. It does not
+    // need an LLVM GPU calling convention or target-specific kernel metadata.
   } else {
     LOG(FATAL) << "Invalid triple " << target_triple.str();
   }
