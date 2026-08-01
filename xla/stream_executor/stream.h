@@ -219,6 +219,10 @@ class Stream {
   // Otherwise returns an error describing why the blocking failed.
   virtual absl::Status BlockHostUntilDone() = 0;
 
+  virtual absl::Status FlushBatchedWork() { return absl::OkStatus(); }
+
+  virtual absl::Status CommitBatchedWorkNoWait() { return absl::OkStatus(); }
+
   // Entrains onto the stream a callback to the host (from the device).
   // Behaves as DoHostCallbackWithStatus below, but the callback should
   // never fail or its failure is inconsequential.

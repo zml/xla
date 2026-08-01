@@ -31,6 +31,7 @@ bazel_dep(name = "rules_python", version = "2.2.0")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "snappy", version = "1.2.1")
 bazel_dep(name = "llvm", version = "0.8.11")
+bazel_dep(name = "xxd", version = "9.1.0917")
 bazel_dep(name = "zlib", version = "1.3.2")
 # go/keep-sorted end
 
@@ -228,6 +229,30 @@ osx.from_archive(
     type = "pkg",
     urls = ["https://mirror.zml.ai/macos_sdks/26.4/CLTools_macOSNMOS_SDK.pkg"],
 )
+
+osx.frameworks(names = [
+    "CoreFoundation",
+    "Foundation",
+    "Kernel",
+    "OSLog",
+    "Security",
+    "SystemConfiguration",
+    "Metal",
+    "MetalPerformanceShaders",
+    "MetalPerformanceShadersGraph",
+    "IOKit",
+    "CoreGraphics",
+    "CoreServices",
+    "CFNetwork",
+    "DiskArbitration",
+    "CoreVideo",
+    "QuartzCore",
+    "CoreImage",
+    "IOSurface",
+    "DriverKit",
+    "ApplicationServices",
+    "OpenGL",
+])
 
 ### pybind
 pybind11_internal_configure = use_extension(
