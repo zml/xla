@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_TRANSFORMS_VARIADIC_OP_SPLITTER_H_
 #define XLA_BACKENDS_GPU_TRANSFORMS_VARIADIC_OP_SPLITTER_H_
 
+#include <cstdint>
+
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -27,14 +29,26 @@ namespace gpu {
 
 // Splits variadic ops with many operands into pieces such that we don't exceed
 // the parameter space on the GPU. Currently only concatenate ops are split up.
+//
+// `max_parameters` is both the threshold above which an op is split and the
+// maximum fan-in of each resulting piece. The default (128) bounds the generic
+// GPU parameter space; Metal needs a much smaller value because its buffer
+// argument table has only 31 slots (a wide concatenate otherwise fails in
+// air-opt with "buffer argument in31 has invalid location").
 class VariadicOpSplitter : public HloModulePass {
  public:
+  explicit VariadicOpSplitter(int64_t max_parameters = 128)
+      : max_parameters_(max_parameters) {}
+
   absl::string_view name() const override { return "variadic-op-splitter"; }
 
  protected:
   absl::StatusOr<bool> RunImpl(
       HloModule* module,
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+
+ private:
+  int64_t max_parameters_;
 };
 
 }  // namespace gpu

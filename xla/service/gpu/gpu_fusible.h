@@ -79,7 +79,22 @@ std::vector<HloComputation*> GetFusibleComputations(
     const HloModule& module,
     const absl::flat_hash_set<absl::string_view>& execution_threads);
 
-inline constexpr int64_t MaxOperandsAndOutputsPerFusion() { return 96; }
+// Upper bound on the number of operands + outputs of a fusion. Each becomes one
+// kernel parameter, so this bounds kernel argument usage.
+//
+// Metal is special: its buffer argument table has only 31 slots (indices 0-30),
+// and every fusion operand/output is emitted as one `[[buffer(N)]]` argument, so
+// a fusion with >31 buffers fails in air-opt with "buffer argument out has
+// invalid location (<31,...>)". Cap below the table size (one slot of margin for
+// buffer-assignment off-by-ones). CUDA/ROCm keep the historical large param-space
+// bound.
+inline int64_t MaxOperandsAndOutputsPerFusion(
+    const se::DeviceDescription& device_info) {
+  if (device_info.gpu_compute_capability().IsMetal()) {
+    return 30;
+  }
+  return 96;
+}
 
 // Whether the op transposes the physical data layout. Fusing such ops may lead
 // to uncoalesced data access and may thus not be beneficial.
@@ -135,6 +150,7 @@ bool IsInputFusibleScatter(const HloInstruction& instr);
 // true to enable more fusion.
 FusionDecision FusionFitsInParameterLimit(
     const HloInstruction& instr1, const HloInstruction& instr2,
+    const se::DeviceDescription& device_info,
     bool is_consumer_producer_fusion = false);
 
 // Determines whether the combination of `instr1` and `instr2` into a (possibly

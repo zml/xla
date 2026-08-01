@@ -120,6 +120,22 @@ class MultiOutputFusion : public HloModulePass {
 
   absl::StatusOr<bool> DoMultiOutputFusion();
 
+  // Metal-only: horizontally merges independent in-place dynamic-update-slice
+  // (DUS) sibling fusions that write DISTINCT buffers with identical
+  // output/update shapes into one multi-output fusion, saving a kernel dispatch.
+  // The motivating case is the per-decode-layer KV-cache write (the separate K
+  // and V DUS): MOF proper never pairs them because they share only scalar
+  // offset operands (IsProfitableOperand skips effective scalars). The modern
+  // in-place DUS emitter already supports multiple DUS roots; this only supplies
+  // the merge trigger. Operates on computation_; returns whether it changed.
+  bool MergeMetalDusSiblings();
+
+  // Metal-only: merges a RoPE head-split slice fusion (kLoop, root = tuple of pure
+  // slices) into its single downstream consumer fusion, removing a per-layer copy
+  // dispatch. Byte-identical (pure indexing of an already-read buffer). Operates on
+  // computation_; returns whether it changed.
+  bool MergeMetalSliceIntoConsumer();
+
   // Recompute reachability for the current computation.
   void RecomputeReachability();
 

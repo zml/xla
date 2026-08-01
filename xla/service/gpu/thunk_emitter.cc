@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/thunk_emitter.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -23,6 +24,7 @@ limitations under the License.
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -154,6 +156,18 @@ limitations under the License.
 #include "xla/service/gpu/kernel_reuse_cache.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/metal_custom_calls.h"
+#include "xla/backends/gpu/runtime/metal_gemm_thunk.h"
+#include "xla/backends/gpu/runtime/metal_flash_attn_thunk.h"
+#include "xla/backends/gpu/runtime/metal_fp8_gemv_thunk.h"
+#include "xla/backends/gpu/runtime/metal_moe_gemv_thunk.h"
+#include "xla/backends/gpu/runtime/metal_gdn_thunk.h"
+#include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
+#include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
+#include "xla/backends/gpu/runtime/metal_print_thunk.h"
+#include "xla/backends/gpu/runtime/metal_sort_thunk.h"
+#include "xla/backends/gpu/runtime/metal_topk_thunk.h"
+#include "xla/service/gpu/metalblas_gemm.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/service/gpu/triton_call.h"
@@ -414,7 +428,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
   GpuExecutable::ConstantInfo info;
   info.symbol_name.assign(global_name);
   info.allocation_index = slice.index();
-  if (!should_emit_initializer) {
+  // Metal does not materialize LLVM/PTX globals at runtime, so preserve even
+  // small constants that are emitted with initializers in the LLVM module.
+  if (!should_emit_initializer || platform_name() == "METAL") {
     info.content = content;
   }
 
@@ -616,6 +632,929 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunk(
       blas_lt_epilogue, algorithm, config.autotune_workspace_size(), a, b, c, d,
       /*group_sizes=*/std::nullopt, bias, aux, std::nullopt, std::nullopt,
       std::nullopt, std::nullopt, std::nullopt, workspace_buffer);
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
+    const HloCustomCallInstruction* instr) {
+  // metalBLAS works in row-major terms (op(A)=M×K, op(B)=K×N), so derive the
+  // GEMM geometry from the custom call's operands + dot dimension numbers the
+  // same way the legacy Metal matmul matcher (AnalyzeMatmulShapes) does. The
+  // mpp_tensor kernel handles EVERY rank-2 f32/f16/bf16 dot: any dense input
+  // layout, any transpose combo, and both output layouts (dim0-major direct;
+  // {0,1} column-major via the transposed-swap below). So fall_back fires only
+  // for dots it genuinely can't do: a non-f32/f16/bf16 dtype, or a batched /
+  // >1-contracting-dim / non-rank-2 dot (those hit the checks below before any
+  // kernel selection). It fails LOUD rather than producing a wrong result (D9).
+  auto fall_back = [&]() -> absl::StatusOr<ThunkSequence> {
+    return absl::UnimplementedError(
+        "Metal GEMM: unsupported dot (non-f32/f16/bf16, batched, >1 contracting "
+        "dim, or non-rank-2) — not wired to metalBLAS.");
+  };
+
+  TF_ASSIGN_OR_RETURN(const auto gpu_config,
+                      instr->backend_config<xla::gpu::GpuBackendConfig>());
+  const DotDimensionNumbers& dnums =
+      gpu_config.gemm_backend_config().dot_dimension_numbers();
+
+  const HloInstruction* lhs = instr->operand(0);
+  const HloInstruction* rhs = instr->operand(1);
+  const Shape& lhs_shape = lhs->shape();
+  const Shape& rhs_shape = rhs->shape();
+  const Shape& out_shape = instr->shape().IsTuple()
+                               ? instr->shape().tuple_shapes(0)
+                               : instr->shape();
+
+  const PrimitiveType dtype = out_shape.element_type();
+  if (dtype != F32 && dtype != F16 && dtype != BF16) return fall_back();
+  if (lhs_shape.element_type() != dtype || rhs_shape.element_type() != dtype) {
+    return fall_back();
+  }
+  // Non-batched, rank-2, one contracting dim each, row-major operands+output.
+  if (dnums.lhs_batch_dimensions_size() != 0 ||
+      dnums.rhs_batch_dimensions_size() != 0 ||
+      dnums.lhs_contracting_dimensions_size() != 1 ||
+      dnums.rhs_contracting_dimensions_size() != 1 ||
+      lhs_shape.dimensions().size() != 2 ||
+      rhs_shape.dimensions().size() != 2 ||
+      out_shape.dimensions().size() != 2) {
+    return fall_back();
+  }
+  // Every operand must be a dense, untiled rank-2 buffer (both {1,0} and {0,1}
+  // qualify). metalBLAS reads each as a physically contiguous 2-D buffer and
+  // derives its TRANS flag / leading dim from the physical layout, so any dense
+  // layout is fine (the {0,1} output is handled by the transposed-swap below). A
+  // tiled/exotic layout goes to fall_back — mpp_tensor doesn't model it.
+  auto dense_rank2 = [](const Shape& s) {
+    return s.has_layout() && s.layout().tiles().empty() &&
+           s.layout().minor_to_major().size() == 2;
+  };
+  if (!dense_rank2(lhs_shape) || !dense_rank2(rhs_shape) ||
+      !dense_rank2(out_shape)) {
+    return fall_back();
+  }
+
+  const int lc = dnums.lhs_contracting_dimensions(0);
+  const int rc = dnums.rhs_contracting_dimensions(0);
+  if ((lc != 0 && lc != 1) || (rc != 0 && rc != 1)) return fall_back();
+  const int64_t M = lhs_shape.dimensions(lc == 0 ? 1 : 0);
+  const int64_t K = lhs_shape.dimensions(lc);
+  const int64_t N = rhs_shape.dimensions(rc == 0 ? 1 : 0);
+  if (rhs_shape.dimensions(rc) != K || out_shape.dimensions(0) != M ||
+      out_shape.dimensions(1) != N) {
+    return fall_back();
+  }
+  // op(A) must be M×K, op(B) must be K×N. metalBLAS's TRANS flag says whether
+  // the contiguous buffer is [M,K]/[K,N] (op = itself, lda/ldb = the row width)
+  // or its transpose. Derive it from the PHYSICAL layout (which logical dim is
+  // minor/contiguous), not the logical dim order: op(A) wants K contiguous
+  // (trans_a iff K is NOT the minor dim); op(B) wants N contiguous (trans_b iff
+  // the contracting dim K IS the minor dim). For the usual row-major {1,0}
+  // operands this reduces to (lc==0)/(rc==1); it also accepts the {0,1} bitcast
+  // XLA hands the lm_head lhs -- physically the [M,K] normed hidden -- which the
+  // old dim0-major-only check rejected (LFM2 and any tied-embedding lm_head).
+  const bool trans_a = (lhs_shape.layout().minor_to_major(0) != lc);
+  const bool trans_b = (rhs_shape.layout().minor_to_major(0) == rc);
+
+  // PREFILL token-axis clamp: if this computation contains a prefill (q_len>1)
+  // zml$flash_attn carrying a num_tokens operand, and this GEMM's M equals that
+  // prefill seqlen (= q_len), then it is one of the per-layer token-axis GEMMs
+  // ([seqlen, *] = QKV / O / gate+up / down). Pass num_tokens so the thunk clamps
+  // the M-row grid to the real prompt length at execute. The lm_head GEMM lives in
+  // a separate Exe with no flash_attn (and is already last-token-sliced), so it is
+  // never matched; decode GEMMs (flash_attn q_len==1) are not matched either.
+  // Detected BEFORE compile so the tile picker can optimize for the clamped grid.
+  BufferAllocation::Slice num_tokens;
+  Shape num_tokens_shape;
+  bool prefill_token_axis = false;
+  for (const HloInstruction* i : instr->parent()->instructions()) {
+    if (i->opcode() != HloOpcode::kCustomCall) continue;
+    const auto* fa = Cast<HloCustomCallInstruction>(i);
+    if (fa->custom_call_target() != "zml$flash_attn") continue;
+    const Shape& fq = fa->operand(0)->shape();
+    if (fq.dimensions().size() != 3 || fq.dimensions(1) <= 1) continue;  // decode
+    if (fq.dimensions(1) != M) continue;  // M is not this layer's token axis
+    const bool fc = fa->operand(1)->shape().dimensions().size() == 4;
+    const int fbase = fc ? 5 : 4;  // q,k,v,tok[,layer]
+    if (fa->operand_count() != fbase + 1) continue;  // no num_tokens operand
+    TF_ASSIGN_OR_RETURN(num_tokens,
+                        GetAllocationSliceForHlo(fa->operand(fbase), {}));
+    num_tokens_shape = fa->operand(fbase)->shape();
+    prefill_token_axis = true;
+    break;
+  }
+  // Same clamp for PAGED prefill modules (llmd's chunked prefill): a prefill
+  // zml$paged_attn (total_q_tokens > num_seqs) whose q token axis equals M.
+  // The real token count is query_start_len[num_seqs] (operand 5, the
+  // [num_seqs+1] i32 cumulative query lengths — tokens are packed from row 0,
+  // so rows >= qsl[num_seqs] are padding). Point the num_tokens slice at that
+  // LAST element; the thunk's host-side u32 read then works unchanged. Without
+  // this, llmd prefill GEMMs ran the full padded M=seqlen with the default
+  // fat tile (measured: down-proj 1088us/layer at ~50GB/s vs the CLI's clamped
+  // ~126us — a ~4.5x whole-prefill gap, 140ms vs 32ms warm).
+  if (!prefill_token_axis) {
+    for (const HloInstruction* i : instr->parent()->instructions()) {
+      if (i->opcode() != HloOpcode::kCustomCall) continue;
+      const auto* pa = Cast<HloCustomCallInstruction>(i);
+      if (pa->custom_call_target() != "zml$paged_attn") continue;
+      if (pa->operand_count() != 6) continue;
+      const Shape& pq = pa->operand(0)->shape();  // [total_q, heads, hd]
+      const Shape& bt = pa->operand(3)->shape();  // [num_seqs, max_blocks]
+      if (pq.dimensions().size() != 3 || bt.dimensions().size() != 2) continue;
+      const int64_t total_q = pq.dimensions(0);
+      const int64_t num_seqs = bt.dimensions(0);
+      if (total_q <= num_seqs) continue;  // decode module
+      if (total_q != M) continue;  // M is not this layer's token axis
+      const Shape& qsl_shape = pa->operand(5)->shape();
+      if (qsl_shape.dimensions().size() != 1 ||
+          qsl_shape.dimensions(0) != num_seqs + 1 ||
+          ShapeUtil::ByteSizeOfPrimitiveType(qsl_shape.element_type()) != 4) {
+        continue;
+      }
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice qsl,
+                          GetAllocationSliceForHlo(pa->operand(5), {}));
+      num_tokens = BufferAllocation::Slice(qsl.allocation(),
+                                           qsl.offset() + num_seqs * 4, 4);
+      num_tokens_shape = ShapeUtil::MakeShape(S32, {});
+      prefill_token_axis = true;
+      break;
+    }
+  }
+
+  const xla::ShapeIndex out_index =
+      instr->shape().IsTuple() ? xla::ShapeIndex{0} : xla::ShapeIndex{};
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice a,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice b,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice c,
+                      GetAllocationSliceForHlo(instr, out_index));
+
+  // COLUMN-MAJOR ({0,1}) OUTPUT: the only rank-2 shape mpp_tensor can't take (it
+  // writes op(C)=M×N row-major, ldc=N). But [M,N]{0,1} is byte-identical to
+  // [N,M]{1,0}, so compute the TRANSPOSE Cᵀ=[N,M] with the SAME kernel and hand
+  // the bytes back as the {0,1} output — no new kernel, native bf16. Cᵀ =
+  // op(B)ᵀ·op(A)ᵀ: swap the operands (new lhs = B, new rhs = A → M'=N, N'=M) and
+  // re-derive the trans flags with lhs<->rhs / lc<->rc swapped (same physical-
+  // layout rule as above). metalBLAS writes [N,M] row-major into c; XLA reads c
+  // as {0,1} [M,N]. {1,0} and {0,1} are the only rank-2 dense output layouts, so
+  // this + the direct path cover every dot that reaches here.
+  //
+  // NOTE: in practice XLA NORMALIZES every dot output to {1,0} (it folds a
+  // transpose-of-dot into an operand-swap at the HLO level itself), so this
+  // branch is not expected to fire on real graphs — verified: transpose(A·B) and
+  // a (A·B)·E chain both emit {1,0}-output __metal$gemms. It is kept purely for
+  // correctness/defense (a future XLA layout-pass change, or an op that pins a
+  // {0,1} operand layout): the alternative was fall_back = a hard crash. Cheap
+  // and provably correct, so total coverage beats a latent Unimplemented.
+  int64_t gm = M, gn = N;
+  bool gtrans_a = trans_a, gtrans_b = trans_b;
+  BufferAllocation::Slice ga = a, gb = b;
+  Shape g_lhs_shape = lhs_shape, g_rhs_shape = rhs_shape;
+  if (!LayoutUtil::IsMonotonicWithDim0Major(out_shape.layout())) {
+    gm = N;
+    gn = M;
+    ga = b;
+    gb = a;
+    g_lhs_shape = rhs_shape;
+    g_rhs_shape = lhs_shape;
+    gtrans_a = (rhs_shape.layout().minor_to_major(0) != rc);  // op(A')=[N,K], K=rc
+    gtrans_b = (lhs_shape.layout().minor_to_major(0) == lc);  // op(B')=[K,M], K=lc
+    // The swapped shape is not a per-layer token-axis GEMM (those are dim0-major);
+    // drop any clamp match so the row-clamp arg isn't wrongly bound.
+    prefill_token_axis = false;
+    num_tokens = BufferAllocation::Slice();
+    num_tokens_shape = Shape();
+  }
+
+  // Kernel-family ladder, most specialized first; each rung returns
+  // Unimplemented outside its regime and the next one takes over.
+  //   1. MLX steel split-K — thin-M batched-decode x@Wᵀ (2<=M<=16, f16/bf16,
+  //      512<=N<=8192, deep K): grid-level K-split at ~bandwidth peak
+  //      (16.7-103us vs gemv_bt's 25-147 on the llmd shapes).
+  //   2. metalBLAS GEMV (gemv_t / gemv_bt) — M==1 decode/lm_head + the thin-M
+  //      shapes split-K declines.
+  //   3. mpp_tensor GEMM — everything else, and never declines for f32/f16/bf16
+  //      (any transpose combo), so no rank-2 float dot falls through. gb is the
+  //      rhs (matrix B); its slice offset feeds the GEMV VEC-load alignment clamp.
+  absl::StatusOr<MetalGemmLaunch> launch =
+      prefill_token_axis
+          ? absl::StatusOr<MetalGemmLaunch>(
+                absl::UnimplementedError("prefill: tensor path"))
+          : CompileMetalblasSplitk(gm, gn, K, gtrans_a, gtrans_b, dtype);
+  if (absl::IsUnimplemented(launch.status())) {
+    launch =
+        CompileMetalblasGemv(gm, gn, K, gtrans_a, gtrans_b, dtype, gb.offset());
+  }
+  if (absl::IsUnimplemented(launch.status())) {
+    launch = CompileMetalblasGemm(gm, gn, K, gtrans_a, gtrans_b, dtype,
+                                  prefill_token_axis);
+  }
+  if (absl::IsUnimplemented(launch.status())) {
+    return fall_back();  // unreachable for f32/f16/bf16 (mpp_tensor never declines).
+  }
+  TF_RETURN_IF_ERROR(launch.status());
+
+  auto thunk = std::make_unique<MetalGemmThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      std::move(*launch), ga, g_lhs_shape, gb, g_rhs_shape, c, out_shape,
+      num_tokens, num_tokens_shape);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPrintThunk(
+    const HloCustomCallInstruction* instr) {
+  const HloInstruction* operand = instr->operand(0);
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
+                      GetAllocationSliceForHlo(operand, {}));
+  // Label: the op_name metadata carries zml's print(name=...); fall back to the
+  // instruction name. The shape (printed too) disambiguates in practice.
+  std::string label = instr->metadata().op_name().empty()
+                          ? std::string(instr->name())
+                          : instr->metadata().op_name();
+  auto thunk = std::make_unique<MetalPrintThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      std::move(label), slice, operand->shape());
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFlashAttnThunk(
+    const HloCustomCallInstruction* instr) {
+  const int operand_count = instr->operand_count();
+  if (operand_count < 4 || operand_count > 6) {
+    return absl::InvalidArgumentError(
+        "zml$flash_attn expects 4 (q,k,v,tok), 5 (+layer or +num_tokens), or 6 "
+        "(+layer +num_tokens) operands.");
+  }
+  // WHOLE-cache feed (RelaxFlashAttnKVLayout folded away the per-token layer
+  // dynamic-slice): k/v are the rank-4 [n_layer, seqlen, n_kv, hd] cache and
+  // operand 4 is the layer index. Otherwise k/v are a single sliced layer
+  // [n_kv, seqlen, hd] (rank 3). PREFILL also carries num_tokens (the real prompt
+  // length, a u32 scalar) as the TRAILING operand so the thunk can clamp the
+  // query-row grid. Detect both from rank + count (not count alone).
+  const bool kv_full_cache =
+      (instr->operand(1)->shape().dimensions().size() == 4);
+  const int base_operands = kv_full_cache ? 5 : 4;  // q,k,v,tok[,layer]
+  const bool has_num_tokens = (operand_count == base_operands + 1);
+  const Shape& q_shape = instr->operand(0)->shape();
+  const Shape& k_shape = instr->operand(1)->shape();
+  const Shape& v_shape = instr->operand(2)->shape();
+  const Shape& tok_shape = instr->operand(3)->shape();
+  const Shape& out_shape = instr->shape();
+
+  const int64_t k_rank = k_shape.dimensions().size();
+  if (q_shape.dimensions().size() != 3 || k_rank != (kv_full_cache ? 4 : 3) ||
+      static_cast<int64_t>(v_shape.dimensions().size()) != k_rank) {
+    return absl::UnimplementedError("zml$flash_attn: unexpected q/k/v rank.");
+  }
+  const int64_t n_q = q_shape.dimensions(0);
+  const int64_t q_len = q_shape.dimensions(1);
+  const int64_t hd = q_shape.dimensions(2);
+  const int64_t n_kv =
+      kv_full_cache ? k_shape.dimensions(2) : k_shape.dimensions(0);
+  const int64_t seqlen = k_shape.dimensions(1);
+  // q_len == 1 is decode (fa_vec); q_len > 1 is prefill (the simdgroup-matrix
+  // kernel_flash_attn_ext). Both route to MetalFlashAttnThunk, which branches on
+  // q_len internally. q_len must be >= 1.
+  if (q_len < 1) {
+    return absl::UnimplementedError("zml$flash_attn: query length must be >= 1.");
+  }
+  if (hd % 32 != 0 || n_kv == 0 || n_q % n_kv != 0 ||
+      k_shape.dimensions(k_rank - 1) != hd ||
+      v_shape.dimensions(k_rank - 1) != hd ||
+      v_shape.dimensions(1) != seqlen) {
+    return absl::UnimplementedError(
+        "zml$flash_attn unsupported shapes (need hd%32==0, n_q%n_kv==0, "
+        "matching k/v).");
+  }
+  // Every kernel path is bf16-typed: fa_vec / prefill are bf16-gated in the
+  // thunk, and the serial fallback kernel reads/writes `bfloat` directly — a
+  // non-bf16 operand would be silently bit-reinterpreted, not converted.
+  // Loud, never silently wrong.
+  // TODO: parameterize the kernels' element type to support f16 models.
+  if (q_shape.element_type() != BF16 || k_shape.element_type() != BF16 ||
+      v_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
+    return absl::UnimplementedError(
+        "zml$flash_attn: q/k/v/out must be bf16 (the Metal flash-attention "
+        "kernels are bf16-typed).");
+  }
+  // Prefill (q_len>1) has only the simdgroup-matrix kernel (the serial
+  // fallback is single-query); reject unsupported prefill geometry at compile
+  // time instead of at first execute. Decode (q_len==1) keeps the serial
+  // fallback for any hd%32==0, so it is not gated here.
+  // TODO: port head_dim!=128 (Gemma-shaped hd=256) and unaligned-seqlen
+  // variants of the prefill kernel; until then such models must use the paged
+  // path, whose tiled kernel covers hd 64/96/128/256/512.
+  if (q_len > 1 && ((hd != 128 && hd != 64) || seqlen % 64 != 0)) {
+    return absl::UnimplementedError(
+        "zml$flash_attn: prefill (q_len>1) needs head_dim 64 or 128 and "
+        "seqlen%64==0.");
+  }
+  const int64_t n_groups = n_q / n_kv;
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice q,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice k,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice v,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice tok,
+                      GetAllocationSliceForHlo(instr->operand(3), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out,
+                      GetAllocationSliceForHlo(instr, {}));
+
+  // The layer-index operand (only present in the whole-cache feed).
+  BufferAllocation::Slice layer;
+  Shape layer_shape;
+  if (kv_full_cache) {
+    TF_ASSIGN_OR_RETURN(layer, GetAllocationSliceForHlo(instr->operand(4), {}));
+    layer_shape = instr->operand(4)->shape();
+  }
+
+  // The num_tokens operand (prefill only): the real prompt length, read host-side
+  // at execute to clamp the query-row grid. Trailing operand after q,k,v,tok[,layer].
+  BufferAllocation::Slice num_tokens;
+  Shape num_tokens_shape;
+  if (has_num_tokens) {
+    TF_ASSIGN_OR_RETURN(
+        num_tokens, GetAllocationSliceForHlo(instr->operand(base_operands), {}));
+    num_tokens_shape = instr->operand(base_operands)->shape();
+  }
+
+  // The thunk reads `tok` host-side at encode ONLY to pick a decode perf variant
+  // (the nsg ramp / head-contiguous gate); the result is numerically identical
+  // regardless, because fa_vec's KV-loop ceiling is the static seqlen and causality
+  // comes from the on-device tok[0] (see flash_attn_vec.metal). That host read is
+  // safe ONLY when `tok` is a host-staged entry parameter — RelaxFlashAttnKVLayout
+  // substitutes the raw token-position param for ZML's device convert(u32->s32) on
+  // the whole-cache path. If `tok` is still a GPU-produced value (the layout-only
+  // fallback, or no raw param was found), dereferencing it host-side would race the
+  // producer on Metal (no totally-ordered host/GPU path — the GDN-prefill race
+  // class), so signal the thunk to skip the read and use a static default (kv =
+  // seqlen) instead. A parameter (possibly behind pure bitcast/reshape relabels) is
+  // host-valid at encode; a convert/compute is not.
+  const HloInstruction* tok_src = instr->operand(3);
+  while (tok_src->opcode() == HloOpcode::kBitcast ||
+         tok_src->opcode() == HloOpcode::kReshape) {
+    tok_src = tok_src->operand(0);
+  }
+  const bool tok_host_coherent = tok_src->opcode() == HloOpcode::kParameter;
+
+  // K/V fed position-major ([..,seqlen,n_kv,hd]) instead of head-major
+  // ([n_kv,seqlen,hd], operand layout {2,1,0}) when RelaxFlashAttnKVLayout
+  // relaxed the layout so ZML's transpose folds to a free bitcast. The whole-
+  // cache feed is always position-major within a layer; a sliced operand is
+  // position-major iff its layout is {2,0,1}. The thunk derives K/V strides.
+  bool kv_position_major = kv_full_cache;
+  if (!kv_full_cache) {
+    const Layout& k_layout = k_shape.layout();
+    kv_position_major = k_layout.minor_to_major().size() == 3 &&
+                        k_layout.minor_to_major(0) == 2 &&
+                        k_layout.minor_to_major(1) == 0 &&
+                        k_layout.minor_to_major(2) == 1;
+  }
+
+  auto thunk = std::make_unique<MetalFlashAttnThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      q, q_shape, k, k_shape, v, v_shape, tok, tok_shape, out, out_shape, n_kv,
+      n_groups, seqlen, hd, kv_position_major, kv_full_cache, layer,
+      layer_shape, num_tokens, num_tokens_shape, tok_host_coherent);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
+    const HloCustomCallInstruction* instr) {
+  if (instr->operand_count() != 6) {
+    return absl::InvalidArgumentError(
+        "zml$paged_attn expects 6 operands "
+        "(q, k_cache, v_cache, block_table, seq_lens, query_start_len).");
+  }
+  const Shape& q_shape = instr->operand(0)->shape();
+  const Shape& k_shape = instr->operand(1)->shape();
+  const Shape& v_shape = instr->operand(2)->shape();
+  const Shape& bt_shape = instr->operand(3)->shape();
+  const Shape& sl_shape = instr->operand(4)->shape();
+  const Shape& qsl_shape = instr->operand(5)->shape();
+  const Shape& out_shape = instr->shape();
+
+  // q/out: [total_q_tokens, num_heads, head_dim]; k/v cache:
+  // [num_blocks, block_size, num_kv_heads, head_dim]; block_table:
+  // [num_seqs, max_num_blocks_per_seq]; seq_lens: [num_seqs];
+  // query_start_len: [num_seqs+1].
+  if (q_shape.dimensions().size() != 3 || k_shape.dimensions().size() != 4 ||
+      v_shape.dimensions().size() != 4 || bt_shape.dimensions().size() != 2) {
+    return absl::UnimplementedError("zml$paged_attn: unexpected operand ranks.");
+  }
+  const int64_t total_q_tokens = q_shape.dimensions(0);
+  const int64_t num_heads = q_shape.dimensions(1);
+  const int64_t head_dim = q_shape.dimensions(2);
+  const int64_t block_size = k_shape.dimensions(1);
+  const int64_t num_kv_heads = k_shape.dimensions(2);
+  const int64_t num_seqs = bt_shape.dimensions(0);
+  const int64_t max_num_blocks_per_seq = bt_shape.dimensions(1);
+
+  if (num_kv_heads == 0 || num_heads % num_kv_heads != 0 ||
+      k_shape.dimensions(3) != head_dim || v_shape.dimensions(1) != block_size ||
+      v_shape.dimensions(2) != num_kv_heads || v_shape.dimensions(3) != head_dim) {
+    return absl::UnimplementedError(
+        "zml$paged_attn: inconsistent q/k/v cache shapes.");
+  }
+  if (head_dim != 64 && head_dim != 96 && head_dim != 128 && head_dim != 256 &&
+      head_dim != 512) {
+    return absl::UnimplementedError(
+        "zml$paged_attn: head_dim must be 64/96/128/256/512.");
+  }
+  if (block_size != 8 && block_size != 16 && block_size != 32) {
+    return absl::UnimplementedError(
+        "zml$paged_attn: block_size must be 8/16/32.");
+  }
+  if (q_shape.element_type() != BF16 && q_shape.element_type() != F16) {
+    return absl::UnimplementedError("zml$paged_attn: q/k/v must be bf16 or f16.");
+  }
+
+  // Attention semantics (scale / softcapping / sliding_window / is_causal) are
+  // carried in the custom call's typed-FFI backend-config dictionary, set by
+  // ZML's metal_attention.zig from AttentionOptions. Absent keys keep the
+  // defaults (scale=1/sqrt(head_dim), no softcap, no sliding window, causal),
+  // so graphs predating the attributes are unchanged. The tiled kernel applies
+  // all of them (is_causal via its IS_CAUSAL function constant); the vector
+  // decode kernel applies scale only and is causal-only, so the thunk routes
+  // softcapped/windowed/bidirectional cases to the tiled kernel.
+  float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  float softcapping = 0.0f;
+  int sliding_window = -1;
+  bool is_causal = true;
+  if (const std::string& cfg = instr->raw_backend_config_string();
+      !cfg.empty()) {
+    mlir::Attribute parsed =
+        mlir::parseAttribute(cfg, ir_emitter_context_->mlir_context());
+    auto dict = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(parsed);
+    if (dict == nullptr) {
+      return absl::InternalError(
+          "zml$paged_attn: backend config is not a dictionary attribute.");
+    }
+    TF_ASSIGN_OR_RETURN(ffi::AttributesMap attrs,
+                        xla::ffi::BuildAttributesMap(dict));
+    auto scalar = [&attrs](absl::string_view name) -> const ffi::Scalar* {
+      auto it = attrs.find(name);
+      if (it == attrs.end()) return nullptr;
+      return std::get_if<ffi::Scalar>(&it->second.AsVariant());
+    };
+    if (const ffi::Scalar* s = scalar("scale")) {
+      if (const float* v = std::get_if<float>(&s->AsVariant())) scale = *v;
+    }
+    if (const ffi::Scalar* s = scalar("softcapping")) {
+      if (const float* v = std::get_if<float>(&s->AsVariant())) {
+        softcapping = *v;
+      }
+    }
+    if (const ffi::Scalar* s = scalar("sliding_window")) {
+      if (const int32_t* v = std::get_if<int32_t>(&s->AsVariant())) {
+        sliding_window = *v;
+      }
+    }
+    // is_causal selects causal (default) vs bidirectional attention. The tiled
+    // kernel honors it through its IS_CAUSAL function constant; is_causal=false
+    // (e.g. the diffusion-draft dflash model) also forces the tiled path off the
+    // causal-only vector decode kernel (see MetalPagedAttnThunk).
+    if (const ffi::Scalar* s = scalar("is_causal")) {
+      if (const bool* v = std::get_if<bool>(&s->AsVariant())) is_causal = *v;
+    }
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice q,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice k_cache,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice v_cache,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice block_table,
+                      GetAllocationSliceForHlo(instr->operand(3), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice seq_lens,
+                      GetAllocationSliceForHlo(instr->operand(4), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice query_start_len,
+                      GetAllocationSliceForHlo(instr->operand(5), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out,
+                      GetAllocationSliceForHlo(instr, {}));
+
+  auto thunk = std::make_unique<MetalPagedAttnThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      q, q_shape, k_cache, k_shape, v_cache, v_shape, block_table, bt_shape,
+      seq_lens, sl_shape, query_start_len, qsl_shape, out, out_shape, num_heads,
+      num_kv_heads, head_dim, block_size, num_seqs, max_num_blocks_per_seq,
+      total_q_tokens, scale, softcapping, sliding_window, is_causal,
+      q_shape.element_type());
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
+    const HloCustomCallInstruction* instr) {
+  if (instr->operand_count() != 8) {
+    return absl::InvalidArgumentError(
+        "zml$gdn expects 8 operands "
+        "(q, k, v, g, beta, h0, cu_seqlens, slot_mapping).");
+  }
+  const Shape& q_shape = instr->operand(0)->shape();
+  const Shape& k_shape = instr->operand(1)->shape();
+  const Shape& v_shape = instr->operand(2)->shape();
+  const Shape& g_shape = instr->operand(3)->shape();
+  const Shape& beta_shape = instr->operand(4)->shape();
+  const Shape& h0_shape = instr->operand(5)->shape();
+  const Shape& cu_seqlens_shape = instr->operand(6)->shape();
+  const Shape& slot_mapping_shape = instr->operand(7)->shape();
+
+  // Output is a (y, ht) tuple; ht aliases h0 (set by ZML's custom-call op).
+  if (!instr->shape().IsTuple() || instr->shape().tuple_shapes().size() != 2) {
+    return absl::UnimplementedError(
+        "zml$gdn: expected a (y, ht) tuple result.");
+  }
+  const Shape& y_shape = instr->shape().tuple_shapes(0);
+  const Shape& ht_shape = instr->shape().tuple_shapes(1);
+
+  // q/k: [total_tokens, Hk, Dk]; v: [total_tokens, Hv, Dv]; g/beta:
+  // [total_tokens, Hv]; h0/ht: [num_seqs, Hv, Dk, Dv]; cu_seqlens:[num_seqs+1];
+  // slot_mapping:[num_seqs].
+  if (q_shape.dimensions().size() != 3 || k_shape.dimensions().size() != 3 ||
+      v_shape.dimensions().size() != 3 || g_shape.dimensions().size() != 2 ||
+      beta_shape.dimensions().size() != 2 ||
+      h0_shape.dimensions().size() != 4 ||
+      cu_seqlens_shape.dimensions().size() != 1 ||
+      slot_mapping_shape.dimensions().size() != 1) {
+    return absl::UnimplementedError("zml$gdn: unexpected operand ranks.");
+  }
+
+  const int64_t total_tokens = q_shape.dimensions(0);
+  const int64_t hk = q_shape.dimensions(1);
+  const int64_t dk = q_shape.dimensions(2);
+  const int64_t hv = v_shape.dimensions(1);
+  const int64_t dv = v_shape.dimensions(2);
+  const int64_t num_seqs = h0_shape.dimensions(0);
+
+  if (hk == 0 || hv == 0 || dk == 0 || dv == 0 || num_seqs == 0) {
+    return absl::UnimplementedError("zml$gdn: invalid dimension (must be > 0).");
+  }
+  if (hv % hk != 0) {
+    return absl::UnimplementedError(
+        "zml$gdn: Hv must be a multiple of Hk (GQA-style grouping).");
+  }
+  if (k_shape.dimensions(0) != total_tokens || k_shape.dimensions(1) != hk ||
+      k_shape.dimensions(2) != dk || v_shape.dimensions(0) != total_tokens ||
+      g_shape.dimensions(0) != total_tokens || g_shape.dimensions(1) != hv ||
+      beta_shape.dimensions(0) != total_tokens ||
+      beta_shape.dimensions(1) != hv || h0_shape.dimensions(1) != hv ||
+      h0_shape.dimensions(2) != dk || h0_shape.dimensions(3) != dv ||
+      cu_seqlens_shape.dimensions(0) != num_seqs + 1 ||
+      slot_mapping_shape.dimensions(0) != num_seqs) {
+    return absl::UnimplementedError(
+        "zml$gdn: inconsistent q/k/v/g/beta/h0/cu_seqlens/slot_mapping shapes.");
+  }
+  const PrimitiveType et = q_shape.element_type();
+  if (et != F32 && et != F16 && et != BF16) {
+    return absl::UnimplementedError("zml$gdn: operands must be f32/f16/bf16.");
+  }
+  if (k_shape.element_type() != et || v_shape.element_type() != et ||
+      g_shape.element_type() != et || beta_shape.element_type() != et ||
+      h0_shape.element_type() != et || y_shape.element_type() != et ||
+      ht_shape.element_type() != et) {
+    return absl::UnimplementedError(
+        "zml$gdn: q/k/v/g/beta/h0/y/ht must share one element type.");
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice q,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice k,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice v,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice g,
+                      GetAllocationSliceForHlo(instr->operand(3), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice beta,
+                      GetAllocationSliceForHlo(instr->operand(4), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice h0,
+                      GetAllocationSliceForHlo(instr->operand(5), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice cu_seqlens,
+                      GetAllocationSliceForHlo(instr->operand(6), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slot_mapping,
+                      GetAllocationSliceForHlo(instr->operand(7), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice y,
+                      GetAllocationSliceForHlo(instr, {0}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice ht,
+                      GetAllocationSliceForHlo(instr, {1}));
+
+  auto thunk = std::make_unique<MetalGdnThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      q, q_shape, k, k_shape, v, v_shape, g, g_shape, beta, beta_shape, h0,
+      h0_shape, cu_seqlens, cu_seqlens_shape, slot_mapping, slot_mapping_shape,
+      y, y_shape, ht, ht_shape, num_seqs, hk, hv, dk, dv, et);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
+    const HloCustomCallInstruction* instr) {
+  if (instr->operand_count() != 3) {
+    return absl::InvalidArgumentError(
+        "metal block-scaled fp8 GEMV expects 3 operands (x, w, scale).");
+  }
+  const Shape& x_shape = instr->operand(0)->shape();
+  const Shape& w_shape = instr->operand(1)->shape();
+  const Shape& scale_shape = instr->operand(2)->shape();
+
+  // Single output [B, N] bf16 (ZML emits a non-tuple custom call for one out,
+  // but tolerate a 1-tuple too).
+  const bool is_tuple = instr->shape().IsTuple();
+  const Shape& out_shape =
+      is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+
+  if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
+      scale_shape.dimensions().size() != 2 ||
+      out_shape.dimensions().size() != 2) {
+    return absl::UnimplementedError("metal block-scaled fp8 GEMV: unexpected operand ranks.");
+  }
+
+  const int64_t b = x_shape.dimensions(0);
+  const int64_t k = x_shape.dimensions(1);
+  const int64_t n = w_shape.dimensions(0);
+
+  if (b == 0 || k == 0 || n == 0) {
+    return absl::UnimplementedError(
+        "metal block-scaled fp8 GEMV: invalid dimension (must be > 0).");
+  }
+  if (w_shape.dimensions(1) != k || out_shape.dimensions(0) != b ||
+      out_shape.dimensions(1) != n) {
+    return absl::UnimplementedError(
+        "metal block-scaled fp8 GEMV: inconsistent x/w/out shapes.");
+  }
+  if (k % 128 != 0 || n % 128 != 0) {
+    return absl::UnimplementedError(
+        "metal block-scaled fp8 GEMV: N and K must be multiples of the 128 block size.");
+  }
+  if (w_shape.element_type() != F8E4M3FN) {
+    return absl::UnimplementedError("metal block-scaled fp8 GEMV: w must be f8e4m3fn.");
+  }
+  if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
+    return absl::UnimplementedError("metal block-scaled fp8 GEMV: x and out must be bf16.");
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scale,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice out,
+      GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
+
+  auto thunk = std::make_unique<MetalFp8GemvThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, b, k, n);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
+    const HloCustomCallInstruction* instr) {
+  // Two flavors share one thunk: the fp8 block-scaled call carries a scale
+  // operand (x, w_f8, scale, expert_id); the bf16 call drops it (x, w, expert_id).
+  const bool is_fp8 =
+      instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
+  const int64_t expected_operands = is_fp8 ? 4 : 3;
+  if (instr->operand_count() != expected_operands) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metal MoE GEMV expects ", expected_operands, " operands."));
+  }
+  const Shape& x_shape = instr->operand(0)->shape();
+  const Shape& w_shape = instr->operand(1)->shape();
+  const int expert_id_idx = is_fp8 ? 3 : 2;
+  const Shape& expert_id_shape = instr->operand(expert_id_idx)->shape();
+
+  // Single output [R, N] bf16 (tolerate a 1-tuple too).
+  const bool is_tuple = instr->shape().IsTuple();
+  const Shape& out_shape =
+      is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+
+  if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 3 ||
+      expert_id_shape.dimensions().size() != 1 ||
+      out_shape.dimensions().size() != 2) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: unexpected operand ranks.");
+  }
+
+  const int64_t r = x_shape.dimensions(0);
+  const int64_t k = x_shape.dimensions(1);
+  const int64_t e = w_shape.dimensions(0);
+  const int64_t n = w_shape.dimensions(1);
+
+  if (r == 0 || k == 0 || n == 0 || e == 0) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: invalid dimension (must be > 0).");
+  }
+  if (w_shape.dimensions(2) != k || out_shape.dimensions(0) != r ||
+      out_shape.dimensions(1) != n || expert_id_shape.dimensions(0) != r) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
+  }
+  // fp8 needs the 128x128 block-scale alignment; bf16 only needs the bfloat4
+  // vectorized loads (K,N multiples of 4 — Gemma4-A4B's K=704 qualifies). The
+  // decode GEMV bounds-checks N and the partial K tile; the steel prefill picks
+  // its align_N/K function constants from the real dims (see the thunk).
+  const int64_t block = is_fp8 ? 128 : 4;
+  if (k % block != 0 || n % block != 0) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metal MoE GEMV: N and K must be multiples of ", block,
+        is_fp8 ? " (fp8 block-scale)." : " (bf16 vectorized load)."));
+  }
+  const PrimitiveType expected_w = is_fp8 ? F8E4M3FN : BF16;
+  if (w_shape.element_type() != expected_w) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metal MoE GEMV: w must be ",
+        is_fp8 ? "f8e4m3fn" : "bf16", "."));
+  }
+  if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: x and out must be bf16.");
+  }
+  if (expert_id_shape.element_type() != S32) {
+    return absl::UnimplementedError("metal MoE GEMV: expert_id must be s32.");
+  }
+
+  // The scale operand is fp8-only; bf16 passes empty slice/shape.
+  BufferAllocation::Slice scale;
+  Shape scale_shape;
+  if (is_fp8) {
+    scale_shape = instr->operand(2)->shape();
+    if (scale_shape.dimensions().size() != 3 ||
+        scale_shape.dimensions(0) != e ||
+        scale_shape.dimensions(1) != n / 128 ||
+        scale_shape.dimensions(2) != k / 128) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: scale must be [E, N/128, K/128].");
+    }
+    TF_ASSIGN_OR_RETURN(scale,
+                        GetAllocationSliceForHlo(instr->operand(2), {}));
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice expert_id,
+      GetAllocationSliceForHlo(instr->operand(expert_id_idx), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice out,
+      GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
+
+  // PREFILL PADDING CLAMP source (mirrors the dense-GEMM clamp in
+  // EmitMetalGemmThunk above): the MoE call's R = padded_tokens*top_k, but only
+  // the real-prompt routes carry meaningful rows (routes are token-major, so the
+  // padding is a contiguous suffix). Find this exe's prefill attention num_tokens
+  // scalar (the same real-prompt-length device value the GEMMs clamp off) and
+  // recover top_k = R / compiled_tokens, so the thunk clamps the sort/gather/
+  // steel/scatter to R_active = num_tokens*top_k. A decode exe (attention q_len==1
+  // / total_q==num_seqs, no num_tokens operand) matches nothing -> top_k stays 0
+  // -> the thunk runs unclamped (decode is not padded).
+  BufferAllocation::Slice moe_num_tokens;
+  Shape moe_num_tokens_shape;
+  int64_t compiled_tokens = 0;
+  for (const HloInstruction* i : instr->parent()->instructions()) {
+    if (i->opcode() != HloOpcode::kCustomCall) continue;
+    const auto* fa = Cast<HloCustomCallInstruction>(i);
+    if (fa->custom_call_target() != "zml$flash_attn") continue;
+    const Shape& fq = fa->operand(0)->shape();
+    if (fq.dimensions().size() != 3 || fq.dimensions(1) <= 1) continue;  // decode
+    const bool fc = fa->operand(1)->shape().dimensions().size() == 4;
+    const int fbase = fc ? 5 : 4;  // q,k,v,tok[,layer]
+    if (fa->operand_count() != fbase + 1) continue;  // no num_tokens operand
+    TF_ASSIGN_OR_RETURN(moe_num_tokens,
+                        GetAllocationSliceForHlo(fa->operand(fbase), {}));
+    moe_num_tokens_shape = fa->operand(fbase)->shape();
+    compiled_tokens = fq.dimensions(1);
+    break;
+  }
+  if (compiled_tokens == 0) {
+    // Paged prefill (llmd chunked prefill): real token count is the last element
+    // of query_start_len[num_seqs] (operand 5 of a prefill zml$paged_attn).
+    for (const HloInstruction* i : instr->parent()->instructions()) {
+      if (i->opcode() != HloOpcode::kCustomCall) continue;
+      const auto* pa = Cast<HloCustomCallInstruction>(i);
+      if (pa->custom_call_target() != "zml$paged_attn") continue;
+      if (pa->operand_count() != 6) continue;
+      const Shape& pq = pa->operand(0)->shape();  // [total_q, heads, hd]
+      const Shape& bt = pa->operand(3)->shape();  // [num_seqs, max_blocks]
+      if (pq.dimensions().size() != 3 || bt.dimensions().size() != 2) continue;
+      const int64_t total_q = pq.dimensions(0);
+      const int64_t num_seqs = bt.dimensions(0);
+      if (total_q <= num_seqs) continue;  // decode module
+      const Shape& qsl_shape = pa->operand(5)->shape();
+      if (qsl_shape.dimensions().size() != 1 ||
+          qsl_shape.dimensions(0) != num_seqs + 1 ||
+          ShapeUtil::ByteSizeOfPrimitiveType(qsl_shape.element_type()) != 4) {
+        continue;
+      }
+      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice qsl,
+                          GetAllocationSliceForHlo(pa->operand(5), {}));
+      moe_num_tokens = BufferAllocation::Slice(
+          qsl.allocation(), qsl.offset() + num_seqs * 4, 4);
+      moe_num_tokens_shape = ShapeUtil::MakeShape(S32, {});
+      compiled_tokens = total_q;
+      break;
+    }
+  }
+  // top_k must evenly divide R (token-major routes) and be in a sane range; else
+  // leave it 0 so the thunk skips the clamp (the slice's presence + top_k>0 gate
+  // has_num_tokens_).
+  int64_t moe_top_k = 0;
+  if (compiled_tokens > 0 && r % compiled_tokens == 0) {
+    const int64_t tk = r / compiled_tokens;
+    if (tk >= 1 && tk <= 256) moe_top_k = tk;
+  }
+  if (moe_top_k == 0) moe_num_tokens = BufferAllocation::Slice();
+
+  auto thunk = std::make_unique<MetalMoeGemvThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
+      out, out_shape, r, k, n, moe_num_tokens, moe_num_tokens_shape, moe_top_k);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalKvWriteThunk(
+    const HloCustomCallInstruction* instr) {
+  // Operand contract fixed by RewriteKvCacheWrites (metal_gpu_compiler.cc):
+  //   k_cache [P,B,H,D] bf16, k_new [H*D] bf16, v_cache [P,B,H,D] bf16,
+  //   v_new [H*D] bf16, slot s32[1], pos s32[1], freq f32[1,D/2].
+  // Output tuple(k_cache', v_cache') aliases operands 0 and 2.
+  TF_RET_CHECK(instr->operand_count() == 7);
+  const Shape& k_cache_shape = instr->operand(0)->shape();
+  TF_RET_CHECK(k_cache_shape.dimensions().size() == 4);
+  TF_RET_CHECK(k_cache_shape.element_type() == BF16);
+  const int64_t num_slots =
+      k_cache_shape.dimensions(0) * k_cache_shape.dimensions(1);
+  const int64_t kv_heads = k_cache_shape.dimensions(2);
+  const int64_t head_dim = k_cache_shape.dimensions(3);
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice k_cache,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice k_new,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice v_cache,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice v_new,
+                      GetAllocationSliceForHlo(instr->operand(3), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slot,
+                      GetAllocationSliceForHlo(instr->operand(4), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice pos,
+                      GetAllocationSliceForHlo(instr->operand(5), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice freq,
+                      GetAllocationSliceForHlo(instr->operand(6), {}));
+
+  auto thunk = std::make_unique<MetalKvWriteThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      k_cache, instr->operand(0)->shape(), k_new, instr->operand(1)->shape(),
+      v_cache, instr->operand(2)->shape(), v_new, instr->operand(3)->shape(),
+      slot, instr->operand(4)->shape(), pos, instr->operand(5)->shape(), freq,
+      instr->operand(6)->shape(), num_slots, kv_heads, head_dim);
+  return GetThunkSequence(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalSortThunk(
+    const HloCustomCallInstruction* instr) {
+  // ABI (RewriteSortToMetalThunk): operand 0 = values[..., n] (bf16/f16/f32),
+  // sorted along the minor-most axis; result = tuple(sorted_values[..., n],
+  // sorted_indices[..., n] s32). opaque = "desc" | "asc".
+  TF_RET_CHECK(instr->operand_count() == 1);
+  TF_RET_CHECK(instr->shape().IsTuple() &&
+               instr->shape().tuple_shapes().size() == 2);
+  const Shape& vshape = instr->operand(0)->shape();
+  const PrimitiveType dtype = vshape.element_type();
+  TF_RET_CHECK(dtype == BF16 || dtype == F16 || dtype == F32 || dtype == S32 ||
+               dtype == S16 || dtype == S8 || dtype == U32 || dtype == U16 ||
+               dtype == U8);
+  const int64_t rank = vshape.dimensions().size();
+  TF_RET_CHECK(rank >= 1);
+  const int64_t n = vshape.dimensions(rank - 1);
+  int64_t rows = 1;
+  for (int64_t i = 0; i + 1 < rank; ++i) rows *= vshape.dimensions(i);
+  const bool descending = instr->opaque() == "desc";
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice data,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out_vals,
+                      GetAllocationSliceForHlo(instr, {0}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice out_idxs,
+                      GetAllocationSliceForHlo(instr, {1}));
+
+  auto thunk = std::make_unique<MetalSortThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      data, out_vals, out_idxs, dtype, rows, n, descending);
+  return GetThunkSequence(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunkF8(
@@ -1280,6 +2219,30 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
       return ThunkSequence::Of<SelectKThunk>(std::move(thunk_info), batch_size,
                                              n, k, dtype, kernel_arguments);
     }
+  }
+
+  // The GPU bucket/radix-select MetalTopKThunk is the SOLE Metal TopK path — the
+  // shared single-pass kernel (one threadgroup over the whole vocab) is gone. It
+  // handles everything the TopkSpecializer emits (k<=64, n>=1, bf16/f16/f32, any
+  // batch): histogram the top bits of the sortable key -> threshold -> gather ->
+  // exact select on the full key, identical Descending top-K, k-independent. Fail
+  // LOUDLY on anything outside that instead of silently degrading. (The shared
+  // GetTopKKernel path below is reached on NON-Metal backends only.)
+  if (platform_name() == "METAL") {
+    TF_RET_CHECK(k <= 64)
+        << "Metal TopK: k=" << k << " > 64 — the radix select kernels template k in "
+           "{1,2,4,8,16,32,64}; the TopkSpecializer should have capped k at 64.";
+    TF_RET_CHECK(dtype == BF16 || dtype == F16 || dtype == F32)
+        << "Metal TopK: dtype " << PrimitiveType_Name(dtype)
+        << " unsupported — the radix sortable-bit transform handles bf16/f16/f32.";
+    const auto& args = kernel_arguments.args();
+    TF_RET_CHECK(args.size() == 3)
+        << "Metal TopK expects 3 buffers (data, vals, idxs).";
+    Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
+        instr, ir_emitter_context_->GetNextThunkId());
+    return GetThunkSequence(std::make_unique<MetalTopKThunk>(
+        std::move(thunk_info), args[0].slice(), args[1].slice(),
+        args[2].slice(), dtype, batch_size, n, k));
   }
 
   auto wavefront_size =
@@ -2839,7 +3802,59 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncStart(const HloInstruction* instr) {
 AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
     const HloInstruction* hlo) {
   auto* custom_call = Cast<HloCustomCallInstruction>(hlo);
-
+  // zml.Tensor.print -> "zml$print": a side-effect-only debugging print. Handle it
+  // with a host-readback thunk (Metal has no FFI print handler wired).
+  if (custom_call->custom_call_target() == "zml$print") {
+    return EmitMetalPrintThunk(custom_call);
+  }
+  // zml's `.metal_fa` attention backend -> "zml$flash_attn": a fused GQA flash-
+  // attention DECODE kernel replacing sdpa's 2 MPSGraph dots + softmax.
+  if (custom_call->custom_call_target() == "zml$flash_attn") {
+    return EmitMetalFlashAttnThunk(custom_call);
+  }
+  // zml's metal paged-attention backend -> "zml$paged_attn": paged attention
+  // over a paged KV cache + block tables. The thunk picks the kernel like
+  // vllm's paged_ops.cpp does: tiled FA-2 MMA for prefill, fa_vec_paged
+  // (matrix-vector) for decode (total_q_tokens == num_seqs).
+  if (custom_call->custom_call_target() == "zml$paged_attn") {
+    return EmitMetalPagedAttnThunk(custom_call);
+  }
+  // Backend-generated (RewriteKvCacheWrites in metal_gpu_compiler.cc): the
+  // decode-step paged KV-cache write as ONE predicated-store kernel, replacing
+  // the 6-kernel slice/pred/select/DUS cluster.
+  if (custom_call->custom_call_target() == "metal$kv_write") {
+    return EmitMetalKvWriteThunk(custom_call);
+  }
+  // Backend-generated (RewriteSortToMetalThunk in metal_gpu_compiler.cc): a
+  // generic Sort on Metal, routed to the native MLX merge sort (the legacy LLVM
+  // bitonic emitter can't lower to valid AIR).
+  if (IsMetalSort(*hlo)) {
+    return EmitMetalSortThunk(custom_call);
+  }
+  // zml's Gated DeltaNet recurrence -> "zml$gdn": the recurrent delta-rule
+  // linear-attention kernel for Qwen3-Next style hybrid models (the Triton GDN
+  // recurrence has no Metal compiler path).
+  if (custom_call->custom_call_target() == "zml$gdn") {
+    return EmitMetalGdnThunk(custom_call);
+  }
+  // Apple Metal has no cuBLASLt FP8. GemmRewriter emits __metal$gemm$f8 (peer to
+  // CUDA's __cublas$lt$matmul$f8) carrying {x, w_f8, scale}; route it to the
+  // fused FP8 GEMV kernel (MetalFp8GemvThunk), never metalBLAS.
+  if (IsMetalFp8Gemm(*hlo)) {
+    return EmitFp8GemvThunk(custom_call);
+  }
+  // Model-emitted grouped block-scaled FP8 GEMV for MoE experts: the model does
+  // top-k routing and emits __metal$moe_gemm$f8 with {x_rows, w[E,N,K]_f8,
+  // scale, expert_id}; route it to the grouped FP8 GEMV kernel.
+  if (IsMetalMoeGemm(*hlo) || IsMetalMoeGemmBf16(*hlo)) {
+    return EmitMoeGemvThunk(custom_call);
+  }
+  // Apple Metal has no cuBLAS/cuBLAS-LT. GemmRewriter emits an honest
+  // __metal$gemm target (GetNonFp8GemmCustomCallTarget, gated on the first-class
+  // MetalComputeCapability) which runs via the in-tree metalBLAS kernels.
+  if (IsMetalGemm(*hlo)) {
+    return EmitMetalGemmThunk(custom_call);
+  }
   if (IsCublasLtMatmul(*hlo)) {
     return EmitCublasLtMatmulThunk(custom_call);
   }
