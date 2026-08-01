@@ -58,6 +58,9 @@ class DeviceSpec {
   bool IsIntelGpu() const {
     return IsGpu() && gpu().gpu_compute_capability().IsOneAPI();
   }
+  bool IsMetal() const {
+    return IsGpu() && gpu().gpu_compute_capability().IsMetal();
+  }
 
  private:
   DeviceSpecType type_;

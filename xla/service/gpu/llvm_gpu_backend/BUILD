@@ -20,6 +20,24 @@ package_group(
 )
 
 cc_library(
+    name = "metal_air_backend",
+    srcs = ["metal_air_backend.cc"],
+    hdrs = ["metal_air_backend.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Core",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:TargetParser",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+cc_library(
     name = "llvm_gpu_backend",
     srcs = ["gpu_backend_lib.cc"],
     hdrs = ["gpu_backend_lib.h"],

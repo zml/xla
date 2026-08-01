@@ -319,7 +319,10 @@ CodegenDecision CanTritonHandleGEMM(
         "Triton backend is not supported on Intel GPUs.");
   }
 
-  CHECK(cuda_compute_capability || rocm_compute_capability);
+  if (!cuda_compute_capability && !rocm_compute_capability) {
+    return CodegenDecision::Forbid(
+        "Triton GEMM is only supported on NVIDIA and AMD GPUs.");
+  }
 
   if (dot.precision_config().algorithm() == PrecisionConfig::ALG_UNSET) {
     if (absl::c_any_of(dot.precision_config().operand_precision(),

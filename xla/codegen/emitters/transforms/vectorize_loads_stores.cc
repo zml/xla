@@ -314,10 +314,11 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
           });
         };
     auto element_type = vector_type.getElementType();
-    if (device_spec_.IsIntelGpu() && (IsSubByteIntOrFloatType(element_type) ||
-                                      has_sub_byte_trunc_user(op))) {
+    if ((device_spec_.IsIntelGpu() || device_spec_.IsMetal()) &&
+        (IsSubByteIntOrFloatType(element_type) ||
+         has_sub_byte_trunc_user(op))) {
       return rewriter.notifyMatchFailure(
-          op, "sub-byte types are not supported for vector loads on Intel GPU");
+          op, "sub-byte types are not supported for vector loads on this GPU");
     }
 
     mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
