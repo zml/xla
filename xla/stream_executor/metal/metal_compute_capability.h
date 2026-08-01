@@ -26,24 +26,43 @@ namespace stream_executor {
 
 // A first-class GpuComputeCapability alternative for the Apple Metal/AIR backend
 // (peer to CudaComputeCapability / RocmComputeCapability / OneAPIComputeCapability).
-// `gpu_family` is the Apple GPU family string (e.g. "Apple9" for M3/M4-class
-// devices); it is descriptive — nothing branches on it yet, but it gives Metal a
-// real identity so the backend no longer has to masquerade as a CUDA device.
+// `architecture` is the raw [MTLDevice architecture].name string used by MLX
+// (for example, "applegpu_g16s"). Its suffix encodes the generation and size:
+// the two digits before the final character are the generation, and the final
+// character is the size class (p/g/s/d). On macOS < 14 the architecture query
+// is unavailable, so the accessors return the same gen-15/non-Ultra defaults the
+// NVFP4 dispatch used before the query was wired.
 class MetalComputeCapability {
  public:
+  static constexpr int kDefaultArchitectureGen = 15;
+  static constexpr char kDefaultArchitectureSize = ' ';
+
   MetalComputeCapability() = default;
-  explicit MetalComputeCapability(std::string gpu_family)
-      : gpu_family_(std::move(gpu_family)) {}
+  explicit MetalComputeCapability(std::string architecture)
+      : architecture_(std::move(architecture)) {}
   explicit MetalComputeCapability(const MetalComputeCapabilityProto& proto)
-      : gpu_family_(proto.gpu_family()) {}
+      : architecture_(proto.gpu_family()) {}
 
-  const std::string& gpu_family() const { return gpu_family_; }
+  const std::string& architecture() const { return architecture_; }
 
-  std::string ToString() const { return absl::StrCat("Metal:", gpu_family_); }
+  int architecture_gen() const {
+    if (!HasMlxArchitectureSuffix()) return kDefaultArchitectureGen;
+    const size_t n = architecture_.size();
+    return (architecture_[n - 3] - '0') * 10 + (architecture_[n - 2] - '0');
+  }
+
+  char architecture_size() const {
+    return HasMlxArchitectureSuffix() ? architecture_.back()
+                                      : kDefaultArchitectureSize;
+  }
+
+  std::string ToString() const {
+    return absl::StrCat("Metal:", architecture_);
+  }
 
   MetalComputeCapabilityProto ToProto() const {
     MetalComputeCapabilityProto proto;
-    proto.set_gpu_family(gpu_family_);
+    proto.set_gpu_family(architecture_);
     return proto;
   }
 
@@ -53,14 +72,21 @@ class MetalComputeCapability {
   }
 
   bool operator==(const MetalComputeCapability& other) const {
-    return gpu_family_ == other.gpu_family_;
+    return architecture_ == other.architecture_;
   }
   bool operator!=(const MetalComputeCapability& other) const {
     return !(*this == other);
   }
 
  private:
-  std::string gpu_family_;
+  bool HasMlxArchitectureSuffix() const {
+    if (architecture_.size() < 3) return false;
+    const size_t n = architecture_.size();
+    return architecture_[n - 3] >= '0' && architecture_[n - 3] <= '9' &&
+           architecture_[n - 2] >= '0' && architecture_[n - 2] <= '9';
+  }
+
+  std::string architecture_;
 };
 
 }  // namespace stream_executor

@@ -95,14 +95,25 @@ KernelArgsPackingSpec::BuildArguments(
     absl::Span<const std::unique_ptr<PackedArgBase>> args,
     size_t shared_memory_bytes) const {
   std::vector<std::vector<char>> result;
+  std::vector<KernelArgumentMetadata> metadata;
   result.reserve(kernel_arguments_.size());
+  metadata.reserve(kernel_arguments_.size());
   for (const KernelArgPackingSpec& kernel_argument : kernel_arguments_) {
     ASSIGN_OR_RETURN(std::vector<char> arg,
                      kernel_argument.BuildArgument(args));
+    const KernelArgumentMetadata::Kind kind = kernel_argument.argument_kind();
+    if (kind == KernelArgumentMetadata::Kind::kDeviceAddress &&
+        arg.size() != sizeof(void*)) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Device-address relocation has %zu bytes; expected %zu", arg.size(),
+          sizeof(void*)));
+    }
+    metadata.push_back(
+        KernelArgumentMetadata{kind, static_cast<int64_t>(arg.size())});
     result.push_back(std::move(arg));
   }
-  return std::make_unique<KernelArgsPackedVector>(std::move(result),
-                                                  shared_memory_bytes);
+  return std::make_unique<KernelArgsPackedVector>(
+      std::move(result), std::move(metadata), shared_memory_bytes);
 }
 absl::StatusOr<KernelArgPackingSpecProto> KernelArgPackingSpec::ToProto()
     const {

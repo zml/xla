@@ -81,6 +81,12 @@ absl::Status MetalKernel::Launch(
     for (const void* arg : packed.argument_addresses()) {
       kernel_arg_addresses.push_back(const_cast<void*>(arg));
     }
+    absl::Span<const KernelArgumentMetadata> metadata =
+        packed.argument_metadata();
+    if (metadata.size() != kernel_arg_addresses.size()) {
+      return absl::InternalError(
+          "Metal kernel arguments expose inconsistent binding metadata.");
+    }
     size_t kernel_args_size = kernel_arg_addresses.size();
     std::array<void*, 2> config = {kernel_arg_addresses.data(),
                                    &kernel_args_size};
@@ -91,7 +97,7 @@ absl::Status MetalKernel::Launch(
     return metal_stream->LaunchMetalKernel(
         thread_dims, block_dims, cluster_dims, pipeline_, function_,
         uses_argument_buffer_, name(), reinterpret_cast<void**>(config.data()),
-        packed.number_of_shared_bytes(), use_pdl());
+        metadata, packed.number_of_shared_bytes(), use_pdl());
   };
 
   if (auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {
@@ -109,46 +115,6 @@ absl::Status MetalKernel::Launch(
   }
 
   return absl::InternalError("Unsupported Metal kernel arguments type.");
-}
-
-absl::Status MetalKernel::LaunchIndirect(const ThreadDim& thread_dims,
-                                         const BlockDim& block_dims,
-                                         void* indirect_grid_device_ptr,
-                                         Stream* stream,
-                                         const KernelArgs& args) {
-  if (pipeline_ == nullptr) {
-    return absl::InternalError("Metal kernel pipeline is not set.");
-  }
-  auto* packed = DynCast<KernelArgsPackedArrayBase>(&args);
-  if (packed == nullptr) {
-    return absl::InternalError(
-        "MetalKernel::LaunchIndirect requires packed kernel arguments.");
-  }
-  int32_t expected_number_of_arguments =
-      Arity() + (packed->number_of_shared_bytes() > 0 ? 1 : 0);
-  CHECK_EQ(expected_number_of_arguments, packed->number_of_arguments())
-      << "Kernel " << name() << " (indirect) has "
-      << packed->number_of_arguments() << " arguments, but expected "
-      << expected_number_of_arguments;
-
-  std::vector<void*> kernel_arg_addresses;
-  kernel_arg_addresses.reserve(packed->argument_addresses().size());
-  for (const void* arg : packed->argument_addresses()) {
-    kernel_arg_addresses.push_back(const_cast<void*>(arg));
-  }
-  size_t kernel_args_size = kernel_arg_addresses.size();
-  std::array<void*, 2> config = {kernel_arg_addresses.data(),
-                                 &kernel_args_size};
-  auto* metal_stream = dynamic_cast<MetalStream*>(stream);
-  if (metal_stream == nullptr) {
-    return absl::InvalidArgumentError("Expected a MetalStream.");
-  }
-  return metal_stream->LaunchMetalKernel(
-      thread_dims, block_dims, /*cluster_dims=*/std::nullopt, pipeline_,
-      function_, uses_argument_buffer_, name(),
-      reinterpret_cast<void**>(config.data()),
-      packed->number_of_shared_bytes(), /*use_pdl=*/false,
-      indirect_grid_device_ptr);
 }
 
 }  // namespace stream_executor::metal

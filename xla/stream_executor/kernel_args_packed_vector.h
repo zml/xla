@@ -34,10 +34,22 @@ class KernelArgsPackedVector : public KernelArgsPackedArrayBase {
                          size_t shared_memory_bytes)
       : argument_storage_(std::move(arguments)),
         shared_memory_bytes_(shared_memory_bytes) {
-    argument_addresses_.reserve(argument_storage_.size());
-    for (std::vector<char>& argument : argument_storage_) {
-      argument_addresses_.push_back(argument.data());
+    InitializeArgumentAddresses();
+  }
+
+  KernelArgsPackedVector(
+      std::vector<std::vector<char>> arguments,
+      std::vector<KernelArgumentMetadata> argument_metadata,
+      size_t shared_memory_bytes)
+      : argument_storage_(std::move(arguments)),
+        argument_metadata_(std::move(argument_metadata)),
+        shared_memory_bytes_(shared_memory_bytes) {
+    if (argument_metadata_.size() == argument_storage_.size()) {
+      for (size_t i = 0; i < argument_metadata_.size(); ++i) {
+        argument_metadata_[i].size = argument_storage_[i].size();
+      }
     }
+    InitializeArgumentAddresses();
   }
 
   size_t number_of_arguments() const final {
@@ -59,8 +71,20 @@ class KernelArgsPackedVector : public KernelArgsPackedArrayBase {
     return argument_addresses_;
   }
 
+  absl::Span<const KernelArgumentMetadata> argument_metadata() const final {
+    return argument_metadata_;
+  }
+
  private:
+  void InitializeArgumentAddresses() {
+    argument_addresses_.reserve(argument_storage_.size());
+    for (std::vector<char>& argument : argument_storage_) {
+      argument_addresses_.push_back(argument.data());
+    }
+  }
+
   std::vector<std::vector<char>> argument_storage_;
+  std::vector<KernelArgumentMetadata> argument_metadata_;
   size_t shared_memory_bytes_ = 0;
   std::vector<const void*> argument_addresses_;
 };

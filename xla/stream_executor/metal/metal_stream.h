@@ -23,8 +23,10 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
@@ -64,16 +66,12 @@ class MetalStream : public StreamCommon {
 
   Stream::PlatformSpecificHandle platform_specific_handle() const override;
 
-  // indirect_grid_device_ptr (optional): a device pointer to a {gx,gy,gz} uint3
-  // threadgroups-per-grid count; when non-null the kernel is dispatched INDIRECTLY
-  // off it (block_dims becomes just the KPROF label bound). Resolved to its
-  // backing MTLBuffer + offset here, like any device argument.
   absl::Status LaunchMetalKernel(
       const ThreadDim& thread_dims, const BlockDim& block_dims,
       const std::optional<ClusterDim>& cluster_dims, void* pipeline,
       void* function, bool use_argument_buffer, absl::string_view name,
-      void** args, int64_t shmem_bytes, bool use_pdl,
-      void* indirect_grid_device_ptr = nullptr);
+      void** args, absl::Span<const KernelArgumentMetadata> arg_metadata,
+      int64_t shmem_bytes, bool use_pdl);
 
   // Force-commits this stream's OPEN command buffer iff it carries the awaited
   // signal `value` (encoded but not yet committed). Called by
@@ -84,12 +82,6 @@ class MetalStream : public StreamCommon {
   void FlushOpenBufferIfCarrying(uint64_t value);
 
  private:
-  absl::Status LaunchKernel(const ThreadDim& thread_dims,
-                            const BlockDim& block_dims,
-                            const std::optional<ClusterDim>& cluster_dims,
-                            void* function, absl::string_view name,
-                            void** args, int64_t shmem_bytes,
-                            bool use_pdl) override;
   // Ensures `command_buffer_` holds an open MPSCommandBuffer.
   void EnsureOpenCommandBuffer();
   // Commits the open command buffer WITHOUT waiting — submits batched GPU work so
