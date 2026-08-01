@@ -117,8 +117,9 @@ absl::StatusOr<MetalGemmLaunch> CompileMetalblasGemv(int64_t M, int64_t N,
                                                      PrimitiveType dtype,
                                                      int64_t b_byte_offset);
 
-// Compiles the MLX steel split-K GEMM (vendored flattened in
-// metal_kernels/vendored/mlx/mlx_steel_splitk.h, MIT) for a thin-M batched-decode
+// Compiles the MLX steel split-K GEMM (entry source in
+// metal_kernels/mlx_entries/mlx_steel_splitk.h over the pinned @mlx archive,
+// MIT) for a thin-M batched-decode
 // x[M,K] @ W[N,K]ᵀ: grid-level K-split — (tiles_n × tiles_m × partitions)
 // threadgroups each MMA-ing a K-chunk into f32 partial planes, plus a trivially
 // parallel accum pass. Harness-measured (2026-06-11-steel_splitk_thin_m.mm,
