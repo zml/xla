@@ -79,7 +79,8 @@ message GpuDeviceInfoProto {
     CudaComputeCapabilityProto cuda_compute_capability = 16;
     RocmComputeCapabilityProto rocm_compute_capability = 17;
     OneAPIComputeCapabilityProto oneapi_compute_capability = 22;
-    MetalComputeCapabilityProto metal_compute_capability = 46;
+    // 46 is collective_memory_granularity on main; keep Metal on a free tag.
+    MetalComputeCapabilityProto metal_compute_capability = 47;
   }
   int64 registers_per_core_limit = 18;
   int64 registers_per_block_limit = 19;
