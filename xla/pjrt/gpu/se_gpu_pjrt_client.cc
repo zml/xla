@@ -1250,6 +1250,8 @@ StreamExecutorGpuRawClient::GetOrImportFabricHandle(
 
 // ==== End cross-host transfer implementations ==== //
 
+#endif  // TENSORFLOW_USE_METAL
+
 void StreamExecutorGpuRawClient::RecordMemoryStats(
     LocalDeviceState* local_device_state) {
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
