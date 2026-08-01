@@ -46,6 +46,7 @@ limitations under the License.
 #include "xla/service/hlo_graph_dumper.h"
 #include "xla/service/instruction_fusion.h"
 #include "xla/shape_util.h"
+#include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
@@ -555,14 +556,115 @@ void MultiOutputFusion::DumpFusionState(const HloInstruction& consumer,
   }
 }
 
+namespace {
+const HloInstruction* InPlaceDusTarget(const HloInstruction* fusion) {
+  const HloInstruction* dest = fusion->fused_expression_root()->operand(0);
+  while (dest->opcode() == HloOpcode::kBitcast) dest = dest->operand(0);
+  if (dest->opcode() != HloOpcode::kParameter) return nullptr;
+  return fusion->operand(dest->parameter_number());
+}
+}  // namespace
+
+bool MultiOutputFusion::MergeMetalDusSiblings() {
+  bool changed = false;
+  bool merged_any = true;
+  while (merged_any) {
+    merged_any = false;
+    RecomputeReachability();
+    std::vector<HloInstruction*> dus_fusions;
+    for (HloInstruction* instr : computation_->instructions()) {
+      if (HloPredicateIsOp<HloOpcode::kFusion>(instr) &&
+          instr->fused_expression_root()->opcode() ==
+              HloOpcode::kDynamicUpdateSlice) {
+        dus_fusions.push_back(instr);
+      }
+    }
+    for (size_t i = 0; i < dus_fusions.size() && !merged_any; ++i) {
+      for (size_t j = i + 1; j < dus_fusions.size(); ++j) {
+        HloInstruction* a = dus_fusions[i];
+        HloInstruction* b = dus_fusions[j];
+        if (reachability_->IsConnected(a, b)) continue;
+        const HloInstruction* ta = InPlaceDusTarget(a);
+        const HloInstruction* tb = InPlaceDusTarget(b);
+        if (ta == nullptr || tb == nullptr || ta == tb) continue;
+        if (!ShapeUtil::Equal(a->shape(), b->shape())) continue;
+        if (!ShapeUtil::Equal(
+                a->fused_expression_root()->operand(1)->shape(),
+                b->fused_expression_root()->operand(1)->shape())) {
+          continue;
+        }
+        VLOG(2) << "Metal: merging sibling in-place DUS fusions " << a->name()
+                << " + " << b->name() << " into one multi-output kernel";
+        a->MergeFusionInstructionIntoMultiOutput(b);
+        changed = true;
+        merged_any = true;
+        break;
+      }
+    }
+  }
+  return changed;
+}
+
+bool MultiOutputFusion::MergeMetalSliceIntoConsumer() {
+  bool changed = false;
+  std::vector<HloInstruction*> producers;
+  for (HloInstruction* instr : computation_->instructions()) {
+    if (!HloPredicateIsOp<HloOpcode::kFusion>(instr)) continue;
+    if (instr->fusion_kind() != HloInstruction::FusionKind::kLoop) continue;
+    if (instr->IsRoot()) continue;  // its outputs are entry results.
+    const HloInstruction* root = instr->fused_expression_root();
+    if (root->opcode() != HloOpcode::kTuple || root->operand_count() == 0) {
+      continue;
+    }
+    bool all_slice = true;
+    for (const HloInstruction* op : root->operands()) {
+      if (op->opcode() != HloOpcode::kSlice) {
+        all_slice = false;
+        break;
+      }
+    }
+    if (all_slice) producers.push_back(instr);
+  }
+  for (HloInstruction* producer : producers) {
+    HloInstruction* consumer = nullptr;
+    bool ok = !producer->users().empty();
+    for (HloInstruction* user : producer->users()) {
+      if (!HloPredicateIsOp<HloOpcode::kGetTupleElement>(user) ||
+          user->user_count() != 1 ||
+          !HloPredicateIsOp<HloOpcode::kFusion>(user->users()[0])) {
+        ok = false;
+        break;
+      }
+      HloInstruction* c = user->users()[0];
+      if (consumer == nullptr) {
+        consumer = c;
+      } else if (consumer != c) {
+        ok = false;  // gtes feed different consumers — leave it alone.
+        break;
+      }
+    }
+    if (!ok || consumer == nullptr) continue;
+    VLOG(2) << "Metal: merging RoPE slice fusion " << producer->name()
+            << " into consumer " << consumer->name();
+    consumer->MergeFusionInstructionIntoMultiOutput(producer);
+    changed = true;
+  }
+  return changed;
+}
+
 absl::StatusOr<bool> MultiOutputFusion::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   bool changed = false;
+  const bool is_metal = device_info_.gpu_compute_capability().IsMetal();
   for (auto* computation : GetFusibleComputations(*module, execution_threads)) {
     computation_ = computation;
     ABSL_ASSIGN_OR_RETURN(bool computation_changed, DoMultiOutputFusion());
     changed |= computation_changed;
+    if (is_metal) {
+      changed |= MergeMetalDusSiblings();
+      changed |= MergeMetalSliceIntoConsumer();
+    }
   }
   return changed;
 }

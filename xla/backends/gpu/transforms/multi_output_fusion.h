@@ -120,6 +120,10 @@ class MultiOutputFusion : public HloModulePass {
 
   absl::StatusOr<bool> DoMultiOutputFusion();
 
+  bool MergeMetalDusSiblings();
+
+  bool MergeMetalSliceIntoConsumer();
+
   // Recompute reachability for the current computation.
   void RecomputeReachability();
 

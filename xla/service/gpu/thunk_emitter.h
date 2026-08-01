@@ -271,6 +271,33 @@ class ThunkEmitter {
 
   absl::StatusOr<ThunkSequence> EmitFft(const HloFftInstruction* instr);
 
+  absl::StatusOr<ThunkSequence> EmitMetalGemmThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalPrintThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalFlashAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalPagedAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalKvWriteThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalSortThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitFp8GemvThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
+      const HloCustomCallInstruction* hlo);
+
   absl::StatusOr<ThunkSequence> EmitInfeed(const HloInfeedInstruction* instr);
 
   absl::StatusOr<ThunkSequence> EmitNorm(const HloCustomCallInstruction* instr);
