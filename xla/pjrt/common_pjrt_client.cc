@@ -19,6 +19,7 @@ limitations under the License.
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -2465,7 +2466,8 @@ CommonPjRtLoadedExecutable::ExecuteHelperOnSingleDevice(
   ABSL_RETURN_IF_ERROR(ExecutePrepareWithOomRetries(
       launch_args, argument_handles, run_id, replica, partition, options,
       /*host_callback_idx=*/0, device));
-  return ExecuteLaunch(*launch_args, fill_future);
+  auto result = ExecuteLaunch(*launch_args, fill_future);
+  return result;
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
@@ -3400,6 +3402,8 @@ Future<> CommonPjRtBufferImpl::ToLiteralImpl(
     return Future<>(logical_shape.status());
   }
 
+  common_client->FlushBatchedWorkForHostTransfer(memory_space());
+
   // TODO(zhangqiaorjc): Fast path if zero device_buffer wait events.
   // Make two copies because EnqueueWorkWhenReady below needs two different
   // lifetimes.
@@ -3647,6 +3651,7 @@ Future<> CommonPjRtBufferImpl::CopyRawToHostFuture(Future<void*> dst,
                                                    int64_t offset,
                                                    int64_t transfer_size) {
   auto buf_client = absl::down_cast<CommonPjRtClient*>(client());
+  buf_client->FlushBatchedWorkForHostTransfer(memory_space());
   PjRtDeviceEventRefVector definition_events;
   PjRtRawBufferRef raw_buffer;
   // tsl::RCReference<tsl::IndirectAsyncValue> indirect_usage_event;
@@ -3876,6 +3881,8 @@ CommonPjRtBufferImpl::DonateWithControlDependency(Future<> dependency) {
 }
 
 Future<> CommonPjRtBufferImpl::GetReadyFuture() {
+  tensorflow::down_cast<CommonPjRtClient*>(client())
+      ->FlushBatchedWorkForHostTransfer(memory_space());
   absl::MutexLock lock(mu_);
   if (!device_buffer()) {
     return Future<>(InvalidArgument(

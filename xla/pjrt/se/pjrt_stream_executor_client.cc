@@ -548,6 +548,21 @@ bool PjRtStreamExecutorRawClient::IsOnCpu(PjRtMemorySpace* memory_space) {
   return memory_space->kind() == PinnedHostMemorySpace::kKind;
 }
 
+void PjRtStreamExecutorClient::FlushBatchedWorkForHostTransfer(
+    PjRtMemorySpace* memory_space) {
+  for (PjRtDevice* device : memory_space->devices()) {
+    auto* se_device = tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+    LocalDeviceState* local_device = se_device->local_device_state();
+    if (local_device == nullptr) continue;
+    se::Stream* stream = local_device->compute_stream();
+    if (stream == nullptr) continue;
+    absl::Status status = stream->FlushBatchedWork();
+    if (!status.ok()) {
+      LOG(ERROR) << "FlushBatchedWork failed during host transfer: " << status;
+    }
+  }
+}
+
 bool PjRtStreamExecutorClient::ShouldPerformZeroCopyLinearize(
     const void* data, const xla::Shape& device_shape, PrimitiveType type,
     absl::Span<int64_t const> dims,
@@ -1506,7 +1521,7 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
        executable = executable_, execution_profile = options.execution_profile,
        parameter_is_tupled_arguments =
            compile_options.parameter_is_tupled_arguments,
-       replica = replica_, partition = partition_,
+       replica = replica_, partition = partition_, fill_future,
        extra_deps = std::move(extra_deps),
        result_definition_event_promises =
            std::move(result_definition_event_promises),
@@ -1761,6 +1776,14 @@ PjRtStreamExecutorRawLoadedExecutable::Execute(
           [exe = executable, reservation = compute_reservation,
            assignment = device_assignment,
            buffers_to_release = std::move(buffers_to_release)]() {});
+    }
+    if (fill_future && result_buffer_or_status.ok()) {
+      absl::Status flush_status =
+          device_state->compute_stream()->CommitBatchedWorkNoWait();
+      if (!flush_status.ok()) {
+        LOG(ERROR) << "CommitBatchedWorkNoWait failed for host-awaited execute: "
+                   << flush_status;
+      }
     }
     return definition_event;
   };

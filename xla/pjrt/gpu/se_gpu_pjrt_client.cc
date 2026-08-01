@@ -54,19 +54,23 @@ limitations under the License.
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/backends/cpu/target_machine_options.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/backends/gpu/collectives/allocator_memory_registration.h"
 #include "xla/backends/gpu/collectives/gpu_clique.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
 #include "xla/backends/gpu/collectives/gpu_collectives.h"
 #include "xla/backends/gpu/collectives/gpu_communicator.h"
+#endif
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/client/local_client.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/core/collectives/clique_id.h"
 #include "xla/core/collectives/collectives.h"
 #include "xla/core/collectives/collectives_registry.h"
 #include "xla/core/collectives/communicator.h"
 #include "xla/core/collectives/rank_id.h"
+#endif
 #include "xla/executable_run_options.h"
 #include "xla/future.h"
 #include "xla/hlo/builder/xla_computation.h"
@@ -141,7 +145,9 @@ limitations under the License.
 #include "tsl/platform/numa.h"
 #include "tsl/platform/protobuf.h"
 #include "tsl/platform/random.h"
+#if !TENSORFLOW_USE_METAL
 #include "tsl/profiler/lib/nvtx_utils.h"
+#endif
 #include "tsl/profiler/lib/traceme.h"
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
@@ -150,6 +156,14 @@ limitations under the License.
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/pjrt/gpu/gpu_metrics.h"
+#endif
+
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
+    defined(TENSORFLOW_USE_METAL)
+#include "xla/debug_options_flags.h"
+#endif
+
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
 #include "xla/pjrt/proto/compile_options.pb.h"
 #include "xla/pjrt/se/stream_executor_executable.pb.h"
 #include "xla/service/gpu/buffer_allocations.h"
@@ -171,6 +185,8 @@ limitations under the License.
 #elif TENSORFLOW_USE_ROCM
 #include "rocm/rocm_config.h"
 #include "xla/stream_executor/rocm/rocm_device_address_vmm_allocator.h"
+#elif TENSORFLOW_USE_METAL
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #endif
 
 #include "xla/service/gpu/gpu_executable_run_options.h"
@@ -284,6 +300,9 @@ static std::string GpuPlatformVersionFromDevices(
 
 void StreamExecutorGpuRawClient::UpdateGlobalProcessInfo(
     absl::Span<xla::coordination::TaskInfo> infos) {
+#if TENSORFLOW_USE_METAL
+  return;
+#else
   if (!abort_collectives_on_failure_) {
     return;
   }
@@ -291,6 +310,7 @@ void StreamExecutorGpuRawClient::UpdateGlobalProcessInfo(
   if (!s.ok()) {
     LOG(WARNING) << s;
   }
+#endif
 }
 
 void StreamExecutorGpuRawClient::UpdateCompileOptionsTopology(
@@ -300,6 +320,38 @@ void StreamExecutorGpuRawClient::UpdateCompileOptionsTopology(
           &topology)
           ->gpu_topology());
 }
+
+#if TENSORFLOW_USE_METAL
+
+absl::StatusOr<PjRtDeviceEventRefVector>
+StreamExecutorGpuClient::CrossHostTransferBuffers(
+    PjRtDeviceEventRefVector transfer_dependencies,
+    std::vector<CrossHostTransferSpec> transfer_specs) {
+  return absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+}
+
+void StreamExecutorGpuClient::ScheduleRemoteSend(
+    PjRtMemorySpace* memory_space, PjRtRawBufferRef raw_buffer,
+    PjRtDeviceEventRefVector definition_events,
+    PjRtDeviceEventPromiseRef usage_event_promise,
+    Future<std::string> serialized_descriptor,
+    PjRtBuffer::RemoteSendCallback on_done) {
+  absl::Status status = absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+  usage_event_promise.SetError(status);
+  std::move(on_done)(status, /*sends_were_enqueued=*/false);
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
+    absl::Span<const Shape> shapes, PjRtDevice* device,
+    PjRtCrossHostRecvNotifier notifier) {
+  return absl::UnimplementedError(
+      "Cross-host transfers are not implemented for Metal.");
+}
+
+#else
 
 // ==== Start cross-host transfer implementations ==== //
 
@@ -1279,12 +1331,21 @@ BuildLocalDeviceStates(LocalClient* xla_client, bool schedule_async,
   std::map<int, std::unique_ptr<LocalDeviceState>> addressable_devices;
   for (se::StreamExecutor* executor :
        xla_client->backend().stream_executors()) {
+    bool use_callback_stream = true;
+#if TENSORFLOW_USE_METAL
+    // Host callbacks run on the compute stream itself: a separate callback queue
+    // has no ordering with it and could mark a buffer ready before its kernels finish.
+    if (executor->GetPlatform()->id() ==
+        stream_executor::metal::kMetalPlatformId) {
+      use_callback_stream = false;
+    }
+#endif  // TENSORFLOW_USE_METAL
     addressable_devices.emplace(
         executor->device_ordinal(),
         std::make_unique<LocalDeviceState>(
             executor, xla_client, LocalDeviceState::kComputeSynchronized,
             max_inflight_computations, /*allow_event_reuse=*/true,
-            /*use_callback_stream=*/true, /*device_ordinal=*/-1,
+            use_callback_stream, /*device_ordinal=*/-1,
             /*stream_options=*/std::nullopt, schedule_async));
   }
   return std::move(addressable_devices);
@@ -1300,6 +1361,12 @@ GetStreamExecutorGpuDeviceAllocator(
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
   const DebugOptions& debug_options = xla::GetDebugOptionsFromFlags();
   GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
+  bool preallocate = allocator_config.preallocate;
+#if TENSORFLOW_USE_METAL
+  if (platform->id() == stream_executor::metal::kMetalPlatformId) {
+    preallocate = false;
+  }
+#endif  // TENSORFLOW_USE_METAL
   if (debug_options.xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
       effective_kind != GpuAllocatorConfig::Kind::kVmm) {
@@ -1319,7 +1386,7 @@ GetStreamExecutorGpuDeviceAllocator(
             auto async_allocator,
             CreateCudaAsyncAllocator(
                 *(ordinal_and_device.second), allocator_config.memory_fraction,
-                allocator_config.preallocate, false, false, true));
+                preallocate, false, false, true));
         allocators.push_back(
             {std::move(async_allocator),
              ordinal_and_device.second->compute_stream(),
@@ -1336,14 +1403,14 @@ GetStreamExecutorGpuDeviceAllocator(
       // collective (upper end) memory, so no separate collective allocator is
       // created. Otherwise, use the separate collective allocator below.
       shared_collective_pool =
-          allocator_config.preallocate &&
+          preallocate &&
           debug_options.xla_gpu_enable_allocator_spatial_partitioning();
       for (const auto& ordinal_and_device : addressable_devices) {
         ABSL_ASSIGN_OR_RETURN(
             auto bfc_allocator,
             CreateBFCAllocator(ordinal_and_device.second->executor(),
                                allocator_config.memory_fraction,
-                               allocator_config.preallocate,
+                               preallocate,
                                allocator_config.gpu_system_memory_size,
                                allocator_config.sub_allocator_alloc_visitors,
                                allocator_config.sub_allocator_free_visitors,
@@ -1456,6 +1523,9 @@ GetStreamExecutorGpuDeviceAllocator(
     }
   }
 
+#if TENSORFLOW_USE_METAL
+  if (platform->id() != stream_executor::metal::kMetalPlatformId) {
+#endif  // TENSORFLOW_USE_METAL
   // Add a separate collective allocator unless the default BFC allocator
   // already serves collective memory from its shared, spatially partitioned
   // pool.
@@ -1473,6 +1543,9 @@ GetStreamExecutorGpuDeviceAllocator(
            /*memory_space=*/(int)xla::gpu::MemorySpaceColor::kCollective});
     }
   }
+#if TENSORFLOW_USE_METAL
+  }
+#endif  // TENSORFLOW_USE_METAL
 
   for (const auto& ordinal_and_device : addressable_devices) {
     ABSL_ASSIGN_OR_RETURN(auto host_allocator,
@@ -1507,6 +1580,9 @@ GetStreamExecutorGpuDeviceAllocator(
 void NameDeviceAndLauncherThread(const LocalTopologyProto& node,
                                  const DeviceProto& device_proto,
                                  WorkerThread* launcher_thread) {
+#if !defined(GOOGLE_CUDA) && !defined(TENSORFLOW_USE_ROCM)
+  return;
+#else
   auto suffix = absl::StrFormat(
       ":#global=%d,local=%d,process=%d,partition=%d#",
       device_proto.global_device_id(), device_proto.local_device_ordinal(),
@@ -1521,10 +1597,12 @@ void NameDeviceAndLauncherThread(const LocalTopologyProto& node,
   launcher_thread->Schedule([name = absl::StrCat("XlaLauncher", suffix)] {
     tsl::profiler::NameCurrentThread(name);
   });
+#endif
 }
 
 }  // namespace
 
+#if !TENSORFLOW_USE_METAL
 // Creates allocator memory registration and adds the required suballocator
 // visitors to `allocator_config`. Allocators that do not use suballocator
 // visitors simply ignore them.
@@ -1553,6 +1631,8 @@ CreateAllocatorMemoryRegistration(GpuAllocatorConfig* allocator_config) {
 
   return memory_registration;
 }
+#endif  // !TENSORFLOW_USE_METAL
+
 
 struct PjRtDevicesAndTopology {
   std::vector<std::unique_ptr<PjRtStreamExecutorDevice>> devices;
@@ -1770,21 +1850,25 @@ absl::StatusOr<PjRtDevicesAndTopology> BuildDistributedDevices(
   gpu_executable_run_options->set_gpu_global_device_ids(
       std::move(gpu_device_ids));
 
-  auto* gpu_collectives = gpu_executable_run_options->collectives();
-  if (gpu_collectives == nullptr) {
-    gpu_collectives = gpu::GpuCollectives::Resolve(platform_name);
-  }
+#if !TENSORFLOW_USE_METAL
+  {
+    auto* gpu_collectives = gpu_executable_run_options->collectives();
+    if (gpu_collectives == nullptr) {
+      gpu_collectives = gpu::GpuCollectives::Resolve(platform_name);
+    }
 
-  size_t num_processes = global_topology.processes().size();
-  if (gpu_collectives->IsImplemented()) {
-    ABSL_ASSIGN_OR_RETURN(
-        auto clique_id_callback,
-        gpu_collectives->InitializeTopology(
-            {ProcessId(process_id), num_processes, local_device_states.size(),
-             kv_store, device_to_process}));
-    gpu_executable_run_options->set_clique_id_callback(
-        std::move(clique_id_callback));
+    size_t num_processes = global_topology.processes().size();
+    if (gpu_collectives->IsImplemented()) {
+      ABSL_ASSIGN_OR_RETURN(
+          auto clique_id_callback,
+          gpu_collectives->InitializeTopology(
+              {ProcessId(process_id), num_processes, local_device_states.size(),
+               kv_store, device_to_process}));
+      gpu_executable_run_options->set_clique_id_callback(
+          std::move(clique_id_callback));
+    }
   }
+#endif  // !TENSORFLOW_USE_METAL
 
   ABSL_ASSIGN_OR_RETURN(GpuTopologyProto gpu_topology,
                    BuildGpuTopology(global_topology, *gpu_target_config,
@@ -1900,7 +1984,11 @@ std::unique_ptr<StreamExecutorGpuClient> MakeStreamExecutorGpuClient(
   attrs.pjrt_c_api_major_version = 0;
   attrs.pjrt_c_api_minor_version = 0;
   attrs.attributes["serialize_with_sdy"] = true;
+#if TENSORFLOW_USE_METAL
+  attrs.attributes["supports_cross_host_transfers"] = PjRtValueType(false);
+#else
   attrs.attributes["supports_cross_host_transfers"] = PjRtValueType(true);
+#endif
   auto result = std::make_unique<StreamExecutorGpuClient>(
       tsl::Fingerprint64(platform_name), platform_name, platform_version,
       process_index, std::move(topology), std::move(raw_client),
@@ -1908,6 +1996,8 @@ std::unique_ptr<StreamExecutorGpuClient> MakeStreamExecutorGpuClient(
   std::vector<std::unique_ptr<PjRtDevice>> devices_copy;
   devices_copy.reserve(devices.size());
   std::vector<std::unique_ptr<PjRtMemorySpace>> memory_spaces;
+  const bool create_pinned_host_memory_space =
+      tsl::Fingerprint64(platform_name) != MetalId();
   const int basePinnedId = devices.size();
   for (auto& device : devices) {
     device->SetClient(result.get());
@@ -1919,10 +2009,12 @@ std::unique_ptr<StreamExecutorGpuClient> MakeStreamExecutorGpuClient(
           std::make_unique<StreamExecutorGpuHbmMemorySpace>(id, device.get());
       device->AttachMemorySpace(memory_space.get(), /*is_default=*/true);
       memory_spaces.push_back(std::move(memory_space));
-      auto pinned = std::make_unique<PinnedHostMemorySpace>(basePinnedId + id,
-                                                            device.get());
-      device->AttachMemorySpace(pinned.get());
-      memory_spaces.push_back(std::move(pinned));
+      if (create_pinned_host_memory_space) {
+        auto pinned = std::make_unique<PinnedHostMemorySpace>(basePinnedId + id,
+                                                              device.get());
+        device->AttachMemorySpace(pinned.get());
+        memory_spaces.push_back(std::move(pinned));
+      }
     }
     devices_copy.push_back(std::move(device));
   }
@@ -1948,6 +2040,8 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   auto pjrt_platform_name = xla::RocmName();
 #elif TENSORFLOW_USE_SYCL
   auto pjrt_platform_name = xla::OneapiName();
+#elif TENSORFLOW_USE_METAL
+  auto pjrt_platform_name = xla::MetalName();
 #else   // TENSORFLOW_USE_ROCM
   auto pjrt_platform_name = xla::CudaName();
 #endif  // TENSORFLOW_USE_ROCM
@@ -1970,8 +2064,13 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
 
   GpuAllocatorConfig allocator_config = options.allocator_config;
   bool preallocate_device_memory = allocator_config.preallocate;
+#if !TENSORFLOW_USE_METAL
   auto memory_registration =
       CreateAllocatorMemoryRegistration(&allocator_config);
+#else
+  std::shared_ptr<gpu::AllocatorMemoryRegistration> memory_registration =
+      nullptr;
+#endif  // !TENSORFLOW_USE_METAL
 
   bool preallocate_host_memory;
   ABSL_RETURN_IF_ERROR(tsl::ReadBoolFromEnvVar(

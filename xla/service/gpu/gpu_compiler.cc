@@ -1997,7 +1997,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
 
   DumpHloModuleIfEnabled(*hlo_module, "before_config_assignment");
 
-  {
+  if (EnableFusionAutotuning()) {
     HloPassPipeline pipeline("autotuner", compilation_stats);
     pipeline.AddPass<FusionWrapper>(
         gpu_topology.gpu_target_config().device_description);
@@ -2170,10 +2170,12 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
             : ScaledDotRewriter::OnFallback::kFail);
 
     // Rewrite GEMMs into custom calls.
-    AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
-    AddGemmRewriterPasses(
-        pipeline, debug_options, gpu_version,
-        gpu_target_config.device_description.runtime_version());
+    if (EnableGemmCustomCalls()) {
+      AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
+      AddGemmRewriterPasses(
+          pipeline, debug_options, gpu_version,
+          gpu_target_config.device_description.runtime_version());
+    }
 
     // Rewrite GEMMs with broadcasted inputs as strided GEMMs.
     pipeline.AddPass<GemmBroadcastFoldingRewriter>();

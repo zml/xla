@@ -109,6 +109,7 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -181,7 +182,7 @@ class GpuExecutableThunkPassBufferAllocator : public ThunkPassBufferAllocator {
       BufferAllocation::Index start_idx)
       : next_idx_(start_idx) {}
 
-  absl::StatusOr<BufferAllocation* absl_nonnull> NewEmptyAllocation(
+  absl::StatusOr<BufferAllocation * absl_nonnull> NewEmptyAllocation(
       int64_t size) override {
     allocations_.push_back(BufferAllocation(next_idx_++, size, /*color=*/0));
     return &allocations_.back();
@@ -318,8 +319,10 @@ static absl::Status RunThunkPasses(
                                      module_output_slices));
     pipeline.AddPass(std::move(pass));
   }
-  pipeline.AddPass(std::make_unique<CommandBufferConversionPass>(
-      hlo_module ? hlo_module->name() : "Anonymous"));
+  if (device_info.platform_version() != "Metal") {
+    pipeline.AddPass(std::make_unique<CommandBufferConversionPass>(
+        hlo_module ? hlo_module->name() : "Anonymous"));
+  }
 
   ABSL_ASSIGN_OR_RETURN(bool changed,
                    pipeline.Run(&root_thunk->thunks(), debug_options,
@@ -520,6 +523,16 @@ GpuExecutable::GpuExecutable(
 }
 
 GpuExecutable::~GpuExecutable() {
+  {
+    absl::MutexLock lock(&metal_module_mutex_);
+    for (auto& [executor, allocations] : metal_constant_allocations_) {
+      for (se::DeviceAddressBase& allocation : allocations) {
+        executor->Deallocate(&allocation);
+      }
+    }
+    metal_constant_allocations_.clear();
+  }
+
   buffer_allocator_.reset();
   if (has_module() && enable_debug_info_manager_) {
     XlaDebugInfoManager::Get()->UnregisterModule(module().unique_id());
@@ -546,6 +559,7 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == stream_executor::metal::kMetalPlatformId) {
   } else {
     return Internal("Unknown platform");
   }
@@ -917,6 +931,64 @@ absl::Status MaybeSyncAndProfile(const ServiceExecutableRunOptions* run_options,
 
 absl::StatusOr<const GpuExecutable::BufferAllocToDeviceMemoryMap*>
 GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
+  se::StreamExecutor* executor = stream->parent();
+
+  if (executor->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    absl::MutexLock lock(metal_module_mutex_);
+    if (auto it = metal_module_globals_.find(executor);
+        it != metal_module_globals_.end()) {
+      return it->second.get();
+    }
+    auto globals = std::make_unique<BufferAllocToDeviceMemoryMap>();
+    std::vector<se::DeviceAddressBase>& owned_allocations =
+        metal_constant_allocations_[executor];
+    bool submitted_mem_copies = false;
+
+    for (const ConstantInfo& info : constants_) {
+      if (info.allocation_index == -1) continue;
+      absl::Span<const BufferAllocation* const> allocations = GetAllocations();
+      if (info.allocation_index < 0 ||
+          info.allocation_index >= allocations.size()) {
+        return absl::InternalError(absl::StrCat(
+            "Metal constant global ", info.symbol_name,
+            " has invalid allocation index ", info.allocation_index));
+      }
+
+      uint64_t allocation_size = allocations[info.allocation_index]->size();
+      uint64_t content_size = info.content.span().size();
+      uint64_t size = content_size == 0 ? allocation_size : content_size;
+      if (size == 0) {
+        CHECK(globals
+                  ->emplace(info.allocation_index,
+                            se::DeviceAddressBase(nullptr, 0))
+                  .second);
+        continue;
+      }
+      se::DeviceAddressBase global =
+          executor->Allocate(size, /*memory_space=*/0);
+      if (global.opaque() == nullptr) {
+        return absl::InternalError(absl::StrCat(
+            "Failed to allocate Metal constant global ", info.symbol_name));
+      }
+      owned_allocations.push_back(global);
+      if (content_size == 0) {
+        RETURN_IF_ERROR(stream->MemZero(&global, size));
+      } else {
+        RETURN_IF_ERROR(
+            stream->Memcpy(&global, info.content.span().data(), content_size));
+      }
+      submitted_mem_copies = true;
+      CHECK(globals->emplace(info.allocation_index, global).second);
+    }
+
+    if (submitted_mem_copies) {
+      CHECK_OK(stream->BlockHostUntilDone());
+    }
+    return metal_module_globals_.emplace(executor, std::move(globals))
+        .first->second.get();
+  }
+
   return module_globals_->Resolve(stream);
 }
 
@@ -1207,7 +1279,6 @@ absl::Status GpuExecutable::ExecuteThunks(
   }
 
   se::DeviceAddressAllocator* const memory_allocator = run_options->allocator();
-  // Force synchronous execution if the allocator requires it.
   const bool block_host_until_done =
       !memory_allocator->AllowsAsynchronousDeallocation();
 

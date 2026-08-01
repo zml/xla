@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/pjrt/device_event.h"
 #include "xla/pjrt/se/event_pool.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/logging.h"
@@ -63,6 +64,15 @@ void BufferSequencingEvent::WaitForEventOnStream(se::Stream* stream) {
   if (event_.IsError()) {
     return;
   }
+
+  // Metal always encodes the GPU-side wait, even same-stream: command buffers on
+  // one queue are not ordered for untracked access, and a redundant wait is cheap.
+  if (stream->parent()->GetPlatform()->id() ==
+      stream_executor::metal::kMetalPlatformId) {
+    stream->WaitFor(event_->event.event()).IgnoreError();
+    return;
+  }
+
   if (event_->definition_stream == stream) {
     return;
   }

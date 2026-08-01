@@ -104,6 +104,8 @@ class CommonPjRtClient : public PjRtClient {
     return std::move(shape);
   }
 
+  virtual void FlushBatchedWorkForHostTransfer(PjRtMemorySpace* memory_space) {}
+
   // Backend specific handlers for when an oom is detected during execute.
   virtual void CallOomHandlers() const {}
 

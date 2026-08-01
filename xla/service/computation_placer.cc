@@ -23,9 +23,13 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/runtime/device_id.h"
 #include "xla/service/device_assignment.h"
+#if !TENSORFLOW_USE_METAL
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
+#endif
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/metal/metal_platform_id.h"
 #include "xla/stream_executor/platform_id.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/sycl/sycl_platform_id.h"
@@ -108,12 +112,16 @@ std::unique_ptr<xla::ComputationPlacer> DefaultComputationPlacer() {
 bool InitModule() {
   xla::ComputationPlacer::RegisterComputationPlacer(
       stream_executor::host::kHostPlatformId, DefaultComputationPlacer);
+#if !TENSORFLOW_USE_METAL
   xla::ComputationPlacer::RegisterComputationPlacer(
       stream_executor::cuda::kCudaPlatformId, DefaultComputationPlacer);
+#endif
   xla::ComputationPlacer::RegisterComputationPlacer(
       stream_executor::rocm::kROCmPlatformId, DefaultComputationPlacer);
   xla::ComputationPlacer::RegisterComputationPlacer(
       stream_executor::sycl::kSyclPlatformId, DefaultComputationPlacer);
+  xla::ComputationPlacer::RegisterComputationPlacer(
+      stream_executor::metal::kMetalPlatformId, DefaultComputationPlacer);
   return true;
 }
 

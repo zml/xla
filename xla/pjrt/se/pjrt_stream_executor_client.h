@@ -503,6 +503,8 @@ class PjRtStreamExecutorClient : public CommonPjRtClientImpl {
     return PjRtStreamExecutorRawClient::IsOnCpu(memory_space);
   }
 
+  void FlushBatchedWorkForHostTransfer(PjRtMemorySpace* memory_space) override;
+
   bool allows_recursion() const override { return false; }
   bool allows_execute_recursion() const override { return true; }
   bool use_stream_based_compaction() const override { return true; }

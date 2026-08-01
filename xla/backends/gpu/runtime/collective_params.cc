@@ -75,7 +75,8 @@ absl::StatusOr<CollectiveParams> CollectiveParams::Create(
 
   GpuCollectives* collectives =
       gpu_options ? gpu_options->collectives() : nullptr;
-  if (collectives == nullptr) {
+  if (collectives == nullptr &&
+      CollectivesRegistry::Default(platform_name).ok()) {
     collectives = GpuCollectives::Resolve(platform_name);
   }
 
