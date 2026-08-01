@@ -103,8 +103,8 @@ bool IsCublasLtMatmul(const HloInstruction& hlo);
 // beta=0).
 bool IsNonFusedCublasLtMatmul(const HloInstruction& hlo);
 
-// (Apple Metal GEMM custom-call predicates -- IsMetalGemm / IsMetalFp8Gemm --
-// live in metal_custom_calls.h, not this CUDA-named header.)
+// (Apple Metal GEMM custom-call predicates -- IsMetalGemm / IsMetalScaledMatmul
+// -- live in metal_custom_calls.h, not this CUDA-named header.)
 
 // Scaled matrix multiplication in FP8. Calls into cublasLt.
 bool IsCublasLtMatmulF8(const HloInstruction& hlo);
@@ -122,8 +122,8 @@ bool IsTriangularSolve(const HloInstruction& hlo);
 inline constexpr absl::string_view kGemmCallTarget = "__cublas$gemm";
 
 // (Apple Metal GEMM custom-call targets -- kMetalGemmCallTarget /
-// kMetalGemmF8CallTarget -- and MetalBlockScaledGemmTarget live in
-// metal_custom_calls.h, not this CUDA-named header.)
+// kMetalScaledMatmulCallTarget -- live in metal_custom_calls.h, not this
+// CUDA-named header.)
 
 // A call to cuBLAS Lt API matrix multiplication.
 inline constexpr absl::string_view kCublasLtMatmulCallTarget =

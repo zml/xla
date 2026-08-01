@@ -133,6 +133,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/rename_fusions.h"
 #include "xla/backends/gpu/transforms/sanitize_constant_names.h"
 #include "xla/backends/gpu/transforms/scalar_constant_sinker.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scan_rewriter.h"
 #include "xla/backends/gpu/transforms/scatter_determinism_expander.h"
@@ -773,6 +774,10 @@ absl::Status RunOptimizationPasses(
   }
   pipeline.AddPass<RaggedDotRewriter>(gpu_version,
                                       gpu_target_config.dnn_version_info);
+  // Fused backend paths first (Metal NVFP4/FP8 scaled-matmul, etc.); then
+  // expand any remaining kScaledDot generically. Triton-supported scaled-dots
+  // are left alone by the ScaledDotRewriter filter below.
+  pipeline.AddPass<FusedScaledDotRewriter>(gpu_version);
   pipeline.AddPass<ScaledDotRewriter>([&compiler, &gpu_target_config](
                                           const HloInstruction* instr) {
     return !compiler.IsScaledDotSupportedByBackend(instr, gpu_target_config);
@@ -2092,6 +2097,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
 
+    pipeline.AddPass<FusedScaledDotRewriter>(gpu_version);
     pipeline.AddPass<ScaledDotRewriter>();
 
     // Rewrite GEMMs into custom calls.
