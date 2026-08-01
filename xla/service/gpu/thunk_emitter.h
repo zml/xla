@@ -101,6 +101,9 @@ class ThunkEmitter {
 
   absl::StatusOr<ThunkSequence> EmitAsyncDone(const HloInstruction* instr);
 
+  AsyncThunkSequence EmitCollectiveKernelThunk(
+      Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
+      const HloInstruction* instr, const CollectiveConfig& config);
   absl::StatusOr<ThunkSequence> EmitCollectiveAsyncDone(
       const HloInstruction* inst);
 
