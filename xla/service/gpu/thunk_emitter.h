@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_hlo_ordering.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
@@ -270,6 +271,42 @@ class ThunkEmitter {
       const HloFusionInstruction* instr, const StaticSliceCopyFusion& copy);
 
   absl::StatusOr<ThunkSequence> EmitFft(const HloFftInstruction* instr);
+
+  absl::StatusOr<ThunkSequence> EmitMetalGemmThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalPrintThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalFlashAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalPagedAttnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalKvWriteThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalSortThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalMxMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalNvfp4MatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
+      const HloCustomCallInstruction* hlo, MetalScaledMatmulScheme scheme);
+
+  absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
+      const HloCustomCallInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitInfeed(const HloInfeedInstruction* instr);
 

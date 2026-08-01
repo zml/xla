@@ -133,10 +133,11 @@ absl::StatusOr<bool> CopyFusion::DoCopyFusion(
         hlo->IsMultiOutputFusion() ? root->operand_count() : int64_t{1};
     int64_t total_outputs = num_outputs + copies.size();
 
-    if (total_outputs > MaxOperandsAndOutputsPerFusion()) {
+    if (total_outputs > MaxOperandsAndOutputsPerFusion(device_description_)) {
       VLOG(1) << "Skipping fusion as it would exceed "
                  "MaxOperandsAndOutputsPerFusion(): "
-              << total_outputs << " > " << MaxOperandsAndOutputsPerFusion();
+              << total_outputs << " > "
+              << MaxOperandsAndOutputsPerFusion(device_description_);
       continue;
     }
 

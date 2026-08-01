@@ -85,7 +85,13 @@ std::vector<HloComputation*> GetFusibleComputations(
     const HloModule& module,
     const absl::flat_hash_set<absl::string_view>& execution_threads);
 
-inline constexpr int64_t MaxOperandsAndOutputsPerFusion() { return 96; }
+inline int64_t MaxOperandsAndOutputsPerFusion(
+    const se::DeviceDescription& device_info) {
+  if (device_info.gpu_compute_capability().IsMetal()) {
+    return 30;
+  }
+  return 96;
+}
 
 // Whether the op transposes the physical data layout. Fusing such ops may lead
 // to uncoalesced data access and may thus not be beneficial.
@@ -141,6 +147,7 @@ bool IsInputFusibleScatter(const HloInstruction& instr);
 // true to enable more fusion.
 FusionDecision FusionFitsInParameterLimit(
     const HloInstruction& instr1, const HloInstruction& instr2,
+    const se::DeviceDescription& device_info,
     bool is_consumer_producer_fusion = false);
 
 // Determines whether the combination of `instr1` and `instr2` into a (possibly

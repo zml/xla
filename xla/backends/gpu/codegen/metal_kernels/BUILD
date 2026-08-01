@@ -55,14 +55,77 @@ embed_files(
     cpp_namespace = "xla::gpu",
 )
 
+embed_files(
+    name = "pagedattention_tiled",
+    srcs = ["vendored/vllm/pagedattention_tiled.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "flash_attn_kernels",
+    srcs = [
+        "custom/flash_attn_prefill.metal",
+        "custom/flash_attn_vec.metal",
+    ],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "paged_attn_vec",
+    srcs = ["custom/paged_attn_vec.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "kv_write",
+    srcs = ["custom/kv_write.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "topk",
+    srcs = ["custom/topk.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "fp8_gemv",
+    srcs = ["custom/fp8_gemv.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "fp8_gemv_pc",
+    srcs = ["custom/fp8_gemv_pc.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "fp8_moe_gemv",
+    srcs = ["custom/fp8_moe_gemv.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "bf16_moe_gemv",
+    srcs = ["custom/bf16_moe_gemv.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "moe_argsort",
+    srcs = ["custom/moe_argsort.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "permute_rows",
+    srcs = ["custom/permute_rows.metal"],
+    cpp_namespace = "xla::gpu",
+)
 
+embed_files(
+    name = "gdn_linear_attention",
+    srcs = ["vendored/vllm/gdn/gdn_linear_attention.metal"],
+    cpp_namespace = "xla::gpu",
+)
