@@ -220,7 +220,15 @@ static bool HasIota(HloSortInstruction* sort, HloInstruction* data) {
     return m::Iota().WithShape(m::Shape().WithElementType(S32).WithDims(dims));
   };
   return Match(sort->operand(1), match_iota(data->shape().dimensions())) ||
-         Match(sort->operand(1), m::Broadcast(match_iota(sort_dims)));
+         Match(sort->operand(1), m::Broadcast(match_iota(sort_dims))) ||
+         // Some frontends (e.g. ZML) build the index operand as a reshape of a
+         // 1-D iota along the sort dimension rather than a broadcast — common
+         // when the sort dimension is the only non-unit dimension (so the
+         // reshape only type-checks when the iota length equals the full
+         // element count, i.e. all other dims are 1, keeping the iota values
+         // aligned to the sort dimension). Recognize that form too so the
+         // sort+slice still lowers to a TopK custom call instead of a full sort.
+         Match(sort->operand(1), m::Reshape(match_iota(sort_dims)));
 }
 
 std::optional<int64_t> TopkRewriter::SortIsInTopK(HloInstruction* inst) {
@@ -246,8 +254,17 @@ std::optional<int64_t> TopkRewriter::SortIsInTopK(HloInstruction* inst) {
   for (HloInstruction* user : sort->users()) {
     const HloInstruction* slice = user;
     if (sort->operand_count() == 2) {
-      if (user->opcode() != HloOpcode::kGetTupleElement ||
-          user->user_count() != 1) {
+      if (user->opcode() != HloOpcode::kGetTupleElement) {
+        supported = false;
+        break;
+      }
+      // A sort output with no consumers (e.g. a top-k that only uses the
+      // indices, like an MoE router that gathers scores separately) shouldn't
+      // block the rewrite.
+      if (user->user_count() == 0) {
+        continue;
+      }
+      if (user->user_count() != 1) {
         supported = false;
         break;
       }
