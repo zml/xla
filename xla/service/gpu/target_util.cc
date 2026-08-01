@@ -55,6 +55,10 @@ namespace {
 // Utility functions to obtain NVPTX/AMDGPU specific information.
 using absl::StrCat;
 
+bool IsMetalAir(llvm::Triple target_triple) {
+  return target_triple.getTriple().rfind("air64", 0) == 0;
+}
+
 // Wrapper structure for carrying llvm intrinsic ids for NVPTX/AMDGPU platforms.
 // On AMDGPU, some of these operations are made as device functions instead of
 // intrinsics. Therefore a variant type is used to wrap the lambda to call
@@ -469,6 +473,13 @@ llvm::CallInst* EmitCallToTargetIntrinsic(
     llvm_intrinsic_or_function = gpu_intrinsic_id.amdgpu_intrinsic_or_function;
   } else if (target_triple.isSPIROrSPIRV()) {
     llvm_intrinsic_or_function = gpu_intrinsic_id.spir_intrinsic_or_function;
+  } else if (IsMetalAir(target_triple)) {
+    LOG(FATAL) << "Metal (air64) reached the legacy LLVM target-intrinsic path "
+                  "(intrinsic id "
+               << static_cast<int>(intrinsic_id)
+               << "); this op must be routed to a native Metal thunk (e.g. "
+                  "metal$sort) or lowered through the MLIR emitter -- refusing "
+                  "to emit NVVM into AIR.";
   } else {
     LOG(FATAL) << "Invalid triple " << target_triple.str();
   }
@@ -500,6 +511,7 @@ void AnnotateFunctionAsGpuKernel(llvm::Module* module, llvm::Function* func,
   } else if (target_triple.isSPIROrSPIRV()) {
     // Attach information so that it can be recognized as a SPIR kernel.
     func->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
+  } else if (IsMetalAir(target_triple)) {
   } else {
     LOG(FATAL) << "Invalid triple " << target_triple.str();
   }

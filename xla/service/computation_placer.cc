@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/runtime/device_id.h"
 #include "xla/service/device_assignment.h"
 #include "xla/stream_executor/platform_id.h"
 

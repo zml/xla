@@ -1979,7 +1979,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
 
   DumpHloModuleIfEnabled(*hlo_module, "before_config_assignment");
 
-  {
+  if (EnableFusionAutotuning()) {
     HloPassPipeline pipeline("autotuner", compilation_stats);
     pipeline.AddPass<FusionWrapper>(
         gpu_topology.gpu_target_config().device_description);

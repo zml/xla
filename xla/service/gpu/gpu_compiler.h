@@ -218,6 +218,8 @@ class GpuCompiler : public LLVMCompiler {
     return absl::OkStatus();
   }
 
+  virtual bool EnableFusionAutotuning() const { return true; }
+
  private:
   struct CompileResultWithMetadata {
     BackendCompileResult backend_result;

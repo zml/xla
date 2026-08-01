@@ -10,12 +10,14 @@ load(
     "@local_config_sycl//sycl:build_defs.bzl",
     "if_sycl_is_configured",
 )
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test", "xla_internal")
 load("//xla/tests:build_defs.bzl", "xla_test")
 load(
     "//xla/tsl:tsl.bzl",
     "if_google",
+    "if_macos",
     "internal_visibility",
     "tsl_copts",
 )
@@ -422,6 +424,22 @@ cc_library(
 )
 
 cc_library(
+    name = "ptx_custom_kernel_emitter_metal",
+    srcs = ["custom_kernel_emitter_metal_stub.cc"],
+    hdrs = ["custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "ptx_custom_kernel_emitter",
     hdrs = ["custom_kernel_emitter.h"],
     tags = ["gpu"],
@@ -431,6 +449,8 @@ cc_library(
         ":ptx_custom_kernel_emitter_rocm",
     ]) + if_sycl_is_configured([
         ":ptx_custom_kernel_emitter_sycl",
+    ]) + if_macos([
+        ":ptx_custom_kernel_emitter_metal",
     ]) + [
         "//xla/hlo/ir:hlo",
         "@com_google_absl//absl/status:statusor",
@@ -488,6 +508,7 @@ cc_library(
         ":kernel_reuse_cache",
         ":launch_dimensions",
         ":matmul_utils",
+        ":metal_custom_calls",
         ":ptx_custom_kernel_emitter",
         ":stream_executor_util",
         ":triton_call",
@@ -536,6 +557,20 @@ cc_library(
         "//xla/backends/gpu/runtime:infeed_thunk",
         "//xla/backends/gpu/runtime:legacy_custom_call_thunk",
         "//xla/backends/gpu/runtime:memset_thunk",
+        "//xla/backends/gpu/runtime:metal_blas_gemm",
+        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_fp8_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_gdn_thunk",
+        "//xla/backends/gpu/runtime:metal_gemm_thunk",
+        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
+        "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_mx_matmul_thunk",
+        "//xla/backends/gpu/runtime:metal_nvfp4_matmul_thunk",
+        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_print_thunk",
+        "//xla/backends/gpu/runtime:metal_sort_thunk",
+        "//xla/backends/gpu/runtime:metal_topk_thunk",
+        "//xla/backends/gpu/runtime:metal_workspace",
         "//xla/backends/gpu/runtime:norm_thunk",
         "//xla/backends/gpu/runtime:outfeed_thunk",
         "//xla/backends/gpu/runtime:ragged_all_to_all_thunk",
@@ -883,6 +918,7 @@ cc_library(
         "//xla/stream_executor/abi:executable_abi_version",
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env_time",
@@ -1570,6 +1606,9 @@ cc_library(
     name = "gpu_transfer_manager",
     srcs = ["gpu_transfer_manager.cc"],
     hdrs = ["gpu_transfer_manager.h"],
+    local_defines = if_macos([
+        "TENSORFLOW_USE_METAL=1",
+    ]),
     deps = [
         ":io_feed_manager",
         ":target_constants",
@@ -1587,7 +1626,7 @@ cc_library(
         "//xla/stream_executor:memory_allocation",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream_executor_h",
-        "//xla/stream_executor/cuda:cuda_platform_id",
+        "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "@com_google_absl//absl/base:core_headers",
@@ -1607,7 +1646,12 @@ cc_library(
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:numbers",
         "@tsl//tsl/platform:statusor",
-    ],
+    ] + if_macos(
+        [],
+        [
+            "//xla/stream_executor/cuda:cuda_platform_id",
+        ],
+    ),
     alwayslink = True,  # Contains per-platform transfer manager registration
 )
 
@@ -1723,6 +1767,7 @@ cc_library(
     hdrs = ["fusion_pipeline.h"],
     deps = [
         ":alias_info",
+        ":gpu_fusible",
         "//xla:xla_proto_cc",
         "//xla/backends/gpu/transforms:conv_canonicalizer",
         "//xla/backends/gpu/transforms:conv_fusion_rewriter",
@@ -3056,6 +3101,7 @@ cc_library(
     hdrs = ["stream_executor_util.h"],
     compatible_with = get_compatible_with_portable(),
     copts = tsl_copts(),
+    local_defines = if_macos(["TENSORFLOW_USE_METAL=1"]),
     deps = [
         ":cublas_cudnn",
         ":launch_dimensions",
@@ -3096,7 +3142,7 @@ cc_library(
         "@tsl//tsl/platform:ml_dtypes",
         "@tsl//tsl/profiler/lib:traceme",
         "@tsl//tsl/profiler/lib:traceme_encode",
-    ],
+    ] + if_macos(["//xla/stream_executor/metal:metal_platform_id"]),
 )
 
 xla_cc_test(
@@ -3875,6 +3921,65 @@ cc_library(
         "//xla/stream_executor/sycl:sycl_platform_id",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+cc_library(
+    name = "metal_gpu_compiler",
+    srcs = [
+        "metal_gpu_compiler_registration.cc",
+    ],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":metal_gpu_compiler_impl",
+        "//xla/service:compiler",
+        "//xla/stream_executor/metal:metal_platform_id",
+    ],
+    alwayslink = True,  # Contains compiler registration
+)
+
+cc_library(
+    name = "metal_gpu_compiler_impl",
+    srcs = ["metal_gpu_compiler.cc"],
+    hdrs = ["metal_gpu_compiler.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        ":gpu_compiler",
+        "//xla/backends/gpu/transforms:metal_fused_scaled_dot_arms",
+        "//xla/service/gpu/llvm_gpu_backend:metal_air_backend",
+        "//xla/stream_executor/metal:metal_subprocess_compilation",
+        ":target_constants",
+        "//xla:shape_util",
+        "//xla:xla_proto_cc",
+        "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_kv_write_thunk",
+        "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
+        "//xla/backends/gpu/runtime:metal_sort_thunk",
+        "//xla/backends/gpu/runtime:metal_topk_thunk",
+        "//xla/backends/gpu/transforms:metal_workspace_rewriter",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/transforms/simplifiers:hlo_dce",
+        "//xla/service:compiler",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/metal:metal_platform_id",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:Support",
         "@llvm-project//llvm:ir_headers",
     ],
 )
