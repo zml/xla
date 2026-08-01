@@ -25,6 +25,7 @@ limitations under the License.
 #include "llvm/IR/Module.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/compiler.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_arms_metal.h"
 #include "xla/service/gpu/gpu_compiler.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/stream_executor/device_description.h"
@@ -59,6 +60,12 @@ class MetalGpuCompiler : public GpuCompiler {
       const HloModule* debug_module, std::optional<int> shard_number) override;
 
   bool RequiresDnnSupport() const override { return false; }
+
+  std::vector<FusedScaledDotArm> FusedScaledDotArms(
+      FusedScaledDotPhase phase, const DebugOptions& debug_options,
+      const GpuTargetConfig& gpu_target_config) const override {
+    return MetalFusedScaledDotArms();
+  }
 
   bool EnableFusionAutotuning() const override { return false; }
 

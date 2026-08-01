@@ -4023,6 +4023,7 @@ cc_library(
     ],
     deps = [
         ":gpu_compiler",
+        "//xla/backends/gpu/transforms:fused_scaled_dot_arms_metal",
         ":metal_air_metadata",
         ":metal_air_toolchain",
         "//xla/backends/gpu/runtime:metal_flash_attn_thunk",
