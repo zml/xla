@@ -447,11 +447,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
   return ThunkSequence{};
 }
 
-ThunkSequence ThunkSequence::Of(std::unique_ptr<Thunk> ir_emitter) {
-  ThunkSequence thunk_sequence;
-  thunk_sequence.push_back(std::move(ir_emitter));
-  return thunk_sequence;
-}
+
 
 AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
   std::vector<AsyncThunkSequence> branch_thunks;
