@@ -115,7 +115,8 @@ static size_t PrefillSmem(int64_t hd) {
 
 void MetalFlashAttnThunk::PrewarmPipeline(se::StreamExecutor* executor,
                                          bool is_prefill, int64_t kv_pos_stride,
-                                         int64_t seqlen, int64_t head_dim) {
+                                         int64_t seqlen, int64_t head_dim,
+                                         int64_t n_kv) {
   auto lib = is_prefill ? CompileMetalSourceToMetallibCached(
                               get_flash_attn_prefill(), HeadDimSubs(head_dim))
                         : CompileMetalSourceToMetallibCached(get_flash_attn_vec(),
@@ -137,13 +138,25 @@ void MetalFlashAttnThunk::PrewarmPipeline(se::StreamExecutor* executor,
     return;
   }
   for (int nsg : {4, 8, 16}) {
-    if (nsg == 8 && seqlen <= 1024) break;
-    if (nsg == 16 && seqlen <= 2048) break;
     const FC fc[] = {{420, FC::Kind::kInt, kv_pos_stride},
                      {421, FC::Kind::kInt, kv_pos_stride},
                      {422, FC::Kind::kInt, nsg},
                      {423, FC::Kind::kInt, 1}};
     metal_exec->LoadKernelWithConstants(*lib, "fa_vec", /*arity=*/7, fc)
+        .IgnoreError();
+  }
+  if (n_kv > 0) {
+    constexpr int kNwgHC = 32;
+    const FC hc_fc[] = {{420, FC::Kind::kInt, kv_pos_stride},
+                        {421, FC::Kind::kInt, kv_pos_stride},
+                        {422, FC::Kind::kInt, n_kv},
+                        {423, FC::Kind::kInt, kNwgHC}};
+    metal_exec->LoadKernelWithConstants(*lib, "fa_vec_hc", /*arity=*/7, hc_fc)
+        .IgnoreError();
+    const FC reduce_fc[] = {{500, FC::Kind::kInt, head_dim},
+                            {501, FC::Kind::kInt, kNwgHC}};
+    metal_exec
+        ->LoadKernelWithConstants(*lib, "fa_vec_reduce", /*arity=*/3, reduce_fc)
         .IgnoreError();
   }
 }

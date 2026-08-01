@@ -20,13 +20,14 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/stream_executor/metal/metal_subprocess_compilation.h"
-#include "xla/backends/gpu/codegen/metal_kernels/fp8_gemm_tiled.h"
 #include "xla/backends/gpu/codegen/metal_kernels/fp8_gemv.h"
-#include "xla/backends/gpu/codegen/metal_kernels/metalblas_shaders.h"
+#include "xla/backends/gpu/codegen/metal_kernels/fp8_gemv_pc.h"
+#include "xla/backends/gpu/codegen/metal_kernels/mlx_kernels.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_args.h"
@@ -46,7 +47,7 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
     ThunkInfo thunk_info, BufferAllocation::Slice x, Shape x_shape,
     BufferAllocation::Slice w, Shape w_shape, BufferAllocation::Slice scale,
     Shape scale_shape, BufferAllocation::Slice out, Shape out_shape, int64_t b,
-    int64_t k, int64_t n)
+    int64_t k, int64_t n, bool per_channel)
     : Thunk(Kind::kCustomCall, std::move(thunk_info)),
       x_(x),
       w_(w),
@@ -58,43 +59,51 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
       out_shape_(std::move(out_shape)),
       b_(b),
       k_(k),
-      n_(n) {}
+      n_(n),
+      per_channel_(per_channel) {}
 
 absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
-  if (kernel_ != nullptr && kernel_tiled_ != nullptr && kernel_steel_ != nullptr)
-    return absl::OkStatus();
+  if (kernel_ != nullptr) return absl::OkStatus();
+
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
 
-  {
-    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
-                        CompileMetalSourceToMetallibCached(get_fp8_gemv()));
-    TF_ASSIGN_OR_RETURN(
-        kernel_,
-        metal_exec->LoadKernelWithConstants(lib, "fp8_gemv", /*arity=*/5, {}));
-  }
-  {
-    TF_ASSIGN_OR_RETURN(
-        std::vector<uint8_t> lib,
-        CompileMetalSourceToMetallibCached(get_fp8_gemm_tiled()));
-    TF_ASSIGN_OR_RETURN(kernel_tiled_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_gemm_tiled", /*arity=*/5, {}));
-  }
-  {
-    TF_ASSIGN_OR_RETURN(
-        std::vector<uint8_t> lib,
-        CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
-    TF_ASSIGN_OR_RETURN(kernel_steel_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_qmm_t", /*arity=*/5, {}));
+  const bool gemv = (b_ == 1);
+  const int64_t vecs = wide_vecs();
+  const bool f32_scale = scale_shape_.element_type() == F32;
+  std::string entry;
+  absl::string_view source;
+  if (per_channel_) {
+    if (gemv) {
+      entry = "fp8_gemv_pc";
+    } else if (vecs != 0) {
+      entry = "fp8_gemv_pc_wide_" + std::to_string(vecs);
+    } else {
+      entry = b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc";
+    }
+    if (f32_scale) entry += "_f32";
+    source = (gemv || vecs != 0) ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
+  } else {
+    entry = gemv ? "fp8_gemv" : (b_ > 16 ? "fp8_qmm_t_bm64" : "fp8_qmm_t");
+    source = gemv ? get_fp8_gemv() : get_mlx_steel_qgemm();
   }
 
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
+                      CompileMetalSourceToMetallibCached(source));
+  TF_ASSIGN_OR_RETURN(
+      kernel_, metal_exec->LoadKernelWithConstants(lib, entry, /*arity=*/5, {}));
+
+  // dims.w is the K block count for block-128 and the scale row stride for
+  // per-channel, negative for a whole-tensor scale; zero would collide with a
+  // real stride.
+  const int32_t scale_w =
+      per_channel_ ? (scale_shape_.dimensions(0) == n_ ? 1 : -1)
+                   : static_cast<int32_t>(k_ / 128);
   const int32_t dims[4] = {static_cast<int32_t>(b_), static_cast<int32_t>(k_),
-                           static_cast<int32_t>(n_),
-                           static_cast<int32_t>(k_ / 128)};
+                           static_cast<int32_t>(n_), scale_w};
   p_dims_ = executor->Allocate(sizeof(dims), 0);
   if (p_dims_.opaque() == nullptr) {
-    return absl::ResourceExhaustedError("zml$fp8_gemv: dims alloc failed.");
+    return absl::ResourceExhaustedError(
+        "zml$scaled_matmul (FP8): dims alloc failed.");
   }
   TF_RETURN_IF_ERROR(executor->SynchronousMemcpy(&p_dims_, dims, sizeof(dims)));
 
@@ -109,8 +118,6 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   absl::MutexLock lock(&mu_);
   if (executor_ != executor) {
     kernel_ = nullptr;
-    kernel_tiled_ = nullptr;
-    kernel_steel_ = nullptr;
     TF_RETURN_IF_ERROR(EnsureLoaded(executor));
     executor_ = executor;
   }
@@ -122,16 +129,21 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(allocs.GetDeviceAddress(out_));    // 3  out
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
-  if (b_ == 1) {
+  const int64_t vecs = wide_vecs();
+  if (b_ == 1 || vecs != 0) {
+    const int64_t rpg = rows_per_group();
+    const uint64_t groups = static_cast<uint64_t>((n_ + rpg - 1) / rpg);
+    const uint64_t ygroups =
+        vecs != 0 ? static_cast<uint64_t>((b_ + vecs - 1) / vecs) : 1;
     return kernel_->Launch(se::ThreadDim(256, 1, 1),
-                           se::BlockDim(static_cast<uint64_t>(n_), 1, 1), stream,
-                           args);
+                           se::BlockDim(groups, ygroups, 1), stream, args);
   }
-  constexpr int64_t kSteelBM = 16, kSteelBN = 64;
-  return kernel_steel_->Launch(
+  constexpr int64_t kBN = 64;
+  const int64_t bm = b_ > 16 ? 64 : 16;
+  return kernel_->Launch(
       se::ThreadDim(32, 2, 2),
-      se::BlockDim(static_cast<uint64_t>((n_ + kSteelBN - 1) / kSteelBN),
-                   static_cast<uint64_t>((b_ + kSteelBM - 1) / kSteelBM), 1),
+      se::BlockDim(static_cast<uint64_t>((n_ + kBN - 1) / kBN),
+                   static_cast<uint64_t>((b_ + bm - 1) / bm), 1),
       stream, args);
 }
 

@@ -55,7 +55,7 @@ class MetalFlashAttnThunk : public Thunk {
 
   static void PrewarmPipeline(stream_executor::StreamExecutor* executor,
                               bool is_prefill, int64_t kv_pos_stride,
-                              int64_t seqlen, int64_t head_dim);
+                              int64_t seqlen, int64_t head_dim, int64_t n_kv);
 
  private:
   absl::Status EnsureFaVecMain(stream_executor::StreamExecutor* executor, int idx)

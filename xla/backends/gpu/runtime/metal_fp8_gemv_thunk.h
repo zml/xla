@@ -38,7 +38,7 @@ class MetalFp8GemvThunk : public Thunk {
                     Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice out, Shape out_shape, int64_t b,
-                    int64_t k, int64_t n);
+                    int64_t k, int64_t n, bool per_channel);
 
   MetalFp8GemvThunk(const MetalFp8GemvThunk&) = delete;
   MetalFp8GemvThunk& operator=(const MetalFp8GemvThunk&) = delete;
@@ -51,15 +51,28 @@ class MetalFp8GemvThunk : public Thunk {
   absl::Status EnsureLoaded(stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  // Must equal kROWS in custom/fp8_gemv_pc.metal.
+  int64_t rows_per_group() const { return per_channel_ ? 2 : 1; }
+
+  // Rows of x one wide threadgroup carries, and the largest batch served by
+  // the wide kernel at all.
+  static constexpr int64_t kMaxVecs = 10;
+  static constexpr int64_t kWideMaxBatch = 12;
+
+  int64_t wide_vecs() const {
+    if (!per_channel_ || b_ < 2 || b_ > kWideMaxBatch) return 0;
+    const int64_t tiles = (b_ + kMaxVecs - 1) / kMaxVecs;
+    return (b_ + tiles - 1) / tiles;
+  }
+
   const BufferAllocation::Slice x_, w_, scale_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, out_shape_;
   const int64_t b_, k_, n_;
+  const bool per_channel_;
 
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_tiled_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
 
   stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
 };

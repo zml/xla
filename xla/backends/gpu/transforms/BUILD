@@ -2280,6 +2280,7 @@ cc_library(
         "//xla/service/gpu:cublas_cudnn",
         "//xla/service/gpu:ir_emission_utils",
         "//xla/service/gpu:matmul_utils",
+        "//xla/service/gpu:metal_custom_calls",
         "//xla/service/gpu:reduction_utils",
         "//xla/service/gpu:stream_executor_util",
         "//xla/stream_executor:device_description",
@@ -2298,6 +2299,23 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "metal_workspace_rewriter",
+    srcs = ["metal_workspace_rewriter.cc"],
+    hdrs = ["metal_workspace_rewriter.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:metal_custom_calls",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -2324,6 +2342,21 @@ xla_cc_test(
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_workspace_rewriter_test",
+    srcs = ["metal_workspace_rewriter_test.cc"],
+    deps = [
+        ":metal_workspace_rewriter",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -3056,6 +3089,24 @@ cc_library(
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "metal_fused_scaled_dot_arms",
+    srcs = ["metal_fused_scaled_dot_arms.cc"],
+    hdrs = ["metal_fused_scaled_dot_arms.h"],
+    deps = [
+        ":fused_scaled_dot_rewriter",
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:metal_custom_calls",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -4348,6 +4399,27 @@ xla_cc_test(
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_fused_scaled_dot_arms_test",
+    srcs = ["metal_fused_scaled_dot_arms_test.cc"],
+    deps = [
+        ":metal_fused_scaled_dot_arms",
+        ":fused_scaled_dot_rewriter",
+        ":scaled_dot_rewriter",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:metal_custom_calls",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],

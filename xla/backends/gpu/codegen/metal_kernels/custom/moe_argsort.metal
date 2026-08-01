@@ -5,25 +5,28 @@ kernel void moe_argsort(
     device const int* expert_ids [[buffer(0)]],   // [R]
     device       int* order      [[buffer(1)]],   // [R] out
     device       int* idx_sorted [[buffer(2)]],   // [R] out
-    constant int3&    dims        [[buffer(3)]],
-    device const int* num_tokens  [[buffer(4)]],   // [1] real prompt length
+    constant int4&    dims        [[buffer(3)]],   // {R, E, unused, unused}
     uint tid [[thread_index_in_threadgroup]])
 {
-    const int R = min(dims.x, num_tokens[0] * dims.z);  // R_active
-    const int E = dims.y;            // <= 256
+    const int R_total = max(dims.x, 0);
+    const int E = dims.y;
+    const bool supported = E > 0 && E <= 256;
+    const uint R = supported ? uint(R_total) : 0u;
     threadgroup atomic_int count[256];
     threadgroup int        offset[256];
     threadgroup atomic_int cursor[256];
 
-    if (int(tid) < E)
-        atomic_store_explicit(&count[tid], 0, memory_order_relaxed);
+    atomic_store_explicit(&count[tid], 0, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int r = int(tid); r < R; r += 256)
-        atomic_fetch_add_explicit(&count[expert_ids[r]], 1, memory_order_relaxed);
+    for (uint r = tid; r < R; r += 256) {
+        const int e = expert_ids[r];
+        const int bucket = (e >= 0 && e < E) ? e : 0;
+        atomic_fetch_add_explicit(&count[bucket], 1, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0) {
+    if (tid == 0 && supported) {
         int acc = 0;
         for (int e = 0; e < E; e++) {
             offset[e] = acc;
@@ -31,28 +34,17 @@ kernel void moe_argsort(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (int(tid) < E)
+    if (supported && int(tid) < E)
         atomic_store_explicit(&cursor[tid], offset[tid], memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int r = int(tid); r < R; r += 256) {
-        int e = expert_ids[r];
-        int pos = atomic_fetch_add_explicit(&cursor[e], 1, memory_order_relaxed);
-        order[pos] = r;
-        idx_sorted[pos] = e;
+    for (uint r = tid; r < R; r += 256) {
+        const int e = expert_ids[r];
+        const bool valid = e >= 0 && e < E;
+        const int bucket = valid ? e : 0;
+        const int pos = atomic_fetch_add_explicit(
+            &cursor[bucket], 1, memory_order_relaxed);
+        order[pos] = int(r);
+        idx_sorted[pos] = valid ? e : 0;
     }
-}
-
-kernel void moe_steel_grid(
-    device const int* num_tokens [[buffer(0)]],   // [1] real prompt length
-    constant int4&    args        [[buffer(1)]],   // {R, n_tiles, top_k, BM}
-    device       uint* grid_out   [[buffer(2)]],   // {gx, gy, gz}
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid != 0) return;
-    const int R = args.x, n_tiles = args.y, top_k = args.z, BM = args.w;
-    const int r_active = min(R, num_tokens[0] * top_k);
-    grid_out[0] = (uint)n_tiles;                         // gx = N-tiles (fixed)
-    grid_out[1] = (uint)((r_active + BM - 1) / BM);      // gy = active M-tiles
-    grid_out[2] = 1u;
 }

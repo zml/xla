@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_GPU_RUNTIME_METAL_MOE_GEMV_THUNK_H_
-#define XLA_BACKENDS_GPU_RUNTIME_METAL_MOE_GEMV_THUNK_H_
+#ifndef XLA_BACKENDS_GPU_RUNTIME_METAL_NVFP4_MATMUL_THUNK_H_
+#define XLA_BACKENDS_GPU_RUNTIME_METAL_NVFP4_MATMUL_THUNK_H_
 
 #include <cstdint>
 #include <memory>
@@ -32,19 +32,19 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-class MetalMoeGemvThunk : public Thunk {
+class MetalNvfp4MatmulThunk : public Thunk {
  public:
-  MetalMoeGemvThunk(ThunkInfo thunk_info, BufferAllocation::Slice x,
-                    Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
-                    BufferAllocation::Slice scale, Shape scale_shape,
-                    BufferAllocation::Slice expert_id, Shape expert_id_shape,
-                    BufferAllocation::Slice out, Shape out_shape,
-                    BufferAllocation::Slice workspace, Shape workspace_shape,
-                    int64_t r, int64_t k, int64_t n);
-  ~MetalMoeGemvThunk() override;
+  MetalNvfp4MatmulThunk(ThunkInfo thunk_info, BufferAllocation::Slice x,
+                        Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
+                        BufferAllocation::Slice scale, Shape scale_shape,
+                        BufferAllocation::Slice out, Shape out_shape,
+                        BufferAllocation::Slice workspace,
+                        Shape workspace_shape, int64_t m, int64_t k, int64_t n,
+                        char arch_size, int arch_gen);
+  ~MetalNvfp4MatmulThunk() override;
 
-  MetalMoeGemvThunk(const MetalMoeGemvThunk&) = delete;
-  MetalMoeGemvThunk& operator=(const MetalMoeGemvThunk&) = delete;
+  MetalNvfp4MatmulThunk(const MetalNvfp4MatmulThunk&) = delete;
+  MetalNvfp4MatmulThunk& operator=(const MetalNvfp4MatmulThunk&) = delete;
 
   absl::Status ExecuteOnStream(const ExecuteParams& params) override;
   absl::StatusOr<ThunkProto> ToProto() const override;
@@ -57,10 +57,13 @@ class MetalMoeGemvThunk : public Thunk {
       stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_;
-  const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_,
-      workspace_shape_;
-  const int64_t r_, k_, n_;
+  const BufferAllocation::Slice x_, w_, scale_, out_, workspace_;
+  const Shape x_shape_, w_shape_, scale_shape_, out_shape_, workspace_shape_;
+  const int64_t m_, k_, n_;
+  // Compile-time target architecture, not the executing device, so runtime
+  // selection cannot disagree with the workspace planned before buffer assignment.
+  const char arch_size_;
+  const int arch_gen_;
 
   absl::Mutex mu_;
   absl::flat_hash_map<stream_executor::StreamExecutor*,
@@ -71,4 +74,4 @@ class MetalMoeGemvThunk : public Thunk {
 }  // namespace gpu
 }  // namespace xla
 
-#endif  // XLA_BACKENDS_GPU_RUNTIME_METAL_MOE_GEMV_THUNK_H_
+#endif  // XLA_BACKENDS_GPU_RUNTIME_METAL_NVFP4_MATMUL_THUNK_H_
