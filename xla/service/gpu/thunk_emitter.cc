@@ -859,7 +859,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
           instr, ir_emitter_context_->GetNextThunkId()),
       std::move(*launch), ga, g_lhs_shape, gb, g_rhs_shape, c, out_shape,
       num_tokens, num_tokens_shape);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPrintThunk(
@@ -876,7 +876,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPrintThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       std::move(label), slice, operand->shape());
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFlashAttnThunk(
@@ -1021,7 +1021,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFlashAttnThunk(
       q, q_shape, k, k_shape, v, v_shape, tok, tok_shape, out, out_shape, n_kv,
       n_groups, seqlen, hd, kv_position_major, kv_full_cache, layer,
       layer_shape, num_tokens, num_tokens_shape, tok_host_coherent);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
@@ -1147,7 +1147,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
       num_kv_heads, head_dim, block_size, num_seqs, max_num_blocks_per_seq,
       total_q_tokens, scale, softcapping, sliding_window, is_causal,
       q_shape.element_type());
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
@@ -1250,7 +1250,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
       q, q_shape, k, k_shape, v, v_shape, g, g_shape, beta, beta_shape, h0,
       h0_shape, cu_seqlens, cu_seqlens_shape, slot_mapping, slot_mapping_shape,
       y, y_shape, ht, ht_shape, num_seqs, hk, hv, dk, dv, et);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
@@ -1313,7 +1313,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, b, k, n);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
@@ -1480,7 +1480,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
       out, out_shape, r, k, n, moe_num_tokens, moe_num_tokens_shape, moe_top_k);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalKvWriteThunk(
@@ -1520,7 +1520,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalKvWriteThunk(
       v_cache, instr->operand(2)->shape(), v_new, instr->operand(3)->shape(),
       slot, instr->operand(4)->shape(), pos, instr->operand(5)->shape(), freq,
       instr->operand(6)->shape(), num_slots, kv_heads, head_dim);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalSortThunk(
@@ -1554,7 +1554,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalSortThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       data, out_vals, out_idxs, dtype, rows, n, descending);
-  return GetThunkSequence(std::move(thunk));
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunkF8(
@@ -2240,7 +2240,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
         << "Metal TopK expects 3 buffers (data, vals, idxs).";
     Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
         instr, ir_emitter_context_->GetNextThunkId());
-    return GetThunkSequence(std::make_unique<MetalTopKThunk>(
+    return ThunkSequence::Of(std::make_unique<MetalTopKThunk>(
         std::move(thunk_info), args[0].slice(), args[1].slice(),
         args[2].slice(), dtype, batch_size, n, k));
   }
