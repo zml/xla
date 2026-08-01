@@ -18,6 +18,7 @@
 load("@bazel_skylib//lib:new_sets.bzl", "sets")
 load("@com_google_protobuf//bazel/common:proto_info.bzl", "ProtoInfo")
 load("//xla/tsl:package_groups.bzl", "DEFAULT_LOAD_VISIBILITY")
+load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 visibility(DEFAULT_LOAD_VISIBILITY)
 
@@ -128,5 +129,102 @@ def text_to_binary_proto(
         deps = proto_deps or [],
         descriptor_set = descriptor_set,
         proto_name = proto_name,
+        **kwargs
+    )
+
+def embed_files(name, srcs, cpp_namespace = "", compatible_with = None, **kwargs):
+    """Compiles srcs into a cc_library with functions returning embedded file data.
+
+    Example:
+        embed_files(
+            name = "embed_some_file",
+            srcs = ["file1.txt", "file2.txt"],
+            cpp_namespace = "my_namespace",
+        )
+
+    will generate a cc_library with the following functions:
+
+        const std::string& get_file1();
+        const std::string& get_file2();
+
+    Args:
+        name: name for the generated cc_library target
+        srcs: files to embed
+        cpp_namespace: If set, the generated code will be wrapped in this namespace
+        compatible_with: The `compatible_with` attribute to pass to the generated targets.
+        **kwargs: keyword arguments passed onto the generated cc_library() rule.
+    """
+
+    namespace_open = ""
+    namespace_close = ""
+    if cpp_namespace:
+        namespace_open = "namespace " + cpp_namespace + " { "
+        namespace_close = "}  // namespace " + cpp_namespace + "\n"
+
+    native.genrule(
+        name = name + "_gen",
+        srcs = srcs,
+        outs = [
+            name + ".cc",
+            name + ".h",
+        ],
+        tools = ["@xxd//:xxd"],
+        cmd = """
+            HDR_OUT=$(location {name}.h)
+            CC_OUT=$(location {name}.cc)
+            GUARD="{guard}"
+
+            echo "#ifndef $${{GUARD}}" > "$${{HDR_OUT}}"
+            echo "#define $${{GUARD}}" >> "$${{HDR_OUT}}"
+            echo "#include <string>" >> "$${{HDR_OUT}}"
+            echo "" >> "$${{HDR_OUT}}"
+            echo "{namespace_open}" >> "$${{HDR_OUT}}"
+
+            echo "#include <cstddef>" > "$${{CC_OUT}}"
+            echo "#include <string>" >> "$${{CC_OUT}}"
+            echo '#include "{name}.h"' >> "$${{CC_OUT}}"
+            echo "" >> "$${{CC_OUT}}"
+            echo "{namespace_open}" >> "$${{CC_OUT}}"
+
+            for src in $(SRCS); do
+                FILENAME=$$(basename "$${{src}}")
+                STEM=$$(echo "$${{FILENAME}}" | sed 's/\\.[^.]*$$//')
+                SAFE_STEM=$$(echo "$${{STEM}}" | sed 's/[^a-zA-Z0-9_]/_/g')
+                FUNC_NAME="get_$${{SAFE_STEM}}"
+                VAR_NAME="$${{SAFE_STEM}}_data"
+
+                echo "const std::string& $${{FUNC_NAME}}();" >> "$${{HDR_OUT}}"
+
+                $(location @xxd//:xxd) -i "$${{src}}" | \
+                sed -e "s/^unsigned char [^[]*/static const unsigned char $${{VAR_NAME}}/" \
+                    -e "s/^unsigned int .*_len/static const size_t $${{VAR_NAME}}_size/" \
+                    >> "$${{CC_OUT}}"
+                echo "" >> "$${{CC_OUT}}"
+
+                echo "const std::string& $${{FUNC_NAME}}() {{" >> "$${{CC_OUT}}"
+                echo "  static const std::string* const kInstance = new std::string(" >> "$${{CC_OUT}}"
+                echo "      reinterpret_cast<const char*>($${{VAR_NAME}}), $${{VAR_NAME}}_size);" >> "$${{CC_OUT}}"
+                echo "  return *kInstance;" >> "$${{CC_OUT}}"
+                echo "}}" >> "$${{CC_OUT}}"
+                echo "" >> "$${{CC_OUT}}"
+            done
+
+            echo "{namespace_close}" >> "$${{HDR_OUT}}"
+            echo "{namespace_close}" >> "$${{CC_OUT}}"
+            echo "#endif  // $${{GUARD}}" >> "$${{HDR_OUT}}"
+        """.format(
+            name = name,
+            guard = name.upper() + "_H_",
+            namespace_open = namespace_open,
+            namespace_close = namespace_close,
+        ),
+        compatible_with = compatible_with,
+    )
+
+    cc_library(
+        name = name,
+        srcs = [name + ".cc"],
+        hdrs = [name + ".h"],
+        compatible_with = compatible_with,
         **kwargs
     )

@@ -87,6 +87,14 @@ struct OwningCudaCubinInMemory {
   std::vector<uint8_t> cubin_bytes;
 };
 
+struct MetalLibraryInMemory {
+  absl::Span<const uint8_t> metallib_bytes;
+};
+
+struct OwningMetalLibraryInMemory {
+  std::vector<uint8_t> metallib_bytes;
+};
+
 // Describes how to load a kernel on any subset of a number of target platforms.
 class KernelLoaderSpec {
  public:
@@ -120,6 +128,10 @@ class KernelLoaderSpec {
     return std::holds_alternative<CudaPtxInMemory>(payload_) ||
            std::holds_alternative<OwningCudaPtxInMemory>(payload_);
   }
+  bool has_metal_library_in_memory() const {
+    return std::holds_alternative<MetalLibraryInMemory>(payload_) ||
+           std::holds_alternative<OwningMetalLibraryInMemory>(payload_);
+  }
 
   // Accessors for platform variant kernel load specifications.
   std::optional<InProcessSymbol> in_process_symbol() const {
@@ -150,6 +162,17 @@ class KernelLoaderSpec {
     return std::nullopt;
   }
 
+  std::optional<MetalLibraryInMemory> metal_library_in_memory() const {
+    if (std::holds_alternative<MetalLibraryInMemory>(payload_)) {
+      return std::get<MetalLibraryInMemory>(payload_);
+    }
+    if (std::holds_alternative<OwningMetalLibraryInMemory>(payload_)) {
+      return MetalLibraryInMemory{
+          std::get<OwningMetalLibraryInMemory>(payload_).metallib_bytes};
+    }
+    return std::nullopt;
+  }
+
   // Use these factory functions to create a spec of any supported type.
   //
   // Note that the kernel_name parameter must be consistent with the kernel in
@@ -174,6 +197,13 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateOwningCudaPtxInMemorySpec(
       std::string ptx, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateMetalLibraryInMemorySpec(
+      absl::Span<const uint8_t> metallib_bytes, std::string kernel_name,
+      size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateOwningMetalLibraryInMemorySpec(
+      std::vector<uint8_t> metallib_bytes, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
 
   void set_kernel_args_packing(KernelArgsPacking kernel_args_packing) {
     kernel_args_packing_ = std::move(kernel_args_packing);
@@ -197,7 +227,8 @@ class KernelLoaderSpec {
  private:
   using Payload =
       std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory>;
+                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
+                   MetalLibraryInMemory, OwningMetalLibraryInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

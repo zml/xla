@@ -60,6 +60,13 @@ static absl::StatusOr<ExecutableAbiVersion> CreateForOneAPI(
   return ExecutableAbiVersion::FromProto(std::move(proto));
 }
 
+static absl::StatusOr<ExecutableAbiVersion> CreateForMetal(
+    const DeviceDescription& /*device_description*/) {
+  ExecutableAbiVersionProto proto;
+  proto.set_platform_name("METAL");
+  return ExecutableAbiVersion::FromProto(std::move(proto));
+}
+
 absl::StatusOr<ExecutableAbiVersion> ExecutableAbiVersion::FromProto(
     const ExecutableAbiVersionProto& proto) {
   return ExecutableAbiVersion(proto);
@@ -75,6 +82,9 @@ ExecutableAbiVersion::FromDeviceDescription(
   }
   if (device_description.gpu_compute_capability().IsOneAPI()) {
     return CreateForOneAPI(device_description);
+  }
+  if (device_description.gpu_compute_capability().IsMetal()) {
+    return CreateForMetal(device_description);
   }
 
   return absl::UnimplementedError(
