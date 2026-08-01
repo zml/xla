@@ -858,7 +858,8 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
   // parallelizing the z dimension (major reduced dimensions). The general
   // recommendation is to use between 128 and 512 threads, so we just go for
   // 256. See https://forums.developer.nvidia.com/t/55529
-  constexpr int64_t kThreadsPerBlockTarget = 256;
+  const int64_t kThreadsPerBlockTarget =
+      analysis_.device_info().gpu_compute_capability().IsMetal() ? 512 : 256;
   if (num_threads_reduced * 2 <= kThreadsPerBlockTarget) {
     int64_t kept_size = reduction_dimensions_.dimensions[kRowKept];
     // Increase the size of the y dimension as long as there's remaining

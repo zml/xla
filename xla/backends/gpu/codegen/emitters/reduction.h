@@ -65,6 +65,11 @@ class ReductionFusion : public MlirKernelEmitter {
 
   const ReductionGroups& GetGroups() const { return groups_; }
 
+  bool HasContiguousRowGrid() const {
+    if (!reduction_dimensions_.is_row_reduction) return false;
+    return num_blocks_.size() < 2 || num_blocks_[1] == 1;
+  }
+
  protected:
   struct EmitterState;
   friend struct EmitterState;

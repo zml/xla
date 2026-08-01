@@ -39,14 +39,19 @@ limitations under the License.
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/AMDGPU/Utils/Chipset.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -63,6 +68,334 @@ limitations under the License.
 
 namespace xla {
 namespace emitters {
+
+void InjectAirThreadPositions(mlir::ModuleOp module_op) {
+  mlir::OpBuilder builder(module_op.getContext());
+  mlir::Type i32 = builder.getI32Type();
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (!fn->hasAttr("xla.entry") || fn.getBody().empty()) {
+      return;
+    }
+    unsigned tid_index = fn.getNumArguments();
+    auto role_attrs = [&](const char* role) {
+      return builder.getDictionaryAttr({builder.getNamedAttr(
+          "xla.air_role", builder.getStringAttr(role))});
+    };
+    mlir::Location loc = fn.getLoc();
+    fn.insertArgument(tid_index, i32,
+                      role_attrs("thread_position_in_threadgroup"), loc);
+    fn.insertArgument(tid_index + 1, i32,
+                      role_attrs("threadgroup_position_in_grid"), loc);
+    mlir::Value tid = fn.getArgument(tid_index);
+    mlir::Value tgid = fn.getArgument(tid_index + 1);
+
+    llvm::SmallVector<mlir::Operation*> to_erase;
+    fn.walk([&](mlir::Operation* op) {
+      mlir::Value src;
+      bool is_x = false;
+      if (auto t = mlir::dyn_cast<mlir::gpu::ThreadIdOp>(op)) {
+        is_x = t.getDimension() == mlir::gpu::Dimension::x;
+        src = tid;
+      } else if (auto b = mlir::dyn_cast<mlir::gpu::BlockIdOp>(op)) {
+        is_x = b.getDimension() == mlir::gpu::Dimension::x;
+        src = tgid;
+      } else {
+        return;
+      }
+      mlir::OpBuilder b(op);
+      mlir::Value idx =
+          is_x ? b.create<mlir::arith::IndexCastOp>(op->getLoc(),
+                                                    b.getIndexType(), src)
+                     .getResult()
+               : b.create<mlir::arith::ConstantIndexOp>(op->getLoc(), 0)
+                     .getResult();
+      op->getResult(0).replaceAllUsesWith(idx);
+      to_erase.push_back(op);
+    });
+    for (mlir::Operation* op : to_erase) {
+      op->erase();
+    }
+  });
+}
+
+void PromoteEntryBuffersToDevice(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto ptr1 = mlir::LLVM::LLVMPointerType::get(ctx, /*addressSpace=*/1);
+  auto addr_space_of = [](mlir::Type t) -> int {
+    auto p = mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(t);
+    return p ? static_cast<int>(p.getAddressSpace()) : -1;
+  };
+  mlir::SymbolTable symtab(module_op);
+
+  auto promote_param = [&](mlir::func::FuncOp fn, unsigned i) {
+    llvm::SmallVector<mlir::Type> inputs(fn.getFunctionType().getInputs());
+    inputs[i] = ptr1;
+    fn.setType(mlir::FunctionType::get(ctx, inputs,
+                                       fn.getFunctionType().getResults()));
+    if (!fn.getBody().empty()) {
+      fn.getBody().front().getArgument(i).setType(ptr1);
+    }
+  };
+
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (!fn->hasAttr("xla.entry") || fn.getBody().empty()) return;
+    auto inputs = fn.getFunctionType().getInputs();
+    for (unsigned i = 0; i < inputs.size(); ++i) {
+      if (addr_space_of(inputs[i]) == 0) promote_param(fn, i);
+    }
+  });
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    module_op.walk([&](mlir::LLVM::GEPOp gep) {
+      if (addr_space_of(gep.getBase().getType()) == 1 &&
+          addr_space_of(gep.getResult().getType()) == 0) {
+        gep.getResult().setType(ptr1);
+        changed = true;
+      }
+    });
+    module_op.walk([&](mlir::func::CallOp call) {
+      auto callee = symtab.lookup<mlir::func::FuncOp>(call.getCallee());
+      if (!callee || callee.getBody().empty()) return;
+      auto params = callee.getFunctionType().getInputs();
+      auto args = call.getArgOperands();
+      for (unsigned i = 0; i < args.size() && i < params.size(); ++i) {
+        if (addr_space_of(args[i].getType()) == 1 &&
+            addr_space_of(params[i]) == 0) {
+          promote_param(callee, i);
+          changed = true;
+        }
+      }
+    });
+    module_op.walk([&](mlir::UnrealizedConversionCastOp ucc) {
+      if (ucc.getNumResults() != 1 || ucc.getInputs().size() != 1) return;
+      if (addr_space_of(ucc.getResult(0).getType()) != 0) return;
+      mlir::Value v = ucc.getInputs()[0];
+      while (auto def = v.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (def.getInputs().size() != 1) return;
+        v = def.getInputs()[0];
+      }
+      if (addr_space_of(v.getType()) == 1) {
+        ucc.getResult(0).setType(ptr1);
+        changed = true;
+      }
+    });
+  }
+}
+
+void RewriteGpuWarpOpsToAir(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto i16 = mlir::IntegerType::get(ctx, 16);
+  auto i32 = mlir::IntegerType::get(ctx, 32);
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto void_ty = mlir::LLVM::LLVMVoidType::get(ctx);
+
+  auto get_or_insert = [&](llvm::StringRef name, mlir::Type result,
+                           llvm::ArrayRef<mlir::Type> args)
+      -> mlir::LLVM::LLVMFuncOp {
+    if (auto f = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) {
+      return f;
+    }
+    mlir::OpBuilder b = mlir::OpBuilder::atBlockBegin(module_op.getBody());
+    auto fty = mlir::LLVM::LLVMFunctionType::get(result, args,
+                                                 /*isVarArg=*/false);
+    return b.create<mlir::LLVM::LLVMFuncOp>(module_op.getLoc(), name, fty);
+  };
+
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (!fn->hasAttr("xla.entry") || fn.getBody().empty()) {
+      return;
+    }
+    llvm::SmallVector<mlir::Operation*> to_erase;
+    fn.walk([&](mlir::Operation* op) {
+      if (auto bar = mlir::dyn_cast<mlir::gpu::BarrierOp>(op)) {
+        mlir::OpBuilder b(op);
+        auto fn_barrier = get_or_insert("air.wg.barrier", void_ty, {i32, i32});
+        mlir::Value c2 = b.create<mlir::LLVM::ConstantOp>(
+            op->getLoc(), i32, b.getI32IntegerAttr(2));
+        mlir::Value c1 = b.create<mlir::LLVM::ConstantOp>(
+            op->getLoc(), i32, b.getI32IntegerAttr(1));
+        b.create<mlir::LLVM::CallOp>(op->getLoc(), fn_barrier,
+                                     mlir::ValueRange{c2, c1});
+        to_erase.push_back(op);
+      } else if (auto shf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(op)) {
+        mlir::Type vty = shf.getValue().getType();
+        // i32 goes through the f32 shuffle builtin by bitcast: an i32 spelling of the
+        // builtin creates a pipeline whether or not it is correct.
+        if (shf.getMode() != mlir::gpu::ShuffleMode::DOWN ||
+            (vty != f32 && vty != i32)) {
+          return;
+        }
+        mlir::OpBuilder b(op);
+        mlir::Value in = shf.getValue();
+        if (vty == i32) {
+          in = b.create<mlir::arith::BitcastOp>(op->getLoc(), f32, in);
+        }
+        mlir::Value delta =
+            b.create<mlir::arith::TruncIOp>(op->getLoc(), i16, shf.getOffset());
+        auto fn_shuffle =
+            get_or_insert("air.simd_shuffle_down.f32", f32, {f32, i16});
+        mlir::Value res =
+            b.create<mlir::LLVM::CallOp>(op->getLoc(), fn_shuffle,
+                                         mlir::ValueRange{in, delta})
+                .getResult();
+        if (vty == i32) {
+          res = b.create<mlir::arith::BitcastOp>(op->getLoc(), i32, res);
+        }
+        shf.getShuffleResult().replaceAllUsesWith(res);
+        mlir::Value vtrue =
+            b.create<mlir::arith::ConstantOp>(op->getLoc(), b.getBoolAttr(true));
+        shf.getValid().replaceAllUsesWith(vtrue);
+        to_erase.push_back(op);
+      }
+    });
+    for (mlir::Operation* op : to_erase) {
+      op->erase();
+    }
+  });
+}
+
+void RewriteMathToAir(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto f32 = mlir::Float32Type::get(ctx);
+  auto decl = [&](llvm::StringRef name, unsigned nargs) -> mlir::LLVM::LLVMFuncOp {
+    if (auto f = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) return f;
+    mlir::OpBuilder b = mlir::OpBuilder::atBlockBegin(module_op.getBody());
+    llvm::SmallVector<mlir::Type> args(nargs, f32);
+    return b.create<mlir::LLVM::LLVMFuncOp>(
+        module_op.getLoc(), name,
+        mlir::LLVM::LLVMFunctionType::get(f32, args, /*isVarArg=*/false));
+  };
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (fn.getBody().empty()) return;  // entry AND reducer clones (see above).
+    llvm::SmallVector<mlir::Operation*> to_erase;
+    fn.walk([&](mlir::Operation* op) {
+      mlir::OpBuilder b(op);
+      auto emit = [&](llvm::StringRef name, mlir::ValueRange args,
+                      mlir::Value result) {
+        mlir::Type rt = result.getType();
+        const bool narrow = rt.isF16() || rt.isBF16();
+        if (!rt.isF32() && !narrow) return false;
+        llvm::SmallVector<mlir::Value> f32args;
+        f32args.reserve(args.size());
+        for (mlir::Value a : args) {
+          f32args.push_back(a.getType() == f32
+                                ? a
+                                : b.create<mlir::arith::ExtFOp>(op->getLoc(),
+                                                                f32, a)
+                                      .getResult());
+        }
+        mlir::Value r =
+            b.create<mlir::LLVM::CallOp>(op->getLoc(),
+                                         decl(name, f32args.size()), f32args)
+                .getResult();
+        if (narrow) {
+          r = b.create<mlir::arith::TruncFOp>(op->getLoc(), rt, r).getResult();
+        }
+        result.replaceAllUsesWith(r);
+        to_erase.push_back(op);
+        return true;
+      };
+      if (auto m = mlir::dyn_cast<mlir::arith::MaximumFOp>(op)) {
+        emit("air.fast_fmax.f32", {m.getLhs(), m.getRhs()}, m.getResult());
+      } else if (auto m = mlir::dyn_cast<mlir::arith::MinimumFOp>(op)) {
+        emit("air.fast_fmin.f32", {m.getLhs(), m.getRhs()}, m.getResult());
+      } else if (auto s = mlir::dyn_cast<mlir::math::SinOp>(op)) {
+        emit("air.fast_sin.f32", {s.getOperand()}, s.getResult());
+      } else if (auto c = mlir::dyn_cast<mlir::math::CosOp>(op)) {
+        emit("air.fast_cos.f32", {c.getOperand()}, c.getResult());
+      }
+    });
+    for (mlir::Operation* op : to_erase) op->erase();
+  });
+}
+
+void RewriteAtomicsToAir(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto i32 = mlir::IntegerType::get(ctx, 32);
+  auto i1 = mlir::IntegerType::get(ctx, 1);
+  auto ptr0 = mlir::LLVM::LLVMPointerType::get(ctx, 0);
+  auto ptr1 = mlir::LLVM::LLVMPointerType::get(ctx, 1);
+  auto get_decl = [&]() -> mlir::LLVM::LLVMFuncOp {
+    llvm::StringRef name = "air.atomic.global.cmpxchg.weak.i32";
+    if (auto f = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) return f;
+    mlir::OpBuilder b = mlir::OpBuilder::atBlockBegin(module_op.getBody());
+    auto fty = mlir::LLVM::LLVMFunctionType::get(
+        i32, {ptr1, ptr0, i32, i32, i32, i32, i1}, /*isVarArg=*/false);
+    return b.create<mlir::LLVM::LLVMFuncOp>(module_op.getLoc(), name, fty);
+  };
+  module_op.walk([&](mlir::func::FuncOp fn) {
+    if (fn.getBody().empty()) return;
+    llvm::SmallVector<mlir::LLVM::AtomicCmpXchgOp> ops;
+    fn.walk([&](mlir::LLVM::AtomicCmpXchgOp op) { ops.push_back(op); });
+    if (ops.empty()) return;
+    mlir::OpBuilder eb = mlir::OpBuilder::atBlockBegin(&fn.getBody().front());
+    mlir::Value one = eb.create<mlir::LLVM::ConstantOp>(fn.getLoc(), i32,
+                                                        eb.getI32IntegerAttr(1));
+    mlir::Value expected_slot = eb.create<mlir::LLVM::AllocaOp>(
+        fn.getLoc(), ptr0, i32, one, /*alignment=*/4);
+    mlir::LLVM::LLVMFuncOp decl = get_decl();
+    for (auto op : ops) {
+      mlir::OpBuilder b(op);
+      mlir::Location loc = op.getLoc();
+      mlir::Value cmp = op.getCmp();
+      auto c0 = b.create<mlir::LLVM::ConstantOp>(loc, i32, b.getI32IntegerAttr(0));
+      auto c2 = b.create<mlir::LLVM::ConstantOp>(loc, i32, b.getI32IntegerAttr(2));
+      auto weak =
+          b.create<mlir::LLVM::ConstantOp>(loc, i1, b.getIntegerAttr(i1, 1));
+      b.create<mlir::LLVM::StoreOp>(loc, cmp, expected_slot);
+      auto call = b.create<mlir::LLVM::CallOp>(
+          loc, decl,
+          mlir::ValueRange{op.getPtr(), expected_slot, op.getVal(), c0, c0, c2,
+                           weak});
+      mlir::Value old = call.getResult();
+      mlir::Value success = b.create<mlir::LLVM::ICmpOp>(
+          loc, mlir::LLVM::ICmpPredicate::eq, old, cmp);
+      mlir::Type struct_ty = op.getResult().getType();
+      mlir::Value s = b.create<mlir::LLVM::UndefOp>(loc, struct_ty);
+      s = b.create<mlir::LLVM::InsertValueOp>(loc, s, old,
+                                              llvm::ArrayRef<int64_t>{0});
+      s = b.create<mlir::LLVM::InsertValueOp>(loc, s, success,
+                                              llvm::ArrayRef<int64_t>{1});
+      op.getResult().replaceAllUsesWith(s);
+      op.erase();
+    }
+  });
+}
+
+void FixupAirPointerAddrSpaces(mlir::ModuleOp module_op) {
+  mlir::MLIRContext* ctx = module_op.getContext();
+  auto as_ptr = [](mlir::Type t) {
+    return mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(t);
+  };
+  llvm::SmallVector<mlir::LLVM::AddrSpaceCastOp> casts;
+  module_op.walk([&](mlir::LLVM::AddrSpaceCastOp c) {
+    auto src = as_ptr(c.getArg().getType());
+    auto res = as_ptr(c.getResult().getType());
+    if (src && res && res.getAddressSpace() == 0 &&
+        (src.getAddressSpace() == 1 || src.getAddressSpace() == 3)) {
+      casts.push_back(c);
+    }
+  });
+  for (auto c : casts) {
+    c.getResult().replaceAllUsesWith(c.getArg());
+    c.erase();
+  }
+  bool again = true;
+  while (again) {
+    again = false;
+    module_op.walk([&](mlir::LLVM::GEPOp gep) {
+      auto base = as_ptr(gep.getBase().getType());
+      auto res = as_ptr(gep.getResult().getType());
+      if (base && res && base.getAddressSpace() != res.getAddressSpace()) {
+        gep.getResult().setType(mlir::LLVM::LLVMPointerType::get(
+            ctx, base.getAddressSpace()));
+        again = true;
+      }
+    });
+  }
+}
 
 #define GEN_PASS_DEF_LOWERTOLLVMGPUPASS
 #include "xla/codegen/emitters/transforms/lower_to_llvm_gpu.h.inc"
@@ -271,6 +604,15 @@ class LowerToLLVMGPUPass
         spirv::populateMathToLLVMSPVConversionPatterns(spirv::getSPIRVMathOps(),
                                                        converter, patterns);
         populateGpuMemorySpaceAttributeConversions(converter);
+      } else if (device_spec_.IsMetal()) {
+        if (auto module_op = mlir::dyn_cast<mlir::ModuleOp>(getOperation())) {
+          InjectAirThreadPositions(module_op);
+          PromoteEntryBuffersToDevice(module_op);
+          RewriteGpuWarpOpsToAir(module_op);
+          RewriteMathToAir(module_op);
+          FixupAirPointerAddrSpaces(module_op);
+          RewriteAtomicsToAir(module_op);
+        }
       } else {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);
         mlir::configureGpuToNVVMConversionLegality(target);

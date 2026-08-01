@@ -296,7 +296,6 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
     // For example,
     // trunc (extractelement <4 x i8> %X, i64 0) to i2 ->
     // extractelement <16 x i2> (bitcast <4 x i8> %X to <16 x i2>), i64 0. The
-    // sub-byte vector types are not supported in the LLVM SPIR-V backend.
     std::function<bool(mlir::Operation*)> has_sub_byte_trunc_user =
         [&](mlir::Operation* op) {
           return absl::c_any_of(op->getUsers(), [&](mlir::Operation* user) {
@@ -310,10 +309,11 @@ struct VectorizeLoad : mlir::OpRewritePattern<mlir::tensor::ExtractOp> {
           });
         };
     auto element_type = vector_type.getElementType();
-    if (device_spec_.IsIntelGpu() && (IsSubByteIntOrFloatType(element_type) ||
-                                      has_sub_byte_trunc_user(op))) {
+    if ((device_spec_.IsIntelGpu() || device_spec_.IsMetal()) &&
+        (IsSubByteIntOrFloatType(element_type) ||
+         has_sub_byte_trunc_user(op))) {
       return rewriter.notifyMatchFailure(
-          op, "sub-byte types are not supported for vector loads on Intel GPU");
+          op, "sub-byte types are not supported for vector loads on this GPU");
     }
 
     mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
