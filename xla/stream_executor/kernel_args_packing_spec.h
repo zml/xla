@@ -63,6 +63,12 @@ class KernelArgPackingSpec {
   absl::StatusOr<std::vector<char>> BuildArgument(
       absl::Span<const std::unique_ptr<PackedArgBase>> args) const;
 
+  KernelArgumentMetadata::Kind argument_kind() const {
+    return relocation_.has_value()
+               ? KernelArgumentMetadata::Kind::kDeviceAddress
+               : KernelArgumentMetadata::Kind::kValue;
+  }
+
   // Builds KernelArgPackingSpec that refers to the given arg number.
   static KernelArgPackingSpec BuildArgRelocation(int argument_index);
 
