@@ -85,13 +85,14 @@ class MetalFlashAttnThunk : public Thunk {
   // Apple's driver), so the first execute pays neither (compile + ~70ms PSO).
   // is_prefill selects kernel_flash_attn_ext (prefill, one PSO) vs fa_vec (decode);
   // for decode it warms every nsg the adaptive ramp can reach for this seqlen
-  // (nsg=4 always, +8 if seqlen>1024, +16 if seqlen>2048), so no decode token —
-  // first or ramp transition — pays PSO creation. kv_pos_stride must match the
-  // thunk's so the warmed PSO's function constants match. Best-effort — failures
-  // are swallowed (the thunk rebuilds at execute).
+  // (all of nsg 4/8/16), plus the head-contiguous fa_vec_hc/fa_vec_reduce pair
+  // that a long context selects mid-generation, so no decode token — first,
+  // ramp transition, or kv>4096 crossing — pays PSO creation. kv_pos_stride and
+  // n_kv must match the thunk's so the warmed PSO's function constants match.
+  // Best-effort — failures are swallowed (the thunk rebuilds at execute).
   static void PrewarmPipeline(stream_executor::StreamExecutor* executor,
                               bool is_prefill, int64_t kv_pos_stride,
-                              int64_t seqlen, int64_t head_dim);
+                              int64_t seqlen, int64_t head_dim, int64_t n_kv);
 
  private:
   // Lazily compile + cache the fa_vec pipeline variants (from favec_lib_) the

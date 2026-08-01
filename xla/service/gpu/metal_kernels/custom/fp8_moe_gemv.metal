@@ -25,7 +25,8 @@ static inline float decode_e4m3fn(uchar b) {
 //   scale:     bfloat [E, N/128, K/128]   (DeepSeek-style 128x128 block scales)
 //   expert_id: int    [R]                 (which expert each output row uses)
 //   out:       bfloat [R, N]              (row-major)
-//   dims = (R, K, N, Kb=K/128)            (Nb=N/128 derived below; Kb unused here)
+//   dims = (R, K, N, E)                   (4th word unused; the scale strides
+//                                          are derived from K and N)
 //
 // The per-(ni, ri) predecessor re-read the full x row once per output column
 // (N times per row) -- at b16 that x re-read was ~2/3 of the kernel's DRAM
@@ -47,7 +48,7 @@ kernel void fp8_moe_gemv(
     uint  lane [[thread_index_in_simdgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
-    const int R = dims.x, K = dims.y, N = dims.z;
+    const int R = max(dims.x, 0), K = max(dims.y, 0), N = max(dims.z, 0);
     const int Nb = N / 128;     // scale rows per expert
     const int Kb = K / 128;     // scale cols per expert (= scale tiles over K)
     constexpr int TN = 8;       // simdgroups == output columns per threadgroup
@@ -62,7 +63,7 @@ kernel void fp8_moe_gemv(
     const int ri = int(tgid.y);
     if (ri >= R) return;
     const int ni = int(tgid.x) * TN + int(sgid);   // this simdgroup's column
-    const bool active = (ni < N);
+    const bool active = ni < N;
 
     const int e = expert_id[ri];
     const device bfloat *xrow = x + (long)ri * K;
@@ -91,5 +92,7 @@ kernel void fp8_moe_gemv(
 
     // Each simdgroup owns one full column: a single simd_sum over its 32 lanes.
     acc = simd_sum(acc);
-    if (active && lane == 0) out[(long)ri * N + ni] = bfloat(acc);
+    if (ni < N && lane == 0) {
+        out[(long)ri * N + ni] = bfloat(acc);
+    }
 }

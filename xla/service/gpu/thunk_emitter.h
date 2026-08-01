@@ -30,7 +30,6 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "llvm/IR/Module.h"
 #include "xla/backends/gpu/runtime/async_execution.h"
-#include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
 #include "xla/backends/gpu/runtime/sequential_thunk.h"
@@ -49,9 +48,6 @@ limitations under the License.
 #include "xla/shape_util.h"
 
 namespace xla::gpu {
-
-class CollectiveKernelThunk;
-struct AllReduceConfig;
 
 struct DynamicSliceCopyFusion;
 struct StaticSliceCopyFusion;
@@ -105,9 +101,6 @@ class ThunkEmitter {
 
   absl::StatusOr<ThunkSequence> EmitAsyncDone(const HloInstruction* instr);
 
-  AsyncThunkSequence EmitCollectiveKernelThunk(
-      Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
-      const HloInstruction* instr, const CollectiveConfig& config);
   absl::StatusOr<ThunkSequence> EmitCollectiveAsyncDone(
       const HloInstruction* inst);
 
@@ -214,7 +207,18 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitMetalGdnThunk(
       const HloCustomCallInstruction* hlo);
 
-  absl::StatusOr<ThunkSequence> EmitFp8GemvThunk(
+  // Weight-only scaled matmul "zml$scaled_matmul". Dispatches by scheme:
+  //   NVFP4 → MetalNvfp4MatmulThunk
+  //   FP8 128-block / per-channel → MetalFp8GemvThunk
+  absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // NVFP4 arm of zml$scaled_matmul (f4e2m1 + e4m3 group-16).
+  absl::StatusOr<ThunkSequence> EmitMetalNvfp4MatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
+  // FP8 arm of zml$scaled_matmul (128-block / per-channel bf16 scales).
+  absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
       const HloCustomCallInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
@@ -273,8 +277,6 @@ class ThunkEmitter {
   AsyncThunkSequence EmitDynamicSliceFusionV2(
       const HloFusionInstruction* instr);
 
-  std::optional<BufferAllocation::Slice> GetAllocationOverride(
-      const HloInstruction* instr, const ShapeIndex& index) const;
   absl::StatusOr<BufferAllocation::Slice> GetAllocationSliceForHlo(
       const HloInstruction* instr, const ShapeIndex& index = {}) const;
   absl::StatusOr<ShapedSlice> GetShapedSliceForHlo(

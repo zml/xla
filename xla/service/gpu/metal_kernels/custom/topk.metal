@@ -98,24 +98,47 @@ SEL(radix_sel32_k1, 1, uint, u32_from_okey32) SEL(radix_sel32_k2, 2, uint, u32_f
 SEL(radix_sel32_k4, 4, uint, u32_from_okey32) SEL(radix_sel32_k8, 8, uint, u32_from_okey32) SEL(radix_sel32_k16, 16, uint, u32_from_okey32)
 SEL(radix_sel32_k32, 32, uint, u32_from_okey32) SEL(radix_sel32_k64, 64, uint, u32_from_okey32)
 
-// Single-pass small-n TopK. One thread runs the SAME (okey desc, index asc)
-// insertion select as the radix SEL path, reading the input directly — no
-// histogram/scan/gather, so ONE dispatch instead of four. The top-k under that
-// total order is unique, so this is byte-identical to the 4-pass radix result.
-// Used for small n only (MoE router topk: n = #experts ~32-128); a single
-// thread over the whole vocab would be far too slow, so large-n keeps radix.
+// Single-pass small-n TopK. Runs the SAME (okey desc, index asc) insertion
+// select as the radix SEL path, reading the input directly — no histogram/scan/
+// gather, so ONE dispatch instead of four. The top-k under that total order is
+// unique, so this is byte-identical to the 4-pass radix result.
+// Used for small n only (MoE router topk: n = #experts ~32-128); a full-vocab
+// scan would be far too slow, so large-n keeps radix.
+//
+// Parallelised across the whole (32-thread) threadgroup: each thread runs the
+// exact insertion select over a strided slice of the input into its OWN sorted
+// top-K (descending), then the T per-thread lists are tree-merged in threadgroup
+// memory (2-pointer merge of two sorted top-K lists -> their combined top-K).
+// Because sgt() is a strict total order (indices are unique), the top-K set AND
+// order are uniquely determined, so the parallel merge is bit-identical to the
+// prior single-thread scan. TG (=32) matches the thunk's ThreadDim; sc is sized
+// for the max threadgroup and the merge is guarded so any nt<=TG is correct.
+#define SEL1_TG 32u
 #define SEL1(NAME, K, INT, OUTT, OKEY, CONV) \
 kernel void NAME(device const INT* logits [[buffer(0)]], constant TKA& a [[buffer(1)]], \
                  device OUTT* outv [[buffer(2)]], device uint* outi [[buffer(3)]], \
-                 uint3 tg [[threadgroup_position_in_grid]], uint3 _t [[thread_position_in_threadgroup]]) { \
-  if (_t.x != 0u) return; \
-  uint b = tg.y, n = a.n, kreq = a.k; device const INT* row = logits + (ulong)b * n; \
+                 uint3 tg [[threadgroup_position_in_grid]], uint3 _t [[thread_position_in_threadgroup]], \
+                 uint3 _nt [[threads_per_threadgroup]]) { \
+  threadgroup uint2 sc[SEL1_TG * K]; \
+  uint b = tg.y, n = a.n, kreq = a.k, tid = _t.x, nt = min(_nt.x, SEL1_TG); \
+  device const INT* row = logits + (ulong)b * n; \
   uint2 t[K]; for (int i = 0; i < K; ++i) t[i] = uint2(0u, 0xffffffffu); \
-  for (uint c = 0; c < n; ++c) { uint2 kv = uint2(OKEY(row[c]), c); \
+  for (uint c = tid; c < n; c += nt) { uint2 kv = uint2(OKEY(row[c]), c); \
     bool p = sgt(t[K-1], kv); t[K-1] = p ? t[K-1] : kv; \
     for (int j = K - 2; j >= 0; --j) { bool q = sgt(t[j], kv); uint2 tt = t[j]; t[j] = q ? t[j] : t[j+1]; t[j+1] = q ? t[j+1] : tt; } } \
+  for (int i = 0; i < K; ++i) sc[tid * K + i] = t[i]; \
+  threadgroup_barrier(mem_flags::mem_threadgroup); \
+  for (uint stride = SEL1_TG >> 1; stride > 0u; stride >>= 1) { \
+    if (tid < stride && tid + stride < nt) { \
+      threadgroup uint2* la = sc + tid * K; threadgroup uint2* lb = sc + (tid + stride) * K; \
+      uint2 m[K]; uint ia = 0u, ib = 0u; \
+      for (int i = 0; i < K; ++i) { uint2 va = la[ia], vb = lb[ib]; bool takea = sgt(va, vb); \
+        m[i] = takea ? va : vb; if (takea) ia++; else ib++; } \
+      for (int i = 0; i < K; ++i) la[i] = m[i]; } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); } \
+  if (tid != 0u) return; \
   device OUTT* ov = outv + (ulong)b * kreq; device uint* oi = outi + (ulong)b * kreq; \
-  for (uint i = 0; i < kreq; ++i) { ov[i] = CONV(t[i].x); oi[i] = t[i].y; } }
+  for (uint i = 0; i < kreq; ++i) { ov[i] = CONV(sc[i].x); oi[i] = sc[i].y; } }
 SEL1(topk1_16_k1, 1, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k2, 2, ushort, ushort, okey32_from_u16, u16_from_okey32)
 SEL1(topk1_16_k4, 4, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k8, 8, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k16, 16, ushort, ushort, okey32_from_u16, u16_from_okey32)
 SEL1(topk1_16_k32, 32, ushort, ushort, okey32_from_u16, u16_from_okey32) SEL1(topk1_16_k64, 64, ushort, ushort, okey32_from_u16, u16_from_okey32)

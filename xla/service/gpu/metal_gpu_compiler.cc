@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_sort_thunk.h"
 #include "xla/backends/gpu/runtime/metal_topk_thunk.h"
+#include "xla/backends/gpu/transforms/metal_workspace_rewriter.h"
 #include "xla/comparison_util.h"
 #include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/shape_util.h"
@@ -253,6 +254,19 @@ absl::Status RelaxFlashAttnKVLayout(HloModule* module) {
 // the first execute is a pure cache hit. Best-effort per op; dedups configs.
 // (GEMM kernels are already compiled at thunk-emit time, inside "Compiled all
 // models"; only their PSO load is lazy — a smaller residual left for later.)
+//
+// TODO: rework prewarming. This pass runs before thunk emission, so it has to
+// rediscover from the HLO what each thunk already knows, and that duplication is
+// the source of its problems: only five of the custom calls are covered because
+// the rest are too awkward to reconstruct here; the configs it derives can drift
+// from the thunk's; and the per-op dedup keys are hand-written, so they are
+// easy to under-specify (fa_seen keys on {is_prefill, kv_pos_stride} while the
+// warm also depends on n_kv and head_dim, so calls sharing a stride can collide
+// and leave the second one cold). Warming from the emitted thunks instead —
+// walking the ThunkSequence after RunBackend and asking each thunk to run its
+// own loader — needs none of that, and their loaders are already idempotent and
+// executor-keyed. An attempt at this made the plugin fail to load, so it needs
+// investigating rather than a straight port.
 void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
   absl::flat_hash_set<std::pair<bool, int64_t>> fa_seen;
   absl::flat_hash_set<std::tuple<int, int64_t, int64_t, int64_t>> paged_seen;
@@ -285,7 +299,7 @@ void PrewarmMetalPipelines(HloModule* module, se::StreamExecutor* stream_exec) {
         const int64_t kv_pos_stride = pos_major ? n_kv * hd : hd;
         if (fa_seen.insert({is_prefill, kv_pos_stride}).second) {
           MetalFlashAttnThunk::PrewarmPipeline(stream_exec, is_prefill,
-                                               kv_pos_stride, seqlen, hd);
+                                               kv_pos_stride, seqlen, hd, n_kv);
         }
       } else if (target == "zml$paged_attn") {
         if (instr->operand_count() != 6) continue;
@@ -927,6 +941,12 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   // Threshold 0 ⇒ no dot qualifies (dot_merger.cc:427 `bytes <= max_size_to_merge`).
   // Use set_config (fresh shared_ptr) rather than mutable_config() so the value
   // survives a later SPMD/Shardy pass re-sharing the config.
+  // Route the block-scaled dot (kScaledDot, produced by CompositeRewriter from
+  // ZML's xla.scaled_dot composite) to the FusedScaledDotRewriter +
+  // ScaledDotRewriter pair instead of Triton: Metal has no Triton codegen, and
+  // that pair is where the Metal MX matmul lowering (and the dequant fallback)
+  // lives. The flag defaults true (Triton), which on Metal would leave
+  // kScaledDot uncodegen-able.
   {
     HloModuleConfig cfg = module->config();
     cfg.mutable_debug_options().set_xla_gpu_dot_merger_threshold_mb(0);
@@ -938,6 +958,9 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
     // plain kSort, which RewriteSortToMetalThunk routes to the native metal$sort
     // kernel (and the legacy nvvm-emitting bitonic emitter is never reached).
     cfg.mutable_debug_options().set_xla_gpu_enable_cub_radix_sort(false);
+    // Route kScaledDot to the scaled-dot rewriters (Metal has no Triton).
+    cfg.mutable_debug_options().set_xla_gpu_experimental_scaled_dot_with_triton(
+        false);
     module->set_config(std::move(cfg));
   }
   TF_ASSIGN_OR_RETURN(
@@ -957,6 +980,27 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
   // TopK).
   PrewarmMetalPipelines(optimized.get(), stream_exec);
   return optimized;
+}
+
+absl::Status MetalGpuCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+    CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats, mlir_context));
+  // ScaledDotRewriter and layout assignment have produced the final Metal
+  // custom-call shapes. Wrap every NVFP4/MoE call that needs scratch in the
+  // uniform (result, s8[workspace]) internal ABI before fusion and
+  // pre-scheduling copy insertion. GTE(0) preserves the frontend-visible
+  // result shape.
+  const se::MetalComputeCapability metal_arch =
+      gpu_target_config.device_description.metal_compute_capability();
+  return MetalWorkspaceRewriter(metal_arch.architecture_size(),
+                                metal_arch.architecture_gen())
+      .Run(hlo_module)
+      .status();
 }
 
 absl::Status MetalGpuCompiler::OptimizeHloConvolutionCanonicalization(

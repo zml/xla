@@ -164,6 +164,15 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
       it != create_options.end()) {
     allocator_config.memory_fraction = std::get<float>(it->second);
   }
+#if TENSORFLOW_USE_METAL
+  // Metal defaults to growing the arena rather than reserving it. Unified
+  // memory means a reservation is taken out of the same pool the OS and every
+  // other process are using, and Metal caps a single MTLBuffer at
+  // maxBufferLength (~61% of RAM), below which BFC cannot place the whole pool
+  // in one region anyway. Set before the option is read, so a client that asks
+  // for preallocation still gets it.
+  allocator_config.preallocate = false;
+#endif  // TENSORFLOW_USE_METAL
   if (auto it = create_options.find("preallocate");
       it != create_options.end()) {
     allocator_config.preallocate = std::get<bool>(it->second);

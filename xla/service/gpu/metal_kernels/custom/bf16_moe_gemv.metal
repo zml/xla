@@ -11,7 +11,7 @@ using namespace metal;
 //   w:         bfloat [E, N, K] (row-major; expert-major)
 //   expert_id: int    [R]       (which expert each output row uses)
 //   out:       bfloat [R, N]    (row-major)
-//   dims = (R, K, N, *)         (4th word ignored; shared layout with fp8 path)
+//   dims = (R, K, N, E)         (4th word unused; shared layout with fp8 path)
 //
 // One threadgroup owns a block of TN=8 columns for a single row (TN simdgroups,
 // one column each) and streams x in BK=128 tiles through threadgroup memory: each
@@ -29,7 +29,7 @@ kernel void bf16_moe_gemv(
     uint  lane [[thread_index_in_simdgroup]],
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
-    const int R = dims.x, K = dims.y, N = dims.z;
+    const int R = max(dims.x, 0), K = max(dims.y, 0), N = max(dims.z, 0);
     constexpr int TN = 8;       // simdgroups == output columns per threadgroup
     constexpr int BK = 128;     // K tile
 
@@ -38,7 +38,7 @@ kernel void bf16_moe_gemv(
     const int ri = int(tgid.y);
     if (ri >= R) return;
     const int ni = int(tgid.x) * TN + int(sgid);   // this simdgroup's column
-    const bool active = (ni < N);
+    const bool active = ni < N;
 
     const int e = expert_id[ri];
     const device bfloat *xrow = x + (long)ri * K;
@@ -58,7 +58,11 @@ kernel void bf16_moe_gemv(
     // tail simply contribute nothing.
     float acc = 0.0f;
     for (int kt = 0; kt < K; kt += BK) {
-        if (tid < BK) Xs[tid] = (kt + int(tid) < K) ? xrow[kt + tid] : bfloat(0);
+        if (tid < BK) {
+            Xs[tid] = (kt + int(tid) < K)
+                          ? xrow[kt + tid]
+                          : bfloat(0);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
             const int k = int(lane) * 4;           // 32 lanes * 4 = 128 = BK
@@ -74,5 +78,7 @@ kernel void bf16_moe_gemv(
 
     // Each simdgroup owns one full column: a single simd_sum over its 32 lanes.
     acc = simd_sum(acc);
-    if (active && lane == 0) out[(long)ri * N + ni] = bfloat(acc);
+    if (ni < N && lane == 0) {
+        out[(long)ri * N + ni] = bfloat(acc);
+    }
 }

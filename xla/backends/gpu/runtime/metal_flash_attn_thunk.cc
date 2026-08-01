@@ -126,7 +126,8 @@ static size_t PrefillSmem(int64_t hd) {
 
 void MetalFlashAttnThunk::PrewarmPipeline(se::StreamExecutor* executor,
                                          bool is_prefill, int64_t kv_pos_stride,
-                                         int64_t seqlen, int64_t head_dim) {
+                                         int64_t seqlen, int64_t head_dim,
+                                         int64_t n_kv) {
   // Best-effort. Compile + cache the metallib, then create the PSO(s) via the
   // compile-time executor (discarded — it warms Apple's driver pipeline cache, so
   // the thunk's first-execute LoadKernelWithConstants is a cache hit). FC values
@@ -156,16 +157,33 @@ void MetalFlashAttnThunk::PrewarmPipeline(se::StreamExecutor* executor,
     return;
   }
   // Decode auto-ramps nsg ∈ {4,8,16} as the live KV length crosses 1024/2048
-  // (ExecuteOnStream). Warm every nsg this seqlen can actually reach, so neither
-  // the first token nor a ramp transition pays PSO creation.
+  // (ExecuteOnStream). Warm all three unconditionally: `seqlen` here is the
+  // cache's static bound, but with paged attention the live KV grows inside a
+  // fixed-size cache, so bounding the enumeration by it used to leave the ramp
+  // transitions cold -- and those land mid-generation, on a live token.
   for (int nsg : {4, 8, 16}) {
-    if (nsg == 8 && seqlen <= 1024) break;
-    if (nsg == 16 && seqlen <= 2048) break;
     const FC fc[] = {{420, FC::Kind::kInt, kv_pos_stride},
                      {421, FC::Kind::kInt, kv_pos_stride},
                      {422, FC::Kind::kInt, nsg},
                      {423, FC::Kind::kInt, 1}};
     metal_exec->LoadKernelWithConstants(*lib, "fa_vec", /*arity=*/7, fc)
+        .IgnoreError();
+  }
+  // The head-contiguous pair, which EnsureFaVecHC loads the first time the live
+  // KV passes 4096. Nothing warmed these before, so a long generation paid two
+  // cold PSO builds partway through. FCs must match EnsureFaVecHC exactly.
+  if (n_kv > 0) {
+    constexpr int kNwgHC = 32;
+    const FC hc_fc[] = {{420, FC::Kind::kInt, kv_pos_stride},
+                        {421, FC::Kind::kInt, kv_pos_stride},
+                        {422, FC::Kind::kInt, n_kv},
+                        {423, FC::Kind::kInt, kNwgHC}};
+    metal_exec->LoadKernelWithConstants(*lib, "fa_vec_hc", /*arity=*/7, hc_fc)
+        .IgnoreError();
+    const FC reduce_fc[] = {{500, FC::Kind::kInt, head_dim},
+                            {501, FC::Kind::kInt, kNwgHC}};
+    metal_exec
+        ->LoadKernelWithConstants(*lib, "fa_vec_reduce", /*arity=*/3, reduce_fc)
         .IgnoreError();
   }
 }

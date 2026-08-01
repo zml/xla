@@ -1,4 +1,4 @@
-/*Copyright 2026 The OpenXLA Authors.
+/*Copyright 2022 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -76,7 +77,6 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_broadcast_thunk.h"
 #include "xla/backends/gpu/runtime/collective_group_thunk.h"
 #include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
-#include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/collective_permute_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
@@ -123,7 +123,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
-#include "xla/hlo/ir/hlo_instruction_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_print_options.h"
@@ -161,6 +160,8 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_flash_attn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_fp8_gemv_thunk.h"
 #include "xla/backends/gpu/runtime/metal_moe_gemv_thunk.h"
+#include "xla/backends/gpu/runtime/metal_nvfp4_matmul_thunk.h"
+#include "xla/backends/gpu/runtime/metal_workspace.h"
 #include "xla/backends/gpu/runtime/metal_gdn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
@@ -230,6 +231,14 @@ bool IsHostExecuteCustomCall(const HloInstruction& hlo) {
                              // the TPU one
 }
 
+template <typename ThunkType>
+static constexpr bool kRequiresCollectiveKernelThunk =
+    std::is_constructible_v<ThunkType, Thunk::ThunkInfo,
+                            const HloAllReduceInstruction*,
+                            std::vector<CollectiveThunk::Buffer>,
+                            std::unique_ptr<CollectiveKernelThunk>,
+                            /*p2p_memcpy_enabled=*/bool>;
+
 Shape GetOutputShape(const HloInstruction* async_start,
                      const HloInstruction* inst, Thunk::Kind kind) {
   // Order of evaluation:
@@ -261,92 +270,89 @@ ShapeIndex GetDstShapeIndex(const HloInstruction* async_start,
 
 }  // namespace
 
-AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
+// The signature of this function would change to absl::Status once we lift the
+// CollectiveKernelThunk out as a top level thunk. It would then become a member
+// function of ThunkEmitter.
+// As it stands now the collective kernel thunk is wrapped inside other
+// collective thunks such as AllReduceStart. So this function is only
+// responsible for emitting the collective kernel thunk and its dependencies.
+xla::Future<std::unique_ptr<CollectiveKernelThunk>> EmitCollectiveKernelThunk(
+    IrEmitterContext* ir_emitter_context, const CallGraph& call_graph,
     Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
-    const HloInstruction* instr, const CollectiveConfig& config) {
+    const HloAllReduceInstruction* instr, const CollectiveConfig& config,
+    ThunkEmitter* compiler,
+    std::vector<std::unique_ptr<HloFusionAnalysis>>&
+        analysis_garbage_collector) {
   std::unique_ptr<HloModule> fused_module =
       NewModuleWithFusion(instr, HloInstruction::FusionKind::kLoop);
   HloFusionInstruction* fusion_instr = Cast<HloFusionInstruction>(
       fused_module->entry_computation()->root_instruction());
-  // For both AllReduce and AllGather the kernel strategy is determined by the
-  // annotation written by CollectiveKernelStrategyAnnotator before scheduling.
-  // Reading the annotation uniformly avoids direct flag checks in the emitter.
-  const HloOpcode opcode = instr->opcode();
-  bool should_flatten = false;
-  bool is_collective_kernel_enabled = false;
-  if (auto gpu_config = instr->backend_config<GpuBackendConfig>();
-      gpu_config.ok()) {
-    is_collective_kernel_enabled = IsTritonCollectiveKernel(
-        gpu_config->collective_backend_config().kernel_strategy());
-  }
-  // For AllReduce two-shot, the fused module must be flattened to 1-D so
-  // Triton can assign contiguous subtiles to each rank.
-  if (opcode == HloOpcode::kAllReduce && is_collective_kernel_enabled) {
-    static constexpr bool kMultimemDisabled = false;
+  const bool has_rank_higher_than_1 =
+      instr->shape().IsArray() && instr->shape().dimensions().size() > 1;
+  bool is_collective_kernel_enabled =
+      instr->GetModule()
+          ->config()
+          .debug_options()
+          .xla_gpu_unsupported_use_all_reduce_one_shot_kernel();
+  static constexpr bool kMultimemDisabled = false;
+  if (is_collective_kernel_enabled && has_rank_higher_than_1) {
     const int64_t size_bytes =
         ShapeUtil::ElementsIn(instr->shape()) *
         primitive_util::ByteWidth(instr->shape().element_type());
-    const bool has_rank_higher_than_1 =
-        instr->shape().IsArray() && instr->shape().dimensions().size() > 1;
-    should_flatten = has_rank_higher_than_1 &&
-                     GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
-                         se::gpu::AllReduceStrategy::kTwoShot;
-  }
-  if (is_collective_kernel_enabled && should_flatten) {
-    RETURN_IF_ERROR(FlattenCollectiveFusion(fusion_instr));
+    const bool is_two_shot =
+        GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
+        se::gpu::AllReduceStrategy::kTwoShot;
+    if (is_two_shot) {
+      RETURN_IF_ERROR(FlattenCollectiveFusion(fusion_instr));
+    }
   }
   const auto make_thunk =
       [thunk_info = std::move(thunk_info), buffers = std::move(buffers), config,
-       fusion_instr, is_async = !IsGPUSyncCollective(*instr),
-       is_collective_kernel_enabled](
+       is_async = !IsGPUSyncCollective(*instr), is_collective_kernel_enabled](
           absl::string_view kernel_name, int32_t shmem_bytes,
           LaunchDimensions launch_dimensions, const std::vector<uint8_t>& cubin,
-          bool use_pdl)
-      -> absl::StatusOr<std::unique_ptr<CollectiveKernelThunk>> {
-    ASSIGN_OR_RETURN(
-        CollectiveKernelSpec kernel_spec,
-        CreateCollectiveKernelSpec(fusion_instr, launch_dimensions));
-    return std::make_unique<CollectiveKernelThunk>(
-        thunk_info, config, std::move(kernel_spec), is_async,
-        std::move(buffers), is_collective_kernel_enabled, kernel_name,
-        launch_dimensions, shmem_bytes,
-        !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl);
-  };
-  const GpuTopology& gpu_topology = ir_emitter_context_->gpu_topology();
+          bool use_pdl) {
+        return std::make_unique<CollectiveKernelThunk>(
+            thunk_info, config, is_async, std::move(buffers),
+            is_collective_kernel_enabled, kernel_name, launch_dimensions,
+            shmem_bytes, kMultimemDisabled,
+            !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl);
+      };
+  const GpuTopology& gpu_topology = ir_emitter_context->gpu_topology();
   const DeviceAssignment* device_assignment = nullptr;
-  if (ir_emitter_context_->hlo_module()
+  if (ir_emitter_context->hlo_module()
           .config()
           .has_static_device_assignment()) {
     device_assignment =
-        &ir_emitter_context_->hlo_module().config().static_device_assignment();
+        &ir_emitter_context->hlo_module().config().static_device_assignment();
   }
   ASSIGN_OR_RETURN(bool did_set_config,
                    TrySetGpuBackendConfigForCollective(
                        gpu_topology, fusion_instr, device_assignment));
   if (!did_set_config) {
-    return Internal("Failed to set GPU backend config for collective kernel.");
+    // TODO(b/522693539):
+    // Because of lack of topology information in the CollectiveKernelThunk,
+    // we cannot know during emission if we can use the collective kernel
+    // thunk or not.
+    return nullptr;
   }
-  analysis_garbage_collector_.push_back(
+  analysis_garbage_collector.push_back(
       std::make_unique<HloFusionAnalysis>(HloFusionAnalysis::Create(
-          *fusion_instr, ir_emitter_context_->gpu_device_info())));
+          *fusion_instr, ir_emitter_context->gpu_device_info())));
   auto emitter =
-      std::make_unique<TritonFusion>(*analysis_garbage_collector_.back());
+      std::make_unique<TritonFusion>(*analysis_garbage_collector.back());
 
   ASSIGN_OR_RETURN(std::vector<Shape> unmanaged_arguments,
                    GetCollectiveUnmanagedKernelArguments(fusion_instr));
   return emitter
-      ->Emit(*ir_emitter_context_, *fusion_instr,
+      ->Emit(*ir_emitter_context, *fusion_instr,
              /*instr_override=*/instr, unmanaged_arguments)
       .Map([make_thunk = std::move(make_thunk),
             fused_module =
-                std::move(fused_module)](TritonFusion::EmitResult result)
-               -> absl::StatusOr<ThunkSequence> {
-        ASSIGN_OR_RETURN(
-            std::unique_ptr<CollectiveKernelThunk> thunk,
-            make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
-                       result.entry.launch_dimensions,
-                       std::move(result.entry.binary), result.entry.use_pdl));
-        return ThunkSequence::Of(std::move(thunk));
+                std::move(fused_module)](TritonFusion::EmitResult result) {
+        return make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
+                          result.entry.launch_dimensions,
+                          std::move(result.entry.binary), result.entry.use_pdl);
       });
 }
 
@@ -438,6 +444,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConstant(
   return ThunkSequence{};
 }
 
+ThunkSequence ThunkSequence::Of(std::unique_ptr<Thunk> ir_emitter) {
+  ThunkSequence thunk_sequence;
+  thunk_sequence.push_back(std::move(ir_emitter));
+  return thunk_sequence;
+}
+
 AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
   std::vector<AsyncThunkSequence> branch_thunks;
   branch_thunks.reserve(instr->branch_count());
@@ -453,10 +465,10 @@ AsyncThunkSequence ThunkEmitter::EmitConditional(const HloInstruction* instr) {
   return tsl::JoinFutures(absl::MakeSpan(branch_thunks))
       .Map([thunk_info = std::move(thunk_info),
             shaped_slice = std::move(shaped_slice)](
-               std::vector<ThunkSequence> branch_thunks) mutable {
-        return ThunkSequence::Of<ConditionalThunk>(std::move(thunk_info),
-                                                   std::move(shaped_slice),
-                                                   std::move(branch_thunks));
+               std::vector<ThunkSequence> branch_thunks) {
+        return ThunkSequence::Of(std::make_unique<ConditionalThunk>(
+            std::move(thunk_info), std::move(shaped_slice),
+            std::move(branch_thunks)));
       });
 }
 
@@ -483,7 +495,9 @@ AsyncThunkSequence ThunkEmitter::EmitPadToStatic(
                     instr, ir_emitter_context_->GetNextThunkId()),
                 std::move(kernel_def).TakeSource(), std::string(spec.name()),
                 kernel_arguments, launch_dimensions)
-      .Map([](auto thunk) { return ThunkSequence::Of(std::move(thunk)); });
+      .Map([](std::unique_ptr<Thunk> thunk) {
+        return ThunkSequence::Of(std::move(thunk));
+      });
 }
 
 // Input = {dynamic array(with dynamic dimension meta data at the end)}
@@ -508,7 +522,9 @@ AsyncThunkSequence ThunkEmitter::EmitSliceToDynamic(
                     instr, ir_emitter_context_->GetNextThunkId()),
                 std::move(kernel_def).TakeSource(), std::string(spec.name()),
                 kernel_arguments, launch_dimensions)
-      .Map([](auto thunk) { return ThunkSequence::Of(std::move(thunk)); });
+      .Map([](std::unique_ptr<Thunk> thunk) {
+        return ThunkSequence::Of(std::move(thunk));
+      });
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConvolutionThunk(
@@ -627,11 +643,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunk(
       instr, ir_emitter_context_->GetNextThunkId());
 
   ASSIGN_OR_RETURN(std::string canonical_hlo, CanonicalGemmHlo(instr));
-  return ThunkSequence::Of<CublasLtMatmulThunk>(
+  auto thunk = std::make_unique<CublasLtMatmulThunk>(
       std::move(thunk_info), std::move(canonical_hlo), std::move(gemm_config),
       blas_lt_epilogue, algorithm, config.autotune_workspace_size(), a, b, c, d,
       /*group_sizes=*/std::nullopt, bias, aux, std::nullopt, std::nullopt,
       std::nullopt, std::nullopt, std::nullopt, workspace_buffer);
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGemmThunk(
@@ -1253,18 +1270,163 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
   return ThunkSequence::Of(std::move(thunk));
 }
 
-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
+    const HloCustomCallInstruction* instr) {
+  // One HLO target; dispatch by scale/weight scheme to the matching thunk.
+  if (instr->operand_count() < 3) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul expects at least 3 operands (x, w, scale).");
+  }
+  // Classify through the same helper the rewriter matched with, so a scheme can
+  // never be fused here and unimplemented there.
+  const std::optional<MetalScaledMatmulScheme> scheme =
+      ClassifyMetalScaledMatmul(instr->operand(1)->shape(),
+                                instr->operand(2)->shape());
+  if (!scheme.has_value()) {
+    return absl::UnimplementedError(absl::StrCat(
+        "zml$scaled_matmul: no Metal thunk implements weight ",
+        instr->operand(1)->shape().ToString(true), " with scale ",
+        instr->operand(2)->shape().ToString(true), "."));
+  }
+  if (instr->operand_count() != 3) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul expects 3 operands (x, w, scale).");
+  }
+  if (instr->shape().IsTuple() && instr->shape().tuple_shapes().empty()) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul output tuple must not be empty.");
+  }
+  const Shape& out_shape = instr->shape().IsTuple()
+                               ? instr->shape().tuple_shapes(0)
+                               : instr->shape();
+  auto is_row_major = [](const Shape& shape) {
+    return shape.IsArray() && shape.has_layout() &&
+           LayoutUtil::IsMonotonicWithDim0Major(shape.layout());
+  };
+  if (!is_row_major(instr->operand(0)->shape()) ||
+      !is_row_major(instr->operand(1)->shape()) ||
+      !is_row_major(instr->operand(2)->shape()) ||
+      !is_row_major(out_shape)) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul requires row-major contiguous x, w, scale, and "
+        "output buffers.");
+  }
+  switch (*scheme) {
+    case MetalScaledMatmulScheme::kNvfp4Group16:
+      return EmitMetalNvfp4MatmulThunk(instr);
+    case MetalScaledMatmulScheme::kFp8Block128:
+    case MetalScaledMatmulScheme::kFp8PerChannel:
+      return EmitMetalFp8GemvThunk(instr);
+  }
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
     const HloCustomCallInstruction* instr) {
   if (instr->operand_count() != 3) {
     return absl::InvalidArgumentError(
-        "metal block-scaled fp8 GEMV expects 3 operands (x, w, scale).");
+        "zml$scaled_matmul (NVFP4) expects 3 operands (x, w, scale).");
   }
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
   const Shape& scale_shape = instr->operand(2)->shape();
 
-  // Single output [B, N] bf16 (ZML emits a non-tuple custom call for one out,
-  // but tolerate a 1-tuple too).
+  // MetalWorkspaceRewriter gives the split-K path a tuple(result, s8[bytes])
+  // result; every other path keeps its plain array result.
+  const bool is_tuple = instr->shape().IsTuple();
+  if (is_tuple && instr->shape().tuple_shapes().size() != 2) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul (NVFP4) must return either a bf16 result or "
+        "tuple(bf16 result, s8 workspace).");
+  }
+  const Shape& out_shape =
+      is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+  Shape workspace_shape;
+  if (is_tuple) {
+    workspace_shape = instr->shape().tuple_shapes(1);
+    if (!workspace_shape.IsArray() || workspace_shape.element_type() != S8 ||
+        workspace_shape.dimensions().size() != 1) {
+      return absl::InvalidArgumentError(
+          "zml$scaled_matmul (NVFP4): workspace must be rank-1 s8.");
+    }
+  }
+
+  if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
+      scale_shape.dimensions().size() != 2 ||
+      out_shape.dimensions().size() != 2) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): x, w, scale, out must all be rank 2.");
+  }
+  const int64_t m = x_shape.dimensions(0);
+  const int64_t k = x_shape.dimensions(1);
+  const int64_t n = w_shape.dimensions(0);
+  if (m == 0 || k == 0 || n == 0) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): invalid dimension.");
+  }
+  if (w_shape.element_type() != F4E2M1FN || w_shape.dimensions(1) != k) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): w must be f4e2m1[N, K] (K minor).");
+  }
+  if (scale_shape.element_type() != F8E4M3FN || k % 16 != 0 ||
+      scale_shape.dimensions(0) != n || scale_shape.dimensions(1) != k / 16) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): scale must be e4m3 [N, K/16].");
+  }
+  if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): x and out must be bf16.");
+  }
+  if (out_shape.dimensions(0) != m || out_shape.dimensions(1) != n) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (NVFP4): out must be [M, N].");
+  }
+  const auto metal_arch =
+      ir_emitter_context_->gpu_device_info().metal_compute_capability();
+  TF_ASSIGN_OR_RETURN(const int64_t expected_workspace_bytes,
+                      GetMetalNvfp4WorkspaceBytes(
+                          m, k, n, metal_arch.architecture_size(),
+                          metal_arch.architecture_gen()));
+  const int64_t workspace_bytes =
+      is_tuple ? workspace_shape.dimensions(0) : 0;
+  if (workspace_bytes != expected_workspace_bytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "zml$scaled_matmul (NVFP4): workspace must be s8[",
+        expected_workspace_bytes, "]; got s8[", workspace_bytes, "]."));
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scale,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice out,
+      GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
+  BufferAllocation::Slice workspace;
+  if (is_tuple) {
+    TF_ASSIGN_OR_RETURN(workspace,
+                        GetAllocationSliceForHlo(instr, ShapeIndex{1}));
+  }
+
+  auto thunk = std::make_unique<MetalNvfp4MatmulThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, workspace,
+      workspace_shape, m, k, n, metal_arch.architecture_size(),
+      metal_arch.architecture_gen());
+  return ThunkSequence::Of(std::move(thunk));
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
+    const HloCustomCallInstruction* instr) {
+  if (instr->operand_count() != 3) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul (FP8) expects 3 operands (x, w, scale).");
+  }
+  const Shape& x_shape = instr->operand(0)->shape();
+  const Shape& w_shape = instr->operand(1)->shape();
+  const Shape& scale_shape = instr->operand(2)->shape();
   const bool is_tuple = instr->shape().IsTuple();
   const Shape& out_shape =
       is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
@@ -1272,31 +1434,36 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
   if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
       scale_shape.dimensions().size() != 2 ||
       out_shape.dimensions().size() != 2) {
-    return absl::UnimplementedError("metal block-scaled fp8 GEMV: unexpected operand ranks.");
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (FP8): x, w, scale, out must all be rank 2.");
   }
-
   const int64_t b = x_shape.dimensions(0);
   const int64_t k = x_shape.dimensions(1);
   const int64_t n = w_shape.dimensions(0);
-
   if (b == 0 || k == 0 || n == 0) {
     return absl::UnimplementedError(
-        "metal block-scaled fp8 GEMV: invalid dimension (must be > 0).");
+        "zml$scaled_matmul (FP8): invalid dimension.");
   }
-  if (w_shape.dimensions(1) != k || out_shape.dimensions(0) != b ||
-      out_shape.dimensions(1) != n) {
+  if (w_shape.element_type() != F8E4M3FN || w_shape.dimensions(1) != k) {
     return absl::UnimplementedError(
-        "metal block-scaled fp8 GEMV: inconsistent x/w/out shapes.");
+        "zml$scaled_matmul (FP8): w must be f8e4m3fn[N, K] (K minor).");
   }
-  if (k % 128 != 0 || n % 128 != 0) {
+  const bool per_channel =
+      (scale_shape.dimensions(0) == n && scale_shape.dimensions(1) == 1);
+  const bool block_128 = (k % 128 == 0 && n % 128 == 0 &&
+                          scale_shape.dimensions(0) == n / 128 &&
+                          scale_shape.dimensions(1) == k / 128);
+  if (scale_shape.element_type() != BF16 || (!per_channel && !block_128)) {
     return absl::UnimplementedError(
-        "metal block-scaled fp8 GEMV: N and K must be multiples of the 128 block size.");
-  }
-  if (w_shape.element_type() != F8E4M3FN) {
-    return absl::UnimplementedError("metal block-scaled fp8 GEMV: w must be f8e4m3fn.");
+        "zml$scaled_matmul (FP8): scale must be bf16 [N/128,K/128] or [N,1].");
   }
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
-    return absl::UnimplementedError("metal block-scaled fp8 GEMV: x and out must be bf16.");
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (FP8): x and out must be bf16.");
+  }
+  if (out_shape.dimensions(0) != b || out_shape.dimensions(1) != n) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (FP8): out must be [B, N].");
   }
 
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
@@ -1312,36 +1479,73 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFp8GemvThunk(
   auto thunk = std::make_unique<MetalFp8GemvThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, b, k, n);
+      x, x_shape, w, w_shape, scale, scale_shape, out, out_shape, b, k, n,
+      per_channel);
   return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     const HloCustomCallInstruction* instr) {
-  // Two flavors share one thunk: the fp8 block-scaled call carries a scale
-  // operand (x, w_f8, scale, expert_id); the bf16 call drops it (x, w, expert_id).
+  // Three flavors share one thunk:
+  //   fp8:   {x, w_f8, scale, expert_id}
+  //   nvfp4: {x, w_f4, scale, expert_id, w_global_scale?}
+  //   bf16:  {x, w, expert_id}
   const bool is_fp8 =
       instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
-  const int64_t expected_operands = is_fp8 ? 4 : 3;
-  if (instr->operand_count() != expected_operands) {
+  const bool is_nvfp4 =
+      instr->custom_call_target() == kMetalMoeGemmF4CallTarget;
+  const bool has_scale = is_fp8 || is_nvfp4;
+  const int64_t expected_operands = has_scale ? 4 : 3;
+  // nvfp4 only: an optional trailing f32[E] per-expert global scale, folded
+  // into the weight group scale by the kernels.
+  const bool has_global_scale =
+      is_nvfp4 && instr->operand_count() == expected_operands + 1;
+  if (instr->operand_count() != expected_operands && !has_global_scale) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "metal MoE GEMV expects ", expected_operands, " operands."));
+        "metal MoE GEMV expects ", expected_operands,
+        is_nvfp4 ? " or 5 operands." : " operands."));
   }
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
-  const int expert_id_idx = is_fp8 ? 3 : 2;
+  const int expert_id_idx = has_scale ? 3 : 2;
   const Shape& expert_id_shape = instr->operand(expert_id_idx)->shape();
 
-  // Single output [R, N] bf16 (tolerate a 1-tuple too).
+  // MetalWorkspaceRewriter gives the sorted-prefill path a tuple(result,
+  // s8[bytes]) result; the per-row path keeps its plain array result.
   const bool is_tuple = instr->shape().IsTuple();
+  if (is_tuple && instr->shape().tuple_shapes().size() != 2) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV must return either a bf16 result or "
+        "tuple(bf16 result, s8 workspace).");
+  }
   const Shape& out_shape =
       is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+  Shape workspace_shape;
+  if (is_tuple) {
+    workspace_shape = instr->shape().tuple_shapes(1);
+    if (!workspace_shape.IsArray() || workspace_shape.element_type() != S8 ||
+        workspace_shape.dimensions().size() != 1) {
+      return absl::InvalidArgumentError(
+          "metal MoE GEMV: workspace must be rank-1 s8.");
+    }
+  }
 
   if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 3 ||
       expert_id_shape.dimensions().size() != 1 ||
       out_shape.dimensions().size() != 2) {
     return absl::UnimplementedError(
         "metal MoE GEMV: unexpected operand ranks.");
+  }
+  auto is_row_major = [](const Shape& shape) {
+    return shape.IsArray() && shape.has_layout() &&
+           LayoutUtil::IsMonotonicWithDim0Major(shape.layout());
+  };
+  if (!is_row_major(x_shape) || !is_row_major(w_shape) ||
+      !is_row_major(expert_id_shape) || !is_row_major(out_shape) ||
+      (has_scale && !is_row_major(instr->operand(2)->shape()))) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV requires row-major contiguous x, w, scale, "
+        "expert_id, and output buffers.");
   }
 
   const int64_t r = x_shape.dimensions(0);
@@ -1353,26 +1557,41 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     return absl::UnimplementedError(
         "metal MoE GEMV: invalid dimension (must be > 0).");
   }
+  constexpr int64_t kMaxKernelDim = std::numeric_limits<int32_t>::max();
+  if (r > kMaxKernelDim || k > kMaxKernelDim || n > kMaxKernelDim ||
+      e > kMaxKernelDim) {
+    return absl::InvalidArgumentError(
+        "metal MoE GEMV: R, E, K, and N must fit signed int32.");
+  }
   if (w_shape.dimensions(2) != k || out_shape.dimensions(0) != r ||
       out_shape.dimensions(1) != n || expert_id_shape.dimensions(0) != r) {
     return absl::UnimplementedError(
         "metal MoE GEMV: inconsistent x/w/expert_id/out shapes.");
   }
-  // fp8 needs the 128x128 block-scale alignment; bf16 only needs the bfloat4
-  // vectorized loads (K,N multiples of 4 — Gemma4-A4B's K=704 qualifies). The
-  // decode GEMV bounds-checks N and the partial K tile; the steel prefill picks
-  // its align_N/K function constants from the real dims (see the thunk).
-  const int64_t block = is_fp8 ? 128 : 4;
-  if (k % block != 0 || n % block != 0) {
+  // FP8 needs 128x128 block-scale and bf16 uses four-wide vector loads.
+  // NVFP4 only requires group-16 K: its QMV/Steel kernels and sorted row
+  // copies all have scalar-safe N tails.
+  if (is_nvfp4 && k % 16 != 0) {
+    return absl::UnimplementedError(
+        "metal MoE GEMV: K must be multiple of 16 "
+        "(nvfp4 group-16; N supports scalar tails).");
+  }
+  const int64_t k_block = is_fp8 ? 128 : 4;
+  const int64_t n_block = is_fp8 ? 128 : 4;
+  if (!is_nvfp4 && (k % k_block != 0 || n % n_block != 0)) {
     return absl::UnimplementedError(absl::StrCat(
-        "metal MoE GEMV: N and K must be multiples of ", block,
+        "metal MoE GEMV: K must be multiple of ", k_block, ", N of ", n_block,
         is_fp8 ? " (fp8 block-scale)." : " (bf16 vectorized load)."));
   }
-  const PrimitiveType expected_w = is_fp8 ? F8E4M3FN : BF16;
+  const PrimitiveType expected_w =
+      is_fp8 ? F8E4M3FN : (is_nvfp4 ? F4E2M1FN : BF16);
   if (w_shape.element_type() != expected_w) {
     return absl::UnimplementedError(absl::StrCat(
         "metal MoE GEMV: w must be ",
-        is_fp8 ? "f8e4m3fn" : "bf16", "."));
+        is_fp8     ? "f8e4m3fn"
+        : is_nvfp4 ? "f4e2m1"
+                   : "bf16",
+        "."));
   }
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
@@ -1381,8 +1600,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
   if (expert_id_shape.element_type() != S32) {
     return absl::UnimplementedError("metal MoE GEMV: expert_id must be s32.");
   }
+  TF_ASSIGN_OR_RETURN(const int64_t expected_workspace_bytes,
+                      GetMetalMoeWorkspaceBytes(r, e, k, n, is_nvfp4));
+  const int64_t workspace_bytes =
+      is_tuple ? workspace_shape.dimensions(0) : 0;
+  if (workspace_bytes != expected_workspace_bytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metal MoE GEMV workspace must be s8[", expected_workspace_bytes,
+        "]; got s8[", workspace_bytes, "]."));
+  }
 
-  // The scale operand is fp8-only; bf16 passes empty slice/shape.
+  // Scale operand: fp8 = [E, N/128, K/128] bf16; nvfp4 = [E, N, K/16] f8e4m3fn.
   BufferAllocation::Slice scale;
   Shape scale_shape;
   if (is_fp8) {
@@ -1392,10 +1620,47 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
         scale_shape.dimensions(1) != n / 128 ||
         scale_shape.dimensions(2) != k / 128) {
       return absl::UnimplementedError(
-          "metal MoE GEMV: scale must be [E, N/128, K/128].");
+          "metal MoE GEMV: fp8 scale must be [E, N/128, K/128].");
+    }
+    if (scale_shape.element_type() != BF16) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: fp8 scale must be bf16.");
     }
     TF_ASSIGN_OR_RETURN(scale,
                         GetAllocationSliceForHlo(instr->operand(2), {}));
+  } else if (is_nvfp4) {
+    scale_shape = instr->operand(2)->shape();
+    if (scale_shape.dimensions().size() != 3 ||
+        scale_shape.dimensions(0) != e || scale_shape.dimensions(1) != n ||
+        scale_shape.dimensions(2) != k / 16) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: nvfp4 scale must be [E, N, K/16].");
+    }
+    if (scale_shape.element_type() != F8E4M3FN) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: nvfp4 scale must be f8e4m3fn.");
+    }
+    TF_ASSIGN_OR_RETURN(scale,
+                        GetAllocationSliceForHlo(instr->operand(2), {}));
+  }
+
+  // Optional nvfp4 per-expert global scale (compressed-tensors g_ct): f32[E].
+  BufferAllocation::Slice global_scale;
+  Shape global_scale_shape;
+  if (has_global_scale) {
+    global_scale_shape = instr->operand(4)->shape();
+    if (global_scale_shape.dimensions().size() != 1 ||
+        global_scale_shape.dimensions(0) != e) {
+      return absl::UnimplementedError(absl::StrCat(
+          "metal MoE GEMV: nvfp4 global scale must be [", e, "]; got ",
+          global_scale_shape.ToString(), "."));
+    }
+    if (global_scale_shape.element_type() != F32) {
+      return absl::UnimplementedError(
+          "metal MoE GEMV: nvfp4 global scale must be f32.");
+    }
+    TF_ASSIGN_OR_RETURN(global_scale,
+                        GetAllocationSliceForHlo(instr->operand(4), {}));
   }
 
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
@@ -1408,78 +1673,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
   TF_ASSIGN_OR_RETURN(
       BufferAllocation::Slice out,
       GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
-
-  // PREFILL PADDING CLAMP source (mirrors the dense-GEMM clamp in
-  // EmitMetalGemmThunk above): the MoE call's R = padded_tokens*top_k, but only
-  // the real-prompt routes carry meaningful rows (routes are token-major, so the
-  // padding is a contiguous suffix). Find this exe's prefill attention num_tokens
-  // scalar (the same real-prompt-length device value the GEMMs clamp off) and
-  // recover top_k = R / compiled_tokens, so the thunk clamps the sort/gather/
-  // steel/scatter to R_active = num_tokens*top_k. A decode exe (attention q_len==1
-  // / total_q==num_seqs, no num_tokens operand) matches nothing -> top_k stays 0
-  // -> the thunk runs unclamped (decode is not padded).
-  BufferAllocation::Slice moe_num_tokens;
-  Shape moe_num_tokens_shape;
-  int64_t compiled_tokens = 0;
-  for (const HloInstruction* i : instr->parent()->instructions()) {
-    if (i->opcode() != HloOpcode::kCustomCall) continue;
-    const auto* fa = Cast<HloCustomCallInstruction>(i);
-    if (fa->custom_call_target() != "zml$flash_attn") continue;
-    const Shape& fq = fa->operand(0)->shape();
-    if (fq.dimensions().size() != 3 || fq.dimensions(1) <= 1) continue;  // decode
-    const bool fc = fa->operand(1)->shape().dimensions().size() == 4;
-    const int fbase = fc ? 5 : 4;  // q,k,v,tok[,layer]
-    if (fa->operand_count() != fbase + 1) continue;  // no num_tokens operand
-    TF_ASSIGN_OR_RETURN(moe_num_tokens,
-                        GetAllocationSliceForHlo(fa->operand(fbase), {}));
-    moe_num_tokens_shape = fa->operand(fbase)->shape();
-    compiled_tokens = fq.dimensions(1);
-    break;
+  BufferAllocation::Slice workspace;
+  if (is_tuple) {
+    TF_ASSIGN_OR_RETURN(workspace,
+                        GetAllocationSliceForHlo(instr, ShapeIndex{1}));
   }
-  if (compiled_tokens == 0) {
-    // Paged prefill (llmd chunked prefill): real token count is the last element
-    // of query_start_len[num_seqs] (operand 5 of a prefill zml$paged_attn).
-    for (const HloInstruction* i : instr->parent()->instructions()) {
-      if (i->opcode() != HloOpcode::kCustomCall) continue;
-      const auto* pa = Cast<HloCustomCallInstruction>(i);
-      if (pa->custom_call_target() != "zml$paged_attn") continue;
-      if (pa->operand_count() != 6) continue;
-      const Shape& pq = pa->operand(0)->shape();  // [total_q, heads, hd]
-      const Shape& bt = pa->operand(3)->shape();  // [num_seqs, max_blocks]
-      if (pq.dimensions().size() != 3 || bt.dimensions().size() != 2) continue;
-      const int64_t total_q = pq.dimensions(0);
-      const int64_t num_seqs = bt.dimensions(0);
-      if (total_q <= num_seqs) continue;  // decode module
-      const Shape& qsl_shape = pa->operand(5)->shape();
-      if (qsl_shape.dimensions().size() != 1 ||
-          qsl_shape.dimensions(0) != num_seqs + 1 ||
-          ShapeUtil::ByteSizeOfPrimitiveType(qsl_shape.element_type()) != 4) {
-        continue;
-      }
-      TF_ASSIGN_OR_RETURN(BufferAllocation::Slice qsl,
-                          GetAllocationSliceForHlo(pa->operand(5), {}));
-      moe_num_tokens = BufferAllocation::Slice(
-          qsl.allocation(), qsl.offset() + num_seqs * 4, 4);
-      moe_num_tokens_shape = ShapeUtil::MakeShape(S32, {});
-      compiled_tokens = total_q;
-      break;
-    }
-  }
-  // top_k must evenly divide R (token-major routes) and be in a sane range; else
-  // leave it 0 so the thunk skips the clamp (the slice's presence + top_k>0 gate
-  // has_num_tokens_).
-  int64_t moe_top_k = 0;
-  if (compiled_tokens > 0 && r % compiled_tokens == 0) {
-    const int64_t tk = r / compiled_tokens;
-    if (tk >= 1 && tk <= 256) moe_top_k = tk;
-  }
-  if (moe_top_k == 0) moe_num_tokens = BufferAllocation::Slice();
 
   auto thunk = std::make_unique<MetalMoeGemvThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
-      out, out_shape, r, k, n, moe_num_tokens, moe_num_tokens_shape, moe_top_k);
+      out, out_shape, workspace, workspace_shape, global_scale,
+      global_scale_shape, has_global_scale, r, k, n);
   return ThunkSequence::Of(std::move(thunk));
 }
 
@@ -1638,11 +1843,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunkF8(
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       instr, ir_emitter_context_->GetNextThunkId());
   ASSIGN_OR_RETURN(std::string canonical_hlo, CanonicalGemmHlo(instr));
-  return ThunkSequence::Of<CublasLtMatmulThunk>(
+  auto thunk = std::make_unique<CublasLtMatmulThunk>(
       std::move(thunk_info), std::move(canonical_hlo), std::move(gemm_config),
       blas_lt_epilogue, algorithm, config.autotune_workspace_size(), a, b, c, d,
       /*group_sizes=*/std::nullopt, bias, std::nullopt, a_scale, b_scale,
       std::nullopt, d_scale, d_amax, workspace_buffer);
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtGroupedMatmulThunk(
@@ -1713,11 +1919,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtGroupedMatmulThunk(
       instr, ir_emitter_context_->GetNextThunkId());
   ASSIGN_OR_RETURN(std::string canonical_hlo, CanonicalGemmHlo(instr));
 
-  return ThunkSequence::Of<CublasLtMatmulThunk>(
+  auto thunk = std::make_unique<CublasLtMatmulThunk>(
       std::move(thunk_info), std::move(canonical_hlo), std::move(gemm_config),
       blas_lt_epilogue, algorithm, config.autotune_workspace_size(), a, b, c, d,
       std::move(group_sizes), bias, std::nullopt, std::nullopt, std::nullopt,
       std::nullopt, std::nullopt, std::nullopt, workspace_buffer);
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunkMx(
@@ -1764,13 +1971,14 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCublasLtMatmulThunkMx(
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       instr, ir_emitter_context_->GetNextThunkId());
   ASSIGN_OR_RETURN(std::string canonical_hlo, CanonicalGemmHlo(instr));
-  return ThunkSequence::Of<CublasLtMatmulThunk>(
+  auto thunk = std::make_unique<CublasLtMatmulThunk>(
       std::move(thunk_info), std::move(canonical_hlo), std::move(gemm_config),
       blas_lt_epilogue, algorithm, config.autotune_workspace_size(), a, b, c, d,
       /*group_sizes=*/std::nullopt,
       /*bias=*/std::nullopt, /*aux=*/std::nullopt, a_scale, b_scale,
       /*c_scale=*/std::nullopt, /*d_scale=*/std::nullopt,
       /*d_amax=*/std::nullopt, workspace_buffer);
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConvolutionReorderThunk(
@@ -1897,13 +2105,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCuDnnThunk(
                      instr->backend_config<xla::gpu::GpuBackendConfig>());
     dropout_seed = gpu_config.cudnn_fmha_backend_config().seed();
   }
-  return ThunkSequence::Of<CuDnnThunk>(
+  return ThunkSequence::Of(std::make_unique<CuDnnThunk>(
       fingerprint,
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       kernel_arguments.GetArgumentShapedSlices(),
       kernel_arguments.GetArgumentOutputFlags(),
-      /*should_memzero=*/IsCustomCallTofMHA(*instr), dropout_seed);
+      /*should_memzero=*/IsCustomCallTofMHA(*instr), dropout_seed));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitPtxCustomCall(
@@ -1913,38 +2121,22 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitPtxCustomCall(
   return ThunkSequence::Of(std::move(thunk));
 }
 
-std::optional<BufferAllocation::Slice> ThunkEmitter::GetAllocationOverride(
-    const HloInstruction* instr, const ShapeIndex& index) const {
-  auto it = allocation_overrides_.find(instr);
-  if (it == allocation_overrides_.end()) {
-    return std::nullopt;
-  }
-
-  int64_t flat_idx = index.empty() ? 0 : index[0];
-  if (flat_idx >= 0 && static_cast<size_t>(flat_idx) < it->second.size()) {
-    return it->second[static_cast<size_t>(flat_idx)];
-  }
-
-  return std::nullopt;
-}
-
 absl::StatusOr<BufferAllocation::Slice> ThunkEmitter::GetAllocationSliceForHlo(
     const HloInstruction* instr, const ShapeIndex& index) const {
-  if (std::optional<BufferAllocation::Slice> slice =
-          GetAllocationOverride(instr, index)) {
-    return *slice;
+  if (!allocation_overrides_.empty()) {
+    auto it = allocation_overrides_.find(instr);
+    if (it != allocation_overrides_.end()) {
+      int64_t flat_idx = index.empty() ? 0 : index[0];
+      if (flat_idx < it->second.size()) {
+        return it->second[flat_idx];
+      }
+    }
   }
-
   return ir_emitter_context_->buffer_assignment().GetUniqueSlice(instr, index);
 }
 
 absl::StatusOr<ShapedSlice> ThunkEmitter::GetShapedSliceForHlo(
     const HloInstruction* instr, const ShapeIndex& index) const {
-  if (std::optional<BufferAllocation::Slice> slice =
-          GetAllocationOverride(instr, index)) {
-    return ShapedSlice{*slice, ShapeUtil::GetSubshape(instr->shape(), index)};
-  }
-
   ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
                    GetAllocationSliceForHlo(instr, index));
   ASSIGN_OR_RETURN(
@@ -2079,14 +2271,14 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFftThunk(
                    GetAllocationSliceForHlo(instr->operand(0)));
   ASSIGN_OR_RETURN(BufferAllocation::Slice dest_slice,
                    GetAllocationSliceForHlo(instr));
-  return ThunkSequence::Of<FftThunk>(
+  return ThunkSequence::Of(std::make_unique<FftThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       instr->fft_type(), instr->fft_length(),
       /*input_buffer=*/arg_slice,
       /*output_buffer=*/dest_slice,
       /*input_shape=*/instr->operand(0)->shape(),
-      /*output_shape=*/instr->shape());
+      /*output_shape=*/instr->shape()));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTriangularSolveCustomCall(
@@ -2126,18 +2318,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTriangularSolveCustomCall(
   // Triangular solve is in-place on 'b', so copy 'b' to the output
   // if they aren't the same buffer.
   if (b_slice.slice != result_slice.slice) {
-    thunks.Emplace<DeviceToDeviceCopyThunk>(
+    thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(
             instr, ir_emitter_context_->GetNextThunkId()),
         /*source_buffer=*/b_slice,
         /*destination_buffer=*/result_slice,
-        /*mem_size=*/ShapeUtil::ByteSizeOf(b_slice.shape));
+        /*mem_size=*/ShapeUtil::ByteSizeOf(b_slice.shape)));
   }
 
-  thunks.Emplace<TriangularSolveThunk>(
+  thunks.push_back(std::make_unique<TriangularSolveThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      backend_config, a_slice, result_slice, temp_slice);
+      backend_config, a_slice, result_slice, temp_slice));
 
   // Elide the sequential thunk if there's no copy.
   if (thunks.size() == 1) {
@@ -2147,7 +2339,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTriangularSolveCustomCall(
       instr, ir_emitter_context_->GetNextThunkId());
   // Don't repeat the annotation from inside thunks
   thunk_info.profile_annotation = {};
-  return ThunkSequence::Of<SequentialThunk>(thunk_info, std::move(thunks));
+  return ThunkSequence::Of(
+      std::make_unique<SequentialThunk>(thunk_info, std::move(thunks)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
@@ -2187,17 +2380,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
 
   auto dtype = data_shape.element_type();
   bool is_cuda = ir_emitter_context_->gpu_compute_capability().IsCuda();
-
-  // Enable RAFT if TopK is_stable = false.
-  bool use_raft = !hlo_instruction_utils::IsTopKStable(instr);
-  // TODO(b/473829358): Remove use_raft_select_k flag after transition period.
-  // Enable RAFT if explicitly flagged.
-  use_raft |= instr->GetModule()
-                  ->config()
-                  .debug_options()
-                  .xla_gpu_experimental_use_raft_select_k();
-
-  if (is_cuda && use_raft) {
+  if (is_cuda && instr->GetModule()
+                     ->config()
+                     .debug_options()
+                     .xla_gpu_experimental_use_raft_select_k()) {
     // The heuristic for deciding when to use TopK Custom Kernel versus
     // Raft::matrix::select_k was developed as part of the initial research
     // in b/409009349.
@@ -2216,8 +2402,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
     Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
         instr, ir_emitter_context_->GetNextThunkId());
     if (use_raft_select_k) {
-      return ThunkSequence::Of<SelectKThunk>(std::move(thunk_info), batch_size,
-                                             n, k, dtype, kernel_arguments);
+      return ThunkSequence::Of(std::make_unique<SelectKThunk>(
+          std::move(thunk_info), batch_size, n, k, dtype, kernel_arguments));
     }
   }
 
@@ -2256,8 +2442,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitTopKCustomCall(
 
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       instr, ir_emitter_context_->GetNextThunkId());
-  return ThunkSequence::Of<CustomKernelThunk>(
-      std::move(thunk_info), std::move(kernel), kernel_arguments);
+  return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
+      std::move(thunk_info), std::move(kernel), kernel_arguments));
 }
 
 AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
@@ -2287,7 +2473,6 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
     block_level_parameters.global_scratch_memory_size =
         call.global_scratch_memory_size;
     block_level_parameters.is_tma_allowed = call.is_tma_allowed;
-    block_level_parameters.waves_per_eu = call.waves_per_eu;
 
     return ir_emitter_context_->kernel_compiler()
         ->CompileTritonToLlvm(
@@ -2301,8 +2486,8 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
               instr, call = std::move(call),
               kernel_compiler = ir_emitter_context_->kernel_compiler(),
               buffer_assignment = &ir_emitter_context_->buffer_assignment(),
-              &gpu_device_info = ir_emitter_context_->gpu_device_info()](
-                 TritonWrapperResult result) mutable
+              gpu_device_info = ir_emitter_context_->gpu_device_info()](
+                 TritonWrapperResult result)
                  -> xla::Future<KernelReuseCache::Entry> {
           auto local_module =
               std::move(result.kernel_source).thread_safe_module();
@@ -2332,9 +2517,8 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
               .Map([use_pdl = result.use_pdl, shmem_bytes = result.shmem_bytes,
                     launch_dimensions = std::move(launch_dimensions),
                     tma_metadata = result.tma_metadata,
-                    kernel_name = std::move(kernel_name)](
-                       const std::vector<uint8_t>& cubin) mutable {
-                return KernelReuseCache::Entry{std::move(kernel_name),
+                    kernel_name](const std::vector<uint8_t>& cubin) {
+                return KernelReuseCache::Entry{kernel_name,
                                                launch_dimensions,
                                                /*cluster_dim=*/std::nullopt,
                                                shmem_bytes,
@@ -2359,8 +2543,8 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
   return status_or_entry.Map(
       [thunk_info = std::move(thunk_info),
        kernel_arguments = std::move(kernel_arguments),
-       call_zeroed_outputs = std::move(call_zeroed_outputs)](
-          const KernelReuseCache::Entry* entry) mutable
+       call_zeroed_outputs =
+           std::move(call_zeroed_outputs)](const KernelReuseCache::Entry* entry)
           -> absl::StatusOr<ThunkSequence> {
         ASSIGN_OR_RETURN(CustomKernel custom_kernel,
                          kernel::CreateOwnedCubinCustomKernel(
@@ -2369,10 +2553,9 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
                              entry->launch_dimensions.block_counts(),
                              entry->launch_dimensions.thread_counts_per_block(),
                              entry->shmem_bytes));
-        return ThunkSequence::Of<CustomKernelThunk>(
-            std::move(thunk_info), std::move(custom_kernel),
-            std::move(kernel_arguments), entry->use_pdl, call_zeroed_outputs,
-            entry->tma_metadata);
+        return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
+            thunk_info, std::move(custom_kernel), kernel_arguments,
+            entry->use_pdl, call_zeroed_outputs, entry->tma_metadata));
       });
 }
 
@@ -2404,10 +2587,10 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncComputation(
   return std::move(nested_thunks)
       .Map([thunk_info = std::move(thunk_info),
             async_execution = std::move(async_execution),
-            execution_stream_id](ThunkSequence nested_thunks) mutable {
-        return ThunkSequence::Of<AsyncStartThunk>(
+            execution_stream_id](ThunkSequence nested_thunks) {
+        return ThunkSequence::Of(std::make_unique<AsyncStartThunk>(
             std::move(thunk_info), execution_stream_id,
-            std::move(nested_thunks), async_execution);
+            std::move(nested_thunks), async_execution));
       });
 }
 
@@ -2437,11 +2620,12 @@ AsyncThunkSequence ThunkEmitter::EmitDynamicSliceCopyFusion(
   BufferAllocation::Slice dst_slice(
       &embedded_allocations[copy.parameters.size()], 0, byte_size);
 
-  ThunkSequence embedded_thunks = ThunkSequence::Of<DeviceToDeviceCopyThunk>(
-      Thunk::ThunkInfo::WithProfileAnnotation(
-          instr, ir_emitter_context_->GetNextThunkId()),
-      ShapedSlice{src_slice, copy_shape},
-      ShapedSlice{dst_slice, copy.results[0].update_shape}, byte_size);
+  ThunkSequence embedded_thunks =
+      ThunkSequence::Of(std::make_unique<DeviceToDeviceCopyThunk>(
+          Thunk::ThunkInfo::WithProfileAnnotation(
+              instr, ir_emitter_context_->GetNextThunkId()),
+          ShapedSlice{src_slice, copy_shape},
+          ShapedSlice{dst_slice, copy.results[0].update_shape}, byte_size));
 
   std::vector<BufferAllocation::Slice> parameter_buffers;
   parameter_buffers.reserve(instr->operand_count());
@@ -2468,11 +2652,11 @@ AsyncThunkSequence ThunkEmitter::EmitDynamicSliceCopyFusion(
       ir_emitter_context_->debug_options()
           .xla_gpu_experimental_dynamic_slice_fusion_verify_offsets();
 
-  return ThunkSequence::Of<DynamicSliceFusionV2Thunk>(
+  return ThunkSequence::Of(std::make_unique<DynamicSliceFusionV2Thunk>(
       std::move(thunk_info), std::move(copy.parameters),
       std::move(copy.results), std::move(parameter_buffers),
       std::move(result_buffers), std::move(embedded_allocations),
-      std::move(embedded_thunks), verify_offsets);
+      std::move(embedded_thunks), verify_offsets));
 }
 
 AsyncThunkSequence ThunkEmitter::EmitStaticSliceCopyFusion(
@@ -2494,11 +2678,11 @@ AsyncThunkSequence ThunkEmitter::EmitStaticSliceCopyFusion(
       arg_slice.allocation(), arg_slice.offset() + copy.source_byte_offset,
       byte_size, arg_slice.element_type());
 
-  return ThunkSequence::Of<DeviceToDeviceCopyThunk>(
+  return ThunkSequence::Of(std::make_unique<DeviceToDeviceCopyThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       ShapedSlice{src_slice, copy.slice_shape},
-      ShapedSlice{dst_slice, instr->shape()}, byte_size);
+      ShapedSlice{dst_slice, instr->shape()}, byte_size));
 }
 
 AsyncThunkSequence ThunkEmitter::EmitFusion(const HloFusionInstruction* instr) {
@@ -2626,11 +2810,11 @@ AsyncThunkSequence ThunkEmitter::EmitDynamicSliceFusionV2(
        parameter_buffers = std::move(parameter_buffers),
        embedded_allocations = std::move(embedded_allocations),
        verify_offsets](ThunkSequence embedded_thunks) mutable {
-        return ThunkSequence::Of<DynamicSliceFusionV2Thunk>(
+        return ThunkSequence::Of(std::make_unique<DynamicSliceFusionV2Thunk>(
             std::move(thunk_info), std::move(parameters), std::move(results),
             std::move(parameter_buffers), std::move(result_buffers),
             std::move(embedded_allocations), std::move(embedded_thunks),
-            verify_offsets);
+            verify_offsets));
       });
 }
 
@@ -2643,12 +2827,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopy(
                    GetAllocationSliceForHlo(instr->operand(0)));
   ASSIGN_OR_RETURN(BufferAllocation::Slice dst_buffer,
                    GetAllocationSliceForHlo(instr));
-  return ThunkSequence::Of<DeviceToDeviceCopyThunk>(
+  return ThunkSequence::Of(std::make_unique<DeviceToDeviceCopyThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       /*source_buffer=*/ShapedSlice{src_buffer, instr->operand(0)->shape()},
       /*destination_buffer=*/ShapedSlice{dst_buffer, instr->shape()},
-      /*mem_size=*/src_buffer.size());
+      /*mem_size=*/src_buffer.size()));
 }
 
 AsyncThunkSequence ThunkEmitter::EmitAsyncCustomCallStart(
@@ -2676,10 +2860,10 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncCustomCallStart(
   return std::move(custom_call_thunks)
       .Map([start_thunk_info = std::move(start_thunk_info),
             async_execution = std::move(async_execution),
-            execution_stream_id](ThunkSequence custom_call_thunks) mutable {
-        return ThunkSequence::Of<AsyncStartThunk>(
+            execution_stream_id](ThunkSequence custom_call_thunks) {
+        return ThunkSequence::Of(std::make_unique<AsyncStartThunk>(
             std::move(start_thunk_info), execution_stream_id,
-            std::move(custom_call_thunks), std::move(async_execution));
+            std::move(custom_call_thunks), std::move(async_execution)));
       });
 }
 
@@ -2716,11 +2900,11 @@ AsyncThunkSequence ThunkEmitter::EmitWhile(const HloInstruction* instr) {
   return std::move(tsl::JoinFutures(EmitHloComputation(condition),
                                     EmitHloComputation(body)))
       .Map([info = std::move(info), pred = pred, trip_count = trip_count](
-               std::tuple<ThunkSequence, ThunkSequence> tuple) mutable {
+               std::tuple<ThunkSequence, ThunkSequence> tuple) {
         auto [cond_thunks, body_thunks] = std::move(tuple);
-        return ThunkSequence::Of<WhileThunk>(
+        return ThunkSequence::Of(std::make_unique<WhileThunk>(
             std::move(info), std::move(pred), std::move(cond_thunks),
-            std::move(body_thunks), trip_count);
+            std::move(body_thunks), trip_count));
       });
 }
 
@@ -2752,7 +2936,9 @@ AsyncThunkSequence ThunkEmitter::EmitRngGetAndUpdateState(
                     instr, ir_emitter_context_->GetNextThunkId()),
                 std::move(kernel_def).TakeSource(), std::string(spec.name()),
                 kernel_arguments, launch_dimensions)
-      .Map([](auto thunk) { return ThunkSequence::Of(std::move(thunk)); });
+      .Map([](std::unique_ptr<Thunk> thunk) {
+        return ThunkSequence::Of(std::move(thunk));
+      });
 }
 
 AsyncThunkSequence ThunkEmitter::EmitSort(const HloSortInstruction* sort) {
@@ -2789,14 +2975,14 @@ AsyncThunkSequence ThunkEmitter::EmitSort(const HloSortInstruction* sort) {
       // TODO(b/26783907): Figure out why we never seem to share
       // buffers for key/value sort.
       VLOG(2) << op_name << " requires initial D2D copy for operand " << i;
-      thunks.Emplace<DeviceToDeviceCopyThunk>(
+      thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
           Thunk::ThunkInfo::WithProfileAnnotation(
               sort, ir_emitter_context_->GetNextThunkId()),
           /*source_buffer=*/
           ShapedSlice{source_address, sort->operand(i)->shape()},
           /*destination_buffer=*/
           ShapedSlice{destination_buffer, sort->operand(i)->shape()},
-          ShapeUtil::ByteSizeOf(sort->operand(i)->shape()));
+          ShapeUtil::ByteSizeOf(sort->operand(i)->shape())));
     }
   }
 
@@ -2812,20 +2998,20 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitReplicaOrPartitionId(
     const HloInstruction* instr) {
   ASSIGN_OR_RETURN(BufferAllocation::Slice result_slice,
                    GetAllocationSliceForHlo(instr, {}));
-  return ThunkSequence::Of<ThunkType>(
+  return ThunkSequence::Of(std::make_unique<ThunkType>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      result_slice);
+      result_slice));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRngSeedThunk(
     const HloInstruction* instr) {
   ASSIGN_OR_RETURN(BufferAllocation::Slice result_slice,
                    GetAllocationSliceForHlo(instr, {}));
-  return ThunkSequence::Of<RngSeedThunk>(
+  return ThunkSequence::Of(std::make_unique<RngSeedThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      result_slice);
+      result_slice));
 }
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCollectivePermute(
     const HloCollectivePermuteInstruction* instr,
@@ -2878,13 +3064,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCollectivePermute(
                                              partition_count)) {
       // For a degenerate collective permute, just generate a copy
       // thunk.
-      thunks.Emplace<DeviceToDeviceCopyThunk>(
+      thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
           Thunk::ThunkInfo::WithProfileAnnotation(
               async_start, ir_emitter_context_->GetNextThunkId()),
           /*source_buffer=*/ShapedSlice{source_slice, operand_shape},
           /*destination_buffer=*/
           ShapedSlice{result_slice, result_buffer_shape},
-          /*mem_size=*/ShapeUtil::ByteSizeOf(operand_shape));
+          /*mem_size=*/ShapeUtil::ByteSizeOf(operand_shape)));
     } else {
       const CollectiveThunk::Buffer buffer = {
           /*element_count=*/ShapeUtil::ElementsIn(operand_shape),
@@ -2897,13 +3083,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCollectivePermute(
   }
   if (!CollectivePermuteThunk::IsDegenerate(instr, replica_count,
                                             partition_count)) {
-    thunks.Emplace<CollectivePermuteThunk>(
+    thunks.push_back(std::make_unique<CollectivePermuteThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(
             async_start, ir_emitter_context_->GetNextThunkId()),
         instr, replica_count, partition_count, buffers,
         ir_emitter_context_->debug_options().xla_gpu_collective_permute_mode(),
         ir_emitter_context_->debug_options()
-            .xla_gpu_collective_permute_connected_components());
+            .xla_gpu_collective_permute_connected_components()));
   }
 
   // For synchronous collectives, emit thunks directly without async wrapping.
@@ -3035,33 +3221,35 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveThunk(
     thunk_info.profile_annotation = async_start->name();
   }
   AsyncThunkSequence thunks;
-  bool use_triton = false;
-  if (auto gpu_config_status =
-          inst->template backend_config<GpuBackendConfig>();
-      gpu_config_status.ok()) {
-    use_triton = IsTritonCollectiveKernel(
-        gpu_config_status->collective_backend_config().kernel_strategy());
-  }
-  // For AllGather the strategy is now determined by the annotation written
-  // by CollectiveKernelStrategyAnnotator.
-  // `use_triton` was already set above by reading the backend_config
-  // annotation.
-  if (use_triton) {
-    CollectiveConfig collective_config =
-        GetCollectiveConfig(inst, use_global_device_ids);
-    thunks = EmitCollectiveKernelThunk(std::move(thunk_info), buffers, inst,
-                                       collective_config);
+  // TODO(b/828435206) Remove this constexpr once collective kernel thunk is
+  // lifted out of the all reduce thunk.
+  if constexpr (kRequiresCollectiveKernelThunk<CollectiveThunkType>) {
+    thunks =
+        EmitCollectiveKernelThunk(
+            ir_emitter_context_, *call_graph_, thunk_info, buffers,
+            Cast<HloAllReduceInstruction>(inst),
+            GetCollectiveConfig(inst, inst->use_global_device_ids()), this,
+            analysis_garbage_collector_)
+            .Map([thunk_info = std::move(thunk_info),
+                  use_memcpy_local_p2p = ir_emitter_context_->debug_options()
+                                             .xla_gpu_use_memcpy_local_p2p(),
+                  buffers = std::move(buffers),
+                  inst](std::unique_ptr<CollectiveKernelThunk>
+                            collective_kernel_thunk) {
+              return ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
+                  thunk_info, inst, /*buffers=*/std::move(buffers),
+                  std::move(collective_kernel_thunk), use_memcpy_local_p2p));
+            });
+  } else if constexpr (std::is_constructible_v<
+                           CollectiveThunkType, Thunk::ThunkInfo,
+                           decltype(inst),
+                           std::vector<CollectiveThunk::Buffer>>) {
+    thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
+        thunk_info, inst, /*buffers=*/std::move(buffers)));
   } else {
-    if constexpr (std::is_constructible_v<
-                      CollectiveThunkType, Thunk::ThunkInfo, decltype(inst),
-                      std::vector<CollectiveThunk::Buffer>>) {
-      thunks = ThunkSequence::Of<CollectiveThunkType>(
-          thunk_info, inst, /*buffers=*/std::move(buffers));
-    } else {
-      thunks = ThunkSequence::Of<CollectiveThunkType>(
-          thunk_info, inst, /*buffers=*/std::move(buffers),
-          ir_emitter_context_->debug_options().xla_gpu_use_memcpy_local_p2p());
-    }
+    thunks = ThunkSequence::Of(std::make_unique<CollectiveThunkType>(
+        thunk_info, inst, /*buffers=*/std::move(buffers),
+        ir_emitter_context_->debug_options().xla_gpu_use_memcpy_local_p2p()));
   }
 
   // For synchronous collectives, emit thunk directly without async wrapping.
@@ -3096,11 +3284,11 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveThunk(
 
   return std::move(thunks).Map(
       [async_start_thunk_info = std::move(async_start_thunk_info),
-       execution_stream_id, async_execution = std::move(async_execution)](
-          ThunkSequence thunks) mutable {
-        return ThunkSequence::Of<AsyncStartThunk>(
-            std::move(async_start_thunk_info), execution_stream_id,
-            std::move(thunks), async_execution);
+       execution_stream_id,
+       async_execution = std::move(async_execution)](ThunkSequence thunks) {
+        return ThunkSequence::Of(std::make_unique<AsyncStartThunk>(
+            async_start_thunk_info, execution_stream_id, std::move(thunks),
+            async_execution));
       });
 }
 
@@ -3143,7 +3331,7 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveGroupStartThunk(
       .Map([group_thunk_info = std::move(group_thunk_info),
             start_thunk_info = std::move(start_thunk_info),
             async_execution = std::move(async_execution), execution_stream_id,
-            is_sync](std::vector<ThunkSequence> sequences) mutable {
+            is_sync](std::vector<ThunkSequence> sequences) {
         ThunkSequence thunks = FlattenThunkSequence(std::move(sequences));
         auto group_thunk = std::make_unique<CollectiveGroupThunk>(
             std::move(group_thunk_info), Thunk::Kind::kGroup,
@@ -3155,10 +3343,10 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveGroupStartThunk(
           return ThunkSequence::Of(std::move(group_thunk));
         }
 
-        return ThunkSequence::Of<AsyncStartThunk>(
+        return ThunkSequence::Of(std::make_unique<AsyncStartThunk>(
             std::move(start_thunk_info), *execution_stream_id,
             ThunkSequence::Of(std::move(group_thunk)),
-            std::move(async_execution));
+            std::move(async_execution)));
       });
 }
 
@@ -3185,10 +3373,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCollectiveAsyncDone(
     return ThunkSequence{};
   }
 
-  return ThunkSequence::Of<AsyncDoneThunk>(
+  return ThunkSequence::Of(std::make_unique<AsyncDoneThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           inst, ir_emitter_context_->GetNextThunkId()),
-      it->second);
+      it->second));
 }
 
 template <typename HloInstType>
@@ -3203,20 +3391,20 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitDegeneratedCollectiveThunk(
   ThunkSequence thunks;
   for (int64_t i = 0; i < buffers.size(); i++) {
     const Shape shape = inst->operand(i)->shape();
-    thunks.Emplace<DeviceToDeviceCopyThunk>(
+    thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(
             inst, ir_emitter_context_->GetNextThunkId()),
         ShapedSlice{buffers[i].source_buffer.slice, shape},
         ShapedSlice{buffers[i].destination_buffer.slice, shape},
-        ShapeUtil::ByteSizeOf(shape));
+        ShapeUtil::ByteSizeOf(shape)));
   }
   if (thunks.size() == 1) {
     return thunks;
   }
-  return ThunkSequence::Of<SequentialThunk>(
+  return ThunkSequence::Of(std::make_unique<SequentialThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           inst, ir_emitter_context_->GetNextThunkId()),
-      std::move(thunks));
+      std::move(thunks)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitInfeed(
@@ -3240,10 +3428,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitInfeed(
                         instr->ToString(), index.ToString());
       }));
 
-  return ThunkSequence::Of<InfeedThunk>(
+  return ThunkSequence::Of(std::make_unique<InfeedThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      std::move(shaped_slices));
+      std::move(shaped_slices)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitOutfeed(
@@ -3267,10 +3455,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitOutfeed(
                         source->ToString(), index.ToString());
       }));
 
-  return ThunkSequence::Of<OutfeedThunk>(
+  return ThunkSequence::Of(std::make_unique<OutfeedThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      std::move(shaped_slices));
+      std::move(shaped_slices)));
 }
 
 static absl::flat_hash_map<std::string, std::string> ConvertFrontendAttributes(
@@ -3318,11 +3506,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopyStartThunk(
                    ShapeHasHostMemorySpace(shape, 0, host_memory_space));
   ASSIGN_OR_RETURN(bool is_src_host_memory,
                    ShapeHasHostMemorySpace(shape, 1, host_memory_space));
-  // H2H is not a supported copy-start variant.
-  if (is_dst_host_memory && is_src_host_memory) {
+  if (is_dst_host_memory == is_src_host_memory) {
     return absl::InternalError(
-        absl::StrFormat("Copy-start %s has host memory space S(%d) on both "
-                        "source and destination, which is unsupported",
+        absl::StrFormat("Copy-start %s doesn't have correct host memory space "
+                        "color S(%d)",
                         copy_start_instr->ToString(),
                         static_cast<int>(stream_executor::MemorySpace::kHost)));
   }
@@ -3331,21 +3518,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopyStartThunk(
   Thunk::ThunkInfo copy_thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       copy_start_instr, ir_emitter_context_->GetNextThunkId());
 
-  std::unique_ptr<Thunk> copy_thunk;
-  if (!is_dst_host_memory && !is_src_host_memory) {
-    // D2D async copy: both source and destination reside in device memory.
-    // The thunk is a raw memcpy, so source and destination layouts must
-    // match; layout-changing copies must not reach this path.
-    TF_RET_CHECK(LayoutUtil::LayoutsInShapesEqual(
-        shape.tuple_shapes(0), input_shape, Layout::Equal().MinorToMajorOnly()))
-        << "Copy-start " << copy_start_instr->ToString()
-        << " has mismatched source/destination layouts";
-    copy_thunk = std::make_unique<DeviceToDeviceCopyThunk>(
-        copy_thunk_info,
-        /*source_buffer=*/ShapedSlice{src_buffer, input_shape},
-        /*destination_buffer=*/ShapedSlice{dst_buffer, input_shape},
-        /*mem_size=*/ShapeUtil::ByteSizeOf(input_shape));
-  } else if (is_dst_host_memory) {
+  std::unique_ptr<CopyThunk> copy_thunk;
+  if (is_dst_host_memory) {
     copy_thunk = std::make_unique<DeviceToHostCopyThunk>(
         copy_thunk_info,
         /*source_buffer=*/ShapedSlice{src_buffer, input_shape},
@@ -3396,10 +3570,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCopyDoneThunk(
   // If the copy-start was asynchronous, emit an AsyncDoneThunk.
   auto it = hlo_async_executions_.find(copy_start_instr);
   if (it != hlo_async_executions_.end()) {
-    return ThunkSequence::Of<AsyncDoneThunk>(
+    return ThunkSequence::Of(std::make_unique<AsyncDoneThunk>(
         Thunk::ThunkInfo::WithProfileAnnotation(
             instr, ir_emitter_context_->GetNextThunkId()),
-        it->second);
+        it->second));
   }
 
   // Synchronous copy: copy-done is a no-op.
@@ -3445,11 +3619,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSendThunk(
       // send/recv pair (pipelined send/recv share the same async stream).
       auto existing_it = hlo_async_executions_.find(canonical_send_instr);
       if (existing_it != hlo_async_executions_.end()) {
-        return ThunkSequence::Of<AsyncStartThunk>(
+        auto start_thunk = std::make_unique<AsyncStartThunk>(
             Thunk::ThunkInfo::WithProfileAnnotation(
                 instr, ir_emitter_context_->GetNextThunkId()),
             execution_stream_id, ThunkSequence::Of(std::move(thunk)),
             existing_it->second);
+        return ThunkSequence::Of(std::move(start_thunk));
       }
 
       auto start_thunk = std::make_unique<AsyncStartThunk>(
@@ -3469,12 +3644,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSendThunk(
         "Unknown channel id in host transfer send instruction");
   }
 
-  return ThunkSequence::Of<HostSendThunk>(
+  return ThunkSequence::Of(std::make_unique<HostSendThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       src->shape(), slice.slice, *instr->channel_id(), send_recv_events_,
       ConvertFrontendAttributes(instr->frontend_attributes()),
-      DeviceConstraint(instr));
+      DeviceConstraint(instr)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSendDoneThunk(
@@ -3489,10 +3664,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSendDoneThunk(
         "instruction");
   }
 
-  return ThunkSequence::Of<HostSendDoneThunk>(
+  return ThunkSequence::Of(std::make_unique<HostSendDoneThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      *instr->channel_id(), send_recv_events_, DeviceConstraint(instr));
+      *instr->channel_id(), send_recv_events_, DeviceConstraint(instr)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRecvThunk(
@@ -3536,11 +3711,12 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRecvThunk(
       // send/recv pair (pipelined send/recv share the same async stream).
       auto existing_it = hlo_async_executions_.find(canonical_recv_instr);
       if (existing_it != hlo_async_executions_.end()) {
-        return ThunkSequence::Of<AsyncStartThunk>(
+        auto start_thunk = std::make_unique<AsyncStartThunk>(
             Thunk::ThunkInfo::WithProfileAnnotation(
                 instr, ir_emitter_context_->GetNextThunkId()),
             execution_stream_id, ThunkSequence::Of(std::move(thunk)),
             existing_it->second);
+        return ThunkSequence::Of(std::move(start_thunk));
       }
 
       auto start_thunk = std::make_unique<AsyncStartThunk>(
@@ -3560,13 +3736,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRecvThunk(
         "Unknown channel id in host transfer recv instruction");
   }
 
-  return ThunkSequence::Of<HostRecvThunk>(
+  return ThunkSequence::Of(std::make_unique<HostRecvThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       instr->shape().tuple_shapes()[0], slice.slice, *instr->channel_id(),
       send_recv_events_,
       ConvertFrontendAttributes(instr->frontend_attributes()),
-      DeviceConstraint(instr));
+      DeviceConstraint(instr)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRecvDoneThunk(
@@ -3579,10 +3755,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitRecvDoneThunk(
         "Unknown channel id in host transfer recv done "
         "instruction");
   }
-  return ThunkSequence::Of<HostRecvDoneThunk>(
+  return ThunkSequence::Of(std::make_unique<HostRecvDoneThunk>(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
-      *instr->channel_id(), send_recv_events_, DeviceConstraint(instr));
+      *instr->channel_id(), send_recv_events_, DeviceConstraint(instr)));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncDone(
@@ -3591,6 +3767,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncDone(
     return EmitCollectiveAsyncDone(instr);
   }
   const HloInstruction* wrapped = instr->async_wrapped_instruction();
+  ThunkSequence thunks;
   switch (wrapped->opcode()) {
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllGather:
@@ -3621,10 +3798,11 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncDone(
           result_slices.push_back({slice, indexed.shape});
         }
 
-        return ThunkSequence::Of<HostExecuteDoneThunk>(
+        thunks.push_back(std::make_unique<HostExecuteDoneThunk>(
             Thunk::ThunkInfo::WithProfileAnnotation(
                 instr, ir_emitter_context_->GetNextThunkId()),
-            std::move(result_slices), async_events);
+            std::move(result_slices), async_events));
+        return thunks;
       }
       auto it = hlo_async_executions_.find(wrapped);
       if (it == hlo_async_executions_.end()) {
@@ -3633,10 +3811,11 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitAsyncDone(
             "EmitAsyncComputation must be called before EmitAsyncDone.",
             wrapped->ToString());
       }
-      return ThunkSequence::Of<AsyncDoneThunk>(
+      thunks.push_back(std::make_unique<AsyncDoneThunk>(
           Thunk::ThunkInfo::WithProfileAnnotation(
               instr, ir_emitter_context_->GetNextThunkId()),
-          it->second);
+          it->second));
+      return thunks;
     }
     default:
       return Internal("Unsupported async done wrapped instruction: %s",
@@ -3654,14 +3833,12 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncStart(const HloInstruction* instr) {
     case HloOpcode::kAllReduce: {
       auto* all_reduce = Cast<HloAllReduceInstruction>(wrapped);
       return EmitCollectiveThunk<AllReduceThunk, HloAllReduceInstruction>(
-          Thunk::kAllReduce, instr, all_reduce,
-          /*use_global_device_ids=*/all_reduce->use_global_device_ids());
+          Thunk::kAllReduce, instr, all_reduce, std::nullopt);
     }
     case HloOpcode::kAllGather: {
       auto* all_gather = Cast<HloAllGatherInstruction>(wrapped);
       return EmitCollectiveThunk<AllGatherThunk, HloAllGatherInstruction>(
-          Thunk::kAllGather, instr, all_gather,
-          /*use_global_device_ids=*/all_gather->use_global_device_ids());
+          Thunk::kAllGather, instr, all_gather, std::nullopt);
     }
     case HloOpcode::kCollectivePermute: {
       auto* collective_permute = Cast<HloCollectivePermuteInstruction>(wrapped);
@@ -3718,10 +3895,10 @@ AsyncThunkSequence ThunkEmitter::EmitAsyncStart(const HloInstruction* instr) {
       return std::move(fusion_thunks)
           .Map([start_thunk_info = std::move(start_thunk_info),
                 async_execution = std::move(async_execution),
-                execution_stream_id](ThunkSequence fusion_thunks) mutable {
-            return ThunkSequence::Of<AsyncStartThunk>(
+                execution_stream_id](ThunkSequence fusion_thunks) {
+            return ThunkSequence::Of(std::make_unique<AsyncStartThunk>(
                 std::move(start_thunk_info), execution_stream_id,
-                std::move(fusion_thunks), std::move(async_execution));
+                std::move(fusion_thunks), std::move(async_execution)));
           });
     }
     case HloOpcode::kCall: {
@@ -3837,16 +4014,16 @@ AsyncThunkSequence ThunkEmitter::EmitCustomCallSwitch(
   if (custom_call->custom_call_target() == "zml$gdn") {
     return EmitMetalGdnThunk(custom_call);
   }
-  // Apple Metal has no cuBLASLt FP8. GemmRewriter emits __metal$gemm$f8 (peer to
-  // CUDA's __cublas$lt$matmul$f8) carrying {x, w_f8, scale}; route it to the
-  // fused FP8 GEMV kernel (MetalFp8GemvThunk), never metalBLAS.
-  if (IsMetalFp8Gemm(*hlo)) {
-    return EmitFp8GemvThunk(custom_call);
+  // Weight-only scaled matmul: FusedScaledDotRewriter's Metal arm rewrites a
+  // weight-only kScaledDot into zml$scaled_matmul; dispatch NVFP4 group-16 or
+  // 128-block / per-channel FP8 via ClassifyMetalScaledMatmul (MX is not a
+  // fused scheme -- it never reaches this call).
+  if (IsMetalScaledMatmul(*hlo)) {
+    return EmitMetalScaledMatmulThunk(custom_call);
   }
-  // Model-emitted grouped block-scaled FP8 GEMV for MoE experts: the model does
-  // top-k routing and emits __metal$moe_gemm$f8 with {x_rows, w[E,N,K]_f8,
-  // scale, expert_id}; route it to the grouped FP8 GEMV kernel.
-  if (IsMetalMoeGemm(*hlo) || IsMetalMoeGemmBf16(*hlo)) {
+  // Model-emitted grouped MoE GEMV (bf16 / fp8 / nvfp4): the model does top-k
+  // routing and emits __metal$moe_gemm{,$f8,$f4}; route to MetalMoeGemvThunk.
+  if (IsMetalMoeGemmAny(*hlo)) {
     return EmitMoeGemvThunk(custom_call);
   }
   // Apple Metal has no cuBLAS/cuBLAS-LT. GemmRewriter emits an honest

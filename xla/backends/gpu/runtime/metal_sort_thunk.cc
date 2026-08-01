@@ -26,7 +26,7 @@ limitations under the License.
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/metal_air_toolchain.h"
-#include "xla/service/gpu/metal_kernels/metalblas_shaders.h"
+#include "xla/service/gpu/metal_kernels/mlx_kernels.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_address.h"
