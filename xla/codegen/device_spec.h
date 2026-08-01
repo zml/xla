@@ -58,6 +58,15 @@ class DeviceSpec {
   bool IsIntelGpu() const {
     return IsGpu() && gpu().gpu_compute_capability().IsOneAPI();
   }
+  // Apple Metal/AIR target — a first-class GpuComputeCapability alternative
+  // (MetalComputeCapability), peer to CUDA/ROCm/oneAPI. Detected via the variant
+  // like the others; selects the GpuToAIR lowering arm instead of NVVM. Because
+  // Metal is its own capability (not a faked CUDA cap anymore), IsNvidiaGpu() is
+  // correctly false for Metal, so ordering vs the other Is*Gpu() checks no longer
+  // matters.
+  bool IsMetal() const {
+    return IsGpu() && gpu().gpu_compute_capability().IsMetal();
+  }
 
  private:
   DeviceSpecType type_;

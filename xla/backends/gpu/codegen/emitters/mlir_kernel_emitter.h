@@ -164,7 +164,10 @@ class MlirKernelEmitter {
 // generating an MLIR module from an HLO fusion. MlirKernelFusion then takes
 // this MLIR module and handles the process of lowering it through various
 // passes down to LLVM IR.
-class MlirKernelFusion final : public KernelFusionInterface {
+// NOTE: not `final` — the Metal backend subclasses this (MetalMlirKernelFusion)
+// and overrides only CreateLLVMModule to emit Apple AIR instead of lowering
+// MLIR->LLVM/NVVM. Behavior is unchanged for plain MlirKernelFusion instances.
+class MlirKernelFusion : public KernelFusionInterface {
  public:
   explicit MlirKernelFusion(std::unique_ptr<MlirKernelEmitter> emitter)
       : emitter_(std::move(emitter)) {}
@@ -187,8 +190,11 @@ class MlirKernelFusion final : public KernelFusionInterface {
                           const HloFusionInstruction& fusion) const final;
 
   // Visible for testing. `buffer_assignment` is optional for testing (assigns
-  // a different buffer to each tensor).
-  xla::Future<LlvmKernelSource> CreateLLVMModule(
+  // a different buffer to each tensor). `virtual` so the Metal backend
+  // (MetalMlirKernelFusion) can override it to post-process the lowered module
+  // into Apple AIR; the inherited Emit() reaches it via virtual dispatch from
+  // EmitLlvmModule().
+  virtual xla::Future<LlvmKernelSource> CreateLLVMModule(
       const se::DeviceDescription& device, const HloFusionInstruction& fusion,
       const std::string& entry_function_name,
       const BufferAssignment* buffer_assignment,

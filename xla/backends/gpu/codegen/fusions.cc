@@ -24,6 +24,9 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/concatenate.h"
 #include "xla/backends/gpu/codegen/emitters/in_place_dynamic_update_slice.h"
 #include "xla/backends/gpu/codegen/emitters/loop.h"
+#if defined(TENSORFLOW_USE_METAL)
+#include "xla/backends/gpu/codegen/emitters/metal_mlir_kernel_fusion.h"
+#endif
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/emitters/reduction.h"
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
@@ -64,6 +67,24 @@ bool HloFusionInfo::CanEmitDynamicUpdateSliceInPlace() const {
   return ret.ok() && *ret;
 }
 
+// Wraps an MlirKernelEmitter in the fusion type used for the current platform.
+// On the macOS/Metal build (where GetFusionEmitter is only ever reached for
+// Metal fusions — no CUDA/ROCm on macOS, and the legacy Metal path doesn't use
+// this) it returns a MetalMlirKernelFusion, which overrides only CreateLLVMModule
+// to emit Apple AIR instead of lowering MLIR->NVVM, and fails loud on any fused
+// DAG the AIR emitter can't lower (never a silently-wrong NVVM kernel). It
+// subclasses MlirKernelFusion, so the cost model's dynamic_cast and the inherited
+// launch_dimensions()/indexing still resolve. Elsewhere it is a plain
+// MlirKernelFusion (no behavior change).
+static std::unique_ptr<KernelFusionInterface> MakeMlirFusion(
+    std::unique_ptr<MlirKernelEmitter> emitter) {
+#if defined(TENSORFLOW_USE_METAL)
+  return std::make_unique<MetalMlirKernelFusion>(std::move(emitter));
+#else
+  return std::make_unique<MlirKernelFusion>(std::move(emitter));
+#endif
+}
+
 std::unique_ptr<FusionInterface> GetFusionEmitter(
     const FusionInfo& fusion_info) {
   const auto& analysis = fusion_info.analysis();
@@ -78,26 +99,22 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       }
       if (IsDynamicUpdateSliceFusion(analysis.fusion_spec()) &&
           fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
-        return std::make_unique<MlirKernelFusion>(
+        return MakeMlirFusion(
             std::make_unique<InPlaceDynamicUpdateSliceFusion>(analysis));
       }
-      return std::make_unique<MlirKernelFusion>(
-          std::make_unique<LoopFusion>(analysis));
+      return MakeMlirFusion(std::make_unique<LoopFusion>(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kReduction: {
-      return std::make_unique<MlirKernelFusion>(
-          CreateReductionFusion(analysis));
+      return MakeMlirFusion(CreateReductionFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kScatter: {
-      return std::make_unique<MlirKernelFusion>(CreateScatterFusion(analysis));
+      return MakeMlirFusion(CreateScatterFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kTranspose: {
-      return std::make_unique<MlirKernelFusion>(
-          CreateTransposeFusion(analysis));
+      return MakeMlirFusion(CreateTransposeFusion(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kConcatenate: {
-      return std::make_unique<MlirKernelFusion>(
-          std::make_unique<ConcatenateFusion>(analysis));
+      return MakeMlirFusion(std::make_unique<ConcatenateFusion>(analysis));
     }
     case HloFusionAnalysis::EmitterFusionKind::kSort: {
       return std::make_unique<SortFusion>();

@@ -65,6 +65,25 @@ class ReductionFusion : public MlirKernelEmitter {
 
   const ReductionGroups& GetGroups() const { return groups_; }
 
+  // True iff the launch grid writes the output in dim-0-major order with the kept
+  // (output) axis mapped to the OUTER block dimension, one block per row group —
+  // so dispatching the first fraction of (x,y) blocks computes exactly the first
+  // output rows. This holds for a ROW reduction whose minor reduced axis fits in a
+  // single block (num_blocks_[1] == 1): the kept axis is num_blocks_[0] (the
+  // delinearized outer block id) and each output row is fully reduced by one
+  // block. A split reduction (num_blocks_[1] > 1) computes each row from several
+  // partial-reduction blocks, and a COLUMN reduction tiles the minor (output) axis
+  // instead — both break the "prefix of blocks == prefix of rows" identity, so
+  // they return false. Used by the Metal prefill token-row clamp to skip padding
+  // rows; conservative (false when the grid shape is not provably row-contiguous).
+  bool HasContiguousRowGrid() const {
+    if (!reduction_dimensions_.is_row_reduction) return false;
+    // num_blocks_ is {row_blocks, reduced_blocks} for a row reduction and
+    // {row_blocks} for a multi-row reduction (which reduces a row within one
+    // block). Anything with the reduced axis split across blocks is not clampable.
+    return num_blocks_.size() < 2 || num_blocks_[1] == 1;
+  }
+
  protected:
   struct EmitterState;
   friend struct EmitterState;

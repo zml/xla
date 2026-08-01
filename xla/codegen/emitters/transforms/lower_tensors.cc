@@ -590,8 +590,97 @@ struct RewriteTensorInsert : OpRewritePattern<mlir::tensor::InsertOp> {
   }
 };
 
+// Recovers the per-lane scalar values feeding a statically-built sub-byte vector
+// (post-unroll: a vector.from_elements, or a constant-index vector.insert chain
+// rooted at a poison/undef or constant base) WITHOUT emitting any vector op, so
+// no <N x iW> LLVM value is ever produced. Returns false if the producer is not
+// static (in which case the caller must fail loud rather than emit a crashing
+// sub-byte vector). See RewriteTransferWrite's Metal branch for why.
+bool CollectStaticVectorLanes(mlir::Value vec, int num_lanes,
+                              mlir::ImplicitLocOpBuilder& b,
+                              llvm::SmallVectorImpl<Value>& lanes) {
+  lanes.assign(num_lanes, nullptr);
+  if (auto fe = vec.getDefiningOp<vector::FromElementsOp>()) {
+    if (static_cast<int>(fe.getElements().size()) != num_lanes) return false;
+    for (int k = 0; k < num_lanes; ++k) lanes[k] = fe.getElements()[k];
+    return true;
+  }
+  Value cur = vec;
+  while (auto ins = cur.getDefiningOp<vector::InsertOp>()) {
+    llvm::ArrayRef<int64_t> pos = ins.getStaticPosition();
+    if (pos.size() != 1 || pos[0] == mlir::ShapedType::kDynamic) return false;
+    int k = static_cast<int>(pos[0]);
+    if (k < 0 || k >= num_lanes) return false;
+    if (!lanes[k]) lanes[k] = ins.getValueToStore();
+    cur = ins.getDest();
+  }
+  // Fill any lane not covered by an insert from a constant base. A vector.extract
+  // of a constant vector folds to a scalar constant under the greedy driver, so
+  // no <N x iW> survives; a non-constant base (e.g. bare poison with a missing
+  // lane) is treated as non-static.
+  bool have_const_base = cur.getDefiningOp<mlir::arith::ConstantOp>() != nullptr;
+  for (int k = 0; k < num_lanes; ++k) {
+    if (lanes[k]) continue;
+    if (!have_const_base) return false;
+    lanes[k] = vector::ExtractOp::create(b, cur, k).getResult();
+  }
+  return true;
+}
+
+// Packs a statically-built sub-byte vector into whole-byte integer store(s) with
+// pure scalar ops (bitcast/extui/shl/or/store i8), avoiding any <N x iW> LLVM
+// value. `linear_index` is the byte index of lane 0 (already >>SubByteIndexing).
+// Lane k lands at bit (k % lanes_per_byte)*w of byte (k / lanes_per_byte) —
+// little-endian nibble order, identical to RewriteTensorInsert / PackIntN.
+mlir::LogicalResult RewriteMetalSubByteStore(
+    vector::TransferWriteOp op, mlir::ImplicitLocOpBuilder& b,
+    TypedValue<mlir::RankedTensorType> tensor_dest, Value linear_index,
+    int sub_byte_width, Value vector_value, mlir::PatternRewriter& rewriter) {
+  auto vec_ty = mlir::cast<mlir::VectorType>(vector_value.getType());
+  int num_lanes = vec_ty.getNumElements();
+  int w = sub_byte_width;
+  if ((num_lanes * w) % 8 != 0) return mlir::failure();  // not byte-aligned
+  int lanes_per_byte = 8 / w;
+  int num_bytes = (num_lanes * w) / 8;
+
+  llvm::SmallVector<Value> lanes;
+  if (!CollectStaticVectorLanes(vector_value, num_lanes, b, lanes)) {
+    return mlir::failure();
+  }
+
+  Type i8 = b.getI8Type();
+  Type sub_ty = b.getIntegerType(w);
+  for (int byte = 0; byte < num_bytes; ++byte) {
+    Value acc;
+    for (int j = 0; j < lanes_per_byte; ++j) {
+      Value s = lanes[byte * lanes_per_byte + j];
+      if (s.getType() != sub_ty) {
+        s = arith::BitcastOp::create(b, sub_ty, s);
+      }
+      Value e = arith::ExtUIOp::create(b, i8, s);
+      if (j > 0) {
+        e = arith::ShLIOp::create(
+            b, e, arith::ConstantIntOp::create(b, i8, w * j));
+      }
+      acc = (j == 0) ? e : arith::OrIOp::create(b, acc, e);
+    }
+    Value byte_index =
+        byte == 0 ? linear_index
+                  : arith::AddIOp::create(
+                        b, linear_index,
+                        arith::ConstantIntOp::create(
+                            b, linear_index.getType(), byte));
+    auto gep = CreateGep(tensor_dest, byte_index, b);
+    auto store = ml::StoreOp::create(b, acc, gep);
+    store.setAlignment(1);
+  }
+  rewriter.replaceOp(op, mlir::ValueRange{op.getBase()});
+  return mlir::success();
+}
+
 struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
-  using OpRewritePattern::OpRewritePattern;
+  RewriteTransferWrite(mlir::MLIRContext* context, const DeviceSpec& device_spec)
+      : OpRewritePattern(context), device_spec_(device_spec) {}
 
   LogicalResult matchAndRewrite(
       vector::TransferWriteOp op,
@@ -616,6 +705,25 @@ struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
           b, linear_index,
           arith::ConstantIntOp::create(b, linear_index.getType(),
                                        SubByteIndexingBits(*sub_byte_width)));
+
+      // Metal/AIR: air-as accepts <N x iW> sub-byte vectors, but the Apple GPU
+      // shader compiler (AGXMetalG16X) crashes at pipeline creation on any packed
+      // 4-/2-bit vector value (insertelement/store <2 x i4>). Other backends rely
+      // on their LLVM target legalizing sub-byte vectors; AIR has no such pass.
+      // So pack the lanes into whole-byte integers with pure scalar ops — no
+      // vector op reaches LLVM. The vectorizer packs exactly one byte per thread,
+      // so a single i8 store owns the whole byte (race-free, no atomics).
+      if (device_spec_.IsMetal()) {
+        if (mlir::failed(RewriteMetalSubByteStore(op, b, tensor_dest,
+                                                  linear_index, *sub_byte_width,
+                                                  vector_value, rewriter))) {
+          return op->emitOpError(
+              "Metal sub-byte vector store: could not statically recover the "
+              "packed lanes (non-static producer); refusing to emit a <N x i4> "
+              "that crashes the Apple GPU compiler");
+        }
+        return mlir::success();
+      }
     }
     auto gep = CreateGep(tensor_dest, linear_index, b);
 
@@ -639,6 +747,8 @@ struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
     rewriter.replaceOp(op, mlir::ValueRange{op.getBase()});
     return success();
   }
+
+  const DeviceSpec& device_spec_;
 };
 
 struct RewriteCall : OpRewritePattern<mlir::func::CallOp> {
@@ -1415,12 +1525,12 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
     MLIRContext* mlir_context = &getContext();
     mlir::RewritePatternSet tensor_patterns(mlir_context);
 
-    tensor_patterns.add<RewriteAtomicRMW>(mlir_context, device_spec_);
+    tensor_patterns.add<RewriteAtomicRMW, RewriteTransferWrite>(mlir_context,
+                                                                device_spec_);
     tensor_patterns.add<RewriteAllocateShared, RewriteGetDynamicDimSize,
                         RewriteNonScalarConstants, RewriteSyncThreads,
                         RewriteTensorExtract, RewriteTensorInsert,
-                        RewriteTransferRead, RewriteTransferWrite>(
-        mlir_context);
+                        RewriteTransferRead>(mlir_context);
     if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),
                                                  std::move(tensor_patterns)))) {
       signalPassFailure();
