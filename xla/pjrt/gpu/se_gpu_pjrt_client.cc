@@ -1141,6 +1141,8 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
 
 // ==== End cross-host transfer implementations ==== //
 
+#endif  // TENSORFLOW_USE_METAL
+
 void StreamExecutorGpuClient::RecordMemoryStats() {
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
     defined(TENSORFLOW_USE_SYCL)
