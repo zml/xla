@@ -23,8 +23,10 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
@@ -68,18 +70,12 @@ class MetalStream : public StreamCommon {
       const ThreadDim& thread_dims, const BlockDim& block_dims,
       const std::optional<ClusterDim>& cluster_dims, void* pipeline,
       void* function, bool use_argument_buffer, absl::string_view name,
-      void** args, int64_t shmem_bytes, bool use_pdl,
-      void* indirect_grid_device_ptr = nullptr);
+      void** args, absl::Span<const KernelArgumentMetadata> arg_metadata,
+      int64_t shmem_bytes, bool use_pdl);
 
   void FlushOpenBufferIfCarrying(uint64_t value);
 
  private:
-  absl::Status LaunchKernel(const ThreadDim& thread_dims,
-                            const BlockDim& block_dims,
-                            const std::optional<ClusterDim>& cluster_dims,
-                            void* function, absl::string_view name,
-                            void** args, int64_t shmem_bytes,
-                            bool use_pdl) override;
   void EnsureOpenCommandBuffer();
   void CommitOpenBufferNoWait();
 

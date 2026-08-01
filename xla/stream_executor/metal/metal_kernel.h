@@ -49,11 +49,6 @@ class MetalKernel : public Kernel {
   absl::StatusOr<int32_t> GetMaxOccupiedBlocksPerCore(
       ThreadDim threads, size_t dynamic_shared_memory_bytes) const override;
 
-  absl::Status LaunchIndirect(const ThreadDim& thread_dims,
-                              const BlockDim& block_dims,
-                              void* indirect_grid_device_ptr, Stream* stream,
-                              const KernelArgs& args);
-
  private:
   absl::Status Launch(const ThreadDim& thread_dims, const BlockDim& block_dims,
                       const std::optional<ClusterDim>& cluster_dims,

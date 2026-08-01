@@ -26,22 +26,26 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
 
 namespace stream_executor::metal {
 
 struct MetalDeviceInfo {
   std::string name;
+  std::string architecture;
   std::string registry_id;
   uint64_t recommended_max_working_set_size = 0;
   uint64_t max_buffer_length = 0;
   uint64_t max_threads_per_threadgroup = 0;
   uint64_t max_threadgroup_memory_length = 0;
+  uint64_t gpu_core_count = 0;
   bool has_unified_memory = true;
 };
 
 struct MetalKernelArgument {
+  enum class Kind : uint8_t { kBuffer, kBytes };
+
+  Kind kind = Kind::kBytes;
   void* buffer = nullptr;
   uint64_t offset = 0;
   const void* bytes = nullptr;
@@ -60,7 +64,17 @@ absl::StatusOr<MetalDeviceInfo> GetDeviceInfo(int ordinal);
 absl::StatusOr<void*> RetainDevice(int ordinal);
 absl::StatusOr<void*> NewCommandQueue(void* device);
 
-void* RetainObject(void* object);
+absl::StatusOr<void*> NewResidencySet(void* device);
+void ResidencySetAddAllocation(void* residency_set, void* buffer);
+void ResidencySetRemoveAllocation(void* residency_set, void* buffer);
+void ResidencySetCommit(void* residency_set);
+void ResidencySetRequestResidency(void* residency_set);
+void ResidencySetEndResidency(void* residency_set);
+uint64_t ResidencySetAllocatedSize(void* residency_set);
+uint64_t BufferAllocatedSize(void* buffer);
+void CommandQueueAddResidencySet(void* queue, void* residency_set);
+uint64_t RecommendedMaxWorkingSetSize(void* device);
+
 void ReleaseObject(void* object);
 
 absl::StatusOr<void*> NewSharedBuffer(void* device, uint64_t size,
@@ -79,9 +93,7 @@ absl::Status EncodeKernel(void* batch_command_buffer, void* pipeline,
                           void* function, bool use_argument_buffer,
                           absl::Span<const MetalKernelArgument> arguments,
                           absl::string_view name, const ThreadDim& thread_dims,
-                          const BlockDim& block_dims, int64_t shmem_bytes,
-                          void* indirect_grid_buffer = nullptr,
-                          uint64_t indirect_grid_offset = 0);
+                          const BlockDim& block_dims, int64_t shmem_bytes);
 absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
                             uint64_t dst_offset, void* src_buffer,
                             uint64_t src_offset, uint64_t size);
@@ -94,7 +106,6 @@ void CommitBatchCommandBufferWithCompletion(
 
 absl::Status WaitUntilCompleted(void* command_buffer);
 absl::Status SynchronizeCommandQueue(void* command_queue);
-Event::Status PollCommandBufferStatus(void* command_buffer);
 
 // On one command queue the signaling command buffer must be committed before
 // the waiting one, or the queue deadlocks.

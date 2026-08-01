@@ -26,19 +26,35 @@ namespace stream_executor {
 
 class MetalComputeCapability {
  public:
+  static constexpr int kDefaultArchitectureGen = 15;
+  static constexpr char kDefaultArchitectureSize = ' ';
+
   MetalComputeCapability() = default;
-  explicit MetalComputeCapability(std::string gpu_family)
-      : gpu_family_(std::move(gpu_family)) {}
+  explicit MetalComputeCapability(std::string architecture)
+      : architecture_(std::move(architecture)) {}
   explicit MetalComputeCapability(const MetalComputeCapabilityProto& proto)
-      : gpu_family_(proto.gpu_family()) {}
+      : architecture_(proto.gpu_family()) {}
 
-  const std::string& gpu_family() const { return gpu_family_; }
+  const std::string& architecture() const { return architecture_; }
 
-  std::string ToString() const { return absl::StrCat("Metal:", gpu_family_); }
+  int architecture_gen() const {
+    if (!HasMlxArchitectureSuffix()) return kDefaultArchitectureGen;
+    const size_t n = architecture_.size();
+    return (architecture_[n - 3] - '0') * 10 + (architecture_[n - 2] - '0');
+  }
+
+  char architecture_size() const {
+    return HasMlxArchitectureSuffix() ? architecture_.back()
+                                      : kDefaultArchitectureSize;
+  }
+
+  std::string ToString() const {
+    return absl::StrCat("Metal:", architecture_);
+  }
 
   MetalComputeCapabilityProto ToProto() const {
     MetalComputeCapabilityProto proto;
-    proto.set_gpu_family(gpu_family_);
+    proto.set_gpu_family(architecture_);
     return proto;
   }
 
@@ -48,14 +64,21 @@ class MetalComputeCapability {
   }
 
   bool operator==(const MetalComputeCapability& other) const {
-    return gpu_family_ == other.gpu_family_;
+    return architecture_ == other.architecture_;
   }
   bool operator!=(const MetalComputeCapability& other) const {
     return !(*this == other);
   }
 
  private:
-  std::string gpu_family_;
+  bool HasMlxArchitectureSuffix() const {
+    if (architecture_.size() < 3) return false;
+    const size_t n = architecture_.size();
+    return architecture_[n - 3] >= '0' && architecture_[n - 3] <= '9' &&
+           architecture_[n - 2] >= '0' && architecture_[n - 2] <= '9';
+  }
+
+  std::string architecture_;
 };
 
 }  // namespace stream_executor

@@ -149,6 +149,33 @@ TEST(GpuComputeCapability, ProtoConversion) {
       GpuComputeCapability::FromProto(
           GpuComputeCapability(RocmComputeCapability("gfx908")).ToProto()),
       IsOkAndHolds(GpuComputeCapability(RocmComputeCapability("gfx908"))));
+  EXPECT_THAT(
+      GpuComputeCapability::FromProto(
+          GpuComputeCapability(MetalComputeCapability("applegpu_g16s"))
+              .ToProto()),
+      IsOkAndHolds(
+          GpuComputeCapability(MetalComputeCapability("applegpu_g16s"))));
+}
+
+TEST(MetalComputeCapability, ParsesMlxArchitectureSuffix) {
+  MetalComputeCapability max("applegpu_g16s");
+  EXPECT_EQ(max.architecture(), "applegpu_g16s");
+  EXPECT_EQ(max.architecture_gen(), 16);
+  EXPECT_EQ(max.architecture_size(), 's');
+
+  MetalComputeCapability ultra("applegpu_g14d");
+  EXPECT_EQ(ultra.architecture_gen(), 14);
+  EXPECT_EQ(ultra.architecture_size(), 'd');
+}
+
+TEST(MetalComputeCapability, UnknownArchitectureUsesDispatchFallback) {
+  for (const std::string& architecture : {"", "Apple M4 Max", "Apple9"}) {
+    MetalComputeCapability capability(architecture);
+    EXPECT_EQ(capability.architecture_gen(),
+              MetalComputeCapability::kDefaultArchitectureGen);
+    EXPECT_EQ(capability.architecture_size(),
+              MetalComputeCapability::kDefaultArchitectureSize);
+  }
 }
 
 TEST(ExecutionUnitDescription, ProtoConversion) {

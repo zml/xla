@@ -107,6 +107,8 @@ class MetalExecutor : public gpu::GpuExecutor {
   void* device() const { return device_; }
   void* command_queue() const { return command_queue_; }
 
+  void FlushResidency();
+
   void* shared_event() const { return shared_event_; }
   void* shared_event_listener() const { return shared_event_listener_; }
   uint64_t NextEventValue() {
@@ -121,6 +123,7 @@ class MetalExecutor : public gpu::GpuExecutor {
     void* buffer = nullptr;
     void* contents = nullptr;
     uint64_t size = 0;
+    bool wired = false;
   };
 
   absl::StatusOr<Allocation> ResolveAllocation(const void* ptr) const;
@@ -130,8 +133,15 @@ class MetalExecutor : public gpu::GpuExecutor {
       absl::Span<const uint8_t> payload, const std::string& kernel_name,
       size_t arity);
 
+  void CommitResidencyLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(allocations_mu_);
+
   void* device_ = nullptr;
   void* command_queue_ = nullptr;
+  void* residency_set_ = nullptr;
+  uint64_t residency_capacity_ = 0;
+  uint64_t residency_bytes_ ABSL_GUARDED_BY(allocations_mu_) = 0;
+  std::atomic<bool> residency_staged_ = false;
+  uint64_t residency_staged_bytes_ ABSL_GUARDED_BY(allocations_mu_) = 0;
   void* shared_event_ = nullptr;
   void* shared_event_listener_ = nullptr;
   std::atomic<uint64_t> next_event_value_{0};

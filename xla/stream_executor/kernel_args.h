@@ -96,6 +96,13 @@ class PackableKernelArgs {
       const = 0;
 };
 
+struct KernelArgumentMetadata {
+  enum class Kind : uint8_t { kValue, kDeviceAddress };
+
+  Kind kind = Kind::kValue;
+  int64_t size = 0;
+};
+
 //===----------------------------------------------------------------------===//
 // Kernel argument packing
 //===----------------------------------------------------------------------===//
@@ -153,6 +160,27 @@ struct KernelArgPacking {
   // Packs an argument as the device argument.
   static Type Pack(const T& arg) { return arg; }
 };
+
+template <typename T>
+struct IsDeviceAddressArgument : std::false_type {};
+
+template <>
+struct IsDeviceAddressArgument<DeviceAddressBase> : std::true_type {};
+
+template <>
+struct IsDeviceAddressArgument<DeviceAddressBase*> : std::true_type {};
+
+template <>
+struct IsDeviceAddressArgument<const DeviceAddressBase*> : std::true_type {};
+
+template <typename T>
+struct IsDeviceAddressArgument<DeviceAddress<T>> : std::true_type {};
+
+template <typename T>
+struct IsDeviceAddressArgument<DeviceAddress<T>*> : std::true_type {};
+
+template <typename T>
+struct IsDeviceAddressArgument<const DeviceAddress<T>*> : std::true_type {};
 
 // A template specialization for packing statically sized arrays.
 template <typename T, size_t N>
@@ -264,6 +292,10 @@ class KernelArgsPackedArrayBase : public KernelArgs {
  public:
   // Gets the list of argument addresses.
   virtual absl::Span<const void* const> argument_addresses() const = 0;
+
+  virtual absl::Span<const KernelArgumentMetadata> argument_metadata() const {
+    return {};
+  }
 
   static bool classof(const KernelArgs* args) {
     return args->kind() == Kind::kPackedArray;
@@ -409,6 +441,7 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
   explicit KernelArgsPackedArray(size_t num_args) {
     device_addr_args_.reserve(num_args);
     argument_addresses_.reserve(num_args);
+    argument_metadata_.reserve(num_args);
   }
 
   // KernelArgsPackedArray is not copyable or movable because argument
@@ -421,6 +454,8 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
     auto& emplaced =
         packed_args_.emplace_back(new internal::PackedArg(std::move(arg)));
     argument_addresses_.push_back(emplaced->argument_address());
+    argument_metadata_.push_back(
+        {KernelArgumentMetadata::Kind::kValue, emplaced->size()});
   }
 
   // Adds an argument to the list.
@@ -429,6 +464,12 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
     auto& emplaced = packed_args_.emplace_back(
         new internal::PackedArg(KernelArgPacking<T>::Pack(arg)));
     argument_addresses_.push_back(emplaced->argument_address());
+    constexpr bool kIsDeviceAddress =
+        IsDeviceAddressArgument<std::remove_cv_t<T>>::value;
+    argument_metadata_.push_back(
+        {kIsDeviceAddress ? KernelArgumentMetadata::Kind::kDeviceAddress
+                          : KernelArgumentMetadata::Kind::kValue,
+         emplaced->size()});
   }
 
   // Adds a device address argument to the list.
@@ -439,6 +480,8 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
     auto& emplaced = packed_args_.emplace_back(new internal::PackedArg(
         KernelArgPacking<const DeviceAddressBase*>::Pack(&arg)));
     argument_addresses_.push_back(emplaced->argument_address());
+    argument_metadata_.push_back(
+        {KernelArgumentMetadata::Kind::kDeviceAddress, emplaced->size()});
   }
 
   // Adds a shared memory argument to the list.
@@ -467,6 +510,10 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
     return argument_addresses_;
   }
 
+  absl::Span<const KernelArgumentMetadata> argument_metadata() const final {
+    return argument_metadata_;
+  }
+
   size_t shared_memory_bytes() const { return shared_memory_bytes_; }
 
   absl::Span<const std::unique_ptr<PackedArgBase>> packed_args() const final {
@@ -482,6 +529,9 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
 
   // Pointers to entries `device_addr_args_` or `packed_args_`.
   absl::InlinedVector<void*, kKernelArgsInlineCapacity> argument_addresses_;
+
+  absl::InlinedVector<KernelArgumentMetadata, kKernelArgsInlineCapacity>
+      argument_metadata_;
 
   // Shared memory required by a kernel.
   size_t shared_memory_bytes_ = 0;
@@ -574,6 +624,10 @@ class KernelArgsPackedTuple : public KernelArgsPackedArrayBase {
     return absl::Span<const void* const>(argument_addresses_.data(), kSize);
   }
 
+  absl::Span<const KernelArgumentMetadata> argument_metadata() const final {
+    return argument_metadata_;
+  }
+
   // Compile time check that KernelArgsPackedTuple is compatible with
   // `OtherArgs`: after stripping const and reference all types match.
   template <typename... OtherArgs>
@@ -592,6 +646,12 @@ class KernelArgsPackedTuple : public KernelArgsPackedArrayBase {
   void InitializeArgumentAddresses(std::index_sequence<Is...>) {
     ((argument_addresses_[Is] = std::get<Is>(storage_).argument_address()),
      ...);
+    ((argument_metadata_[Is] = {
+          IsDeviceAddressArgument<absl::remove_cvref_t<Args>>::value
+              ? KernelArgumentMetadata::Kind::kDeviceAddress
+              : KernelArgumentMetadata::Kind::kValue,
+          std::get<Is>(storage_).size()}),
+     ...);
   }
 
   // Storage for packed kernel arguments.
@@ -602,6 +662,7 @@ class KernelArgsPackedTuple : public KernelArgsPackedArrayBase {
 
   // Pointers into `storage_`.
   std::array<const void*, kSize> argument_addresses_;
+  std::array<KernelArgumentMetadata, kSize> argument_metadata_;
 };
 
 // Packs the given arguments into a KernelArgsPackedTuple.

@@ -42,11 +42,11 @@ cc_library(
     ]),
     linkopts = if_macos([
         "-Wl,-framework,Foundation",
+        "-Wl,-framework,IOKit",
         "-Wl,-framework,Metal",
         "-Wl,-framework,MetalPerformanceShaders",
     ]),
     deps = [
-        "//xla/stream_executor:event",
         "//xla/stream_executor:launch_dim",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/log",
@@ -77,8 +77,8 @@ cc_library(
     deps = [
         ":metal_runtime",
         ":metal_stream",
-        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:stream",
@@ -101,6 +101,7 @@ cc_library(
         ":metal_runtime",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:event",
+        "//xla/stream_executor:kernel_args",
         "//xla/stream_executor:launch_dim",
         "//xla/stream_executor:platform",
         "//xla/stream_executor:stream",
@@ -110,7 +111,9 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -118,9 +121,10 @@ cc_library(
     name = "metal_executor_hdrs",
     hdrs = ["metal_executor.h"],
     deps = [
+        ":metal_runtime",
+        "//xla/stream_executor:blas",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
-        "//xla/stream_executor:blas",
         "//xla/stream_executor:dnn",
         "//xla/stream_executor:event",
         "//xla/stream_executor:fft",
@@ -152,9 +156,9 @@ cc_library(
         ":metal_kernel",
         ":metal_runtime",
         ":metal_stream",
+        "//xla/stream_executor:blas",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
-        "//xla/stream_executor:blas",
         "//xla/stream_executor:dnn",
         "//xla/stream_executor:event",
         "//xla/stream_executor:fft",
@@ -207,6 +211,8 @@ cc_library(
     alwayslink = True,
 )
 
+# alwayslink forces :metal_platform's static registration to link; without
+# it the platform silently never registers.
 cc_library(
     name = "all_runtime",
     visibility = ["//visibility:public"],

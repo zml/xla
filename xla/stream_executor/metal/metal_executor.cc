@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -96,6 +97,8 @@ MetalExecutor::~MetalExecutor() {
   }
   ReleaseObject(shared_event_listener_);
   ReleaseObject(shared_event_);
+  ResidencySetEndResidency(residency_set_);
+  ReleaseObject(residency_set_);
   ReleaseObject(command_queue_);
   ReleaseObject(device_);
 }
@@ -103,6 +106,14 @@ MetalExecutor::~MetalExecutor() {
 absl::Status MetalExecutor::Init() {
   TF_ASSIGN_OR_RETURN(device_, RetainDevice(device_ordinal()));
   TF_ASSIGN_OR_RETURN(command_queue_, NewCommandQueue(device_));
+  TF_ASSIGN_OR_RETURN(residency_set_, NewResidencySet(device_));
+  if (residency_set_ != nullptr) {
+    residency_capacity_ = RecommendedMaxWorkingSetSize(device_);
+    if (const char* env = std::getenv("METAL_RESIDENCY_LIMIT_MB")) {
+      residency_capacity_ = static_cast<uint64_t>(std::atoll(env)) << 20;
+    }
+    CommandQueueAddResidencySet(command_queue_, residency_set_);
+  }
   shared_event_ = NewSharedEvent(device_);
   if (shared_event_ == nullptr) {
     LOG(WARNING) << "Metal: newSharedEvent failed; falling back to host-side "
@@ -225,10 +236,42 @@ DeviceAddressBase MetalExecutor::Allocate(uint64_t size, int64_t memory_space) {
   }
   if (size != 0) {
     absl::MutexLock lock(allocations_mu_);
+    constexpr uint64_t kMinWiredBytes = 1 << 20;  // 1 MiB
+    const uint64_t wired_bytes =
+        residency_set_ != nullptr ? BufferAllocatedSize(*buffer) : 0;
+    const bool wired = residency_set_ != nullptr && size >= kMinWiredBytes &&
+                       residency_bytes_ + wired_bytes <= residency_capacity_;
+    if (wired) {
+      ResidencySetAddAllocation(residency_set_, *buffer);
+      residency_staged_ = true;
+      residency_staged_bytes_ += wired_bytes;
+      residency_bytes_ += wired_bytes;
+      constexpr uint64_t kResidencyFlushBytes = uint64_t{1} << 30;  // 1 GiB
+      if (residency_staged_bytes_ >= kResidencyFlushBytes) {
+        CommitResidencyLocked();
+      }
+    }
     allocations_.emplace(reinterpret_cast<uintptr_t>(contents),
-                         Allocation{*buffer, contents, size});
+                         Allocation{*buffer, contents, size, wired});
   }
   return DeviceAddressBase(contents, size);
+}
+
+void MetalExecutor::CommitResidencyLocked() {
+  ResidencySetCommit(residency_set_);
+  ResidencySetRequestResidency(residency_set_);
+  residency_staged_ = false;
+  residency_staged_bytes_ = 0;
+  residency_bytes_ = ResidencySetAllocatedSize(residency_set_);
+  VLOG(2) << "Metal residency: " << (residency_bytes_ >> 20) << " MiB in set of "
+          << (residency_capacity_ >> 20) << " MiB cap";
+}
+
+void MetalExecutor::FlushResidency() {
+  if (residency_set_ == nullptr || !residency_staged_) return;
+  absl::MutexLock lock(allocations_mu_);
+  if (!residency_staged_) return;
+  CommitResidencyLocked();
 }
 
 void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
@@ -242,6 +285,12 @@ void MetalExecutor::Deallocate(DeviceAddressBase* mem) {
                << mem->opaque();
     *mem = DeviceAddressBase(nullptr, 0);
     return;
+  }
+  if (it->second.wired) {
+    ResidencySetRemoveAllocation(residency_set_, it->second.buffer);
+    residency_staged_ = true;
+    const uint64_t wired_bytes = BufferAllocatedSize(it->second.buffer);
+    residency_bytes_ -= std::min(residency_bytes_, wired_bytes);
   }
   ReleaseObject(it->second.buffer);
   allocations_.erase(it);
@@ -347,6 +396,57 @@ bool MetalExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
   return true;
 }
 
+namespace {
+
+int64_t AppleGpuMemoryBandwidth(const MetalComputeCapability& cc,
+                                uint64_t core_count) {
+  struct Part {
+    int gen;
+    int64_t max_cores;
+    int64_t bytes_per_second;
+  };
+  static constexpr Part kParts[] = {
+      {13, 8, 68'250'000'000},    // M1            128-bit LPDDR4X-4266
+      {13, 16, 204'800'000'000},  // M1 Pro        256-bit LPDDR5-6400
+      {13, 32, 409'600'000'000},  // M1 Max        512-bit
+      {13, 64, 819'200'000'000},  // M1 Ultra     1024-bit
+      {14, 10, 102'400'000'000},  // M2            128-bit LPDDR5-6400
+      {14, 19, 204'800'000'000},  // M2 Pro        256-bit
+      {14, 38, 409'600'000'000},  // M2 Max        512-bit
+      {14, 76, 819'200'000'000},  // M2 Ultra     1024-bit
+      {15, 10, 102'400'000'000},  // M3            128-bit LPDDR5-6400
+      {15, 18, 153'600'000'000},  // M3 Pro        192-bit
+      {15, 30, 307'200'000'000},  // M3 Max        384-bit (30-core bin)
+      {15, 40, 409'600'000'000},  // M3 Max        512-bit (40-core bin)
+      {15, 80, 819'200'000'000},  // M3 Ultra     1024-bit
+      {16, 10, 120'000'000'000},  // M4            128-bit LPDDR5X-7500
+      {16, 20, 273'100'000'000},  // M4 Pro        256-bit LPDDR5X-8533
+      {16, 32, 409'600'000'000},  // M4 Max        384-bit (32-core bin)
+      {16, 40, 546'100'000'000},  // M4 Max        512-bit (40-core bin)
+      {17, 10, 153'600'000'000},  // M5            128-bit LPDDR5X-9600
+      {17, 20, 307'200'000'000},  // M5 Pro        256-bit
+      {17, 32, 460'800'000'000},  // M5 Max        384-bit (32-core bin)
+      {17, 40, 614'400'000'000},  // M5 Max        512-bit (40-core bin)
+  };
+
+  const int gen = cc.architecture_gen();
+  const int64_t cores = static_cast<int64_t>(core_count);
+  if (cores > 0) {
+    for (const Part& part : kParts) {
+      if (part.gen == gen && cores <= part.max_cores) {
+        return part.bytes_per_second;
+      }
+    }
+  }
+
+  constexpr int64_t kFallbackBytesPerSecondPerCore = 15'000'000'000;
+  const int64_t assumed_cores = cores > 0 ? cores : 8;
+  return std::clamp<int64_t>(assumed_cores * kFallbackBytesPerSecondPerCore,
+                             60'000'000'000, 3'000'000'000'000);
+}
+
+}  // namespace
+
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 MetalExecutor::CreateDeviceDescription() const {
   TF_ASSIGN_OR_RETURN(MetalDeviceInfo info, GetDeviceInfo(device_ordinal()));
@@ -354,7 +454,7 @@ MetalExecutor::CreateDeviceDescription() const {
   desc->set_device_vendor("Apple");
   desc->set_platform_version("Metal");
   desc->set_gpu_compute_capability(
-      GpuComputeCapability(MetalComputeCapability(info.name)));
+      GpuComputeCapability(MetalComputeCapability(info.architecture)));
   desc->set_driver_version(SemanticVersion{0, 0, 0});
   desc->set_runtime_version(SemanticVersion{0, 0, 0});
   desc->set_compile_time_toolkit_version(SemanticVersion{0, 0, 0});
@@ -375,7 +475,8 @@ MetalExecutor::CreateDeviceDescription() const {
   desc->set_device_address_bits(64);
   desc->set_device_memory_size(info.recommended_max_working_set_size);
   desc->set_l2_cache_size(0);
-  desc->set_memory_bandwidth(0);
+  desc->set_memory_bandwidth(AppleGpuMemoryBandwidth(
+      MetalComputeCapability(info.architecture), info.gpu_core_count));
   desc->set_pcie_bandwidth(0);
   const int64_t tg_mem = info.max_threadgroup_memory_length == 0
                              ? 32 * 1024
@@ -384,9 +485,11 @@ MetalExecutor::CreateDeviceDescription() const {
   desc->set_shared_memory_per_core(tg_mem);
   desc->set_shared_memory_per_block(tg_mem);
   desc->set_shared_memory_per_block_optin(tg_mem);
-  desc->set_clock_rate_ghz(0.0);
-  desc->set_core_count(1);
-  desc->set_fpus_per_core(1);
+  desc->set_clock_rate_ghz(1.4);
+  desc->set_core_count(info.gpu_core_count == 0
+                           ? 1
+                           : static_cast<int>(info.gpu_core_count));
+  desc->set_fpus_per_core(128);
   desc->set_ecc_enabled(false);
   return desc;
 }

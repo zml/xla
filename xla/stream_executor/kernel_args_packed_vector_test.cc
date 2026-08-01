@@ -74,5 +74,23 @@ TEST(KernelArgsPackedVectorTest,
   EXPECT_EQ(args.number_of_arguments(), 3);
 }
 
+TEST(KernelArgsPackedVectorTest, StoresExactBindingMetadata) {
+  std::vector<std::vector<char>> storage = {{1, 2, 3, 4},
+                                            {5, 6, 7, 8, 9, 10, 11, 12}};
+  std::vector<KernelArgumentMetadata> metadata = {
+      {KernelArgumentMetadata::Kind::kValue, 0},
+      {KernelArgumentMetadata::Kind::kDeviceAddress, 0}};
+  KernelArgsPackedVector args(std::move(storage), std::move(metadata),
+                              /*shared_memory_bytes=*/0);
+
+  ASSERT_THAT(args.argument_metadata(), SizeIs(2));
+  EXPECT_EQ(args.argument_metadata()[0].kind,
+            KernelArgumentMetadata::Kind::kValue);
+  EXPECT_EQ(args.argument_metadata()[0].size, 4);
+  EXPECT_EQ(args.argument_metadata()[1].kind,
+            KernelArgumentMetadata::Kind::kDeviceAddress);
+  EXPECT_EQ(args.argument_metadata()[1].size, 8);
+}
+
 }  // namespace
 }  // namespace stream_executor
