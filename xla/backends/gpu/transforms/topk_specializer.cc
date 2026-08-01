@@ -48,7 +48,7 @@ namespace xla::gpu {
 namespace {
 
 absl::StatusOr<HloInstruction*> SmallBufferOptimization(
-    HloCustomCallInstruction* topk, bool is_cuda) {
+    HloCustomCallInstruction* topk, bool is_cuda, bool is_metal) {
   Shape data_shape = topk->operand(0)->shape();
   auto dtype = data_shape.element_type();
   auto supported_dtypes = {F32, BF16};
@@ -98,6 +98,9 @@ absl::StatusOr<HloInstruction*> SmallBufferOptimization(
         max_k = 64;
       }
     }
+  } else if (is_metal) {
+    max_k = 64;
+    min_n = 1;
   }
 
   if (k > max_k) {
@@ -131,8 +134,9 @@ class SpecializeTopkVisitor : public DfsHloRewriteVisitor {
     }
     TF_RET_CHECK(topk->operand_count() == 1);
     bool is_cuda = compute_capability_.IsCuda();
+    bool is_metal = compute_capability_.IsMetal();
 
-    if (auto small_topk = SmallBufferOptimization(topk, is_cuda);
+    if (auto small_topk = SmallBufferOptimization(topk, is_cuda, is_metal);
         small_topk.ok()) {
       return ReplaceInstruction(topk, *small_topk);
     } else {  // NOLINT(readability-else-after-return)
