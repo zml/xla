@@ -82,6 +82,14 @@ class MultiModuleLoaderSpec {
     return {cuda_cubin_in_memory_.data(), cuda_cubin_in_memory_.size()};
   }
 
+  bool has_metal_library_in_memory() const {
+    return has_metal_library_in_memory_;
+  }
+  absl::Span<const uint8_t> metal_library_in_memory() const {
+    CHECK(has_metal_library_in_memory());
+    return {metal_library_in_memory_.data(), metal_library_in_memory_.size()};
+  }
+
   bool has_cuda_ptx_in_memory() const { return has_cuda_ptx_in_memory_; }
   const char* cuda_ptx_in_memory() const {
     CHECK(has_cuda_ptx_in_memory());
@@ -94,6 +102,12 @@ class MultiModuleLoaderSpec {
     cuda_cubin_in_memory_ = cubin_bytes;
   }
 
+  void AddMetalLibraryInMemory(absl::Span<const uint8_t> metallib_bytes) {
+    CHECK(!metallib_bytes.empty());
+    has_metal_library_in_memory_ = true;
+    metal_library_in_memory_ = metallib_bytes;
+  }
+
   void AddCudaPtxInMemory(const char* ptx) {
     has_cuda_ptx_in_memory_ = true;
     // The CUDA driver does not like getting an empty string as PTX.
@@ -103,6 +117,8 @@ class MultiModuleLoaderSpec {
  private:
   absl::Span<const uint8_t> cuda_cubin_in_memory_;
   bool has_cuda_cubin_in_memory_ = false;
+  absl::Span<const uint8_t> metal_library_in_memory_;
+  bool has_metal_library_in_memory_ = false;
   const char* cuda_ptx_in_memory_;
   bool has_cuda_ptx_in_memory_ = false;
 };

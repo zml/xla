@@ -78,6 +78,21 @@ KernelLoaderSpec KernelLoaderSpec::CreateOwningCudaPtxInMemorySpec(
                           std::move(kernel_name), arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateMetalLibraryInMemorySpec(
+    absl::Span<const uint8_t> metallib_bytes, std::string kernel_name,
+    size_t arity, KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{MetalLibraryInMemory{metallib_bytes},
+                          std::move(kernel_name), arity, kernel_args_packing};
+}
+
+KernelLoaderSpec KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+    std::vector<uint8_t> metallib_bytes, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{
+      OwningMetalLibraryInMemory{std::move(metallib_bytes)},
+      std::move(kernel_name), arity, kernel_args_packing};
+}
+
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
@@ -109,8 +124,15 @@ absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
         in_process_symbol()->persistent_name);
   }
 
+  if (has_metal_library_in_memory()) {
+    absl::Span<const uint8_t> data =
+        metal_library_in_memory()->metallib_bytes;
+    proto.mutable_metal_library()->mutable_data()->assign(data.begin(),
+                                                          data.end());
+  }
+
   CHECK(has_cuda_cubin_in_memory() || has_cuda_ptx_in_memory() ||
-        has_in_process_symbol());
+        has_in_process_symbol() || has_metal_library_in_memory());
 
   if (std::holds_alternative<KernelArgsPackingSpec>(kernel_args_packing_)) {
     ASSIGN_OR_RETURN(
@@ -165,11 +187,16 @@ absl::StatusOr<KernelLoaderSpec> KernelLoaderSpec::FromProto(
           proto.kernel_name(), proto.arity(), kernel_args_packing);
     }
 
+    case KernelLoaderSpecProto::kMetalLibrary: {
+      const std::string& data = proto.metal_library().data();
+      return KernelLoaderSpec::CreateOwningMetalLibraryInMemorySpec(
+          std::vector<uint8_t>{data.begin(), data.end()}, proto.kernel_name(),
+          proto.arity(), std::move(kernel_args_packing));
+    }
+
     default:
       return absl::InvalidArgumentError(
-          "Invalid KernelLoaderSpecProto. Neither PTX nor CUBIN payload has "
-          "been "
-          "found.");
+          "Invalid KernelLoaderSpecProto. No kernel payload has been found.");
   }
 }
 
