@@ -687,7 +687,7 @@ cc_library(
     deps = [
         ":se_gpu_pjrt_compiler_impl",
         "//xla/pjrt:pjrt_compiler",
-        "//xla/pjrt:stream_executor_platform_id_mapping",
+        "//xla/pjrt/se:stream_executor_platform_id_mapping",
         "//xla/service/gpu:metal_gpu_compiler",
         "//xla/stream_executor/metal:metal_platform_id",
         "//xla/stream_executor/platform:initialize",
