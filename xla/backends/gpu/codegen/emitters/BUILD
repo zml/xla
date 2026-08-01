@@ -100,6 +100,7 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emitter_context",
+        "//xla/service/gpu/llvm_gpu_backend:metal_air_backend",
         "//xla/stream_executor:device_description",
         "//xla/tsl/concurrency:future",
         "//xla/tsl/platform:statusor",

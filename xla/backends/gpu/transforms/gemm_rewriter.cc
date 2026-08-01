@@ -59,6 +59,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/service/matmul_indexing_utils.h"
 #include "xla/service/pattern_matcher.h"
@@ -333,6 +334,41 @@ std::optional<MatchedFp8Param> MatchFp8Param(HloInstruction* instr) {
 
   param.commutative_ops = {subgraph.begin() + start, subgraph.end()};
   return param;
+}
+
+constexpr int64_t kMetalBlockScaledGemvMaxBatch = 16;
+
+HloInstruction* SkipBlockDequantWrapperOps(HloInstruction* instr) {
+  while (HloPredicateIsOp<HloOpcode::kReshape, HloOpcode::kBitcast,
+                          HloOpcode::kTranspose, HloOpcode::kCopy,
+                          HloOpcode::kConvert>(instr)) {
+    instr = instr->mutable_operand(0);
+  }
+  return instr;
+}
+
+bool MatchMetalBlockScaledDequant(HloInstruction* operand,
+                                  HloInstruction** w_quant_out,
+                                  HloInstruction** scale_out) {
+  HloInstruction* mul = SkipBlockDequantWrapperOps(operand);
+  if (!HloPredicateIsOp<HloOpcode::kMultiply>(mul)) {
+    return false;
+  }
+  for (int i = 0; i < 2; ++i) {
+    HloInstruction* w = SkipBlockDequantWrapperOps(mul->mutable_operand(i));
+    if (MetalBlockScaledGemmTarget(w->shape().element_type()).empty()) {
+      continue;  // not a supported quantized weight leaf on this side
+    }
+    HloInstruction* bcast =
+        SkipBlockDequantWrapperOps(mul->mutable_operand(1 - i));
+    if (!HloPredicateIsOp<HloOpcode::kBroadcast>(bcast)) {
+      continue;
+    }
+    *w_quant_out = w;
+    *scale_out = SkipBlockDequantWrapperOps(bcast->mutable_operand(0));
+    return true;
+  }
+  return false;
 }
 
 // Transposes a matrix by swapping the contracting and non-contracting
@@ -654,7 +690,74 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
         toolkit_version_(toolkit_version),
         options_(options) {}
 
+  absl::StatusOr<bool> TryRewriteMetalBlockScaledGemv(HloInstruction* dot) {
+    const DotDimensionNumbers& dnums = dot->dot_dimension_numbers();
+    if (dnums.lhs_batch_dimensions_size() != 0 ||
+        dnums.rhs_batch_dimensions_size() != 0 ||
+        dnums.lhs_contracting_dimensions_size() != 1 ||
+        dnums.rhs_contracting_dimensions_size() != 1 ||
+        dnums.lhs_contracting_dimensions(0) != 1 ||
+        dnums.rhs_contracting_dimensions(0) != 1) {
+      return false;
+    }
+    HloInstruction* x = dot->mutable_operand(0);
+    HloInstruction* weight = dot->mutable_operand(1);
+    if (x->shape().dimensions().size() != 2 ||
+        weight->shape().dimensions().size() != 2 ||
+        x->shape().element_type() != BF16) {
+      return false;
+    }
+    const int64_t b = x->shape().dimensions(0);
+    const int64_t k = x->shape().dimensions(1);
+    const int64_t n = weight->shape().dimensions(0);
+    if (b < 1 || b > kMetalBlockScaledGemvMaxBatch ||
+        weight->shape().dimensions(1) != k) {
+      return false;
+    }
+
+    HloInstruction* w_quant = nullptr;
+    HloInstruction* scale = nullptr;
+    if (!MatchMetalBlockScaledDequant(weight, &w_quant, &scale)) {
+      return false;
+    }
+    const absl::string_view target =
+        MetalBlockScaledGemmTarget(w_quant->shape().element_type());
+    if (target.empty() || w_quant->shape().dimensions().size() != 2 ||
+        w_quant->shape().dimensions(0) != n ||
+        w_quant->shape().dimensions(1) != k) {
+      return false;
+    }
+    constexpr int64_t kFp8BlockSize = 128;
+    if (scale->shape().element_type() != BF16 ||
+        scale->shape().dimensions().size() != 2 || n % kFp8BlockSize != 0 ||
+        k % kFp8BlockSize != 0 ||
+        scale->shape().dimensions(0) != n / kFp8BlockSize ||
+        scale->shape().dimensions(1) != k / kFp8BlockSize) {
+      return false;
+    }
+    const Shape& out_shape = dot->shape();
+    if (out_shape.element_type() != BF16 ||
+        out_shape.dimensions().size() != 2 ||
+        out_shape.dimensions(0) != b || out_shape.dimensions(1) != n) {
+      return false;
+    }
+
+    HloInstruction* call = dot->AddInstruction(HloInstruction::CreateCustomCall(
+        out_shape, {x, w_quant, scale}, target));
+    TF_RETURN_IF_ERROR(ReplaceInstruction(dot, call));
+    VLOG(1) << "Rerouted Metal block-scaled dot into a fused " << target
+            << " GEMV.";
+    return true;
+  }
+
   absl::Status HandleDot(HloInstruction* instr) override {
+    if (gpu_version_.IsMetal() &&
+        options_.dtype == GemmRewriterOptions::DType::kFp8Only) {
+      ABSL_ASSIGN_OR_RETURN(bool rewrote, TryRewriteMetalBlockScaledGemv(instr));
+      if (rewrote) {
+        return absl::OkStatus();
+      }
+    }
     ABSL_ASSIGN_OR_RETURN(
         bool is_supported_matmul,
         IsCublasSupportedMatMul(*instr,
@@ -680,7 +783,12 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     ABSL_ASSIGN_OR_RETURN(bool is_matmul_tiny,
                      IsMatrixMultiplicationTooSmallForRewriting(
                          *instr, gemm_rewrite_size_threshold));
-    if (is_matmul_tiny && IsDotSupportedByClassicalEmitters(*instr)) {
+    const bool metal_batched =
+        gpu_version_.IsMetal() &&
+        (instr->dot_dimension_numbers().lhs_batch_dimensions_size() != 0 ||
+         instr->dot_dimension_numbers().rhs_batch_dimensions_size() != 0);
+    if ((is_matmul_tiny || metal_batched) &&
+        IsDotSupportedByClassicalEmitters(*instr)) {
       return absl::OkStatus();
     }
 
@@ -2317,6 +2425,10 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     // We should check the capabilities and route accordingly.
     if (gpu_version_.IsOneAPI()) {
       return absl::string_view(kCublasLtMatmulCallTarget);
+    }
+
+    if (gpu_version_.IsMetal()) {
+      return absl::string_view(kMetalGemmCallTarget);
     }
 
     // All internal conditions are met, check if we meet the requirements of
