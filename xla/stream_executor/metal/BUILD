@@ -33,6 +33,31 @@ cc_library(
 )
 
 # Drives Apple's AIR toolchain (air-as, air-opt, metallib) as subprocesses.
+cc_library(
+    name = "metal_subprocess_compilation",
+    srcs = ["metal_subprocess_compilation.cc"],
+    hdrs = ["metal_subprocess_compilation.h"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla/backends/gpu/codegen/metal_kernels:metal_include_root",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:status",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:subprocess",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
 
 cc_library(
     name = "metal_runtime",
