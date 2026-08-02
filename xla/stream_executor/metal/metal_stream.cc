@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -118,6 +119,9 @@ absl::Status MetalStream::RecordEvent(Event* event) {
   if (metal_event == nullptr) {
     return absl::InvalidArgumentError("Expected a MetalEvent.");
   }
+  // Serialize command-buffer state (command_buffer_ + batching counters) against
+  // concurrent transfer-path ops; uncontended on the single-threaded decode path.
+  absl::MutexLock lock(executor_->command_buffer_mu());
   // Encode a GPU-side signal at the END of this execute's work (after all
   // kernels) so a dependent execute can order on it WITHOUT a host block. The
   // event is value-backed (MetalEvent polls the shared-event value), so it does
@@ -185,6 +189,11 @@ absl::Status MetalStream::WaitFor(Event* event) {
   if (metal_event != nullptr && metal_event->shared_event() != nullptr &&
       metal_event->signal_value() != 0) {
     const uint64_t value = metal_event->signal_value();
+    // Serialize command-buffer state against concurrent transfer-path ops. Held
+    // through the cross-stream commit below (CommitOpenBufferThroughLocked runs
+    // under this same lock); released on every return by RAII. Uncontended on
+    // the single-threaded decode path.
+    absl::MutexLock lock(executor_->command_buffer_mu());
     // IN-BUFFER FAST PATH: if this value was signaled into THIS stream's still-
     // open command buffer (same shared event, not yet committed), the consumer's
     // kernels will be encoded into the SAME buffer AFTER the signal, so the
@@ -228,7 +237,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     if (metal_event->shared_event() == executor_->shared_event() &&
         command_buffer_ != nullptr && value <= waited_value_high_) {
       if (BatchDbgEnabled()) ++g_bdbg.w_covered;
-      executor_->CommitOpenBufferThrough(value);
+      executor_->CommitOpenBufferThroughLocked(value);
       return absl::OkStatus();
     }
     if (BatchDbgEnabled()) ++g_bdbg.w_xbuf;
@@ -238,7 +247,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
     // Cross-stream/cross-batch: the producer's buffer may still be OPEN; on the
     // single shared queue a waiter committed before its signaler deadlocks, so
     // force-commit the producer's open buffer carrying this value FIRST.
-    executor_->CommitOpenBufferThrough(value);
+    executor_->CommitOpenBufferThroughLocked(value);
     EnsureOpenCommandBuffer();
     metal::EncodeWaitForSharedEvent(command_buffer_,
                                     metal_event->shared_event(), value);
@@ -270,6 +279,7 @@ absl::Status MetalStream::Memset32(DeviceAddressBase* location,
       const uint64_t offset =
           reinterpret_cast<const char*>(location->opaque()) -
           reinterpret_cast<const char*>(alloc->contents);
+      absl::MutexLock lock(executor_->command_buffer_mu());
       EnsureOpenCommandBuffer();
       return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
                                    b);
@@ -300,6 +310,7 @@ absl::Status MetalStream::MemZero(DeviceAddressBase* location, uint64_t size) {
     const uint64_t offset =
         reinterpret_cast<const char*>(location->opaque()) -
         reinterpret_cast<const char*>(alloc->contents);
+    absl::MutexLock lock(executor_->command_buffer_mu());
     EnsureOpenCommandBuffer();
     return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
                                  /*value=*/0);
@@ -357,6 +368,7 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase* device_dst,
     const bool overlap =
         same_buf && dst_off < src_off + size && src_off < dst_off + size;
     if (!overlap) {
+      absl::MutexLock lock(executor_->command_buffer_mu());
       EnsureOpenCommandBuffer();
       return metal::EncodeBlitCopy(command_buffer_, dst->buffer, dst_off,
                                    src->buffer, src_off, size);
@@ -402,55 +414,70 @@ absl::Status MetalStream::DoHostCallbackWithStatus(
   // / BlockHostUntilDone force-commit (CommitOpenBufferThrough) — so it is never
   // starved. Single serial
   // listener queue ⇒ callbacks run in value (== completion) order, exactly-once.
-  void* shared_event = executor_->shared_event();
-  void* listener = executor_->shared_event_listener();
-  const uint64_t value =
-      pending_signal_high_ != 0 ? pending_signal_high_ : last_signaled_value_;
-  if (shared_event != nullptr && listener != nullptr && value != 0) {
-    metal::NotifySharedEventListener(listener, shared_event, value,
-                                     std::move(run));
-    return absl::OkStatus();
-  }
+  // Guard the command-buffer state read + possible commit; the "already-past"
+  // inline run() below is done OUTSIDE the lock (the callback must not re-enter a
+  // stream op while we hold it).
+  {
+    absl::MutexLock lock(executor_->command_buffer_mu());
+    void* shared_event = executor_->shared_event();
+    void* listener = executor_->shared_event_listener();
+    const uint64_t value =
+        pending_signal_high_ != 0 ? pending_signal_high_ : last_signaled_value_;
+    if (shared_event != nullptr && listener != nullptr && value != 0) {
+      metal::NotifySharedEventListener(listener, shared_event, value,
+                                       std::move(run));
+      return absl::OkStatus();
+    }
 
-  // Fallback: there is uncommitted work but no shared-event signal (an execute
-  // with kernels and no RecordEvent), or no listener — commit with the legacy
-  // per-buffer completion handler so the callback still fires on real
-  // completion. Otherwise (no GPU work at all) run inline ("already-past").
-  if (command_buffer_ != nullptr) {
-    void* batch = command_buffer_;
-    command_buffer_ = nullptr;
-    pending_signal_high_ = 0;
-    signals_since_commit_ = 0;
-    waited_value_high_ = 0;
-    metal::CommitBatchCommandBufferWithCompletion(batch, std::move(run));
-    ReleaseObject(batch);
-    return absl::OkStatus();
+    // Fallback: there is uncommitted work but no shared-event signal (an execute
+    // with kernels and no RecordEvent), or no listener — commit with the legacy
+    // per-buffer completion handler so the callback still fires on real
+    // completion. Otherwise (no GPU work at all) run inline ("already-past").
+    if (command_buffer_ != nullptr) {
+      void* batch = command_buffer_;
+      command_buffer_ = nullptr;
+      pending_signal_high_ = 0;
+      signals_since_commit_ = 0;
+      waited_value_high_ = 0;
+      metal::CommitBatchCommandBufferWithCompletion(batch, std::move(run));
+      ReleaseObject(batch);
+      return absl::OkStatus();
+    }
   }
   run();
   return absl::OkStatus();
 }
 
 absl::Status MetalStream::BlockHostUntilDone() {
-  if (command_buffer_ == nullptr) {
-    return absl::OkStatus();
+  // Commit + reset the batching state under the lock (this is the operation the
+  // concurrent transfer path double-committed), then WAIT outside it so the GPU
+  // drain does not block other streams / concurrent transfers whose own commits
+  // are already done. Uncontended on the single-threaded decode path.
+  void* committed = nullptr;
+  {
+    absl::MutexLock lock(executor_->command_buffer_mu());
+    if (command_buffer_ == nullptr) {
+      return absl::OkStatus();
+    }
+    // Commit the open command buffer, then (below) wait its final committed
+    // segment, which drains all prior work on the queue.
+    committed = metal::CommitBatchCommandBuffer(command_buffer_);
+    ReleaseObject(command_buffer_);
+    command_buffer_ = nullptr;
+    // Match FlushBatchedWork's reset discipline. This commit advances the
+    // stream's signaled-value bookkeeping; leaving it stale is unsafe: a stale
+    // pending_signal_high_ survives into the NEXT open buffer
+    // (EnsureOpenCommandBuffer does not clear it), where WaitFor's in-buffer fast
+    // path (value <= pending_signal_high_) could skip a cross-buffer wait for a
+    // signal that was never encoded into that buffer; a stale
+    // signals_since_commit_ skews the per-buffer signal cap. The work is
+    // committed + about to be waited, so advancing last_signaled_value_ to it is
+    // correct.
+    if (pending_signal_high_ != 0) last_signaled_value_ = pending_signal_high_;
+    pending_signal_high_ = 0;
+    signals_since_commit_ = 0;
+    waited_value_high_ = 0;
   }
-  // Commit the open command buffer, then wait its final committed segment (which
-  // drains all prior work on the queue). Release both regardless of wait status.
-  void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
-  ReleaseObject(command_buffer_);
-  command_buffer_ = nullptr;
-  // Match FlushBatchedWork's reset discipline. This commit advances the stream's
-  // signaled-value bookkeeping; leaving it stale is unsafe: a stale
-  // pending_signal_high_ survives into the NEXT open buffer (EnsureOpenCommandBuffer
-  // does not clear it), where WaitFor's in-buffer fast path (value <=
-  // pending_signal_high_) could skip a cross-buffer wait for a signal that was
-  // never encoded into that buffer; a stale signals_since_commit_ skews the
-  // per-buffer signal cap. The work is committed + about to be waited, so
-  // advancing last_signaled_value_ to it is correct.
-  if (pending_signal_high_ != 0) last_signaled_value_ = pending_signal_high_;
-  pending_signal_high_ = 0;
-  signals_since_commit_ = 0;
-  waited_value_high_ = 0;
   absl::Status status = WaitUntilCompleted(committed);
   // (GPU profiling resolves inside CommitBatchCommandBuffer — the one commit
   // funnel shared by this path and RecordEvent — so nothing to do here.)
@@ -472,6 +499,7 @@ absl::Status MetalStream::FlushBatchedWork() {
   // the readback runs on the same thread that issued the executes, after the
   // last one, so command_buffer_ is stable here. No cadence state to recompute
   // — the commit cadence is self-clocked off GPU progress in RecordEvent.
+  absl::MutexLock lock(executor_->command_buffer_mu());
   if (BatchDbgEnabled()) {
     static int tok = 0;
     if ((tok++ % 32) == 0) {
@@ -501,10 +529,13 @@ absl::Status MetalStream::CommitBatchedWorkNoWait() {
   // Committing here fires the listener. It only flushes (there is no cadence
   // state to skew), so it is safe even when interleaved mid-token with batched
   // decode executes on this same stream.
+  absl::MutexLock lock(executor_->command_buffer_mu());
   CommitOpenBufferNoWait();
   return absl::OkStatus();
 }
 
+// Assumes executor_->command_buffer_mu() is held (callers: FlushBatchedWork,
+// CommitBatchedWorkNoWait).
 void MetalStream::CommitOpenBufferNoWait() {
   if (command_buffer_ == nullptr) return;
   void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
@@ -525,8 +556,9 @@ void MetalStream::FlushOpenBufferIfCarrying(uint64_t value) {
   // (value > last_signaled_value_). Committing lets the encoded signal fire so
   // a cross-stream waiter on `value` can be committed safely after it. No-op
   // otherwise — which is ALWAYS until per-execute commits are deferred, since
-  // RecordEvent leaves pending_signal_high_ == 0. Single-host-thread stream-op
-  // model (like the rest of this class); the executor serializes callers.
+  // RecordEvent leaves pending_signal_high_ == 0. Assumes
+  // executor_->command_buffer_mu() is held: the only caller is
+  // MetalExecutor::CommitOpenBufferThroughLocked, invoked under that lock.
   if (command_buffer_ == nullptr) return;
   if (pending_signal_high_ < value || value <= last_signaled_value_) return;
   void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
@@ -615,13 +647,17 @@ absl::Status MetalStream::LaunchMetalKernel(
 
   // Encode into the stream's open command buffer (#62): the whole execution is
   // one command buffer, committed + waited once by BlockHostUntilDone, instead
-  // of one tiny command buffer per kernel.
+  // of one tiny command buffer per kernel. Lock only the command-buffer touch —
+  // the residency flush + argument resolution above run without it, so
+  // command_buffer_mu_ never nests with allocations_mu_.
+  absl::MutexLock lock(executor_->command_buffer_mu());
   EnsureOpenCommandBuffer();
   return metal::EncodeKernel(command_buffer_, pipeline, function,
                              use_argument_buffer, arguments, name, thread_dims,
                              block_dims, shmem_bytes);
 }
 
+// Assumes executor_->command_buffer_mu() is held.
 void MetalStream::EnsureOpenCommandBuffer() {
   if (command_buffer_ == nullptr) {
     command_buffer_ = metal::NewBatchCommandBuffer(executor_->command_queue());

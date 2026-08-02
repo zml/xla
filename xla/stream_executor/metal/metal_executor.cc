@@ -430,6 +430,17 @@ void MetalExecutor::UnregisterStream(MetalStream* stream) {
 
 void MetalExecutor::CommitOpenBufferThrough(uint64_t value) {
   if (value == 0) return;
+  // Public entry (e.g. the async shared-event flush thunk, on a host-waiter
+  // thread that holds no stream lock): take the command-buffer lock first, in
+  // the canonical order, then do the cross-stream commit.
+  absl::MutexLock cb_lock(command_buffer_mu_);
+  CommitOpenBufferThroughLocked(value);
+}
+
+void MetalExecutor::CommitOpenBufferThroughLocked(uint64_t value) {
+  if (value == 0) return;
+  // Caller already holds command_buffer_mu_. FlushOpenBufferIfCarrying mutates
+  // each stream's command-buffer state under that same lock, so it is safe here.
   absl::MutexLock lock(streams_mu_);
   for (MetalStream* stream : streams_) {
     stream->FlushOpenBufferIfCarrying(value);

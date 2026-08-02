@@ -145,6 +145,29 @@ class MetalExecutor : public gpu::GpuExecutor {
   void RegisterStream(MetalStream* stream);
   void UnregisterStream(MetalStream* stream);
   void CommitOpenBufferThrough(uint64_t value);
+  // Same as CommitOpenBufferThrough, but assumes the caller already holds
+  // command_buffer_mu(). Used by the stream ops (e.g. WaitFor) that take the
+  // command-buffer lock and then need the cross-stream commit while still under
+  // it; CommitOpenBufferThrough is the entry that takes the lock itself (the
+  // async event-flush thunk, which runs on an unrelated host-waiter thread).
+  // Precondition (not annotated: streams lock command_buffer_mu_ through the
+  // accessor, which -Wthread-safety cannot track cross-object): the caller holds
+  // command_buffer_mu().
+  void CommitOpenBufferThroughLocked(uint64_t value);
+
+  // Serializes every per-stream command-buffer mutation (command_buffer_ and
+  // its batching counters) across ALL streams on this device's single queue.
+  // The stream ops were written single-threaded ("no atomics needed"), but
+  // PJRT's async host-transfer path (LinearizeHostBufferInto dispatched on the
+  // UnboundedAsyncWorkRunner pool) drives Memcpy/BlockHostUntilDone on the
+  // shared stream from many threads during weight load, which double-committed
+  // the open MTLCommandBuffer (-> "_completedCallbacksDone == false" / "commit
+  // an already committed command buffer" -> segfault). This lock makes those
+  // ops thread-safe. It is UNCONTENDED on the single-threaded decode hot path
+  // (~ns), and the big host memcpys and GPU waits are performed OUTSIDE it, so
+  // decode timing is unchanged. Lock order: command_buffer_mu_ BEFORE
+  // streams_mu_ (and it never nests with allocations_mu_).
+  absl::Mutex& command_buffer_mu() const { return command_buffer_mu_; }
 
   struct Allocation {
     void* buffer = nullptr;
@@ -200,6 +223,10 @@ class MetalExecutor : public gpu::GpuExecutor {
   mutable absl::Mutex modules_mu_;
   absl::flat_hash_map<const void*, void*> loaded_modules_
       ABSL_GUARDED_BY(modules_mu_);
+
+  // Guards all streams' command-buffer batching state; see command_buffer_mu().
+  // Declared before streams_mu_ to document the lock order (acquired first).
+  mutable absl::Mutex command_buffer_mu_;
 
   // Registered streams, for CommitOpenBufferThrough (cross-stream commit hook).
   mutable absl::Mutex streams_mu_;
