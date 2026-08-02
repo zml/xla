@@ -82,15 +82,11 @@ absl::StatusOr<std::optional<int64_t>> MoeWorkspaceBytes(
         "Metal MoE custom call must have at least x and weight operands");
   }
 
-  // nvfp4 may carry an optional trailing f32[E] per-expert global scale.
   const int64_t expected_operands = IsMetalMoeGemmBf16(call) ? 3 : 4;
-  const bool has_global_scale =
-      IsMetalMoeGemmF4(call) && call.operand_count() == expected_operands + 1;
-  if (call.operand_count() != expected_operands && !has_global_scale) {
+  if (call.operand_count() != expected_operands) {
     return absl::InvalidArgumentError(
         absl::StrCat("Metal MoE custom call must have ", expected_operands,
-                     IsMetalMoeGemmF4(call) ? " or 5" : "", " operands; got ",
-                     call.operand_count()));
+                     " operands; got ", call.operand_count()));
   }
 
   const Shape& x = call.operand(0)->shape();

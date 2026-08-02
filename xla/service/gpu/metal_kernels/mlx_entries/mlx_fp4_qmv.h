@@ -517,60 +517,19 @@ NVFP4_QMV_WIDE_ENTRY(5)
 // tid.x = route row r, tid.y = N-tile (8 cols). 64 threads = 2 simdgroups.
 // Matches MLX gather_qmv launch for M=1, B=R (one vector per expert pick).
 //
-// When `moe_has_global_scale` is set the call carries a trailing f32[E]
-// per-expert global scale (the compressed-tensors weight-encode divisor) and
-// the kernel folds its reciprocal into the f32 group scale, one indexed load
-// per threadgroup. Folding into the *weight* group scale keeps the f32
-// accumulator at output magnitude: `sum(x*w*s*inv_g)` never holds the
-// global-inflated `sum(x*w*s)` that a divide-the-output scheme would round.
-// When the constant is unset no buffer is bound and no fold is compiled in.
-//
-// XLA DELTA: 440 is the same logical constant as mlx_steel_qgemm.h's; both
-// bundles bind it from MetalMoeGemvThunk. It sits in our 4xx range because
-// upstream MLX owns 0-26, 100, 101, 110, 199, 200-202 and 300-302 across its
-// kernel tree, and our custom/ shaders already number from 420. Never allocate
-// ours below 400.
+// out = sum_k x * f4(w) * e4m3(scale). Per-expert weight global scale is
+// applied outside the kernel by the model (same as dense zml$scaled_matmul).
 // =============================================================================
-constant bool moe_has_global_scale [[function_constant(440)]];
-
-// The e4m3 group scale, folded with the per-expert global reciprocal when the
-// call carries one. `U` is f32 here, so the fold is a pure exponent shift and
-// costs no precision; without the operand this is the unmodified MLX decode.
-//
-// This is ours and has no upstream counterpart: it wraps upstream's
-// dequantize_scale, which the include supplies. It cannot be injected into an
-// upstream body from outside -- the call would be `dequantize_scale<U,
-// group_size>(sl[0])`, dependent on group_size, but its argument is uint8_t, a
-// builtin with no associated namespace, so ADL finds nothing and the name binds
-// at definition time to ::dequantize_scale.
-//
-// TODO: the seam upstream would need is a defaulted `typename ScaleDecoder =
-// DefaultScaleDecoder` template parameter on fp_qmv_impl -- defaulted, so zero
-// behaviour change for upstream, and a signature patch survives a reshuffle
-// where a body patch does not. Worth filing. It does NOT help us today: the
-// gather below is a fork of upstream's fp_qmv_impl BODY (partial-tile guard,
-// int64_t, no K-tail -- see the XLA DELTA there), so there is no upstream body
-// for a ScaleDecoder to be threaded into. The seam only pays off if the fork
-// items above land upstream first.
-template <typename U, int group_size, bool has_global_scale>
-static inline U moe_group_scale(uint8_t s, float inv_g) {
-  U out = dequantize_scale<U, group_size>(s);
-  if constexpr (has_global_scale) {
-    out *= U(inv_g);
-  }
-  return out;
-}
 
 // XLA DELTA: ours. Same idea as upstream's fp_gather_qmv (adjust w/scales by the
 // expert index, then run the qmv body), but the body is xla_fp_qmv_impl's, not
 // upstream's -- it carries the same partial-tile predication and int64_t
-// hardening, plus the inv_g fold above. Our MoE ABI is also flatter than
-// upstream's batched-shape one: x[R,K], w[E,N,K/2], scale[E,N,K/16],
-// expert_id[R] -> out[R,N].
+// hardening. Our MoE ABI is also flatter than upstream's batched-shape one:
+// x[R,K], w[E,N,K/2], scale[E,N,K/16], expert_id[R] -> out[R,N].
 //
 // The partial K-tail is unreachable here for the same reason as in
 // xla_fp_qmv_impl -- see the K-tail note at the top of this file.
-template <typename T, int group_size, int bits, bool has_global_scale>
+template <typename T, int group_size, int bits>
 void gather_qmv_moe_impl(
     const device uint8_t* w_base,
     const device uint8_t* scales_base,
@@ -578,7 +537,6 @@ void gather_qmv_moe_impl(
     const device T* x,
     device bfloat* y,
     int R, int K, int N,
-    float inv_g,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -637,7 +595,7 @@ void gather_qmv_moe_impl(
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device auto* sl =
             scales + static_cast<int64_t>(row) * in_vec_size_g;
-        U s = moe_group_scale<U, group_size, has_global_scale>(sl[0], inv_g);
+        U s = dequantize_scale<U, group_size>(sl[0]);
         result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
       }
       ws += block_size * bytes_per_pack / pack_factor;
@@ -654,7 +612,7 @@ void gather_qmv_moe_impl(
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device auto* sl =
             scales + static_cast<int64_t>(row) * in_vec_size_g;
-        U s = moe_group_scale<U, group_size, has_global_scale>(sl[0], inv_g);
+        U s = dequantize_scale<U, group_size>(sl[0]);
         result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
       }
     }
@@ -676,7 +634,7 @@ void gather_qmv_moe_impl(
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device auto* sl =
             scales + static_cast<int64_t>(row) * in_vec_size_g;
-        U s = moe_group_scale<U, group_size, has_global_scale>(sl[0], inv_g);
+        U s = dequantize_scale<U, group_size>(sl[0]);
         result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
       }
       ws += block_size * bytes_per_pack / pack_factor;
@@ -692,7 +650,7 @@ void gather_qmv_moe_impl(
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         const device auto* sl =
             scales + static_cast<int64_t>(row) * in_vec_size_g;
-        U s = moe_group_scale<U, group_size, has_global_scale>(sl[0], inv_g);
+        U s = dequantize_scale<U, group_size>(sl[0]);
         result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
       }
     }
@@ -711,8 +669,6 @@ kernel void nvfp4_gather_qmv(
     device const int* expert_id [[buffer(3)]],
     device bfloat* out [[buffer(4)]],
     constant int4& dims [[buffer(5)]],  // {R, K, N, E}
-    device const float* w_global_scale
-        [[buffer(6), function_constant(moe_has_global_scale)]],  // f32[E]
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -739,18 +695,8 @@ kernel void nvfp4_gather_qmv(
     return;
   }
 
-  // `e` is bounds-checked above, so this is one safe indexed f32 load per
-  // threadgroup. Both branches are compiled, but the function constant is
-  // resolved at pipeline creation, so each specialization keeps only one.
-  //
   // K%8 holds unconditionally (group_size 16 forces K%16==0), so there is no
   // partial-K tail to guard. See the K-tail note at the top of this file.
-  if (moe_has_global_scale) {
-    const float inv_g = 1.0f / w_global_scale[e];
-    gather_qmv_moe_impl<bfloat, 16, 4, true>(
-        w, scale, e, x, out, R, K, N, inv_g, tid, simd_gid, simd_lid);
-  } else {
-    gather_qmv_moe_impl<bfloat, 16, 4, false>(
-        w, scale, e, x, out, R, K, N, 1.0f, tid, simd_gid, simd_lid);
-  }
+  gather_qmv_moe_impl<bfloat, 16, 4>(
+      w, scale, e, x, out, R, K, N, tid, simd_gid, simd_lid);
 }

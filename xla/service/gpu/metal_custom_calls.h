@@ -140,19 +140,13 @@ inline bool IsMetalMoeGemm(const HloInstruction& hlo) {
 
 // NVFP4 flavor of the grouped MoE GEMV: f4e2m1 weights + e4m3 group-16 scales.
 //   {x_rows[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
-//    expert_id[R] s32, w_global_scale[E] f32 (optional)} -> out[R,N] bf16
+//    expert_id[R] s32} -> out[R,N] bf16
 //
-// The optional trailing operand is the compressed-tensors per-expert weight
-// *encode divisor* g_ct. Both nvfp4 kernels fold 1/g_ct[expert_id[r]] into the
-// weight's group scale, which is why it is passed rather than applied to x:
-// pre-scaling x costs a gather plus a full read/write pass over x_rows per MoE
-// call, and cannot fuse into this opaque custom call. Folding into the weight
-// also keeps the f32 accumulator at output magnitude -- never divide a
-// global-inflated output, which quantizes small components away. g_ct is not
-// MLX's similarly named global_scale_w (an amax): mlx_global_scale_w =
-// 2688 / g_ct. Do not both pass this operand and pre-divide x by g_ct.
-// ThunkEmitter routes this call to MetalMoeGemvThunk (nvfp4_gather_qmv decode
-// + nvfp4_gather_qmm_rhs prefill).
+// out = sum_k x * f4(w) * e4m3(scale). Any per-expert weight global scale
+// (compressed-tensors g_ct / ModelOpt weight_scale_2) is applied outside the
+// kernel by the model, matching dense zml$scaled_matmul. ThunkEmitter routes
+// this call to MetalMoeGemvThunk (nvfp4_gather_qmv decode +
+// nvfp4_gather_qmm_rhs prefill).
 inline constexpr absl::string_view kMetalMoeGemmF4CallTarget =
     "__metal$moe_gemm$f4";
 

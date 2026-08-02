@@ -1487,22 +1487,18 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
     const HloCustomCallInstruction* instr) {
   // Three flavors share one thunk:
   //   fp8:   {x, w_f8, scale, expert_id}
-  //   nvfp4: {x, w_f4, scale, expert_id, w_global_scale?}
+  //   nvfp4: {x, w_f4, scale, expert_id}
   //   bf16:  {x, w, expert_id}
+  // Per-expert weight global scale (if any) is applied outside the kernel.
   const bool is_fp8 =
       instr->custom_call_target() == kMetalMoeGemmF8CallTarget;
   const bool is_nvfp4 =
       instr->custom_call_target() == kMetalMoeGemmF4CallTarget;
   const bool has_scale = is_fp8 || is_nvfp4;
   const int64_t expected_operands = has_scale ? 4 : 3;
-  // nvfp4 only: an optional trailing f32[E] per-expert global scale, folded
-  // into the weight group scale by the kernels.
-  const bool has_global_scale =
-      is_nvfp4 && instr->operand_count() == expected_operands + 1;
-  if (instr->operand_count() != expected_operands && !has_global_scale) {
+  if (instr->operand_count() != expected_operands) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "metal MoE GEMV expects ", expected_operands,
-        is_nvfp4 ? " or 5 operands." : " operands."));
+        "metal MoE GEMV expects ", expected_operands, " operands."));
   }
   const Shape& x_shape = instr->operand(0)->shape();
   const Shape& w_shape = instr->operand(1)->shape();
@@ -1643,25 +1639,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
                         GetAllocationSliceForHlo(instr->operand(2), {}));
   }
 
-  // Optional nvfp4 per-expert global scale (compressed-tensors g_ct): f32[E].
-  BufferAllocation::Slice global_scale;
-  Shape global_scale_shape;
-  if (has_global_scale) {
-    global_scale_shape = instr->operand(4)->shape();
-    if (global_scale_shape.dimensions().size() != 1 ||
-        global_scale_shape.dimensions(0) != e) {
-      return absl::UnimplementedError(absl::StrCat(
-          "metal MoE GEMV: nvfp4 global scale must be [", e, "]; got ",
-          global_scale_shape.ToString(), "."));
-    }
-    if (global_scale_shape.element_type() != F32) {
-      return absl::UnimplementedError(
-          "metal MoE GEMV: nvfp4 global scale must be f32.");
-    }
-    TF_ASSIGN_OR_RETURN(global_scale,
-                        GetAllocationSliceForHlo(instr->operand(4), {}));
-  }
-
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
                       GetAllocationSliceForHlo(instr->operand(0), {}));
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
@@ -1682,8 +1659,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMoeGemvThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       x, x_shape, w, w_shape, scale, scale_shape, expert_id, expert_id_shape,
-      out, out_shape, workspace, workspace_shape, global_scale,
-      global_scale_shape, has_global_scale, r, k, n);
+      out, out_shape, workspace, workspace_shape, r, k, n);
   return ThunkSequence::Of(std::move(thunk));
 }
 

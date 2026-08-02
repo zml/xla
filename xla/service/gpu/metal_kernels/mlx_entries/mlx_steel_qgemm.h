@@ -84,17 +84,6 @@ constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
 
-// NVFP4 MoE only: whether the call carries a trailing f32[E] per-expert global
-// scale (the compressed-tensors weight-encode divisor). When unset, no buffer
-// is bound and nvfp4_gather_qmm_rhs behaves exactly as before. The MX entries
-// never reference this constant.
-//
-// XLA DELTA: 440 is the same logical constant as mlx_fp4_qmv.h's; both bundles
-// bind it from MetalMoeGemvThunk. It sits in our 4xx range because upstream MLX
-// owns 0-26, 100, 101, 110, 199, 200-202 and 300-302 across its kernel tree, and
-// our custom/ shaders already number from 420. Never allocate ours below 400.
-constant bool moe_has_global_scale [[function_constant(440)]];
-
 ///////////////////////////////////////////////////////////////////////////////
 // Fp8BlockLoader — DeepSeek 128x128-block adaptation of MLX QuantizedBlockLoader
 //
@@ -628,19 +617,6 @@ inline void dequantize_mx(uint8_t w, U scale, threadgroup U* w_local) {
   w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
 }
 
-// NVFP4 MoE global-scale fold: same as dequantize_mx, but the group scale
-// arrives in f32 (already multiplied by the per-expert global reciprocal) and
-// is rounded into the bf16 tile exactly once. Rounding the folded scale to
-// bf16 first would round twice: an e4m3 scale times an f4 value is otherwise
-// exact in bf16, so the unfolded path stores an exact product.
-template <typename T, int bits>
-inline void dequantize_mx_global(uint8_t w, float scale, threadgroup T* w_local) {
-  static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-  w_local[0] = T(scale * DequantizeMx<4, float>{}(w));
-  w_local[1] = T(scale * DequantizeMx<4, float>{}(w >> 4));
-}
-
-
 // XlaQuantizedBlockLoader — 1-D per-(row, K-group) uint8 scales.
 //
 // XLA DELTA: a RENAME-FORK of upstream's QuantizedBlockLoader (fp_quantized.h).
@@ -810,168 +786,6 @@ struct XlaQuantizedBlockLoader {
     T scale = dequantize_scale_mx<T, group_size>(*scales);
     for (int i = 0; i < n_reads; i++) {
       dequantize_mx<T, bits>(src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
-  }
-
-  void next() {
-    src += tile_stride;
-    if (reduction_dim == 1) {
-      if (group_steps > 1) {
-        group_step_cnt++;
-        if (group_step_cnt == group_steps) {
-          group_step_cnt = 0;
-          scales++;
-        }
-      } else {
-        scales += scale_step;
-      }
-    } else {
-      scales += group_stride;
-    }
-  }
-};
-
-// QuantizedBlockLoader with the NVFP4 MoE per-expert global reciprocal folded
-// into the group scale (see nvfp4_gather_qmm_rhs). Structurally identical to
-// the loader above; only the two scale decodes differ.
-//
-// This is a separate struct, not a template parameter on QuantizedBlockLoader,
-// because MSL supports neither inheritance nor a conditionally-present member:
-// an unconditional `float` member repacks the shared struct and grows the
-// shipping mxfp4_qmm_t / mxfp8_qmm_t loader stack frame from 64 to 72 bytes
-// (verified by diffing the emitted AIR). The MX entries must stay untouched, so
-// the fold lives here. Keep the two loaders in sync.
-template <
-    typename T,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short reduction_dim,
-    short tgp_size,
-    short group_size,
-    short bits>
-struct Nvfp4GlobalQuantizedBlockLoader {
-  MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
-  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
-      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size < BCOLS ? 1 : group_size / BCOLS;
-  MLX_MTL_CONST short scale_step = group_size < BCOLS ? BCOLS / group_size : 1;
-
-  static_assert(
-      (n_reads * pack_factor) <= group_size,
-      "The number of reads per thread must be less than the group size.");
-
-  const int src_ld;
-  const int64_t tile_stride;
-  short group_step_cnt;
-  const int64_t group_stride;
-
-  const short thread_idx;
-  const short bi;
-  const short bj;
-
-  threadgroup T* dst;
-  const device uint8_t* src;
-  const device uint8_t* scales;
-  // 1/g_ct for this tile's expert, or 1.0f when the call carries no global
-  // scale -- in which case every store below is bit-identical to the loader
-  // above (an e4m3 scale times an f4 value is exact in bf16, so the f32 and T
-  // multiplies round to the same product).
-  const float global_scale_recip;
-
-  // The fold must happen in f32 and round into the tile exactly once; folding
-  // into a T group scale first would round twice.
-  float group_scale() const {
-    return dequantize_scale_mx<float, group_size>(*scales) * global_scale_recip;
-  }
-
-  Nvfp4GlobalQuantizedBlockLoader(
-      const device uint8_t* src_,
-      const device uint8_t* scales_,
-      const int src_ld_,
-      threadgroup T* dst_,
-      ushort simd_group_id,
-      ushort simd_lane_id,
-      float global_scale_recip_)
-      : src_ld(src_ld_),
-        tile_stride(reduction_dim
-                        ? static_cast<int64_t>(BCOLS_PACKED) * bytes_per_pack
-                        : static_cast<int64_t>(BROWS) * src_ld *
-                            bytes_per_pack / pack_factor),
-        group_step_cnt(0),
-        group_stride(
-            static_cast<int64_t>(BROWS) * src_ld / group_size),
-        thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(n_reads * thread_idx / BCOLS_PACKED),
-        bj((n_reads * thread_idx) % BCOLS_PACKED),
-        dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + static_cast<int64_t>(bi) * src_ld * bytes_per_pack /
-                pack_factor +
-            static_cast<int64_t>(bj) * bytes_per_pack),
-        scales(
-            scales_ + static_cast<int64_t>(bi) * src_ld / group_size +
-            (bj * pack_factor) / group_size),
-        global_scale_recip(global_scale_recip_) {}
-
-  void load_unsafe() const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    float scale = group_scale();
-    for (int i = 0; i < n_reads; i++) {
-      dequantize_mx_global<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
-  }
-
-  void load_safe(short2 src_tile_dim) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    if (reduction_dim == 1) {
-      const short valid_k = src_tile_dim.x;
-      const short valid_rows = src_tile_dim.y;
-      if (!quantized_mx_row_in_bounds(bi, valid_rows) ||
-          quantized_mx_valid_values<pack_factor>(bj, 0, valid_k) == 0) {
-        for (int i = 0; i < n_reads * pack_factor; i++) {
-          dst[i] = T(0);
-        }
-        return;
-      }
-
-      float scale = group_scale();
-      for (int i = 0; i < n_reads; i++) {
-        const short valid_values =
-            quantized_mx_valid_values<pack_factor>(bj, short(i), valid_k);
-        if (valid_values == 0) {
-          for (short j = 0; j < pack_factor; j++) {
-            dst[i * pack_factor + j] = T(0);
-          }
-          continue;
-        }
-
-        dequantize_mx_global<T, bits>(
-            src[i * bytes_per_pack], scale, dst + i * pack_factor);
-        for (short j = valid_values; j < pack_factor; j++) {
-          dst[i * pack_factor + j] = T(0);
-        }
-      }
-      return;
-    }
-
-    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
-      }
-      return;
-    }
-    float scale = group_scale();
-    for (int i = 0; i < n_reads; i++) {
-      dequantize_mx_global<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
     }
   }
 
@@ -1784,6 +1598,7 @@ kernel void bf16_gather_mm_rhs(
 //   y:       bfloat [R, N]
 //   mnk = {R, N, K, _}
 // Tiles BM=16, BN=32, BK=32, WM=1, WN=2 (64 threads) — same as fp8 gather.
+// out = sum x * f4(w) * e4m3(scale); per-expert global scale is applied outside.
 ///////////////////////////////////////////////////////////////////////////////
 template <
     typename T,
@@ -1804,7 +1619,6 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
     const int M,
     const int N,
     const int K,
-    const device float* w_global_scale,  // f32[E], or null when absent
     threadgroup T* Xs,
     threadgroup T* Ws,
     uint3 tid,
@@ -1820,10 +1634,7 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
       transpose ? BK_padded : BN_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  // One instantiation carries the fold; an absent operand passes a reciprocal
-  // of 1.0f, which is bit-identical (an e4m3 scale times an f4 value is exact
-  // in bf16, so both paths round to the same product) and reads no buffer.
-  using loader_w_t = Nvfp4GlobalQuantizedBlockLoader<
+  using loader_w_t = XlaQuantizedBlockLoader<
       T,
       transpose ? BN : BK,
       transpose ? BK : BN,
@@ -1885,12 +1696,9 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
 
     thread mma_t mma_op(simd_group_id, simd_lane_id);
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
-    // Same `index` the weight/scale offsets above already trust; the fold is
-    // one indexed f32 load per expert run.
     thread loader_w_t loader_w(
         wl + index * stride_w, scales + index * stride_s,
-        transpose ? K : N, Ws, simd_group_id, simd_lane_id,
-        w_global_scale ? 1.0f / w_global_scale[index] : 1.0f);
+        transpose ? K : N, Ws, simd_group_id, simd_lane_id);
 
     if (align_M && align_N) {
       gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
@@ -1954,8 +1762,6 @@ kernel void nvfp4_gather_qmm_rhs(
     device const uint* indices [[buffer(3)]],
     device bfloat* y [[buffer(4)]],
     constant int4& mnk [[buffer(5)]],  // {R, N, K, _}
-    device const float* w_global_scale
-        [[buffer(6), function_constant(moe_has_global_scale)]],  // f32[E]
     uint3 tid [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
@@ -1975,13 +1781,6 @@ kernel void nvfp4_gather_qmm_rhs(
   const int N = mnk.y;
   const int K = mnk.z;
 
-  // A conditionally-declared argument may only be read under its own function
-  // constant; hoisting it to a null pointer keeps the fold in one instantiation.
-  const device float* gs = nullptr;
-  if (moe_has_global_scale) {
-    gs = w_global_scale;
-  }
-
   nvfp4_gather_qmm_rhs_impl<bfloat, 16, 4, BM, BN, BK, WM, WN, transpose>(
-      x, w, scale, indices, y, R, N, K, gs, Xs, Ws, tid, sg, sl);
+      x, w, scale, indices, y, R, N, K, Xs, Ws, tid, sg, sl);
 }

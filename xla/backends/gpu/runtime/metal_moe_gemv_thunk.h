@@ -50,14 +50,9 @@ namespace gpu {
 //   fp8:   {x[R,K] bf16, w[E,N,K] f8e4m3fn, scale[E,N/128,K/128] bf16,
 //           expert_id[R] s32} -> out[R,N] bf16
 //   nvfp4: {x[R,K] bf16, w[E,N,K] f4e2m1, scale[E,N,K/16] f8e4m3fn,
-//           expert_id[R] s32, w_global_scale[E] f32 (optional)}
-//           -> out[R,N] bf16
-//           (w_global_scale[e] is the compressed-tensors weight-global encode
-//            divisor g_ct; both nvfp4 kernels fold its reciprocal into the
-//            weight's group scale. Folding into the *weight* keeps the f32
-//            accumulator at output magnitude, unlike pre-scaling x -- which
-//            costs a full read/write pass over x -- or dividing the output.
-//            Absent: no buffer is bound and the kernels are unchanged.)
+//           expert_id[R] s32} -> out[R,N] bf16
+//           (out = sum x * f4(w) * e4m3(scale); any per-expert weight global
+//            scale is applied outside the kernel by the model, matching dense.)
 //
 // Dispatch (MLX GatherQMM-aligned for NVFP4):
 //   small R / decode: per-row GEMV (nvfp4_gather_qmv / fp8_moe_gemv /
@@ -72,16 +67,13 @@ namespace gpu {
 //       unsupported shapes stay on their per-row GEMV path
 class MetalMoeGemvThunk : public Thunk {
  public:
-  // `global_scale` is bound only when `has_global_scale` (nvfp4 only).
   MetalMoeGemvThunk(ThunkInfo thunk_info, BufferAllocation::Slice x,
                     Shape x_shape, BufferAllocation::Slice w, Shape w_shape,
                     BufferAllocation::Slice scale, Shape scale_shape,
                     BufferAllocation::Slice expert_id, Shape expert_id_shape,
                     BufferAllocation::Slice out, Shape out_shape,
                     BufferAllocation::Slice workspace, Shape workspace_shape,
-                    BufferAllocation::Slice global_scale, Shape
-                    global_scale_shape, bool has_global_scale, int64_t r,
-                    int64_t k, int64_t n);
+                    int64_t r, int64_t k, int64_t n);
   ~MetalMoeGemvThunk() override;
 
   MetalMoeGemvThunk(const MetalMoeGemvThunk&) = delete;
@@ -102,11 +94,9 @@ class MetalMoeGemvThunk : public Thunk {
       stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_,
-      global_scale_;
+  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_;
   const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_,
-      workspace_shape_, global_scale_shape_;
-  const bool has_global_scale_;
+      workspace_shape_;
   const int64_t r_, k_, n_;
 
   absl::Mutex mu_;
