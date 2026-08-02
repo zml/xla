@@ -374,6 +374,12 @@ void MetalExecutor::UnregisterStream(MetalStream* stream) {
 
 void MetalExecutor::CommitOpenBufferThrough(uint64_t value) {
   if (value == 0) return;
+  absl::MutexLock cb_lock(command_buffer_mu_);
+  CommitOpenBufferThroughLocked(value);
+}
+
+void MetalExecutor::CommitOpenBufferThroughLocked(uint64_t value) {
+  if (value == 0) return;
   absl::MutexLock lock(streams_mu_);
   for (MetalStream* stream : streams_) {
     stream->FlushOpenBufferIfCarrying(value);

@@ -118,6 +118,9 @@ class MetalExecutor : public gpu::GpuExecutor {
   void RegisterStream(MetalStream* stream);
   void UnregisterStream(MetalStream* stream);
   void CommitOpenBufferThrough(uint64_t value);
+  void CommitOpenBufferThroughLocked(uint64_t value);
+
+  absl::Mutex& command_buffer_mu() const { return command_buffer_mu_; }
 
   struct Allocation {
     void* buffer = nullptr;
@@ -152,6 +155,10 @@ class MetalExecutor : public gpu::GpuExecutor {
   mutable absl::Mutex modules_mu_;
   absl::flat_hash_map<const void*, void*> loaded_modules_
       ABSL_GUARDED_BY(modules_mu_);
+
+  // Lock order: command_buffer_mu_ before streams_mu_; never nested with
+  // allocations_mu_.
+  mutable absl::Mutex command_buffer_mu_;
 
   mutable absl::Mutex streams_mu_;
   std::vector<MetalStream*> streams_ ABSL_GUARDED_BY(streams_mu_);

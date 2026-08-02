@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/launch_dim.h"
@@ -106,6 +107,7 @@ absl::Status MetalStream::RecordEvent(Event* event) {
   if (metal_event == nullptr) {
     return absl::InvalidArgumentError("Expected a MetalEvent.");
   }
+  absl::MutexLock lock(executor_->command_buffer_mu());
   if (command_buffer_ != nullptr) {
     const uint64_t value = executor_->NextEventValue();
     metal::EncodeSignalSharedEvent(command_buffer_, executor_->shared_event(),
@@ -149,6 +151,7 @@ absl::Status MetalStream::WaitFor(Event* event) {
   if (metal_event != nullptr && metal_event->shared_event() != nullptr &&
       metal_event->signal_value() != 0) {
     const uint64_t value = metal_event->signal_value();
+    absl::MutexLock lock(executor_->command_buffer_mu());
     if (metal_event->shared_event() == executor_->shared_event() &&
         command_buffer_ != nullptr && value > last_signaled_value_ &&
         value <= pending_signal_high_) {
@@ -163,11 +166,11 @@ absl::Status MetalStream::WaitFor(Event* event) {
     if (metal_event->shared_event() == executor_->shared_event() &&
         command_buffer_ != nullptr && value <= waited_value_high_) {
       if (BatchDbgEnabled()) ++g_bdbg.w_covered;
-      executor_->CommitOpenBufferThrough(value);
+      executor_->CommitOpenBufferThroughLocked(value);
       return absl::OkStatus();
     }
     if (BatchDbgEnabled()) ++g_bdbg.w_xbuf;
-    executor_->CommitOpenBufferThrough(value);
+    executor_->CommitOpenBufferThroughLocked(value);
     EnsureOpenCommandBuffer();
     metal::EncodeWaitForSharedEvent(command_buffer_,
                                     metal_event->shared_event(), value);
@@ -195,6 +198,7 @@ absl::Status MetalStream::Memset32(DeviceAddressBase* location,
       const uint64_t offset =
           reinterpret_cast<const char*>(location->opaque()) -
           reinterpret_cast<const char*>(alloc->contents);
+      absl::MutexLock lock(executor_->command_buffer_mu());
       EnsureOpenCommandBuffer();
       return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
                                    b);
@@ -215,6 +219,7 @@ absl::Status MetalStream::MemZero(DeviceAddressBase* location, uint64_t size) {
     const uint64_t offset =
         reinterpret_cast<const char*>(location->opaque()) -
         reinterpret_cast<const char*>(alloc->contents);
+    absl::MutexLock lock(executor_->command_buffer_mu());
     EnsureOpenCommandBuffer();
     return metal::EncodeBlitFill(command_buffer_, alloc->buffer, offset, size,
                                  /*value=*/0);
@@ -258,6 +263,7 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase* device_dst,
     const bool overlap =
         same_buf && dst_off < src_off + size && src_off < dst_off + size;
     if (!overlap) {
+      absl::MutexLock lock(executor_->command_buffer_mu());
       EnsureOpenCommandBuffer();
       return metal::EncodeBlitCopy(command_buffer_, dst->buffer, dst_off,
                                    src->buffer, src_off, size);
@@ -277,47 +283,55 @@ absl::Status MetalStream::DoHostCallbackWithStatus(
     }
   };
 
-  void* shared_event = executor_->shared_event();
-  void* listener = executor_->shared_event_listener();
-  const uint64_t value =
-      pending_signal_high_ != 0 ? pending_signal_high_ : last_signaled_value_;
-  if (shared_event != nullptr && listener != nullptr && value != 0) {
-    metal::NotifySharedEventListener(listener, shared_event, value,
-                                     std::move(run));
-    return absl::OkStatus();
-  }
+  {
+    absl::MutexLock lock(executor_->command_buffer_mu());
+    void* shared_event = executor_->shared_event();
+    void* listener = executor_->shared_event_listener();
+    const uint64_t value =
+        pending_signal_high_ != 0 ? pending_signal_high_ : last_signaled_value_;
+    if (shared_event != nullptr && listener != nullptr && value != 0) {
+      metal::NotifySharedEventListener(listener, shared_event, value,
+                                       std::move(run));
+      return absl::OkStatus();
+    }
 
-  if (command_buffer_ != nullptr) {
-    void* batch = command_buffer_;
-    command_buffer_ = nullptr;
-    pending_signal_high_ = 0;
-    signals_since_commit_ = 0;
-    waited_value_high_ = 0;
-    metal::CommitBatchCommandBufferWithCompletion(batch, std::move(run));
-    ReleaseObject(batch);
-    return absl::OkStatus();
+    if (command_buffer_ != nullptr) {
+      void* batch = command_buffer_;
+      command_buffer_ = nullptr;
+      pending_signal_high_ = 0;
+      signals_since_commit_ = 0;
+      waited_value_high_ = 0;
+      metal::CommitBatchCommandBufferWithCompletion(batch, std::move(run));
+      ReleaseObject(batch);
+      return absl::OkStatus();
+    }
   }
   run();
   return absl::OkStatus();
 }
 
 absl::Status MetalStream::BlockHostUntilDone() {
-  if (command_buffer_ == nullptr) {
-    return absl::OkStatus();
+  void* committed = nullptr;
+  {
+    absl::MutexLock lock(executor_->command_buffer_mu());
+    if (command_buffer_ == nullptr) {
+      return absl::OkStatus();
+    }
+    committed = metal::CommitBatchCommandBuffer(command_buffer_);
+    ReleaseObject(command_buffer_);
+    command_buffer_ = nullptr;
+    if (pending_signal_high_ != 0) last_signaled_value_ = pending_signal_high_;
+    pending_signal_high_ = 0;
+    signals_since_commit_ = 0;
+    waited_value_high_ = 0;
   }
-  void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
-  ReleaseObject(command_buffer_);
-  command_buffer_ = nullptr;
-  if (pending_signal_high_ != 0) last_signaled_value_ = pending_signal_high_;
-  pending_signal_high_ = 0;
-  signals_since_commit_ = 0;
-  waited_value_high_ = 0;
   absl::Status status = WaitUntilCompleted(committed);
   ReleaseObject(committed);
   return status;
 }
 
 absl::Status MetalStream::FlushBatchedWork() {
+  absl::MutexLock lock(executor_->command_buffer_mu());
   if (BatchDbgEnabled()) {
     static int tok = 0;
     if ((tok++ % 32) == 0) {
@@ -338,6 +352,7 @@ absl::Status MetalStream::FlushBatchedWork() {
 }
 
 absl::Status MetalStream::CommitBatchedWorkNoWait() {
+  absl::MutexLock lock(executor_->command_buffer_mu());
   CommitOpenBufferNoWait();
   return absl::OkStatus();
 }
@@ -433,6 +448,7 @@ absl::Status MetalStream::LaunchMetalKernel(
     }
   }
 
+  absl::MutexLock lock(executor_->command_buffer_mu());
   EnsureOpenCommandBuffer();
   return metal::EncodeKernel(command_buffer_, pipeline, function,
                              use_argument_buffer, arguments, name, thread_dims,
