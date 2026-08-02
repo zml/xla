@@ -102,9 +102,8 @@ MetalMoeGemvThunk::MetalMoeGemvThunk(
     BufferAllocation::Slice w, Shape w_shape, BufferAllocation::Slice scale,
     Shape scale_shape, BufferAllocation::Slice expert_id, Shape expert_id_shape,
     BufferAllocation::Slice out, Shape out_shape,
-    BufferAllocation::Slice workspace, Shape workspace_shape,
-    BufferAllocation::Slice global_scale, Shape global_scale_shape,
-    bool has_global_scale, int64_t r, int64_t k, int64_t n)
+    BufferAllocation::Slice workspace, Shape workspace_shape, int64_t r,
+    int64_t k, int64_t n)
     : Thunk(Kind::kCustomCall, std::move(thunk_info)),
       x_(x),
       w_(w),
@@ -112,15 +111,12 @@ MetalMoeGemvThunk::MetalMoeGemvThunk(
       expert_id_(expert_id),
       out_(out),
       workspace_(workspace),
-      global_scale_(global_scale),
       x_shape_(std::move(x_shape)),
       w_shape_(std::move(w_shape)),
       scale_shape_(std::move(scale_shape)),
       expert_id_shape_(std::move(expert_id_shape)),
       out_shape_(std::move(out_shape)),
       workspace_shape_(std::move(workspace_shape)),
-      global_scale_shape_(std::move(global_scale_shape)),
-      has_global_scale_(has_global_scale),
       r_(r),
       k_(k),
       n_(n) {}
@@ -180,12 +176,10 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
       TF_ASSIGN_OR_RETURN(
           std::vector<uint8_t> lib,
           CompileMetalSourceToMetallibCached(get_mlx_fp4_qmv()));
-      const FC gemv_fc[] = {{440, FC::Kind::kBool, has_global_scale_}};
       TF_ASSIGN_OR_RETURN(
           next->kernel,
-          metal_exec->LoadKernelWithConstants(
-              lib, "nvfp4_gather_qmv",
-              /*arity=*/has_global_scale_ ? 7 : 6, gemv_fc));
+          metal_exec->LoadKernelWithConstants(lib, "nvfp4_gather_qmv",
+                                              /*arity=*/6, {}));
     } else {
       TF_ASSIGN_OR_RETURN(
           std::vector<uint8_t> lib,
@@ -218,15 +212,9 @@ MetalMoeGemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
                         metal_exec->LoadKernelWithConstants(
                             steel_lib, "fp8_gather_qmm_rhs", /*arity=*/6, fc));
   } else if (is_nvfp4) {
-    const FC fc_nvfp4[] = {{200, FC::Kind::kBool, align_m},
-                           {201, FC::Kind::kBool, align_n},
-                           {202, FC::Kind::kBool, align_k},
-                           {440, FC::Kind::kBool, has_global_scale_}};
-    TF_ASSIGN_OR_RETURN(
-        next->kernel_steel,
-        metal_exec->LoadKernelWithConstants(steel_lib, "nvfp4_gather_qmm_rhs",
-                                            /*arity=*/has_global_scale_ ? 7 : 6,
-                                            fc_nvfp4));
+    TF_ASSIGN_OR_RETURN(next->kernel_steel,
+                        metal_exec->LoadKernelWithConstants(
+                            steel_lib, "nvfp4_gather_qmm_rhs", /*arity=*/6, fc));
   } else {
     TF_ASSIGN_OR_RETURN(next->kernel_steel,
                         metal_exec->LoadKernelWithConstants(
@@ -337,8 +325,7 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
         se::ThreadDim(64, 1, 1),
         se::BlockDim((kcols + 63) / 64, rows, 1), stream, a_gx));
 
-    se::KernelArgsPackedArray a_mm(
-        /*num_args=*/(has_scale ? 6 : 5) + (has_global_scale_ ? 1 : 0));
+    se::KernelArgsPackedArray a_mm(/*num_args=*/has_scale ? 6 : 5);
     a_mm.add_argument(x_sorted);
     a_mm.add_argument(allocs.GetDeviceAddress(w_));
     if (has_scale) {
@@ -347,9 +334,6 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
     a_mm.add_argument(idx_sorted);
     a_mm.add_argument(out_sorted);
     a_mm.add_argument(state->dims_steel);
-    if (has_global_scale_) {
-      a_mm.add_argument(allocs.GetDeviceAddress(global_scale_));
-    }
     constexpr int64_t kBM = 16, kBN = 32;
     TF_RETURN_IF_ERROR(state->kernel_steel->Launch(
         se::ThreadDim(32, 2, 1),
@@ -370,8 +354,7 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   }
 
   constexpr int64_t kMoeGemvTN = 8;
-  se::KernelArgsPackedArray args(
-      /*num_args=*/(has_scale ? 6 : 5) + (has_global_scale_ ? 1 : 0));
+  se::KernelArgsPackedArray args(/*num_args=*/has_scale ? 6 : 5);
   args.add_argument(allocs.GetDeviceAddress(x_));
   args.add_argument(allocs.GetDeviceAddress(w_));
   if (has_scale) {
@@ -380,9 +363,6 @@ absl::Status MetalMoeGemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(allocs.GetDeviceAddress(expert_id_));
   args.add_argument(output);
   args.add_argument(state->dims);
-  if (has_global_scale_) {
-    args.add_argument(allocs.GetDeviceAddress(global_scale_));
-  }
   if (is_nvfp4) {
     return state->kernel->Launch(
         se::ThreadDim(32, 2, 1),
@@ -408,9 +388,6 @@ Thunk::BufferUses MetalMoeGemvThunk::buffer_uses() const {
     uses.push_back(BufferUse::Read(scale_, scale_shape_));
   }
   uses.push_back(BufferUse::Read(expert_id_, expert_id_shape_));
-  if (has_global_scale_) {
-    uses.push_back(BufferUse::Read(global_scale_, global_scale_shape_));
-  }
   uses.push_back(BufferUse::Write(out_, out_shape_));
   if (workspace_.size() != 0) {
     uses.push_back(BufferUse::Scratch(workspace_, workspace_shape_));

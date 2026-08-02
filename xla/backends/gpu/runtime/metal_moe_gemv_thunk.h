@@ -40,9 +40,7 @@ class MetalMoeGemvThunk : public Thunk {
                     BufferAllocation::Slice expert_id, Shape expert_id_shape,
                     BufferAllocation::Slice out, Shape out_shape,
                     BufferAllocation::Slice workspace, Shape workspace_shape,
-                    BufferAllocation::Slice global_scale, Shape
-                    global_scale_shape, bool has_global_scale, int64_t r,
-                    int64_t k, int64_t n);
+                    int64_t r, int64_t k, int64_t n);
   ~MetalMoeGemvThunk() override;
 
   MetalMoeGemvThunk(const MetalMoeGemvThunk&) = delete;
@@ -59,11 +57,9 @@ class MetalMoeGemvThunk : public Thunk {
       stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_,
-      global_scale_;
+  const BufferAllocation::Slice x_, w_, scale_, expert_id_, out_, workspace_;
   const Shape x_shape_, w_shape_, scale_shape_, expert_id_shape_, out_shape_,
-      workspace_shape_, global_scale_shape_;
-  const bool has_global_scale_;
+      workspace_shape_;
   const int64_t r_, k_, n_;
 
   absl::Mutex mu_;
