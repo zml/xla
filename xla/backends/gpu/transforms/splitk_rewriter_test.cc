@@ -41,6 +41,16 @@ se::DeviceDescription GetDeviceDescription() {
       .value();
 }
 
+se::DeviceDescription GetRocmDeviceDescription() {
+  return se::DeviceDescription::FromProto(
+             ParseTextProto<stream_executor::GpuDeviceInfoProto>(R"pb(
+               core_count: 304
+               rocm_compute_capability { gcn_arch_name: "gfx942" }
+             )pb")
+                 .value())
+      .value();
+}
+
 class SplitkRewriterTest : public HloHardwareIndependentTestBase {
  public:
   SplitkRewriterTest() : rewriter_(GetDeviceDescription()) {}
@@ -213,6 +223,30 @@ CHECK: dot({{.*}}), lhs_batch_dims={1}, lhs_contracting_dims={2}, rhs_batch_dims
 CHECK: ROOT {{.*}} = f32[1024,2048]{1,0} reduce
   )")
                   .value_or(false));
+}
+
+TEST_F(SplitkRewriterTest, FlyLocalSplitCandidateKeepsEligibleBf16DotIntact) {
+  const char* hlo_string = R"(
+HloModule module
+
+ENTRY test {
+  lhs = bf16[128,4096]{1,0} parameter(0)
+  rhs = bf16[11008,4096]{1,0} parameter(1)
+  ROOT dot = bf16[128,11008]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={1}
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_enable_flydsl_gemm(true);
+  SplitkRewriter rewriter(GetRocmDeviceDescription());
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          rewriter.HloModulePass::Run(module.get()));
+  EXPECT_FALSE(changed);
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kDot);
 }
 
 }  // namespace

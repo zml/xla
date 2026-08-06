@@ -183,6 +183,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_llvm_disable_expensive_passes(false);
   opts.set_xla_backend_optimization_level(3);
   opts.set_xla_gpu_autotune_level(4);
+  opts.set_xla_gpu_autotune_num_repetitions(1);
   opts.set_xla_gpu_autotune_max_solutions(0);
   opts.set_xla_gpu_fusion_autotune_top_k_configs(1);
   opts.set_xla_cpu_multi_thread_eigen(true);
@@ -1590,6 +1591,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "in the list) solution is numerically CORRECT. Otherwise, the autotuner "
       "might discard many other correct solutions based on the failed "
       "BufferComparator test."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_autotune_num_repetitions",
+      int32_setter_for(
+          &DebugOptions::set_xla_gpu_autotune_num_repetitions),
+      debug_options->xla_gpu_autotune_num_repetitions(),
+      "Number of timed executions per candidate during GPU autotuning. The "
+      "median duration is used. Values below 1 are treated as 1."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_autotune_max_solutions",
       int64_setter_for(&DebugOptions::set_xla_gpu_autotune_max_solutions),

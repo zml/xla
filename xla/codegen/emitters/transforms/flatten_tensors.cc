@@ -825,6 +825,50 @@ struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
   }
 };
 
+struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::BufferStoreOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getDestination().getType())) {
+      return rewriter.notifyMatchFailure(op,
+                                         "the destination is already flat");
+    }
+
+    Location loc = op.getLoc();
+    Value flat_destination = Flatten(op.getDestination(), rewriter);
+    auto new_op = gpu::BufferStoreOp::create(
+        rewriter, loc, flat_destination.getType(), op.getValue(),
+        flat_destination, op.getDestinationIndex(), op.getCachePolicyAttr());
+
+    Value result = new_op.getResult();
+    if (result.getType() != op.getResult().getType()) {
+      result = UnrealizedConversionCastOp::create(
+                   rewriter, loc, op.getResult().getType(), result)
+                   .getResult(0);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
+struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::SplitBufferLoadOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getSource().getType())) {
+      return rewriter.notifyMatchFailure(op, "the source is already flat");
+    }
+
+    Value flat_source = Flatten(op.getSource(), rewriter);
+    rewriter.replaceOpWithNewOp<gpu::SplitBufferLoadOp>(
+        op, op.getResult().getType(), flat_source, op.getVectorIndex(),
+        op.getScalarIndex());
+    return mlir::success();
+  }
+};
+
 struct RewriteGetDynamicDimSizeOp : OpRewritePattern<GetDynamicDimSizeOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -859,6 +903,8 @@ class FlattenTensorsPass
         RewriteAllocateShared,
         RewriteAsyncCopyGlobalToShared,
         RewriteBufferLoad,
+        RewriteBufferStore,
+        RewriteSplitBufferLoad,
         RewriteAtomicRMW,
         RewriteConstant,
         RewriteCpuLoad,

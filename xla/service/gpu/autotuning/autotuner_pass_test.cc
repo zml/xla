@@ -455,6 +455,7 @@ TEST_P(AutotunerFlagsTest, AutotuneLevel) {
       GetProfileOptions(debug_options, config_assigner_options);
   EXPECT_EQ(profile_options.should_init_buffers,
             params.expected_should_init_buffers);
+  EXPECT_EQ(profile_options.repetitions, 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(

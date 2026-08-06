@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/gpu_profiler.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -300,17 +301,23 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
     RETURN_IF_ERROR(stream_->BlockHostUntilDone());
   }
 
-  ExecutionProfile profile;
-  profile.set_warmup_run_executed(true);
-  std::vector<ExecutionInput> execution_inputs =
-      CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
-                                       rz_buffers.input_shapes());
+  std::vector<absl::Duration> durations;
+  durations.reserve(options_.repetitions);
+  for (int repetition = 0; repetition < options_.repetitions; ++repetition) {
+    ExecutionProfile profile;
+    profile.set_warmup_run_executed(true);
+    std::vector<ExecutionInput> execution_inputs =
+        CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
+                                         rz_buffers.input_shapes());
 
-  ASSIGN_OR_RETURN(ExecutionOutput execution_output,
-                   Execute(executable, std::move(execution_inputs), &profile));
-
-  result.duration = absl::Nanoseconds(profile.compute_time_ns());
-  result.output_buffer = execution_output.Commit().ConsumeResult();
+    ASSIGN_OR_RETURN(
+        ExecutionOutput execution_output,
+        Execute(executable, std::move(execution_inputs), &profile));
+    durations.push_back(absl::Nanoseconds(profile.compute_time_ns()));
+    result.output_buffer = execution_output.Commit().ConsumeResult();
+  }
+  std::sort(durations.begin(), durations.end());
+  result.duration = durations[durations.size() / 2];
   return result;
 }
 

@@ -227,6 +227,42 @@ size_t ChooseSplitK(const DotDimensions& dims,
   return candidates[absl::c_min_element(costs) - costs.begin()];
 }
 
+// Fly's local-split kernel uses two wave groups to cover K and reduces their
+// FP32 accumulators inside the workgroup. It therefore gets split-K
+// parallelism without materializing FP32 partials or launching a reduction.
+// Keep eligible dots intact so this kernel can compete with unsplit library
+// and Triton candidates in the ordinary backend autotuner.
+bool CanUseFlyLocalSplitK(const HloDotInstruction& dot) {
+  if (dot.shape().dimensions_size() != 2 ||
+      dot.operand(0)->shape().dimensions_size() != 2 ||
+      dot.operand(1)->shape().dimensions_size() != 2 ||
+      dot.shape().element_type() != BF16 ||
+      dot.operand(0)->shape().element_type() != BF16 ||
+      dot.operand(1)->shape().element_type() != BF16) {
+    return false;
+  }
+  const DotDimensionNumbers& dnums = dot.dot_dimension_numbers();
+  if (!dnums.lhs_batch_dimensions().empty() ||
+      !dnums.rhs_batch_dimensions().empty() ||
+      dnums.lhs_contracting_dimensions_size() != 1 ||
+      dnums.rhs_contracting_dimensions_size() != 1 ||
+      dnums.lhs_contracting_dimensions(0) != 1 ||
+      (dnums.rhs_contracting_dimensions(0) != 0 &&
+       dnums.rhs_contracting_dimensions(0) != 1)) {
+    return false;
+  }
+  const int64_t rhs_contracting_dimension =
+      dnums.rhs_contracting_dimensions(0);
+  if (!dot.operand(1)->shape().has_layout() ||
+      dot.operand(1)->shape().layout().minor_to_major(0) !=
+          rhs_contracting_dimension) {
+    return false;
+  }
+  const DotDimensions dims = GetDotDimensions(&dot);
+  return dims.m % 128 == 0 && dims.n % 64 == 0 && dims.k >= 256 &&
+         dims.k % 128 == 0;
+}
+
 // Pads the given instruction with zeros along the given dimension to the given
 // size.
 HloInstruction* PadInstruction(HloInstruction* instr, int64_t dimension_idx,
@@ -394,7 +430,15 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
                          .debug_options()
                          .xla_gpu_experimental_force_split_k();
     if (split_k == 0) {
-      split_k = ChooseSplitK(GetDotDimensions(dot), device_description_);
+      const DebugOptions& debug_options =
+          dot->parent()->parent()->config().debug_options();
+      split_k = debug_options.xla_gpu_enable_flydsl_gemm() &&
+                        device_description_
+                            .gpu_compute_capability()
+                            .IsRocm() &&
+                        CanUseFlyLocalSplitK(*dot)
+                    ? 1
+                    : ChooseSplitK(GetDotDimensions(dot), device_description_);
     }
     if (split_k == 1) {
       return absl::OkStatus();

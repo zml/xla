@@ -35,6 +35,8 @@ struct ProfileOptions {
   // Whether to initialize the buffers with random data or leave them
   // uninitialized.
   bool should_init_buffers = false;
+  // Number of timed executions per candidate. The median duration is used.
+  int repetitions = 1;
 };
 
 struct ProfileResult {

@@ -53,8 +53,8 @@ ENTRY main {
           "waves_per_eu":2}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.2, /*arel=*/0.02}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.2, /*arel=*/0.02}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16Mma256x256x256MultipleBlocks) {
@@ -80,8 +80,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16Mfma32x32x8) {
@@ -110,8 +110,170 @@ ENTRY main {
           "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16SingleBufferLdsMfma32) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_single_buffer_lds
+
+fly_gemm {
+  lhs = bf16[256,128]{1,0} parameter(0)
+  rhs = bf16[128,512]{0,1} parameter(1)
+  ROOT dot = bf16[256,512]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["32"]}
+}
+
+ENTRY main {
+  lhs = bf16[256,128]{1,0} parameter(0)
+  rhs = bf16[128,512]{0,1} parameter(1)
+  ROOT fusion = bf16[256,512]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"256",
+          "block_k":"32", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_32X32X8", "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["128","256"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16Pipelined128x64x128RollingRefill) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_pipelined_128x64x128
+
+fly_gemm {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[384,128]{0,1} parameter(1)
+  ROOT dot = bf16[256,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["128"]}
+}
+
+ENTRY main {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[384,128]{0,1} parameter(1)
+  ROOT fusion = bf16[256,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"64",
+          "block_k":"128", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true,
+          "rolling_refill":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["128","64"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16Pipelined128x64x128LocalSplitK) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_pipelined_128x64x128_local_split_k
+
+fly_gemm {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[384,128]{0,1} parameter(1)
+  ROOT dot = bf16[256,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["128"]}
+}
+
+ENTRY main {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[384,128]{0,1} parameter(1)
+  ROOT fusion = bf16[256,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"64",
+          "block_k":"128", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true,
+          "local_split_k":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["128","64"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16LocalSplitKWithTransposedRhsDotDimension) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_local_split_k_transposed_rhs
+
+fly_gemm {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[128,384]{1,0} parameter(1)
+  ROOT dot = bf16[256,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={1},
+      backend_config={"sizes":["128"]}
+}
+
+ENTRY main {
+  lhs = bf16[256,384]{1,0} parameter(0)
+  rhs = bf16[128,384]{1,0} parameter(1)
+  ROOT fusion = bf16[256,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"64",
+          "block_k":"128", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true,
+          "local_split_k":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["128","64"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16Preloaded64x64Tile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_preloaded_64x64
+
+fly_gemm {
+  lhs = bf16[128,256]{1,0} parameter(0)
+  rhs = bf16[256,128]{0,1} parameter(1)
+  ROOT dot = bf16[128,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["64"]}
+}
+
+ENTRY main {
+  lhs = bf16[128,256]{1,0} parameter(0)
+  rhs = bf16[256,128]{0,1} parameter(1)
+  ROOT fusion = bf16[128,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"64", "block_n":"64",
+          "block_k":"64", "num_warps":"4", "stage_rhs":true,
+          "preload_lds_fragments":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["64","64"]}],
+          "num_stages":"2", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16WideN128x512Tile) {
@@ -142,8 +304,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16ColumnMajorRhsVectorLoads) {
@@ -173,8 +335,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16RhsRegisterPipeline) {
@@ -204,8 +366,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16FlyDslStagedRhsPipeline) {
@@ -236,8 +398,8 @@ ENTRY main {
           "num_stages":"2", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16FlyDslStagedRhsSixteenWaves) {
@@ -267,8 +429,8 @@ ENTRY main {
           "num_stages":"2", "num_warps":"16", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/2.0, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/2.0, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16FlyDslStagedRhsSmallTile) {
@@ -299,8 +461,8 @@ ENTRY main {
           "num_stages":"2", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/2.0, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/2.0, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16FlyDslRegisterRhsPipeline) {
@@ -332,8 +494,78 @@ ENTRY main {
           "num_stages":"2", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1.0, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16DirectToVgprRhsOddTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_direct_to_vgpr_rhs
+
+fly_gemm {
+  lhs = bf16[224,192]{1,0} parameter(0)
+  rhs_row_major = bf16[256,192]{1,0} parameter(1)
+  rhs = bf16[192,256]{0,1} bitcast(rhs_row_major)
+  ROOT dot = bf16[224,256]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["64"]}
+}
+
+ENTRY main {
+  lhs = bf16[224,192]{1,0} parameter(0)
+  rhs = bf16[256,192]{1,0} parameter(1)
+  ROOT fusion = bf16[224,256]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"224", "block_n":"256",
+          "block_k":"64", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16",
+          "schedule_instructions":true, "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true,
+          "direct_to_vgpr":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["224","256"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16DirectToVgprLhsOddTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_direct_to_vgpr_lhs
+
+fly_gemm {
+  lhs = bf16[256,192]{1,0} parameter(0)
+  rhs_row_major = bf16[224,192]{1,0} parameter(1)
+  rhs = bf16[192,224]{0,1} bitcast(rhs_row_major)
+  ROOT dot = bf16[256,224]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      backend_config={"sizes":["64"]}
+}
+
+ENTRY main {
+  lhs = bf16[256,192]{1,0} parameter(0)
+  rhs = bf16[224,192]{1,0} parameter(1)
+  ROOT fusion = bf16[256,224]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"256", "block_n":"224",
+          "block_k":"64", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16",
+          "schedule_instructions":true, "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true,
+          "direct_to_vgpr":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["256","224"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16VectorMatrix1x256x256) {
@@ -359,8 +591,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 TEST_F(FlyGemmDeviceTest, Bf16MatrixVector256x256x1) {
@@ -386,8 +618,8 @@ ENTRY main {
           "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
 }  // namespace

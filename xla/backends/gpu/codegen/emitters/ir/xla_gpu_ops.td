@@ -113,6 +113,52 @@ def XLAGPU_BufferLoadOp : XLAGPU_Op<"buffer_load"> {
   }];
 }
 
+def XLAGPU_BufferStoreOp : XLAGPU_Op<"buffer_store", [
+    TypesMatchWith<"result type matches destination type",
+                   "destination", "result", "$_self">
+  ]> {
+  let summary = "Stores a contiguous vector through an AMD buffer descriptor.";
+
+  let description = [{
+    Stores a contiguous vector to a physical linear tensor offset using an AMD
+    raw buffer instruction. The descriptor bounds suppress out-of-range writes,
+    which permits branchless GEMM epilogues at matrix edges. `cache_policy` is
+    forwarded to the target buffer instruction; gfx942 uses bit 1 for `nt`.
+  }];
+
+  let arguments = (ins AnyVectorOfNonZeroRank:$value,
+                       AnyRankedTensor:$destination,
+                       Index:$destination_index,
+                       I32Attr:$cache_policy);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $value `,` $destination `[` $destination_index `]`
+    `cache_policy` `=` $cache_policy attr-dict
+    `:` type($value) `,` type($destination)
+  }];
+}
+
+def XLAGPU_SplitBufferLoadOp : XLAGPU_Op<"split_buffer_load"> {
+  let summary = "Loads a contiguous vector with split AMD buffer offsets.";
+
+  let description = [{
+    Loads a contiguous vector using separate lane-varying and uniform physical
+    linear tensor offsets. The lowering maps these to the voffset and soffset
+    operands of an AMD raw buffer instruction, allowing loop-varying uniform
+    offsets to remain in SGPRs instead of being combined in every lane.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source, Index:$vector_index,
+                       Index:$scalar_index);
+  let results = (outs AnyVectorOfNonZeroRank:$result);
+
+  let assemblyFormat = [{
+    $source `[` $vector_index `+` $scalar_index `]` attr-dict
+    `:` type($source) `->` type($result)
+  }];
+}
+
 def XLAGPU_ShuffleReduceOp : XLAGPU_Op<"shuffle_reduce",
     [Pure,  CallOpInterface,
      TypesMatchWith<"result type matches type of operands",
