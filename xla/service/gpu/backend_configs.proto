@@ -300,6 +300,23 @@ message FlyGemmConfig {
   // Use FlyDSL's gfx942 B_TO_LDS=false pipeline: copy A directly to LDS while
   // double-buffering 128-bit RHS fragments in VGPRs.
   bool async_lhs = 11;
+  // Preload complete A/B LDS fragments into VGPRs around each pipelined K
+  // iteration, matching FlyDSL's splitk_hgemm B_TO_LDS schedule.
+  bool preload_lds_fragments = 12;
+  // Keep one A+B tile in LDS and prefetch the next tile into VGPRs. This
+  // trades a second workgroup barrier for a smaller LDS allocation.
+  bool single_buffer_lds = 13;
+  // Keep the wave-local operand of a Tensile-style 256x224x64 tile in VGPRs
+  // instead of round-tripping it through LDS.
+  bool direct_to_vgpr = 14;
+  // Refill a single-buffered LDS tile through a short rolling VMEM window
+  // instead of issuing the complete next tile before compute.
+  bool rolling_refill = 15;
+  // Split each K128 stage across two pairs of waves, matching hipBLASLt's
+  // MIWT4_4 / MIWaveGroup[2,1] / LocalSplitU=2 schedule. Each wave spills
+  // half its FP32 partial tile for its partner through the reusable A/B LDS
+  // allocation, then reduces and stores the half it retained in VGPRs.
+  bool local_split_k = 16;
 }
 
 // A backend config for dynamic-slice and dynamic-update-slice instructions

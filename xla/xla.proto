@@ -554,6 +554,10 @@ message DebugOptions {
   // Relative precision for comparing different GEMM solutions
   optional float xla_gpu_autotune_gemm_rtol = 316;
 
+  // Number of timed executions per candidate during GPU autotuning. The
+  // median is used to reduce sensitivity to clock and launch-time noise.
+  optional int32 xla_gpu_autotune_num_repetitions = 516;
+
   // 0:   Disable gemm and convolution autotuning.
   // 1:   Enable autotuning, but disable correctness checking.
   // 2:   Also set output buffers to random numbers during autotuning.
