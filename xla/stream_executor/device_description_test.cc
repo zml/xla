@@ -149,6 +149,16 @@ TEST(GpuComputeCapability, ProtoConversion) {
       GpuComputeCapability::FromProto(
           GpuComputeCapability(RocmComputeCapability("gfx908")).ToProto()),
       IsOkAndHolds(GpuComputeCapability(RocmComputeCapability("gfx908"))));
+  VulkanComputeCapability vulkan(/*api_version_major=*/1,
+                                 /*api_version_minor=*/2,
+                                 /*shader_bfloat16=*/true,
+                                 /*storage_buffer_16bit_access=*/true,
+                                 /*subgroup_size=*/32,
+                                 /*subgroup_basic=*/true,
+                                 /*subgroup_shuffle=*/true);
+  EXPECT_THAT(GpuComputeCapability::FromProto(
+                  GpuComputeCapability(vulkan).ToProto()),
+              IsOkAndHolds(GpuComputeCapability(vulkan)));
 }
 
 TEST(ExecutionUnitDescription, ProtoConversion) {

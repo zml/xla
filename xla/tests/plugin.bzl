@@ -35,4 +35,22 @@ load("//xla/tsl:package_groups.bzl", "DEFAULT_LOAD_VISIBILITY")
 
 visibility(DEFAULT_LOAD_VISIBILITY)
 
-plugins = {}
+plugins = {
+    "vulkan": {
+        "deps": [
+            "//xla/backends/gpu/runtime:thunk_runtime_dependencies",
+            "//xla/service:service",
+            "//xla/service/gpu:gpu_transfer_manager",
+            "//xla/service/gpu:vulkan_gpu_compiler",
+            "//xla/stream_executor/vulkan:vulkan_platform",
+            "//xla/tests:pjrt_gpu_client_registry",
+        ],
+        "copts": [],
+        "tags": [
+            "gpu",
+            "vulkan-only",
+        ],
+        "args": [],
+        "data": [],
+    },
+}
