@@ -30,6 +30,9 @@ message VulkanComputeCapabilityProto {
   uint32 api_version_minor = 2;
   bool shader_bfloat16 = 3;
   bool storage_buffer_16bit_access = 4;
+  uint32 subgroup_size = 5;
+  bool subgroup_basic = 6;
+  bool subgroup_shuffle = 7;
 }
 
 message GpuComputeCapabilityProto {

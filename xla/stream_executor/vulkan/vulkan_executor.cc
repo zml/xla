@@ -236,6 +236,7 @@ class VulkanDriver {
 
   PFN_vkGetDeviceProcAddr get_device_proc_addr = nullptr;
   PFN_vkGetPhysicalDeviceProperties get_physical_device_properties = nullptr;
+  PFN_vkGetPhysicalDeviceProperties2 get_physical_device_properties2 = nullptr;
   PFN_vkGetPhysicalDeviceFeatures2 get_physical_device_features2 = nullptr;
   PFN_vkGetPhysicalDeviceMemoryProperties get_physical_device_memory_properties =
       nullptr;
@@ -391,6 +392,9 @@ class VulkanDriver {
     RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
                                      "vkGetPhysicalDeviceProperties",
                                      &get_physical_device_properties));
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+                                     "vkGetPhysicalDeviceProperties2",
+                                     &get_physical_device_properties2));
     RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
                                      "vkGetPhysicalDeviceFeatures2",
                                      &get_physical_device_features2));
@@ -1162,8 +1166,15 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
   }
   VkPhysicalDevice physical_device = Driver().physical_devices()[device_ordinal];
   VkPhysicalDeviceProperties properties = {};
+  VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
+  subgroup_properties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceProperties2 properties2 = {};
+  properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  properties2.pNext = &subgroup_properties;
   VkPhysicalDeviceMemoryProperties memory_properties = {};
   Driver().get_physical_device_properties(physical_device, &properties);
+  Driver().get_physical_device_properties2(physical_device, &properties2);
   Driver().get_physical_device_memory_properties(physical_device,
                                                  &memory_properties);
   TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
@@ -1182,7 +1193,14 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
       VK_API_VERSION_MAJOR(properties.apiVersion),
       VK_API_VERSION_MINOR(properties.apiVersion),
       shader_features.shader_bfloat16,
-      shader_features.storage_buffer_16bit_access);
+      shader_features.storage_buffer_16bit_access,
+      subgroup_properties.subgroupSize,
+      (subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+          (subgroup_properties.supportedOperations &
+           VK_SUBGROUP_FEATURE_BASIC_BIT) != 0,
+      (subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+          (subgroup_properties.supportedOperations &
+           VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0);
   description->set_thread_dim_limit(ThreadDim(
       properties.limits.maxComputeWorkGroupSize[0],
       properties.limits.maxComputeWorkGroupSize[1],
@@ -1193,7 +1211,7 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
       properties.limits.maxComputeWorkGroupCount[2]));
   description->set_threads_per_block_limit(
       properties.limits.maxComputeWorkGroupInvocations);
-  description->set_threads_per_warp(32);
+  description->set_threads_per_warp(subgroup_properties.subgroupSize);
   description->set_core_count(1);
   description->set_device_address_bits(sizeof(void*) * 8);
   description->set_shared_memory_per_block(

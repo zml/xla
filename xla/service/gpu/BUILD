@@ -3784,7 +3784,9 @@ cc_library(
     deps = [
         ":gpu_compiler",
         ":target_constants",
+        "//xla/backends/gpu/transforms:vulkan_flash_attention_rewriter",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass_pipeline",
         "//xla/service:dump",
         "//xla/service/gpu/llvm_gpu_backend:spirv_backend",
         "//xla/stream_executor:semantic_version",

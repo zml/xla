@@ -91,6 +91,13 @@ inline bool IsPdlLaunchInsertionEnabled(
 // FusionBackendConfig.kind requel to this string.
 inline constexpr absl::string_view kCustomFusionKind = "__custom_fusion";
 
+// Vulkan flash-attention frontend custom call and its lowered custom-fusion
+// configuration name.
+inline constexpr absl::string_view kVulkanFlashAttentionCallTarget =
+    "zml$flash_attn";
+inline constexpr absl::string_view kVulkanFlashAttentionFusionConfigName =
+    "vulkan_flash_attention";
+
 // Generic fusions that use Triton have FusionBackendConfig.kind equal to this
 // string. This fusion kind will eventually subsume all usages of
 // kTritonGemmFusionKind.

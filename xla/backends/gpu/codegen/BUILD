@@ -106,9 +106,14 @@ cc_library(
     hdrs = ["custom.h"],
     deps = [
         ":fusion_emitter",
+        "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
+        "//xla/backends/gpu/codegen/emitters:vulkan_flash_attention",
         "//xla/hlo/ir:hlo",
         "//xla/service/gpu:ir_emitter_context",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/stream_executor:device_description",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
     ],
 )
 

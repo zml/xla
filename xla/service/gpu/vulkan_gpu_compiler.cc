@@ -22,6 +22,9 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "xla/backends/gpu/transforms/vulkan_flash_attention_rewriter.h"
+#include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/dump.h"
 #include "xla/service/gpu/llvm_gpu_backend/spirv_backend.h"
 #include "xla/service/gpu/target_constants.h"
@@ -52,6 +55,23 @@ absl::Status VulkanGpuCompiler::AddAutotunerPass(
     const AliasInfo*, mlir::MLIRContext*,
     HloCostAnalysis::ShapeSizeFunction, const MultiProcessKeyValueStore&) {
   return absl::OkStatus();
+}
+
+absl::Status VulkanGpuCompiler::OptimizeHloPostLayoutAssignment(
+    HloModule* hlo_module, se::StreamExecutor* stream_exec,
+    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
+    CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
+  RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+      thread_pool, compilation_stats, mlir_context));
+
+  HloPassPipeline pipeline("vulkan post-layout assignment",
+                           compilation_stats);
+  pipeline.AddPass<VulkanFlashAttentionRewriter>();
+  return pipeline
+      .Run(hlo_module, {HloInstruction::kMainExecutionThread})
+      .status();
 }
 
 absl::StatusOr<GpuCompiler::BackendCompileResult>

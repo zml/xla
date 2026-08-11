@@ -808,6 +808,35 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "vulkan_flash_attention_rewriter",
+    srcs = ["vulkan_flash_attention_rewriter.cc"],
+    hdrs = ["vulkan_flash_attention_rewriter.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "vulkan_flash_attention_rewriter_test",
+    srcs = ["vulkan_flash_attention_rewriter_test.cc"],
+    deps = [
+        ":vulkan_flash_attention_rewriter",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "cudnn_fused_conv_rewriter",
     srcs = ["cudnn_fused_conv_rewriter.cc"],
     hdrs = ["cudnn_fused_conv_rewriter.h"],

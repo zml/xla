@@ -47,16 +47,24 @@ class VulkanComputeCapability {
   VulkanComputeCapability(uint32_t api_version_major,
                           uint32_t api_version_minor,
                           bool shader_bfloat16 = false,
-                          bool storage_buffer_16bit_access = false)
+                          bool storage_buffer_16bit_access = false,
+                          uint32_t subgroup_size = 0,
+                          bool subgroup_basic = false,
+                          bool subgroup_shuffle = false)
       : api_version_major_(api_version_major),
         api_version_minor_(api_version_minor),
         shader_bfloat16_(shader_bfloat16),
-        storage_buffer_16bit_access_(storage_buffer_16bit_access) {}
+        storage_buffer_16bit_access_(storage_buffer_16bit_access),
+        subgroup_size_(subgroup_size),
+        subgroup_basic_(subgroup_basic),
+        subgroup_shuffle_(subgroup_shuffle) {}
   explicit VulkanComputeCapability(const VulkanComputeCapabilityProto& proto)
       : VulkanComputeCapability(proto.api_version_major(),
                                 proto.api_version_minor(),
                                 proto.shader_bfloat16(),
-                                proto.storage_buffer_16bit_access()) {}
+                                proto.storage_buffer_16bit_access(),
+                                proto.subgroup_size(), proto.subgroup_basic(),
+                                proto.subgroup_shuffle()) {}
 
   uint32_t api_version_major() const { return api_version_major_; }
   uint32_t api_version_minor() const { return api_version_minor_; }
@@ -64,6 +72,9 @@ class VulkanComputeCapability {
   bool storage_buffer_16bit_access() const {
     return storage_buffer_16bit_access_;
   }
+  uint32_t subgroup_size() const { return subgroup_size_; }
+  bool subgroup_basic() const { return subgroup_basic_; }
+  bool subgroup_shuffle() const { return subgroup_shuffle_; }
 
   std::string ToString() const;
   VulkanComputeCapabilityProto ToProto() const;
@@ -74,7 +85,10 @@ class VulkanComputeCapability {
            lhs.api_version_minor_ == rhs.api_version_minor_ &&
            lhs.shader_bfloat16_ == rhs.shader_bfloat16_ &&
            lhs.storage_buffer_16bit_access_ ==
-               rhs.storage_buffer_16bit_access_;
+               rhs.storage_buffer_16bit_access_ &&
+           lhs.subgroup_size_ == rhs.subgroup_size_ &&
+           lhs.subgroup_basic_ == rhs.subgroup_basic_ &&
+           lhs.subgroup_shuffle_ == rhs.subgroup_shuffle_;
   }
 
  private:
@@ -82,6 +96,9 @@ class VulkanComputeCapability {
   uint32_t api_version_minor_ = 2;
   bool shader_bfloat16_ = false;
   bool storage_buffer_16bit_access_ = false;
+  uint32_t subgroup_size_ = 0;
+  bool subgroup_basic_ = false;
+  bool subgroup_shuffle_ = false;
 };
 
 // Describes the capabilities and performance characteristics of a specific
@@ -642,10 +659,14 @@ class DeviceDescription {
   void set_vulkan_compute_capability(uint32_t api_version_major,
                                      uint32_t api_version_minor,
                                      bool shader_bfloat16 = false,
-                                     bool storage_buffer_16bit_access = false) {
+                                     bool storage_buffer_16bit_access = false,
+                                     uint32_t subgroup_size = 0,
+                                     bool subgroup_basic = false,
+                                     bool subgroup_shuffle = false) {
     gpu_compute_capability_ = VulkanComputeCapability(
         api_version_major, api_version_minor, shader_bfloat16,
-        storage_buffer_16bit_access);
+        storage_buffer_16bit_access, subgroup_size, subgroup_basic,
+        subgroup_shuffle);
   }
 
   void set_numa_node(int value) { numa_node_ = value; }
