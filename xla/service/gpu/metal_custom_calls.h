@@ -96,7 +96,12 @@ inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
     return std::nullopt;
   }
   if (weights.element_type() == F8E4M3FN && scale.element_type() == BF16) {
-    if (scale_n == n && scale_k == 1) {
+    // The per-channel kernels place no bound on N, but they do on K: the decode
+    // GEMV (fp8_gemv_pc) strides the contraction by 4 and silently drops a
+    // shorter tail, and the thin-M/prefill qmm (fp8_qmm_t_pc) loads a full
+    // BK=32 tile with no tail arm, so it would read past the weights. K % 32
+    // covers both. kFp8Block128 below needs no such check -- K % 128 implies it.
+    if (scale_n == n && scale_k == 1 && k % 32 == 0) {
       return MetalScaledMatmulScheme::kFp8PerChannel;
     }
     if (n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&

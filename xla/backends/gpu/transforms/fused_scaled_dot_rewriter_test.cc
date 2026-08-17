@@ -217,6 +217,27 @@ TEST(MetalScaledMatmulSchemeTest, RejectsDegenerateAndOffGridShapes) {
                    .has_value());
 }
 
+// The per-channel kernels have no contraction tail: fp8_gemv_pc strides K by 4
+// and drops a shorter remainder, and fp8_qmm_t_pc loads a full BK=32 tile, so an
+// unaligned K reads past the weights. Declining here sends those shapes to the
+// generic dequantize expansion instead. K % 32 covers both strides; the block-128
+// scheme needs no equivalent because K % 128 already implies it.
+TEST(MetalScaledMatmulSchemeTest, RejectsPerChannelWithUnalignedContraction) {
+  // Aligned: the scheme every FP8 projection in Qwen3.6-27B-NVFP4 lands on.
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 64}),
+                                      ShapeUtil::MakeShape(BF16, {8, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  // A multiple of 4 but not of 32: the decode GEMV would be fine, the qmm would
+  // over-read, so it must still decline.
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 20}),
+                                         ShapeUtil::MakeShape(BF16, {8, 1}))
+                   .has_value());
+  // Not even a multiple of 4.
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 30}),
+                                         ShapeUtil::MakeShape(BF16, {8, 1}))
+                   .has_value());
+}
+
 // The two schemes in production use are 128x128-block FP8 and NVFP4 group-16.
 // NVFP4 is exercised throughout this file; these two cover the FP8 spellings.
 
