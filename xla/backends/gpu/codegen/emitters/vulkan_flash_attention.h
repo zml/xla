@@ -24,8 +24,11 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/codegen/emitters/computation_partitioner.h"
 #include "xla/hlo/analysis/indexing_map.h"
@@ -35,6 +38,14 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 
 namespace xla::gpu {
+
+namespace internal {
+
+mlir::Value SelectTensorElementOrZero(mlir::ImplicitLocOpBuilder& builder,
+                                      mlir::Value condition, mlir::Value tensor,
+                                      mlir::ValueRange indices);
+
+}  // namespace internal
 
 // Emits portable Vulkan subgroup flash-attention kernels.
 class VulkanFlashAttentionEmitter final : public MlirKernelEmitter {
@@ -52,9 +63,8 @@ class VulkanFlashAttentionEmitter final : public MlirKernelEmitter {
   std::optional<IndexingMap> ComputeThreadIdToOutputIndexing(
       int64_t root_index, mlir::MLIRContext* context) const override;
 
-  std::optional<std::vector<IndexingMap>>
-  ComputeThreadIdToInputIndexing(int64_t root_index,
-                                 mlir::MLIRContext* context) const override;
+  std::optional<std::vector<IndexingMap>> ComputeThreadIdToInputIndexing(
+      int64_t root_index, mlir::MLIRContext* context) const override;
 
  protected:
   absl::Status EmitEntryFunction(

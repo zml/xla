@@ -456,3 +456,28 @@ cc_library(
         "@llvm-project//mlir:TensorDialect",
     ],
 )
+
+xla_cc_test(
+    name = "vulkan_flash_attention_test",
+    srcs = ["vulkan_flash_attention_test.cc"],
+    tags = ["gpu"],
+    deps = [
+        ":mlir_kernel_emitter",
+        ":vulkan_flash_attention",
+        "//xla/codegen:llvm_kernel_source",
+        "//xla/codegen:mlir_kernel_source",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu/llvm_gpu_backend:spirv_backend",
+        "//xla/stream_executor:device_description",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SCFDialect",
+    ],
+)
