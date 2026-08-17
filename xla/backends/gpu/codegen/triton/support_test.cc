@@ -2461,6 +2461,59 @@ INSTANTIATE_TEST_SUITE_P(
         ::testing::Bool()),
     ScaledDotTestName);
 
+// tt.dot_scaled deduces the scale factor from the shapes and only knows 16 and
+// 32. Anything else has to be declined here: GemmFusion::HandleScaledDot fuses
+// without a legality check, and the generic dequantize expansion has already
+// run, so letting one through is a compile failure and not a slow path.
+TEST_F(SupportTest, ScaledDotWithUnsupportedBlockSizeIsRejected) {
+  const std::string kHloTestTemplate = R"(
+HloModule ScaledDotBlockSize
+
+ENTRY triton_computation {
+  lhs = f8e4m3fn[16, 128] parameter(0)
+  lhs_scale = f8e8m0fnu[16, 1] parameter(1)
+  rhs = f8e4m3fn[128, 16] parameter(2)
+  rhs_scale = f8e8m0fnu[1, 16] parameter(3)
+  ROOT dot = f32[16, 16] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+      lhs_contracting_dims={1},
+      rhs_contracting_dims={0},
+      backend_config={sizes:[16]}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(
+      TestedInstruction ti,
+      ParseTemplateAndGetInstruction(kHloTestTemplate, F8E4M3FN,
+                                     HloOpcode::kScaledDot));
+  // 128 contracted values per scale, which Triton's verifier would reject.
+  EXPECT_FALSE(IsTritonSupportedInstruction(
+      ti.Instruction(), se::CudaComputeCapability::Hopper()));
+}
+
+// A scale grouped along an output dimension (a DeepSeek-style 128x128 grid) has
+// no tt.dot_scaled spelling either: it wants one scale row per operand row.
+TEST_F(SupportTest, ScaledDotWithBlockedOutputDimensionIsRejected) {
+  const std::string kHloTestTemplate = R"(
+HloModule ScaledDotBlockedOutput
+
+ENTRY triton_computation {
+  lhs = f8e4m3fn[16, 32] parameter(0)
+  lhs_scale = f8e8m0fnu[16, 1] parameter(1)
+  rhs = f8e4m3fn[32, 128] parameter(2)
+  rhs_scale = f8e8m0fnu[1, 1] parameter(3)
+  ROOT dot = f32[16, 128] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+      lhs_contracting_dims={1},
+      rhs_contracting_dims={0},
+      backend_config={sizes:[16]}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(
+      TestedInstruction ti,
+      ParseTemplateAndGetInstruction(kHloTestTemplate, F8E4M3FN,
+                                     HloOpcode::kScaledDot));
+  EXPECT_FALSE(IsTritonSupportedInstruction(
+      ti.Instruction(), se::CudaComputeCapability::Hopper()));
+}
+
 TEST_P(SupportTestWithTilingParam, NestedFusionsAreRejected) {
   // Nested fusions are not supported by xtile emitter.
   absl::string_view hlo_text = R"(
