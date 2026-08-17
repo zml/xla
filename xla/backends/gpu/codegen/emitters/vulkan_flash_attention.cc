@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -31,13 +32,14 @@ limitations under the License.
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/TypeRange.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
+#include "mlir/IR/Verifier.h"
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/codegen/emitters/computation_partitioner.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
@@ -48,8 +50,8 @@ limitations under the License.
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/llvm_ir/llvm_util.h"
+#include "xla/status_macros.h"
 #include "xla/stream_executor/launch_dim.h"
-#include "xla/tsl/platform/status_macros.h"
 
 namespace xla::gpu {
 namespace {
@@ -80,6 +82,37 @@ Value I1Constant(ImplicitLocOpBuilder& builder, bool value) {
   return arith::ConstantIntOp::create(builder, builder.getI1Type(), value);
 }
 
+mlir::Type GetElementType(Value tensor) {
+  return mlir::cast<mlir::ShapedType>(tensor.getType()).getElementType();
+}
+
+Value ZeroOfType(ImplicitLocOpBuilder& builder, mlir::Type type) {
+  return arith::ConstantOp::create(builder, builder.getZeroAttr(type));
+}
+
+}  // namespace
+
+namespace internal {
+
+Value SelectTensorElementOrZero(ImplicitLocOpBuilder& builder, Value condition,
+                                Value tensor, ValueRange indices) {
+  mlir::Type element_type = GetElementType(tensor);
+  scf::IfOp if_op = scf::IfOp::create(builder, TypeRange{element_type},
+                                      condition, /*withElseRegion=*/true);
+  OpBuilder then_builder = if_op.getThenBodyBuilder();
+  ImplicitLocOpBuilder implicit_then(builder.getLoc(), then_builder);
+  Value loaded = tensor::ExtractOp::create(implicit_then, tensor, indices);
+  scf::YieldOp::create(implicit_then, loaded);
+  OpBuilder else_builder = if_op.getElseBodyBuilder();
+  ImplicitLocOpBuilder implicit_else(builder.getLoc(), else_builder);
+  scf::YieldOp::create(implicit_else, ZeroOfType(implicit_else, element_type));
+  return if_op.getResult(0);
+}
+
+}  // namespace internal
+
+namespace {
+
 ValueRange UpdateIf(
     ImplicitLocOpBuilder& builder, Value condition, ValueRange current,
     llvm::function_ref<SmallVector<Value>(ImplicitLocOpBuilder&)> update) {
@@ -94,21 +127,6 @@ ValueRange UpdateIf(
   return if_op.getResults();
 }
 
-Value SelectTensorElement(ImplicitLocOpBuilder& builder, Value condition,
-                          Value tensor_value, ValueRange indices,
-                          Value fallback) {
-  scf::IfOp if_op = scf::IfOp::create(builder, TypeRange{fallback.getType()},
-                                      condition, /*withElseRegion=*/true);
-  OpBuilder then_builder = if_op.getThenBodyBuilder();
-  ImplicitLocOpBuilder implicit_then(builder.getLoc(), then_builder);
-  Value loaded = tensor::ExtractOp::create(implicit_then, tensor_value, indices);
-  scf::YieldOp::create(implicit_then, loaded);
-  OpBuilder else_builder = if_op.getElseBodyBuilder();
-  ImplicitLocOpBuilder implicit_else(builder.getLoc(), else_builder);
-  scf::YieldOp::create(implicit_else, fallback);
-  return if_op.getResult(0);
-}
-
 Value ToF32(ImplicitLocOpBuilder& builder, Value value) {
   return arith::ExtFOp::create(builder, builder.getF32Type(), value);
 }
@@ -117,15 +135,15 @@ Value ShuffleSum(ImplicitLocOpBuilder& builder, Value value,
                  int64_t subgroup_size) {
   Value zero = F32Constant(builder, 0.0f);
   for (int64_t offset = subgroup_size / 2; offset > 0; offset /= 2) {
-    Value offset_value = arith::ConstantIntOp::create(
-        builder, builder.getI32Type(), offset);
+    Value offset_value =
+        arith::ConstantIntOp::create(builder, builder.getI32Type(), offset);
     Value width_value = arith::ConstantIntOp::create(
         builder, builder.getI32Type(), subgroup_size);
-    mlir::gpu::ShuffleOp shuffle = mlir::gpu::ShuffleOp::create(
-        builder, value, offset_value, width_value,
-        mlir::gpu::ShuffleMode::DOWN);
-    Value shuffled = arith::SelectOp::create(
-        builder, shuffle.getValid(), shuffle.getShuffleResult(), zero);
+    mlir::gpu::ShuffleOp shuffle =
+        mlir::gpu::ShuffleOp::create(builder, value, offset_value, width_value,
+                                     mlir::gpu::ShuffleMode::DOWN);
+    Value shuffled = arith::SelectOp::create(builder, shuffle.getValid(),
+                                             shuffle.getShuffleResult(), zero);
     value = arith::AddFOp::create(builder, value, shuffled);
   }
   return value;
@@ -137,33 +155,32 @@ Value ReduceWorkgroup(ImplicitLocOpBuilder& builder, Value partial, Value tid,
   const int64_t subgroup_count = kThreadsPerBlock / subgroup_size;
   Value shared_allocation = shared;
   Value reduced = ShuffleSum(builder, partial, subgroup_size);
-  Value lane_zero = arith::CmpIOp::create(
-      builder, arith::CmpIPredicate::eq, lane, IndexConstant(builder, 0));
-  Value subgroup_values = UpdateIf(
-      builder, lane_zero, ValueRange{shared},
-      [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
-        return {tensor::InsertOp::create(nested, reduced, shared,
-                                         ValueRange{subgroup})};
-      })[0];
+  Value lane_zero = arith::CmpIOp::create(builder, arith::CmpIPredicate::eq,
+                                          lane, IndexConstant(builder, 0));
+  Value subgroup_values =
+      UpdateIf(builder, lane_zero, ValueRange{shared},
+               [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
+                 return {tensor::InsertOp::create(nested, reduced, shared,
+                                                  ValueRange{subgroup})};
+               })[0];
   SyncThreadsOp::create(builder, TypeRange{subgroup_values.getType()},
                         ValueRange{subgroup_values});
 
-  Value is_first_subgroup = arith::CmpIOp::create(
-      builder, arith::CmpIPredicate::ult, tid,
-      IndexConstant(builder, subgroup_count));
-  Value subgroup_sum = SelectTensorElement(
-      builder, is_first_subgroup, shared_allocation, ValueRange{tid},
-      F32Constant(builder, 0.0f));
+  Value is_first_subgroup =
+      arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, tid,
+                            IndexConstant(builder, subgroup_count));
+  Value subgroup_sum = internal::SelectTensorElementOrZero(
+      builder, is_first_subgroup, shared_allocation, ValueRange{tid});
   subgroup_sum = ShuffleSum(builder, subgroup_sum, subgroup_size);
-  Value thread_zero = arith::CmpIOp::create(
-      builder, arith::CmpIPredicate::eq, tid, IndexConstant(builder, 0));
-  Value workgroup_sum = UpdateIf(
-      builder, thread_zero, ValueRange{shared_allocation},
-      [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
-        return {tensor::InsertOp::create(nested, subgroup_sum,
-                                         shared_allocation,
-                                         ValueRange{IndexConstant(nested, 0)})};
-      })[0];
+  Value thread_zero = arith::CmpIOp::create(builder, arith::CmpIPredicate::eq,
+                                            tid, IndexConstant(builder, 0));
+  Value workgroup_sum =
+      UpdateIf(builder, thread_zero, ValueRange{shared_allocation},
+               [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
+                 return {tensor::InsertOp::create(
+                     nested, subgroup_sum, shared_allocation,
+                     ValueRange{IndexConstant(nested, 0)})};
+               })[0];
   SyncThreadsOp::create(builder, TypeRange{workgroup_sum.getType()},
                         ValueRange{workgroup_sum});
   return tensor::ExtractOp::create(builder, shared_allocation,
@@ -201,6 +218,8 @@ VulkanFlashAttentionEmitter::CreateMLIRModule(
   SetBackendKind(&mlir_context, entry_function, BackendKind::kGpu);
   emitters::SetIndexDataLayout(*module, fusion);
   RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
+  TF_RET_CHECK(mlir::succeeded(mlir::verify(*module)))
+      << "Vulkan flash-attention emitter produced invalid MLIR";
   return module;
 }
 
@@ -265,8 +284,8 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
   Value kv_length = IndexConstant(builder, kv_length_);
   Value below_kv_length = arith::CmpIOp::create(
       builder, arith::CmpIPredicate::ult, key_limit, kv_length);
-  key_limit = arith::SelectOp::create(builder, below_kv_length, key_limit,
-                                      kv_length);
+  key_limit =
+      arith::SelectOp::create(builder, below_kv_length, key_limit, kv_length);
 
   Value row_is_valid = I1Constant(builder, true);
   if (fusion.operand_count() == 5) {
@@ -274,24 +293,24 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
         builder, entry_function.getArgument(4), ValueRange{});
     Value num_tokens = arith::IndexCastOp::create(
         builder, builder.getIndexType(), num_tokens_u32);
-    row_is_valid = arith::CmpIOp::create(
-        builder, arith::CmpIPredicate::ult, query_row, num_tokens);
-    key_limit = arith::SelectOp::create(builder, row_is_valid, key_limit,
-                                        zero_index);
+    row_is_valid = arith::CmpIOp::create(builder, arith::CmpIPredicate::ult,
+                                         query_row, num_tokens);
+    key_limit =
+        arith::SelectOp::create(builder, row_is_valid, key_limit, zero_index);
   }
 
   Value shared = AllocateSharedOp::create(
       builder, RankedTensorType::get({kThreadsPerBlock / subgroup_size_},
                                      builder.getF32Type()));
-  Value negative_infinity = F32Constant(
-      builder, -std::numeric_limits<float>::infinity());
+  Value negative_infinity =
+      F32Constant(builder, -std::numeric_limits<float>::infinity());
   Value zero = F32Constant(builder, 0.0f);
 
   SmallVector<Value> initial{negative_infinity, zero, zero};
   if (head_dim_ > kThreadsPerBlock) initial.push_back(zero);
   initial.push_back(shared);
-  scf::ForOp key_loop = scf::ForOp::create(
-      builder, zero_index, key_limit, IndexConstant(builder, 1), initial);
+  scf::ForOp key_loop = scf::ForOp::create(builder, zero_index, key_limit,
+                                           IndexConstant(builder, 1), initial);
   {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(key_loop.getBody());
@@ -300,30 +319,29 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
     Value running_sum = key_loop.getRegionIterArgs()[1];
     Value output0 = key_loop.getRegionIterArgs()[2];
     int shared_index = head_dim_ > kThreadsPerBlock ? 4 : 3;
-    Value output1 = head_dim_ > kThreadsPerBlock
-                        ? key_loop.getRegionIterArgs()[3]
-                        : zero;
+    Value output1 =
+        head_dim_ > kThreadsPerBlock ? key_loop.getRegionIterArgs()[3] : zero;
     Value loop_shared = key_loop.getRegionIterArgs()[shared_index];
 
-    Value dim0_valid = arith::CmpIOp::create(
-        builder, arith::CmpIPredicate::ult, tid,
-        IndexConstant(builder, head_dim_));
-    Value q0 = SelectTensorElement(builder, dim0_valid, q,
-                                   ValueRange{query_head, query_row, tid}, zero);
-    Value k0 = SelectTensorElement(builder, dim0_valid, k,
-                                   ValueRange{kv_head, key_index, tid}, zero);
-    Value partial = arith::MulFOp::create(builder, ToF32(builder, q0),
-                                         ToF32(builder, k0));
+    Value dim0_valid =
+        arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, tid,
+                              IndexConstant(builder, head_dim_));
+    Value q0 = internal::SelectTensorElementOrZero(
+        builder, dim0_valid, q, ValueRange{query_head, query_row, tid});
+    Value k0 = internal::SelectTensorElementOrZero(
+        builder, dim0_valid, k, ValueRange{kv_head, key_index, tid});
+    Value partial =
+        arith::MulFOp::create(builder, ToF32(builder, q0), ToF32(builder, k0));
     if (head_dim_ > kThreadsPerBlock) {
       Value dim1 = arith::AddIOp::create(
           builder, tid, IndexConstant(builder, kThreadsPerBlock));
-      Value dim1_valid = arith::CmpIOp::create(
-          builder, arith::CmpIPredicate::ult, dim1,
-          IndexConstant(builder, head_dim_));
-      Value q1 = SelectTensorElement(
-          builder, dim1_valid, q, ValueRange{query_head, query_row, dim1}, zero);
-      Value k1 = SelectTensorElement(
-          builder, dim1_valid, k, ValueRange{kv_head, key_index, dim1}, zero);
+      Value dim1_valid =
+          arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, dim1,
+                                IndexConstant(builder, head_dim_));
+      Value q1 = internal::SelectTensorElementOrZero(
+          builder, dim1_valid, q, ValueRange{query_head, query_row, dim1});
+      Value k1 = internal::SelectTensorElementOrZero(
+          builder, dim1_valid, k, ValueRange{kv_head, key_index, dim1});
       partial = arith::AddFOp::create(
           builder, partial,
           arith::MulFOp::create(builder, ToF32(builder, q1),
@@ -341,8 +359,8 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
         builder, arith::SubFOp::create(builder, score, new_max));
     Value new_sum = arith::AddFOp::create(
         builder, arith::MulFOp::create(builder, running_sum, alpha), beta);
-    Value v0 = SelectTensorElement(builder, dim0_valid, v,
-                                   ValueRange{kv_head, key_index, tid}, zero);
+    Value v0 = internal::SelectTensorElementOrZero(
+        builder, dim0_valid, v, ValueRange{kv_head, key_index, tid});
     Value new_output0 = arith::AddFOp::create(
         builder, arith::MulFOp::create(builder, output0, alpha),
         arith::MulFOp::create(builder, beta, ToF32(builder, v0)));
@@ -351,11 +369,11 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
     if (head_dim_ > kThreadsPerBlock) {
       Value dim1 = arith::AddIOp::create(
           builder, tid, IndexConstant(builder, kThreadsPerBlock));
-      Value dim1_valid = arith::CmpIOp::create(
-          builder, arith::CmpIPredicate::ult, dim1,
-          IndexConstant(builder, head_dim_));
-      Value v1 = SelectTensorElement(
-          builder, dim1_valid, v, ValueRange{kv_head, key_index, dim1}, zero);
+      Value dim1_valid =
+          arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, dim1,
+                                IndexConstant(builder, head_dim_));
+      Value v1 = internal::SelectTensorElementOrZero(
+          builder, dim1_valid, v, ValueRange{kv_head, key_index, dim1});
       Value new_output1 = arith::AddFOp::create(
           builder, arith::MulFOp::create(builder, output1, alpha),
           arith::MulFOp::create(builder, beta, ToF32(builder, v1)));
@@ -366,19 +384,18 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
   }
 
   Value final_sum = key_loop.getResult(1);
-  Value has_keys = arith::CmpFOp::create(
-      builder, arith::CmpFPredicate::OGT, final_sum, zero);
-  Value write0 = arith::CmpIOp::create(
-      builder, arith::CmpIPredicate::ult, tid,
-      IndexConstant(builder, head_dim_));
-  Value normalized0 = arith::DivFOp::create(builder, key_loop.getResult(2),
-                                            final_sum);
+  Value has_keys = arith::CmpFOp::create(builder, arith::CmpFPredicate::OGT,
+                                         final_sum, zero);
+  Value write0 = arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, tid,
+                                       IndexConstant(builder, head_dim_));
+  Value normalized0 =
+      arith::DivFOp::create(builder, key_loop.getResult(2), final_sum);
   normalized0 = arith::SelectOp::create(builder, has_keys, normalized0, zero);
   output = UpdateIf(
       builder, write0, ValueRange{output},
       [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
-        Value bf16 = arith::TruncFOp::create(nested, nested.getBF16Type(),
-                                             normalized0);
+        Value bf16 =
+            arith::TruncFOp::create(nested, nested.getBF16Type(), normalized0);
         return {tensor::InsertOp::create(
             nested, bf16, output, ValueRange{query_head, query_row, tid})};
       })[0];
@@ -386,11 +403,11 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
   if (head_dim_ > kThreadsPerBlock) {
     Value dim1 = arith::AddIOp::create(
         builder, tid, IndexConstant(builder, kThreadsPerBlock));
-    Value write1 = arith::CmpIOp::create(
-        builder, arith::CmpIPredicate::ult, dim1,
-        IndexConstant(builder, head_dim_));
-    Value normalized1 = arith::DivFOp::create(builder, key_loop.getResult(3),
-                                              final_sum);
+    Value write1 =
+        arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, dim1,
+                              IndexConstant(builder, head_dim_));
+    Value normalized1 =
+        arith::DivFOp::create(builder, key_loop.getResult(3), final_sum);
     normalized1 = arith::SelectOp::create(builder, has_keys, normalized1, zero);
     output = UpdateIf(
         builder, write1, ValueRange{output},
