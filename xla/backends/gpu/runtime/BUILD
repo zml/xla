@@ -5764,6 +5764,34 @@ xla_cc_test(
     ],
 )
 
+xla_cc_test(
+    name = "metal_fp8_kernel_test",
+    size = "medium",
+    srcs = ["metal_fp8_kernel_test.cc"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "//xla/service/gpu:metal_air_toolchain",
+        "//xla/service/gpu/metal_kernels:fp8_gemv_pc",
+        "//xla/service/gpu/metal_kernels:mlx_kernels",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:metal_platform",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_executor",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "metal_nvfp4_matmul_thunk",
     srcs = ["metal_nvfp4_matmul_thunk.cc"],

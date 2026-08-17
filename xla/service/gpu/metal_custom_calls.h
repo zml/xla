@@ -57,7 +57,7 @@ inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
     return std::nullopt;
   }
   if (weights.element_type() == F8E4M3FN && scale.element_type() == BF16) {
-    if (scale_n == n && scale_k == 1) {
+    if (scale_n == n && scale_k == 1 && k % 32 == 0) {
       return MetalScaledMatmulScheme::kFp8PerChannel;
     }
     if (n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&

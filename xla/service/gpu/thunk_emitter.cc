@@ -1482,8 +1482,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
     return absl::UnimplementedError(
         "zml$scaled_matmul (FP8): w must be f8e4m3fn[N, K] (K minor).");
   }
-  const bool per_channel =
-      (scale_shape.dimensions(0) == n && scale_shape.dimensions(1) == 1);
+  const bool per_channel = (scale_shape.dimensions(0) == n &&
+                            scale_shape.dimensions(1) == 1 && k % 32 == 0);
   const bool block_128 = (k % 128 == 0 && n % 128 == 0 &&
                           scale_shape.dimensions(0) == n / 128 &&
                           scale_shape.dimensions(1) == k / 128);

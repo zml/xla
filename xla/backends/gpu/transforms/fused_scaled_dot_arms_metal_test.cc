@@ -197,6 +197,18 @@ TEST(MetalScaledMatmulSchemeTest, RejectsDegenerateAndOffGridShapes) {
                    .has_value());
 }
 
+TEST(MetalScaledMatmulSchemeTest, RejectsPerChannelWithUnalignedContraction) {
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 64}),
+                                      ShapeUtil::MakeShape(BF16, {8, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 20}),
+                                         ShapeUtil::MakeShape(BF16, {8, 1}))
+                   .has_value());
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 30}),
+                                         ShapeUtil::MakeShape(BF16, {8, 1}))
+                   .has_value());
+}
+
 TEST_F(MetalFusedScaledDotRewriterTest, Fp8Block128IsFused) {
   ExpectMetalScaledMatmul(R"(
     HloModule module
