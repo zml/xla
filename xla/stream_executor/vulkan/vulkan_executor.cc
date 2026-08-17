@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -33,7 +34,6 @@ limitations under the License.
 #include <optional>
 #include <set>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -51,7 +51,6 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/stream_common.h"
-#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/status_macros.h"
 
 namespace stream_executor::vulkan {
@@ -60,13 +59,15 @@ namespace {
 constexpr char kValidationLayer[] = "VK_LAYER_KHRONOS_validation";
 
 struct VulkanDevicePerformanceProperties {
-  std::optional<int64_t> core_count;
+  std::optional<int> core_count;
   std::optional<int64_t> threads_per_warp;
   std::optional<int64_t> threads_per_core;
-  std::optional<int64_t> fpus_per_core;
+  std::optional<int> fpus_per_core;
   std::optional<int64_t> memory_bandwidth;
   std::optional<int64_t> l2_cache_size;
   std::optional<float> clock_rate_ghz;
+  std::array<uint8_t, VK_UUID_SIZE> device_uuid = {};
+  bool has_device_uuid = false;
   std::string pci_bus_id;
   std::vector<std::string> probe_diagnostics;
 };
@@ -78,7 +79,8 @@ bool HasExtension(const std::set<std::string>& extensions,
 
 template <typename T>
 absl::Status ApplyPositiveIntegerOverride(const char* name,
-                                          std::optional<T>* value) {
+                                          std::optional<T>* value,
+                                          std::vector<std::string>* diagnostics) {
   const char* text = std::getenv(name);
   if (text == nullptr) return absl::OkStatus();
   char* end = nullptr;
@@ -89,11 +91,13 @@ absl::Status ApplyPositiveIntegerOverride(const char* name,
         absl::StrFormat("%s must be a positive integer, got '%s'", name, text));
   }
   *value = static_cast<T>(parsed);
+  diagnostics->push_back(absl::StrCat(name, ": explicit override applied"));
   return absl::OkStatus();
 }
 
 absl::Status ApplyPositiveFloatOverride(const char* name,
-                                        std::optional<float>* value) {
+                                        std::optional<float>* value,
+                                        std::vector<std::string>* diagnostics) {
   const char* text = std::getenv(name);
   if (text == nullptr) return absl::OkStatus();
   char* end = nullptr;
@@ -103,54 +107,237 @@ absl::Status ApplyPositiveFloatOverride(const char* name,
         absl::StrFormat("%s must be a positive number, got '%s'", name, text));
   }
   *value = parsed;
+  diagnostics->push_back(absl::StrCat(name, ": explicit override applied"));
   return absl::OkStatus();
 }
 
-std::optional<float> ReadMaxClockGhzFromSysfs(absl::string_view path) {
-  std::string contents;
-  if (!tsl::ReadFileToString(tsl::Env::Default(), std::string(path), &contents)
-           .ok()) {
-    return std::nullopt;
+std::string FormatUuid(
+    const std::array<uint8_t, VK_UUID_SIZE>& uuid,
+    absl::string_view prefix = {}) {
+  std::string result(prefix);
+  for (size_t i = 0; i < uuid.size(); ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) result.push_back('-');
+    absl::StrAppendFormat(&result, "%02x", uuid[i]);
   }
-  float max_mhz = 0.0f;
-  const char* cursor = contents.c_str();
-  while (*cursor != '\0') {
-    char* end = nullptr;
-    float candidate = std::strtof(cursor, &end);
-    if (end != cursor) {
-      std::string_view suffix(end, std::min<size_t>(8, std::strlen(end)));
-      if (suffix.find("Mhz") != std::string_view::npos ||
-          suffix.find("MHz") != std::string_view::npos) {
-        max_mhz = std::max(max_mhz, candidate);
-      }
-      cursor = end;
-    } else {
-      ++cursor;
-    }
-  }
-  if (max_mhz <= 0.0f) return std::nullopt;
-  return max_mhz / 1000.0f;
+  return result;
 }
 
-// NVML is optional for Vulkan builds, so load only the small API surface used
-// for device discovery instead of introducing a link-time CUDA dependency.
-void ProbeNvml(absl::string_view pci_bus_id,
-               VulkanDevicePerformanceProperties* performance) {
+std::string NormalizeUuid(absl::string_view uuid) {
+  std::string result;
+  result.reserve(2 * VK_UUID_SIZE);
+  for (unsigned char character : uuid) {
+    if (std::isxdigit(character)) {
+      result.push_back(static_cast<char>(std::tolower(character)));
+    }
+  }
+  if (result.size() > 2 * VK_UUID_SIZE) {
+    result.erase(0, result.size() - 2 * VK_UUID_SIZE);
+  }
+  return result;
+}
+
+using CuDevice = int;
+using CuResult = int;
+struct CuUuid {
+  char bytes[VK_UUID_SIZE];
+};
+
+constexpr CuResult kCudaSuccess = 0;
+constexpr int kCudaAttributeClockRate = 13;
+constexpr int kCudaAttributeMultiprocessorCount = 16;
+constexpr int kCudaAttributeMemoryClockRate = 36;
+constexpr int kCudaAttributeGlobalMemoryBusWidth = 37;
+constexpr int kCudaAttributeL2CacheSize = 38;
+constexpr int kCudaAttributeMaxThreadsPerMultiprocessor = 39;
+
+struct CudaApi {
+  using Init = CuResult (*)(unsigned int);
+  using DeviceGetCount = CuResult (*)(int*);
+  using DeviceGet = CuResult (*)(CuDevice*, int);
+  using DeviceGetUuid = CuResult (*)(CuUuid*, CuDevice);
+  using DeviceGetAttribute = CuResult (*)(int*, int, CuDevice);
+  using DeviceGetPciBusId = CuResult (*)(char*, int, CuDevice);
+
+  void* library = nullptr;
+  Init init = nullptr;
+  DeviceGetCount device_get_count = nullptr;
+  DeviceGet device_get = nullptr;
+  DeviceGetUuid device_get_uuid = nullptr;
+  DeviceGetAttribute device_get_attribute = nullptr;
+  DeviceGetPciBusId device_get_pci_bus_id = nullptr;
+  std::string error;
+};
+
+const CudaApi& GetCudaApi() {
+  static const CudaApi* api = [] {
+    CudaApi* result = new CudaApi;
+    result->library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (result->library == nullptr) {
+      const char* error = dlerror();
+      result->error = error == nullptr ? "dlopen failed" : error;
+      return result;
+    }
+    auto load = [result](const char* name) {
+      return dlsym(result->library, name);
+    };
+    result->init = reinterpret_cast<CudaApi::Init>(load("cuInit"));
+    result->device_get_count = reinterpret_cast<CudaApi::DeviceGetCount>(
+        load("cuDeviceGetCount"));
+    result->device_get =
+        reinterpret_cast<CudaApi::DeviceGet>(load("cuDeviceGet"));
+    result->device_get_uuid = reinterpret_cast<CudaApi::DeviceGetUuid>(
+        load("cuDeviceGetUuid_v2"));
+    if (result->device_get_uuid == nullptr) {
+      result->device_get_uuid = reinterpret_cast<CudaApi::DeviceGetUuid>(
+          load("cuDeviceGetUuid"));
+    }
+    result->device_get_attribute =
+        reinterpret_cast<CudaApi::DeviceGetAttribute>(
+            load("cuDeviceGetAttribute"));
+    result->device_get_pci_bus_id =
+        reinterpret_cast<CudaApi::DeviceGetPciBusId>(
+            load("cuDeviceGetPCIBusId"));
+    if (result->init == nullptr || result->device_get_count == nullptr ||
+        result->device_get == nullptr ||
+        result->device_get_attribute == nullptr ||
+        result->device_get_pci_bus_id == nullptr) {
+      result->error = "required discovery symbols are missing";
+    } else if (result->init(0) != kCudaSuccess) {
+      result->error = "initialization failed";
+    }
+    return result;
+  }();
+  return *api;
+}
+
+void ProbeCuda(VulkanDevicePerformanceProperties* performance) {
+  const CudaApi& api = GetCudaApi();
+  if (!api.error.empty()) {
+    performance->probe_diagnostics.push_back(
+        absl::StrCat("CUDA unavailable: ", api.error));
+    return;
+  }
+
+  int device_count = 0;
+  if (api.device_get_count(&device_count) != kCudaSuccess) {
+    performance->probe_diagnostics.push_back(
+        "CUDA could not query the device count");
+    return;
+  }
+
+  std::optional<CuDevice> matched_device;
+  if (performance->has_device_uuid && api.device_get_uuid != nullptr) {
+    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+      CuDevice device = 0;
+      CuUuid uuid = {};
+      if (api.device_get(&device, ordinal) == kCudaSuccess &&
+          api.device_get_uuid(&uuid, device) == kCudaSuccess &&
+          std::memcmp(uuid.bytes, performance->device_uuid.data(),
+                      VK_UUID_SIZE) == 0) {
+        matched_device = device;
+        performance->probe_diagnostics.push_back(
+            "CUDA device matched by UUID");
+        break;
+      }
+    }
+  } else if (api.device_get_uuid == nullptr) {
+    performance->probe_diagnostics.push_back(
+        "CUDA UUID query symbol is unavailable");
+  }
+
+  if (!matched_device.has_value() && !performance->pci_bus_id.empty()) {
+    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+      CuDevice device = 0;
+      std::array<char, 32> pci_bus_id = {};
+      if (api.device_get(&device, ordinal) != kCudaSuccess ||
+          api.device_get_pci_bus_id(pci_bus_id.data(),
+                                    static_cast<int>(pci_bus_id.size()),
+                                    device) != kCudaSuccess ||
+          performance->pci_bus_id != pci_bus_id.data()) {
+        continue;
+      }
+      if (performance->has_device_uuid && api.device_get_uuid != nullptr) {
+        CuUuid uuid = {};
+        if (api.device_get_uuid(&uuid, device) != kCudaSuccess ||
+            std::memcmp(uuid.bytes, performance->device_uuid.data(),
+                        VK_UUID_SIZE) != 0) {
+          performance->probe_diagnostics.push_back(
+              "CUDA PCI identity matched, but the device UUID did not match");
+          return;
+        }
+      }
+      matched_device = device;
+      performance->probe_diagnostics.push_back(
+          "CUDA device matched by PCI identity");
+      break;
+    }
+  }
+
+  if (!matched_device.has_value()) {
+    performance->probe_diagnostics.push_back(
+        "CUDA did not find the Vulkan device by UUID or PCI identity");
+    return;
+  }
+
+  auto query_attribute = [&](int attribute, absl::string_view name,
+                             auto* output) {
+    int value = 0;
+    if (api.device_get_attribute(&value, attribute, *matched_device) ==
+            kCudaSuccess &&
+        value > 0) {
+      *output = value;
+      performance->probe_diagnostics.push_back(
+          absl::StrFormat("CUDA %s=%d", name, value));
+    } else {
+      performance->probe_diagnostics.push_back(
+          absl::StrCat("CUDA did not report ", name));
+    }
+  };
+  query_attribute(kCudaAttributeMultiprocessorCount, "multiprocessor count",
+                  &performance->core_count);
+  query_attribute(kCudaAttributeMaxThreadsPerMultiprocessor,
+                  "maximum threads per multiprocessor",
+                  &performance->threads_per_core);
+  query_attribute(kCudaAttributeL2CacheSize, "L2 cache size",
+                  &performance->l2_cache_size);
+
+  std::optional<int64_t> clock_rate_khz;
+  query_attribute(kCudaAttributeClockRate, "clock rate", &clock_rate_khz);
+  if (clock_rate_khz.has_value()) {
+    performance->clock_rate_ghz =
+        static_cast<float>(*clock_rate_khz) / 1'000'000.0f;
+  }
+
+  std::optional<int64_t> memory_clock_khz;
+  std::optional<int64_t> memory_bus_width_bits;
+  query_attribute(kCudaAttributeMemoryClockRate, "memory clock rate",
+                  &memory_clock_khz);
+  query_attribute(kCudaAttributeGlobalMemoryBusWidth, "memory bus width",
+                  &memory_bus_width_bits);
+  if (memory_clock_khz.has_value() && memory_bus_width_bits.has_value()) {
+    performance->memory_bandwidth =
+        2 * *memory_clock_khz * 1000 * *memory_bus_width_bits / 8;
+    performance->probe_diagnostics.push_back(absl::StrFormat(
+        "CUDA derived memory bandwidth=%d bytes/s",
+        *performance->memory_bandwidth));
+  }
+}
+
+void ProbeNvml(VulkanDevicePerformanceProperties* performance) {
   using NvmlDevice = struct nvmlDevice_st*;
   using NvmlReturn = int;
   constexpr NvmlReturn kNvmlSuccess = 0;
-  constexpr int kNvmlClockSm = 1;
-  constexpr int kNvmlClockMem = 2;
 
   using Init = NvmlReturn (*)();
   using GetHandle = NvmlReturn (*)(const char*, NvmlDevice*);
-  using GetMaxClock = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
-  using GetMemoryBusWidth = NvmlReturn (*)(NvmlDevice, unsigned int*);
+  using GetUuid = NvmlReturn (*)(NvmlDevice, char*, unsigned int);
+  using GetNumGpuCores = NvmlReturn (*)(NvmlDevice, unsigned int*);
   struct NvmlApi {
     void* library = nullptr;
-    GetHandle get_handle = nullptr;
-    GetMaxClock get_max_clock = nullptr;
-    GetMemoryBusWidth get_memory_bus_width = nullptr;
+    GetHandle get_handle_by_uuid = nullptr;
+    GetHandle get_handle_by_pci_bus_id = nullptr;
+    GetUuid get_uuid = nullptr;
+    GetNumGpuCores get_num_gpu_cores = nullptr;
     std::string error;
   };
   static const NvmlApi* api = [] {
@@ -165,15 +352,17 @@ void ProbeNvml(absl::string_view pci_bus_id,
       return dlsym(result->library, name);
     };
     Init init = reinterpret_cast<Init>(load("nvmlInit_v2"));
-    result->get_handle = reinterpret_cast<GetHandle>(
+    result->get_handle_by_uuid = reinterpret_cast<GetHandle>(
+        load("nvmlDeviceGetHandleByUUID"));
+    result->get_handle_by_pci_bus_id = reinterpret_cast<GetHandle>(
         load("nvmlDeviceGetHandleByPciBusId_v2"));
-    result->get_max_clock = reinterpret_cast<GetMaxClock>(
-        load("nvmlDeviceGetMaxClockInfo"));
-    result->get_memory_bus_width = reinterpret_cast<GetMemoryBusWidth>(
-        load("nvmlDeviceGetMemoryBusWidth"));
-    if (init == nullptr || result->get_handle == nullptr ||
-        result->get_max_clock == nullptr ||
-        result->get_memory_bus_width == nullptr) {
+    result->get_uuid =
+        reinterpret_cast<GetUuid>(load("nvmlDeviceGetUUID"));
+    result->get_num_gpu_cores = reinterpret_cast<GetNumGpuCores>(
+        load("nvmlDeviceGetNumGpuCores"));
+    if (init == nullptr || result->get_handle_by_uuid == nullptr ||
+        result->get_handle_by_pci_bus_id == nullptr ||
+        result->get_uuid == nullptr || result->get_num_gpu_cores == nullptr) {
       result->error = "required discovery symbols are missing";
     } else if (init() != kNvmlSuccess) {
       result->error = "initialization failed";
@@ -185,39 +374,56 @@ void ProbeNvml(absl::string_view pci_bus_id,
         absl::StrCat("NVML unavailable: ", api->error));
     return;
   }
+
   NvmlDevice device = nullptr;
-  if (api->get_handle(std::string(pci_bus_id).c_str(), &device) !=
-      kNvmlSuccess) {
-    performance->probe_diagnostics.push_back(absl::StrCat(
-        "NVML could not find PCI device ", pci_bus_id));
-    // Do not call nvmlShutdown: CUDA and other users in this process may share
-    // NVML's process-global initialization state.
+  if (performance->has_device_uuid) {
+    const std::string uuid = FormatUuid(performance->device_uuid, "GPU-");
+    if (api->get_handle_by_uuid(uuid.c_str(), &device) == kNvmlSuccess) {
+      performance->probe_diagnostics.push_back(
+          "NVML device matched by UUID");
+    }
+  }
+  if (device == nullptr && !performance->pci_bus_id.empty() &&
+      api->get_handle_by_pci_bus_id(performance->pci_bus_id.c_str(), &device) ==
+          kNvmlSuccess) {
+    std::array<char, 96> nvml_uuid = {};
+    if (performance->has_device_uuid &&
+        (api->get_uuid(device, nvml_uuid.data(),
+                       static_cast<unsigned int>(nvml_uuid.size())) !=
+             kNvmlSuccess ||
+         NormalizeUuid(nvml_uuid.data()) !=
+             NormalizeUuid(FormatUuid(performance->device_uuid)))) {
+      performance->probe_diagnostics.push_back(
+          "NVML PCI identity matched, but the device UUID did not match");
+      return;
+    }
+    performance->probe_diagnostics.push_back(
+        "NVML device matched by PCI identity");
+  }
+  if (device == nullptr) {
+    performance->probe_diagnostics.push_back(
+        "NVML did not find the Vulkan device by UUID or PCI identity");
     return;
   }
-  unsigned int sm_clock_mhz = 0;
-  if (api->get_max_clock(device, kNvmlClockSm, &sm_clock_mhz) ==
-          kNvmlSuccess &&
-      sm_clock_mhz != 0) {
-    performance->clock_rate_ghz = sm_clock_mhz / 1000.0f;
-  } else {
+
+  unsigned int gpu_core_count = 0;
+  if (api->get_num_gpu_cores(device, &gpu_core_count) != kNvmlSuccess ||
+      gpu_core_count == 0) {
     performance->probe_diagnostics.push_back(
-        "NVML did not report a maximum SM clock");
+        "NVML did not report the GPU core count");
+    return;
   }
-  unsigned int memory_clock_mhz = 0;
-  unsigned int memory_bus_width_bits = 0;
-  if (api->get_max_clock(device, kNvmlClockMem, &memory_clock_mhz) ==
-          kNvmlSuccess &&
-      api->get_memory_bus_width(device, &memory_bus_width_bits) ==
-          kNvmlSuccess &&
-      memory_clock_mhz != 0 && memory_bus_width_bits != 0) {
-    performance->memory_bandwidth =
-        2LL * memory_clock_mhz * 1'000'000 * memory_bus_width_bits / 8;
-  } else {
+  if (!performance->core_count.has_value() ||
+      gpu_core_count % *performance->core_count != 0) {
     performance->probe_diagnostics.push_back(
-        "NVML did not report both maximum memory clock and bus width");
+        "NVML GPU core count cannot be divided by the CUDA multiprocessor "
+        "count");
+    return;
   }
-  // Keep the library loaded because NVML may share process-global state with
-  // another StreamExecutor backend and returned handles remain library-owned.
+  performance->fpus_per_core = gpu_core_count / *performance->core_count;
+  performance->probe_diagnostics.push_back(absl::StrFormat(
+      "NVML GPU core count=%u; FPUs per multiprocessor=%d", gpu_core_count,
+      *performance->fpus_per_core));
 }
 
 absl::Status VulkanError(absl::string_view operation, VkResult result) {
@@ -627,7 +833,18 @@ VulkanDriver& Driver() {
 
 absl::StatusOr<VulkanDevicePerformanceProperties>
 QueryDevicePerformanceProperties(VkPhysicalDevice physical_device,
-                                 const VkPhysicalDeviceProperties& properties) {
+                                 VkPhysicalDeviceProperties* properties) {
+  VkPhysicalDeviceProperties2 properties2 = {};
+  properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  Driver().get_physical_device_properties2(physical_device, &properties2);
+  *properties = properties2.properties;
+  if (properties->apiVersion < VK_API_VERSION_1_2) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Vulkan device %s supports Vulkan %d.%d, but Vulkan 1.2 is required",
+        properties->deviceName, VK_API_VERSION_MAJOR(properties->apiVersion),
+        VK_API_VERSION_MINOR(properties->apiVersion)));
+  }
+
   uint32_t extension_count = 0;
   RETURN_IF_VK_ERROR(Driver().enumerate_device_extension_properties(
       physical_device, /*pLayerName=*/nullptr, &extension_count,
@@ -645,20 +862,11 @@ QueryDevicePerformanceProperties(VkPhysicalDevice physical_device,
 
   VkPhysicalDeviceSubgroupProperties subgroup = {};
   subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-  VkPhysicalDeviceShaderSMBuiltinsPropertiesNV nv_sm = {};
-  nv_sm.sType =
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV;
-  VkPhysicalDeviceShaderCorePropertiesAMD amd_core = {};
-  amd_core.sType =
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD;
-  VkPhysicalDeviceShaderCoreProperties2AMD amd_core2 = {};
-  amd_core2.sType =
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD;
+  VkPhysicalDeviceIDProperties device_id = {};
+  device_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
   VkPhysicalDevicePCIBusInfoPropertiesEXT pci = {};
   pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
 
-  VkPhysicalDeviceProperties2 properties2 = {};
-  properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
   VkBaseOutStructure* tail =
       reinterpret_cast<VkBaseOutStructure*>(&properties2);
   auto append = [&tail](void* property) {
@@ -667,109 +875,73 @@ QueryDevicePerformanceProperties(VkPhysicalDevice physical_device,
     tail = next;
   };
   append(&subgroup);
-  const bool has_nv_sm =
-      HasExtension(extensions, VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME);
-  const bool has_amd_core =
-      HasExtension(extensions, VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME);
-  const bool has_amd_core2 = HasExtension(
-      extensions, VK_AMD_SHADER_CORE_PROPERTIES_2_EXTENSION_NAME);
+  append(&device_id);
   const bool has_pci =
       HasExtension(extensions, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
-  if (has_nv_sm) append(&nv_sm);
-  if (has_amd_core) append(&amd_core);
-  if (has_amd_core2) append(&amd_core2);
   if (has_pci) append(&pci);
   Driver().get_physical_device_properties2(physical_device, &properties2);
 
   VulkanDevicePerformanceProperties performance;
   if (subgroup.subgroupSize != 0) {
     performance.threads_per_warp = subgroup.subgroupSize;
-  }
-  if (has_nv_sm && nv_sm.shaderSMCount != 0) {
-    performance.core_count = nv_sm.shaderSMCount;
-    if (nv_sm.shaderWarpsPerSM != 0 && subgroup.subgroupSize != 0) {
-      performance.threads_per_core =
-          static_cast<int64_t>(nv_sm.shaderWarpsPerSM) * subgroup.subgroupSize;
-    }
     performance.probe_diagnostics.push_back(absl::StrFormat(
-        "%s: shaderSMCount=%u, shaderWarpsPerSM=%u",
-        VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME, nv_sm.shaderSMCount,
-        nv_sm.shaderWarpsPerSM));
-  } else {
-    performance.probe_diagnostics.push_back(absl::StrCat(
-        VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME,
-        has_nv_sm ? ": returned no topology" : ": not supported"));
-  }
-
-  if (has_amd_core2 && amd_core2.activeComputeUnitCount != 0) {
-    performance.core_count = amd_core2.activeComputeUnitCount;
-  } else if (has_amd_core && amd_core.shaderEngineCount != 0 &&
-             amd_core.shaderArraysPerEngineCount != 0 &&
-             amd_core.computeUnitsPerShaderArray != 0) {
-    performance.core_count =
-        static_cast<int64_t>(amd_core.shaderEngineCount) *
-        amd_core.shaderArraysPerEngineCount *
-        amd_core.computeUnitsPerShaderArray;
-  }
-  if (has_amd_core && amd_core.simdPerComputeUnit != 0 &&
-      amd_core.wavefrontsPerSimd != 0 && amd_core.wavefrontSize != 0) {
-    performance.threads_per_core =
-        static_cast<int64_t>(amd_core.simdPerComputeUnit) *
-        amd_core.wavefrontsPerSimd * amd_core.wavefrontSize;
-    // Each AMD SIMD contains wavefrontSize vector lanes. This is the closest
-    // hardware quantity to XLA's scalar FPUs-per-core model.
-    performance.fpus_per_core =
-        static_cast<int64_t>(amd_core.simdPerComputeUnit) *
-        amd_core.wavefrontSize;
-  }
-  if (has_amd_core || has_amd_core2) {
-    performance.probe_diagnostics.push_back(absl::StrFormat(
-        "AMD shader core properties: active CUs=%u, physical topology=%ux%ux%u",
-        amd_core2.activeComputeUnitCount, amd_core.shaderEngineCount,
-        amd_core.shaderArraysPerEngineCount,
-        amd_core.computeUnitsPerShaderArray));
+        "Vulkan subgroup size=%u", subgroup.subgroupSize));
   } else {
     performance.probe_diagnostics.push_back(
-        "AMD shader core property extensions: not supported");
+        "Vulkan did not report a subgroup size");
+  }
+  if (std::any_of(device_id.deviceUUID,
+                  device_id.deviceUUID + VK_UUID_SIZE,
+                  [](uint8_t byte) { return byte != 0; })) {
+    std::copy_n(device_id.deviceUUID, VK_UUID_SIZE,
+                performance.device_uuid.begin());
+    performance.has_device_uuid = true;
+    performance.probe_diagnostics.push_back(absl::StrCat(
+        "Vulkan device UUID=", FormatUuid(performance.device_uuid)));
+  } else {
+    performance.probe_diagnostics.push_back(
+        "Vulkan did not report a device UUID");
   }
 
   if (has_pci) {
     performance.pci_bus_id =
         absl::StrFormat("%04x:%02x:%02x.%x", pci.pciDomain, pci.pciBus,
                         pci.pciDevice, pci.pciFunction);
+    performance.probe_diagnostics.push_back(
+        absl::StrCat("Vulkan PCI identity=", performance.pci_bus_id));
   } else {
     performance.probe_diagnostics.push_back(
-        "VK_EXT_pci_bus_info: not supported; external probes unavailable");
+        "VK_EXT_pci_bus_info is not supported");
   }
 
-  if (properties.vendorID == 0x10de && !performance.pci_bus_id.empty()) {
-    ProbeNvml(performance.pci_bus_id, &performance);
-  }
-  if (!performance.clock_rate_ghz.has_value() &&
-      !performance.pci_bus_id.empty()) {
-    std::string sysfs_path = absl::StrFormat(
-        "/sys/bus/pci/devices/%s/pp_dpm_sclk", performance.pci_bus_id);
-    performance.clock_rate_ghz = ReadMaxClockGhzFromSysfs(sysfs_path);
-    if (!performance.clock_rate_ghz.has_value()) {
-      performance.probe_diagnostics.push_back(
-          absl::StrCat("sysfs did not provide a maximum core clock at ",
-                       sysfs_path));
-    }
+  if (properties->vendorID == 0x10de) {
+    ProbeCuda(&performance);
+    ProbeNvml(&performance);
+  } else {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "Vulkan performance discovery supports NVIDIA devices only; device "
+        "%s has vendor ID 0x%04x",
+        properties->deviceName, properties->vendorID));
   }
 
   RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
-      "XLA_VULKAN_CORE_COUNT", &performance.core_count));
+      "XLA_VULKAN_CORE_COUNT", &performance.core_count,
+      &performance.probe_diagnostics));
   RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
-      "XLA_VULKAN_THREADS_PER_CORE", &performance.threads_per_core));
+      "XLA_VULKAN_THREADS_PER_CORE", &performance.threads_per_core,
+      &performance.probe_diagnostics));
   RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
-      "XLA_VULKAN_FPUS_PER_CORE", &performance.fpus_per_core));
+      "XLA_VULKAN_FPUS_PER_CORE", &performance.fpus_per_core,
+      &performance.probe_diagnostics));
   RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_MEMORY_BANDWIDTH_BYTES_PER_SECOND",
-      &performance.memory_bandwidth));
+      &performance.memory_bandwidth, &performance.probe_diagnostics));
   RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
-      "XLA_VULKAN_L2_CACHE_SIZE_BYTES", &performance.l2_cache_size));
+      "XLA_VULKAN_L2_CACHE_SIZE_BYTES", &performance.l2_cache_size,
+      &performance.probe_diagnostics));
   RETURN_IF_ERROR(ApplyPositiveFloatOverride(
-      "XLA_VULKAN_CLOCK_RATE_GHZ", &performance.clock_rate_ghz));
+      "XLA_VULKAN_CLOCK_RATE_GHZ", &performance.clock_rate_ghz,
+      &performance.probe_diagnostics));
   return performance;
 }
 
@@ -802,9 +974,13 @@ absl::Status ValidateDevicePerformanceProperties(
       "Vulkan device performance description is incomplete:\n"
       "  device: %s\n"
       "  vendor/device: %04x:%04x\n"
+      "  UUID: %s\n"
       "  PCI: %s\n"
       "  missing:",
       properties.deviceName, properties.vendorID, properties.deviceID,
+      performance.has_device_uuid
+          ? FormatUuid(performance.device_uuid)
+          : "unavailable",
       performance.pci_bus_id.empty() ? "unavailable"
                                      : performance.pci_bus_id);
   for (absl::string_view field : missing) {
@@ -1533,14 +1709,13 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
   VkPhysicalDevice physical_device = Driver().physical_devices()[device_ordinal];
   VkPhysicalDeviceProperties properties = {};
   VkPhysicalDeviceMemoryProperties memory_properties = {};
-  Driver().get_physical_device_properties(physical_device, &properties);
   Driver().get_physical_device_memory_properties(physical_device,
                                                  &memory_properties);
   TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
                       Driver().GetShaderFeatures(physical_device));
   TF_ASSIGN_OR_RETURN(
       VulkanDevicePerformanceProperties performance,
-      QueryDevicePerformanceProperties(physical_device, properties));
+      QueryDevicePerformanceProperties(physical_device, &properties));
   RETURN_IF_ERROR(
       ValidateDevicePerformanceProperties(properties, performance));
 
