@@ -672,6 +672,49 @@ CodegenDecision IsTritonSupportedDot(
   return CodegenDecision::Allow();
 }
 
+CodegenDecision IsSupportedScaleGrid(const HloScaledDotInstruction& dot,
+                                     int operand_index) {
+  const Shape& operand = dot.operand(operand_index)->shape();
+  const Shape& scale = dot.operand(operand_index + 2)->shape();
+  if (ShapeUtil::IsScalar(scale)) {
+    return CodegenDecision::Allow();
+  }
+  if (scale.dimensions().size() != operand.dimensions().size()) {
+    return CodegenDecision::Forbid(
+        "Scale operand does not have the same rank as the operand it scales.");
+  }
+  const DotDimensionNumbers& dnums = dot.dot_dimension_numbers();
+  const auto& contracting_dims = operand_index == 0
+                                     ? dnums.lhs_contracting_dimensions()
+                                     : dnums.rhs_contracting_dimensions();
+  if (contracting_dims.size() != 1) {
+    return CodegenDecision::Allow();
+  }
+  const int64_t contracting_dim = contracting_dims[0];
+
+  for (int64_t d = 0; d < operand.dimensions().size(); ++d) {
+    const int64_t operand_dim = operand.dimensions(d);
+    const int64_t scale_dim = scale.dimensions(d);
+    if (scale_dim == 0 || operand_dim % scale_dim != 0) {
+      return CodegenDecision::Forbid(
+          "Scale operand dimensions do not divide the operand's.");
+    }
+    const int64_t block_size = operand_dim / scale_dim;
+    if (d == contracting_dim) {
+      if (block_size != 16 && block_size != 32) {
+        return CodegenDecision::Forbid(
+            absl::StrCat("Unsupported scale block size ", block_size,
+                         ": tt.dot_scaled only deduces 16 or 32."));
+      }
+    } else if (block_size != 1) {
+      return CodegenDecision::Forbid(absl::StrCat(
+          "Scale is blocked along non-contracting dimension ", d,
+          ", which tt.dot_scaled cannot express."));
+    }
+  }
+  return CodegenDecision::Allow();
+}
+
 CodegenDecision IsTritonSupportedScaledDot(
     const HloScaledDotInstruction& dot,
     const se::GpuComputeCapability& gpu_version) {
@@ -704,6 +747,16 @@ CodegenDecision IsTritonSupportedScaledDot(
       !absl::c_linear_search(supported_scale_types, rhs_scale_type)) {
     return CodegenDecision::Forbid(absl::StrCat(
         "Unsupported RHS scale type: ", PrimitiveType_Name(rhs_scale_type)));
+  }
+  if (lhs_type != BF16) {
+    if (CodegenDecision decision = IsSupportedScaleGrid(dot, 0); !decision) {
+      return decision;
+    }
+  }
+  if (rhs_type != BF16) {
+    if (CodegenDecision decision = IsSupportedScaleGrid(dot, 1); !decision) {
+      return decision;
+    }
   }
   return CodegenDecision::Allow();
 }
