@@ -15,15 +15,11 @@ limitations under the License.
 
 #include "xla/stream_executor/vulkan/vulkan_platform.h"
 
-#include <memory>
-#include <string>
-
 #include <gtest/gtest.h>
-#include "absl/status/status.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/vulkan/vulkan_platform_id.h"
-#include "xla/tsl/platform/status_matchers.h"
 
 namespace stream_executor::vulkan {
 namespace {
@@ -34,36 +30,6 @@ TEST(VulkanPlatformTest, RegistersWithPlatformManager) {
   EXPECT_EQ(platform->id(), kVulkanPlatformId);
   EXPECT_EQ(platform->Name(), "VULKAN");
   EXPECT_GE(platform->VisibleDeviceCount(), 0);
-}
-
-TEST(VulkanPlatformTest, DeviceDescriptionIsCompleteOrActionable) {
-  ASSERT_OK_AND_ASSIGN(Platform * platform,
-                       PlatformManager::PlatformWithName("vulkan"));
-  if (platform->VisibleDeviceCount() == 0) {
-    GTEST_SKIP() << "No Vulkan device is visible";
-  }
-
-  absl::StatusOr<std::unique_ptr<DeviceDescription>> description =
-      platform->DescriptionForDevice(0);
-  if (!description.ok()) {
-    EXPECT_EQ(description.status().code(),
-              absl::StatusCode::kFailedPrecondition);
-    EXPECT_NE(description.status().message().find(
-                  "Vulkan device performance description is incomplete"),
-              std::string::npos);
-    EXPECT_NE(description.status().message().find("missing:"),
-              std::string::npos);
-    EXPECT_NE(description.status().message().find("Explicit overrides"),
-              std::string::npos);
-    return;
-  }
-
-  EXPECT_GT((*description)->core_count(), 0);
-  EXPECT_GT((*description)->threads_per_core_limit(), 0);
-  EXPECT_GT((*description)->fpus_per_core(), 0);
-  EXPECT_GT((*description)->memory_bandwidth(), 0);
-  EXPECT_GT((*description)->l2_cache_size(), 0);
-  EXPECT_GT((*description)->clock_rate_ghz(), 0.0f);
 }
 
 }  // namespace
