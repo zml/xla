@@ -180,6 +180,7 @@ cc_library(
         "//xla/backends/gpu/codegen/emitters:reduction",
         "//xla/backends/gpu/codegen/emitters:scatter",
         "//xla/backends/gpu/codegen/emitters:transpose",
+        "//xla/backends/gpu/codegen/emitters:vulkan_gemm",
         "//xla/backends/gpu/codegen/triton:fusion",
         "//xla/codegen:ir_emission_utils",
         "//xla/hlo/ir:hlo",
@@ -187,6 +188,7 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:statusor",
     ],
 )

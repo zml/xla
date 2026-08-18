@@ -18,6 +18,7 @@ limitations under the License.
 #include <optional>
 #include <utility>
 
+#include "absl/log/log.h"
 #include "xla/backends/gpu/codegen/copy.h"
 #include "xla/backends/gpu/codegen/cudnn.h"
 #include "xla/backends/gpu/codegen/custom.h"
@@ -28,6 +29,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/reduction.h"
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
+#include "xla/backends/gpu/codegen/emitters/vulkan_gemm.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/sort.h"
 #include "xla/backends/gpu/codegen/triton/fusion.h"
@@ -71,6 +73,13 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
     case HloFusionAnalysis::EmitterFusionKind::kCustomFusion:
       return std::make_unique<CustomFusion>();
     case HloFusionAnalysis::EmitterFusionKind::kLoop: {
+      if (std::optional<VulkanGemmConfig> config = MatchVulkanGemm(analysis)) {
+        VLOG(1) << "Selecting portable Vulkan bf16 GEMM for " << config->m
+                << "x" << config->k << " * " << config->k << "x"
+                << config->n;
+        return std::make_unique<MlirKernelFusion>(
+            std::make_unique<VulkanGemmEmitter>(*config));
+      }
       // Check for a memcpy fusion before checking if a DUS can be emitted in
       // place.
       if (auto copy_fusion = fusion_info.GetCopyFusion()) {

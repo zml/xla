@@ -426,6 +426,38 @@ cc_library(
 )
 
 cc_library(
+    name = "vulkan_gemm",
+    srcs = ["vulkan_gemm.cc"],
+    hdrs = ["vulkan_gemm.h"],
+    deps = [
+        ":mlir_kernel_emitter",
+        "//xla:shape_util",
+        "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
+        "//xla/codegen/emitters:computation_partitioner",
+        "//xla/codegen/emitters:kernel_api_builder",
+        "//xla/codegen/emitters/ir:xla",
+        "//xla/hlo/analysis:indexing_analysis",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/service/llvm_ir:llvm_util",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:launch_dim",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:TensorDialect",
+    ],
+)
+
+cc_library(
     name = "vulkan_flash_attention",
     srcs = ["vulkan_flash_attention.cc"],
     hdrs = ["vulkan_flash_attention.h"],
