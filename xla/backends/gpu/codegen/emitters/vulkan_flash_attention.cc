@@ -163,14 +163,16 @@ Value ReduceWorkgroup(ImplicitLocOpBuilder& builder, Value partial, Value tid,
                  return {tensor::InsertOp::create(nested, reduced, shared,
                                                   ValueRange{subgroup})};
                })[0];
-  SyncThreadsOp::create(builder, TypeRange{subgroup_values.getType()},
-                        ValueRange{subgroup_values});
+  Value shared_after_first_sync =
+      SyncThreadsOp::create(builder, TypeRange{subgroup_values.getType()},
+                            ValueRange{subgroup_values})
+          .getResult(0);
 
   Value is_first_subgroup =
       arith::CmpIOp::create(builder, arith::CmpIPredicate::ult, tid,
                             IndexConstant(builder, subgroup_count));
   Value subgroup_sum = internal::SelectTensorElementOrZero(
-      builder, is_first_subgroup, shared_allocation, ValueRange{tid});
+      builder, is_first_subgroup, shared_after_first_sync, ValueRange{tid});
   subgroup_sum = ShuffleSum(builder, subgroup_sum, subgroup_size);
   Value thread_zero = arith::CmpIOp::create(builder, arith::CmpIPredicate::eq,
                                             tid, IndexConstant(builder, 0));
@@ -181,9 +183,11 @@ Value ReduceWorkgroup(ImplicitLocOpBuilder& builder, Value partial, Value tid,
                      nested, subgroup_sum, shared_allocation,
                      ValueRange{IndexConstant(nested, 0)})};
                })[0];
-  SyncThreadsOp::create(builder, TypeRange{workgroup_sum.getType()},
-                        ValueRange{workgroup_sum});
-  return tensor::ExtractOp::create(builder, shared_allocation,
+  Value shared_after_second_sync =
+      SyncThreadsOp::create(builder, TypeRange{workgroup_sum.getType()},
+                            ValueRange{workgroup_sum})
+          .getResult(0);
+  return tensor::ExtractOp::create(builder, shared_after_second_sync,
                                    ValueRange{IndexConstant(builder, 0)});
 }
 
