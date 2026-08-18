@@ -1022,6 +1022,29 @@ bool CanNotBeFusedIntoAUser(const HloInstruction& hlo) {
 // Let input and output data volumes of a fusion grow by small amounts.
 constexpr int kIoToleranceBytes = 1024;
 
+// Looks through bitcasts and reshapes: neither moves data, so the source they
+// read from is what decides whether a broadcast is worth fusing.
+const HloInstruction& StripBitcasts(const HloInstruction& hlo) {
+  const HloInstruction* current = &hlo;
+  while (current->opcode() == HloOpcode::kBitcast ||
+         current->opcode() == HloOpcode::kReshape) {
+    current = current->operand(0);
+  }
+  return *current;
+}
+
+bool IsBroadcastOfParameterOrConstant(const HloInstruction& hlo) {
+  if (hlo.opcode() != HloOpcode::kBroadcast) {
+    return false;
+  }
+  const HloInstruction* source = &StripBitcasts(*hlo.operand(0));
+  if (source->opcode() == HloOpcode::kConvert) {
+    source = &StripBitcasts(*source->operand(0));
+  }
+  return source->opcode() == HloOpcode::kParameter ||
+         source->opcode() == HloOpcode::kConstant;
+}
+
 // Returns true if all users of the given operand are kSlice operations
 // with the same shape as `slice_shape`.
 bool AllUsersAreSlicesWithSameShape(const HloInstruction& operand,
@@ -1192,9 +1215,7 @@ GetPropagatedDimOrdersAndRequirementsIfProfitablyFusible(
     bool accepted = false;
     if (hlo.IsElementwise() && hlo.operand_count() == 2) {
       for (const HloInstruction* operand : hlo.operands()) {
-        if (operand->opcode() == HloOpcode::kBroadcast &&
-            (operand->operand(0)->opcode() == HloOpcode::kParameter ||
-             operand->operand(0)->opcode() == HloOpcode::kConstant) &&
+        if (IsBroadcastOfParameterOrConstant(*operand) &&
             std::holds_alternative<DimOrdersAndReqs>(
                 GetPropagatedDimOrdersAndRequirementsIfProfitablyFusible(
                     *operand, TransformDirection::kOutputToInput,
