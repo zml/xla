@@ -1022,6 +1022,38 @@ bool CanNotBeFusedIntoAUser(const HloInstruction& hlo) {
 // Let input and output data volumes of a fusion grow by small amounts.
 constexpr int kIoToleranceBytes = 1024;
 
+// Looks through bitcasts and reshapes, which move no data.
+const HloInstruction& StripBitcasts(const HloInstruction& hlo) {
+  const HloInstruction* current = &hlo;
+  while (current->opcode() == HloOpcode::kBitcast ||
+         current->opcode() == HloOpcode::kReshape) {
+    current = current->operand(0);
+  }
+  return *current;
+}
+
+// A broadcast of a parameter or constant, allowing bitcasts on the way to the source.
+//
+// The bare `broadcast(parameter)` form is rare in practice: a dequantization emitted by
+// ScaledDotRewriter reaches the multiply as `broadcast(bitcast(scale))` whenever the scale
+// needs a rank squeeze first, such as the `[N, 1] -> [N]` for a per-channel grid. That is still
+// a small scale splatted over a weight, which is what the caller means to detect.
+//
+// A bitcast on the *outside* -- `bitcast(broadcast(scale))`, which a `[N/128, K/128]` grid
+// produces because its broadcast is rank 4 and has to be merged back down -- is deliberately
+// not accepted. The multiply would fuse but the broadcast could not follow it through that
+// bitcast (CalculateBitcastOfBroadcast refuses to hoist it, as it mixes operand and broadcast
+// dimensions), so the broadcast would become a fusion parameter and be materialized at the full
+// size of the weight: one dequantized tensor traded for another.
+bool IsBroadcastOfParameterOrConstant(const HloInstruction& hlo) {
+  if (hlo.opcode() != HloOpcode::kBroadcast) {
+    return false;
+  }
+  const HloInstruction& source = StripBitcasts(*hlo.operand(0));
+  return source.opcode() == HloOpcode::kParameter ||
+         source.opcode() == HloOpcode::kConstant;
+}
+
 // Returns true if all users of the given operand are kSlice operations
 // with the same shape as `slice_shape`.
 bool AllUsersAreSlicesWithSameShape(const HloInstruction& operand,
@@ -1192,9 +1224,7 @@ GetPropagatedDimOrdersAndRequirementsIfProfitablyFusible(
     bool accepted = false;
     if (hlo.IsElementwise() && hlo.operand_count() == 2) {
       for (const HloInstruction* operand : hlo.operands()) {
-        if (operand->opcode() == HloOpcode::kBroadcast &&
-            (operand->operand(0)->opcode() == HloOpcode::kParameter ||
-             operand->operand(0)->opcode() == HloOpcode::kConstant) &&
+        if (IsBroadcastOfParameterOrConstant(*operand) &&
             std::holds_alternative<DimOrdersAndReqs>(
                 GetPropagatedDimOrdersAndRequirementsIfProfitablyFusible(
                     *operand, TransformDirection::kOutputToInput,
