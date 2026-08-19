@@ -238,6 +238,16 @@ TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesPartialMAndN) {
   RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/70);
 }
 
+// An N tail *wider than BK*, which is the only shape that reaches the row guard
+// in PerChannelFp8BlockLoader::load_safe. N=100 leaves the second tile with
+// num_outs=36 against BK=32, so a guard comparing the row index `bi` to the
+// column extent zeroes rows 32..35 -- columns 96..99 come back 0. The n=70 cases
+// above cannot catch it: their tail of 6 is below BK, so nothing is wrongly
+// zeroed. Both BM tiles, because the guard is in the shared loader.
+TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesNTailWiderThanBk) {
+  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100);
+}
+
 // Prefill qmm (BM=64): B > 16.
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64MatchesGolden) {
   RunPerChannelCase(/*b=*/32, /*k=*/256, /*n=*/128);
@@ -245,6 +255,10 @@ TEST_F(MetalFp8KernelTest, PerChannelQmmBm64MatchesGolden) {
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesPartialMAndN) {
   RunPerChannelCase(/*b=*/20, /*k=*/160, /*n=*/70);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesNTailWiderThanBk) {
+  RunPerChannelCase(/*b=*/20, /*k=*/160, /*n=*/100);
 }
 
 }  // namespace

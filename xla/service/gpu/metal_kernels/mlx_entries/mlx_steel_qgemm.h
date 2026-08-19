@@ -1194,7 +1194,14 @@ struct PerChannelFp8BlockLoader {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
-    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+    // Steel's source-tile convention is (valid columns, valid rows), and this
+    // loader is transposed: `bi` walks output channels, i.e. rows. Guarding it
+    // against `.x` -- the valid K extent -- zeroed every row past BK, so an N
+    // tail wider than BK came out as zeros: at N=100 the second tile has
+    // num_outs=36 against BK=32, and output columns 96..99 were zero. Callers
+    // only ever pass a full BK for the column extent, so K needs no check of
+    // its own. Same reasoning as XlaQuantizedBlockLoader::load_safe above.
+    if (reduction_dim == 1 && bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
