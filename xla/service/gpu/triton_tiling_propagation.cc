@@ -1039,19 +1039,30 @@ const HloInstruction& StripBitcasts(const HloInstruction& hlo) {
 // needs a rank squeeze first, such as the `[N, 1] -> [N]` for a per-channel grid. That is still
 // a small scale splatted over a weight, which is what the caller means to detect.
 //
+// A convert on the way to the source is looked through as well, and it is the common case
+// whenever both operands are sub-16-bit: GetTargetType widens an NVFP4 (f4e2m1 + f8e4m3) or an
+// MX (f8e4m3 + e8m0) pair to BF16, so UpscaleBoth converts the *scale* too and the multiply
+// sees `broadcast(convert(scale))`. Those are exactly the dots that cost the most when they
+// fall to this expansion, and they were the ones this predicate declined. It is deliberately
+// not folded into StripBitcasts, whose contract is that it moves no data.
+//
 // A bitcast on the *outside* -- `bitcast(broadcast(scale))`, which a `[N/128, K/128]` grid
 // produces because its broadcast is rank 4 and has to be merged back down -- is deliberately
 // not accepted. The multiply would fuse but the broadcast could not follow it through that
 // bitcast (CalculateBitcastOfBroadcast refuses to hoist it, as it mixes operand and broadcast
 // dimensions), so the broadcast would become a fusion parameter and be materialized at the full
-// size of the weight: one dequantized tensor traded for another.
+// size of the weight: one dequantized tensor traded for another. The same holds for a convert
+// on the outside, which is why only the inside is stripped here.
 bool IsBroadcastOfParameterOrConstant(const HloInstruction& hlo) {
   if (hlo.opcode() != HloOpcode::kBroadcast) {
     return false;
   }
-  const HloInstruction& source = StripBitcasts(*hlo.operand(0));
-  return source.opcode() == HloOpcode::kParameter ||
-         source.opcode() == HloOpcode::kConstant;
+  const HloInstruction* source = &StripBitcasts(*hlo.operand(0));
+  if (source->opcode() == HloOpcode::kConvert) {
+    source = &StripBitcasts(*source->operand(0));
+  }
+  return source->opcode() == HloOpcode::kParameter ||
+         source->opcode() == HloOpcode::kConstant;
 }
 
 // Returns true if all users of the given operand are kSlice operations

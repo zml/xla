@@ -896,6 +896,66 @@ ENTRY e {
       GmockMatch(m::Fusion(m::Parameter(), m::Parameter(), m::Parameter())));
 }
 
+// A rank-squeezing bitcast between the broadcast and its source, which is how a
+// per-channel dequantization reaches the multiply: ScaledDotRewriter broadcasts
+// the scale after a `[N, 1] -> [N]` bitcast. Still a small scale splatted over a
+// weight, so it must fuse.
+//
+// V1 only. The v2 search space keeps its own copy of this heuristic
+// (IsBinaryElementwiseOfBroadcastParamOrConst) which reads operand(0) directly
+// and looks through nothing, so it declines both this and the convert case
+// below. v2 is off by default; the two copies are worth reconciling separately.
+TEST_P(GemmFusionTest, BinaryElementwiseOfBroadcastOfBitcastIsFused) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  p2 = f32[3072,1] parameter(2)
+  s = f32[3072] bitcast(p2)
+  b = f32[8192,3072] broadcast(s), dimensions={1}
+  p0 = f16[8192,3072] parameter(0)
+  p0c = f32[8192,3072] convert(p0)
+  a = f32[8192,3072] multiply(p0c, b)
+  p1 = f32[3072,768] parameter(1)
+  ROOT r = f32[8192,768] dot(a, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+})"));
+  const se::CudaComputeCapability cc{se::CudaComputeCapability::kAmpere, 0};
+  EXPECT_TRUE(GemmFusion(cc).Run(module.get()).value());
+  EXPECT_THAT(
+      module->entry_computation()->root_instruction(),
+      GmockMatch(m::Fusion(m::Parameter(), m::Parameter(), m::Parameter())));
+}
+
+// A convert between the broadcast and its source. GetTargetType widens both
+// operands to BF16 whenever each is under 16 bits -- NVFP4 (f4e2m1 + f8e4m3) and
+// MX (f8e4m3 + e8m0) -- so UpscaleBoth converts the scale as well and the
+// multiply sees broadcast(convert(scale)). Those are the dequantizations that
+// cost the most when they fall to this expansion.
+//
+// Hopper, not Ampere: an f8e4m3fn convert is not Triton-supported below sm89,
+// so on Ampere the fusion would stop at the convert regardless of this
+// predicate. V1 only, for the same reason as the bitcast case above.
+TEST_P(GemmFusionTest, BinaryElementwiseOfBroadcastOfConvertIsFused) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  p2 = f8e4m3fn[3072] parameter(2)
+  c = f32[3072] convert(p2)
+  b = f32[8192,3072] broadcast(c), dimensions={1}
+  p0 = f16[8192,3072] parameter(0)
+  p0c = f32[8192,3072] convert(p0)
+  a = f32[8192,3072] multiply(p0c, b)
+  p1 = f32[3072,768] parameter(1)
+  ROOT r = f32[8192,768] dot(a, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+})"));
+  const se::CudaComputeCapability cc{se::CudaComputeCapability::kHopper, 0};
+  EXPECT_TRUE(GemmFusion(cc).Run(module.get()).value());
+  EXPECT_THAT(
+      module->entry_computation()->root_instruction(),
+      GmockMatch(m::Fusion(m::Parameter(), m::Parameter(), m::Parameter())));
+}
+
 TEST_P(GemmFusionTest, BinaryElementwiseOfUnsupportedBroadcastIsNotFused) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
                        ParseAndReturnVerifiedModule(R"(
@@ -906,6 +966,29 @@ ENTRY e {
   p0 = f16[8192,3072] parameter(0)
   p0c = f32[8192,3072] convert(p0)
   a = f32[8192,3072] add(p0c, s)
+  p1 = f32[3072,768] parameter(1)
+  ROOT r = f32[8192,768] dot(a, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+})"));
+  const se::CudaComputeCapability cc{se::CudaComputeCapability::kAmpere, 0};
+  EXPECT_THAT(GemmFusion(cc).Run(module.get()), IsOkAndHolds(false));
+}
+
+// The convert case has the same asymmetry as the bitcast one above: only a
+// convert *between* the broadcast and its source is looked through. Outside, the
+// broadcast could not follow the multiply into the fusion and would be
+// materialized at the full size of the weight -- one dequantized tensor traded
+// for another -- so this must stay unfused.
+TEST_P(GemmFusionTest, BinaryElementwiseOfConvertOfBroadcastIsNotFused) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  p2 = f8e4m3fn[3072] parameter(2)
+  b = f8e4m3fn[8192,3072] broadcast(p2), dimensions={1}
+  c = f32[8192,3072] convert(b)
+  p0 = f16[8192,3072] parameter(0)
+  p0c = f32[8192,3072] convert(p0)
+  a = f32[8192,3072] multiply(p0c, c)
   p1 = f32[3072,768] parameter(1)
   ROOT r = f32[8192,768] dot(a, p1),
     lhs_contracting_dims={1}, rhs_contracting_dims={0}
