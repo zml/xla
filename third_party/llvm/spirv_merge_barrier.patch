@@ -1,16 +1,291 @@
-diff --git a/llvm/lib/Target/SPIRV/SPIRVInstrInfo.td b/llvm/lib/Target/SPIRV/SPIRVInstrInfo.td
---- a/llvm/lib/Target/SPIRV/SPIRVInstrInfo.td
-+++ b/llvm/lib/Target/SPIRV/SPIRVInstrInfo.td
-@@ -630,10 +630,12 @@ def OpFwidthCoarse: UnOp<"OpFwidthCoarse", 215>;
- 
- def OpPhi: Op<245, (outs ID:$res), (ins TYPE:$type, ID:$var0, ID:$block0, variable_ops),
-                   "$res = OpPhi $type $var0 $block0">;
-+let isBarrier = 1, isTerminator = 1 in
- def OpLoopMerge: Op<246, (outs), (ins unknown:$merge, unknown:$continue, LoopControl:$lc, variable_ops),
-                   "OpLoopMerge $merge $continue $lc">;
- def OpLoopControlINTEL: Op<5887, (outs), (ins LoopControl:$lc, variable_ops),
-                   "OpLoopControlINTEL $lc">;
-+let isBarrier = 1, isTerminator = 1 in
- def OpSelectionMerge: Op<247, (outs), (ins unknown:$merge, SelectionControl:$sc),
-                   "OpSelectionMerge $merge $sc">;
- def OpLabel: Op<248, (outs ID:$label), (ins), "$label = OpLabel">;
+diff --git a/llvm/lib/Target/SPIRV/CMakeLists.txt b/llvm/lib/Target/SPIRV/CMakeLists.txt
+--- a/llvm/lib/Target/SPIRV/CMakeLists.txt
++++ b/llvm/lib/Target/SPIRV/CMakeLists.txt
+@@ -24,6 +24,7 @@ add_llvm_target(SPIRVCodeGen
+   SPIRVCommandLine.cpp
+   SPIRVCtorDtorLowering.cpp
+   SPIRVEmitIntrinsics.cpp
++  SPIRVFixupMergeTerminators.cpp
+   SPIRVGlobalRegistry.cpp
+   SPIRVInstrInfo.cpp
+   SPIRVInstructionSelector.cpp
+diff --git a/llvm/lib/Target/SPIRV/SPIRV.h b/llvm/lib/Target/SPIRV/SPIRV.h
+--- a/llvm/lib/Target/SPIRV/SPIRV.h
++++ b/llvm/lib/Target/SPIRV/SPIRV.h
+@@ -32,6 +32,7 @@ FunctionPass *createSPIRVRegularizerPass();
+ FunctionPass *createSPIRVPreLegalizerCombiner();
+ FunctionPass *createSPIRVPreLegalizerPass();
+ FunctionPass *createSPIRVPostLegalizerPass();
++FunctionPass *createSPIRVFixupMergeTerminatorsPass();
+ ModulePass *createSPIRVEmitIntrinsicsPass(const SPIRVTargetMachine &TM);
+ ModulePass *createSPIRVPrepareGlobalsPass();
+ ModulePass *createSPIRVCtorDtorLoweringLegacyPass();
+@@ -46,6 +47,7 @@ void initializeSPIRVConvergenceRegionAnalysisWrapperPassPass(PassRegistry &);
+ void initializeSPIRVPreLegalizerPass(PassRegistry &);
+ void initializeSPIRVPreLegalizerCombinerPass(PassRegistry &);
+ void initializeSPIRVPostLegalizerPass(PassRegistry &);
++void initializeSPIRVFixupMergeTerminatorsPass(PassRegistry &);
+ void initializeSPIRVStructurizerPass(PassRegistry &);
+ void initializeSPIRVCBufferAccessLegacyPass(PassRegistry &);
+ void initializeSPIRVPushConstantAccessLegacyPass(PassRegistry &);
+diff --git a/llvm/lib/Target/SPIRV/SPIRVFixupMergeTerminators.cpp b/llvm/lib/Target/SPIRV/SPIRVFixupMergeTerminators.cpp
+new file mode 100644
+--- /dev/null
++++ b/llvm/lib/Target/SPIRV/SPIRVFixupMergeTerminators.cpp
+@@ -0,0 +1,92 @@
++//===-- SPIRVFixupMergeTerminators.cpp - Fix merge placement ------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "SPIRV.h"
++#include "SPIRVInstrInfo.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/ErrorHandling.h"
++#include <iterator>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "spirv-fixup-merge-terminators"
++
++namespace {
++
++class SPIRVFixupMergeTerminators final : public MachineFunctionPass {
++public:
++  static char ID;
++
++  SPIRVFixupMergeTerminators() : MachineFunctionPass(ID) {
++    initializeSPIRVFixupMergeTerminatorsPass(
++        *PassRegistry::getPassRegistry());
++  }
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  StringRef getPassName() const override {
++    return "SPIR-V merge terminator fixup";
++  }
++};
++
++bool isValidMergeTerminator(unsigned MergeOpcode, unsigned TerminatorOpcode) {
++  switch (MergeOpcode) {
++  case SPIRV::OpLoopMerge:
++    return TerminatorOpcode == SPIRV::OpBranch ||
++           TerminatorOpcode == SPIRV::OpBranchConditional;
++  case SPIRV::OpSelectionMerge:
++    return TerminatorOpcode == SPIRV::OpBranchConditional ||
++           TerminatorOpcode == SPIRV::OpSwitch;
++  default:
++    llvm_unreachable("expected a SPIR-V merge instruction");
++  }
++}
++
++bool SPIRVFixupMergeTerminators::runOnMachineFunction(MachineFunction &MF) {
++  bool Changed = false;
++  for (MachineBasicBlock &MBB : MF) {
++    MachineInstr *Merge = nullptr;
++    for (MachineInstr &MI : MBB) {
++      if (MI.getOpcode() != SPIRV::OpLoopMerge &&
++          MI.getOpcode() != SPIRV::OpSelectionMerge)
++        continue;
++      if (Merge)
++        report_fatal_error("multiple SPIR-V merge instructions in one block");
++      Merge = &MI;
++    }
++    if (!Merge)
++      continue;
++
++    MachineBasicBlock::iterator Terminator = MBB.getLastNonDebugInstr();
++    if (Terminator == MBB.end() ||
++        !isValidMergeTerminator(Merge->getOpcode(), Terminator->getOpcode()))
++      report_fatal_error("invalid SPIR-V merge terminator");
++
++    if (std::next(Merge->getIterator()) == Terminator)
++      continue;
++    MBB.splice(Terminator, &MBB, Merge->getIterator());
++    Changed = true;
++  }
++  return Changed;
++}
++
++} // namespace
++
++char SPIRVFixupMergeTerminators::ID = 0;
++
++INITIALIZE_PASS(SPIRVFixupMergeTerminators, DEBUG_TYPE,
++                "SPIR-V merge terminator fixup", false, false)
++
++FunctionPass *llvm::createSPIRVFixupMergeTerminatorsPass() {
++  return new SPIRVFixupMergeTerminators();
++}
+diff --git a/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp b/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp
+@@ -69,6 +69,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSPIRVTarget() {
+   initializeSPIRVRegularizerLegacyPass(PR);
+   initializeSPIRVPreLegalizerPass(PR);
+   initializeSPIRVPostLegalizerPass(PR);
++  initializeSPIRVFixupMergeTerminatorsPass(PR);
+   initializeSPIRVMergeRegionExitTargetsLegacyPass(PR);
+   initializeSPIRVEmitIntrinsicsPass(PR);
+   initializeSPIRVPrepareFunctionsLegacyPass(PR);
+@@ -136,1 +137,2 @@ public:
+   void addPostRegAlloc() override;
++  void addPreEmitPass() override;
+@@ -296,3 +298,7 @@ bool SPIRVPassConfig::addGlobalInstructionSelect() {
+   addPass(new SPIRVInstructionSelect());
+   return false;
+ }
++
++void SPIRVPassConfig::addPreEmitPass() {
++  addPass(createSPIRVFixupMergeTerminatorsPass());
++}
+diff --git a/llvm/test/CodeGen/SPIRV/merge-terminator-adjacency.mir b/llvm/test/CodeGen/SPIRV/merge-terminator-adjacency.mir
+new file mode 100644
+--- /dev/null
++++ b/llvm/test/CodeGen/SPIRV/merge-terminator-adjacency.mir
+@@ -0,0 +1,137 @@
++# RUN: llc -mtriple=spirv-unknown-vulkan-compute \
++# RUN:   -run-pass=spirv-fixup-merge-terminators -verify-machineinstrs %s \
++# RUN:   -o - | FileCheck %s
++
++--- |
++  target triple = "spirv-unknown-vulkan-compute"
++
++  define void @loop_branch() { ret void }
++  define void @loop_branch_conditional() { ret void }
++  define void @selection_branch_conditional() { ret void }
++  define void @selection_switch() { ret void }
++...
++---
++name: loop_branch
++legalized: true
++selected: true
++tracksRegLiveness: true
++body: |
++  ; CHECK-LABEL: name: loop_branch
++  bb.0:
++    successors: %bb.1
++
++    ; CHECK: OpNop
++    ; CHECK-NEXT: OpLoopMerge
++    ; CHECK-NEXT: OpBranch
++    OpLoopMerge %bb.2, %bb.1, 0
++    OpNop
++    OpBranch %bb.1
++
++  bb.1:
++    successors: %bb.0
++
++    OpBranch %bb.0
++
++  bb.2:
++    OpReturn
++...
++---
++name: loop_branch_conditional
++legalized: true
++selected: true
++tracksRegLiveness: true
++registers:
++  - { id: 0, class: type }
++  - { id: 1, class: iid }
++body: |
++  ; CHECK-LABEL: name: loop_branch_conditional
++  bb.0:
++    successors: %bb.1, %bb.2
++
++    %0:type = OpTypeBool
++    %1:iid = OpConstantTrue %0
++    ; CHECK: OpNop
++    ; CHECK-NEXT: OpLoopMerge
++    ; CHECK-NEXT: OpBranchConditional
++    OpLoopMerge %bb.2, %bb.1, 0
++    OpNop
++    OpBranchConditional %1, %bb.1, %bb.2
++
++  bb.1:
++    successors: %bb.0
++
++    OpBranch %bb.0
++
++  bb.2:
++    OpReturn
++...
++---
++name: selection_branch_conditional
++legalized: true
++selected: true
++tracksRegLiveness: true
++registers:
++  - { id: 0, class: type }
++  - { id: 1, class: iid }
++body: |
++  ; CHECK-LABEL: name: selection_branch_conditional
++  bb.0:
++    successors: %bb.1, %bb.2
++
++    %0:type = OpTypeBool
++    %1:iid = OpConstantTrue %0
++    ; CHECK: OpNop
++    ; CHECK-NEXT: OpSelectionMerge
++    ; CHECK-NEXT: OpBranchConditional
++    OpSelectionMerge %bb.3, 0
++    OpNop
++    OpBranchConditional %1, %bb.1, %bb.2
++
++  bb.1:
++    successors: %bb.3
++
++    OpBranch %bb.3
++
++  bb.2:
++    successors: %bb.3
++
++    OpBranch %bb.3
++
++  bb.3:
++    OpReturn
++...
++---
++name: selection_switch
++legalized: true
++selected: true
++tracksRegLiveness: true
++registers:
++  - { id: 0, class: type }
++  - { id: 1, class: iid }
++body: |
++  ; CHECK-LABEL: name: selection_switch
++  bb.0:
++    successors: %bb.1, %bb.2
++
++    %0:type = OpTypeInt 32, 0
++    %1:iid = OpConstantI %0, 0
++    ; CHECK: OpNop
++    ; CHECK-NEXT: OpSelectionMerge
++    ; CHECK-NEXT: OpSwitch
++    OpSelectionMerge %bb.3, 0
++    OpNop
++    OpSwitch %1, %bb.1, 0, %bb.2
++
++  bb.1:
++    successors: %bb.3
++
++    OpBranch %bb.3
++
++  bb.2:
++    successors: %bb.3
++
++    OpBranch %bb.3
++
++  bb.3:
++    OpReturn
++...
