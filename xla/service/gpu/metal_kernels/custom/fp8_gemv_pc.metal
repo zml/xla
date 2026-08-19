@@ -10,6 +10,8 @@ static inline float decode_e4m3fn(uchar b) {
     return s ? -v : v;
 }
 
+constant constexpr int kROWS = 4;
+
 template <typename ST>
 [[kernel]] void fp8_gemv_pc_entry(
     device const bfloat *x      [[buffer(0)]],
@@ -27,29 +29,56 @@ template <typename ST>
     lut[tid] = decode_e4m3fn(uchar(tid));
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const int ni = int(tgid.x);
+    const int n0 = int(tgid.x) * kROWS;
     const int bi = int(tgid.y);
-    if (ni >= N || bi >= B) return;
+    if (n0 >= N || bi >= B) return;
 
-    const device uchar  *wrow = w + (long)ni * K;
+    const device uchar *wrow[kROWS];
+    for (int r = 0; r < kROWS; ++r)
+        wrow[r] = w + (long)min(n0 + r, N - 1) * K;
     const device bfloat *xrow = x + (long)bi * K;
 
-    float acc = 0.0f;
-    for (int k = int(tid) * 4; k + 4 <= K; k += 256 * 4) {
-        uchar4 wv = *(const device uchar4 *)(wrow + k);
-        bfloat4 xv = *(const device bfloat4 *)(xrow + k);
-        acc += float(xv.x) * lut[wv.x] + float(xv.y) * lut[wv.y] +
-               float(xv.z) * lut[wv.z] + float(xv.w) * lut[wv.w];
+    float acc[kROWS];
+    for (int r = 0; r < kROWS; ++r) acc[r] = 0.0f;
+
+    for (int k = int(tid) * 16; k + 16 <= K; k += 256 * 16) {
+        bfloat4 b0 = *(const device bfloat4 *)(xrow + k);
+        bfloat4 b1 = *(const device bfloat4 *)(xrow + k + 4);
+        bfloat4 b2 = *(const device bfloat4 *)(xrow + k + 8);
+        bfloat4 b3 = *(const device bfloat4 *)(xrow + k + 12);
+        for (int r = 0; r < kROWS; ++r) {
+            uchar4 a0 = *(const device uchar4 *)(wrow[r] + k);
+            uchar4 a1 = *(const device uchar4 *)(wrow[r] + k + 4);
+            uchar4 a2 = *(const device uchar4 *)(wrow[r] + k + 8);
+            uchar4 a3 = *(const device uchar4 *)(wrow[r] + k + 12);
+            acc[r] += float(b0.x)*lut[a0.x] + float(b0.y)*lut[a0.y]
+                    + float(b0.z)*lut[a0.z] + float(b0.w)*lut[a0.w]
+                    + float(b1.x)*lut[a1.x] + float(b1.y)*lut[a1.y]
+                    + float(b1.z)*lut[a1.z] + float(b1.w)*lut[a1.w]
+                    + float(b2.x)*lut[a2.x] + float(b2.y)*lut[a2.y]
+                    + float(b2.z)*lut[a2.z] + float(b2.w)*lut[a2.w]
+                    + float(b3.x)*lut[a3.x] + float(b3.y)*lut[a3.y]
+                    + float(b3.z)*lut[a3.z] + float(b3.w)*lut[a3.w];
+        }
     }
-    acc = simd_sum(acc);
-    threadgroup float part[8];
-    if (lane == 0) part[sgid] = acc;
+
+    threadgroup float part[kROWS][8];
+    for (int r = 0; r < kROWS; ++r) {
+        acc[r] = simd_sum(acc[r]);
+        if (lane == 0) part[r][sgid] = acc[r];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sgid == 0) {
-        float t = (lane < 8) ? part[lane] : 0.0f;
-        t = simd_sum(t);
-        const int si = (dims.w < 0) ? 0 : ni;
-        if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
+        const bool per_tensor = dims.w < 0;
+        for (int r = 0; r < kROWS; ++r) {
+            float t = (lane < 8) ? part[r][lane] : 0.0f;
+            t = simd_sum(t);
+            const int ni = n0 + r;
+            if (lane == 0 && ni < N) {
+                const int si = per_tensor ? 0 : ni;
+                out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
+            }
+        }
     }
 }
 

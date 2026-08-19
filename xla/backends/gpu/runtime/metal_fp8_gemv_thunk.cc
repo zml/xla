@@ -123,9 +123,11 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
   if (b_ == 1) {
-    return kernel_->Launch(se::ThreadDim(256, 1, 1),
-                           se::BlockDim(static_cast<uint64_t>(n_), 1, 1), stream,
-                           args);
+    const int64_t rows_per_group = per_channel_ ? 4 : 1;
+    const uint64_t groups =
+        static_cast<uint64_t>((n_ + rows_per_group - 1) / rows_per_group);
+    return kernel_->Launch(se::ThreadDim(256, 1, 1), se::BlockDim(groups, 1, 1),
+                           stream, args);
   }
   constexpr int64_t kBN = 64;
   const int64_t bm = b_ > 16 ? 64 : 16;
