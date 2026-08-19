@@ -70,14 +70,11 @@ class MetalFp8GemvThunk : public Thunk {
 
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
-  // b==1: per-row GEMV. b>1: Steel tiled q-GEMM (BM=16 small M, BM=64 prefill).
-  // per_channel_: fp8_gemv_pc / pc qmm variants.
+  // Exactly one entry point can ever launch: which one is a function of
+  // per_channel_, b_ and the scale's dtype, and all three are fixed when the
+  // emitter builds this thunk. b==1 takes the per-row GEMV, b>1 the Steel tiled
+  // q-GEMM (BM=16 small M, BM=64 prefill). So load one rather than the family.
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel64_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm64_ ABSL_GUARDED_BY(mu_);
 
   stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
 };

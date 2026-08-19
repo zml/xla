@@ -17,10 +17,14 @@ static inline float decode_e4m3fn(uchar b) {
 //   scale: bfloat [N, 1]     out: bfloat [B, N]
 //   dims = (B, K, N, scale row stride: 1 for [N,1], negative for a [1,1]
 //           whole-tensor scale, which is stride 0)
-kernel void fp8_gemv_pc(
+// ST is the scale's storage type. The accumulator is already f32 and the scale
+// multiplies it after the reduction, so an f32 scale is used at full precision
+// here -- unlike the qmm path, where the product still lands in a bf16 tile.
+template <typename ST>
+[[kernel]] void fp8_gemv_pc_entry(
     device const bfloat *x      [[buffer(0)]],
     device const uchar  *w      [[buffer(1)]],
-    device const bfloat *scale  [[buffer(2)]],
+    device const ST     *scale  [[buffer(2)]],
     device       bfloat *out    [[buffer(3)]],
     constant int4&       dims   [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -60,3 +64,13 @@ kernel void fp8_gemv_pc(
         if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
     }
 }
+
+// An MSL entry point cannot itself be a template, so each scale dtype is
+// stamped out by name -- the same idiom as gdn_linear_attention.
+#define instantiate_fp8_gemv_pc(name, st)                                 \
+  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st>(     \
+      device const bfloat*, device const uchar*, device const st*,        \
+      device bfloat*, constant int4&, uint3, uint, uint, uint);
+
+instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float)

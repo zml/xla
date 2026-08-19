@@ -66,6 +66,17 @@ uint16_t Bfloat16Bits(float value) {
   return static_cast<uint16_t>(bits >> 16);
 }
 
+// Bfloat16Bits above truncates, which is exact for every value the cases below
+// feed in -- they are all small integers -- but wrong for a computed result:
+// the hardware rounds to nearest-even on the store. Use this whenever the
+// expected value is a product rather than an input.
+uint16_t Bfloat16BitsRne(float value) {
+  uint32_t bits;
+  __builtin_memcpy(&bits, &value, sizeof(bits));
+  const uint32_t rounding = ((bits >> 16) & 1) + 0x7fff;
+  return static_cast<uint16_t>((bits + rounding) >> 16);
+}
+
 float Bfloat16ToFloat(uint16_t bits) {
   const uint32_t widened = static_cast<uint32_t>(bits) << 16;
   float value;
@@ -114,8 +125,12 @@ class MetalFp8KernelTest : public ::testing::Test {
   // kernel that ignores the stride walks off the end of a 2-byte allocation --
   // which Metal will not fault on, the pages being there -- so the golden
   // below, not a crash, is what catches it.
+  // `f32_scale` sends the scale as f32 through the _f32 entry points. That is a
+  // wiring check: an f32 buffer bound to a `device const bfloat*` is read as
+  // pairs of bf16 and silently produces garbage. It does NOT prove the extra
+  // precision -- see PerTensorGemvKeepsAnF32ScaleExact for that.
   void RunPerChannelCase(int32_t b, int32_t k, int32_t n,
-                         bool per_tensor = false) {
+                         bool per_tensor = false, bool f32_scale = false) {
     ASSERT_EQ(k % 32, 0) << "the per-channel kernels have no contraction tail";
 
     // Every one of the three indices gets its own signature, so a kernel that
@@ -140,10 +155,21 @@ class MetalFp8KernelTest : public ::testing::Test {
     auto scale_of = [&](int32_t col) {
       return static_cast<float>(per_tensor ? 3 : 1 + (col % 4));
     };
-    std::vector<uint16_t> scale(per_tensor ? 1 : static_cast<size_t>(n));
-    for (size_t i = 0; i < scale.size(); ++i) {
-      scale[i] = Bfloat16Bits(scale_of(static_cast<int32_t>(i)));
+    const size_t scale_count = per_tensor ? 1 : static_cast<size_t>(n);
+    std::vector<uint16_t> scale_bf16(f32_scale ? 0 : scale_count);
+    std::vector<float> scale_f32(f32_scale ? scale_count : 0);
+    for (size_t i = 0; i < scale_count; ++i) {
+      const float v = scale_of(static_cast<int32_t>(i));
+      if (f32_scale) {
+        scale_f32[i] = v;
+      } else {
+        scale_bf16[i] = Bfloat16Bits(v);
+      }
     }
+    const void* scale_data =
+        f32_scale ? static_cast<const void*>(scale_f32.data())
+                  : static_cast<const void*>(scale_bf16.data());
+    const uint64_t scale_bytes = scale_count * (f32_scale ? 4 : 2);
     // 0x7fc1 is a NaN, so an element the kernel never writes fails loudly.
     std::vector<uint16_t> out(static_cast<size_t>(b) * n, 0x7fc1);
 
@@ -155,8 +181,7 @@ class MetalFp8KernelTest : public ::testing::Test {
         AllocateAndCopy(x.data(), x.size() * sizeof(x[0]));
     se::DeviceAddressBase w_device =
         AllocateAndCopy(w.data(), w.size() * sizeof(w[0]));
-    se::DeviceAddressBase scale_device =
-        AllocateAndCopy(scale.data(), scale.size() * sizeof(scale[0]));
+    se::DeviceAddressBase scale_device = AllocateAndCopy(scale_data, scale_bytes);
     se::DeviceAddressBase out_device =
         AllocateAndCopy(out.data(), out.size() * sizeof(out[0]));
     ASSERT_NE(x_device.opaque(), nullptr);
@@ -166,9 +191,10 @@ class MetalFp8KernelTest : public ::testing::Test {
 
     const bool decode = (b == 1);
     const bool large_m = b > 16;
-    const std::string kernel_name =
-        decode ? "fp8_gemv_pc"
-               : (large_m ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
+    std::string kernel_name = decode ? "fp8_gemv_pc"
+                                    : (large_m ? "fp8_qmm_t_pc_bm64"
+                                               : "fp8_qmm_t_pc");
+    if (f32_scale) kernel_name += "_f32";
     TF_ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<se::Kernel> kernel,
         metal_executor_->LoadKernelWithConstants(
@@ -292,6 +318,92 @@ TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
 // through the same base, so a stride the loader ignores shows up here as well.
 TEST_F(MetalFp8KernelTest, PerTensorQmmHandlesPartialN) {
   RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
+}
+
+// The _f32 entries, through all three tiles and both scale grids. Wiring only:
+// every value here is bf16-exact, so an f32 and a bf16 scale agree bit for bit.
+TEST_F(MetalFp8KernelTest, PerChannelGemvAcceptsAnF32Scale) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+                    /*f32_scale=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelQmmAcceptsAnF32Scale) {
+  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+                    /*f32_scale=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelQmmBm64AcceptsAnF32Scale) {
+  RunPerChannelCase(/*b=*/32, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+                    /*f32_scale=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorGemvAcceptsAnF32Scale) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/true,
+                    /*f32_scale=*/true);
+}
+
+// The one case that actually proves the f32 scale buys precision, which the
+// harness above cannot: its generators only produce bf16-exact values and
+// powers of two, and bf16 rounding commutes with those, so an f32-scale kernel
+// and a bf16-scale kernel are bit-identical on every case there.
+//
+// This uses a real ModelOpt scale -- layer 11's q_proj -- which bf16 cannot
+// hold, and asserts the output bit pattern. The decode GEMV multiplies the f32
+// scale into an f32 accumulator and rounds once on the store, so the answer is
+// exactly bf16(scale * sum). Rounding the scale first lands elsewhere, and the
+// test pins that the two differ so it cannot pass vacuously.
+TEST_F(MetalFp8KernelTest, PerTensorGemvKeepsAnF32ScaleExact) {
+  // K must make the running sum a non-power-of-two: bf16 rounding commutes
+  // with multiplication by a power of two, so at K=256 the two spellings of the
+  // scale agree bit for bit and the test would pass vacuously. 320 = 2^6 * 5
+  // does not commute away, and the ASSERT_NE below keeps that honest.
+  constexpr int32_t kK = 320;
+  constexpr int32_t kN = 64;
+  constexpr float kScale = 0.00111607f;  // not representable in bf16
+
+  std::vector<uint16_t> x(kK, Bfloat16Bits(1.0f));
+  std::vector<uint8_t> w(static_cast<size_t>(kN) * kK, kE4m3One);
+  std::vector<float> scale(1, kScale);
+  std::vector<uint16_t> out(kN, 0x7fc1);
+  const int32_t dims[4] = {1, kK, kN, -1};
+
+  se::DeviceAddressBase x_device =
+      AllocateAndCopy(x.data(), x.size() * sizeof(x[0]));
+  se::DeviceAddressBase w_device =
+      AllocateAndCopy(w.data(), w.size() * sizeof(w[0]));
+  se::DeviceAddressBase scale_device =
+      AllocateAndCopy(scale.data(), scale.size() * sizeof(scale[0]));
+  se::DeviceAddressBase out_device =
+      AllocateAndCopy(out.data(), out.size() * sizeof(out[0]));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Kernel> kernel,
+                          metal_executor_->LoadKernelWithConstants(
+                              gemv_metallib_, "fp8_gemv_pc_f32",
+                              /*arity=*/5, {}));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                          executor_->CreateStream());
+  se::KernelArgsPackedArray args(/*num_args=*/5);
+  args.add_argument(x_device);
+  args.add_argument(w_device);
+  args.add_argument(scale_device);
+  args.add_argument(out_device);
+  args.add_argument(dims);
+  TF_ASSERT_OK(kernel->Launch(se::ThreadDim(256, 1, 1),
+                              se::BlockDim(static_cast<uint64_t>(kN), 1, 1),
+                              stream.get(), args));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  TF_ASSERT_OK(executor_->SynchronousMemcpyD2H(
+      out_device, out.size() * sizeof(out[0]), out.data()));
+
+  const float sum = static_cast<float>(kK);  // 1.0 * 1.0, kK times
+  const uint16_t expected = Bfloat16BitsRne(kScale * sum);
+  const uint16_t if_scale_were_rounded =
+      Bfloat16BitsRne(Bfloat16ToFloat(Bfloat16BitsRne(kScale)) * sum);
+  ASSERT_NE(expected, if_scale_were_rounded)
+      << "pick a scale where the two spellings actually differ";
+  for (int32_t col = 0; col < kN; ++col) {
+    EXPECT_EQ(out[col], expected) << "at column " << col;
+  }
 }
 
 }  // namespace
