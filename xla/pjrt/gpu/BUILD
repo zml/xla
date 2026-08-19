@@ -838,7 +838,7 @@ cc_library(
     deps = [
         ":se_gpu_pjrt_compiler_impl",
         "//xla/pjrt:pjrt_compiler",
-        "//xla/pjrt:stream_executor_platform_id_mapping",
+        "//xla/pjrt/se:stream_executor_platform_id_mapping",
         "//xla/service/gpu:vulkan_gpu_compiler",
         "//xla/stream_executor/platform:initialize",
         "//xla/stream_executor/vulkan:vulkan_platform_id",

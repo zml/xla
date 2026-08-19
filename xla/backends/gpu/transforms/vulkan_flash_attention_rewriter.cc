@@ -32,7 +32,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 
 namespace xla::gpu {
 namespace {
@@ -125,15 +125,15 @@ class FlashAttentionVisitor : public DfsHloRewriteVisitor {
         call->parent()->IsFusionComputation()) {
       return absl::OkStatus();
     }
-    RETURN_IF_ERROR(ValidateFlashAttentionCall(*call));
-    ASSIGN_OR_RETURN(HloComputation * fusion_body, CreateFusionBody(*call));
+    ABSL_RETURN_IF_ERROR(ValidateFlashAttentionCall(*call));
+    ABSL_ASSIGN_OR_RETURN(HloComputation * fusion_body, CreateFusionBody(*call));
     HloInstruction* fusion = call->parent()->AddInstruction(
         HloInstruction::CreateFusion(call->shape(),
                                      HloInstruction::FusionKind::kCustom,
                                      call->operands(), fusion_body));
     call->GetModule()->SetAndUniquifyInstrName(fusion,
                                                "vulkan_flash_attention");
-    RETURN_IF_ERROR(SetBackendConfig(*fusion));
+    ABSL_RETURN_IF_ERROR(SetBackendConfig(*fusion));
     return ReplaceInstruction(call, fusion);
   }
 };

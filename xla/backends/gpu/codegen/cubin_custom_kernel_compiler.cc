@@ -24,7 +24,7 @@ limitations under the License.
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/Module.h"
@@ -152,7 +152,7 @@ absl::StatusOr<std::unique_ptr<Thunk>> CubinCustomKernelCompiler::CompileImpl(
         kernel_arguments.args().size(), launch_dimensions.block_counts(),
         launch_dimensions.thread_counts_per_block(), 0);
   };
-  ASSIGN_OR_RETURN(CustomKernel custom_kernel, create_custom_kernel());
+  ABSL_ASSIGN_OR_RETURN(CustomKernel custom_kernel, create_custom_kernel());
 
   return std::make_unique<CustomKernelThunk>(
       thunk_info, std::move(custom_kernel), kernel_arguments);

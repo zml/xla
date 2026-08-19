@@ -55,7 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/stream_common.h"
 #include "tsl/profiler/lib/traceme.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 
 namespace stream_executor::vulkan {
 namespace {
@@ -670,7 +670,7 @@ class VulkanDriver {
     }
 
     PFN_vkCreateInstance create_instance = nullptr;
-    RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_, "vkCreateInstance",
+    ABSL_RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_, "vkCreateInstance",
                                    &create_instance));
 
     const bool validation_requested = ValidationRequested();
@@ -679,7 +679,7 @@ class VulkanDriver {
     bool synchronization_validation = false;
 
     PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
-    RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
+    ABSL_RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
                                    "vkEnumerateInstanceExtensionProperties",
                                    &enumerate_extensions));
     uint32_t extension_count = 0;
@@ -699,7 +699,7 @@ class VulkanDriver {
 
     if (validation_requested) {
       PFN_vkEnumerateInstanceLayerProperties enumerate_layers = nullptr;
-      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
+      ABSL_RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
                                      "vkEnumerateInstanceLayerProperties",
                                      &enumerate_layers));
 
@@ -780,15 +780,15 @@ class VulkanDriver {
     }
     RETURN_IF_VK_ERROR(
         create_instance(&create_info, /*pAllocator=*/nullptr, &instance_));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkDestroyInstance", &destroy_instance_));
 
     if (validation_requested) {
       PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger = nullptr;
-      RETURN_IF_ERROR(LoadInstanceProc(
+      ABSL_RETURN_IF_ERROR(LoadInstanceProc(
           get_instance_proc_addr_, instance_, "vkCreateDebugUtilsMessengerEXT",
           &create_debug_messenger));
-      RETURN_IF_ERROR(LoadInstanceProc(
+      ABSL_RETURN_IF_ERROR(LoadInstanceProc(
           get_instance_proc_addr_, instance_,
           "vkDestroyDebugUtilsMessengerEXT",
           &destroy_debug_utils_messenger_));
@@ -801,37 +801,37 @@ class VulkanDriver {
     }
 
     PFN_vkEnumeratePhysicalDevices enumerate_physical_devices = nullptr;
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkEnumeratePhysicalDevices",
                                      &enumerate_physical_devices));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceProperties",
                                      &get_physical_device_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceProperties2",
                                      &get_physical_device_properties2));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceFeatures2",
                                      &get_physical_device_features2));
-    RETURN_IF_ERROR(LoadInstanceProc(
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
         get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties",
         &get_physical_device_memory_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
         get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties2",
         &get_physical_device_memory_properties2));
-    RETURN_IF_ERROR(LoadInstanceProc(
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
         get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceQueueFamilyProperties",
         &get_physical_device_queue_family_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
         get_instance_proc_addr_, instance_,
         "vkEnumerateDeviceExtensionProperties",
         &enumerate_device_extension_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkCreateDevice", &create_device));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetDeviceProcAddr",
                                      &get_device_proc_addr));
 
@@ -985,22 +985,22 @@ QueryDevicePerformanceProperties(VkPhysicalDevice physical_device,
         properties->deviceName, properties->vendorID));
   }
 
-  RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_CORE_COUNT", &performance.core_count,
       &performance.probe_diagnostics));
-  RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_THREADS_PER_CORE", &performance.threads_per_core,
       &performance.probe_diagnostics));
-  RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_FPUS_PER_CORE", &performance.fpus_per_core,
       &performance.probe_diagnostics));
-  RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_MEMORY_BANDWIDTH_BYTES_PER_SECOND",
       &performance.memory_bandwidth, &performance.probe_diagnostics));
-  RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
       "XLA_VULKAN_L2_CACHE_SIZE_BYTES", &performance.l2_cache_size,
       &performance.probe_diagnostics));
-  RETURN_IF_ERROR(ApplyPositiveFloatOverride(
+  ABSL_RETURN_IF_ERROR(ApplyPositiveFloatOverride(
       "XLA_VULKAN_CLOCK_RATE_GHZ", &performance.clock_rate_ghz,
       &performance.probe_diagnostics));
   return performance;
@@ -1336,7 +1336,7 @@ struct VulkanExecutor::Impl {
   }
 
   absl::Status Initialize(int ordinal) {
-    RETURN_IF_ERROR(Driver().Initialize());
+    ABSL_RETURN_IF_ERROR(Driver().Initialize());
     if (ordinal < 0 || ordinal >= Driver().physical_devices().size()) {
       return absl::OutOfRangeError(
           absl::StrFormat("Vulkan device ordinal %d is out of range", ordinal));
@@ -1373,7 +1373,7 @@ struct VulkanExecutor::Impl {
           "Vulkan device %s does not support required extension %s",
           properties.deviceName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME));
     }
-    TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
+    ABSL_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
                         Driver().GetShaderFeatures(physical_device));
     shader_bfloat16 = shader_features.shader_bfloat16;
     storage_buffer_16bit_access =
@@ -1496,7 +1496,7 @@ struct VulkanExecutor::Impl {
         physical_device, &device_info, /*pAllocator=*/nullptr, &device));
 
 #define LOAD_DEVICE_PROC(name)                                                \
-  RETURN_IF_ERROR(LoadDeviceProc(Driver().get_device_proc_addr, device, #name, \
+  ABSL_RETURN_IF_ERROR(LoadDeviceProc(Driver().get_device_proc_addr, device, #name, \
                                  &name))
     LOAD_DEVICE_PROC(vkDestroyDevice);
     LOAD_DEVICE_PROC(vkGetDeviceQueue);
@@ -1539,19 +1539,19 @@ struct VulkanExecutor::Impl {
 #undef LOAD_DEVICE_PROC
 
     if (Driver().debug_utils_enabled()) {
-      RETURN_IF_ERROR(LoadDeviceProc(
+      ABSL_RETURN_IF_ERROR(LoadDeviceProc(
           Driver().get_device_proc_addr, device,
           "vkSetDebugUtilsObjectNameEXT", &vkSetDebugUtilsObjectNameEXT));
-      RETURN_IF_ERROR(LoadDeviceProc(
+      ABSL_RETURN_IF_ERROR(LoadDeviceProc(
           Driver().get_device_proc_addr, device,
           "vkCmdBeginDebugUtilsLabelEXT", &vkCmdBeginDebugUtilsLabelEXT));
-      RETURN_IF_ERROR(LoadDeviceProc(
+      ABSL_RETURN_IF_ERROR(LoadDeviceProc(
           Driver().get_device_proc_addr, device,
           "vkCmdEndDebugUtilsLabelEXT", &vkCmdEndDebugUtilsLabelEXT));
-      RETURN_IF_ERROR(LoadDeviceProc(
+      ABSL_RETURN_IF_ERROR(LoadDeviceProc(
           Driver().get_device_proc_addr, device,
           "vkQueueBeginDebugUtilsLabelEXT", &vkQueueBeginDebugUtilsLabelEXT));
-      RETURN_IF_ERROR(LoadDeviceProc(
+      ABSL_RETURN_IF_ERROR(LoadDeviceProc(
           Driver().get_device_proc_addr, device,
           "vkQueueEndDebugUtilsLabelEXT", &vkQueueEndDebugUtilsLabelEXT));
     }
@@ -1775,31 +1775,31 @@ class VulkanStream final : public StreamCommon {
   }
   absl::Status Memcpy(void* host_dst, const DeviceAddressBase& gpu_src,
                       uint64_t size) override {
-    RETURN_IF_ERROR(BlockHostUntilDone());
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
     return executor_->SynchronousMemcpy(host_dst, gpu_src, size);
   }
   absl::Status Memcpy(DeviceAddressBase* gpu_dst, const void* host_src,
                       uint64_t size) override {
-    RETURN_IF_ERROR(BlockHostUntilDone());
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
     return executor_->SynchronousMemcpy(gpu_dst, host_src, size);
   }
   absl::Status Memcpy(DeviceAddressBase* gpu_dst,
                       const DeviceAddressBase& gpu_src,
                       uint64_t size) override {
-    RETURN_IF_ERROR(BlockHostUntilDone());
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
     return executor_->MemcpyDeviceToDevice(gpu_dst, gpu_src, size);
   }
   absl::Status MemZero(DeviceAddressBase* location, uint64_t size) override {
-    RETURN_IF_ERROR(BlockHostUntilDone());
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
     return executor_->Memset(location, 0, size);
   }
   absl::Status Memset32(DeviceAddressBase* location, uint32_t pattern,
                         uint64_t size) override {
-    RETURN_IF_ERROR(BlockHostUntilDone());
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
     return executor_->Memset32(location, pattern, size);
   }
   absl::Status BlockHostUntilDone() override {
-    RETURN_IF_ERROR(executor_->WaitTimeline(DependencyValue()));
+    ABSL_RETURN_IF_ERROR(executor_->WaitTimeline(DependencyValue()));
     wait_value_ = 0;
     return absl::OkStatus();
   }
@@ -1841,7 +1841,7 @@ absl::Status VulkanKernel::Launch(
   if (vulkan_stream == nullptr) {
     return absl::InvalidArgumentError("Vulkan kernel requires VulkanStream");
   }
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       uint64_t value,
       executor_->Launch(*this, thread_dims, block_dims, args,
                         vulkan_stream->wait_value()));
@@ -1894,22 +1894,27 @@ class VulkanCommandBuffer final : public CommandBuffer {
 
   absl::StatusOr<const Command*> CreateEmptyCmd(
       absl::Span<const Command* const>, StreamPriority) override {
-    RETURN_IF_ERROR(CheckCreating());
+    ABSL_RETURN_IF_ERROR(CheckCreating());
     commands_.push_back(std::make_unique<EmptyCommand>());
     return commands_.back().get();
   }
 
   absl::StatusOr<const Command*> CreateLaunch(
-      const ThreadDim& threads, const BlockDim& blocks, const Kernel& kernel,
+      const ThreadDim& threads, const BlockDim& blocks,
+      const std::optional<ClusterDim>& cluster_dims, const Kernel& kernel,
       const KernelArgs& args, absl::Span<const Command* const>,
       StreamPriority) override {
-    RETURN_IF_ERROR(CheckCreating());
+    ABSL_RETURN_IF_ERROR(CheckCreating());
+    if (cluster_dims.has_value()) {
+      return absl::UnimplementedError(
+          "Vulkan command buffers do not support cluster launches");
+    }
     auto* vulkan_kernel = dynamic_cast<const VulkanKernel*>(&kernel);
     if (vulkan_kernel == nullptr) {
       return absl::InvalidArgumentError(
           "Vulkan command buffer requires a VulkanKernel");
     }
-    ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
+    ABSL_ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
                      GetDeviceArguments(args));
     auto command = std::make_unique<LaunchCommand>();
     command->kernel = vulkan_kernel;
@@ -1922,15 +1927,21 @@ class VulkanCommandBuffer final : public CommandBuffer {
   }
 
   absl::Status UpdateLaunch(const Command* command, const ThreadDim& threads,
-                            const BlockDim& blocks, const Kernel& kernel,
+                            const BlockDim& blocks,
+                            const std::optional<ClusterDim>& cluster_dims,
+                            const Kernel& kernel,
                             const KernelArgs& args) override {
-    RETURN_IF_ERROR(CheckUpdating());
+    ABSL_RETURN_IF_ERROR(CheckUpdating());
+    if (cluster_dims.has_value()) {
+      return absl::UnimplementedError(
+          "Vulkan command buffers do not support cluster launches");
+    }
     auto* launch = dynamic_cast<const LaunchCommand*>(command);
     auto* vulkan_kernel = dynamic_cast<const VulkanKernel*>(&kernel);
     if (launch == nullptr || vulkan_kernel == nullptr) {
       return absl::InvalidArgumentError("Invalid Vulkan launch update");
     }
-    ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
+    ABSL_ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
                      GetDeviceArguments(args));
     auto* mutable_launch = const_cast<LaunchCommand*>(launch);
     mutable_launch->kernel = vulkan_kernel;
@@ -1951,7 +1962,7 @@ class VulkanCommandBuffer final : public CommandBuffer {
       return absl::InvalidArgumentError(
           "Vulkan command buffer requires a VulkanStream");
     }
-    ASSIGN_OR_RETURN(std::unique_ptr<VulkanExecutor::CommandBatch> batch,
+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<VulkanExecutor::CommandBatch> batch,
                      executor_->BeginCommandBatch());
     for (const auto& command : commands_) {
       auto* launch = dynamic_cast<const LaunchCommand*>(command.get());
@@ -1969,7 +1980,7 @@ class VulkanCommandBuffer final : public CommandBuffer {
       executor_->DestroyCommandBatch(batch.get());
       return absl::OkStatus();
     }
-    ASSIGN_OR_RETURN(uint64_t value,
+    ABSL_ASSIGN_OR_RETURN(uint64_t value,
                      executor_->SubmitCommandBatch(
                          std::move(batch), vulkan_stream->wait_value(),
                          absl::StrFormat("XLA Vulkan command buffer [%d]",
@@ -2096,13 +2107,13 @@ VulkanExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
 void VulkanExecutor::ShutdownDriver() { Driver().Shutdown(); }
 
 absl::StatusOr<int> VulkanExecutor::GetDeviceCount() {
-  RETURN_IF_ERROR(Driver().Initialize());
+  ABSL_RETURN_IF_ERROR(Driver().Initialize());
   return Driver().physical_devices().size();
 }
 
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
-  RETURN_IF_ERROR(Driver().Initialize());
+  ABSL_RETURN_IF_ERROR(Driver().Initialize());
   if (device_ordinal < 0 ||
       device_ordinal >= Driver().physical_devices().size()) {
     return absl::OutOfRangeError("Vulkan device ordinal is out of range");
@@ -2112,12 +2123,12 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
   VkPhysicalDeviceMemoryProperties memory_properties = {};
   Driver().get_physical_device_memory_properties(physical_device,
                                                  &memory_properties);
-  TF_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
+  ABSL_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
                       Driver().GetShaderFeatures(physical_device));
-  TF_ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       VulkanDevicePerformanceProperties performance,
       QueryDevicePerformanceProperties(physical_device, &properties));
-  RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       ValidateDevicePerformanceProperties(properties, performance));
 
   auto description = std::make_unique<DeviceDescription>();
@@ -2483,7 +2494,7 @@ absl::Status VulkanExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
     return tsl::profiler::TraceMeEncode("VulkanMemcpyH2D",
                                         {{"bytes", size}});
   });
-  ASSIGN_OR_RETURN(Impl::AllocationView view,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(device_dst->opaque(), size));
   std::memcpy(static_cast<std::byte*>(view.allocation->mapped) + view.offset,
               host_src, size);
@@ -2498,7 +2509,7 @@ absl::Status VulkanExecutor::SynchronousMemcpy(
     return tsl::profiler::TraceMeEncode("VulkanMemcpyD2H",
                                         {{"bytes", size}});
   });
-  ASSIGN_OR_RETURN(Impl::AllocationView view,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(device_src.opaque(), size));
   std::memcpy(host_dst,
               static_cast<std::byte*>(view.allocation->mapped) + view.offset,
@@ -2516,9 +2527,9 @@ absl::Status VulkanExecutor::MemcpyDeviceToDevice(
     return tsl::profiler::TraceMeEncode("VulkanMemcpyD2D",
                                         {{"bytes", size}});
   });
-  ASSIGN_OR_RETURN(Impl::AllocationView dst,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView dst,
                    impl_->FindAllocation(device_dst->opaque(), size));
-  ASSIGN_OR_RETURN(Impl::AllocationView src,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView src,
                    impl_->FindAllocation(device_src.opaque(), size));
   std::memmove(static_cast<std::byte*>(dst.allocation->mapped) + dst.offset,
                static_cast<std::byte*>(src.allocation->mapped) + src.offset,
@@ -2532,7 +2543,7 @@ absl::Status VulkanExecutor::Memset(DeviceAddressBase* location, uint8_t value,
     return tsl::profiler::TraceMeEncode(
         "VulkanMemset", {{"bytes", size}, {"value", value}});
   });
-  ASSIGN_OR_RETURN(Impl::AllocationView view,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(location->opaque(), size));
   std::memset(static_cast<std::byte*>(view.allocation->mapped) + view.offset,
               value, size);
@@ -2550,7 +2561,7 @@ absl::Status VulkanExecutor::Memset32(DeviceAddressBase* location,
     return absl::InvalidArgumentError(
         "Vulkan Memset32 requires 4-byte size and alignment");
   }
-  ASSIGN_OR_RETURN(Impl::AllocationView view,
+  ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(location->opaque(), size));
   auto* begin = reinterpret_cast<uint32_t*>(
       static_cast<std::byte*>(view.allocation->mapped) + view.offset);
@@ -2725,7 +2736,7 @@ absl::Status VulkanExecutor::RecordLaunch(
       "%s [grid=%dx%dx%d, block=%dx%dx%d]", kernel.name(), block_dims.x,
       block_dims.y, block_dims.z, thread_dims.x, thread_dims.y, thread_dims.z);
 
-  ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
+  ABSL_ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
                    GetDeviceArguments(args));
   if (arguments.size() < kernel.Arity()) {
     return absl::InvalidArgumentError(absl::StrFormat(
@@ -2742,7 +2753,7 @@ absl::Status VulkanExecutor::RecordLaunch(
       return absl::InvalidArgumentError("Vulkan descriptor argument is missing");
     }
     const DeviceAddressBase& argument = arguments[binding.argument_index];
-    ASSIGN_OR_RETURN(Impl::AllocationView view,
+    ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
                      impl_->FindAllocation(argument.opaque(), argument.size()));
     VkDescriptorBufferInfo buffer_info = {};
     buffer_info.buffer = view.allocation->buffer;
@@ -2857,7 +2868,7 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
     const VulkanKernel& kernel, const ThreadDim& thread_dims,
     const BlockDim& block_dims, const KernelArgs& args,
     uint64_t wait_value) {
-  ASSIGN_OR_RETURN(std::unique_ptr<CommandBatch> batch, BeginCommandBatch());
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<CommandBatch> batch, BeginCommandBatch());
   absl::Status recorded =
       RecordLaunch(batch.get(), kernel, thread_dims, block_dims, args);
   if (!recorded.ok()) {

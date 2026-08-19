@@ -20,7 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -175,13 +175,13 @@ VulkanGemmEmitter::CreateMLIRModule(
   mlir::OpBuilder builder(&mlir_context);
   auto loc = mlir::NameLoc::get(builder.getStringAttr(fusion.name()));
   mlir::OwningOpRef<mlir::ModuleOp> module = llvm_ir::CreateMlirModuleOp(loc);
-  ASSIGN_OR_RETURN(mlir::func::FuncOp entry_function,
+  ABSL_ASSIGN_OR_RETURN(mlir::func::FuncOp entry_function,
                    emitters::EmitKernelApi(*module, fusion, buffer_assignment,
                                            GetDefaultBufferAlignment(),
                                            entry_function_name));
   SetBackendKind(&mlir_context, entry_function, BackendKind::kGpu);
   emitters::SetIndexDataLayout(*module, fusion);
-  RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
+  ABSL_RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
   TF_RET_CHECK(mlir::succeeded(mlir::verify(*module)))
       << "Vulkan GEMM emitter produced invalid MLIR";
   return module;

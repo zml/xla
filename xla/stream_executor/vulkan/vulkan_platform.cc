@@ -25,7 +25,7 @@ limitations under the License.
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/vulkan/vulkan_executor.h"
 #include "xla/stream_executor/vulkan/vulkan_platform_id.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 
 namespace stream_executor::vulkan {
 
@@ -66,7 +66,7 @@ void VulkanPlatform::Shutdown() {
 absl::StatusOr<std::unique_ptr<StreamExecutor>>
 VulkanPlatform::GetUncachedExecutor(int ordinal) {
   auto executor = std::make_unique<VulkanExecutor>(this, ordinal);
-  RETURN_IF_ERROR(executor->Init());
+  ABSL_RETURN_IF_ERROR(executor->Init());
   return std::move(executor);
 }
 

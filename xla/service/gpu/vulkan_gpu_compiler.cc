@@ -30,7 +30,7 @@ limitations under the License.
 #include "xla/service/gpu/target_constants.h"
 #include "xla/stream_executor/vulkan/vulkan_platform_id.h"
 #include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "absl/status/status_macros.h"
 
 namespace xla::gpu {
 
@@ -59,11 +59,11 @@ absl::Status VulkanGpuCompiler::AddAutotunerPass(
 
 absl::Status VulkanGpuCompiler::OptimizeHloPostLayoutAssignment(
     HloModule* hlo_module, se::StreamExecutor* stream_exec,
-    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const CompileOptions& options, const GpuTopology& gpu_topology,
     const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
     CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
-  RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
-      hlo_module, stream_exec, options, gpu_target_config, alias_info,
+  ABSL_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
+      hlo_module, stream_exec, options, gpu_topology, alias_info,
       thread_pool, compilation_stats, mlir_context));
 
   HloPassPipeline pipeline("vulkan post-layout assignment",
@@ -93,7 +93,7 @@ VulkanGpuCompiler::CompileTargetBinary(
     return BackendCompileResult{/*asm_text=*/"", /*binary=*/{}};
   }
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::string spirv,
       spirv::CompileToVulkanSPIRV(
           llvm_module, device_description.gpu_compute_capability(),
