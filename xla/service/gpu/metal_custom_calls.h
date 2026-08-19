@@ -70,7 +70,9 @@ enum class MetalScaledMatmulScheme {
   kNvfp4Group16,
   // f8e4m3fn w[N,K] + bf16 scale[N/128,K/128] -> MetalFp8GemvThunk.
   kFp8Block128,
-  // f8e4m3fn w[N,K] + bf16 scale[N,1] -> MetalFp8GemvThunk.
+  // f8e4m3fn w[N,K] + bf16 or f32 scale[N,1] -> MetalFp8GemvThunk. Also serves
+  // a whole-tensor scale[1,1], which is the same kernel read at stride 0, so it
+  // gets no enumerator of its own.
   kFp8PerChannel,
 };
 
@@ -95,18 +97,32 @@ inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
     }
     return std::nullopt;
   }
-  if (weights.element_type() == F8E4M3FN && scale.element_type() == BF16) {
+  if (weights.element_type() == F8E4M3FN) {
+    const bool bf16_scale = scale.element_type() == BF16;
+    const bool f32_scale = scale.element_type() == F32;
+
+    // Block-128 is tested first, and only for BF16. Two reasons, both of which
+    // only bite once scale_n == 1 is admitted below: a [1, 1] scale on an
+    // exactly [128, 128] weight satisfies scale_n == n / 128, so it would
+    // change arm if per-channel matched first; and the block-128 entries take
+    // `device const bfloat*`, where an f32 buffer reads as pairs of bf16 and
+    // silently produces garbage. Only the per-channel family has _f32 entries.
+    if (bf16_scale && n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&
+        scale_k == k / 128) {
+      return MetalScaledMatmulScheme::kFp8Block128;
+    }
+    // scale_n == 1 is a whole-tensor scale, which the per-channel kernels serve
+    // at stride 0 -- every output row reads element 0. It is the same kernel,
+    // not a separate arm, so there is no enumerator for it.
+    //
     // The per-channel kernels place no bound on N, but they do on K: the decode
     // GEMV (fp8_gemv_pc) strides the contraction by 4 and silently drops a
     // shorter tail, and the thin-M/prefill qmm (fp8_qmm_t_pc) loads a full
     // BK=32 tile with no tail arm, so it would read past the weights. K % 32
-    // covers both. kFp8Block128 below needs no such check -- K % 128 implies it.
-    if (scale_n == n && scale_k == 1 && k % 32 == 0) {
+    // covers both. kFp8Block128 above needs no such check -- K % 128 implies it.
+    if ((bf16_scale || f32_scale) && (scale_n == n || scale_n == 1) &&
+        scale_k == 1 && k % 32 == 0) {
       return MetalScaledMatmulScheme::kFp8PerChannel;
-    }
-    if (n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&
-        scale_k == k / 128) {
-      return MetalScaledMatmulScheme::kFp8Block128;
     }
   }
   return std::nullopt;

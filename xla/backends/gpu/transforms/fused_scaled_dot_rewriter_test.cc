@@ -182,6 +182,55 @@ TEST(MetalScaledMatmulSchemeTest, ClassifiesTheThreeImplementedSchemes) {
             MetalScaledMatmulScheme::kFp8Block128);
 }
 
+// A whole-tensor scale is per-channel read at stride 0, so it classifies as
+// kFp8PerChannel rather than getting an arm of its own. ModelOpt writes these
+// as f32, and the per-channel kernels have _f32 entries, so both dtypes go.
+TEST(MetalScaledMatmulSchemeTest, ClassifiesPerTensorAndF32Scales) {
+  // [1, 1]: the shape a rank-0 scale arrives in, since xla.scaled_dot requires
+  // the scale to carry the operand's rank.
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(F32, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  // f32 per-channel: what llmd emits for a fused q/k/v whose members each
+  // carried their own whole-tensor scale.
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(F32, {8, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  // K % 32 still applies to all of them.
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 24}),
+                                         ShapeUtil::MakeShape(F32, {1, 1}))
+                   .has_value());
+}
+
+// Two shapes that satisfy both FP8 arms once scale_n == 1 is admitted. The
+// classifier tests block-128 first so they keep their existing answer; ordered
+// the other way these would silently change kernel.
+TEST(MetalScaledMatmulSchemeTest, BlockOneTwentyEightWinsTheAmbiguousShapes) {
+  // scale_n == n / 128 == 1 and scale_k == k / 128 == 1, and simultaneously
+  // scale_n == 1, so per-channel would also match.
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {128, 128}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8Block128);
+  // N == 1 makes scale_n == n == 1 for a [1,1] scale, but K is not a multiple
+  // of 128 so block-128 declines and per-channel takes it.
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {1, 32}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+}
+
+// The block-128 entries take `device const bfloat*`; an f32 buffer bound there
+// reads as pairs of bf16 and silently produces garbage. Only the per-channel
+// family has _f32 entries, so the f32 relaxation must not reach this arm.
+TEST(MetalScaledMatmulSchemeTest, BlockOneTwentyEightStaysBf16Only) {
+  EXPECT_FALSE(
+      ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {256, 256}),
+                                ShapeUtil::MakeShape(F32, {2, 2}))
+          .has_value());
+}
+
 // Same grids as above, e8m0 scales: only the dtype differs, so each of these
 // isolates one scale-dtype guard. MX has no thunk, so all three must decline.
 TEST(MetalScaledMatmulSchemeTest, E8m0ScalesAreNeverClassified) {
