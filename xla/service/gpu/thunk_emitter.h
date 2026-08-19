@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_hlo_ordering.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
@@ -299,7 +300,7 @@ class ThunkEmitter {
       const HloCustomCallInstruction* hlo);
 
   absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
-      const HloCustomCallInstruction* hlo);
+      const HloCustomCallInstruction* hlo, MetalScaledMatmulScheme scheme);
 
   absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
       const HloCustomCallInstruction* hlo);

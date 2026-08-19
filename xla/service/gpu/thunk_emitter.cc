@@ -1352,7 +1352,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
       return EmitMetalNvfp4MatmulThunk(instr);
     case MetalScaledMatmulScheme::kFp8Block128:
     case MetalScaledMatmulScheme::kFp8PerChannel:
-      return EmitMetalFp8GemvThunk(instr);
+      return EmitMetalFp8GemvThunk(instr, *scheme);
   }
 }
 
@@ -1453,7 +1453,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
-    const HloCustomCallInstruction* instr) {
+    const HloCustomCallInstruction* instr, MetalScaledMatmulScheme scheme) {
   if (instr->operand_count() != 3) {
     return absl::InvalidArgumentError(
         "zml$scaled_matmul (FP8) expects 3 operands (x, w, scale).");
@@ -1482,15 +1482,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
     return absl::UnimplementedError(
         "zml$scaled_matmul (FP8): w must be f8e4m3fn[N, K] (K minor).");
   }
-  const bool per_channel = (scale_shape.dimensions(0) == n &&
-                            scale_shape.dimensions(1) == 1 && k % 32 == 0);
-  const bool block_128 = (k % 128 == 0 && n % 128 == 0 &&
-                          scale_shape.dimensions(0) == n / 128 &&
-                          scale_shape.dimensions(1) == k / 128);
-  if (scale_shape.element_type() != BF16 || (!per_channel && !block_128)) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (FP8): scale must be bf16 [N/128,K/128] or [N,1].");
-  }
+  const bool per_channel = scheme == MetalScaledMatmulScheme::kFp8PerChannel;
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
         "zml$scaled_matmul (FP8): x and out must be bf16.");
