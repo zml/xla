@@ -14,7 +14,9 @@ static inline float decode_e4m3fn(uchar b) {
 // output channel and is constant across K, so it factors out of the reduction:
 //   out[bi, ni] = scale[ni] * sum_k x[bi, k] * decode_e4m3fn(w[ni, k])
 //   x:     bfloat [B, K]     w: uchar [N, K] (f8e4m3fn)
-//   scale: bfloat [N, 1]     out: bfloat [B, N]     dims = (B, K, N, unused)
+//   scale: bfloat [N, 1]     out: bfloat [B, N]
+//   dims = (B, K, N, scale row stride: 1 for [N,1], negative for a [1,1]
+//           whole-tensor scale, which is stride 0)
 kernel void fp8_gemv_pc(
     device const bfloat *x      [[buffer(0)]],
     device const uchar  *w      [[buffer(1)]],
@@ -52,6 +54,9 @@ kernel void fp8_gemv_pc(
     if (sgid == 0) {
         float t = (lane < 8) ? part[lane] : 0.0f;
         t = simd_sum(t);
-        if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[ni]) * t);
+        // Stride 0 makes every threadgroup read scale[0] -- a uniform load,
+        // cheaper than the per-row one -- which is a whole-tensor scale.
+        const int si = (dims.w < 0) ? 0 : ni;
+        if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
     }
 }

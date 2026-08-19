@@ -100,9 +100,17 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
                                         lib_pc, "fp8_gemv_pc", /*arity=*/5, {}));
   }
 
+  // dims.w means two different things by scheme. The block-128 GEMV reads it as
+  // K/128; the per-channel kernels ignored it and now read it as the scale's
+  // row stride, with a negative sentinel for a [1, 1] whole-tensor scale. The
+  // sentinel has to be negative rather than 0, because k_/128 is exactly 1 for
+  // every K in {128, 160, 192, 224} -- all legal under K % 32 -- so a stale
+  // write would be indistinguishable from a real stride.
+  const int32_t scale_w =
+      per_channel_ ? (scale_shape_.dimensions(0) == n_ ? 1 : -1)
+                   : static_cast<int32_t>(k_ / 128);
   const int32_t dims[4] = {static_cast<int32_t>(b_), static_cast<int32_t>(k_),
-                           static_cast<int32_t>(n_),
-                           static_cast<int32_t>(k_ / 128)};
+                           static_cast<int32_t>(n_), scale_w};
   p_dims_ = executor->Allocate(sizeof(dims), 0);
   if (p_dims_.opaque() == nullptr) {
     return absl::ResourceExhaustedError(
