@@ -168,6 +168,37 @@ TEST(MetalScaledMatmulSchemeTest, ClassifiesTheThreeImplementedSchemes) {
             MetalScaledMatmulScheme::kFp8Block128);
 }
 
+TEST(MetalScaledMatmulSchemeTest, ClassifiesPerTensorAndF32Scales) {
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(F32, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(F32, {8, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 24}),
+                                         ShapeUtil::MakeShape(F32, {1, 1}))
+                   .has_value());
+}
+
+TEST(MetalScaledMatmulSchemeTest, BlockOneTwentyEightWinsTheAmbiguousShapes) {
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {128, 128}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8Block128);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {1, 32}),
+                                      ShapeUtil::MakeShape(BF16, {1, 1})),
+            MetalScaledMatmulScheme::kFp8PerChannel);
+}
+
+TEST(MetalScaledMatmulSchemeTest, BlockOneTwentyEightStaysBf16Only) {
+  EXPECT_FALSE(
+      ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {256, 256}),
+                                ShapeUtil::MakeShape(F32, {2, 2}))
+          .has_value());
+}
+
 TEST(MetalScaledMatmulSchemeTest, E8m0ScalesAreNeverClassified) {
   EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F4E2M1FN, {8, 32}),
                                          ShapeUtil::MakeShape(F8E8M0FNU, {8, 2}))

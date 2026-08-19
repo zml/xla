@@ -56,13 +56,20 @@ inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
     }
     return std::nullopt;
   }
-  if (weights.element_type() == F8E4M3FN && scale.element_type() == BF16) {
-    if (scale_n == n && scale_k == 1 && k % 32 == 0) {
-      return MetalScaledMatmulScheme::kFp8PerChannel;
-    }
-    if (n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&
+  if (weights.element_type() == F8E4M3FN) {
+    const bool bf16_scale = scale.element_type() == BF16;
+    const bool f32_scale = scale.element_type() == F32;
+
+    // Block-128 is tested first and only for bf16: a [1, 1] scale on a
+    // single-block weight matches both arms, and the block-128 entries read an
+    // f32 scale as bf16 pairs.
+    if (bf16_scale && n % 128 == 0 && k % 128 == 0 && scale_n == n / 128 &&
         scale_k == k / 128) {
       return MetalScaledMatmulScheme::kFp8Block128;
+    }
+    if ((bf16_scale || f32_scale) && (scale_n == n || scale_n == 1) &&
+        scale_k == 1 && k % 32 == 0) {
+      return MetalScaledMatmulScheme::kFp8PerChannel;
     }
   }
   return std::nullopt;
