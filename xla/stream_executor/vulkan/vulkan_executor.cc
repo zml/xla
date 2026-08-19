@@ -19,6 +19,7 @@ limitations under the License.
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cctype>
 #include <cstddef>
@@ -35,6 +36,7 @@ limitations under the License.
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -52,6 +54,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/stream_common.h"
+#include "tsl/profiler/lib/traceme.h"
 #include "xla/tsl/platform/status_macros.h"
 
 namespace stream_executor::vulkan {
@@ -573,6 +576,8 @@ class VulkanDriver {
     return physical_devices_;
   }
 
+  bool debug_utils_enabled() const { return debug_utils_enabled_; }
+
   absl::StatusOr<VulkanShaderFeatures> GetShaderFeatures(
       VkPhysicalDevice physical_device) const {
     uint32_t extension_count = 0;
@@ -672,16 +677,31 @@ class VulkanDriver {
     std::vector<const char*> enabled_layers;
     std::vector<const char*> enabled_extensions;
     bool synchronization_validation = false;
+
+    PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
+    RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
+                                   "vkEnumerateInstanceExtensionProperties",
+                                   &enumerate_extensions));
+    uint32_t extension_count = 0;
+    RETURN_IF_VK_ERROR(
+        enumerate_extensions(nullptr, &extension_count, nullptr));
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    RETURN_IF_VK_ERROR(enumerate_extensions(nullptr, &extension_count,
+                                            extensions.data()));
+    debug_utils_enabled_ = std::any_of(
+        extensions.begin(), extensions.end(), [](const auto& extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+        });
+    if (debug_utils_enabled_) {
+      enabled_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
     if (validation_requested) {
       PFN_vkEnumerateInstanceLayerProperties enumerate_layers = nullptr;
-      PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions =
-          nullptr;
-      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr,
+      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
                                      "vkEnumerateInstanceLayerProperties",
                                      &enumerate_layers));
-      RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr,
-                                     "vkEnumerateInstanceExtensionProperties",
-                                     &enumerate_extensions));
 
       uint32_t layer_count = 0;
       RETURN_IF_VK_ERROR(enumerate_layers(&layer_count, nullptr));
@@ -698,22 +718,10 @@ class VulkanDriver {
       }
       enabled_layers.push_back(kValidationLayer);
 
-      uint32_t extension_count = 0;
-      RETURN_IF_VK_ERROR(
-          enumerate_extensions(nullptr, &extension_count, nullptr));
-      std::vector<VkExtensionProperties> extensions(extension_count);
-      RETURN_IF_VK_ERROR(enumerate_extensions(nullptr, &extension_count,
-                                              extensions.data()));
-      bool has_debug_utils = std::any_of(
-          extensions.begin(), extensions.end(), [](const auto& extension) {
-            return std::strcmp(extension.extensionName,
-                               VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
-          });
-      if (!has_debug_utils) {
+      if (!debug_utils_enabled_) {
         return absl::FailedPreconditionError(
             "Vulkan validation requested, but VK_EXT_debug_utils is missing");
       }
-      enabled_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
       extension_count = 0;
       RETURN_IF_VK_ERROR(enumerate_extensions(
@@ -862,6 +870,7 @@ class VulkanDriver {
   PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils_messenger_ = nullptr;
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+  bool debug_utils_enabled_ = false;
   std::vector<VkPhysicalDevice> physical_devices_;
 };
 
@@ -1114,6 +1123,7 @@ class VulkanKernel final : public Kernel {
 
 struct VulkanExecutor::Impl {
   struct Allocation {
+    uint64_t id = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
@@ -1132,6 +1142,75 @@ struct VulkanExecutor::Impl {
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
   };
 
+  template <typename Handle>
+  static uint64_t HandleValue(Handle handle) {
+    if constexpr (std::is_pointer_v<Handle>) {
+      return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+    } else {
+      return static_cast<uint64_t>(handle);
+    }
+  }
+
+  void SetObjectName(VkObjectType type, uint64_t handle,
+                     absl::string_view name) const {
+    if (vkSetDebugUtilsObjectNameEXT == nullptr || handle == 0) return;
+    std::string null_terminated(name);
+    VkDebugUtilsObjectNameInfoEXT info = {};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType = type;
+    info.objectHandle = handle;
+    info.pObjectName = null_terminated.c_str();
+    VkResult result = vkSetDebugUtilsObjectNameEXT(device, &info);
+    if (result != VK_SUCCESS) {
+      VLOG(1) << VulkanError("vkSetDebugUtilsObjectNameEXT", result);
+    }
+  }
+
+  template <typename Handle>
+  void SetObjectName(VkObjectType type, Handle handle,
+                     absl::string_view name) const {
+    SetObjectName(type, HandleValue(handle), name);
+  }
+
+  void BeginCommandLabel(VkCommandBuffer command_buffer,
+                         absl::string_view name) const {
+    if (vkCmdBeginDebugUtilsLabelEXT == nullptr) return;
+    std::string null_terminated(name);
+    VkDebugUtilsLabelEXT label = {};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = null_terminated.c_str();
+    label.color[0] = 0.20f;
+    label.color[1] = 0.55f;
+    label.color[2] = 0.95f;
+    label.color[3] = 1.0f;
+    vkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
+  }
+
+  void EndCommandLabel(VkCommandBuffer command_buffer) const {
+    if (vkCmdEndDebugUtilsLabelEXT != nullptr) {
+      vkCmdEndDebugUtilsLabelEXT(command_buffer);
+    }
+  }
+
+  void BeginQueueLabel(absl::string_view name) const {
+    if (vkQueueBeginDebugUtilsLabelEXT == nullptr) return;
+    std::string null_terminated(name);
+    VkDebugUtilsLabelEXT label = {};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = null_terminated.c_str();
+    label.color[0] = 0.20f;
+    label.color[1] = 0.55f;
+    label.color[2] = 0.95f;
+    label.color[3] = 1.0f;
+    vkQueueBeginDebugUtilsLabelEXT(queue, &label);
+  }
+
+  void EndQueueLabel() const {
+    if (vkQueueEndDebugUtilsLabelEXT != nullptr) {
+      vkQueueEndDebugUtilsLabelEXT(queue);
+    }
+  }
+
   absl::StatusOr<uint64_t> CurrentTimelineValue() const {
     uint64_t value = 0;
     VkResult result = vkGetSemaphoreCounterValue(device, timeline, &value);
@@ -1143,6 +1222,10 @@ struct VulkanExecutor::Impl {
 
   absl::Status WaitForTimeline(uint64_t value) const {
     if (value == 0) return absl::OkStatus();
+    tsl::profiler::TraceMe trace([&] {
+      return tsl::profiler::TraceMeEncode(
+          "VulkanWaitTimeline", {{"timeline_value", value}});
+    });
     VLOG(2) << "Waiting for Vulkan timeline value " << value;
     VkSemaphoreWaitInfo wait_info = {};
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
@@ -1441,7 +1524,31 @@ struct VulkanExecutor::Impl {
     LOAD_DEVICE_PROC(vkCmdPipelineBarrier);
 #undef LOAD_DEVICE_PROC
 
+    if (Driver().debug_utils_enabled()) {
+      RETURN_IF_ERROR(LoadDeviceProc(
+          Driver().get_device_proc_addr, device,
+          "vkSetDebugUtilsObjectNameEXT", &vkSetDebugUtilsObjectNameEXT));
+      RETURN_IF_ERROR(LoadDeviceProc(
+          Driver().get_device_proc_addr, device,
+          "vkCmdBeginDebugUtilsLabelEXT", &vkCmdBeginDebugUtilsLabelEXT));
+      RETURN_IF_ERROR(LoadDeviceProc(
+          Driver().get_device_proc_addr, device,
+          "vkCmdEndDebugUtilsLabelEXT", &vkCmdEndDebugUtilsLabelEXT));
+      RETURN_IF_ERROR(LoadDeviceProc(
+          Driver().get_device_proc_addr, device,
+          "vkQueueBeginDebugUtilsLabelEXT", &vkQueueBeginDebugUtilsLabelEXT));
+      RETURN_IF_ERROR(LoadDeviceProc(
+          Driver().get_device_proc_addr, device,
+          "vkQueueEndDebugUtilsLabelEXT", &vkQueueEndDebugUtilsLabelEXT));
+    }
+
+    SetObjectName(VK_OBJECT_TYPE_DEVICE, device,
+                  absl::StrFormat("XLA Vulkan device %d: %s", ordinal,
+                                  properties.deviceName));
+
     vkGetDeviceQueue(device, queue_family_index, 0, &queue);
+    SetObjectName(VK_OBJECT_TYPE_QUEUE, queue,
+                  absl::StrFormat("XLA Vulkan compute queue %d", ordinal));
     VkCommandPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
@@ -1449,6 +1556,8 @@ struct VulkanExecutor::Impl {
     pool_info.queueFamilyIndex = queue_family_index;
     RETURN_IF_VK_ERROR(vkCreateCommandPool(device, &pool_info, nullptr,
                                             &command_pool));
+    SetObjectName(VK_OBJECT_TYPE_COMMAND_POOL, command_pool,
+                  "XLA Vulkan transient command pool");
 
     VkSemaphoreTypeCreateInfo semaphore_type = {};
     semaphore_type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -1459,6 +1568,8 @@ struct VulkanExecutor::Impl {
     semaphore_info.pNext = &semaphore_type;
     RETURN_IF_VK_ERROR(
         vkCreateSemaphore(device, &semaphore_info, nullptr, &timeline));
+    SetObjectName(VK_OBJECT_TYPE_SEMAPHORE, timeline,
+                  "XLA Vulkan completion timeline");
     completion_thread = std::thread([this] { CompletionLoop(); });
     return absl::OkStatus();
   }
@@ -1549,6 +1660,7 @@ struct VulkanExecutor::Impl {
   bool storage_buffer_16bit_access = false;
   absl::Mutex allocations_mutex;
   std::map<uintptr_t, std::unique_ptr<Allocation>> allocations;
+  std::atomic<uint64_t> next_allocation_id = 0;
   std::mutex queue_mutex;
   uint64_t next_timeline_value = 0;
   std::deque<Submission> submissions;
@@ -1596,6 +1708,11 @@ struct VulkanExecutor::Impl {
   PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets = nullptr;
   PFN_vkCmdDispatch vkCmdDispatch = nullptr;
   PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
+  PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT = nullptr;
+  PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT = nullptr;
+  PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT = nullptr;
+  PFN_vkQueueBeginDebugUtilsLabelEXT vkQueueBeginDebugUtilsLabelEXT = nullptr;
+  PFN_vkQueueEndDebugUtilsLabelEXT vkQueueEndDebugUtilsLabelEXT = nullptr;
 };
 
 class VulkanStream final : public StreamCommon {
@@ -1846,6 +1963,10 @@ VulkanExecutor::CreateDeviceDescription() const {
 
 absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
     const KernelLoaderSpec& spec) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanLoadKernel", {{"kernel", spec.kernel_name()}});
+  });
   std::optional<VulkanSpirvInMemory> spirv = spec.vulkan_spirv_in_memory();
   if (!spirv.has_value()) {
     return absl::InvalidArgumentError(
@@ -1875,6 +1996,8 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
             << " SPIR-V bytes";
   RETURN_IF_VK_ERROR(impl_->vkCreateShaderModule(
       impl_->device, &shader_info, nullptr, &kernel->shader_module_));
+  impl_->SetObjectName(VK_OBJECT_TYPE_SHADER_MODULE, kernel->shader_module_,
+                       absl::StrCat("XLA shader: ", kernel->name()));
   LOG(INFO) << "Vulkan kernel " << kernel->name()
             << ": shader module created";
 
@@ -1898,6 +2021,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   layout_info.pBindings = layout_bindings.data();
   RETURN_IF_VK_ERROR(impl_->vkCreateDescriptorSetLayout(
       impl_->device, &layout_info, nullptr, &kernel->descriptor_set_layout_));
+  impl_->SetObjectName(
+      VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, kernel->descriptor_set_layout_,
+      absl::StrCat("XLA descriptors: ", kernel->name()));
 
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1905,6 +2031,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   pipeline_layout_info.pSetLayouts = &kernel->descriptor_set_layout_;
   RETURN_IF_VK_ERROR(impl_->vkCreatePipelineLayout(
       impl_->device, &pipeline_layout_info, nullptr, &kernel->pipeline_layout_));
+  impl_->SetObjectName(VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+                       kernel->pipeline_layout_,
+                       absl::StrCat("XLA pipeline layout: ", kernel->name()));
 
   VkComputePipelineCreateInfo pipeline_info = {};
   pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1918,6 +2047,8 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   RETURN_IF_VK_ERROR(impl_->vkCreateComputePipelines(
       impl_->device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
       &kernel->pipeline_));
+  impl_->SetObjectName(VK_OBJECT_TYPE_PIPELINE, kernel->pipeline_,
+                       absl::StrCat("XLA kernel: ", kernel->name()));
   LOG(INFO) << "Vulkan kernel " << kernel->name()
             << ": compute pipeline created";
 
@@ -1957,12 +2088,18 @@ void VulkanExecutor::UnloadKernel(const Kernel* kernel) {
 
 DeviceAddressBase VulkanExecutor::Allocate(uint64_t size,
                                            int64_t memory_space) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanAllocate", {{"bytes", size}, {"memory_space", memory_space}});
+  });
   if (static_cast<MemorySpace>(memory_space) == MemorySpace::kCollective) {
     LOG(ERROR) << "Vulkan collective memory is not implemented";
     return DeviceAddressBase();
   }
   if (size == 0) return DeviceAddressBase();
   auto allocation = std::make_unique<Impl::Allocation>();
+  allocation->id =
+      impl_->next_allocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
   allocation->size = size;
 
   VkBufferCreateInfo buffer_info = {};
@@ -1978,6 +2115,9 @@ DeviceAddressBase VulkanExecutor::Allocate(uint64_t size,
     LOG(ERROR) << VulkanError("vkCreateBuffer", result);
     return DeviceAddressBase();
   }
+  impl_->SetObjectName(
+      VK_OBJECT_TYPE_BUFFER, allocation->buffer,
+      absl::StrFormat("XLA buffer %d (%d bytes)", allocation->id, size));
   VkMemoryRequirements requirements = {};
   impl_->vkGetBufferMemoryRequirements(impl_->device, allocation->buffer,
                                        &requirements);
@@ -1999,6 +2139,10 @@ DeviceAddressBase VulkanExecutor::Allocate(uint64_t size,
     impl_->vkDestroyBuffer(impl_->device, allocation->buffer, nullptr);
     return DeviceAddressBase();
   }
+  impl_->SetObjectName(
+      VK_OBJECT_TYPE_DEVICE_MEMORY, allocation->memory,
+      absl::StrFormat("XLA memory %d (%d bytes)", allocation->id,
+                      allocate_info.allocationSize));
   result = impl_->vkBindBufferMemory(impl_->device, allocation->buffer,
                                      allocation->memory, 0);
   if (result == VK_SUCCESS) {
@@ -2034,6 +2178,11 @@ void VulkanExecutor::Deallocate(DeviceAddressBase* mem) {
     allocation = std::move(it->second);
     impl_->allocations.erase(it);
   }
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanDeallocate",
+        {{"allocation_id", allocation->id}, {"bytes", allocation->size}});
+  });
   impl_->vkUnmapMemory(impl_->device, allocation->memory);
   impl_->vkDestroyBuffer(impl_->device, allocation->buffer, nullptr);
   impl_->vkFreeMemory(impl_->device, allocation->memory, nullptr);
@@ -2100,6 +2249,10 @@ void VulkanExecutor::ScheduleCallback(
 absl::Status VulkanExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
                                                const void* host_src,
                                                uint64_t size) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode("VulkanMemcpyH2D",
+                                        {{"bytes", size}});
+  });
   ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(device_dst->opaque(), size));
   std::memcpy(static_cast<std::byte*>(view.allocation->mapped) + view.offset,
@@ -2111,6 +2264,10 @@ absl::Status VulkanExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
 
 absl::Status VulkanExecutor::SynchronousMemcpy(
     void* host_dst, const DeviceAddressBase& device_src, uint64_t size) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode("VulkanMemcpyD2H",
+                                        {{"bytes", size}});
+  });
   ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(device_src.opaque(), size));
   std::memcpy(host_dst,
@@ -2125,6 +2282,10 @@ absl::Status VulkanExecutor::SynchronousMemcpy(
 absl::Status VulkanExecutor::MemcpyDeviceToDevice(
     DeviceAddressBase* device_dst, const DeviceAddressBase& device_src,
     uint64_t size) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode("VulkanMemcpyD2D",
+                                        {{"bytes", size}});
+  });
   ASSIGN_OR_RETURN(Impl::AllocationView dst,
                    impl_->FindAllocation(device_dst->opaque(), size));
   ASSIGN_OR_RETURN(Impl::AllocationView src,
@@ -2137,6 +2298,10 @@ absl::Status VulkanExecutor::MemcpyDeviceToDevice(
 
 absl::Status VulkanExecutor::Memset(DeviceAddressBase* location, uint8_t value,
                                     uint64_t size) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanMemset", {{"bytes", size}, {"value", value}});
+  });
   ASSIGN_OR_RETURN(Impl::AllocationView view,
                    impl_->FindAllocation(location->opaque(), size));
   std::memset(static_cast<std::byte*>(view.allocation->mapped) + view.offset,
@@ -2146,6 +2311,10 @@ absl::Status VulkanExecutor::Memset(DeviceAddressBase* location, uint8_t value,
 
 absl::Status VulkanExecutor::Memset32(DeviceAddressBase* location,
                                       uint32_t value, uint64_t size) {
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanMemset32", {{"bytes", size}, {"value", value}});
+  });
   if (size % sizeof(uint32_t) != 0 ||
       reinterpret_cast<uintptr_t>(location->opaque()) % alignof(uint32_t) != 0) {
     return absl::InvalidArgumentError(
