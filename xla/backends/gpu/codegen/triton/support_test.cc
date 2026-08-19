@@ -2465,7 +2465,7 @@ INSTANTIATE_TEST_SUITE_P(
 // 32. Anything else has to be declined here: GemmFusion::HandleScaledDot fuses
 // without a legality check, and the generic dequantize expansion has already
 // run, so letting one through is a compile failure and not a slow path.
-TEST_F(SupportTest, ScaledDotWithUnsupportedBlockSizeIsRejected) {
+TEST_P(SupportTestWithTilingParam, ScaledDotWithUnsupportedBlockSizeIsRejected) {
   const std::string kHloTestTemplate = R"(
 HloModule ScaledDotBlockSize
 
@@ -2491,7 +2491,7 @@ ENTRY triton_computation {
 
 // A scale grouped along an output dimension (a DeepSeek-style 128x128 grid) has
 // no tt.dot_scaled spelling either: it wants one scale row per operand row.
-TEST_F(SupportTest, ScaledDotWithBlockedOutputDimensionIsRejected) {
+TEST_P(SupportTestWithTilingParam, ScaledDotWithBlockedOutputDimensionIsRejected) {
   const std::string kHloTestTemplate = R"(
 HloModule ScaledDotBlockedOutput
 
