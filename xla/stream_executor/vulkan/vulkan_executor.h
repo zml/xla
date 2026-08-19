@@ -24,7 +24,9 @@ limitations under the License.
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/gpu/gpu_executor.h"
 #include "xla/stream_executor/kernel.h"
@@ -62,6 +64,8 @@ class VulkanExecutor final : public gpu::GpuExecutor {
 
   absl::StatusOr<std::unique_ptr<Kernel>> LoadKernel(
       const KernelLoaderSpec& spec) override;
+  absl::StatusOr<std::unique_ptr<CommandBuffer>> CreateCommandBuffer(
+      CommandBuffer::Mode mode) override;
   void UnloadKernel(const Kernel* kernel) override;
 
   DeviceAddressBase Allocate(uint64_t size, int64_t memory_space) override;
@@ -97,8 +101,19 @@ class VulkanExecutor final : public gpu::GpuExecutor {
 
  private:
   friend class VulkanKernel;
+  friend class VulkanCommandBuffer;
 
   struct Impl;
+  struct CommandBatch;
+  absl::StatusOr<std::unique_ptr<CommandBatch>> BeginCommandBatch();
+  absl::Status RecordLaunch(CommandBatch* batch, const VulkanKernel& kernel,
+                            const ThreadDim& thread_dims,
+                            const BlockDim& block_dims,
+                            const KernelArgs& args);
+  void DestroyCommandBatch(CommandBatch* batch);
+  absl::StatusOr<uint64_t> SubmitCommandBatch(
+      std::unique_ptr<CommandBatch> batch, uint64_t wait_value,
+      absl::string_view label);
   absl::StatusOr<uint64_t> Launch(const VulkanKernel& kernel,
                                   const ThreadDim& thread_dims,
                                   const BlockDim& block_dims,

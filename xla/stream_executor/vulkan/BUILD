@@ -16,6 +16,7 @@ cc_library(
     linkopts = ["-ldl"],
     deps = [
         "//xla/stream_executor:activate_context",
+        "//xla/stream_executor:command_buffer",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:event",

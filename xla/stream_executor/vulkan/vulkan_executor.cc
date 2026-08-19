@@ -1139,7 +1139,10 @@ struct VulkanExecutor::Impl {
   struct Submission {
     uint64_t value = 0;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    // Descriptor sets referenced by a recorded command buffer must remain
+    // alive until every dispatch in that command buffer has completed. A
+    // batched XLA executable has one pool per recorded launch.
+    std::vector<VkDescriptorPool> descriptor_pools;
   };
 
   template <typename Handle>
@@ -1250,15 +1253,22 @@ struct VulkanExecutor::Impl {
       submissions.pop_front();
       vkFreeCommandBuffers(device, command_pool, 1,
                            &submission.command_buffer);
-      if (submission.descriptor_pool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(device, submission.descriptor_pool, nullptr);
+      for (VkDescriptorPool descriptor_pool : submission.descriptor_pools) {
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
       }
     }
   }
 
   absl::StatusOr<uint64_t> Submit(VkCommandBuffer command_buffer,
-                                  VkDescriptorPool descriptor_pool,
-                                  uint64_t wait_value) {
+                                  absl::Span<const VkDescriptorPool>
+                                      descriptor_pools,
+                                  uint64_t wait_value,
+                                  absl::string_view label) {
+    tsl::profiler::TraceMe trace([&] {
+      return tsl::profiler::TraceMeEncode(
+          "VulkanQueueSubmit",
+          {{"kernel", label}, {"wait_value", wait_value}});
+    });
     std::lock_guard<std::mutex> lock(queue_mutex);
     uint64_t signal_value = ++next_timeline_value;
     VkTimelineSemaphoreSubmitInfo timeline_info = {};
@@ -1279,12 +1289,16 @@ struct VulkanExecutor::Impl {
     submit_info.pCommandBuffers = &command_buffer;
     submit_info.signalSemaphoreCount = 1;
     submit_info.pSignalSemaphores = &timeline;
+    BeginQueueLabel(label);
     VkResult result = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+    EndQueueLabel();
     if (result != VK_SUCCESS) return VulkanError("vkQueueSubmit", result);
     VLOG(1) << "Submitted Vulkan command buffer: wait=" << wait_value
             << ", signal=" << signal_value;
-    submissions.push_back(
-        Submission{signal_value, command_buffer, descriptor_pool});
+    submissions.push_back(Submission{
+        signal_value, command_buffer,
+        std::vector<VkDescriptorPool>(descriptor_pools.begin(),
+                                      descriptor_pools.end())});
     return signal_value;
   }
 
@@ -1589,8 +1603,8 @@ struct VulkanExecutor::Impl {
       for (const Submission& submission : submissions) {
         vkFreeCommandBuffers(device, command_pool, 1,
                              &submission.command_buffer);
-        if (submission.descriptor_pool != VK_NULL_HANDLE) {
-          vkDestroyDescriptorPool(device, submission.descriptor_pool, nullptr);
+        for (VkDescriptorPool descriptor_pool : submission.descriptor_pools) {
+          vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         }
       }
       submissions.clear();
@@ -1713,6 +1727,12 @@ struct VulkanExecutor::Impl {
   PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT = nullptr;
   PFN_vkQueueBeginDebugUtilsLabelEXT vkQueueBeginDebugUtilsLabelEXT = nullptr;
   PFN_vkQueueEndDebugUtilsLabelEXT vkQueueEndDebugUtilsLabelEXT = nullptr;
+};
+
+struct VulkanExecutor::CommandBatch {
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  std::vector<VkDescriptorPool> descriptor_pools;
+  size_t dispatch_count = 0;
 };
 
 class VulkanStream final : public StreamCommon {
@@ -1858,10 +1878,220 @@ absl::StatusOr<std::vector<DeviceAddressBase>> GetDeviceArguments(
   return absl::InvalidArgumentError("Unsupported Vulkan kernel argument type");
 }
 
+class VulkanCommandBuffer final : public CommandBuffer {
+ public:
+  VulkanCommandBuffer(Mode mode, VulkanExecutor* executor)
+      : mode_(mode), executor_(executor) {}
+
+  struct EmptyCommand final : Command {};
+  struct LaunchCommand final : Command {
+    const VulkanKernel* kernel = nullptr;
+    ThreadDim threads;
+    BlockDim blocks;
+    std::vector<DeviceAddressBase> arguments;
+    size_t shared_memory_bytes = 0;
+  };
+
+  absl::StatusOr<const Command*> CreateEmptyCmd(
+      absl::Span<const Command* const>, StreamPriority) override {
+    RETURN_IF_ERROR(CheckCreating());
+    commands_.push_back(std::make_unique<EmptyCommand>());
+    return commands_.back().get();
+  }
+
+  absl::StatusOr<const Command*> CreateLaunch(
+      const ThreadDim& threads, const BlockDim& blocks, const Kernel& kernel,
+      const KernelArgs& args, absl::Span<const Command* const>,
+      StreamPriority) override {
+    RETURN_IF_ERROR(CheckCreating());
+    auto* vulkan_kernel = dynamic_cast<const VulkanKernel*>(&kernel);
+    if (vulkan_kernel == nullptr) {
+      return absl::InvalidArgumentError(
+          "Vulkan command buffer requires a VulkanKernel");
+    }
+    ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
+                     GetDeviceArguments(args));
+    auto command = std::make_unique<LaunchCommand>();
+    command->kernel = vulkan_kernel;
+    command->threads = threads;
+    command->blocks = blocks;
+    command->arguments = std::move(arguments);
+    command->shared_memory_bytes = args.number_of_shared_bytes();
+    commands_.push_back(std::move(command));
+    return commands_.back().get();
+  }
+
+  absl::Status UpdateLaunch(const Command* command, const ThreadDim& threads,
+                            const BlockDim& blocks, const Kernel& kernel,
+                            const KernelArgs& args) override {
+    RETURN_IF_ERROR(CheckUpdating());
+    auto* launch = dynamic_cast<const LaunchCommand*>(command);
+    auto* vulkan_kernel = dynamic_cast<const VulkanKernel*>(&kernel);
+    if (launch == nullptr || vulkan_kernel == nullptr) {
+      return absl::InvalidArgumentError("Invalid Vulkan launch update");
+    }
+    ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
+                     GetDeviceArguments(args));
+    auto* mutable_launch = const_cast<LaunchCommand*>(launch);
+    mutable_launch->kernel = vulkan_kernel;
+    mutable_launch->threads = threads;
+    mutable_launch->blocks = blocks;
+    mutable_launch->arguments = std::move(arguments);
+    mutable_launch->shared_memory_bytes = args.number_of_shared_bytes();
+    return absl::OkStatus();
+  }
+
+  absl::Status Submit(Stream* stream) override {
+    if (mode_ != Mode::kPrimary || state_ != State::kFinalized) {
+      return absl::FailedPreconditionError(
+          "Vulkan command buffer is not finalized for submission");
+    }
+    auto* vulkan_stream = dynamic_cast<VulkanStream*>(stream);
+    if (vulkan_stream == nullptr) {
+      return absl::InvalidArgumentError(
+          "Vulkan command buffer requires a VulkanStream");
+    }
+    ASSIGN_OR_RETURN(std::unique_ptr<VulkanExecutor::CommandBatch> batch,
+                     executor_->BeginCommandBatch());
+    for (const auto& command : commands_) {
+      auto* launch = dynamic_cast<const LaunchCommand*>(command.get());
+      if (launch == nullptr) continue;
+      KernelArgsDeviceAddressArray args(launch->arguments,
+                                        launch->shared_memory_bytes);
+      absl::Status recorded = executor_->RecordLaunch(
+          batch.get(), *launch->kernel, launch->threads, launch->blocks, args);
+      if (!recorded.ok()) {
+        executor_->DestroyCommandBatch(batch.get());
+        return recorded;
+      }
+    }
+    if (batch->dispatch_count == 0) {
+      executor_->DestroyCommandBatch(batch.get());
+      return absl::OkStatus();
+    }
+    ASSIGN_OR_RETURN(uint64_t value,
+                     executor_->SubmitCommandBatch(
+                         std::move(batch), vulkan_stream->wait_value(),
+                         absl::StrFormat("XLA Vulkan command buffer [%d]",
+                                         commands_.size())));
+    vulkan_stream->Submitted(value);
+    return absl::OkStatus();
+  }
+
+  absl::Status Finalize() override {
+    if (state_ == State::kFinalized) {
+      return absl::FailedPreconditionError(
+          "Vulkan command buffer is already finalized");
+    }
+    state_ = State::kFinalized;
+    return absl::OkStatus();
+  }
+  absl::Status Update() override {
+    if (state_ != State::kFinalized) {
+      return absl::FailedPreconditionError(
+          "Only a finalized Vulkan command buffer can be updated");
+    }
+    state_ = State::kUpdate;
+    return absl::OkStatus();
+  }
+  Mode mode() const override { return mode_; }
+  State state() const override { return state_; }
+  std::string ToString() const override {
+    return absl::StrFormat("VulkanCommandBuffer{mode=%d, commands=%d}",
+                           static_cast<int>(mode_), commands_.size());
+  }
+  absl::Status SetPriority(StreamPriority) override {
+    return absl::OkStatus();
+  }
+
+#define VULKAN_UNSUPPORTED_COMMAND(name, signature) \
+  absl::Status name signature override { return Unsupported(#name); }
+#define VULKAN_UNSUPPORTED_CREATE(name, signature) \
+  absl::StatusOr<const Command*> name signature override { \
+    return Unsupported(#name);                              \
+  }
+  VULKAN_UNSUPPORTED_CREATE(CreateChildCommand,
+      (const CommandBuffer&, absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateChildCommand,
+      (const Command*, const CommandBuffer&))
+  VULKAN_UNSUPPORTED_CREATE(CreateChildCommand,
+      (absl::AnyInvocable<absl::Status(CommandBuffer*)>,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateChildCommand,
+      (const Command*, absl::AnyInvocable<absl::Status(CommandBuffer*)>))
+  VULKAN_UNSUPPORTED_CREATE(CreateMemcpyD2D,
+      (DeviceAddressBase*, const DeviceAddressBase&, uint64_t,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateMemcpyD2D,
+      (const Command*, DeviceAddressBase*, const DeviceAddressBase&, uint64_t))
+  VULKAN_UNSUPPORTED_CREATE(CreateMemset,
+      (DeviceAddressBase*, BitPattern, size_t,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateMemset,
+      (const Command*, DeviceAddressBase*, const BitPattern&, size_t))
+  VULKAN_UNSUPPORTED_CREATE(CreateDnnGraphCommand,
+      (dnn::DnnGraph&, Stream&, absl::Span<DeviceAddressBase>,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateDnnGraphCommand,
+      (const Command*, dnn::DnnGraph&, Stream&,
+       absl::Span<DeviceAddressBase>))
+  VULKAN_UNSUPPORTED_CREATE(CreateCase,
+      (DeviceAddress<int32_t>, std::vector<CreateCommands>,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_CREATE(CreateCase,
+      (DeviceAddress<bool>, std::vector<CreateCommands>,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateCase,
+      (const Command*, DeviceAddress<int32_t>, std::vector<UpdateCommands>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateCase,
+      (const Command*, DeviceAddress<bool>, std::vector<UpdateCommands>))
+  VULKAN_UNSUPPORTED_CREATE(CreateWhile,
+      (DeviceAddress<bool>, CreateCommands, CreateCommands,
+       absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateWhile,
+      (const Command*, DeviceAddress<bool>, UpdateCommands, UpdateCommands))
+#undef VULKAN_UNSUPPORTED_CREATE
+#undef VULKAN_UNSUPPORTED_COMMAND
+
+ private:
+  absl::Status Trace(
+      Stream*, absl::AnyInvocable<absl::Status(Stream*)>) override {
+    return Unsupported("Trace");
+  }
+  absl::Status CheckCreating() const {
+    return state_ == State::kCreate
+               ? absl::OkStatus()
+               : absl::FailedPreconditionError(
+                     "Vulkan command buffer is not being created");
+  }
+  absl::Status CheckUpdating() const {
+    return state_ == State::kUpdate
+               ? absl::OkStatus()
+               : absl::FailedPreconditionError(
+                     "Vulkan command buffer is not being updated");
+  }
+  static absl::Status Unsupported(absl::string_view operation) {
+    return absl::UnimplementedError(
+        absl::StrCat(operation,
+                     " is not supported by Vulkan command buffers yet"));
+  }
+
+  Mode mode_;
+  State state_ = State::kCreate;
+  VulkanExecutor* executor_;
+  std::vector<std::unique_ptr<Command>> commands_;
+};
+
 VulkanExecutor::VulkanExecutor(Platform* platform, int device_ordinal)
     : GpuExecutor(platform, device_ordinal), impl_(std::make_unique<Impl>()) {}
 
 VulkanExecutor::~VulkanExecutor() = default;
+
+absl::StatusOr<std::unique_ptr<CommandBuffer>>
+VulkanExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {
+  return std::unique_ptr<CommandBuffer>(
+      std::make_unique<VulkanCommandBuffer>(mode, this));
+}
 
 void VulkanExecutor::ShutdownDriver() { Driver().Shutdown(); }
 
@@ -2408,10 +2638,93 @@ bool VulkanExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
   return true;
 }
 
-absl::StatusOr<uint64_t> VulkanExecutor::Launch(
+absl::StatusOr<std::unique_ptr<VulkanExecutor::CommandBatch>>
+VulkanExecutor::BeginCommandBatch() {
+  auto batch = std::make_unique<CommandBatch>();
+  VkCommandBufferAllocateInfo command_info = {};
+  command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  command_info.commandPool = impl_->command_pool;
+  command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_info.commandBufferCount = 1;
+  {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    RETURN_IF_VK_ERROR(impl_->vkAllocateCommandBuffers(
+        impl_->device, &command_info, &batch->command_buffer));
+  }
+
+  VkCommandBufferBeginInfo begin_info = {};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VkResult result =
+      impl_->vkBeginCommandBuffer(batch->command_buffer, &begin_info);
+  if (result != VK_SUCCESS) {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1,
+                                &batch->command_buffer);
+    return VulkanError("vkBeginCommandBuffer", result);
+  }
+  return batch;
+}
+
+void VulkanExecutor::DestroyCommandBatch(CommandBatch* batch) {
+  if (batch == nullptr) return;
+  if (batch->command_buffer != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1,
+                                &batch->command_buffer);
+    batch->command_buffer = VK_NULL_HANDLE;
+  }
+  for (VkDescriptorPool pool : batch->descriptor_pools) {
+    impl_->vkDestroyDescriptorPool(impl_->device, pool, nullptr);
+  }
+  batch->descriptor_pools.clear();
+}
+
+absl::StatusOr<uint64_t> VulkanExecutor::SubmitCommandBatch(
+    std::unique_ptr<CommandBatch> batch, uint64_t wait_value,
+    absl::string_view label) {
+  if (batch == nullptr || batch->command_buffer == VK_NULL_HANDLE) {
+    return absl::InvalidArgumentError("Vulkan command batch is empty");
+  }
+  VkResult result = impl_->vkEndCommandBuffer(batch->command_buffer);
+  if (result != VK_SUCCESS) {
+    DestroyCommandBatch(batch.get());
+    return VulkanError("vkEndCommandBuffer", result);
+  }
+
+  absl::StatusOr<uint64_t> submitted =
+      impl_->Submit(batch->command_buffer, batch->descriptor_pools, wait_value,
+                    label);
+  if (!submitted.ok()) {
+    DestroyCommandBatch(batch.get());
+    return submitted.status();
+  }
+  impl_->ReclaimCompleted();
+  return *submitted;
+}
+
+absl::Status VulkanExecutor::RecordLaunch(
+    CommandBatch* batch,
     const VulkanKernel& kernel, const ThreadDim& thread_dims,
-    const BlockDim& block_dims, const KernelArgs& args,
-    uint64_t wait_value) {
+    const BlockDim& block_dims, const KernelArgs& args) {
+  if (batch == nullptr || batch->command_buffer == VK_NULL_HANDLE) {
+    return absl::InvalidArgumentError("Vulkan command batch is not recording");
+  }
+  tsl::profiler::TraceMe trace([&] {
+    return tsl::profiler::TraceMeEncode(
+        "VulkanLaunchKernel",
+        {{"kernel", kernel.name()},
+         {"grid_x", block_dims.x},
+         {"grid_y", block_dims.y},
+         {"grid_z", block_dims.z},
+         {"block_x", thread_dims.x},
+         {"block_y", thread_dims.y},
+         {"block_z", thread_dims.z}});
+  });
+  const std::string dispatch_name = absl::StrFormat(
+      "%s [grid=%dx%dx%d, block=%dx%dx%d]", kernel.name(), block_dims.x,
+      block_dims.y, block_dims.z, thread_dims.x, thread_dims.y, thread_dims.z);
+
   ASSIGN_OR_RETURN(std::vector<DeviceAddressBase> arguments,
                    GetDeviceArguments(args));
   if (arguments.size() < kernel.Arity()) {
@@ -2504,38 +2817,9 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
   impl_->vkUpdateDescriptorSets(impl_->device, writes.size(), writes.data(), 0,
                                 nullptr);
 
-  VkCommandBufferAllocateInfo command_info = {};
-  command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  command_info.commandPool = impl_->command_pool;
-  command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  command_info.commandBufferCount = 1;
-  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-  {
-    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
-    result = impl_->vkAllocateCommandBuffers(impl_->device, &command_info,
-                                             &command_buffer);
-  }
-  if (result != VK_SUCCESS) {
-    destroy_pool();
-    return VulkanError("vkAllocateCommandBuffers", result);
-  }
-  auto cleanup = [&] {
-    {
-      std::lock_guard<std::mutex> lock(impl_->queue_mutex);
-      impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1,
-                                  &command_buffer);
-    }
-    destroy_pool();
-  };
-
-  VkCommandBufferBeginInfo begin_info = {};
-  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  result = impl_->vkBeginCommandBuffer(command_buffer, &begin_info);
-  if (result != VK_SUCCESS) {
-    cleanup();
-    return VulkanError("vkBeginCommandBuffer", result);
-  }
+  batch->descriptor_pools.push_back(descriptor_pool);
+  VkCommandBuffer command_buffer = batch->command_buffer;
+  impl_->BeginCommandLabel(command_buffer, dispatch_name);
   VkMemoryBarrier before = {};
   before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   before.srcAccessMask =
@@ -2564,19 +2848,25 @@ absl::StatusOr<uint64_t> VulkanExecutor::Launch(
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0,
                               nullptr, 0, nullptr);
-  result = impl_->vkEndCommandBuffer(command_buffer);
-  if (result != VK_SUCCESS) {
-    cleanup();
-    return VulkanError("vkEndCommandBuffer", result);
+  impl_->EndCommandLabel(command_buffer);
+  ++batch->dispatch_count;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<uint64_t> VulkanExecutor::Launch(
+    const VulkanKernel& kernel, const ThreadDim& thread_dims,
+    const BlockDim& block_dims, const KernelArgs& args,
+    uint64_t wait_value) {
+  ASSIGN_OR_RETURN(std::unique_ptr<CommandBatch> batch, BeginCommandBatch());
+  absl::Status recorded =
+      RecordLaunch(batch.get(), kernel, thread_dims, block_dims, args);
+  if (!recorded.ok()) {
+    DestroyCommandBatch(batch.get());
+    return recorded;
   }
-  absl::StatusOr<uint64_t> submitted =
-      impl_->Submit(command_buffer, descriptor_pool, wait_value);
-  if (!submitted.ok()) {
-    cleanup();
-    return submitted.status();
-  }
-  impl_->ReclaimCompleted();
-  return *submitted;
+  const std::string label =
+      absl::StrFormat("%s [1 dispatch]", kernel.name());
+  return SubmitCommandBatch(std::move(batch), wait_value, label);
 }
 
 }  // namespace stream_executor::vulkan

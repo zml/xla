@@ -123,12 +123,16 @@ CommandBufferConfig GetCommandBufferConfig(
       std::move(commands), std::move(enabled_collectives), device_info,
       debug_options.xla_gpu_command_buffer_unroll_loops(), num_local_devices};
 
-  // XLA command buffers are reusable execution graphs (for example, CUDA or
-  // HIP graphs), not native Vulkan VkCommandBuffers. VulkanExecutor does not
-  // implement StreamExecutor::CreateCommandBuffer, so preserve the ordinary
-  // thunk sequence for this target.
+  // Vulkan command buffers currently support serialized kernel/fusion
+  // sequences. Keep every other command kind on the ordinary thunk path until
+  // its native Vulkan recording semantics are implemented.
   if (device_info.gpu_compute_capability().IsVulkan()) {
+    const bool fusion_enabled =
+        config.enabled_commands.contains(DebugOptions::FUSION);
     config.enabled_commands.clear();
+    if (fusion_enabled) {
+      config.enabled_commands.insert(DebugOptions::FUSION);
+    }
     config.enabled_collectives.reset();
     return config;
   }
@@ -374,6 +378,12 @@ static bool IsConvertible(const AsyncStartThunk& async_start_thunk,
 // Returns true if the given Thunk is convertible to a command buffer operation
 // based on the provided `config`.
 bool IsConvertible(const Thunk& thunk, const CommandBufferConfig& config) {
+  // Device-to-device copies share the FUSION command category, but the first
+  // Vulkan implementation records kernel launches only.
+  if (config.device_description.gpu_compute_capability().IsVulkan() &&
+      thunk.kind() == Thunk::kCopy) {
+    return false;
+  }
   // Async start thunks are convertible if all nested thunks are convertible.
   if (thunk.kind() == Thunk::kAsyncStart) {
     return IsConvertible(static_cast<const AsyncStartThunk&>(thunk), config);
