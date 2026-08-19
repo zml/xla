@@ -205,12 +205,20 @@ TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesPartialMAndN) {
   RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/70);
 }
 
+TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesNTailWiderThanBk) {
+  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100);
+}
+
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64MatchesGolden) {
   RunPerChannelCase(/*b=*/32, /*k=*/256, /*n=*/128);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesPartialMAndN) {
   RunPerChannelCase(/*b=*/20, /*k=*/160, /*n=*/70);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesNTailWiderThanBk) {
+  RunPerChannelCase(/*b=*/20, /*k=*/160, /*n=*/100);
 }
 
 }  // namespace
