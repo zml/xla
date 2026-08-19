@@ -16,9 +16,11 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_fp8_gemv_thunk.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/gpu/buffer_allocations.h"
@@ -61,43 +63,27 @@ MetalFp8GemvThunk::MetalFp8GemvThunk(
       per_channel_(per_channel) {}
 
 absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
-  if (kernel_ != nullptr && kernel_steel_ != nullptr && kernel_pc_ != nullptr &&
-      kernel_steel64_ != nullptr && kernel_pc_qmm_ != nullptr &&
-      kernel_pc_qmm64_ != nullptr)
-    return absl::OkStatus();
+  if (kernel_ != nullptr) return absl::OkStatus();
 
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
 
-  {
-    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
-                        CompileMetalSourceToMetallibCached(get_fp8_gemv()));
-    TF_ASSIGN_OR_RETURN(
-        kernel_,
-        metal_exec->LoadKernelWithConstants(lib, "fp8_gemv", /*arity=*/5, {}));
+  const bool gemv = (b_ == 1);
+  const bool f32_scale = scale_shape_.element_type() == F32;
+  std::string entry;
+  absl::string_view source;
+  if (per_channel_) {
+    entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
+    if (f32_scale) entry += "_f32";
+    source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
+  } else {
+    entry = gemv ? "fp8_gemv" : (b_ > 16 ? "fp8_qmm_t_bm64" : "fp8_qmm_t");
+    source = gemv ? get_fp8_gemv() : get_mlx_steel_qgemm();
   }
-  {
-    TF_ASSIGN_OR_RETURN(
-        std::vector<uint8_t> lib,
-        CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
-    TF_ASSIGN_OR_RETURN(kernel_steel_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_qmm_t", /*arity=*/5, {}));
-    TF_ASSIGN_OR_RETURN(kernel_steel64_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_qmm_t_bm64", /*arity=*/5, {}));
-    TF_ASSIGN_OR_RETURN(kernel_pc_qmm_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_qmm_t_pc", /*arity=*/5, {}));
-    TF_ASSIGN_OR_RETURN(kernel_pc_qmm64_,
-                        metal_exec->LoadKernelWithConstants(
-                            lib, "fp8_qmm_t_pc_bm64", /*arity=*/5, {}));
-  }
-  {
-    TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib_pc,
-                        CompileMetalSourceToMetallibCached(get_fp8_gemv_pc()));
-    TF_ASSIGN_OR_RETURN(kernel_pc_, metal_exec->LoadKernelWithConstants(
-                                        lib_pc, "fp8_gemv_pc", /*arity=*/5, {}));
-  }
+
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
+                      CompileMetalSourceToMetallibCached(source));
+  TF_ASSIGN_OR_RETURN(
+      kernel_, metal_exec->LoadKernelWithConstants(lib, entry, /*arity=*/5, {}));
 
   // dims.w is the K block count for block-128 and the scale row stride for
   // per-channel, negative for a whole-tensor scale; zero would collide with a
@@ -125,11 +111,6 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   absl::MutexLock lock(&mu_);
   if (executor_ != executor) {
     kernel_ = nullptr;
-    kernel_steel_ = nullptr;
-    kernel_pc_ = nullptr;
-    kernel_steel64_ = nullptr;
-    kernel_pc_qmm_ = nullptr;
-    kernel_pc_qmm64_ = nullptr;
     TF_RETURN_IF_ERROR(EnsureLoaded(executor));
     executor_ = executor;
   }
@@ -141,36 +122,17 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(allocs.GetDeviceAddress(out_));    // 3  out
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
-  if (per_channel_) {
-    if (b_ == 1) {
-      return kernel_pc_->Launch(se::ThreadDim(256, 1, 1),
-                                se::BlockDim(static_cast<uint64_t>(n_), 1, 1),
-                                stream, args);
-    }
-    const bool large_m = b_ > 16;
-    se::Kernel* kpc = large_m ? kernel_pc_qmm64_.get() : kernel_pc_qmm_.get();
-    const int64_t kPcBM = large_m ? 64 : 16;
-    constexpr int64_t kPcBN = 64;
-    return kpc->Launch(
-        se::ThreadDim(32, 2, 2),
-        se::BlockDim(static_cast<uint64_t>((n_ + kPcBN - 1) / kPcBN),
-                     static_cast<uint64_t>((b_ + kPcBM - 1) / kPcBM), 1),
-        stream, args);
-  }
   if (b_ == 1) {
     return kernel_->Launch(se::ThreadDim(256, 1, 1),
                            se::BlockDim(static_cast<uint64_t>(n_), 1, 1), stream,
                            args);
   }
-  const bool large_m = b_ > 16;
-  stream_executor::Kernel* ksteel =
-      large_m ? kernel_steel64_.get() : kernel_steel_.get();
-  const int64_t kSteelBM = large_m ? 64 : 16;
-  constexpr int64_t kSteelBN = 64;
-  return ksteel->Launch(
+  constexpr int64_t kBN = 64;
+  const int64_t bm = b_ > 16 ? 64 : 16;
+  return kernel_->Launch(
       se::ThreadDim(32, 2, 2),
-      se::BlockDim(static_cast<uint64_t>((n_ + kSteelBN - 1) / kSteelBN),
-                   static_cast<uint64_t>((b_ + kSteelBM - 1) / kSteelBM), 1),
+      se::BlockDim(static_cast<uint64_t>((n_ + kBN - 1) / kBN),
+                   static_cast<uint64_t>((b_ + bm - 1) / bm), 1),
       stream, args);
 }
 

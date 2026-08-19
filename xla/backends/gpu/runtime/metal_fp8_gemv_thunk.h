@@ -59,11 +59,6 @@ class MetalFp8GemvThunk : public Thunk {
   absl::Mutex mu_;
   stream_executor::StreamExecutor* executor_ ABSL_GUARDED_BY(mu_) = nullptr;
   std::unique_ptr<stream_executor::Kernel> kernel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_steel64_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<stream_executor::Kernel> kernel_pc_qmm64_ ABSL_GUARDED_BY(mu_);
 
   stream_executor::DeviceAddressBase p_dims_ ABSL_GUARDED_BY(mu_);
 };

@@ -10,10 +10,11 @@ static inline float decode_e4m3fn(uchar b) {
     return s ? -v : v;
 }
 
-kernel void fp8_gemv_pc(
+template <typename ST>
+[[kernel]] void fp8_gemv_pc_entry(
     device const bfloat *x      [[buffer(0)]],
     device const uchar  *w      [[buffer(1)]],
-    device const bfloat *scale  [[buffer(2)]],
+    device const ST     *scale  [[buffer(2)]],
     device       bfloat *out    [[buffer(3)]],
     constant int4&       dims   [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -51,3 +52,11 @@ kernel void fp8_gemv_pc(
         if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
     }
 }
+
+#define instantiate_fp8_gemv_pc(name, st)                                 \
+  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st>(     \
+      device const bfloat*, device const uchar*, device const st*,        \
+      device bfloat*, constant int4&, uint3, uint, uint, uint);
+
+instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float)

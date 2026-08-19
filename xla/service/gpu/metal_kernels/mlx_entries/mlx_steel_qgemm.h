@@ -1137,8 +1137,12 @@ kernel void fp8_qmm_t_bm64(
 // output column within the [BN, BK] weight tile), read once and applied to every
 // decoded byte, and next() never advances it. The impl bases `scales` at the tile's
 // N column (y_col); this loader adds the thread's row bi. reduction_dim is always 1.
+// ST is the scale's storage type, separate from T: ModelOpt writes a per-tensor
+// scale as f32, and rounding it to bf16 to match the tiles would put a coherent
+// per-channel bias on the whole projection.
 template <
     typename T,
+    typename ST,
     short BROWS,
     short BCOLS,
     short dst_ld,
@@ -1162,11 +1166,11 @@ struct PerChannelFp8BlockLoader {
   // One scale per output row n, at stride `scale_stride_`: 1 for a genuine
   // [N, 1] per-channel grid, 0 for a [1, 1] whole-tensor scale, which is the
   // same kernel with every row reading element 0.
-  const device T* scales;
+  const device ST* scales;
 
   PerChannelFp8BlockLoader(
       const device uchar* src_,
-      const device T* scales_,
+      const device ST* scales_,
       const short scale_stride_,
       const int src_ld_,
       threadgroup T* dst_,
@@ -1188,9 +1192,9 @@ struct PerChannelFp8BlockLoader {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
-    T scale = *scales;
+    const float scale = static_cast<float>(*scales);
     for (int i = 0; i < n_reads; i++) {
-      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack]) * scale);
     }
   }
 
@@ -1217,9 +1221,9 @@ struct PerChannelFp8BlockLoader {
       }
       return;
     }
-    T scale = *scales;
+    const float scale = static_cast<float>(*scales);
     for (int i = 0; i < n_reads; i++) {
-      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack]) * scale);
     }
   }
 
@@ -1232,6 +1236,7 @@ struct PerChannelFp8BlockLoader {
 // the scale base at y_col (not the 2-D block index).
 template <
     typename T,
+    typename ST,
     const int group_size,
     const int bits,
     const bool aligned_N,
@@ -1240,7 +1245,7 @@ template <
     const int BN = 64>
 METAL_FUNC void fp_qmm_t_pc_impl(
     const device uchar* w,
-    const device T* scales,
+    const device ST* scales,
     const short scale_stride,
     const device T* x,
     device T* y,
@@ -1269,7 +1274,7 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t =
-      PerChannelFp8BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+      PerChannelFp8BlockLoader<T, ST, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
 
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
@@ -1349,17 +1354,17 @@ METAL_FUNC void fp_qmm_t_pc_impl(
 // old `k / 128` could never produce -- and that is exactly 1 for every
 // K in {128, 160, 192, 224}, all legal under K % 32 -- so 0 would be
 // indistinguishable from a stale write. Negative cannot be.
-kernel void fp8_qmm_t_pc(
+template <typename ST, int BM>
+[[kernel]] void fp8_qmm_t_pc_entry(
     device const bfloat* x [[buffer(0)]],
     device const uchar* w [[buffer(1)]],
-    device const bfloat* scale [[buffer(2)]],
+    device const ST* scale [[buffer(2)]],
     device bfloat* y [[buffer(3)]],
     constant int4& dims [[buffer(4)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
-  constexpr int BM = 16;
   constexpr int BK = 32;
   constexpr int BN = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
@@ -1369,33 +1374,24 @@ kernel void fp8_qmm_t_pc(
   const int K = dims.y;
   const int N = dims.z;
   const short ss = dims.w < 0 ? 0 : 1;
-  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
+  fp_qmm_t_pc_impl<bfloat, ST, 128, 8, false, BM, BK, BN>(
       w, scale, ss, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 
-kernel void fp8_qmm_t_pc_bm64(
-    device const bfloat* x [[buffer(0)]],
-    device const uchar* w [[buffer(1)]],
-    device const bfloat* scale [[buffer(2)]],
-    device bfloat* y [[buffer(3)]],
-    constant int4& dims [[buffer(4)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint sl [[thread_index_in_simdgroup]]) {
-  constexpr int BM = 64;
-  constexpr int BK = 32;
-  constexpr int BN = 64;
-  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
-  threadgroup bfloat Xs[BM * BK_padded];
-  threadgroup bfloat Ws[BN * BK_padded];
-  const int M = dims.x;
-  const int K = dims.y;
-  const int N = dims.z;
-  const short ss = dims.w < 0 ? 0 : 1;
-  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
-      w, scale, ss, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
-}
+// The tiles stay bfloat; only the scale's storage type varies. An MSL entry
+// point cannot itself be a template, so each (scale dtype, BM) pair is stamped
+// out by name -- the same idiom as gdn_linear_attention and the splitk bundle.
+#define instantiate_fp8_qmm_t_pc(name, st, bm)                        \
+  template [[host_name(name)]] [[kernel]] void                        \
+  fp8_qmm_t_pc_entry<st, bm>(                                         \
+      device const bfloat*, device const uchar*, device const st*,    \
+      device bfloat*, constant int4&, uint3, uint, uint, uint);
+
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc", bfloat, 16)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_bm64", bfloat, 64)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_f32", float, 16)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_bm64_f32", float, 64)
+
 
 // MoE gather variant (transpose=true): each output row r selects expert
 // indices[r]; out[r,n] = sum_k x[r,k] * dequant(w[indices[r], n, k]).
