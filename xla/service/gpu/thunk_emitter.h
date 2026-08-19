@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_hlo_ordering.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/service/gpu/metal_custom_calls.h"
 #include "xla/service/llvm_ir/llvm_command_line_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape_util.h"
@@ -221,8 +222,10 @@ class ThunkEmitter {
       const HloCustomCallInstruction* hlo);
 
   // FP8 arm of zml$scaled_matmul (128-block / per-channel bf16 scales).
+  // `scheme` comes from the caller's ClassifyMetalScaledMatmul, so the scale
+  // rule lives in exactly one place; this only re-checks the call's own ABI.
   absl::StatusOr<ThunkSequence> EmitMetalFp8GemvThunk(
-      const HloCustomCallInstruction* hlo);
+      const HloCustomCallInstruction* hlo, MetalScaledMatmulScheme scheme);
 
   absl::StatusOr<ThunkSequence> EmitMoeGemvThunk(
       const HloCustomCallInstruction* hlo);

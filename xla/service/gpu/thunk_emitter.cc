@@ -1315,7 +1315,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
       return EmitMetalNvfp4MatmulThunk(instr);
     case MetalScaledMatmulScheme::kFp8Block128:
     case MetalScaledMatmulScheme::kFp8PerChannel:
-      return EmitMetalFp8GemvThunk(instr);
+      return EmitMetalFp8GemvThunk(instr, *scheme);
   }
 }
 
@@ -1418,7 +1418,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
-    const HloCustomCallInstruction* instr) {
+    const HloCustomCallInstruction* instr, MetalScaledMatmulScheme scheme) {
   if (instr->operand_count() != 3) {
     return absl::InvalidArgumentError(
         "zml$scaled_matmul (FP8) expects 3 operands (x, w, scale).");
@@ -1447,18 +1447,14 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalFp8GemvThunk(
     return absl::UnimplementedError(
         "zml$scaled_matmul (FP8): w must be f8e4m3fn[N, K] (K minor).");
   }
-  // K % 32: the per-channel kernels have no contraction tail arm. Kept in step
-  // with ClassifyMetalScaledMatmul, which declines the same shapes so they fall
-  // through to the generic dequantize expansion instead of reaching us.
-  const bool per_channel = (scale_shape.dimensions(0) == n &&
-                            scale_shape.dimensions(1) == 1 && k % 32 == 0);
-  const bool block_128 = (k % 128 == 0 && n % 128 == 0 &&
-                          scale_shape.dimensions(0) == n / 128 &&
-                          scale_shape.dimensions(1) == k / 128);
-  if (scale_shape.element_type() != BF16 || (!per_channel && !block_128)) {
-    return absl::UnimplementedError(
-        "zml$scaled_matmul (FP8): scale must be bf16 [N/128,K/128] or [N,1].");
-  }
+  // Which scale grid this is was decided by ClassifyMetalScaledMatmul, in the
+  // caller and in the rewriter that formed the call. Re-deriving it here would
+  // be a second copy of the rule with no test of its own, and the two could
+  // drift into a hard compile failure: by the time we run, the rewriter has
+  // already removed the kScaledDot, so there is no generic expansion to fall
+  // back to. Everything below is this call's own ABI, which the classifier
+  // does not look at.
+  const bool per_channel = scheme == MetalScaledMatmulScheme::kFp8PerChannel;
   if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
     return absl::UnimplementedError(
         "zml$scaled_matmul (FP8): x and out must be bf16.");
