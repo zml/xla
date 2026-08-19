@@ -1159,11 +1159,15 @@ struct PerChannelFp8BlockLoader {
 
   threadgroup T* dst;
   const device uchar* src;
-  const device T* scales;  // one bf16 per output row n; points at scales[bi]
+  // One scale per output row n, at stride `scale_stride_`: 1 for a genuine
+  // [N, 1] per-channel grid, 0 for a [1, 1] whole-tensor scale, which is the
+  // same kernel with every row reading element 0.
+  const device T* scales;
 
   PerChannelFp8BlockLoader(
       const device uchar* src_,
       const device T* scales_,
+      const short scale_stride_,
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1178,7 +1182,7 @@ struct PerChannelFp8BlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi) {}  // per-row scale (constant across K)
+        scales(scales_ + bi * scale_stride_) {}  // constant across K
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -1237,6 +1241,7 @@ template <
 METAL_FUNC void fp_qmm_t_pc_impl(
     const device uchar* w,
     const device T* scales,
+    const short scale_stride,
     const device T* x,
     device T* y,
     threadgroup T* Xs,
@@ -1272,13 +1277,13 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   auto wl = (const device uchar*)w;
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * static_cast<int64_t>(K);
-  scales += y_col;  // per-channel scale base: the tile's N column
+  scales += y_col * scale_stride;  // scale base: the tile's N column
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, scale_stride, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
@@ -1335,8 +1340,15 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   }
 }
 
-// Per-channel dense q-GEMM entries (bf16[M,K] . f8e4m3fn[N,K] with bf16 [N,1]
+// Per-channel dense q-GEMM entries (bf16[M,K] . f8e4m3fn[N,K] with a bf16
 // scale -> bf16[M,N]). Small-M (batched decode) BM=16, large-M (prefill) BM=64.
+//
+// dims.w carries the scale's row stride, not K/128 as the block-128 entries
+// read it: 1 for a [N, 1] per-channel grid, and a negative sentinel for a
+// [1, 1] whole-tensor scale, which is stride 0. It has to be a value the host's
+// old `k / 128` could never produce -- and that is exactly 1 for every
+// K in {128, 160, 192, 224}, all legal under K % 32 -- so 0 would be
+// indistinguishable from a stale write. Negative cannot be.
 kernel void fp8_qmm_t_pc(
     device const bfloat* x [[buffer(0)]],
     device const uchar* w [[buffer(1)]],
@@ -1356,8 +1368,9 @@ kernel void fp8_qmm_t_pc(
   const int M = dims.x;
   const int K = dims.y;
   const int N = dims.z;
+  const short ss = dims.w < 0 ? 0 : 1;
   fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
-      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+      w, scale, ss, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 
 kernel void fp8_qmm_t_pc_bm64(
@@ -1379,8 +1392,9 @@ kernel void fp8_qmm_t_pc_bm64(
   const int M = dims.x;
   const int K = dims.y;
   const int N = dims.z;
+  const short ss = dims.w < 0 ? 0 : 1;
   fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
-      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+      w, scale, ss, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 
 // MoE gather variant (transpose=true): each output row r selects expert

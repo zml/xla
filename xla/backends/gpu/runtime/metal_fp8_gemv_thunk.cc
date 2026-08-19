@@ -99,9 +99,14 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
                                         lib_pc, "fp8_gemv_pc", /*arity=*/5, {}));
   }
 
+  // dims.w is the K block count for block-128 and the scale row stride for
+  // per-channel, negative for a whole-tensor scale; zero would collide with a
+  // real stride.
+  const int32_t scale_w =
+      per_channel_ ? (scale_shape_.dimensions(0) == n_ ? 1 : -1)
+                   : static_cast<int32_t>(k_ / 128);
   const int32_t dims[4] = {static_cast<int32_t>(b_), static_cast<int32_t>(k_),
-                           static_cast<int32_t>(n_),
-                           static_cast<int32_t>(k_ / 128)};
+                           static_cast<int32_t>(n_), scale_w};
   p_dims_ = executor->Allocate(sizeof(dims), 0);
   if (p_dims_.opaque() == nullptr) {
     return absl::ResourceExhaustedError(

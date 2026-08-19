@@ -90,7 +90,8 @@ class MetalFp8KernelTest : public ::testing::Test {
     return allocation;
   }
 
-  void RunPerChannelCase(int32_t b, int32_t k, int32_t n) {
+  void RunPerChannelCase(int32_t b, int32_t k, int32_t n,
+                         bool per_tensor = false) {
     ASSERT_EQ(k % 32, 0) << "the per-channel kernels have no contraction tail";
 
     std::vector<uint16_t> x(static_cast<size_t>(b) * k);
@@ -107,13 +108,16 @@ class MetalFp8KernelTest : public ::testing::Test {
         w[static_cast<size_t>(col) * k + depth] = value;
       }
     }
-    std::vector<uint16_t> scale(static_cast<size_t>(n));
-    for (int32_t col = 0; col < n; ++col) {
-      scale[col] = Bfloat16Bits(static_cast<float>(1 + (col % 4)));
+    auto scale_of = [&](int32_t col) {
+      return static_cast<float>(per_tensor ? 3 : 1 + (col % 4));
+    };
+    std::vector<uint16_t> scale(per_tensor ? 1 : static_cast<size_t>(n));
+    for (size_t i = 0; i < scale.size(); ++i) {
+      scale[i] = Bfloat16Bits(scale_of(static_cast<int32_t>(i)));
     }
     std::vector<uint16_t> out(static_cast<size_t>(b) * n, 0x7fc1);
 
-    const int32_t dims[4] = {b, k, n, k / 128};
+    const int32_t dims[4] = {b, k, n, per_tensor ? -1 : 1};
     se::DeviceAddressBase x_device =
         AllocateAndCopy(x.data(), x.size() * sizeof(x[0]));
     se::DeviceAddressBase w_device =
@@ -169,7 +173,7 @@ class MetalFp8KernelTest : public ::testing::Test {
         const float expected = static_cast<float>(1 + (row % 3)) *
                                static_cast<float>(k) *
                                static_cast<float>((col % 2 == 0) ? 1 : 2) *
-                               static_cast<float>(1 + (col % 4));
+                               scale_of(col);
         const float actual =
             Bfloat16ToFloat(out[static_cast<size_t>(row) * n + col]);
         EXPECT_NEAR(actual, expected, expected * 0.005f)
@@ -219,6 +223,22 @@ TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesPartialMAndN) {
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64HandlesNTailWiderThanBk) {
   RunPerChannelCase(/*b=*/20, /*k=*/160, /*n=*/100);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorGemvReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorQmmReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/32, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorQmmHandlesPartialN) {
+  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
 }
 
 }  // namespace

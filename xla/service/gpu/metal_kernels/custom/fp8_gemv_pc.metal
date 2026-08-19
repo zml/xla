@@ -47,6 +47,7 @@ kernel void fp8_gemv_pc(
     if (sgid == 0) {
         float t = (lane < 8) ? part[lane] : 0.0f;
         t = simd_sum(t);
-        if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[ni]) * t);
+        const int si = (dims.w < 0) ? 0 : ni;
+        if (lane == 0) out[(long)bi * N + ni] = bfloat(float(scale[si]) * t);
     }
 }
