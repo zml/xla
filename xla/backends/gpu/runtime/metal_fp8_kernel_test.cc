@@ -213,9 +213,13 @@ class MetalFp8KernelTest : public ::testing::Test {
     // Mirrors MetalFp8GemvThunk::ExecuteOnStream exactly; a divergence here
     // would test a launch geometry nothing in production uses.
     if (decode) {
-      TF_ASSERT_OK(kernel->Launch(se::ThreadDim(256, 1, 1),
-                                  se::BlockDim(static_cast<uint64_t>(n), 1, 1),
-                                  stream.get(), args));
+      // 4 output channels per threadgroup -- must match kROWS in the shader
+      // and the dispatch in MetalFp8GemvThunk.
+      constexpr int64_t kGemvRows = 4;
+      TF_ASSERT_OK(kernel->Launch(
+          se::ThreadDim(256, 1, 1),
+          se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows), 1, 1),
+          stream.get(), args));
     } else {
       constexpr int64_t kPcBN = 64;
       const int64_t pc_bm = large_m ? 64 : 16;
@@ -389,7 +393,7 @@ TEST_F(MetalFp8KernelTest, PerTensorGemvKeepsAnF32ScaleExact) {
   args.add_argument(out_device);
   args.add_argument(dims);
   TF_ASSERT_OK(kernel->Launch(se::ThreadDim(256, 1, 1),
-                              se::BlockDim(static_cast<uint64_t>(kN), 1, 1),
+                              se::BlockDim(static_cast<uint64_t>(kN / 4), 1, 1),
                               stream.get(), args));
   TF_ASSERT_OK(stream->BlockHostUntilDone());
   TF_ASSERT_OK(executor_->SynchronousMemcpyD2H(
