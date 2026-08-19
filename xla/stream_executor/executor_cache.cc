@@ -60,4 +60,9 @@ absl::StatusOr<StreamExecutor*> ExecutorCache::Get(int ordinal) const {
       absl::StrFormat("No executors registered for ordinal %d", ordinal));
 }
 
+void ExecutorCache::DestroyAllExecutors() {
+  absl::MutexLock lock(mutex_);
+  cache_.clear();
+}
+
 }  // namespace stream_executor

@@ -58,6 +58,11 @@ absl::StatusOr<StreamExecutor*> VulkanPlatform::FindExisting(int ordinal) {
   return executor_cache_.Get(ordinal);
 }
 
+void VulkanPlatform::Shutdown() {
+  executor_cache_.DestroyAllExecutors();
+  VulkanExecutor::ShutdownDriver();
+}
+
 absl::StatusOr<std::unique_ptr<StreamExecutor>>
 VulkanPlatform::GetUncachedExecutor(int ordinal) {
   auto executor = std::make_unique<VulkanExecutor>(this, ordinal);
@@ -66,6 +71,18 @@ VulkanPlatform::GetUncachedExecutor(int ordinal) {
 }
 
 }  // namespace stream_executor::vulkan
+
+namespace stream_executor {
+
+void ShutdownVulkanPlatform() {
+  absl::StatusOr<Platform*> platform =
+      PlatformManager::PlatformWithId(vulkan::kVulkanPlatformId,
+                                      /*initialize_platform=*/false);
+  if (!platform.ok()) return;
+  static_cast<vulkan::VulkanPlatform*>(*platform)->Shutdown();
+}
+
+}  // namespace stream_executor
 
 namespace stream_executor {
 namespace {

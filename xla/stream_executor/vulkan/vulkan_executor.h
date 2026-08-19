@@ -50,6 +50,7 @@ class VulkanExecutor final : public gpu::GpuExecutor {
   static absl::StatusOr<int> GetDeviceCount();
   static absl::StatusOr<std::unique_ptr<DeviceDescription>>
   CreateDeviceDescription(int device_ordinal);
+  static void ShutdownDriver();
 
   absl::Status Init() override;
 

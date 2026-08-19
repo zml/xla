@@ -40,6 +40,10 @@ class VulkanPlatform final : public Platform {
   absl::StatusOr<StreamExecutor*> ExecutorForDevice(int ordinal) override;
   absl::StatusOr<StreamExecutor*> FindExisting(int ordinal) override;
 
+  // Releases cached executors and the Vulkan instance while tracing layers are
+  // still loaded. There must be no live client using this platform.
+  void Shutdown();
+
  private:
   absl::StatusOr<std::unique_ptr<StreamExecutor>> GetUncachedExecutor(
       int ordinal);
@@ -49,5 +53,11 @@ class VulkanPlatform final : public Platform {
 };
 
 }  // namespace stream_executor::vulkan
+
+namespace stream_executor {
+
+void ShutdownVulkanPlatform();
+
+}  // namespace stream_executor
 
 #endif  // XLA_STREAM_EXECUTOR_VULKAN_VULKAN_PLATFORM_H_

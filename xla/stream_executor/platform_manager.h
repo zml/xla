@@ -99,6 +99,9 @@ class PlatformManager {
   static absl::StatusOr<Platform*> PlatformWithName(absl::string_view target,
                                                     bool initialize_platform);
 
+  static absl::StatusOr<Platform*> PlatformWithId(
+      const Platform::Id& id, bool initialize_platform);
+
   // Retrieves the platform registered with the given platform id (an opaque,
   // comparable value provided by the Platform's Id() method).
   //

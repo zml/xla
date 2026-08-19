@@ -243,6 +243,11 @@ PlatformManagerImpl& Impl() {
   return Impl().PlatformWithName(target, initialize_platform);
 }
 
+/*static*/ absl::StatusOr<Platform*> PlatformManager::PlatformWithId(
+    const Platform::Id& id, bool initialize_platform) {
+  return Impl().PlatformWithId(id, initialize_platform);
+}
+
 /*static*/ absl::StatusOr<Platform*> PlatformManager::InitializePlatformWithId(
     const Platform::Id& id) {
   return Impl().InitializePlatformWithId(id);

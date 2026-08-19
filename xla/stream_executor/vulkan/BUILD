@@ -33,6 +33,7 @@ cc_library(
         "//xla/stream_executor:stream_common",
         "//xla/stream_executor:stream_executor_h",
         "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

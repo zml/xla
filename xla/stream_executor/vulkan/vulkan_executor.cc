@@ -39,6 +39,7 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -537,11 +538,35 @@ struct VulkanShaderFeatures {
 
 class VulkanDriver {
  public:
-  ~VulkanDriver() = default;
+  // Intentionally no destructor. See `Driver()` for the rationale: the
+  // singleton is wrapped in `absl::NoDestructor` so that `vkDestroyInstance`
+  // is never invoked from `__run_exit_handlers`. Tearing down the Vulkan
+  // instance during process exit races with implicit layer finalization
+  // (notably `VK_LAYER_MESA_device_select`, whose per-process state can be
+  // released via its own `.fini` before our destructor runs), producing a
+  // segfault deep inside the layer during `vkDestroyInstance`. Process-lifetime
+  // GPU state is reclaimed by the kernel on exit, so leaking the instance is
+  // safe and matches common Vulkan singleton practice.
 
   absl::Status Initialize() {
-    std::call_once(once_, [this] { status_ = InitializeOnce(); });
+    std::lock_guard<std::mutex> lock(initialization_mutex_);
+    if (instance_ != VK_NULL_HANDLE) return absl::OkStatus();
+    status_ = InitializeOnce();
     return status_;
+  }
+
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(initialization_mutex_);
+    physical_devices_.clear();
+    if (debug_messenger_ != VK_NULL_HANDLE &&
+        destroy_debug_utils_messenger_ != nullptr) {
+      destroy_debug_utils_messenger_(instance_, debug_messenger_, nullptr);
+      debug_messenger_ = VK_NULL_HANDLE;
+    }
+    if (instance_ != VK_NULL_HANDLE && destroy_instance_ != nullptr) {
+      destroy_instance_(instance_, nullptr);
+      instance_ = VK_NULL_HANDLE;
+    }
   }
 
   absl::Span<const VkPhysicalDevice> physical_devices() const {
@@ -624,21 +649,23 @@ class VulkanDriver {
 
  private:
   absl::Status InitializeOnce() {
-    library_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     if (library_ == nullptr) {
-      return absl::NotFoundError(
-          absl::StrCat("Unable to load libvulkan.so.1: ", dlerror()));
+      library_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+      if (library_ == nullptr) {
+        return absl::NotFoundError(
+            absl::StrCat("Unable to load libvulkan.so.1: ", dlerror()));
+      }
     }
 
-    auto get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+    get_instance_proc_addr_ = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         dlsym(library_, "vkGetInstanceProcAddr"));
-    if (get_instance_proc_addr == nullptr) {
+    if (get_instance_proc_addr_ == nullptr) {
       return absl::NotFoundError(
           "libvulkan.so.1 does not export vkGetInstanceProcAddr");
     }
 
     PFN_vkCreateInstance create_instance = nullptr;
-    RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr, "vkCreateInstance",
+    RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_, "vkCreateInstance",
                                    &create_instance));
 
     const bool validation_requested = ValidationRequested();
@@ -745,12 +772,18 @@ class VulkanDriver {
     }
     RETURN_IF_VK_ERROR(
         create_instance(&create_info, /*pAllocator=*/nullptr, &instance_));
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+                                     "vkDestroyInstance", &destroy_instance_));
 
     if (validation_requested) {
       PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger = nullptr;
       RETURN_IF_ERROR(LoadInstanceProc(
-          get_instance_proc_addr, instance_, "vkCreateDebugUtilsMessengerEXT",
+          get_instance_proc_addr_, instance_, "vkCreateDebugUtilsMessengerEXT",
           &create_debug_messenger));
+      RETURN_IF_ERROR(LoadInstanceProc(
+          get_instance_proc_addr_, instance_,
+          "vkDestroyDebugUtilsMessengerEXT",
+          &destroy_debug_utils_messenger_));
       RETURN_IF_VK_ERROR(create_debug_messenger(
           instance_, &debug_create_info, nullptr, &debug_messenger_));
       LOG(INFO) << "Enabled " << kValidationLayer
@@ -760,37 +793,37 @@ class VulkanDriver {
     }
 
     PFN_vkEnumeratePhysicalDevices enumerate_physical_devices = nullptr;
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkEnumeratePhysicalDevices",
                                      &enumerate_physical_devices));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceProperties",
                                      &get_physical_device_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceProperties2",
                                      &get_physical_device_properties2));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceFeatures2",
                                      &get_physical_device_features2));
     RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr, instance_,
+        get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties",
         &get_physical_device_memory_properties));
     RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr, instance_,
+        get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties2",
         &get_physical_device_memory_properties2));
     RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr, instance_,
+        get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceQueueFamilyProperties",
         &get_physical_device_queue_family_properties));
     RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr, instance_,
+        get_instance_proc_addr_, instance_,
         "vkEnumerateDeviceExtensionProperties",
         &enumerate_device_extension_properties));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkCreateDevice", &create_device));
-    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr, instance_,
+    RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetDeviceProcAddr",
                                      &get_device_proc_addr));
 
@@ -821,16 +854,23 @@ class VulkanDriver {
     return absl::OkStatus();
   }
 
-  std::once_flag once_;
+  std::mutex initialization_mutex_;
   absl::Status status_;
   void* library_ = nullptr;
+  PFN_vkGetInstanceProcAddr get_instance_proc_addr_ = nullptr;
+  PFN_vkDestroyInstance destroy_instance_ = nullptr;
+  PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils_messenger_ = nullptr;
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
   std::vector<VkPhysicalDevice> physical_devices_;
 };
 
 VulkanDriver& Driver() {
-  static VulkanDriver* driver = new VulkanDriver;
+  // Wrapped in `absl::NoDestructor` so the singleton is not torn down at
+  // process exit. See the note on `VulkanDriver` for why calling
+  // `vkDestroyInstance` from `__run_exit_handlers` is unsafe in the presence
+  // of implicit Vulkan layers such as `VK_LAYER_MESA_device_select`.
+  static absl::NoDestructor<VulkanDriver> driver;
   return *driver;
 }
 
@@ -1705,6 +1745,8 @@ VulkanExecutor::VulkanExecutor(Platform* platform, int device_ordinal)
     : GpuExecutor(platform, device_ordinal), impl_(std::make_unique<Impl>()) {}
 
 VulkanExecutor::~VulkanExecutor() = default;
+
+void VulkanExecutor::ShutdownDriver() { Driver().Shutdown(); }
 
 absl::StatusOr<int> VulkanExecutor::GetDeviceCount() {
   RETURN_IF_ERROR(Driver().Initialize());

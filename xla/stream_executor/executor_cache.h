@@ -47,6 +47,10 @@ class ExecutorCache {
   // has been created), or a NOT_FOUND status.
   absl::StatusOr<StreamExecutor*> Get(int ordinal) const;
 
+  // Destroys all cached executors. Callers must ensure that no outstanding
+  // users retain pointers returned by this cache.
+  void DestroyAllExecutors();
+
  private:
   // Protects cache_.
   mutable absl::Mutex mutex_;

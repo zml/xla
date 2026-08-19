@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -74,6 +75,7 @@ limitations under the License.
 #include "xla/service/custom_call_target_registry.h"
 #include "xla/service/gpu_topology.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/stream_executor/vulkan/vulkan_platform.h"
 #include "xla/tsl/platform/statusor.h"
 
 #if GOOGLE_CUDA
@@ -92,6 +94,8 @@ namespace gpu_plugin {
 #endif
 
 const PJRT_Api* GetGpuPjrtApi();
+
+std::atomic<int> vulkan_client_count{0};
 
 PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -241,7 +245,24 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
   }
   PJRT_ASSIGN_OR_RETURN(std::unique_ptr<xla::PjRtClient> client,
                         xla::GetXlaPjrtGpuClient(options));
+  if (client->platform_name() == xla::VulkanName()) {
+    vulkan_client_count.fetch_add(1, std::memory_order_relaxed);
+  }
   args->client = pjrt::CreateWrapperClient(GetGpuPjrtApi(), std::move(client));
+  return nullptr;
+}
+
+PJRT_Error* PJRT_Client_Destroy(PJRT_Client_Destroy_Args* args) {
+  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "PJRT_Client_Destroy_Args", PJRT_Client_Destroy_Args_STRUCT_SIZE,
+      args->struct_size));
+  const bool is_vulkan =
+      args->client->client->platform_name() == xla::VulkanName();
+  delete args->client;
+  if (is_vulkan &&
+      vulkan_client_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    stream_executor::ShutdownVulkanPlatform();
+  }
   return nullptr;
 }
 
@@ -631,12 +652,16 @@ const PJRT_Api* GetGpuPjrtApi() {
   static PJRT_AbiVersion_Extension abi_version_extension =
       pjrt::CreateGpuAbiVersionExtension(&xla_transform_extension.base);
 
-  static const PJRT_Api pjrt_api = pjrt::CreatePjrtApi(
-      pjrt::gpu_plugin::PJRT_Client_Create,
-      pjrt::gpu_plugin::PJRT_ExecuteContext_Create,
-      pjrt::gpu_plugin::PJRT_GpuDeviceTopology_Create,
-      pjrt::PJRT_Plugin_Initialize_NoOp, &abi_version_extension.base,
-      pjrt::gpu_plugin::PJRT_Plugin_Attributes_Gpu);
+  static const PJRT_Api pjrt_api = [] {
+    PJRT_Api api = pjrt::CreatePjrtApi(
+        pjrt::gpu_plugin::PJRT_Client_Create,
+        pjrt::gpu_plugin::PJRT_ExecuteContext_Create,
+        pjrt::gpu_plugin::PJRT_GpuDeviceTopology_Create,
+        pjrt::PJRT_Plugin_Initialize_NoOp, &abi_version_extension.base,
+        pjrt::gpu_plugin::PJRT_Plugin_Attributes_Gpu);
+    api.PJRT_Client_Destroy = pjrt::gpu_plugin::PJRT_Client_Destroy;
+    return api;
+  }();
 
   return &pjrt_api;
 }
