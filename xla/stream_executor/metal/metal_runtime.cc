@@ -61,6 +61,41 @@ std::string NSStringToString(NSString* string) {
 
 constexpr uint32_t kProfMaxSamples = 4096;
 
+static bool MetalBlitStatsEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("METAL_BLIT_STATS");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+
+struct MetalBlitStats {
+  std::atomic<uint64_t> copies{0}, copy_bytes{0}, fills{0}, fill_bytes{0};
+  std::atomic<uint64_t> last_report_ns{0};
+};
+static MetalBlitStats g_blit_stats;
+
+static void MetalBlitStatsRecord(bool is_fill, uint64_t size) {
+  if (!MetalBlitStatsEnabled()) return;
+  if (is_fill) {
+    g_blit_stats.fills.fetch_add(1, std::memory_order_relaxed);
+    g_blit_stats.fill_bytes.fetch_add(size, std::memory_order_relaxed);
+  } else {
+    g_blit_stats.copies.fetch_add(1, std::memory_order_relaxed);
+    g_blit_stats.copy_bytes.fetch_add(size, std::memory_order_relaxed);
+  }
+  const uint64_t now = absl::GetCurrentTimeNanos();
+  uint64_t last = g_blit_stats.last_report_ns.load(std::memory_order_relaxed);
+  if (now - last < 1000000000ull) return;
+  if (!g_blit_stats.last_report_ns.compare_exchange_strong(last, now)) return;
+  fprintf(stderr,
+          "[metal-blit] copies=%llu (%.2f GB)  fills=%llu (%.2f GB)\n",
+          (unsigned long long)g_blit_stats.copies.load(),
+          g_blit_stats.copy_bytes.load() / 1e9,
+          (unsigned long long)g_blit_stats.fills.load(),
+          g_blit_stats.fill_bytes.load() / 1e9);
+}
+
 std::atomic<bool> g_prof_enabled{false};
 std::mutex g_prof_mu;
 id<MTLCounterSampleBuffer> g_prof_buf = nil;
@@ -700,6 +735,7 @@ absl::Status EncodeBlitCopy(void* batch_command_buffer, void* dst_buffer,
     return absl::InternalError("Metal EncodeBlitCopy: null buffer.");
   }
   if (size == 0) return absl::OkStatus();
+  MetalBlitStatsRecord(/*is_fill=*/false, size);
   @autoreleasepool {
     id<MTLCommandBuffer> cb =
         Obj<MPSCommandBuffer*>(batch_command_buffer).commandBuffer;
@@ -721,6 +757,7 @@ absl::Status EncodeBlitFill(void* batch_command_buffer, void* buffer,
     return absl::InternalError("Metal EncodeBlitFill: null buffer.");
   }
   if (size == 0) return absl::OkStatus();
+  MetalBlitStatsRecord(/*is_fill=*/true, size);
   @autoreleasepool {
     id<MTLCommandBuffer> cb =
         Obj<MPSCommandBuffer*>(batch_command_buffer).commandBuffer;
