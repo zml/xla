@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_STREAM_EXECUTOR_METAL_METAL_STREAM_H_
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -132,7 +133,20 @@ class MetalStream : public StreamCommon {
   // dry test above decides cadence): it caps encoded-command growth in one open
   // buffer when the GPU stays busy for a long stretch (e.g. large prefill
   // executes). Balanced decode commits far below it.
-  static constexpr int kMaxSignalsPerBuffer = 64;
+  // METAL_MAX_SIGNALS overrides it for cadence experiments: the dry test is
+  // REACTIVE (it only fires once the GPU has already drained, so every
+  // self-clocked commit is preceded by however long it took the host to reach
+  // the next execute), and forcing a commit every N executes instead lets that
+  // idle be measured against a queue that is kept non-empty. Default 64 = the
+  // original safety bound.
+  static int MaxSignalsPerBuffer() {
+    static const int v = [] {
+      const char* e = std::getenv("METAL_MAX_SIGNALS");
+      const int n = e ? std::atoi(e) : 0;
+      return n > 0 ? n : 64;
+    }();
+    return v;
+  }
   // Commit-eligible executes (signals) encoded into the current open buffer.
   int signals_since_commit_ = 0;
   // Highest shared-event value already encoded as a GPU WAIT into the current

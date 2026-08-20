@@ -93,8 +93,15 @@ absl::Status MetalStream::WaitFor(Stream* other) {
 namespace {
 bool BatchDbgEnabled() {
   static const bool on = [] {
-    const char* e = std::getenv("METAL_KPROF");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
+    // METAL_KPROF also starts the GPU-timestamp profiler, which forces a
+    // per-dispatch encoder and a per-commit waitUntilCompleted -- so the commit
+    // cadence it reports is the cadence of a SERIALIZED run, not the real one.
+    // METAL_BATCH_DBG gives these counters alone, at full speed.
+    for (const char* v : {"METAL_BATCH_DBG", "METAL_KPROF"}) {
+      const char* e = std::getenv(v);
+      if (e != nullptr && e[0] != '\0' && e[0] != '0') return true;
+    }
+    return false;
   }();
   return on;
 }
@@ -154,7 +161,7 @@ absl::Status MetalStream::RecordEvent(Event* event) {
     const bool gpu_dry =
         metal::SharedEventSignaledValue(executor_->shared_event()) >=
         last_signaled_value_;
-    if (gpu_dry || signals_since_commit_ >= kMaxSignalsPerBuffer) {
+    if (gpu_dry || signals_since_commit_ >= MaxSignalsPerBuffer()) {
       void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
       ReleaseObject(command_buffer_);
       command_buffer_ = nullptr;
