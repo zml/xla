@@ -21,7 +21,6 @@ limitations under the License.
 #include <optional>
 #include <variant>
 
-#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -74,6 +73,8 @@ class VulkanExecutor final : public gpu::GpuExecutor {
       MemorySpace memory_space) override;
   absl::StatusOr<std::unique_ptr<MemoryAllocation>> HostMemoryAllocate(
       uint64_t size) override;
+  bool HostMemoryRegister(void* location, uint64_t size) override;
+  bool HostMemoryUnregister(void* location) override;
   bool IsHostMemoryPinned(const void* ptr, uint64_t size) override;
   bool SynchronizeAllActivity() override;
   absl::Status SynchronousMemcpy(DeviceAddressBase* device_dst,
@@ -96,9 +97,6 @@ class VulkanExecutor final : public gpu::GpuExecutor {
                         uint64_t size);
   absl::StatusOr<uint64_t> TimelineValue() const;
   absl::Status WaitTimeline(uint64_t value) const;
-  void ScheduleCallback(
-      uint64_t value,
-      absl::AnyInvocable<absl::Status() &&> callback);
 
  private:
   friend class VulkanKernel;

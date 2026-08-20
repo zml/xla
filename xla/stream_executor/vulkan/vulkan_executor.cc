@@ -24,7 +24,6 @@ limitations under the License.
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -35,7 +34,6 @@ limitations under the License.
 #include <optional>
 #include <set>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -1302,39 +1300,6 @@ struct VulkanExecutor::Impl {
     return signal_value;
   }
 
-  void ScheduleCallback(
-      uint64_t value,
-      absl::AnyInvocable<absl::Status() &&> callback) {
-    {
-      std::lock_guard<std::mutex> lock(callback_mutex);
-      callbacks.emplace(value, std::move(callback));
-    }
-    callback_cv.notify_one();
-  }
-
-  void CompletionLoop() {
-    while (true) {
-      uint64_t value = 0;
-      absl::AnyInvocable<absl::Status() &&> callback;
-      {
-        std::unique_lock<std::mutex> lock(callback_mutex);
-        callback_cv.wait(lock,
-                         [this] { return stop_callbacks || !callbacks.empty(); });
-        if (stop_callbacks && callbacks.empty()) return;
-        auto it = callbacks.begin();
-        value = it->first;
-        callback = std::move(it->second);
-        callbacks.erase(it);
-      }
-      absl::Status status = WaitForTimeline(value);
-      if (status.ok()) status = std::move(callback)();
-      if (!status.ok()) {
-        LOG(ERROR) << "Vulkan completion callback failed: " << status;
-      }
-      ReclaimCompleted();
-    }
-  }
-
   absl::Status Initialize(int ordinal) {
     ABSL_RETURN_IF_ERROR(Driver().Initialize());
     if (ordinal < 0 || ordinal >= Driver().physical_devices().size()) {
@@ -1584,19 +1549,12 @@ struct VulkanExecutor::Impl {
         vkCreateSemaphore(device, &semaphore_info, nullptr, &timeline));
     SetObjectName(VK_OBJECT_TYPE_SEMAPHORE, timeline,
                   "XLA Vulkan completion timeline");
-    completion_thread = std::thread([this] { CompletionLoop(); });
     return absl::OkStatus();
   }
 
   ~Impl() {
     if (device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device);
-    {
-      std::lock_guard<std::mutex> lock(callback_mutex);
-      stop_callbacks = true;
-    }
-    callback_cv.notify_all();
-    if (completion_thread.joinable()) completion_thread.join();
     ReclaimCompleted();
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
@@ -1674,16 +1632,12 @@ struct VulkanExecutor::Impl {
   bool storage_buffer_16bit_access = false;
   absl::Mutex allocations_mutex;
   std::map<uintptr_t, std::unique_ptr<Allocation>> allocations;
+  absl::Mutex registered_host_memory_mutex;
+  std::map<uintptr_t, uint64_t> registered_host_memory;
   std::atomic<uint64_t> next_allocation_id = 0;
   std::mutex queue_mutex;
   uint64_t next_timeline_value = 0;
   std::deque<Submission> submissions;
-  std::mutex callback_mutex;
-  std::condition_variable callback_cv;
-  std::multimap<uint64_t, absl::AnyInvocable<absl::Status() &&>> callbacks;
-  bool stop_callbacks = false;
-  std::thread completion_thread;
-
   PFN_vkDestroyDevice vkDestroyDevice = nullptr;
   PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
   PFN_vkCreateBuffer vkCreateBuffer = nullptr;
@@ -1805,8 +1759,11 @@ class VulkanStream final : public StreamCommon {
   }
   absl::Status DoHostCallbackWithStatus(
       absl::AnyInvocable<absl::Status() &&> callback) override {
-    executor_->ScheduleCallback(DependencyValue(), std::move(callback));
-    return absl::OkStatus();
+    // Host callbacks occupy the stream and must complete before later stream
+    // operations begin. Vulkan copies are synchronous host operations, so run
+    // the callback synchronously after draining earlier GPU work.
+    ABSL_RETURN_IF_ERROR(BlockHostUntilDone());
+    return std::move(callback)();
   }
   PlatformSpecificHandle platform_specific_handle() const override {
     return {};
@@ -2462,10 +2419,39 @@ VulkanExecutor::HostMemoryAllocate(uint64_t size) {
       memory, size, [](void* pointer, uint64_t) { std::free(pointer); });
 }
 
+bool VulkanExecutor::HostMemoryRegister(void* location, uint64_t size) {
+  if (location == nullptr || size == 0) return false;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(location);
+  if (size > std::numeric_limits<uintptr_t>::max() - start) return false;
+
+  absl::MutexLock lock(&impl_->registered_host_memory_mutex);
+  return impl_->registered_host_memory.emplace(start, size).second;
+}
+
+bool VulkanExecutor::HostMemoryUnregister(void* location) {
+  if (location == nullptr) return false;
+  absl::MutexLock lock(&impl_->registered_host_memory_mutex);
+  return impl_->registered_host_memory.erase(
+             reinterpret_cast<uintptr_t>(location)) == 1;
+}
+
 bool VulkanExecutor::IsHostMemoryPinned(const void* ptr, uint64_t size) {
-  // Vulkan allocations are host-visible, host-coherent, and persistently
-  // mapped, so they can be used directly as host-to-device transfer sources.
-  return size != 0 && impl_->FindAllocation(ptr, size).ok();
+  if (ptr == nullptr || size == 0) return false;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+  if (size > std::numeric_limits<uintptr_t>::max() - start) return false;
+
+  // Vulkan H2D copies synchronously consume the source on the host and write
+  // into persistently mapped HOST_VISIBLE | HOST_COHERENT device memory. A
+  // PJRT DmaMap registration therefore makes the complete registered range
+  // safe to use without an additional pinned staging allocation.
+  absl::MutexLock lock(&impl_->registered_host_memory_mutex);
+  auto it = impl_->registered_host_memory.upper_bound(start);
+  if (it == impl_->registered_host_memory.begin()) return false;
+  --it;
+  const uintptr_t registered_start = it->first;
+  const uintptr_t registered_end = registered_start + it->second;
+  return start >= registered_start && start < registered_end &&
+         size <= registered_end - start;
 }
 
 bool VulkanExecutor::SynchronizeAllActivity() {
@@ -2485,12 +2471,6 @@ absl::StatusOr<uint64_t> VulkanExecutor::TimelineValue() const {
 
 absl::Status VulkanExecutor::WaitTimeline(uint64_t value) const {
   return impl_->WaitForTimeline(value);
-}
-
-void VulkanExecutor::ScheduleCallback(
-    uint64_t value,
-    absl::AnyInvocable<absl::Status() &&> callback) {
-  impl_->ScheduleCallback(value, std::move(callback));
 }
 
 absl::Status VulkanExecutor::SynchronousMemcpy(DeviceAddressBase* device_dst,
