@@ -129,8 +129,15 @@ class MetalFp8KernelTest : public ::testing::Test {
   // wiring check: an f32 buffer bound to a `device const bfloat*` is read as
   // pairs of bf16 and silently produces garbage. It does NOT prove the extra
   // precision -- see PerTensorGemvKeepsAnF32ScaleExact for that.
+  // gemv_rows is the decode kernel's kROWS. The thunk picks it from N
+  // (MetalFp8GemvThunk::rows_per_group), so both values are reachable in
+  // production and both need covering; the entry name and the threadgroup
+  // count have to move together or the launch computes only some of the
+  // output channels.
   void RunPerChannelCase(int32_t b, int32_t k, int32_t n,
-                         bool per_tensor = false, bool f32_scale = false) {
+                         bool per_tensor = false, bool f32_scale = false,
+                         int32_t gemv_rows = 4) {
+    ASSERT_TRUE(gemv_rows == 2 || gemv_rows == 4);
     ASSERT_EQ(k % 32, 0) << "the per-channel kernels have no contraction tail";
 
     // Every one of the three indices gets its own signature, so a kernel that
@@ -195,6 +202,7 @@ class MetalFp8KernelTest : public ::testing::Test {
                                     : (large_m ? "fp8_qmm_t_pc_bm64"
                                                : "fp8_qmm_t_pc");
     if (f32_scale) kernel_name += "_f32";
+    if (decode && gemv_rows == 2) kernel_name += "_r2";
     TF_ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<se::Kernel> kernel,
         metal_executor_->LoadKernelWithConstants(
@@ -213,9 +221,10 @@ class MetalFp8KernelTest : public ::testing::Test {
     // Mirrors MetalFp8GemvThunk::ExecuteOnStream exactly; a divergence here
     // would test a launch geometry nothing in production uses.
     if (decode) {
-      // 4 output channels per threadgroup -- must match kROWS in the shader
-      // and the dispatch in MetalFp8GemvThunk.
-      constexpr int64_t kGemvRows = 4;
+      // gemv_rows output channels per threadgroup -- must match the kROWS the
+      // selected entry was instantiated with, and the dispatch in
+      // MetalFp8GemvThunk.
+      const int64_t kGemvRows = gemv_rows;
       TF_ASSERT_OK(kernel->Launch(
           se::ThreadDim(256, 1, 1),
           se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows), 1, 1),
@@ -269,6 +278,30 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesNonBlockAlignedK) {
 // N is not a multiple of the BN=64 tile, so the last threadgroup is partial.
 TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesPartialN) {
   RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/70);
+}
+
+// The kROWS=2 entry, which the thunk selects for a narrow N so the dispatch
+// keeps enough threadgroups to saturate memory. Same golden as the kROWS=4
+// case above: the row count is a launch-geometry choice and must not be
+// visible in the result.
+TEST_F(MetalFp8KernelTest, PerChannelGemvTwoRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+                    /*f32_scale=*/false, /*gemv_rows=*/2);
+}
+
+// N odd and not a multiple of kROWS=2, so the last threadgroup computes one
+// real channel and one clamped onto it. Catches a dispatch that rounded the
+// group count the wrong way: with N/4 groups this case loses half its columns.
+TEST_F(MetalFp8KernelTest, PerChannelGemvTwoRowsHandlesPartialN) {
+  RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/71, /*per_tensor=*/false,
+                    /*f32_scale=*/false, /*gemv_rows=*/2);
+}
+
+// The narrow-N path with an f32 whole-tensor scale -- the combination the 112
+// unfused projections in Qwen3.8-27B actually hit (o_proj / out_proj, N=5120).
+TEST_F(MetalFp8KernelTest, PerTensorGemvTwoRowsReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/true,
+                    /*f32_scale=*/true, /*gemv_rows=*/2);
 }
 
 // Thin-M qmm (BM=16): 1 < B <= 16.

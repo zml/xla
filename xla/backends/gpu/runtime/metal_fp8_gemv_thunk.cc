@@ -78,6 +78,11 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (per_channel_) {
     entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
     if (f32_scale) entry += "_f32";
+    // kROWS divides the threadgroup count, so on a narrow N the default 4
+    // starves the GPU before it saturates memory -- see the group-count/
+    // bandwidth table in custom/fp8_gemv_pc.metal. Drop to 2 rows when 4 would
+    // leave fewer than kMinGroups threadgroups.
+    if (gemv && rows_per_group() == 2) entry += "_r2";
     source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
   } else {
     // Block-128 has no f32 arm; ClassifyMetalScaledMatmul only admits bf16 there.
@@ -134,12 +139,8 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   // Both schemes tile the same way (BN=64, BM=64 for prefill else 16), so the
   // geometry depends only on b_ -- the scheme is already baked into kernel_.
   if (b_ == 1) {
-    // The per-channel GEMV computes 4 output channels per threadgroup; the
-    // block-128 one still computes one. Keep this in step with kROWS in
-    // custom/fp8_gemv_pc.metal.
-    const int64_t rows_per_group = per_channel_ ? 4 : 1;
-    const uint64_t groups =
-        static_cast<uint64_t>((n_ + rows_per_group - 1) / rows_per_group);
+    const int64_t rpg = rows_per_group();
+    const uint64_t groups = static_cast<uint64_t>((n_ + rpg - 1) / rpg);
     return kernel_->Launch(se::ThreadDim(256, 1, 1), se::BlockDim(groups, 1, 1),
                            stream, args);
   }

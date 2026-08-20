@@ -27,12 +27,24 @@ static inline float decode_e4m3fn(uchar b) {
 // variance the one-row form had. Eight rows and 32-byte loads were both tried
 // and are slower.
 //
+// But kROWS also DIVIDES the threadgroup count, and below roughly 2048 groups
+// this GPU is parallelism-starved rather than bandwidth-bound. Profiling the
+// four shapes this model actually runs showed the achieved bandwidth tracking
+// the group count, not the byte count:
+//
+//     groups  1280 (N=5120)  1536 (N=6144)  2560 (N=10240)  3584 (N=14336)
+//     GB/s     385            455            482             499
+//
+// So kROWS is a template parameter and the thunk picks it from N: 4 once there
+// is enough work to go round, 2 when quartering N would starve the machine.
+// Trading x traffic (cached -- x is one 10-40 KB row) for occupancy is the
+// right way round at the small end, and the wrong way round at the large end.
+//
 // ST is the scale's storage type. The accumulator is already f32 and the scale
 // multiplies it after the reduction, so an f32 scale is used at full precision
 // here -- unlike the qmm path, where the product still lands in a bf16 tile.
-constant constexpr int kROWS = 4;
 
-template <typename ST>
+template <typename ST, int kROWS>
 [[kernel]] void fp8_gemv_pc_entry(
     device const bfloat *x      [[buffer(0)]],
     device const uchar  *w      [[buffer(1)]],
@@ -108,12 +120,16 @@ template <typename ST>
     }
 }
 
-// An MSL entry point cannot itself be a template, so each scale dtype is
-// stamped out by name -- the same idiom as gdn_linear_attention.
-#define instantiate_fp8_gemv_pc(name, st)                                 \
-  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st>(     \
-      device const bfloat*, device const uchar*, device const st*,        \
+// An MSL entry point cannot itself be a template, so each (scale dtype, kROWS)
+// pair is stamped out by name -- the same idiom as gdn_linear_attention. The
+// unsuffixed names stay kROWS=4 so the existing tests and the thunk's default
+// keep their meaning.
+#define instantiate_fp8_gemv_pc(name, st, rows)                              \
+  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st, rows>(  \
+      device const bfloat*, device const uchar*, device const st*,           \
       device bfloat*, constant int4&, uint3, uint, uint, uint);
 
-instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat)
-instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float)
+instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat, 4)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float, 4)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_r2", bfloat, 2)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32_r2", float, 2)
