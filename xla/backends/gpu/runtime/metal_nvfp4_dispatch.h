@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace xla {
 namespace gpu {
@@ -169,10 +170,26 @@ inline int ComputeNvfp4QmmSplitK(int M, int N, int K,
   return split_k;
 }
 
-// MLX qmv_wide launch: n_tiles = ceil(M/5), vecs_per_tg = ceil(M/n_tiles).
+// Widest qmv_wide tile. MLX's launch formula fixes this at 5; entries exist to
+// 12 so METAL_NVFP4_WIDE_VECS can sweep it without a rebuild. See the note on
+// the entries in mlx_fp4_qmv.h for why 5 is not obviously the right number.
+inline constexpr int kNvfp4QmvWideMaxVecs = 12;
+inline int Nvfp4QmvWideMaxVecs() {
+  static const int v = [] {
+    const char* e = std::getenv("METAL_NVFP4_WIDE_VECS");
+    const int n = e ? std::atoi(e) : 0;
+    return (n >= 2 && n <= kNvfp4QmvWideMaxVecs) ? n : 5;
+  }();
+  return v;
+}
+
+// MLX qmv_wide launch: n_tiles = ceil(M/cap), vecs_per_tg = ceil(M/n_tiles).
+// Fewest tiles first, then the smallest tile that fills them -- every tile
+// re-reads the weights, so M=6 at cap 5 is 2x3 and not 5+1.
 inline int Nvfp4QmvWideVecsPerTg(int M) {
   if (M <= 1) return 1;
-  const int n_tiles = (M + 4) / 5;  // ceil(M / 5)
+  const int cap = Nvfp4QmvWideMaxVecs();
+  const int n_tiles = (M + cap - 1) / cap;
   return (M + n_tiles - 1) / n_tiles;
 }
 
@@ -187,11 +204,28 @@ inline bool Nvfp4SplitkAlignN(int N) {
 // MLX QuantizedMatmul::eval_gpu (transpose, non-batched):
 //   M >= vector_limit → qmm_splitk (falls back to qmm if split_k<=1)
 //   else → dispatch_qmv → qmv_wide if M>=2 else qmv
+// Overrides the MLX table's qmv batch limit, i.e. how far up M the qmv path
+// runs before the tiled qmm takes over. 0 leaves the table alone. Measured, the
+// table is right here -- qmm is ahead from M=11 and the limit is 10 -- but the
+// FP8 arm's equivalent bound was 4 too low, so this stays sweepable.
+inline int Nvfp4QmvBatchLimitOverride() {
+  static const int v = [] {
+    const char* e = std::getenv("METAL_NVFP4_QMV_MAX");
+    const int n = e ? std::atoi(e) : 0;
+    return n > 0 ? n : 0;
+  }();
+  return v;
+}
+
 inline Nvfp4DensePath SelectNvfp4DensePath(
     int64_t M, int64_t K, int64_t N, char arch_size = kNvfp4DefaultArchSize,
     int arch_gen = kNvfp4DefaultArchGen) {
-  const int limit = GetNvfp4QmvBatchLimit(
-      static_cast<int>(K), static_cast<int>(N), arch_size, arch_gen);
+  const int override_limit = Nvfp4QmvBatchLimitOverride();
+  const int limit = override_limit > 0
+                        ? override_limit
+                        : GetNvfp4QmvBatchLimit(static_cast<int>(K),
+                                                static_cast<int>(N), arch_size,
+                                                arch_gen);
   if (M < limit) {
     return (M >= 2) ? Nvfp4DensePath::kQmvWide : Nvfp4DensePath::kQmv;
   }
@@ -210,6 +244,20 @@ inline const char* Nvfp4QmvWideKernelName(int vecs_per_tg) {
       return "nvfp4_qmv_wide_4";
     case 5:
       return "nvfp4_qmv_wide_5";
+    case 6:
+      return "nvfp4_qmv_wide_6";
+    case 7:
+      return "nvfp4_qmv_wide_7";
+    case 8:
+      return "nvfp4_qmv_wide_8";
+    case 9:
+      return "nvfp4_qmv_wide_9";
+    case 10:
+      return "nvfp4_qmv_wide_10";
+    case 11:
+      return "nvfp4_qmv_wide_11";
+    case 12:
+      return "nvfp4_qmv_wide_12";
     default:
       return nullptr;
   }

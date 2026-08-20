@@ -52,7 +52,7 @@ struct MetalNvfp4MatmulThunk::LoadedState {
 
   std::unique_ptr<se::Kernel> kernel_qmv;
   // Index zero/one unused; vecs_per_tg=2..5 occupy their natural slots.
-  std::unique_ptr<se::Kernel> kernel_qmv_wide[6];
+  std::unique_ptr<se::Kernel> kernel_qmv_wide[kNvfp4QmvWideMaxVecs + 1];
   std::unique_ptr<se::Kernel> kernel_qmm;
   std::unique_ptr<se::Kernel> kernel_splitk;
   std::unique_ptr<se::Kernel> kernel_splitk_sum;
@@ -207,7 +207,8 @@ absl::Status MetalNvfp4MatmulThunk::ExecuteOnStream(
 
   if (state->path == Nvfp4DensePath::kQmvWide) {
     const int vecs = Nvfp4QmvWideVecsPerTg(static_cast<int>(m_));
-    if (vecs < 2 || vecs > 5 || state->kernel_qmv_wide[vecs] == nullptr) {
+    if (vecs < 2 || vecs > kNvfp4QmvWideMaxVecs ||
+        state->kernel_qmv_wide[vecs] == nullptr) {
       return absl::InternalError(absl::StrCat(
           "zml$scaled_matmul (NVFP4): missing qmv_wide_", vecs, " for M=", m_));
     }
