@@ -68,13 +68,20 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   auto* metal_exec = static_cast<se::metal::MetalExecutor*>(executor);
 
   const bool gemv = (b_ == 1);
+  const int64_t vecs = wide_vecs();
   const bool f32_scale = scale_shape_.element_type() == F32;
   std::string entry;
   absl::string_view source;
   if (per_channel_) {
-    entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
+    if (gemv) {
+      entry = "fp8_gemv_pc";
+    } else if (vecs != 0) {
+      entry = "fp8_gemv_pc_wide_" + std::to_string(vecs);
+    } else {
+      entry = b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc";
+    }
     if (f32_scale) entry += "_f32";
-    source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
+    source = (gemv || vecs != 0) ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
   } else {
     entry = gemv ? "fp8_gemv" : (b_ > 16 ? "fp8_qmm_t_bm64" : "fp8_qmm_t");
     source = gemv ? get_fp8_gemv() : get_mlx_steel_qgemm();
@@ -122,11 +129,14 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(allocs.GetDeviceAddress(out_));    // 3  out
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
-  if (b_ == 1) {
+  const int64_t vecs = wide_vecs();
+  if (b_ == 1 || vecs != 0) {
     const int64_t rpg = rows_per_group();
     const uint64_t groups = static_cast<uint64_t>((n_ + rpg - 1) / rpg);
-    return kernel_->Launch(se::ThreadDim(256, 1, 1), se::BlockDim(groups, 1, 1),
-                           stream, args);
+    const uint64_t ygroups =
+        vecs != 0 ? static_cast<uint64_t>((b_ + vecs - 1) / vecs) : 1;
+    return kernel_->Launch(se::ThreadDim(256, 1, 1),
+                           se::BlockDim(groups, ygroups, 1), stream, args);
   }
   constexpr int64_t kBN = 64;
   const int64_t bm = b_ > 16 ? 64 : 16;

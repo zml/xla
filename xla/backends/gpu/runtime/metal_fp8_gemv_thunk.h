@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_RUNTIME_METAL_FP8_GEMV_THUNK_H_
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 
 #include "absl/status/status.h"
@@ -53,6 +54,31 @@ class MetalFp8GemvThunk : public Thunk {
 
   // Must equal kROWS in custom/fp8_gemv_pc.metal.
   int64_t rows_per_group() const { return per_channel_ ? 2 : 1; }
+
+  static int64_t MaxVecs() {
+    static const int64_t v = [] {
+      const char* e = std::getenv("METAL_FP8_WIDE_VECS");
+      const int64_t n = e ? std::atoll(e) : 0;
+      return (n >= 2 && n <= 12) ? n : 10;
+    }();
+    return v;
+  }
+
+  static int64_t WideMaxBatch() {
+    static const int64_t v = [] {
+      const char* e = std::getenv("METAL_FP8_WIDE_MAX");
+      const int64_t n = e ? std::atoll(e) : 0;
+      return n > 0 ? n : 12;
+    }();
+    return v;
+  }
+
+  int64_t wide_vecs() const {
+    if (!per_channel_ || b_ < 2 || b_ > WideMaxBatch()) return 0;
+    const int64_t max_vecs = MaxVecs();
+    const int64_t tiles = (b_ + max_vecs - 1) / max_vecs;
+    return (b_ + tiles - 1) / tiles;
+  }
 
   const BufferAllocation::Slice x_, w_, scale_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, out_shape_;

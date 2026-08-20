@@ -151,15 +151,21 @@ class MetalFp8KernelTest : public ::testing::Test {
     ASSERT_NE(out_device.opaque(), nullptr);
 
     const bool decode = (b == 1);
+    constexpr int64_t kMaxVecs = 10;
+    constexpr int64_t kWideMax = 12;
+    const int64_t tiles = (b + kMaxVecs - 1) / kMaxVecs;
+    const int64_t vecs =
+        (b >= 2 && b <= kWideMax) ? (b + tiles - 1) / tiles : 0;
     const bool large_m = b > 16;
-    std::string kernel_name = decode ? "fp8_gemv_pc"
-                                    : (large_m ? "fp8_qmm_t_pc_bm64"
-                                               : "fp8_qmm_t_pc");
+    std::string kernel_name =
+        decode ? "fp8_gemv_pc"
+               : (vecs != 0 ? "fp8_gemv_pc_wide_" + std::to_string(vecs)
+                            : (large_m ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc"));
     if (f32_scale) kernel_name += "_f32";
     TF_ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<se::Kernel> kernel,
         metal_executor_->LoadKernelWithConstants(
-            decode ? gemv_metallib_ : qmm_metallib_, kernel_name,
+            (decode || vecs != 0) ? gemv_metallib_ : qmm_metallib_, kernel_name,
             /*arity=*/5, {}));
     TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
                             executor_->CreateStream());
@@ -171,10 +177,13 @@ class MetalFp8KernelTest : public ::testing::Test {
     args.add_argument(out_device);
     args.add_argument(dims);
 
-    if (decode) {
+    if (decode || vecs != 0) {
+      const uint64_t ygroups =
+          vecs != 0 ? static_cast<uint64_t>((b + vecs - 1) / vecs) : 1;
       TF_ASSERT_OK(kernel->Launch(
           se::ThreadDim(256, 1, 1),
-          se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows), 1, 1),
+          se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows),
+                       ygroups, 1),
           stream.get(), args));
     } else {
       constexpr int64_t kPcBN = 64;
@@ -226,16 +235,65 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesOddN) {
   RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/71);
 }
 
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTwoRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/2, /*k=*/256, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideThreeRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/3, /*k=*/160, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideFourRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/4, /*k=*/128, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorGemvWideReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/2, /*k=*/256, /*n=*/128, /*per_tensor=*/true,
+                    /*f32_scale=*/true);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideFiveRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/5, /*k=*/160, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideSixRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/6, /*k=*/128, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideSevenRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/7, /*k=*/160, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideEightRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/8, /*k=*/128, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideNineRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/9, /*k=*/160, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTenRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/10, /*k=*/128, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideElevenRowsHasARaggedTile) {
+  RunPerChannelCase(/*b=*/11, /*k=*/160, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTwelveRowsTilesEvenly) {
+  RunPerChannelCase(/*b=*/12, /*k=*/128, /*n=*/128);
+}
+
 TEST_F(MetalFp8KernelTest, PerChannelQmmMatchesGolden) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128);
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesPartialMAndN) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/70);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/70);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesNTailWiderThanBk) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/100);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmBm64MatchesGolden) {
@@ -255,7 +313,7 @@ TEST_F(MetalFp8KernelTest, PerTensorGemvReadsTheSingleScale) {
 }
 
 TEST_F(MetalFp8KernelTest, PerTensorQmmReadsTheSingleScale) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
 }
 
 TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
@@ -263,7 +321,7 @@ TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
 }
 
 TEST_F(MetalFp8KernelTest, PerTensorQmmHandlesPartialN) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelGemvAcceptsAnF32Scale) {
@@ -272,7 +330,7 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvAcceptsAnF32Scale) {
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmAcceptsAnF32Scale) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
                     /*f32_scale=*/true);
 }
 
