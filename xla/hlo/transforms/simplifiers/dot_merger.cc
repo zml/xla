@@ -91,13 +91,14 @@ struct EquivalenceKey {
   PrimitiveType shared_op_type;
   PrimitiveType concat_op_type;
   PrimitiveType dot_type;
+  bool concat_op_is_dequantized;
   std::string precision_config_bytes;
 
   template <typename H>
   friend H AbslHashValue(H h, const EquivalenceKey& k) {
     return H::combine(std::move(h), k.source, k.dim_categories, k.queue_id,
                       k.shared_op_type, k.concat_op_type, k.dot_type,
-                      k.precision_config_bytes);
+                      k.concat_op_is_dequantized, k.precision_config_bytes);
   }
 
   bool operator==(const EquivalenceKey& other) const {
@@ -106,6 +107,7 @@ struct EquivalenceKey {
            shared_op_type == other.shared_op_type &&
            concat_op_type == other.concat_op_type &&
            dot_type == other.dot_type &&
+           concat_op_is_dequantized == other.concat_op_is_dequantized &&
            precision_config_bytes == other.precision_config_bytes;
   }
 
@@ -113,10 +115,12 @@ struct EquivalenceKey {
     int64_t id1 = source->unique_id();
     int64_t id2 = other.source->unique_id();
     auto t1 = std::tie(id1, queue_id, dim_categories, shared_op_type,
-                       concat_op_type, dot_type, precision_config_bytes);
+                       concat_op_type, dot_type, concat_op_is_dequantized,
+                       precision_config_bytes);
     auto t2 = std::tie(id2, other.queue_id, other.dim_categories,
                        other.shared_op_type, other.concat_op_type,
-                       other.dot_type, other.precision_config_bytes);
+                       other.dot_type, other.concat_op_is_dequantized,
+                       other.precision_config_bytes);
     return t1 < t2;
   }
 };
@@ -130,6 +134,37 @@ struct DotOperandUsage {
   int tz;
 };
 
+bool IsDequantizedWeight(const HloInstruction* operand) {
+  const PrimitiveType wide = operand->shape().element_type();
+  if (!primitive_util::IsFloatingPointType(wide)) return false;
+  const int64_t elements = ShapeUtil::ElementsIn(operand->shape());
+
+  // A dequantization is a short chain; give up (and report "not dequantized")
+  // on anything deeper.
+  constexpr int kMaxVisited = 16;
+  std::vector<const HloInstruction*> worklist = {operand};
+  for (int visited = 0; !worklist.empty() && visited < kMaxVisited; ++visited) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if (instr->opcode() == HloOpcode::kConvert) {
+      const Shape& from = instr->operand(0)->shape();
+      if (primitive_util::BitWidth(from.element_type()) <
+              primitive_util::BitWidth(wide) &&
+          ShapeUtil::ElementsIn(from) == elements) {
+        return true;
+      }
+    }
+    if (instr->IsElementwise() || instr->opcode() == HloOpcode::kBroadcast ||
+        instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape ||
+        instr->opcode() == HloOpcode::kTranspose) {
+      worklist.insert(worklist.end(), instr->operands().begin(),
+                      instr->operands().end());
+    }
+  }
+  return false;
+}
+
 absl::StatusOr<EquivalenceKey> GetEquivalenceKey(
     const HloInstruction* dot, const HloInstruction* operand,
     int shared_operand_idx, const HloInstruction* source,
@@ -142,9 +177,9 @@ absl::StatusOr<EquivalenceKey> GetEquivalenceKey(
   std::vector<DotOperandDims::Category> dim_categories =
       canonical_dims.Categories();
 
+  const HloInstruction* concat_operand = dot->operand(1 - shared_operand_idx);
   PrimitiveType shared_op_type = operand->shape().element_type();
-  PrimitiveType concat_op_type =
-      dot->operand(1 - shared_operand_idx)->shape().element_type();
+  PrimitiveType concat_op_type = concat_operand->shape().element_type();
   PrimitiveType dot_type = dot->shape().element_type();
   std::string precision_config_bytes =
       dot->precision_config().SerializeAsString();
@@ -155,6 +190,7 @@ absl::StatusOr<EquivalenceKey> GetEquivalenceKey(
                         shared_op_type,
                         concat_op_type,
                         dot_type,
+                        IsDequantizedWeight(concat_operand),
                         std::move(precision_config_bytes)};
 }
 

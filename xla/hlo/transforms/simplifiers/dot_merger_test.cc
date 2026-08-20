@@ -484,6 +484,101 @@ TEST_F(DotMergerTest, NoMergeDataDependency) {
   EXPECT_FALSE(changed);
 }
 
+TEST_F(DotMergerTest, MergeTwoDequantizedWeights) {
+  absl::string_view module_string = R"(
+  HloModule module
+
+  ENTRY main {
+    lhs   = bf16[200,100] parameter(0)
+    w0    = f8e4m3fn[100,10] parameter(1)
+    sc0   = bf16[10] parameter(2)
+    w1    = f8e4m3fn[100,50] parameter(3)
+    sc1   = bf16[50] parameter(4)
+    c0    = bf16[100,10] convert(w0)
+    b0    = bf16[100,10] broadcast(sc0), dimensions={1}
+    rhs0  = bf16[100,10] multiply(c0, b0)
+    c1    = bf16[100,50] convert(w1)
+    b1    = bf16[100,50] broadcast(sc1), dimensions={1}
+    rhs1  = bf16[100,50] multiply(c1, b1)
+    dot0  = bf16[200,10] dot(lhs, rhs0), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    dot1  = bf16[200,50] dot(lhs, rhs1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    ROOT tuple = (bf16[200,10], bf16[200,50]) tuple(dot0, dot1)
+  })";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(module_string));
+  DotMerger pass(/*max_size_to_merge=*/std::numeric_limits<int64_t>::max());
+  ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+  EXPECT_TRUE(changed);
+}
+
+TEST_F(DotMergerTest, NoMergeDequantizedWithPlainWeight) {
+  absl::string_view module_string = R"(
+  HloModule module
+
+  ENTRY main {
+    lhs   = bf16[200,100] parameter(0)
+    w0    = f8e4m3fn[100,10] parameter(1)
+    sc0   = bf16[10] parameter(2)
+    c0    = bf16[100,10] convert(w0)
+    b0    = bf16[100,10] broadcast(sc0), dimensions={1}
+    rhs0  = bf16[100,10] multiply(c0, b0)
+    rhs1  = bf16[100,50] parameter(3)
+    dot0  = bf16[200,10] dot(lhs, rhs0), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    dot1  = bf16[200,50] dot(lhs, rhs1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    ROOT tuple = (bf16[200,10], bf16[200,50]) tuple(dot0, dot1)
+  })";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(module_string));
+  DotMerger pass(/*max_size_to_merge=*/std::numeric_limits<int64_t>::max());
+  ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(DotMergerTest, MergeUnquantizedWeightScaledTheSameWay) {
+  absl::string_view module_string = R"(
+  HloModule module
+
+  ENTRY main {
+    lhs   = bf16[200,100] parameter(0)
+    w0    = bf16[100,10] parameter(1)
+    sc0   = bf16[10] parameter(2)
+    w1    = bf16[100,50] parameter(3)
+    sc1   = bf16[50] parameter(4)
+    b0    = bf16[100,10] broadcast(sc0), dimensions={1}
+    rhs0  = bf16[100,10] multiply(w0, b0)
+    b1    = bf16[100,50] broadcast(sc1), dimensions={1}
+    rhs1  = bf16[100,50] multiply(w1, b1)
+    dot0  = bf16[200,10] dot(lhs, rhs0), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    dot1  = bf16[200,50] dot(lhs, rhs1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    ROOT tuple = (bf16[200,10], bf16[200,50]) tuple(dot0, dot1)
+  })";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(module_string));
+  DotMerger pass(/*max_size_to_merge=*/std::numeric_limits<int64_t>::max());
+  ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+  EXPECT_TRUE(changed);
+}
+
+TEST_F(DotMergerTest, MergeWithDequantizedSharedOperand) {
+  absl::string_view module_string = R"(
+  HloModule module
+
+  ENTRY main {
+    xq    = f8e4m3fn[200,100] parameter(0)
+    lhs   = bf16[200,100] convert(xq)
+    rhs0  = bf16[100,10] parameter(1)
+    rhs1  = bf16[100,50] parameter(2)
+    dot0  = bf16[200,10] dot(lhs, rhs0), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    dot1  = bf16[200,50] dot(lhs, rhs1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    ROOT tuple = (bf16[200,10], bf16[200,50]) tuple(dot0, dot1)
+  })";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(module_string));
+  DotMerger pass(/*max_size_to_merge=*/std::numeric_limits<int64_t>::max());
+  ASSERT_OK_AND_ASSIGN(bool changed, this->RunHloPass(&pass, module.get()));
+  EXPECT_TRUE(changed);
+}
+
 TEST_F(DotMergerTest, MergeSameContractingDimsOnBothSides) {
   absl::string_view module_string = R"(
   HloModule module
