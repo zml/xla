@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace xla {
 namespace gpu {
@@ -123,9 +124,20 @@ inline int ComputeNvfp4QmmSplitK(int M, int N, int K,
   return split_k;
 }
 
+inline constexpr int kNvfp4QmvWideMaxVecs = 12;
+inline int Nvfp4QmvWideMaxVecs() {
+  static const int v = [] {
+    const char* e = std::getenv("METAL_NVFP4_WIDE_VECS");
+    const int n = e ? std::atoi(e) : 0;
+    return (n >= 2 && n <= kNvfp4QmvWideMaxVecs) ? n : 5;
+  }();
+  return v;
+}
+
 inline int Nvfp4QmvWideVecsPerTg(int M) {
   if (M <= 1) return 1;
-  const int n_tiles = (M + 4) / 5;  // ceil(M / 5)
+  const int cap = Nvfp4QmvWideMaxVecs();
+  const int n_tiles = (M + cap - 1) / cap;
   return (M + n_tiles - 1) / n_tiles;
 }
 
@@ -136,11 +148,24 @@ inline bool Nvfp4SplitkAlignN(int N) {
   return Nvfp4QmmAlignN(N, kNvfp4SplitkBN);
 }
 
+inline int Nvfp4QmvBatchLimitOverride() {
+  static const int v = [] {
+    const char* e = std::getenv("METAL_NVFP4_QMV_MAX");
+    const int n = e ? std::atoi(e) : 0;
+    return n > 0 ? n : 0;
+  }();
+  return v;
+}
+
 inline Nvfp4DensePath SelectNvfp4DensePath(
     int64_t M, int64_t K, int64_t N, char arch_size = kNvfp4DefaultArchSize,
     int arch_gen = kNvfp4DefaultArchGen) {
-  const int limit = GetNvfp4QmvBatchLimit(
-      static_cast<int>(K), static_cast<int>(N), arch_size, arch_gen);
+  const int override_limit = Nvfp4QmvBatchLimitOverride();
+  const int limit = override_limit > 0
+                        ? override_limit
+                        : GetNvfp4QmvBatchLimit(static_cast<int>(K),
+                                                static_cast<int>(N), arch_size,
+                                                arch_gen);
   if (M < limit) {
     return (M >= 2) ? Nvfp4DensePath::kQmvWide : Nvfp4DensePath::kQmv;
   }
@@ -159,6 +184,20 @@ inline const char* Nvfp4QmvWideKernelName(int vecs_per_tg) {
       return "nvfp4_qmv_wide_4";
     case 5:
       return "nvfp4_qmv_wide_5";
+    case 6:
+      return "nvfp4_qmv_wide_6";
+    case 7:
+      return "nvfp4_qmv_wide_7";
+    case 8:
+      return "nvfp4_qmv_wide_8";
+    case 9:
+      return "nvfp4_qmv_wide_9";
+    case 10:
+      return "nvfp4_qmv_wide_10";
+    case 11:
+      return "nvfp4_qmv_wide_11";
+    case 12:
+      return "nvfp4_qmv_wide_12";
     default:
       return nullptr;
   }

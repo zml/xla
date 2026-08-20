@@ -506,6 +506,25 @@ NVFP4_QMV_WIDE_ENTRY(2)
 NVFP4_QMV_WIDE_ENTRY(3)
 NVFP4_QMV_WIDE_ENTRY(4)
 NVFP4_QMV_WIDE_ENTRY(5)
+// XLA DELTA: 6..12, past MLX's launch formula. They exist so the cap can be
+// swept, NOT because a wider tile is better here -- measured, it is not, and 5
+// stays the default. Throughput peaks at 5 and falls off after, and
+// non-monotonically (7 below 8, 9 below 10), which is register allocation going
+// over a cliff rather than a smooth occupancy trade.
+//
+// Worth stating because the FP8 arm's identical-looking cap of 5 was WRONG and
+// won at 10 once its x staging stopped spilling (custom/fp8_gemv_pc.metal).
+// The difference is the body: this one already keeps per-vector state to one
+// accumulator and one pointer, with x loaded and consumed inside the same
+// unrolled step, so there is no spill to recover. Same shape of kernel,
+// opposite answer -- do not re-derive either cap from the other.
+NVFP4_QMV_WIDE_ENTRY(6)
+NVFP4_QMV_WIDE_ENTRY(7)
+NVFP4_QMV_WIDE_ENTRY(8)
+NVFP4_QMV_WIDE_ENTRY(9)
+NVFP4_QMV_WIDE_ENTRY(10)
+NVFP4_QMV_WIDE_ENTRY(11)
+NVFP4_QMV_WIDE_ENTRY(12)
 #undef NVFP4_QMV_WIDE_ENTRY
 
 // =============================================================================
