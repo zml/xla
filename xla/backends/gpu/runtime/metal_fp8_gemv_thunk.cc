@@ -78,11 +78,6 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (per_channel_) {
     entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
     if (f32_scale) entry += "_f32";
-    // kROWS divides the threadgroup count, so on a narrow N the default 4
-    // starves the GPU before it saturates memory -- see the group-count/
-    // bandwidth table in custom/fp8_gemv_pc.metal. Drop to 2 rows when 4 would
-    // leave fewer than kMinGroups threadgroups.
-    if (gemv && rows_per_group() == 2) entry += "_r2";
     source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
   } else {
     // Block-128 has no f32 arm; ClassifyMetalScaledMatmul only admits bf16 there.

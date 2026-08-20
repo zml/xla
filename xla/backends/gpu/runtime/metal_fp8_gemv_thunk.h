@@ -63,19 +63,10 @@ class MetalFp8GemvThunk : public Thunk {
   absl::Status EnsureLoaded(stream_executor::StreamExecutor* executor)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  // Output channels one decode-GEMV threadgroup computes. Block-128 always does
-  // one; the per-channel kernel does kROWS, which both amortizes the x row and
-  // DIVIDES the threadgroup count -- and below ~2048 groups this GPU runs out of
-  // parallelism before it runs out of bandwidth (the table in
-  // custom/fp8_gemv_pc.metal). Depends only on shape, so EnsureLoaded and the
-  // launch must read it from here rather than each deciding for itself: picking
-  // the "_r2" entry and then dispatching N/4 groups would silently compute only
-  // half the output channels.
-  int64_t rows_per_group() const {
-    if (!per_channel_) return 1;
-    constexpr int64_t kMinGroups = 2048;
-    return (n_ / 4 >= kMinGroups) ? 4 : 2;
-  }
+  // Output channels one decode-GEMV threadgroup computes; must equal kROWS in
+  // custom/fp8_gemv_pc.metal, which carries the benchmark that picked 2. The
+  // block-128 GEMV still does one row.
+  int64_t rows_per_group() const { return per_channel_ ? 2 : 1; }
 
   const BufferAllocation::Slice x_, w_, scale_, out_;
   const Shape x_shape_, w_shape_, scale_shape_, out_shape_;
