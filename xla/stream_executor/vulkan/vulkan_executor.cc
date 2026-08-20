@@ -2462,6 +2462,12 @@ VulkanExecutor::HostMemoryAllocate(uint64_t size) {
       memory, size, [](void* pointer, uint64_t) { std::free(pointer); });
 }
 
+bool VulkanExecutor::IsHostMemoryPinned(const void* ptr, uint64_t size) {
+  // Vulkan allocations are host-visible, host-coherent, and persistently
+  // mapped, so they can be used directly as host-to-device transfer sources.
+  return size != 0 && impl_->FindAllocation(ptr, size).ok();
+}
+
 bool VulkanExecutor::SynchronizeAllActivity() {
   uint64_t value = 0;
   {

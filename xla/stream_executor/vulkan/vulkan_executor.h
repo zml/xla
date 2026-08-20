@@ -74,6 +74,7 @@ class VulkanExecutor final : public gpu::GpuExecutor {
       MemorySpace memory_space) override;
   absl::StatusOr<std::unique_ptr<MemoryAllocation>> HostMemoryAllocate(
       uint64_t size) override;
+  bool IsHostMemoryPinned(const void* ptr, uint64_t size) override;
   bool SynchronizeAllActivity() override;
   absl::Status SynchronousMemcpy(DeviceAddressBase* device_dst,
                                  const void* host_src,
