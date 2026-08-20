@@ -10,9 +10,7 @@ static inline float decode_e4m3fn(uchar b) {
     return s ? -v : v;
 }
 
-constant constexpr int kROWS = 4;
-
-template <typename ST>
+template <typename ST, int kROWS>
 [[kernel]] void fp8_gemv_pc_entry(
     device const bfloat *x      [[buffer(0)]],
     device const uchar  *w      [[buffer(1)]],
@@ -82,10 +80,13 @@ template <typename ST>
     }
 }
 
-#define instantiate_fp8_gemv_pc(name, st)                                 \
-  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st>(     \
-      device const bfloat*, device const uchar*, device const st*,        \
+// keep their meaning.
+#define instantiate_fp8_gemv_pc(name, st, rows)                              \
+  template [[host_name(name)]] [[kernel]] void fp8_gemv_pc_entry<st, rows>(  \
+      device const bfloat*, device const uchar*, device const st*,           \
       device bfloat*, constant int4&, uint3, uint, uint, uint);
 
-instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat)
-instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float)
+instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat, 4)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float, 4)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_r2", bfloat, 2)
+instantiate_fp8_gemv_pc("fp8_gemv_pc_f32_r2", float, 2)

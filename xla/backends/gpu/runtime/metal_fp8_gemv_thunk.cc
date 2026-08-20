@@ -74,6 +74,7 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (per_channel_) {
     entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
     if (f32_scale) entry += "_f32";
+    if (gemv && rows_per_group() == 2) entry += "_r2";
     source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
   } else {
     entry = gemv ? "fp8_gemv" : (b_ > 16 ? "fp8_qmm_t_bm64" : "fp8_qmm_t");
@@ -123,9 +124,8 @@ absl::Status MetalFp8GemvThunk::ExecuteOnStream(const ExecuteParams& params) {
   args.add_argument(p_dims_);                          // 4  dims (int4)
 
   if (b_ == 1) {
-    const int64_t rows_per_group = per_channel_ ? 4 : 1;
-    const uint64_t groups =
-        static_cast<uint64_t>((n_ + rows_per_group - 1) / rows_per_group);
+    const int64_t rpg = rows_per_group();
+    const uint64_t groups = static_cast<uint64_t>((n_ + rpg - 1) / rpg);
     return kernel_->Launch(se::ThreadDim(256, 1, 1), se::BlockDim(groups, 1, 1),
                            stream, args);
   }

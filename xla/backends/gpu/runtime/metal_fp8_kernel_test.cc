@@ -98,7 +98,9 @@ class MetalFp8KernelTest : public ::testing::Test {
   }
 
   void RunPerChannelCase(int32_t b, int32_t k, int32_t n,
-                         bool per_tensor = false, bool f32_scale = false) {
+                         bool per_tensor = false, bool f32_scale = false,
+                         int32_t gemv_rows = 4) {
+    ASSERT_TRUE(gemv_rows == 2 || gemv_rows == 4);
     ASSERT_EQ(k % 32, 0) << "the per-channel kernels have no contraction tail";
 
     std::vector<uint16_t> x(static_cast<size_t>(b) * k);
@@ -154,6 +156,7 @@ class MetalFp8KernelTest : public ::testing::Test {
                                     : (large_m ? "fp8_qmm_t_pc_bm64"
                                                : "fp8_qmm_t_pc");
     if (f32_scale) kernel_name += "_f32";
+    if (decode && gemv_rows == 2) kernel_name += "_r2";
     TF_ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<se::Kernel> kernel,
         metal_executor_->LoadKernelWithConstants(
@@ -170,7 +173,7 @@ class MetalFp8KernelTest : public ::testing::Test {
     args.add_argument(dims);
 
     if (decode) {
-      constexpr int64_t kGemvRows = 4;
+      const int64_t kGemvRows = gemv_rows;
       TF_ASSERT_OK(kernel->Launch(
           se::ThreadDim(256, 1, 1),
           se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows), 1, 1),
@@ -219,6 +222,21 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesNonBlockAlignedK) {
 
 TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesPartialN) {
   RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/70);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvTwoRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+                    /*f32_scale=*/false, /*gemv_rows=*/2);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvTwoRowsHandlesPartialN) {
+  RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/71, /*per_tensor=*/false,
+                    /*f32_scale=*/false, /*gemv_rows=*/2);
+}
+
+TEST_F(MetalFp8KernelTest, PerTensorGemvTwoRowsReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/1, /*k=*/256, /*n=*/128, /*per_tensor=*/true,
+                    /*f32_scale=*/true, /*gemv_rows=*/2);
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmMatchesGolden) {
