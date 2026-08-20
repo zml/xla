@@ -197,15 +197,28 @@ class MetalFp8KernelTest : public ::testing::Test {
     ASSERT_NE(out_device.opaque(), nullptr);
 
     const bool decode = (b == 1);
+    // Mirrors MetalFp8GemvThunk::wide_vecs(): fewest tiles, then the smallest
+    // tile that fills them. 0 means not the wide path.
+    //
+    // These two MUST equal MetalFp8GemvThunk::MaxVecs() and WideMaxBatch(),
+    // which are private to the thunk. Drift does not fail a test, it MOVES one:
+    // raise kWideMax above the thunk's and every case named for a Steel tile
+    // quietly reroutes to the wide kernel, leaving BM=16 untested and green.
+    constexpr int64_t kMaxVecs = 10;
+    constexpr int64_t kWideMax = 12;
+    const int64_t tiles = (b + kMaxVecs - 1) / kMaxVecs;
+    const int64_t vecs =
+        (b >= 2 && b <= kWideMax) ? (b + tiles - 1) / tiles : 0;
     const bool large_m = b > 16;
-    std::string kernel_name = decode ? "fp8_gemv_pc"
-                                    : (large_m ? "fp8_qmm_t_pc_bm64"
-                                               : "fp8_qmm_t_pc");
+    std::string kernel_name =
+        decode ? "fp8_gemv_pc"
+               : (vecs != 0 ? "fp8_gemv_pc_wide_" + std::to_string(vecs)
+                            : (large_m ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc"));
     if (f32_scale) kernel_name += "_f32";
     TF_ASSERT_OK_AND_ASSIGN(
         std::unique_ptr<se::Kernel> kernel,
         metal_executor_->LoadKernelWithConstants(
-            decode ? gemv_metallib_ : qmm_metallib_, kernel_name,
+            (decode || vecs != 0) ? gemv_metallib_ : qmm_metallib_, kernel_name,
             /*arity=*/5, {}));
     TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
                             executor_->CreateStream());
@@ -219,10 +232,13 @@ class MetalFp8KernelTest : public ::testing::Test {
 
     // Mirrors MetalFp8GemvThunk::ExecuteOnStream exactly; a divergence here
     // would test a launch geometry nothing in production uses.
-    if (decode) {
+    if (decode || vecs != 0) {
+      const uint64_t ygroups =
+          vecs != 0 ? static_cast<uint64_t>((b + vecs - 1) / vecs) : 1;
       TF_ASSERT_OK(kernel->Launch(
           se::ThreadDim(256, 1, 1),
-          se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows), 1, 1),
+          se::BlockDim(static_cast<uint64_t>((n + kGemvRows - 1) / kGemvRows),
+                       ygroups, 1),
           stream.get(), args));
     } else {
       constexpr int64_t kPcBN = 64;
@@ -282,14 +298,79 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvHandlesOddN) {
   RunPerChannelCase(/*b=*/1, /*k=*/128, /*n=*/71);
 }
 
-// Thin-M qmm (BM=16): 1 < B <= 16.
+// The wide decode kernels, which serve `b` input rows from one threadgroup so a
+// thin batch stops paying for the BM=16 tile. x varies down M here, so a kernel
+// that read the wrong x row -- or never wrote rows past the first -- fails
+// rather than matching by symmetry.
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTwoRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/2, /*k=*/256, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideThreeRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/3, /*k=*/160, /*n=*/128);
+}
+
+// b=4 with an N that is odd: exercises both tails at once (the clamped output
+// channel and the clamped input row).
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideFourRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/4, /*k=*/128, /*n=*/71);
+}
+
+// The per-tensor f32 scale is what the unfused projections of a mixed-precision
+// checkpoint actually carry, and it is read once per output channel here.
+TEST_F(MetalFp8KernelTest, PerTensorGemvWideReadsTheSingleScale) {
+  RunPerChannelCase(/*b=*/2, /*k=*/256, /*n=*/128, /*per_tensor=*/true,
+                    /*f32_scale=*/true);
+}
+
+// kVECS picks kCHUNK -- 16 bytes of w per thread through 4, 8 through 7, 4 from
+// 8 on -- so these are three different inner loops, and b=5 and b=8 are the
+// first of their regime. k=160 at b=5 leaves most threads idle on the last step.
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideFiveRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/5, /*k=*/160, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideSixRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/6, /*k=*/128, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideSevenRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/7, /*k=*/160, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideEightRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/8, /*k=*/128, /*n=*/128);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideNineRowsHandlesOddN) {
+  RunPerChannelCase(/*b=*/9, /*k=*/160, /*n=*/71);
+}
+
+// b=10 is the widest single tile: kVECS == MaxVecs().
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTenRowsMatchesGolden) {
+  RunPerChannelCase(/*b=*/10, /*k=*/128, /*n=*/128);
+}
+
+// Past MaxVecs the batch tiles as 2x6, never 10+1 or 10+2. These are the cases
+// where grid.y > 1, so a kernel that ignored tgid.y -- or a launch that forgot
+// to divide by vecs -- writes only the first tile.
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideElevenRowsHasARaggedTile) {
+  RunPerChannelCase(/*b=*/11, /*k=*/160, /*n=*/71);
+}
+
+TEST_F(MetalFp8KernelTest, PerChannelGemvWideTwelveRowsTilesEvenly) {
+  RunPerChannelCase(/*b=*/12, /*k=*/128, /*n=*/128);
+}
+
+// Thin-M qmm (BM=16): kWideMax < B <= 16. Everything at or below kWideMax takes
+// the wide kernel now, so b=13..16 is the only window that reaches BM=16.
 TEST_F(MetalFp8KernelTest, PerChannelQmmMatchesGolden) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128);
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128);
 }
 
 // A partial M tile and a partial N tile at once.
 TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesPartialMAndN) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/70);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/70);
 }
 
 // An N tail *wider than BK*, which is the only shape that reaches the row guard
@@ -299,7 +380,7 @@ TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesPartialMAndN) {
 // above cannot catch it: their tail of 6 is below BK, so nothing is wrongly
 // zeroed. Both BM tiles, because the guard is in the shared loader.
 TEST_F(MetalFp8KernelTest, PerChannelQmmHandlesNTailWiderThanBk) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/100);
 }
 
 // Prefill qmm (BM=64): B > 16.
@@ -322,7 +403,7 @@ TEST_F(MetalFp8KernelTest, PerTensorGemvReadsTheSingleScale) {
 }
 
 TEST_F(MetalFp8KernelTest, PerTensorQmmReadsTheSingleScale) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128, /*per_tensor=*/true);
 }
 
 TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
@@ -332,7 +413,7 @@ TEST_F(MetalFp8KernelTest, PerTensorQmmBm64ReadsTheSingleScale) {
 // Stride 0 must survive a partial N tile too: the tail path indexes the scale
 // through the same base, so a stride the loader ignores shows up here as well.
 TEST_F(MetalFp8KernelTest, PerTensorQmmHandlesPartialN) {
-  RunPerChannelCase(/*b=*/5, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
+  RunPerChannelCase(/*b=*/13, /*k=*/128, /*n=*/100, /*per_tensor=*/true);
 }
 
 // The _f32 entries, through all three tiles and both scale grids. Wiring only:
@@ -343,7 +424,7 @@ TEST_F(MetalFp8KernelTest, PerChannelGemvAcceptsAnF32Scale) {
 }
 
 TEST_F(MetalFp8KernelTest, PerChannelQmmAcceptsAnF32Scale) {
-  RunPerChannelCase(/*b=*/8, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
+  RunPerChannelCase(/*b=*/16, /*k=*/256, /*n=*/128, /*per_tensor=*/false,
                     /*f32_scale=*/true);
 }
 

@@ -10,6 +10,17 @@ static inline float decode_e4m3fn(uchar b) {
     return s ? -v : v;
 }
 
+// The same decode with no table: e4m3fn's fields land in half's, four at a
+// time, giving decode_e4m3fn's value divided by 2^8 (half's bias is 15, e4m3's
+// is 7). Subnormals fall out for free and 0x7F/0xFF decode to +-480 exactly as
+// the table does, since neither form special-cases fn's NaN. The 2^8 is a power
+// of two, so the caller folds it into the scale exactly.
+static inline float4 dec4_over256(uchar4 b) {
+    const ushort4 u = ushort4(b);
+    return float4(as_type<half4>(((u & ushort4(0x007F)) << 7) |
+                                 ((u & ushort4(0x0080)) << 8)));
+}
+
 // Per-CHANNEL block-scaled FP8 GEMV (decode, B==1). The scale is one value per
 // output channel and is constant across K, so it factors out of the reduction:
 //   out[bi, ni] = scale[ni] * sum_k x[bi, k] * decode_e4m3fn(w[ni, k])
@@ -127,6 +138,121 @@ template <typename ST>
     }
 }
 
+// Thin-M decode: one threadgroup serves kVECS input rows at once.
+//
+// B>1 used to fall to the Steel BM=16 qmm, where at M=2 fourteen of sixteen
+// tile rows are padding. The weight is the expensive operand, so load it ONCE
+// per threadgroup and apply it to kVECS input vectors instead -- the same trick
+// nvfp4_qmv_wide_V uses. Weight traffic per output row drops by kVECS while x
+// traffic (a few KB, cached) rises.
+//
+// The live frame is kROWS*kVECS accumulators plus kVECS*(kCHUNK/4) staged x
+// vectors, and the second term is what limits how wide this can go:
+//
+// 1. x must be staged in one array PER CHUNK POSITION. A single
+//    bfloat4 xb[kVECS][4] -- or the flat bfloat4 xb[kVECS*4] -- gets demoted
+//    out of registers into thread scratch once it passes ~12 elements, at a 4x
+//    cost. Same trap mlx_fp4_qmv.h:63-70 documents, and it is what used to make
+//    kVECS=8 slower than kVECS=4 despite reading the weights half as often.
+//
+// 2. kCHUNK has to SHRINK as kVECS grows, since the frame is their product:
+//    16 bytes of w per thread up to kVECS=4, 8 through 7, 4 from 8 on.
+template <typename ST, int kVECS>
+[[kernel]] void fp8_gemv_pc_wide_entry(
+    device const bfloat *x      [[buffer(0)]],
+    device const uchar  *w      [[buffer(1)]],
+    device const ST     *scale  [[buffer(2)]],
+    device       bfloat *out    [[buffer(3)]],
+    constant int4&       dims   [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    // Bytes of w per thread per step, and the bfloat4 of x that pairs with it.
+    constexpr int kCHUNK = (kVECS >= 8) ? 4 : (kVECS >= 5 ? 8 : 16);
+    constexpr int NF = kCHUNK / 4;
+
+    const int B = dims.x, K = dims.y, N = dims.z;
+    const int n0 = int(tgid.x) * kROWS;
+    const int b0 = int(tgid.y) * kVECS;
+    if (n0 >= N || b0 >= B) return;
+
+    // Both tails clamp onto the last valid index rather than branching: the
+    // extra lanes are computed and then not stored.
+    const device uchar *wrow[kROWS];
+#pragma unroll
+    for (int r = 0; r < kROWS; ++r)
+        wrow[r] = w + (long)min(n0 + r, N - 1) * K;
+    const device bfloat *xrow[kVECS];
+#pragma unroll
+    for (int v = 0; v < kVECS; ++v)
+        xrow[v] = x + (long)min(b0 + v, B - 1) * K;
+
+    float acc[kROWS][kVECS];
+#pragma unroll
+    for (int r = 0; r < kROWS; ++r)
+#pragma unroll
+        for (int v = 0; v < kVECS; ++v) acc[r][v] = 0.0f;
+
+    // K % 32 == 0 is enforced by ClassifyMetalScaledMatmul, so every kCHUNK
+    // divides K and there is no tail. The unrolls are load-bearing: a residual
+    // loop over v keeps the x staging addressable, which is what demotes it.
+    for (int k = int(tid) * kCHUNK; k + kCHUNK <= K; k += 256 * kCHUNK) {
+        bfloat4 x0[kVECS], x1[kVECS], x2[kVECS], x3[kVECS];
+#pragma unroll
+        for (int v = 0; v < kVECS; ++v) {
+            x0[v] = *(const device bfloat4 *)(xrow[v] + k);
+            if (NF > 1) x1[v] = *(const device bfloat4 *)(xrow[v] + k + 4);
+            if (NF > 2) x2[v] = *(const device bfloat4 *)(xrow[v] + k + 8);
+            if (NF > 3) x3[v] = *(const device bfloat4 *)(xrow[v] + k + 12);
+        }
+#pragma unroll
+        for (int r = 0; r < kROWS; ++r) {
+            float4 wq[NF];
+#pragma unroll
+            for (int j = 0; j < NF; ++j)
+                wq[j] = dec4_over256(
+                    *(const device uchar4 *)(wrow[r] + k + 4 * j));
+#pragma unroll
+            for (int v = 0; v < kVECS; ++v) {
+                float s = dot(wq[0], float4(x0[v]));
+                if (NF > 1) s += dot(wq[1], float4(x1[v]));
+                if (NF > 2) s += dot(wq[2], float4(x2[v]));
+                if (NF > 3) s += dot(wq[3], float4(x3[v]));
+                acc[r][v] += s;
+            }
+        }
+    }
+
+    threadgroup float part[kROWS][kVECS][8];
+    for (int r = 0; r < kROWS; ++r) {
+        for (int v = 0; v < kVECS; ++v) {
+            float a = simd_sum(acc[r][v]);
+            if (lane == 0) part[r][v][sgid] = a;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        const bool per_tensor = dims.w < 0;
+        for (int r = 0; r < kROWS; ++r) {
+            const int ni = n0 + r;
+            // A clamped row still reads a scale, so clamp that index too.
+            const int si = per_tensor ? 0 : min(ni, N - 1);
+            // Undo dec4_over256's 2^-8, exactly, once per output row.
+            const float s = float(scale[si]) * 256.0f;
+            for (int v = 0; v < kVECS; ++v) {
+                float t = (lane < 8) ? part[r][v][lane] : 0.0f;
+                t = simd_sum(t);
+                const int bi = b0 + v;
+                if (lane == 0 && ni < N && bi < B) {
+                    out[(long)bi * N + ni] = bfloat(s * t);
+                }
+            }
+        }
+    }
+}
+
 // An MSL entry point cannot itself be a template, so each scale dtype is
 // stamped out by name -- the same idiom as gdn_linear_attention.
 #define instantiate_fp8_gemv_pc(name, st)                                 \
@@ -136,3 +262,34 @@ template <typename ST>
 
 instantiate_fp8_gemv_pc("fp8_gemv_pc", bfloat)
 instantiate_fp8_gemv_pc("fp8_gemv_pc_f32", float)
+
+#define instantiate_fp8_gemv_pc_wide(name, st, vecs)                           \
+  template [[host_name(name)]] [[kernel]] void                                 \
+  fp8_gemv_pc_wide_entry<st, vecs>(                                            \
+      device const bfloat*, device const uchar*, device const st*,             \
+      device bfloat*, constant int4&, uint3, uint, uint, uint);
+
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_2", bfloat, 2)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_2_f32", float, 2)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_3", bfloat, 3)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_3_f32", float, 3)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_4", bfloat, 4)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_4_f32", float, 4)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_5", bfloat, 5)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_5_f32", float, 5)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_6", bfloat, 6)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_6_f32", float, 6)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_7", bfloat, 7)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_7_f32", float, 7)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_8", bfloat, 8)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_8_f32", float, 8)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_9", bfloat, 9)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_9_f32", float, 9)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_10", bfloat, 10)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_10_f32", float, 10)
+// 11 and 12 are past MaxVecs and unreachable by default; they exist so
+// METAL_FP8_WIDE_VECS can sweep the range without a rebuild.
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_11", bfloat, 11)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_11_f32", float, 11)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_12", bfloat, 12)
+instantiate_fp8_gemv_pc_wide("fp8_gemv_pc_wide_12_f32", float, 12)
