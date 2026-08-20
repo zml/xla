@@ -6627,12 +6627,24 @@ absl::Status SpmdPartitioningVisitor::HandleScaledDot(HloInstruction* hlo) {
       scale = scale.Reshard(HloSharding::Replicate());
       return true;
     }
+    // A size-1 scale dimension is a broadcast, so there is nothing to divide.
+    // Demanding it divide the shard count sends an `[out, 1]` per-channel scale
+    // on a row-parallel projection to the replicated DefaultAction, which
+    // all-gathers the weight.
+    bool broadcast_over_sharded_dim = false;
     for (int64_t d = 0; d < scale_shape.dimensions().size(); ++d) {
+      if (scale_shape.dimensions(d) == 1) {
+        broadcast_over_sharded_dim |= data.sharding().dimension(d) > 1;
+        continue;
+      }
       if (scale_shape.dimensions(d) % data.sharding().dimension(d) != 0) {
         return false;
       }
     }
-    scale = scale.Reshard(data.sharding());
+    // Following the data would tile that size-1 dimension; replicating keeps
+    // the data sharded instead.
+    scale = scale.Reshard(broadcast_over_sharded_dim ? HloSharding::Replicate()
+                                                     : data.sharding());
     return true;
   };
   if (!follow_data(lhs_scale, lhs) || !follow_data(rhs_scale, rhs)) {
