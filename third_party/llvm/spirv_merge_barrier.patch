@@ -134,7 +134,7 @@ diff --git a/llvm/lib/Target/SPIRV/SPIRVTargetMachine.cpp b/llvm/lib/Target/SPIR
    initializeSPIRVPostLegalizerPass(PR);
 +  initializeSPIRVFixupMergeTerminatorsPass(PR);
    initializeSPIRVMergeRegionExitTargetsLegacyPass(PR);
-   initializeSPIRVEmitIntrinsicsPass(PR);
+   initializeSPIRVEmitIntrinsicsLegacyPass(PR);
    initializeSPIRVPrepareFunctionsLegacyPass(PR);
 @@ -136,1 +137,2 @@ public:
    void addPostRegAlloc() override;

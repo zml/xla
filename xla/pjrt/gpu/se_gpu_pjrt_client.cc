@@ -2106,10 +2106,16 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   auto se_gpu_topology =
       CreateSEGpuTopology(pjrt_platform_name, std::move(gpu_topology),
                           GetFirstExecutor(device_topology_pair.first));
+  // Vulkan host-to-device transfers are synchronous CPU copies into
+  // persistently mapped HOST_VISIBLE | HOST_COHERENT memory. They do not DMA
+  // from the caller's host pointer, so generic GPU staging is unnecessary and
+  // only adds an asynchronous host-buffer copy before the Vulkan copy.
+  const bool should_stage_host_to_device_transfers =
+      !is_vulkan && options.should_stage_host_to_device_transfers;
   auto raw_client = std::make_unique<StreamExecutorGpuRawClient>(
       tsl::Fingerprint64(pjrt_platform_name), std::move(allocator), xla_client,
       std::move(host_memory_allocator),
-      options.should_stage_host_to_device_transfers,
+      should_stage_host_to_device_transfers,
       /*async_work_runner=*/nullptr,
       GetFirstExecutor(device_topology_pair.first), kv_store,
       preallocate_device_memory, options.abort_collectives_on_failure,
