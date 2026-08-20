@@ -74,7 +74,6 @@ absl::Status MetalFp8GemvThunk::EnsureLoaded(se::StreamExecutor* executor) {
   if (per_channel_) {
     entry = gemv ? "fp8_gemv_pc" : (b_ > 16 ? "fp8_qmm_t_pc_bm64" : "fp8_qmm_t_pc");
     if (f32_scale) entry += "_f32";
-    if (gemv && rows_per_group() == 2) entry += "_r2";
     source = gemv ? get_fp8_gemv_pc() : get_mlx_steel_qgemm();
   } else {
     entry = gemv ? "fp8_gemv" : (b_ > 16 ? "fp8_qmm_t_bm64" : "fp8_qmm_t");
