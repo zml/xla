@@ -81,8 +81,11 @@ absl::Status MetalStream::WaitFor(Stream* other) {
 namespace {
 bool BatchDbgEnabled() {
   static const bool on = [] {
-    const char* e = std::getenv("METAL_KPROF");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
+    for (const char* v : {"METAL_BATCH_DBG", "METAL_KPROF"}) {
+      const char* e = std::getenv(v);
+      if (e != nullptr && e[0] != '\0' && e[0] != '0') return true;
+    }
+    return false;
   }();
   return on;
 }
@@ -121,7 +124,7 @@ absl::Status MetalStream::RecordEvent(Event* event) {
     const bool gpu_dry =
         metal::SharedEventSignaledValue(executor_->shared_event()) >=
         last_signaled_value_;
-    if (gpu_dry || signals_since_commit_ >= kMaxSignalsPerBuffer) {
+    if (gpu_dry || signals_since_commit_ >= MaxSignalsPerBuffer()) {
       void* committed = metal::CommitBatchCommandBuffer(command_buffer_);
       ReleaseObject(command_buffer_);
       command_buffer_ = nullptr;

@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_STREAM_EXECUTOR_METAL_METAL_STREAM_H_
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -83,7 +84,14 @@ class MetalStream : public StreamCommon {
   void* command_buffer_ = nullptr;
   uint64_t last_signaled_value_ = 0;
   uint64_t pending_signal_high_ = 0;
-  static constexpr int kMaxSignalsPerBuffer = 64;
+  static int MaxSignalsPerBuffer() {
+    static const int v = [] {
+      const char* e = std::getenv("METAL_MAX_SIGNALS");
+      const int n = e ? std::atoi(e) : 0;
+      return n > 0 ? n : 64;
+    }();
+    return v;
+  }
   int signals_since_commit_ = 0;
   // Highest value already encoded as a GPU wait into the open buffer; later
   // waits for <= it are elided. Reset whenever the buffer closes: a wait in an
