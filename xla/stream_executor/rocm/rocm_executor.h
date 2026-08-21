@@ -24,6 +24,7 @@ limitations under the License.
 #include <utility>
 #include <variant>
 
+#include "absl/base/call_once.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -210,6 +211,13 @@ class RocmExecutor : public GpuExecutor {
 
   // Cache of peer access capabilities. Populated during Init().
   absl::flat_hash_map<int, bool> peer_access_cache_;
+
+  // Cached HIP stream priority range. Initialized once on first non-default
+  // request and then reused for subsequent calls.
+  absl::once_flag stream_priority_once_;
+  int stream_priority_lowest_ = 0;
+  int stream_priority_highest_ = 0;
+  bool stream_priority_query_ok_ = false;
 };
 
 }  // namespace stream_executor::gpu

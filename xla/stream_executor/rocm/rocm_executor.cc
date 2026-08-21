@@ -1100,16 +1100,29 @@ int RocmExecutor::GetGpuStreamPriority(StreamPriority priority) {
   if (priority == StreamPriority::Default) {
     return 0;
   }
-  std::unique_ptr<ActivateContext> activation = Activate();
-  int lowest, highest;
-  IncrementRocmPerformanceCounter(
-      RocmPerformanceCounter::kStreamPriorityRangeQuery);
-  auto status = hipDeviceGetStreamPriorityRange(&lowest, &highest);
-  if (status != hipSuccess) {
-    LOG(ERROR) << "Failed to get stream priority range: " << ToString(status);
+
+  absl::call_once(stream_priority_once_, [this]() {
+    std::unique_ptr<ActivateContext> activation = Activate();
+    int lowest = 0;
+    int highest = 0;
+    IncrementRocmPerformanceCounter(
+        RocmPerformanceCounter::kStreamPriorityRangeQuery);
+    hipError_t status = hipDeviceGetStreamPriorityRange(&lowest, &highest);
+    if (status != hipSuccess) {
+      LOG(ERROR) << "Failed to get stream priority range: " << ToString(status);
+      stream_priority_query_ok_ = false;
+      return;
+    }
+    stream_priority_lowest_ = lowest;
+    stream_priority_highest_ = highest;
+    stream_priority_query_ok_ = true;
+  });
+
+  if (!stream_priority_query_ok_) {
     return 0;
   }
-  return priority == StreamPriority::Highest ? highest : lowest;
+  return priority == StreamPriority::Highest ? stream_priority_highest_
+                                             : stream_priority_lowest_;
 }
 
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
