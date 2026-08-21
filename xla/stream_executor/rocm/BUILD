@@ -1163,6 +1163,7 @@ cc_library(
     deps = [
         ":rocm_kernel",
         ":rocm_status",
+        ":rocm_stream",
         "//xla/stream_executor:bit_pattern",
         "//xla/stream_executor:command_buffer",
         "//xla/stream_executor:device_address",
