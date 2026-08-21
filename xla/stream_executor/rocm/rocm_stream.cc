@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_event.h"
 #include "xla/stream_executor/rocm/rocm_kernel.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/platform/errors.h"
@@ -139,6 +140,7 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
 absl::Status RecordEvent(StreamExecutor* executor, hipEvent_t event,
                          hipStream_t stream) {
   std::unique_ptr<ActivateContext> activation = executor->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventRecord);
   hipError_t res = hipEventRecord(event, stream);
   switch (res) {
     case hipSuccess:
@@ -158,6 +160,7 @@ absl::Status RecordEvent(StreamExecutor* executor, hipEvent_t event,
 absl::Status WaitStreamOnEvent(StreamExecutor* executor, hipStream_t stream,
                                hipEvent_t event) {
   std::unique_ptr<ActivateContext> activation = executor->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventWait);
   RETURN_IF_ERROR(ToStatus(hipStreamWaitEvent(stream, event, 0 /* = flags */),
                            "could not wait stream on event"));
   return absl::OkStatus();
@@ -491,6 +494,7 @@ absl::Status LaunchRocmKernel(
           << " bdz: " << block_dim_z << " smem: " << shared_mem_bytes
           << " func: " << (const void*)function;
 
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kKernelLaunch);
   auto res = hipModuleLaunchKernel(
       function, grid_dim_x, grid_dim_y, grid_dim_z, block_dim_x, block_dim_y,
       block_dim_z, shared_mem_bytes, stream, kernel_params, extra);

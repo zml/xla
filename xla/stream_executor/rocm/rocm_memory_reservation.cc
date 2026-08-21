@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_raw_memory_allocation.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -83,6 +84,7 @@ absl::Status RocmMemoryReservation::Map(size_t reservation_offset,
         "RocmMemoryReservation::Map requires a RocmRawMemoryAllocation");
   }
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmMap);
   absl::Status status = ToStatus(
       hipMemMap(ptr_ + reservation_offset, size, allocation_offset,
                 rocm_alloc->GetHandle(), 0ULL),
@@ -102,6 +104,7 @@ absl::Status RocmMemoryReservation::SetAccess(uint64_t reservation_offset,
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
 
   int device_count = 0;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
   RETURN_IF_ERROR(
       ToStatus(hipGetDeviceCount(&device_count), "hipGetDeviceCount"));
 
@@ -127,6 +130,7 @@ absl::Status RocmMemoryReservation::SetAccess(uint64_t reservation_offset,
 
 absl::Status RocmMemoryReservation::UnMap(size_t offset, size_t size) {
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmUnmap);
   absl::Status status = ToStatus(hipMemUnmap(ptr_ + offset, size));
   if (status.ok()) {
     mapped_bytes_ = mapped_bytes_ >= size ? mapped_bytes_ - size : 0;
@@ -145,6 +149,7 @@ RocmMemoryReservation::~RocmMemoryReservation() {
   // HIP_ERROR_InvalidValue. Tracking mapped_bytes_ avoids that redundant (and
   // very noisy) double-unmap at teardown.
   if (mapped_bytes_ > 0) {
+    IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmUnmap);
     auto unmap_status =
         ToStatus(hipMemUnmap(ptr_, size_), "Error unmapping ROCm memory");
     if (!unmap_status.ok()) {

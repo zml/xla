@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/util.h"
@@ -78,6 +79,7 @@ VmmAllocate(StreamExecutor* executor, uint64_t size) {
     return status;
   }
 
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmMap);
   status = ToStatus(hipMemMap(ptr, padded_size, 0, handle, 0ULL));
   if (!status.ok()) {
     ToStatus(hipMemAddressFree(ptr, padded_size)).IgnoreError();
@@ -87,6 +89,7 @@ VmmAllocate(StreamExecutor* executor, uint64_t size) {
 
   // Cleanup on error: unmap + free VA + release physical memory.
   absl::Cleanup cleanup = [&]() {
+    IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmUnmap);
     ToStatus(hipMemUnmap(ptr, padded_size)).IgnoreError();
     ToStatus(hipMemAddressFree(ptr, padded_size)).IgnoreError();
     ToStatus(hipMemRelease(handle)).IgnoreError();
@@ -99,6 +102,7 @@ VmmAllocate(StreamExecutor* executor, uint64_t size) {
   // Set access for this device and all P2P-capable peers, matching the CUDA
   // pattern that gates on CanEnablePeerAccessTo().
   int device_count = 0;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
   RETURN_IF_ERROR(ToStatus(hipGetDeviceCount(&device_count)));
   for (int peer = 0; peer < device_count; peer++) {
     if (peer != executor->device_ordinal()) {
@@ -126,6 +130,7 @@ static void VmmDeallocate(StreamExecutor* executor, void* ptr,
   VLOG(3) << "VMM deallocating " << ptr << " padded size: " << padded_size
           << " device: " << executor->device_ordinal();
 
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kVmmUnmap);
   absl::Status status = ToStatus(hipMemUnmap(ptr, padded_size));
   if (!status.ok()) {
     LOG(ERROR) << "Failed to unmap VMM memory at " << ptr << ": " << status;

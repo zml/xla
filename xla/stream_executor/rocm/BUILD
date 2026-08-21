@@ -38,6 +38,34 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "rocm_performance_counters",
+    srcs = ["rocm_performance_counters.cc"],
+    hdrs = ["rocm_performance_counters.h"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "rocm_performance_counters_test",
+    srcs = ["rocm_performance_counters_test.cc"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        ":rocm_performance_counters",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 xla_cc_test(
     name = "rocm_compute_capability_test",
     srcs = ["rocm_compute_capability_test.cc"],
@@ -78,6 +106,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":rocm_performance_counters",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:event",
@@ -129,6 +158,7 @@ cc_library(
         ":rocm_event",
         ":rocm_kernel",
         ":rocm_pcie_bandwidth",
+        ":rocm_performance_counters",
         ":rocm_platform_id",
         ":rocm_status",
         ":rocm_stream",
@@ -321,6 +351,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":rocm_executor",
+        ":rocm_performance_counters",
         ":rocm_platform_id",
         ":rocm_runtime_abi_version",
         ":rocm_status",
@@ -480,6 +511,7 @@ cc_library(
         ":rocm_complex_converters",
         ":rocm_executor",
         ":rocm_helpers",
+        ":rocm_performance_counters",
         ":rocm_platform_id",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:blas",
@@ -535,6 +567,7 @@ cc_library(
     deps = [
         ":hipfft_if_static",  # buildcleaner: keep
         ":rocm_complex_converters",
+        ":rocm_performance_counters",
         ":rocm_platform_id",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:device_address",
@@ -582,6 +615,7 @@ cc_library(
         ":miopen_if_static",  # build_cleaner: keep
         ":rocm_executor",
         ":rocm_helpers",
+        ":rocm_performance_counters",
         ":rocm_platform_id",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:blas",
@@ -928,6 +962,7 @@ cc_library(
     deps = [
         ":rocm_event",
         ":rocm_kernel",
+        ":rocm_performance_counters",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:device_address",
@@ -994,6 +1029,7 @@ cc_library(
     ],
     deps = [
         ":rocm_event",
+        ":rocm_performance_counters",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:event_based_timer",
@@ -1083,6 +1119,7 @@ cc_library(
     ],
     deps = [
         ":rocm_kernel",
+        ":rocm_performance_counters",
         ":rocm_status",
         ":rocm_stream",
         "//xla/stream_executor:bit_pattern",
@@ -1521,6 +1558,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":rocm_performance_counters",
         ":rocm_raw_memory_allocation",
         ":rocm_status",
         "//xla:util",
@@ -1578,6 +1616,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":rocm_performance_counters",
         ":rocm_status",
         "//xla:util",
         "//xla/stream_executor:activate_context",
@@ -1607,6 +1646,7 @@ cc_library(
     ],
     deps = [
         ":rocm_memory_reservation",
+        ":rocm_performance_counters",
         ":rocm_raw_memory_allocation",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
