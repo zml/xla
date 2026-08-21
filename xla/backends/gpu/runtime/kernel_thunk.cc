@@ -200,10 +200,8 @@ absl::Status KernelThunk::Initialize(const InitializeParams& params) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<KernelThunk::KernelWithArgs> KernelThunk::GetKernelAndArgs(
-    const BufferAllocations& buffer_allocations,
+absl::StatusOr<se::Kernel*> KernelThunk::GetKernel(
     se::StreamExecutor* executor) const {
-  se::Kernel* kernel;
   {
     absl::MutexLock lock(mutex_);
     auto it = kernel_cache_.find(executor);
@@ -212,8 +210,14 @@ absl::StatusOr<KernelThunk::KernelWithArgs> KernelThunk::GetKernelAndArgs(
           "Kernel not loaded for executor (Initialize() not called): %s",
           kernel_name_));
     }
-    kernel = it->second.get();
+    return it->second.get();
   }
+}
+
+absl::StatusOr<KernelThunk::KernelWithArgs> KernelThunk::GetKernelAndArgs(
+    const BufferAllocations& buffer_allocations,
+    se::StreamExecutor* executor) const {
+  ASSIGN_OR_RETURN(se::Kernel * kernel, GetKernel(executor));
   absl::InlinedVector<se::KernelArg, 4> kernel_args;
   for (int idx = 0; idx < args_.size(); ++idx) {
     se::DeviceAddressBase buf =
