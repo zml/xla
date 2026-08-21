@@ -37,6 +37,7 @@ limitations under the License.
 #include "xla/stream_executor/memory_reservation.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_memory_reservation.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_raw_memory_allocation.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream.h"
@@ -164,6 +165,8 @@ absl::Status RocmDeviceAddressVmmAllocator::EnqueueDeferredDeallocation(
     PerDeviceState& state, uint64_t seqno) {
   hipStream_t hip_stream =
       static_cast<hipStream_t>(state.stream->platform_specific_handle().stream);
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kVmmTimelineWrite);
   return ToStatus(
       hipStreamWriteValue64(
           hip_stream, reinterpret_cast<void*>(state.timeline_dev_ptr), seqno,

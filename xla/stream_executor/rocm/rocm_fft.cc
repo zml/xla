@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/rocm/rocm_complex_converters.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/scratch_allocator.h"
 #include "xla/stream_executor/stream.h"
@@ -108,6 +109,7 @@ hipfftType ROCMFftType(fft::Type type) {
 
 // Associates the given stream with the given rocFFT plan.
 bool SetStream(StreamExecutor *parent, hipfftHandle plan, Stream *stream) {
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kFftSetStream);
   auto ret = wrap::hipfftSetStream(
       parent, plan,
       static_cast<hipStream_t>(stream->platform_specific_handle().stream));

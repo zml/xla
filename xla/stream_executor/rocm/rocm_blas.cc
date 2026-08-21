@@ -50,6 +50,7 @@ limitations under the License.
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/rocm/rocm_complex_converters.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/scratch_allocator.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -190,6 +191,8 @@ bool ROCMBlas::Init() {
   int dev = 0;
   hipError_t result = hipGetDevice(&dev);
   hipDeviceProp_t props;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kDevicePropertiesQuery);
   result = hipGetDeviceProperties(&props, dev);
   if (result == hipSuccess) {
     auto cap = RocmComputeCapability(props.gcnArchName);
@@ -216,6 +219,7 @@ bool ROCMBlas::SetStream(Stream *stream) {
       (stream != nullptr)
           ? static_cast<hipStream_t>(stream->platform_specific_handle().stream)
           : nullptr;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kRocblasSetStream);
   if (auto ret = rocblas_set_stream(blas_, handle);
       ret != rocblas_status_success) {
     LOG(ERROR) << "failed to set stream for rocBLAS calls: " << ToString(ret);

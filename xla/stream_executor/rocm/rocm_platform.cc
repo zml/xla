@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_executor.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/rocm/rocm_runtime_abi_version.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
@@ -77,6 +78,7 @@ int ROCmPlatform::VisibleDeviceCount() const {
   }
 
   int device_count = 0;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
   hipError_t res = hipGetDeviceCount(&device_count);
   if (res != hipSuccess) {
     LOG(ERROR) << "could not retrieve ROCM device count: " << ToString(res);
