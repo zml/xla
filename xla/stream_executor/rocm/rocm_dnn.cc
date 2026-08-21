@@ -57,6 +57,7 @@ limitations under the License.
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/plugin_registry.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/scratch_allocator.h"
 #include "xla/stream_executor/stream.h"
@@ -438,6 +439,8 @@ class MIOpenAccess {
                      stream->platform_specific_handle().stream)
                : nullptr;
     if (!current_stream_ || hip_stream != *current_stream_) {
+      IncrementRocmPerformanceCounter(
+          RocmPerformanceCounter::kMiopenSetStream);
       auto status = miopenSetStream(handle_, hip_stream);
       CHECK_EQ(status, miopenStatusSuccess) << "Failed to set MIOpen stream.";
       current_stream_ = hip_stream;

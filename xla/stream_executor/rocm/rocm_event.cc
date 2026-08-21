@@ -28,6 +28,7 @@ limitations under the License.
 #include "rocm/include/hip/hip_runtime.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
@@ -38,6 +39,7 @@ namespace {
 absl::Status WaitStreamOnEvent(StreamExecutor *executor, hipStream_t stream,
                                hipEvent_t event) {
   std::unique_ptr<ActivateContext> activation = executor->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventWait);
   ABSL_RETURN_IF_ERROR(ToStatus(hipStreamWaitEvent(stream, event, 0 /* = flags */),
                            "could not wait stream on event"));
   return absl::OkStatus();
@@ -60,6 +62,10 @@ absl::StatusOr<hipEvent_t> InitEvent(StreamExecutor *executor,
 
   std::unique_ptr<ActivateContext> activation = executor->Activate();
   hipEvent_t event;
+  IncrementRocmPerformanceCounter(
+      flags == EventFlags::kDefault
+          ? RocmPerformanceCounter::kEventCreateTiming
+          : RocmPerformanceCounter::kEventCreateSystem);
   hipError_t res = hipEventCreateWithFlags(&event, hipflags);
 
   if (res == hipSuccess) {
@@ -110,6 +116,7 @@ absl::Status RocmEvent::WaitForEventOnExternalStream(std::intptr_t stream) {
 
 absl::Status RocmEvent::Synchronize() {
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventSynchronize);
   return ToStatus(hipEventSynchronize(handle_),
                   "could not synchronize on ROCm event");
 }

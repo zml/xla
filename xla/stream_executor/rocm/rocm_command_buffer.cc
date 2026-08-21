@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_kernel.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/rocm/rocm_stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -55,6 +56,7 @@ namespace {
 absl::StatusOr<hipGraph_t> CreateGraph() {
   VLOG(2) << "Create new HIP graph";
   hipGraph_t graph;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kGraphCreate);
   ABSL_RETURN_IF_ERROR(ToStatus(hipGraphCreate(&graph, /*flags=*/0),
                            "Failed to create HIP graph"));
   VLOG(2) << "Created HIP graph " << graph;
@@ -156,6 +158,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateMemsetNode(
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateMemset);
   ABSL_RETURN_IF_ERROR(
       ToStatus(hipGraphAddMemsetNode(&node_handle, graph_, deps.data(),
                                      deps.size(), &params),
@@ -180,6 +184,8 @@ absl::Status RocmCommandBuffer::UpdateMemsetNode(GraphNodeHandle node_handle,
   params.value = bit_pattern.GetPatternBroadcastedToUint32();
   params.width = num_elements;
 
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeUpdateMemset);
   return ToStatus(hipGraphExecMemsetNodeSetParams(
                       exec_, ToHipGraphHandle(node_handle), &params),
                   "Failed to set memset node params");
@@ -195,6 +201,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateMemcpyD2DNode(
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateMemcpy);
   ABSL_RETURN_IF_ERROR(ToStatus(
       hipGraphAddMemcpyNode1D(&node_handle, graph_, deps.data(), deps.size(),
                               AsDevicePtr(destination), AsDevicePtr(source),
@@ -211,6 +219,8 @@ absl::Status RocmCommandBuffer::UpdateMemcpyD2DNode(
           << "; dst: " << destination.opaque() << "; src: " << source.opaque()
           << "; size: " << size;
 
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeUpdateMemcpy);
   return ToStatus(
       hipGraphExecMemcpyNodeSetParams1D(
           exec_, ToHipGraphHandle(node_handle), AsDevicePtr(destination),
@@ -233,6 +243,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateClonedChildNode(
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateChild);
   ABSL_RETURN_IF_ERROR(ToStatus(
       hipGraphAddChildGraphNode(&node_handle, graph_, deps.data(), deps.size(),
                                 child_graph),
@@ -253,6 +265,8 @@ absl::Status RocmCommandBuffer::UpdateClonedChildNode(
   VLOG(2) << "Set child node params " << node_handle << " in graph executable "
           << exec_ << "to params contained in " << child_graph;
 
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeUpdateChild);
   return ToStatus(hipGraphExecChildGraphNodeSetParams(
                       exec_, ToHipGraphHandle(node_handle), child_graph),
                   "Failed to set HIP graph child node params");
@@ -299,6 +313,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateKernelNode(
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateKernel);
   ABSL_RETURN_IF_ERROR(
       ToStatus(hipGraphAddKernelNode(&node_handle, graph_, deps.data(),
                                      deps.size(), &params),
@@ -343,6 +359,8 @@ absl::Status RocmCommandBuffer::UpdateKernelNode(
       const_cast<void**>(packed_args->argument_addresses().data());
   params.extra = nullptr;
 
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeUpdateKernel);
   return ToStatus(hipGraphExecKernelNodeSetParams(
                       exec_, ToHipGraphHandle(node_handle), &params),
                   "Failed to set HIP graph kernel node params");
@@ -356,6 +374,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateEmptyNode(
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateEmpty);
   ABSL_RETURN_IF_ERROR(ToStatus(
       hipGraphAddEmptyNode(&node_handle, graph_, deps.data(), deps.size()),
       "Failed to add empty node to a HIP graph"));
@@ -369,6 +389,7 @@ absl::Status RocmCommandBuffer::Trace(
 
   VLOG(5) << "Trace into GPU command buffer graph " << graph_
           << " on a stream: " << stream;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kGraphTrace);
 
   RocmStream* rocm_stream = static_cast<RocmStream*>(stream);
 
@@ -417,6 +438,7 @@ absl::Status RocmCommandBuffer::Trace(
 absl::Status RocmCommandBuffer::LaunchGraph(Stream* stream) {
   VLOG(3) << "Launch command buffer executable graph " << exec_
           << " on a stream: " << stream;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kGraphLaunch);
   return ToStatus(
       hipGraphLaunch(exec_, static_cast<hipStream_t>(
                                 stream->platform_specific_handle().stream)),
@@ -441,6 +463,8 @@ absl::Status RocmCommandBuffer::PrepareFinalization() {
   // graphs. Insert an empty node so the graph is non-empty, analogous to
   // CUDA's NoOp kernel insertion for the same case.
   hipGraphNode_t node_handle = nullptr;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kGraphNodeCreateEmpty);
   ABSL_RETURN_IF_ERROR(ToStatus(hipGraphAddEmptyNode(&node_handle, graph_,
                                                 /*pDependencies=*/nullptr,
                                                 /*numDependencies=*/0),
@@ -465,6 +489,7 @@ absl::Status RocmCommandBuffer::WriteGraphToDotFile(absl::string_view path) {
 
 absl::Status RocmCommandBuffer::InstantiateGraph() {
   VLOG(2) << "Instantiate HIP executable graph from graph " << graph_;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kGraphInstantiate);
   return ToStatus(hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0),
                   "Failed to instantiate HIP graph");
 }

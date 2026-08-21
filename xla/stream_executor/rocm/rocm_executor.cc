@@ -81,6 +81,7 @@ limitations under the License.
 #include "xla/stream_executor/rocm/rocm_kernel.h"
 #include "xla/stream_executor/rocm/rocm_memory_bandwidth.h"
 #include "xla/stream_executor/rocm/rocm_pcie_bandwidth.h"
+#include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/rocm/rocm_stream.h"
@@ -204,6 +205,8 @@ absl::StatusOr<std::string> GetDeviceName(hipDevice_t device) {
 
 absl::StatusOr<int> GetGpuISAVersion(hipDevice_t device) {
   hipDeviceProp_t props;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kDevicePropertiesQuery);
   hipError_t result = hipGetDeviceProperties(&props, device);
   if (result == hipSuccess) {
     std::string gcnName = props.gcnArchName;
@@ -223,6 +226,8 @@ absl::StatusOr<int> GetGpuISAVersion(hipDevice_t device) {
 // for eg: amdgcn-amd-amdhsa--gfx908:sramecc+:xnack-
 absl::StatusOr<std::string> GetGpuGCNArchName(hipDevice_t device) {
   hipDeviceProp_t props;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kDevicePropertiesQuery);
   hipError_t result = hipGetDeviceProperties(&props, device);
   if (result == hipSuccess) {
     return props.gcnArchName;
@@ -316,6 +321,7 @@ absl::StatusOr<hipDevice_t> GetDevice(int device_ordinal) {
 
 bool CanEnablePeerAccess(hipDevice_t from, hipDevice_t to) {
   int can_access_peer = -1;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kPeerAccessQuery);
   hipError_t result = hipDeviceCanAccessPeer(&can_access_peer, from, to);
   if (result != hipSuccess) {
     LOG(ERROR) << "failed to detect peer access capability: "
@@ -392,6 +398,8 @@ absl::StatusOr<bool> IsEccEnabled(hipDevice_t device) {
 
 bool GetDeviceProperties(hipDeviceProp_t* device_properties,
                          int device_ordinal) {
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kDevicePropertiesQuery);
   hipError_t res = hipGetDeviceProperties(device_properties, device_ordinal);
   if (res != hipSuccess) {
     LOG(ERROR) << "failed to query device properties: " << ToString(res);
@@ -654,6 +662,7 @@ absl::Status RocmExecutor::Init() {
 
   // Initialize peer access cache for all devices
   int device_count = 0;
+  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
   ABSL_RETURN_IF_ERROR(
       ToStatus(hipGetDeviceCount(&device_count), "Failed to get device count"));
   for (int i = 0; i < device_count; ++i) {
@@ -1138,6 +1147,8 @@ int RocmExecutor::GetGpuStreamPriority(StreamPriority priority) {
   }
   std::unique_ptr<ActivateContext> activation = Activate();
   int lowest, highest;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kStreamPriorityRangeQuery);
   auto status = hipDeviceGetStreamPriorityRange(&lowest, &highest);
   if (status != hipSuccess) {
     LOG(ERROR) << "Failed to get stream priority range: " << ToString(status);
