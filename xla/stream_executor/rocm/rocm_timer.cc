@@ -18,6 +18,7 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -66,7 +67,7 @@ RocmTimer::RocmTimer(StreamExecutor* executor, RocmEvent start_event,
 
 RocmTimer::~RocmTimer() {
   if (semaphore_ && !is_stopped_) {
-    // Signal the delay kernel that it can exit
+    // Signal the delay kernel that it can exit.
     *semaphore_ = GpuSemaphoreState::kRelease;
     // Wait for the delay kernel to exit before destroying the value that it is
     // watching.
@@ -89,7 +90,7 @@ absl::StatusOr<absl::Duration> RocmTimer::GetElapsedDuration() {
       LOG_FIRST_N(WARNING, 5)
           << "Delay kernel timed out: measured time has sub-optimal accuracy.";
     } else {
-      // Signal that the kernel can exit
+      // Signal that the kernel can exit.
       *semaphore_ = GpuSemaphoreState::kRelease;
     }
   }
