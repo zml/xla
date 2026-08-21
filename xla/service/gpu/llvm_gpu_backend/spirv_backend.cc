@@ -147,6 +147,7 @@ std::string VulkanBindingForAccess(llvm::IntrinsicInst& get_base_pointer) {
 // https://github.com/KhronosGroup/SPIRV-LLVM-Translator/blob/main/docs/SPIRVRepresentationInLLVM.rst#address-spaces
 constexpr unsigned kSpirvLlvmDefaultAddressSpace = 0;
 constexpr unsigned kSpirvLlvmCrossWorkgroupAddressSpace = 1;
+constexpr unsigned kSpirvLlvmWorkgroupAddressSpace = 3;
 
 void SPIRVBackendInit() {
   LLVMInitializeSPIRVTargetInfo();
@@ -267,11 +268,10 @@ void LegalizeVulkanShaderComparisons(llvm::Module* module) {
   }
 }
 
-// After scalarization, express all storage-buffer accesses as indices into the
-// runtime array carried by spirv.VulkanBuffer. This is the representation the
-// logical SPIR-V backend uses to derive Vulkan ArrayStride and descriptor
-// accesses, including for vectorized XLA loops.
-absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
+// After scalarization, express Vulkan storage-buffer and workgroup accesses as
+// aggregate GEPs with a leading zero. Logical SPIR-V requires an aggregate
+// base object in order to form OpAccessChain instructions.
+absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
   llvm::SmallVector<llvm::Instruction*> memory_operations;
   for (llvm::Function& function : *module) {
     for (llvm::BasicBlock& block : function) {
@@ -304,21 +304,36 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
       }
     }
 
-    auto* get_base_pointer = llvm::dyn_cast<llvm::IntrinsicInst>(root);
-    if (get_base_pointer == nullptr ||
-        get_base_pointer->getIntrinsicID() !=
+    llvm::ArrayType* storage_array = nullptr;
+    llvm::IntrinsicInst* get_base_pointer = nullptr;
+    if (auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(root);
+        intrinsic != nullptr &&
+        intrinsic->getIntrinsicID() ==
             llvm::Intrinsic::spv_resource_getbasepointer) {
+      get_base_pointer = intrinsic;
+      auto* resource_type = llvm::dyn_cast<llvm::TargetExtType>(
+          get_base_pointer->getArgOperand(0)->getType());
+      storage_array =
+          resource_type == nullptr
+              ? nullptr
+              : llvm::dyn_cast<llvm::ArrayType>(
+                    resource_type->getTypeParameter(0));
+      if (storage_array == nullptr || storage_array->getNumElements() != 0) {
+        return absl::InternalError(
+            "Vulkan storage buffer does not contain a runtime array");
+      }
+    } else if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(root);
+               global != nullptr &&
+               global->getAddressSpace() ==
+                   kSpirvLlvmWorkgroupAddressSpace) {
+      storage_array =
+          llvm::dyn_cast<llvm::ArrayType>(global->getValueType());
+      if (storage_array == nullptr) {
+        return absl::InternalError(
+            "Vulkan workgroup allocation is not an array");
+      }
+    } else {
       continue;
-    }
-    auto* resource_type = llvm::dyn_cast<llvm::TargetExtType>(
-        get_base_pointer->getArgOperand(0)->getType());
-    auto* runtime_array = resource_type == nullptr
-                              ? nullptr
-                              : llvm::dyn_cast<llvm::ArrayType>(
-                                    resource_type->getTypeParameter(0));
-    if (runtime_array == nullptr || runtime_array->getNumElements() != 0) {
-      return absl::InternalError(
-          "Vulkan storage buffer does not contain a runtime array");
     }
 
     llvm::IRBuilder<> builder(operation);
@@ -333,17 +348,21 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
           byte_offset, builder.CreateSExtOrTrunc(gep_offset, index_type));
     }
 
-    llvm::Type* element_type = runtime_array->getElementType();
+    llvm::Type* element_type = storage_array->getElementType();
     llvm::TypeSize type_size = data_layout.getTypeAllocSize(element_type);
     if (type_size.isScalable() || type_size.getFixedValue() == 0) {
       return absl::UnimplementedError(
-          "Vulkan storage buffer has an unsupported scalable or zero-sized "
+          "Vulkan memory object has an unsupported scalable or zero-sized "
           "element type");
     }
-    const std::string binding = VulkanBindingForAccess(*get_base_pointer);
+    const std::string allocation =
+        get_base_pointer == nullptr
+            ? "workgroup allocation " + root->getName().str()
+            : "storage-buffer binding " +
+                  VulkanBindingForAccess(*get_base_pointer);
     auto incompatible_access = [&](llvm::Type* access_type) {
       return absl::UnimplementedError(absl::StrCat(
-          "Vulkan storage-buffer binding ", binding, " declared element type ",
+          "Vulkan ", allocation, " declared element type ",
           PrintLlvmType(*element_type), " is incompatible with access type ",
           PrintLlvmType(*access_type), " at byte offset ",
           PrintLlvmValue(*byte_offset)));
@@ -373,7 +392,7 @@ absl::Status NormalizeVulkanBufferAccesses(llvm::Module* module) {
             element_index, llvm::ConstantInt::get(index_type, lane));
       }
       return builder.CreateGEP(
-          runtime_array, root,
+          storage_array, root,
           {llvm::ConstantInt::get(index_type, 0), lane_index});
     };
     llvm::Value* normalized_pointer = element_pointer(0);
@@ -574,7 +593,7 @@ absl::StatusOr<std::string> EmitModuleToSPIRV(
   scalarize_pm.add(llvm::createScalarizerPass(scalarizer_options));
   scalarize_pm.run(*module);
   if (normalize_vulkan_buffers) {
-    ABSL_RETURN_IF_ERROR(NormalizeVulkanBufferAccesses(module));
+    ABSL_RETURN_IF_ERROR(NormalizeVulkanMemoryAccesses(module));
     llvm::legacy::PassManager cleanup_pm;
     cleanup_pm.add(llvm::createDeadCodeEliminationPass());
     cleanup_pm.run(*module);

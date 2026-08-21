@@ -41,6 +41,11 @@ stream_executor::GpuComputeCapability TestComputeCapability() {
       stream_executor::OneAPIComputeCapability::BMG());
 }
 
+stream_executor::GpuComputeCapability TestVulkanComputeCapability() {
+  return stream_executor::GpuComputeCapability(
+      stream_executor::VulkanComputeCapability(1, 2));
+}
+
 absl::StatusOr<std::unique_ptr<llvm::Module>> ParseLlvmIr(
     absl::string_view ir, llvm::LLVMContext& context) {
   llvm::SMDiagnostic diagnostic;
@@ -88,6 +93,35 @@ entry:
 
   EXPECT_OK(
       CompileToSPIRV(module.get(), TestComputeCapability(), DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanWorkgroupFlatGep) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+@shared = private addrspace(3) global [64 x i32] undef
+
+declare i32 @llvm.spv.thread.id.in.group.i32(i32)
+
+define void @workgroup_flat_gep() #0 {
+entry:
+  %index32 = call i32 @llvm.spv.thread.id.in.group.i32(i32 0)
+  %index = zext i32 %index32 to i64
+  %pointer = getelementptr inbounds [4 x i8], ptr addrspace(3) @shared,
+                                   i64 %index
+  store volatile i32 %index32, ptr addrspace(3) %pointer, align 4
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="64,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(module.get(),
+                                 TestVulkanComputeCapability(),
+                                 DebugOptions()));
 }
 
 }  // namespace
