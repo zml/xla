@@ -489,9 +489,29 @@ absl::Status RocmCommandBuffer::WriteGraphToDotFile(absl::string_view path) {
 
 absl::Status RocmCommandBuffer::InstantiateGraph() {
   VLOG(2) << "Instantiate HIP executable graph from graph " << graph_;
-  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kGraphInstantiate);
-  return ToStatus(hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0),
-                  "Failed to instantiate HIP graph");
+  auto instantiate = [this]() {
+    IncrementRocmPerformanceCounter(
+        RocmPerformanceCounter::kGraphInstantiate);
+    return ToStatus(hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0),
+                    "Failed to instantiate HIP graph");
+  };
+
+  absl::Status instantiated = instantiate();
+  if (instantiated.code() != absl::StatusCode::kResourceExhausted) {
+    return instantiated;
+  }
+
+  LOG(WARNING) << "Retry HIP graph instantiation after OOM error";
+  absl::Status trimmed = ToStatus(
+      hipDeviceGraphMemTrim(stream_exec_->device_ordinal()),
+      "Failed to trim device graph memory after graph instantiation OOM");
+  if (!trimmed.ok()) {
+    return absl::Status(
+        instantiated.code(),
+        absl::StrCat(instantiated.message(), "; graph memory trim failed: ",
+                     trimmed.message()));
+  }
+  return instantiate();
 }
 
 RocmCommandBuffer::~RocmCommandBuffer() {
