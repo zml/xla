@@ -212,36 +212,23 @@ absl::StatusOr<std::string> GetDeviceName(hipDevice_t device) {
 }
 
 absl::StatusOr<int> GetGpuISAVersion(hipDevice_t device) {
-  hipDeviceProp_t props;
-  IncrementRocmPerformanceCounter(
-      RocmPerformanceCounter::kDevicePropertiesQuery);
-  hipError_t result = hipGetDeviceProperties(&props, device);
-  if (result == hipSuccess) {
-    std::string gcnName = props.gcnArchName;
-    std::vector<std::string> tokens = absl::StrSplit(gcnName, ':');
-    std::string amdgpu_version = gcnName;
-    if (!tokens.empty() && tokens[0].size() >= 3) {
-      amdgpu_version = tokens[0].substr(3);
-    }
-    int version = std::stoi(amdgpu_version);
-    return version;
+  ASSIGN_OR_RETURN(hipDeviceProp_t props,
+                   RocmExecutor::GetDeviceProperties(device));
+  std::string gcnName = props.gcnArchName;
+  std::vector<std::string> tokens = absl::StrSplit(gcnName, ':');
+  std::string amdgpu_version = gcnName;
+  if (!tokens.empty() && tokens[0].size() >= 3) {
+    amdgpu_version = tokens[0].substr(3);
   }
-  return absl::InternalError(absl::StrFormat(
-      "failed to determine AMDGpu ISA version for device %d", device));
+  return std::stoi(amdgpu_version);
 }
 
 // Return the full GCN Architecture Name for the device
 // for eg: amdgcn-amd-amdhsa--gfx908:sramecc+:xnack-
 absl::StatusOr<std::string> GetGpuGCNArchName(hipDevice_t device) {
-  hipDeviceProp_t props;
-  IncrementRocmPerformanceCounter(
-      RocmPerformanceCounter::kDevicePropertiesQuery);
-  hipError_t result = hipGetDeviceProperties(&props, device);
-  if (result == hipSuccess) {
-    return props.gcnArchName;
-  }
-  return absl::InternalError(absl::StrFormat(
-      "failed to determine AMDGpu GCN Arch Name for device %d", device));
+  ASSIGN_OR_RETURN(hipDeviceProp_t props,
+                   RocmExecutor::GetDeviceProperties(device));
+  return props.gcnArchName;
 }
 
 // Helper function that turns the integer output of hipDeviceGetAttribute to
@@ -402,19 +389,6 @@ absl::StatusOr<bool> IsEccEnabled(hipDevice_t device) {
       hipDeviceGetAttribute(&value, hipDeviceAttributeEccEnabled, device),
       "hipDeviceGetAttribute(hipDeviceAttributeEccEnabled) failed"));
   return value != 0;
-}
-
-bool GetDeviceProperties(hipDeviceProp_t* device_properties,
-                         int device_ordinal) {
-  IncrementRocmPerformanceCounter(
-      RocmPerformanceCounter::kDevicePropertiesQuery);
-  hipError_t res = hipGetDeviceProperties(device_properties, device_ordinal);
-  if (res != hipSuccess) {
-    LOG(ERROR) << "failed to query device properties: " << ToString(res);
-    return false;
-  }
-
-  return true;
 }
 
 // Allocates memory on the GPU device.
@@ -1125,6 +1099,29 @@ int RocmExecutor::GetGpuStreamPriority(StreamPriority priority) {
                                              : stream_priority_lowest_;
 }
 
+absl::StatusOr<hipDeviceProp_t> RocmExecutor::GetDeviceProperties(
+    int device_ordinal) {
+  static auto* const cache_mu = new absl::Mutex;
+  static auto* const cache =
+      new absl::flat_hash_map<int, hipDeviceProp_t>;
+
+  absl::MutexLock lock(cache_mu);
+  auto it = cache->find(device_ordinal);
+  if (it != cache->end()) {
+    return it->second;
+  }
+
+  hipDeviceProp_t properties;
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kDevicePropertiesQuery);
+  RETURN_IF_ERROR(ToStatus(
+      hipGetDeviceProperties(&properties, device_ordinal),
+      absl::StrFormat("failed to query properties for ROCm device %d",
+                      device_ordinal)));
+  cache->emplace(device_ordinal, properties);
+  return properties;
+}
+
 absl::StatusOr<std::unique_ptr<DeviceDescription>>
 RocmExecutor::CreateDeviceDescription(int device_ordinal) {
   ASSIGN_OR_RETURN(hipDevice_t device, GetDevice(device_ordinal));
@@ -1145,27 +1142,25 @@ RocmExecutor::CreateDeviceDescription(int device_ordinal) {
                                              : tsl::port::kNUMANoAffinity);
   }
 
-  hipDeviceProp_t prop;
-  if (GetDeviceProperties(&prop, device_ordinal)) {
-    desc.set_threads_per_block_limit(prop.maxThreadsPerBlock);
+  ASSIGN_OR_RETURN(hipDeviceProp_t prop, GetDeviceProperties(device_ordinal));
+  desc.set_threads_per_block_limit(prop.maxThreadsPerBlock);
 
-    ThreadDim thread_dim_limit;
-    thread_dim_limit.x = prop.maxThreadsDim[0];
-    thread_dim_limit.y = prop.maxThreadsDim[1];
-    thread_dim_limit.z = prop.maxThreadsDim[2];
-    desc.set_thread_dim_limit(thread_dim_limit);
+  ThreadDim thread_dim_limit;
+  thread_dim_limit.x = prop.maxThreadsDim[0];
+  thread_dim_limit.y = prop.maxThreadsDim[1];
+  thread_dim_limit.z = prop.maxThreadsDim[2];
+  desc.set_thread_dim_limit(thread_dim_limit);
 
-    float clock_rate_ghz = static_cast<float>(prop.clockRate) / 1e6;
-    desc.set_clock_rate_ghz(clock_rate_ghz);
+  float clock_rate_ghz = static_cast<float>(prop.clockRate) / 1e6;
+  desc.set_clock_rate_ghz(clock_rate_ghz);
 
-    // mem_bandwidth = 2 * mem_bus_width_in_bytes * mem_clock_rate_in_hz
-    int64_t memory_bandwidth =
-        2 * (static_cast<int64_t>(prop.memoryBusWidth) / 8) *
-        (static_cast<int64_t>(prop.memoryClockRate) * 1000);
-    desc.set_memory_bandwidth(memory_bandwidth);
+  // mem_bandwidth = 2 * mem_bus_width_in_bytes * mem_clock_rate_in_hz
+  int64_t memory_bandwidth =
+      2 * (static_cast<int64_t>(prop.memoryBusWidth) / 8) *
+      (static_cast<int64_t>(prop.memoryClockRate) * 1000);
+  desc.set_memory_bandwidth(memory_bandwidth);
 
-    desc.set_l2_cache_size(prop.l2CacheSize);
-  }
+  desc.set_l2_cache_size(prop.l2CacheSize);
 
   {
     std::optional<int64_t> pcie_bw = gpu::GetRocmPcieBandwidth(pci_bus_id);
