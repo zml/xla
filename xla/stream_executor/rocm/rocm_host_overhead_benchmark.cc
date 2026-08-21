@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "benchmark/benchmark.h"
 #include "rocm/include/hip/hip_runtime.h"
+#include "rocm/include/rocblas/rocblas.h"
 #include "xla/stream_executor/rocm/rocm_host_overhead_benchmark_kernels.h"
 
 namespace stream_executor::gpu {
@@ -40,6 +41,15 @@ bool CheckHip(benchmark::State& state, hipError_t result,
   std::string message = std::string(operation) + ": " +
                         hipGetErrorName(result) + " (" +
                         hipGetErrorString(result) + ")";
+  state.SkipWithError(message.c_str());
+  return false;
+}
+
+bool CheckRocblas(benchmark::State& state, rocblas_status result,
+                  const char* operation) {
+  if (result == rocblas_status_success) return true;
+  std::string message = std::string(operation) + ": rocBLAS status " +
+                        std::to_string(static_cast<int>(result));
   state.SkipWithError(message.c_str());
   return false;
 }
@@ -204,6 +214,118 @@ void BM_EventRecordWait(benchmark::State& state,
   (void)hipStreamDestroy(producer);
 }
 
+enum class StatePattern { kSame, kAlternate, kCachedSame };
+
+void BM_RocblasSetStream(benchmark::State& state, StatePattern pattern) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipStream_t streams[2] = {nullptr, nullptr};
+  if (!CheckHip(state,
+                hipStreamCreateWithFlags(&streams[0], hipStreamNonBlocking),
+                "hipStreamCreateWithFlags(0)") ||
+      !CheckHip(state,
+                hipStreamCreateWithFlags(&streams[1], hipStreamNonBlocking),
+                "hipStreamCreateWithFlags(1)")) {
+    if (streams[0] != nullptr) (void)hipStreamDestroy(streams[0]);
+    return;
+  }
+
+  rocblas_handle handle = nullptr;
+  if (!CheckRocblas(state, rocblas_create_handle(&handle),
+                    "rocblas_create_handle")) {
+    (void)hipStreamDestroy(streams[1]);
+    (void)hipStreamDestroy(streams[0]);
+    return;
+  }
+  if (!CheckRocblas(state, rocblas_set_stream(handle, streams[0]),
+                    "warm-up rocblas_set_stream")) {
+    (void)rocblas_destroy_handle(handle);
+    (void)hipStreamDestroy(streams[1]);
+    (void)hipStreamDestroy(streams[0]);
+    return;
+  }
+
+  constexpr int kStateBatchSize = 16384;
+  hipStream_t cached_stream = streams[0];
+  double elapsed_seconds = 0;
+  int64_t operations = 0;
+  int64_t api_calls = 0;
+  for (auto _ : state) {
+    auto start = Clock::now();
+    for (int i = 0; i < kStateBatchSize; ++i) {
+      hipStream_t next = pattern == StatePattern::kAlternate ? streams[i & 1]
+                                                             : streams[0];
+      if (pattern == StatePattern::kCachedSame && next == cached_stream) {
+        benchmark::DoNotOptimize(cached_stream);
+        continue;
+      }
+      if (!CheckRocblas(state, rocblas_set_stream(handle, next),
+                        "rocblas_set_stream")) {
+        break;
+      }
+      cached_stream = next;
+      ++api_calls;
+    }
+    auto end = Clock::now();
+    elapsed_seconds += Seconds(end - start);
+    operations += kStateBatchSize;
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["api_call_fraction"] =
+      static_cast<double>(api_calls) / operations;
+  state.counters["ns/op"] = elapsed_seconds * 1e9 / operations;
+  state.SetItemsProcessed(operations);
+  (void)rocblas_destroy_handle(handle);
+  (void)hipStreamDestroy(streams[1]);
+  (void)hipStreamDestroy(streams[0]);
+}
+
+void BM_RocblasSetAtomicsMode(benchmark::State& state, StatePattern pattern) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  rocblas_handle handle = nullptr;
+  if (!CheckRocblas(state, rocblas_create_handle(&handle),
+                    "rocblas_create_handle")) {
+    return;
+  }
+
+  constexpr int kStateBatchSize = 16384;
+  rocblas_atomics_mode cached_mode = rocblas_atomics_allowed;
+  double elapsed_seconds = 0;
+  int64_t operations = 0;
+  int64_t api_calls = 0;
+  for (auto _ : state) {
+    auto start = Clock::now();
+    for (int i = 0; i < kStateBatchSize; ++i) {
+      rocblas_atomics_mode next =
+          pattern == StatePattern::kAlternate
+              ? (i & 1 ? rocblas_atomics_not_allowed : rocblas_atomics_allowed)
+              : rocblas_atomics_allowed;
+      if (pattern == StatePattern::kCachedSame && next == cached_mode) {
+        benchmark::DoNotOptimize(cached_mode);
+        continue;
+      }
+      if (!CheckRocblas(state, rocblas_set_atomics_mode(handle, next),
+                        "rocblas_set_atomics_mode")) {
+        break;
+      }
+      cached_mode = next;
+      ++api_calls;
+    }
+    auto end = Clock::now();
+    elapsed_seconds += Seconds(end - start);
+    operations += kStateBatchSize;
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["api_call_fraction"] =
+      static_cast<double>(api_calls) / operations;
+  state.counters["ns/op"] = elapsed_seconds * 1e9 / operations;
+  state.SetItemsProcessed(operations);
+  (void)rocblas_destroy_handle(handle);
+}
+
 #define REGISTER_LAUNCH(ARITY, ARG_PATH, PACKED, STREAM_NAME, STREAM_FLAGS) \
   BENCHMARK_CAPTURE(BM_ModuleLaunchKernel,                              \
                     args##ARITY##_##ARG_PATH##_##STREAM_NAME, ARITY,    \
@@ -237,6 +359,24 @@ BENCHMARK_CAPTURE(BM_EventRecordWait, timing,
     ->UseManualTime();
 BENCHMARK_CAPTURE(BM_EventRecordWait, timing_no_system_fence,
                   EventVisibility::kTimingNoSystemFence)
+    ->UseManualTime();
+
+BENCHMARK_CAPTURE(BM_RocblasSetStream, same_stream, StatePattern::kSame)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_RocblasSetStream, alternating_streams,
+                  StatePattern::kAlternate)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_RocblasSetStream, cached_same_stream,
+                  StatePattern::kCachedSame)
+    ->UseManualTime();
+
+BENCHMARK_CAPTURE(BM_RocblasSetAtomicsMode, same_mode, StatePattern::kSame)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_RocblasSetAtomicsMode, alternating_modes,
+                  StatePattern::kAlternate)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_RocblasSetAtomicsMode, cached_same_mode,
+                  StatePattern::kCachedSame)
     ->UseManualTime();
 
 #undef REGISTER_LAUNCH_ARITY
