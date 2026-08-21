@@ -52,7 +52,7 @@ absl::Status FuncGetAttribute(hipFunction_attribute attribute,
 absl::StatusOr<int32_t> RocmKernel::GetMaxOccupiedBlocksPerCore(
     ThreadDim threads, size_t dynamic_shared_memory_bytes) const {
   int32_t threads_per_block = threads.x * threads.y * threads.z;
-  VLOG(0) << "Get kernel block occupancy: " << name()
+  VLOG(3) << "Get kernel block occupancy: " << name()
           << "; threads_per_block: " << threads_per_block
           << "; dynamic_shared_memory_bytes: " << dynamic_shared_memory_bytes;
 
