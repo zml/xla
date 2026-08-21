@@ -484,18 +484,19 @@ class KernelArgsPackedArray : public KernelArgsPackedArrayBase,
   size_t shared_memory_bytes_ = 0;
 };
 
-inline void PackKernelArgsInto(absl::Span<const DeviceAddressBase> args,
-                               uint32_t shmem_bytes,
-                               KernelArgsPackedArray* packed) {
+inline std::unique_ptr<KernelArgsPackedArray> PackKernelArgs(
+    absl::Span<const DeviceAddressBase> args, uint32_t shmem_bytes) {
+  auto packed = std::make_unique<KernelArgsPackedArray>(args.size());
   for (const DeviceAddressBase& buf : args) {
     packed->add_argument(buf);
   }
   packed->add_shared_bytes(shmem_bytes);
+  return packed;
 }
 
-inline void PackKernelArgsInto(absl::Span<const KernelArg> args,
-                               uint32_t shmem_bytes,
-                               KernelArgsPackedArray* packed) {
+inline std::unique_ptr<KernelArgsPackedArray> PackKernelArgs(
+    absl::Span<const KernelArg> args, uint32_t shmem_bytes) {
+  auto packed = std::make_unique<KernelArgsPackedArray>(args.size());
   for (const auto& arg : args) {
     std::visit(
         absl::Overload{
@@ -506,19 +507,6 @@ inline void PackKernelArgsInto(absl::Span<const KernelArg> args,
         arg);
   }
   packed->add_shared_bytes(shmem_bytes);
-}
-
-inline std::unique_ptr<KernelArgsPackedArray> PackKernelArgs(
-    absl::Span<const DeviceAddressBase> args, uint32_t shmem_bytes) {
-  auto packed = std::make_unique<KernelArgsPackedArray>(args.size());
-  PackKernelArgsInto(args, shmem_bytes, packed.get());
-  return packed;
-}
-
-inline std::unique_ptr<KernelArgsPackedArray> PackKernelArgs(
-    absl::Span<const KernelArg> args, uint32_t shmem_bytes) {
-  auto packed = std::make_unique<KernelArgsPackedArray>(args.size());
-  PackKernelArgsInto(args, shmem_bytes, packed.get());
   return packed;
 }
 
