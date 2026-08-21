@@ -368,6 +368,36 @@ absl::StatusOr<HloInstruction*> SplitKDimensionOfDot(HloDotInstruction* src_dot,
   return splitk_root;
 }
 
+bool FeedsFromBlockScaledDequantize(const HloInstruction* operand) {
+  constexpr int kMaxVisited = 32;
+  std::vector<const HloInstruction*> worklist = {operand};
+  for (int visited = 0; !worklist.empty() && visited < kMaxVisited; ++visited) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if ((instr->opcode() == HloOpcode::kBitcast ||
+         instr->opcode() == HloOpcode::kReshape) &&
+        instr->operand(0)->opcode() == HloOpcode::kBroadcast &&
+        instr->operand(0)->shape().dimensions().size() >
+            instr->shape().dimensions().size()) {
+      return true;
+    }
+    // kConcatenate is load-bearing: DotMerger runs first, and on a merged
+    // operand the dequantize is only reachable through the concat.
+    if (instr->IsElementwise() || instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape ||
+        instr->opcode() == HloOpcode::kTranspose ||
+        instr->opcode() == HloOpcode::kBroadcast ||
+        instr->opcode() == HloOpcode::kConcatenate ||
+        instr->opcode() == HloOpcode::kCopy ||
+        instr->opcode() == HloOpcode::kPad ||
+        instr->opcode() == HloOpcode::kSlice) {
+      worklist.insert(worklist.end(), instr->operands().begin(),
+                      instr->operands().end());
+    }
+  }
+  return false;
+}
+
 class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
  public:
   explicit SplitkRewriterVisitor(se::DeviceDescription device_description)
@@ -386,6 +416,9 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
         })) {
       // Neither cuBLAS nor Triton support s32, so we don't benefit from
       // splitting K.
+      return absl::OkStatus();
+    }
+    if (absl::c_any_of(dot->operands(), FeedsFromBlockScaledDequantize)) {
       return absl::OkStatus();
     }
     size_t split_k = dot->parent()
