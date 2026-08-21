@@ -19,6 +19,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/log.h"
@@ -99,24 +100,27 @@ VmmAllocate(StreamExecutor* executor, uint64_t size) {
           << " padded size: " << padded_size << " granularity: " << granularity
           << " device: " << executor->device_ordinal();
 
-  // Set access for this device and all P2P-capable peers, matching the CUDA
-  // pattern that gates on CanEnablePeerAccessTo().
-  int device_count = 0;
-  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
-  ABSL_RETURN_IF_ERROR(ToStatus(hipGetDeviceCount(&device_count)));
-  for (int peer = 0; peer < device_count; peer++) {
-    if (peer != executor->device_ordinal()) {
-      auto peer_executor_or = const_cast<Platform*>(executor->GetPlatform())
-                                  ->ExecutorForDevice(peer);
-      if (!peer_executor_or.ok() ||
-          !executor->CanEnablePeerAccessTo(peer_executor_or.value())) {
-        continue;
-      }
-    }
-    hipMemAccessDesc access_desc = GetVmmAccessDescriptor(peer);
-    ABSL_RETURN_IF_ERROR(
-        ToStatus(hipMemSetAccess(ptr, padded_size, &access_desc, 1)));
+  // Set access for this device and all P2P-capable peers. Use the executor's
+  // ordinal cache instead of re-querying peer capability through peer
+  // executors for every allocation. Keep the local descriptor last: ROCm 7.14
+  // can corrupt a mapping when local access is granted before peer access.
+  int device_count = executor->GetPlatform()->VisibleDeviceCount();
+  if (device_count < 0) {
+    return absl::InternalError("Failed to query visible ROCm device count");
   }
+  std::vector<hipMemAccessDesc> access_descriptors;
+  access_descriptors.reserve(device_count);
+  for (int peer = 0; peer < device_count; peer++) {
+    if (peer == executor->device_ordinal() ||
+        !executor->CanEnablePeerAccessTo(peer)) {
+      continue;
+    }
+    access_descriptors.push_back(GetVmmAccessDescriptor(peer));
+  }
+  access_descriptors.push_back(
+      GetVmmAccessDescriptor(executor->device_ordinal()));
+  ABSL_RETURN_IF_ERROR(ToStatus(hipMemSetAccess(
+      ptr, padded_size, access_descriptors.data(), access_descriptors.size())));
 
   std::move(cleanup).Cancel();
   return std::make_tuple(ptr, padded_size, handle);
