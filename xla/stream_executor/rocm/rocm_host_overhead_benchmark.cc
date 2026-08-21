@@ -326,6 +326,263 @@ void BM_RocblasSetAtomicsMode(benchmark::State& state, StatePattern pattern) {
   (void)rocblas_destroy_handle(handle);
 }
 
+struct GraphData {
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  std::vector<hipGraphNode_t> nodes;
+  uint64_t argument = 0;
+  void* argument_address = &argument;
+  hipKernelNodeParams params{};
+};
+
+void DestroyGraph(GraphData& data) {
+  if (data.exec != nullptr) (void)hipGraphExecDestroy(data.exec);
+  if (data.graph != nullptr) (void)hipGraphDestroy(data.graph);
+  data.exec = nullptr;
+  data.graph = nullptr;
+}
+
+bool CreateGraph(benchmark::State& state, hipFunction_t function,
+                 int node_count, bool instantiate, GraphData& data) {
+  if (!CheckHip(state, hipGraphCreate(&data.graph, 0), "hipGraphCreate")) {
+    return false;
+  }
+
+  data.params.func = function;
+  data.params.gridDim = dim3(1, 1, 1);
+  data.params.blockDim = dim3(1, 1, 1);
+  data.params.sharedMemBytes = 0;
+  data.params.kernelParams = &data.argument_address;
+  data.params.extra = nullptr;
+  data.nodes.reserve(node_count);
+
+  hipGraphNode_t dependency = nullptr;
+  for (int i = 0; i < node_count; ++i) {
+    hipGraphNode_t node = nullptr;
+    const hipGraphNode_t* dependencies = i == 0 ? nullptr : &dependency;
+    size_t dependency_count = i == 0 ? 0 : 1;
+    if (!CheckHip(state,
+                  hipGraphAddKernelNode(&node, data.graph, dependencies,
+                                        dependency_count, &data.params),
+                  "hipGraphAddKernelNode")) {
+      DestroyGraph(data);
+      return false;
+    }
+    data.nodes.push_back(node);
+    dependency = node;
+  }
+
+  if (instantiate &&
+      !CheckHip(state,
+                hipGraphInstantiate(&data.exec, data.graph, nullptr, nullptr, 0),
+                "hipGraphInstantiate")) {
+    DestroyGraph(data);
+    return false;
+  }
+  return true;
+}
+
+void BM_GraphNodeUpdates(benchmark::State& state, int node_count) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipFunction_t function = nullptr;
+  if (!CheckHip(state, GetRocmHostOverheadBenchmarkKernel(1, &function),
+                "GetRocmHostOverheadBenchmarkKernel")) {
+    return;
+  }
+
+  GraphData data;
+  if (!CreateGraph(state, function, node_count, true, data)) return;
+
+  double elapsed_seconds = 0;
+  int64_t updates = 0;
+  for (auto _ : state) {
+    data.argument ^= 1;
+    auto start = Clock::now();
+    for (hipGraphNode_t node : data.nodes) {
+      if (!CheckHip(state,
+                    hipGraphExecKernelNodeSetParams(data.exec, node,
+                                                    &data.params),
+                    "hipGraphExecKernelNodeSetParams")) {
+        break;
+      }
+      ++updates;
+    }
+    auto end = Clock::now();
+    elapsed_seconds += Seconds(end - start);
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["ns/node"] = elapsed_seconds * 1e9 / updates;
+  state.SetItemsProcessed(updates);
+  DestroyGraph(data);
+}
+
+void BM_WholeGraphExecUpdate(benchmark::State& state, int node_count) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipFunction_t function = nullptr;
+  if (!CheckHip(state, GetRocmHostOverheadBenchmarkKernel(1, &function),
+                "GetRocmHostOverheadBenchmarkKernel")) {
+    return;
+  }
+
+  GraphData first;
+  GraphData second;
+  first.argument = 0;
+  second.argument = 1;
+  if (!CreateGraph(state, function, node_count, true, first) ||
+      !CreateGraph(state, function, node_count, false, second)) {
+    DestroyGraph(second);
+    DestroyGraph(first);
+    return;
+  }
+
+  double elapsed_seconds = 0;
+  int64_t updates = 0;
+  for (auto _ : state) {
+    GraphData& update = updates & 1 ? first : second;
+    hipGraphNode_t error_node = nullptr;
+    hipGraphExecUpdateResult update_result = hipGraphExecUpdateError;
+    auto start = Clock::now();
+    hipError_t result = hipGraphExecUpdate(first.exec, update.graph, &error_node,
+                                           &update_result);
+    auto end = Clock::now();
+    if (!CheckHip(state, result, "hipGraphExecUpdate")) break;
+    if (update_result != hipGraphExecUpdateSuccess) {
+      state.SkipWithError("hipGraphExecUpdate did not accept matching graph");
+      break;
+    }
+    elapsed_seconds += Seconds(end - start);
+    ++updates;
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["ns/graph"] = elapsed_seconds * 1e9 / updates;
+  state.counters["ns/node"] = elapsed_seconds * 1e9 / updates / node_count;
+  state.SetItemsProcessed(updates * node_count);
+  DestroyGraph(second);
+  DestroyGraph(first);
+}
+
+void BM_GraphReplay(benchmark::State& state, int node_count, bool upload,
+                    bool first_replay) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipFunction_t function = nullptr;
+  if (!CheckHip(state, GetRocmHostOverheadBenchmarkKernel(1, &function),
+                "GetRocmHostOverheadBenchmarkKernel")) {
+    return;
+  }
+
+  hipStream_t stream = nullptr;
+  if (!CheckHip(state, hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags")) {
+    return;
+  }
+
+  double enqueue_seconds = 0;
+  double sync_seconds = 0;
+  double upload_enqueue_seconds = 0;
+  double upload_sync_seconds = 0;
+  int64_t launches = 0;
+
+  GraphData steady_graph;
+  if (!first_replay &&
+      !CreateGraph(state, function, node_count, true, steady_graph)) {
+    (void)hipStreamDestroy(stream);
+    return;
+  }
+
+  if (!first_replay) {
+    if (upload) {
+      auto upload_start = Clock::now();
+      if (!CheckHip(state, hipGraphUpload(steady_graph.exec, stream),
+                    "hipGraphUpload")) {
+        DestroyGraph(steady_graph);
+        (void)hipStreamDestroy(stream);
+        return;
+      }
+      auto upload_enqueue_end = Clock::now();
+      if (!CheckHip(state, hipStreamSynchronize(stream),
+                    "hipGraphUpload synchronization")) {
+        DestroyGraph(steady_graph);
+        (void)hipStreamDestroy(stream);
+        return;
+      }
+      auto upload_end = Clock::now();
+      upload_enqueue_seconds = Seconds(upload_enqueue_end - upload_start);
+      upload_sync_seconds = Seconds(upload_end - upload_enqueue_end);
+    }
+    if (!CheckHip(state, hipGraphLaunch(steady_graph.exec, stream),
+                  "warm-up hipGraphLaunch") ||
+        !CheckHip(state, hipStreamSynchronize(stream),
+                  "warm-up hipStreamSynchronize")) {
+      DestroyGraph(steady_graph);
+      (void)hipStreamDestroy(stream);
+      return;
+    }
+  }
+
+  const int batch_size = first_replay ? 1 : 64;
+  for (auto _ : state) {
+    GraphData first_graph;
+    GraphData* graph = &steady_graph;
+    if (first_replay) {
+      if (!CreateGraph(state, function, node_count, true, first_graph)) break;
+      graph = &first_graph;
+      if (upload) {
+        auto upload_start = Clock::now();
+        if (!CheckHip(state, hipGraphUpload(graph->exec, stream),
+                      "hipGraphUpload")) {
+          DestroyGraph(first_graph);
+          break;
+        }
+        auto upload_enqueue_end = Clock::now();
+        if (!CheckHip(state, hipStreamSynchronize(stream),
+                      "hipGraphUpload synchronization")) {
+          DestroyGraph(first_graph);
+          break;
+        }
+        auto upload_end = Clock::now();
+        upload_enqueue_seconds += Seconds(upload_enqueue_end - upload_start);
+        upload_sync_seconds += Seconds(upload_end - upload_enqueue_end);
+      }
+    }
+
+    auto enqueue_start = Clock::now();
+    for (int i = 0; i < batch_size; ++i) {
+      if (!CheckHip(state, hipGraphLaunch(graph->exec, stream),
+                    "hipGraphLaunch")) {
+        break;
+      }
+    }
+    auto enqueue_end = Clock::now();
+    if (!CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize")) {
+      if (first_replay) DestroyGraph(first_graph);
+      break;
+    }
+    auto sync_end = Clock::now();
+    enqueue_seconds += Seconds(enqueue_end - enqueue_start);
+    sync_seconds += Seconds(sync_end - enqueue_end);
+    launches += batch_size;
+    state.SetIterationTime(Seconds(sync_end - enqueue_start));
+    if (first_replay) DestroyGraph(first_graph);
+  }
+
+  SetBatchCounters(state, enqueue_seconds, sync_seconds, launches);
+  if (upload) {
+    int64_t upload_count = first_replay ? state.iterations() : 1;
+    state.counters["upload_enqueue_us"] =
+        upload_enqueue_seconds * 1e6 / upload_count;
+    state.counters["upload_sync_us"] =
+        upload_sync_seconds * 1e6 / upload_count;
+  }
+  DestroyGraph(steady_graph);
+  (void)hipStreamDestroy(stream);
+}
+
 #define REGISTER_LAUNCH(ARITY, ARG_PATH, PACKED, STREAM_NAME, STREAM_FLAGS) \
   BENCHMARK_CAPTURE(BM_ModuleLaunchKernel,                              \
                     args##ARITY##_##ARG_PATH##_##STREAM_NAME, ARITY,    \
@@ -379,6 +636,30 @@ BENCHMARK_CAPTURE(BM_RocblasSetAtomicsMode, cached_same_mode,
                   StatePattern::kCachedSame)
     ->UseManualTime();
 
+#define REGISTER_GRAPH_SIZE(NODES)                                  \
+  BENCHMARK_CAPTURE(BM_GraphNodeUpdates, nodes_##NODES, NODES)       \
+      ->UseManualTime();                                             \
+  BENCHMARK_CAPTURE(BM_WholeGraphExecUpdate, nodes_##NODES, NODES)   \
+      ->UseManualTime()
+
+REGISTER_GRAPH_SIZE(1);
+REGISTER_GRAPH_SIZE(8);
+REGISTER_GRAPH_SIZE(32);
+REGISTER_GRAPH_SIZE(128);
+REGISTER_GRAPH_SIZE(512);
+
+BENCHMARK_CAPTURE(BM_GraphReplay, first_no_upload, 128, false, true)
+    ->UseManualTime()
+    ->Iterations(20);
+BENCHMARK_CAPTURE(BM_GraphReplay, first_after_upload, 128, true, true)
+    ->UseManualTime()
+    ->Iterations(20);
+BENCHMARK_CAPTURE(BM_GraphReplay, steady_no_upload, 128, false, false)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_GraphReplay, steady_after_upload, 128, true, false)
+    ->UseManualTime();
+
+#undef REGISTER_GRAPH_SIZE
 #undef REGISTER_LAUNCH_ARITY
 #undef REGISTER_LAUNCH
 
