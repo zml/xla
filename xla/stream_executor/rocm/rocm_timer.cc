@@ -18,7 +18,6 @@ limitations under the License.
 #include <memory>
 #include <utility>
 
-#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -45,8 +44,7 @@ absl::StatusOr<float> GetEventElapsedTime(StreamExecutor* executor,
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventSynchronize);
   hipError_t res = hipEventSynchronize(stop);
   if (res != hipSuccess) {
-    LOG(ERROR) << "failed to synchronize the stop event: " << ToString(res);
-    return false;
+    return ToStatus(res, "failed to synchronize the stop event");
   }
   float elapsed_milliseconds;
   ABSL_RETURN_IF_ERROR(
