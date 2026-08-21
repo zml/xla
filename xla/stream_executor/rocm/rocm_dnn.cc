@@ -437,14 +437,31 @@ class MIOpenAccess {
         stream ? static_cast<hipStream_t>(
                      stream->platform_specific_handle().stream)
                : nullptr;
-    auto status = miopenSetStream(handle_, hip_stream);
-    CHECK_EQ(status, miopenStatusSuccess) << "Failed to set MIOpen stream.";
+    if (!current_stream_ || hip_stream != *current_stream_) {
+      auto status = miopenSetStream(handle_, hip_stream);
+      CHECK_EQ(status, miopenStatusSuccess) << "Failed to set MIOpen stream.";
+      current_stream_ = hip_stream;
+    }
     return MIOpenHandle(executor, std::move(lock), handle_);
   }
 
+  void NotifyStreamDestroyed(Stream* stream) {
+    hipStream_t hip_stream = static_cast<hipStream_t>(
+        stream->platform_specific_handle().stream);
+    absl::MutexLock lock(mutex_);
+    if (current_stream_ && hip_stream == *current_stream_) {
+      current_stream_.reset();
+    }
+  }
+
  private:
-  // Guards the enqueueing of MIOpen operations via the handle_ below.
+  // Guards current_stream_ and the enqueueing of MIOpen operations via the
+  // handle_ below.
   absl::Mutex mutex_;
+
+  // If set, indicates the stream currently active on handle_, to avoid the
+  // overhead of re-setting the same stream unnecessarily.
+  std::optional<hipStream_t> current_stream_ ABSL_GUARDED_BY(mutex_);
 
   // MIOpen library handle.
   miopenHandle_t handle_ ABSL_GUARDED_BY(mutex_);  // Owned.
@@ -472,6 +489,10 @@ absl::Status MIOpenSupport::Init() {
   return absl::Status{absl::StatusCode::kInternal,
                       absl::StrCat("miopen library could not create a handle: ",
                                    ToString(status))};
+}
+
+void MIOpenSupport::NotifyStreamDestroyed(Stream* stream) /* override */ {
+  miopen_->NotifyStreamDestroyed(stream);
 }
 
 absl::StatusOr<stream_executor::dnn::VersionInfo> MIOpenSupport::GetVersion() {
