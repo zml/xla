@@ -96,7 +96,7 @@ class CommandBufferThunk : public Thunk {
     // buffer allocations passed in `params`. Returns buffer allocations that
     // changed since the last update. Returned buffer allocations are sorted by
     // the buffer allocation index. `persistent_alloc_indices` must be sorted.
-    Command::UpdatedAllocations UpdateBufferAllocations(
+    std::vector<BufferAllocation::Index> UpdateBufferAllocations(
         const CommandExecutor& commands, const Thunk::ExecuteParams& params,
         absl::Span<const BufferAllocation::Index> persistent_alloc_indices)
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
