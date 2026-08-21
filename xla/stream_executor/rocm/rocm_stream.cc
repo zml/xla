@@ -24,6 +24,7 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/base/call_once.h"
 #include "absl/base/casts.h"
 #include "absl/base/no_destructor.h"
 #include "absl/base/thread_annotations.h"
@@ -226,7 +227,67 @@ absl::Status SynchronizeStream(StreamExecutor* executor, hipStream_t stream) {
   return absl::OkStatus();
 }
 
+absl::StatusOr<bool> StreamIsCapturing(StreamExecutor* executor,
+                                       hipStream_t stream) {
+  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  hipStreamCaptureStatus status;
+  RETURN_IF_ERROR(ToStatus(hipStreamIsCapturing(stream, &status),
+                           "Failed to check HIP stream capture status"));
+  return status == hipStreamCaptureStatusActive;
+}
+
 }  // namespace
+
+RocmStream::CaptureHandle::CaptureHandle(CaptureHandle&& other)
+    : stream_(std::exchange(other.stream_, nullptr)),
+      graph_(std::exchange(other.graph_, nullptr)) {}
+
+absl::Status RocmStream::CaptureHandle::EndCapture() {
+  if (stream_ == nullptr || graph_ == nullptr) {
+    return absl::OkStatus();
+  }
+
+  RocmStream* stream = std::exchange(stream_, nullptr);
+  hipGraph_t graph = std::exchange(graph_, nullptr);
+  hipGraph_t captured_graph = nullptr;
+  RETURN_IF_ERROR(ToStatus(
+      hipStreamEndCapture(stream->stream_handle_, &captured_graph),
+      "Failed to end HIP stream capture"));
+  if (captured_graph != graph) {
+    return absl::InternalError(
+        "HIP stream capture should update the graph passed to BeginCapture");
+  }
+  return absl::OkStatus();
+}
+
+RocmStream::CaptureHandle::~CaptureHandle() { EndCapture().IgnoreError(); }
+
+absl::StatusOr<RocmStream::CaptureHandle> RocmStream::BeginCapture(
+    hipGraph_t graph, const hipGraphNode_t* dependencies,
+    size_t num_dependencies, hipStreamCaptureMode mode) {
+  absl::call_once(capture_stream_once_, [this]() {
+    capture_stream_ = parent()->CreateStream(priority());
+  });
+  if (!capture_stream_.ok()) {
+    return capture_stream_.status();
+  }
+
+  RocmStream* capture_stream =
+      static_cast<RocmStream*>(capture_stream_->get());
+  ASSIGN_OR_RETURN(bool is_capturing,
+                   StreamIsCapturing(executor_, capture_stream->stream_handle_));
+  if (is_capturing) {
+    return absl::FailedPreconditionError(
+        "HIP capture stream is already capturing");
+  }
+
+  RETURN_IF_ERROR(ToStatus(
+      hipStreamBeginCaptureToGraph(
+          capture_stream->stream_handle_, graph, dependencies,
+          /*dependencyData=*/nullptr, num_dependencies, mode),
+      "Failed to begin HIP stream capture to graph"));
+  return CaptureHandle(capture_stream, graph);
+}
 
 absl::StatusOr<std::unique_ptr<RocmStream>> RocmStream::Create(
     StreamExecutor* executor,

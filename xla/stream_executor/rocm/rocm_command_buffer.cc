@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_kernel.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
+#include "xla/stream_executor/rocm/rocm_stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
@@ -374,38 +375,37 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateEmptyNode(
 
 absl::Status RocmCommandBuffer::Trace(
     Stream* stream, absl::AnyInvocable<absl::Status(Stream* stream)> function) {
-  ABSL_RETURN_IF_ERROR(CheckNotFinalized());
-  ABSL_ASSIGN_OR_RETURN(size_t count, GetNodeCount());
-  if (count != 0 || !is_owned_graph_)
-    return absl::InternalError(
-        "Stream can't be traced on non empty command buffer");
+  RETURN_IF_ERROR(CheckNotFinalized());
 
   VLOG(5) << "Trace into GPU command buffer graph " << graph_
           << " on a stream: " << stream;
 
-  hipStream_t stream_handle =
-      static_cast<hipStream_t>(stream->platform_specific_handle().stream);
+  RocmStream* rocm_stream = static_cast<RocmStream*>(stream);
 
-  // Switch stream into the capture mode.
   uint64_t start_nanos = tsl::Env::Default()->NowNanos();
-  ABSL_RETURN_IF_ERROR(ToStatus(
-      hipStreamBeginCapture(stream_handle, hipStreamCaptureModeThreadLocal),
-      "Failed to begin stream capture"));
-  auto traced = function(stream);
+  ASSIGN_OR_RETURN(
+      RocmStream::CaptureHandle capture_handle,
+      rocm_stream->BeginCapture(
+          graph_, /*dependencies=*/nullptr, /*num_dependencies=*/0,
+          hipStreamCaptureModeThreadLocal));
+  Stream* capture_stream = capture_handle.capturing_stream();
+  absl::Status traced = function(capture_stream);
 
-  // Always stop capturing the stream before checking `traced` result.
-  VLOG(5) << "End stream " << stream << " capture";
-  hipGraph_t captured_graph;
-  ABSL_RETURN_IF_ERROR(ToStatus(hipStreamEndCapture(stream_handle, &captured_graph),
-                           "Failed to end stream capture"));
-  ABSL_RETURN_IF_ERROR(
-      ToStatus(hipGraphDestroy(std::exchange(graph_, captured_graph)),
-               "Failed to destroy HIP graph"));
+  // Always end capture before propagating a tracing error.
+  VLOG(5) << "End stream " << capture_stream << " capture";
+  absl::Status ended = capture_handle.EndCapture();
   uint64_t end_nanos = tsl::Env::Default()->NowNanos();
 
-  if (!traced.ok())
+  if (!traced.ok()) {
+    if (!ended.ok()) {
+      return absl::InternalError(absl::StrCat(
+          "Failed to capture gpu graph: ", traced.message(),
+          "; failed to end capture: ", ended.message()));
+    }
     return absl::InternalError(
         absl::StrCat("Failed to capture gpu graph: ", traced.message()));
+  }
+  RETURN_IF_ERROR(ended);
 
   VLOG(5) << "Traced into the GPU command buffer graph " << graph_ << " (took "
           << (end_nanos - start_nanos) / 1000 << " μs)";
