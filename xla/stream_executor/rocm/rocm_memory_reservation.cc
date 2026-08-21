@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -103,29 +104,35 @@ absl::Status RocmMemoryReservation::SetAccess(uint64_t reservation_offset,
                                               size_t size) {
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
 
-  int device_count = 0;
-  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
-  RETURN_IF_ERROR(
-      ToStatus(hipGetDeviceCount(&device_count), "hipGetDeviceCount"));
-
-  for (int peer = 0; peer < device_count; ++peer) {
-    if (peer != executor_->device_ordinal()) {
-      auto peer_executor_or = const_cast<Platform*>(executor_->GetPlatform())
-                                  ->ExecutorForDevice(peer);
-      if (!peer_executor_or.ok() ||
-          !executor_->CanEnablePeerAccessTo(peer_executor_or.value())) {
-        continue;
-      }
-    }
-    hipMemAccessDesc desc = {};
-    desc.location.type = hipMemLocationTypeDevice;
-    desc.location.id = peer;
-    desc.flags = hipMemAccessFlagsProtReadWrite;
-    RETURN_IF_ERROR(
-        ToStatus(hipMemSetAccess(ptr_ + reservation_offset, size, &desc, 1),
-                 "hipMemSetAccess for peer device"));
+  int device_count = executor_->GetPlatform()->VisibleDeviceCount();
+  if (device_count < 0) {
+    return absl::InternalError("Failed to query visible ROCm device count");
   }
-  return absl::OkStatus();
+  std::vector<hipMemAccessDesc> access_descriptors;
+  access_descriptors.reserve(device_count);
+  for (int peer = 0; peer < device_count; ++peer) {
+    if (peer == executor_->device_ordinal() ||
+        !executor_->CanEnablePeerAccessTo(peer)) {
+      continue;
+    }
+    hipMemAccessDesc descriptor = {};
+    descriptor.location.type = hipMemLocationTypeDevice;
+    descriptor.location.id = peer;
+    descriptor.flags = hipMemAccessFlagsProtReadWrite;
+    access_descriptors.push_back(descriptor);
+  }
+
+  // Grant local access last. ROCm 7.14 can corrupt the mapping when local
+  // access is granted before peer access.
+  hipMemAccessDesc local_descriptor = {};
+  local_descriptor.location.type = hipMemLocationTypeDevice;
+  local_descriptor.location.id = executor_->device_ordinal();
+  local_descriptor.flags = hipMemAccessFlagsProtReadWrite;
+  access_descriptors.push_back(local_descriptor);
+  return ToStatus(hipMemSetAccess(ptr_ + reservation_offset, size,
+                                  access_descriptors.data(),
+                                  access_descriptors.size()),
+                  "hipMemSetAccess for local and peer devices");
 }
 
 absl::Status RocmMemoryReservation::UnMap(size_t offset, size_t size) {
