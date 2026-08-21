@@ -262,7 +262,12 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUDNN);
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::CUSTOM_CALL);
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::DYNAMIC_SLICE_FUSION);
+#if !TENSORFLOW_USE_ROCM
+  // On ROCm, frequently changing fusion arguments force costly HIP graph-node
+  // updates and can be slower than launching the kernels directly. Keep
+  // FUSION opt-in there; the repeated-enum flag accepts +FUSION.
   opts.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);
+#endif
   opts.add_xla_gpu_enable_collectives_command_buffer_filter(
       DebugOptions::ALLCOLLECTIVES);
   opts.set_xla_gpu_graph_min_graph_size(5);
