@@ -321,6 +321,7 @@ xla_cc_test(
     ],
     deps = [
         ":rocm_host_overhead_benchmark_kernels",
+        "//xla/tsl/framework:bfc_allocator",
         "//xla/tsl/platform:test_main",
         "@com_google_benchmark//:benchmark",
         "@local_config_rocm//rocm:hip",
