@@ -54,6 +54,7 @@ class RocmCommandBuffer : public GpuCommandBuffer {
   RocmCommandBuffer(Mode mode, StreamExecutor* executor, hipGraph_t graph,
                     bool is_owned_graph)
       : GpuCommandBuffer(mode, executor),
+        stream_exec_(executor),
         graph_(graph),
         is_owned_graph_(is_owned_graph) {}
 
@@ -176,6 +177,7 @@ class RocmCommandBuffer : public GpuCommandBuffer {
 
   RocmCommandBuffer* parent_ = nullptr;
 
+  StreamExecutor* stream_exec_ = nullptr;
   hipGraph_t graph_ = nullptr;
   bool is_owned_graph_ = true;
   hipGraphExec_t exec_ = nullptr;
