@@ -368,6 +368,53 @@ absl::StatusOr<HloInstruction*> SplitKDimensionOfDot(HloDotInstruction* src_dot,
   return splitk_root;
 }
 
+// A block-scaled dequantize spells its scale as a broadcast that a following
+// bitcast merges back into the operand's own dimensions:
+//
+//   bf16[40,24] scale -> bf16[40,128,24,128] broadcast -> bf16[5120,3072]
+//
+// Splitting K rewrites the operand to [.., split_k, K/split_k], and no dim
+// order can be propagated back through that merge afterwards, so GemmFusion
+// declines the multiply and the dequantized weight is materialized at full
+// width -- for a `f8e4m3fn[17408,5120]` that is 178 MB written and re-read per
+// layer per step. Split-K only ever buys parallelism; it never buys enough to
+// pay for a weight-sized round trip.
+//
+// Only a rank-reducing bitcast can merge a broadcast dimension away, which is
+// what separates this from the per-channel spelling ([N,1] -> [N] -> [N,K]).
+// A per-channel scale is constant along the contraction, stays fusible after a
+// split, and must keep its split-K.
+bool FeedsFromBlockScaledDequantize(const HloInstruction* operand) {
+  constexpr int kMaxVisited = 32;
+  std::vector<const HloInstruction*> worklist = {operand};
+  for (int visited = 0; !worklist.empty() && visited < kMaxVisited; ++visited) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if ((instr->opcode() == HloOpcode::kBitcast ||
+         instr->opcode() == HloOpcode::kReshape) &&
+        instr->operand(0)->opcode() == HloOpcode::kBroadcast &&
+        instr->operand(0)->shape().dimensions().size() >
+            instr->shape().dimensions().size()) {
+      return true;
+    }
+    // kConcatenate is load-bearing, not defensive: DotMerger runs before this
+    // pass and concatenates the two quantized in_proj weights into one dot, so
+    // on a merged operand the dequantize is only reachable through the concat.
+    if (instr->IsElementwise() || instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape ||
+        instr->opcode() == HloOpcode::kTranspose ||
+        instr->opcode() == HloOpcode::kBroadcast ||
+        instr->opcode() == HloOpcode::kConcatenate ||
+        instr->opcode() == HloOpcode::kCopy ||
+        instr->opcode() == HloOpcode::kPad ||
+        instr->opcode() == HloOpcode::kSlice) {
+      worklist.insert(worklist.end(), instr->operands().begin(),
+                      instr->operands().end());
+    }
+  }
+  return false;
+}
+
 class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
  public:
   explicit SplitkRewriterVisitor(se::DeviceDescription device_description)
@@ -386,6 +433,9 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
         })) {
       // Neither cuBLAS nor Triton support s32, so we don't benefit from
       // splitting K.
+      return absl::OkStatus();
+    }
+    if (absl::c_any_of(dot->operands(), FeedsFromBlockScaledDequantize)) {
       return absl::OkStatus();
     }
     size_t split_k = dot->parent()
