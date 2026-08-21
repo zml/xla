@@ -279,8 +279,8 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateKernelNode(
   }
 
   hipKernelNodeParams params{};
-  hipFunction_t function =
-      static_cast<const RocmKernel&>(kernel).gpu_function();
+  const auto& rocm_kernel = static_cast<const RocmKernel&>(kernel);
+  hipFunction_t function = rocm_kernel.gpu_function();
   params.func = function;
   params.gridDim.x = blocks.x;
   params.gridDim.y = blocks.y;
@@ -295,10 +295,7 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateKernelNode(
 
   if (shared_mem_bytes != 0) {
     RETURN_IF_ERROR(
-        ToStatus(hipFuncSetAttribute(function,
-                                     hipFuncAttributeMaxDynamicSharedMemorySize,
-                                     shared_mem_bytes),
-                 "Failed to set shared memory size"));
+        rocm_kernel.UpdateMaxDynamicSharedMemoryBytes(shared_mem_bytes));
   }
 
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
@@ -334,8 +331,8 @@ absl::Status RocmCommandBuffer::UpdateKernelNode(
   }
 
   hipKernelNodeParams params{};
-  hipFunction_t function =
-      static_cast<const RocmKernel&>(kernel).gpu_function();
+  const auto& rocm_kernel = static_cast<const RocmKernel&>(kernel);
+  hipFunction_t function = rocm_kernel.gpu_function();
   params.func = function;
   params.gridDim.x = blocks.x;
   params.gridDim.y = blocks.y;
@@ -350,10 +347,7 @@ absl::Status RocmCommandBuffer::UpdateKernelNode(
 
   if (shared_mem_bytes != 0) {
     RETURN_IF_ERROR(
-        ToStatus(hipFuncSetAttribute(function,
-                                     hipFuncAttributeMaxDynamicSharedMemorySize,
-                                     shared_mem_bytes),
-                 "Failed to set shared memory size"));
+        rocm_kernel.UpdateMaxDynamicSharedMemoryBytes(shared_mem_bytes));
   }
 
   return ToStatus(hipGraphExecKernelNodeSetParams(
