@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "rocm/include/hip/hip_runtime.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_address.h"
@@ -51,7 +52,10 @@ RocmRawMemoryAllocation::Create(StreamExecutor* executor, uint64_t size) {
   uint64_t padded_size = xla::RoundUpTo<uint64_t>(size, granularity);
 
   hipMemGenericAllocationHandle_t handle;
-  ABSL_RETURN_IF_ERROR(ToStatus(hipMemCreate(&handle, padded_size, &props, 0ULL)));
+  ABSL_RETURN_IF_ERROR(ToStatus(
+      hipMemCreate(&handle, padded_size, &props, 0ULL),
+      absl::StrFormat("hipMemCreate failed for %u bytes on device %d",
+                      padded_size, executor->device_ordinal())));
 
   return std::unique_ptr<RocmRawMemoryAllocation>(
       new RocmRawMemoryAllocation(executor, handle, padded_size));

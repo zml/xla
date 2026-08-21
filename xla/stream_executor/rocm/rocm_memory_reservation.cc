@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 #include "rocm/include/hip/hip_runtime.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/device_address.h"
@@ -56,7 +57,10 @@ RocmMemoryReservation::Create(StreamExecutor* executor, uint64_t size) {
 
   void* ptr = nullptr;
   ABSL_RETURN_IF_ERROR(ToStatus(
-      hipMemAddressReserve(&ptr, padded_size, granularity, nullptr, 0ULL)));
+      hipMemAddressReserve(&ptr, padded_size, granularity, nullptr, 0ULL),
+      absl::StrFormat(
+          "hipMemAddressReserve failed for %u bytes on device %d",
+          padded_size, executor->device_ordinal())));
 
   return std::unique_ptr<RocmMemoryReservation>(new RocmMemoryReservation(
       executor, static_cast<char*>(ptr), padded_size));
@@ -79,9 +83,14 @@ absl::Status RocmMemoryReservation::Map(size_t reservation_offset,
         "RocmMemoryReservation::Map requires a RocmRawMemoryAllocation");
   }
   std::unique_ptr<ActivateContext> activation = executor_->Activate();
-  absl::Status status =
-      ToStatus(hipMemMap(ptr_ + reservation_offset, size, allocation_offset,
-                         rocm_alloc->GetHandle(), 0ULL));
+  absl::Status status = ToStatus(
+      hipMemMap(ptr_ + reservation_offset, size, allocation_offset,
+                rocm_alloc->GetHandle(), 0ULL),
+      absl::StrFormat(
+          "hipMemMap failed for %u bytes at reservation offset %u and "
+          "allocation offset %u on device %d",
+          size, reservation_offset, allocation_offset,
+          executor_->device_ordinal()));
   if (status.ok()) {
     mapped_bytes_ += size;
   }
