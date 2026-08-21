@@ -276,6 +276,38 @@ xla_test(
     ],
 )
 
+rocm_library(
+    name = "rocm_host_overhead_benchmark_kernels",
+    testonly = 1,
+    srcs = ["rocm_host_overhead_benchmark_kernels.cu.cc"],
+    hdrs = ["rocm_host_overhead_benchmark_kernels.h"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        "@local_config_rocm//rocm:hip",
+        "@local_config_rocm//rocm:rocm_headers",
+    ],
+)
+
+xla_cc_test(
+    name = "rocm_host_overhead_benchmark",
+    srcs = ["rocm_host_overhead_benchmark.cc"],
+    tags = [
+        "gpu",
+        "manual",
+        "rocm-only",
+    ],
+    deps = [
+        ":rocm_host_overhead_benchmark_kernels",
+        "//xla/tsl/platform:test_main",
+        "@com_google_benchmark//:benchmark",
+        "@local_config_rocm//rocm:hip",
+        "@local_config_rocm//rocm:rocm_headers",
+    ],
+)
+
 cc_library(
     name = "rocm_platform",
     srcs = ["rocm_platform.cc"],
