@@ -93,6 +93,20 @@ TEST(DebugOptions, SchedulerMemoryFencingDefaultsToDisabled) {
       -1);
 }
 
+TEST(DebugOptions, FusionCommandBufferDefaultIsPlatformSpecific) {
+  DebugOptions options = DefaultDebugOptionsIgnoringFlags();
+  const auto& command_types = options.xla_gpu_enable_command_buffer();
+  bool fusion_enabled =
+      absl::c_find(command_types, DebugOptions::FUSION) != command_types.end();
+#if TENSORFLOW_USE_ROCM
+  // HIP graph updates are expensive for address-churning fusion workloads.
+  // Users can still opt in with --xla_gpu_enable_command_buffer=+FUSION.
+  EXPECT_FALSE(fusion_enabled);
+#else
+  EXPECT_TRUE(fusion_enabled);
+#endif
+}
+
 TEST(DebugOptions, CommandBufferUpdateModesParseFromFlags) {
   for (const auto& [name, expected] : std::vector<
            std::pair<const char*, DebugOptions::CommandBufferUpdateMode>>{
