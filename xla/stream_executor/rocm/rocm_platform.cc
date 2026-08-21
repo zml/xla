@@ -70,22 +70,23 @@ ROCmPlatform::ROCmPlatform() : name_(rocm::kROCmPlatformId->ToName()) {}
 Platform::Id ROCmPlatform::id() const { return rocm::kROCmPlatformId; }
 
 int ROCmPlatform::VisibleDeviceCount() const {
-  // Throw away the result - it logs internally, and this [containing] function
-  // isn't in the path of user control. It's safe to call this > 1x.
+  // Initialized in a thread-safe manner the first time this is run.
+  static const int num_devices = [] {
+    if (!PlatformInitialize().ok()) {
+      return -1;
+    }
 
-  if (!PlatformInitialize().ok()) {
-    return -1;
-  }
+    int device_count = 0;
+    IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
+    hipError_t res = hipGetDeviceCount(&device_count);
+    if (res != hipSuccess) {
+      LOG(ERROR) << "could not retrieve ROCM device count: " << ToString(res);
+      return 0;
+    }
 
-  int device_count = 0;
-  IncrementRocmPerformanceCounter(RocmPerformanceCounter::kDeviceCountQuery);
-  hipError_t res = hipGetDeviceCount(&device_count);
-  if (res != hipSuccess) {
-    LOG(ERROR) << "could not retrieve ROCM device count: " << ToString(res);
-    return 0;
-  }
-
-  return device_count;
+    return device_count;
+  }();
+  return num_devices;
 }
 
 const std::string& ROCmPlatform::Name() const { return name_; }
