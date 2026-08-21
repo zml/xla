@@ -128,6 +128,11 @@ class RocmExecutor : public GpuExecutor {
   static absl::StatusOr<std::unique_ptr<DeviceDescription>>
   CreateDeviceDescription(int device_ordinal);
 
+  // Returns immutable HIP properties for a device. Successful queries are
+  // cached for the process lifetime; failures are returned without caching.
+  static absl::StatusOr<hipDeviceProp_t> GetDeviceProperties(
+      int device_ordinal);
+
   // Returns a RocmKernel pointer for a given Kernel, if the kernel is
   // associated with this executor. Otherwise a NotFound error is returned.
   absl::StatusOr<const RocmKernel*> GetRocmKernel(const Kernel* kernel);

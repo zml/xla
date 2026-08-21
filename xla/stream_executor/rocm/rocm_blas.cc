@@ -50,6 +50,7 @@ limitations under the License.
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/plugin_registry.h"
 #include "xla/stream_executor/rocm/rocm_complex_converters.h"
+#include "xla/stream_executor/rocm/rocm_executor.h"
 #include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/scratch_allocator.h"
@@ -188,17 +189,14 @@ bool ROCMBlas::Init() {
     return false;
   }
 
-  int dev = 0;
-  hipError_t result = hipGetDevice(&dev);
-  hipDeviceProp_t props;
-  IncrementRocmPerformanceCounter(
-      RocmPerformanceCounter::kDevicePropertiesQuery);
-  result = hipGetDeviceProperties(&props, dev);
-  if (result == hipSuccess) {
-    auto cap = RocmComputeCapability(props.gcnArchName);
-    has_mfma_ = cap.has_mfma_instr_support();
-    use_hgemm_alt_impl_ = (cap.gfx_version() == "gfx90a");
+  auto props = RocmExecutor::GetDeviceProperties(parent_->device_ordinal());
+  if (!props.ok()) {
+    LOG(ERROR) << "Failed to query ROCm device properties: " << props.status();
+    return false;
   }
+  auto cap = RocmComputeCapability(props->gcnArchName);
+  has_mfma_ = cap.has_mfma_instr_support();
+  use_hgemm_alt_impl_ = (cap.gfx_version() == "gfx90a");
 
   return true;
 }
