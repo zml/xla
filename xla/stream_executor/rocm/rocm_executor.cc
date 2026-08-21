@@ -134,7 +134,8 @@ bool ShouldLaunchDelayKernel() {
       return value != nullptr && !absl::string_view{value}.empty() &&
              absl::string_view{value} != "0";
     };
-    return !is_enabled("HIP_LAUNCH_BLOCKING") &&
+    return !is_enabled("XLA_ROCM_DISABLE_DELAY_KERNEL") &&
+           !is_enabled("HIP_LAUNCH_BLOCKING") &&
            !is_enabled("AMD_SERIALIZE_KERNEL") &&
            !is_enabled("AMD_SERIALIZE_COPY");
   }();

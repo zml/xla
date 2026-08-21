@@ -89,6 +89,18 @@ TEST_P(RocmTimerTest, Create) {
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
+TEST_P(RocmTimerTest, DestroyBeforeStopping) {
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        RocmTimer timer,
+        RocmTimer::Create(executor_, stream_.get(), GetParam()));
+  }
+
+  // A delay-kernel timer must release the kernel and wait for it before its
+  // coherent host semaphore is destroyed.
+  EXPECT_THAT(stream_->BlockHostUntilDone(), absl_testing::IsOk());
+}
+
 INSTANTIATE_TEST_SUITE_P(RocmTimerTest, RocmTimerTest,
                          ::testing::Values(RocmTimer::TimerType::kEventBased,
                                            RocmTimer::TimerType::kDelayKernel));
