@@ -143,22 +143,46 @@ std::optional<VulkanGemmConfig> MatchVulkanGemm(
       dimensions.rhs_batch_dimensions_size() != 0 ||
       dimensions.lhs_contracting_dimensions_size() != 1 ||
       dimensions.rhs_contracting_dimensions_size() != 1 ||
-      dimensions.lhs_contracting_dimensions(0) != 1 ||
-      dimensions.rhs_contracting_dimensions(0) != 0 ||
-      lhs.dimensions(1) != rhs.dimensions(0) ||
-      output.dimensions(0) != lhs.dimensions(0) ||
-      output.dimensions(1) != rhs.dimensions(1) ||
-      lhs.dimensions(0) <= 0 || lhs.dimensions(1) <= 0 ||
-      rhs.dimensions(1) <= 0) {
+      dimensions.lhs_contracting_dimensions(0) != 1) {
     return std::nullopt;
   }
 
-  return VulkanGemmConfig{lhs.dimensions(0), rhs.dimensions(1),
-                          lhs.dimensions(1)};
+  int64_t m = lhs.dimensions(0);
+  int64_t k = lhs.dimensions(1);
+  int64_t n;
+  VulkanGemmRhsLayout rhs_layout;
+  switch (dimensions.rhs_contracting_dimensions(0)) {
+    case 0:
+      n = rhs.dimensions(1);
+      rhs_layout = VulkanGemmRhsLayout::kKxN;
+      if (k != rhs.dimensions(0)) {
+        return std::nullopt;
+      }
+      break;
+    case 1:
+      n = rhs.dimensions(0);
+      rhs_layout = VulkanGemmRhsLayout::kNxK;
+      if (k != rhs.dimensions(1)) {
+        return std::nullopt;
+      }
+      break;
+    default:
+      return std::nullopt;
+  }
+
+  if (output.dimensions(0) != m || output.dimensions(1) != n || m <= 0 ||
+      n <= 0 || k <= 0) {
+    return std::nullopt;
+  }
+
+  return VulkanGemmConfig{m, n, k, rhs_layout};
 }
 
 VulkanGemmEmitter::VulkanGemmEmitter(VulkanGemmConfig config)
-    : m_(config.m), n_(config.n), k_(config.k) {}
+    : m_(config.m),
+      n_(config.n),
+      k_(config.k),
+      rhs_layout_(config.rhs_layout) {}
 
 LaunchDimensions VulkanGemmEmitter::launch_dimensions() const {
   return LaunchDimensions(
@@ -228,7 +252,7 @@ absl::Status VulkanGemmEmitter::EmitKernel(
       thread_col);
 
   RankedTensorType tile_type =
-      RankedTensorType::get({kTileSize, kTileSize}, builder.getBF16Type());
+      RankedTensorType::get({kTileSize, kTileSize}, builder.getF32Type());
   Value lhs_tile = AllocateSharedOp::create(builder, tile_type);
   Value rhs_tile = AllocateSharedOp::create(builder, tile_type);
   Value zero_index = IndexConstant(builder, 0);
@@ -246,7 +270,18 @@ absl::Status VulkanGemmEmitter::EmitKernel(
     Value loop_rhs_tile = tile_loop.getRegionIterArgs()[2];
     Value tile_base = arith::MulIOp::create(builder, tile, tile_size);
     Value lhs_k = arith::AddIOp::create(builder, tile_base, thread_col);
-    Value rhs_k = arith::AddIOp::create(builder, tile_base, thread_row);
+    // Keep thread X on the contiguous RHS dimension. For [N,K], transpose the
+    // cooperative load when inserting it into the logical [K,N] shared tile.
+    Value rhs_k_thread = rhs_layout_ == VulkanGemmRhsLayout::kKxN
+                             ? thread_row
+                             : thread_col;
+    Value rhs_n_thread = rhs_layout_ == VulkanGemmRhsLayout::kKxN
+                             ? thread_col
+                             : thread_row;
+    Value rhs_k = arith::AddIOp::create(builder, tile_base, rhs_k_thread);
+    Value rhs_n = arith::AddIOp::create(
+        builder, arith::MulIOp::create(builder, block_col, tile_size),
+        rhs_n_thread);
 
     Value lhs_row_valid = arith::CmpIOp::create(
         builder, arith::CmpIPredicate::ult, row, IndexConstant(builder, m_));
@@ -256,21 +291,32 @@ absl::Status VulkanGemmEmitter::EmitKernel(
         arith::AndIOp::create(builder, lhs_row_valid, lhs_k_valid);
     Value lhs_value = SelectTensorElementOrZero(
         builder, lhs_valid, lhs, ValueRange{row, lhs_k});
+    lhs_value =
+        arith::ExtFOp::create(builder, builder.getF32Type(), lhs_value);
     Value written_lhs = tensor::InsertOp::create(
         builder, lhs_value, loop_lhs_tile,
         ValueRange{thread_row, thread_col});
 
     Value rhs_k_valid = arith::CmpIOp::create(
         builder, arith::CmpIPredicate::ult, rhs_k, IndexConstant(builder, k_));
-    Value rhs_col_valid = arith::CmpIOp::create(
-        builder, arith::CmpIPredicate::ult, col, IndexConstant(builder, n_));
+    Value rhs_n_valid = arith::CmpIOp::create(
+        builder, arith::CmpIPredicate::ult, rhs_n, IndexConstant(builder, n_));
     Value rhs_valid =
-        arith::AndIOp::create(builder, rhs_k_valid, rhs_col_valid);
+        arith::AndIOp::create(builder, rhs_k_valid, rhs_n_valid);
+    SmallVector<Value, 2> rhs_indices =
+        rhs_layout_ == VulkanGemmRhsLayout::kKxN
+            ? SmallVector<Value, 2>{rhs_k, rhs_n}
+            : SmallVector<Value, 2>{rhs_n, rhs_k};
+    SmallVector<Value, 2> rhs_tile_indices =
+        rhs_layout_ == VulkanGemmRhsLayout::kKxN
+            ? SmallVector<Value, 2>{thread_row, thread_col}
+            : SmallVector<Value, 2>{thread_col, thread_row};
     Value rhs_value = SelectTensorElementOrZero(
-        builder, rhs_valid, rhs, ValueRange{rhs_k, col});
+        builder, rhs_valid, rhs, ValueRange(rhs_indices));
+    rhs_value =
+        arith::ExtFOp::create(builder, builder.getF32Type(), rhs_value);
     Value written_rhs = tensor::InsertOp::create(
-        builder, rhs_value, loop_rhs_tile,
-        ValueRange{thread_row, thread_col});
+        builder, rhs_value, loop_rhs_tile, ValueRange(rhs_tile_indices));
 
     SmallVector<mlir::Type> tile_types{written_lhs.getType(),
                                        written_rhs.getType()};
@@ -292,21 +338,17 @@ absl::Status VulkanGemmEmitter::EmitKernel(
           builder, synchronized_lhs, ValueRange{thread_row, inner_k});
       Value rhs_element = tensor::ExtractOp::create(
           builder, synchronized_rhs, ValueRange{inner_k, thread_col});
-      Value product = arith::MulFOp::create(
-          builder,
-          arith::ExtFOp::create(builder, builder.getF32Type(), lhs_element),
-          arith::ExtFOp::create(builder, builder.getF32Type(), rhs_element));
+      Value product =
+          arith::MulFOp::create(builder, lhs_element, rhs_element);
       Value updated_sum = arith::AddFOp::create(builder, sum, product);
       scf::YieldOp::create(builder, updated_sum);
     }
 
-    auto reusable_tiles =
-        SyncThreadsOp::create(builder, TypeRange(tile_types),
-                              ValueRange{synchronized_lhs, synchronized_rhs})
-            .getResults();
+    SyncThreadsOp::create(builder, TypeRange(tile_types),
+                          ValueRange{loop_lhs_tile, loop_rhs_tile});
     scf::YieldOp::create(
-        builder, ValueRange{k_loop.getResult(0), reusable_tiles[0],
-                            reusable_tiles[1]});
+        builder,
+        ValueRange{k_loop.getResult(0), loop_lhs_tile, loop_rhs_tile});
   }
 
   Value row_valid = arith::CmpIOp::create(

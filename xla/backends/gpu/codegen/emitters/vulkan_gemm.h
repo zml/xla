@@ -35,10 +35,16 @@ limitations under the License.
 
 namespace xla::gpu {
 
+enum class VulkanGemmRhsLayout {
+  kKxN,
+  kNxK,
+};
+
 struct VulkanGemmConfig {
   int64_t m;
   int64_t n;
   int64_t k;
+  VulkanGemmRhsLayout rhs_layout;
 };
 
 // Returns a configuration only for the portable Vulkan GEMM subset.
@@ -77,6 +83,7 @@ class VulkanGemmEmitter final : public MlirKernelEmitter {
   int64_t m_;
   int64_t n_;
   int64_t k_;
+  VulkanGemmRhsLayout rhs_layout_;
 };
 
 }  // namespace xla::gpu
