@@ -304,6 +304,7 @@ xla_cc_test(
         "//xla/tsl/platform:test_main",
         "@com_google_benchmark//:benchmark",
         "@local_config_rocm//rocm:hip",
+        "@local_config_rocm//rocm:rocblas",
         "@local_config_rocm//rocm:rocm_headers",
     ],
 )
