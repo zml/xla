@@ -294,11 +294,6 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateKernelNode(
       const_cast<void**>(packed_args->argument_addresses().data());
   params.extra = nullptr;
 
-  if (shared_mem_bytes != 0) {
-    RETURN_IF_ERROR(
-        rocm_kernel.UpdateMaxDynamicSharedMemoryBytes(shared_mem_bytes));
-  }
-
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
   hipGraphNode_t node_handle = nullptr;
@@ -345,11 +340,6 @@ absl::Status RocmCommandBuffer::UpdateKernelNode(
   params.kernelParams =
       const_cast<void**>(packed_args->argument_addresses().data());
   params.extra = nullptr;
-
-  if (shared_mem_bytes != 0) {
-    RETURN_IF_ERROR(
-        rocm_kernel.UpdateMaxDynamicSharedMemoryBytes(shared_mem_bytes));
-  }
 
   return ToStatus(hipGraphExecKernelNodeSetParams(
                       exec_, ToHipGraphHandle(node_handle), &params),

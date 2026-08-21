@@ -79,31 +79,6 @@ absl::StatusOr<KernelMetadata> RocmKernel::GetKernelMetadata() {
   return kernel_metadata;
 }
 
-absl::Status RocmKernel::UpdateMaxDynamicSharedMemoryBytes(
-    int32_t shared_memory_bytes) const {
-  if (shared_memory_bytes <=
-      max_dynamic_shared_memory_bytes_.load(std::memory_order_relaxed)) {
-    return absl::OkStatus();
-  }
-
-  absl::MutexLock lock(mu_);
-  if (shared_memory_bytes <=
-      max_dynamic_shared_memory_bytes_.load(std::memory_order_relaxed)) {
-    return absl::OkStatus();
-  }
-
-  std::unique_ptr<ActivateContext> activation = executor_->Activate();
-  RETURN_IF_ERROR(ToStatus(
-      hipFuncSetAttribute(rocm_function_,
-                          hipFuncAttributeMaxDynamicSharedMemorySize,
-                          shared_memory_bytes),
-      "Failed to set shared memory size"));
-
-  max_dynamic_shared_memory_bytes_.store(shared_memory_bytes,
-                                         std::memory_order_relaxed);
-  return absl::OkStatus();
-}
-
 absl::Status RocmKernel::Launch(const ThreadDim& thread_dims,
                                 const BlockDim& block_dims,
                                 const std::optional<ClusterDim>& cluster_dims,
