@@ -45,13 +45,13 @@ absl::Status WaitStreamOnEvent(StreamExecutor *executor, hipStream_t stream,
   return absl::OkStatus();
 }
 
-enum class EventFlags { kDefault, kDisableTiming };
+enum class EventFlags { kTimingOnly, kDisableTiming };
 absl::StatusOr<hipEvent_t> InitEvent(StreamExecutor *executor,
                                      EventFlags flags) {
   int hipflags;
   switch (flags) {
-    case EventFlags::kDefault:
-      hipflags = hipEventDefault;
+    case EventFlags::kTimingOnly:
+      hipflags = hipEventDefault | hipEventDisableSystemFence;
       break;
     case EventFlags::kDisableTiming:
       hipflags = hipEventDisableTiming | hipEventReleaseToSystem;
@@ -63,7 +63,7 @@ absl::StatusOr<hipEvent_t> InitEvent(StreamExecutor *executor,
   std::unique_ptr<ActivateContext> activation = executor->Activate();
   hipEvent_t event;
   IncrementRocmPerformanceCounter(
-      flags == EventFlags::kDefault
+      flags == EventFlags::kTimingOnly
           ? RocmPerformanceCounter::kEventCreateTiming
           : RocmPerformanceCounter::kEventCreateSystem);
   hipError_t res = hipEventCreateWithFlags(&event, hipflags);
@@ -125,7 +125,7 @@ absl::StatusOr<RocmEvent> RocmEvent::Create(StreamExecutor *executor,
                                             bool allow_timing) {
   ABSL_ASSIGN_OR_RETURN(
       hipEvent_t event_handle,
-      InitEvent(executor, allow_timing ? EventFlags::kDefault
+      InitEvent(executor, allow_timing ? EventFlags::kTimingOnly
                                        : EventFlags::kDisableTiming));
 
   return RocmEvent(executor, event_handle);
