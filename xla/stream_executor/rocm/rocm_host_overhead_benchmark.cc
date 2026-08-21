@@ -17,6 +17,7 @@ limitations under the License.
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,8 @@ limitations under the License.
 #include "rocm/include/hip/hip_runtime.h"
 #include "rocm/include/rocblas/rocblas.h"
 #include "xla/stream_executor/rocm/rocm_host_overhead_benchmark_kernels.h"
+#include "xla/tsl/framework/allocator.h"
+#include "xla/tsl/framework/bfc_allocator.h"
 
 namespace stream_executor::gpu {
 namespace {
@@ -53,6 +56,30 @@ bool CheckRocblas(benchmark::State& state, rocblas_status result,
   state.SkipWithError(message.c_str());
   return false;
 }
+
+class HipSubAllocator : public tsl::SubAllocator {
+ public:
+  HipSubAllocator() : SubAllocator({}, {}) {}
+
+  void* Alloc(size_t alignment, size_t num_bytes,
+              size_t* bytes_received) override {
+    (void)alignment;
+    void* pointer = nullptr;
+    if (hipMalloc(&pointer, num_bytes) != hipSuccess) return nullptr;
+    *bytes_received = num_bytes;
+    return pointer;
+  }
+
+  void Free(void* pointer, size_t num_bytes) override {
+    (void)num_bytes;
+    (void)hipFree(pointer);
+  }
+
+  bool SupportsCoalescing() const override { return false; }
+  tsl::AllocatorMemoryType GetMemoryType() const override {
+    return tsl::AllocatorMemoryType::kDevice;
+  }
+};
 
 void SetBatchCounters(benchmark::State& state, double enqueue_seconds,
                       double sync_seconds, int64_t operations) {
@@ -583,6 +610,189 @@ void BM_GraphReplay(benchmark::State& state, int node_count, bool upload,
   (void)hipStreamDestroy(stream);
 }
 
+void BM_HipMallocFree(benchmark::State& state, size_t allocation_size) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  void* warmup = nullptr;
+  if (!CheckHip(state, hipMalloc(&warmup, allocation_size),
+                "warm-up hipMalloc") ||
+      !CheckHip(state, hipFree(warmup), "warm-up hipFree")) {
+    return;
+  }
+
+  constexpr int kAllocationBatchSize = 64;
+  double elapsed_seconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto start = Clock::now();
+    for (int i = 0; i < kAllocationBatchSize; ++i) {
+      void* pointer = nullptr;
+      if (!CheckHip(state, hipMalloc(&pointer, allocation_size), "hipMalloc") ||
+          !CheckHip(state, hipFree(pointer), "hipFree")) {
+        break;
+      }
+    }
+    auto end = Clock::now();
+    elapsed_seconds += Seconds(end - start);
+    operations += kAllocationBatchSize;
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["ns/alloc_free"] = elapsed_seconds * 1e9 / operations;
+  state.SetItemsProcessed(operations);
+}
+
+void BM_HipMallocAsyncFree(benchmark::State& state, size_t allocation_size) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipStream_t stream = nullptr;
+  if (!CheckHip(state, hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags")) {
+    return;
+  }
+
+  void* warmup = nullptr;
+  if (!CheckHip(state, hipMallocAsync(&warmup, allocation_size, stream),
+                "warm-up hipMallocAsync") ||
+      !CheckHip(state, hipFreeAsync(warmup, stream),
+                "warm-up hipFreeAsync") ||
+      !CheckHip(state, hipStreamSynchronize(stream),
+                "warm-up hipStreamSynchronize")) {
+    (void)hipStreamDestroy(stream);
+    return;
+  }
+
+  constexpr int kAllocationBatchSize = 256;
+  std::array<void*, kAllocationBatchSize> pointers{};
+  double enqueue_seconds = 0;
+  double sync_seconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto enqueue_start = Clock::now();
+    for (void*& pointer : pointers) {
+      if (!CheckHip(state,
+                    hipMallocAsync(&pointer, allocation_size, stream),
+                    "hipMallocAsync")) {
+        break;
+      }
+    }
+    for (void* pointer : pointers) {
+      if (!CheckHip(state, hipFreeAsync(pointer, stream), "hipFreeAsync")) {
+        break;
+      }
+    }
+    auto enqueue_end = Clock::now();
+    if (!CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize")) {
+      break;
+    }
+    auto sync_end = Clock::now();
+    enqueue_seconds += Seconds(enqueue_end - enqueue_start);
+    sync_seconds += Seconds(sync_end - enqueue_end);
+    operations += kAllocationBatchSize;
+    state.SetIterationTime(Seconds(sync_end - enqueue_start));
+  }
+
+  SetBatchCounters(state, enqueue_seconds, sync_seconds, operations);
+  (void)hipStreamDestroy(stream);
+}
+
+void BM_BfcReuse(benchmark::State& state, size_t allocation_size) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  tsl::BFCAllocator::Options options;
+  options.allow_growth = true;
+  tsl::BFCAllocator allocator(std::make_unique<HipSubAllocator>(),
+                              /*total_memory=*/64ULL << 20,
+                              "rocm_host_overhead_benchmark", options);
+
+  void* warmup = allocator.AllocateRaw(/*alignment=*/256, allocation_size);
+  if (warmup == nullptr) {
+    state.SkipWithError("BFC warm-up allocation failed");
+    return;
+  }
+  allocator.DeallocateRaw(warmup);
+
+  constexpr int kAllocationBatchSize = 16384;
+  double elapsed_seconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto start = Clock::now();
+    for (int i = 0; i < kAllocationBatchSize; ++i) {
+      void* pointer =
+          allocator.AllocateRaw(/*alignment=*/256, allocation_size);
+      benchmark::DoNotOptimize(pointer);
+      allocator.DeallocateRaw(pointer);
+    }
+    auto end = Clock::now();
+    elapsed_seconds += Seconds(end - start);
+    operations += kAllocationBatchSize;
+    state.SetIterationTime(Seconds(end - start));
+  }
+
+  state.counters["ns/alloc_free"] = elapsed_seconds * 1e9 / operations;
+  state.SetItemsProcessed(operations);
+}
+
+void BM_StreamWriteValue64(benchmark::State& state, int logical_teardowns,
+                           bool coalesced) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipStream_t stream = nullptr;
+  uint64_t* marker = nullptr;
+  if (!CheckHip(state, hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags") ||
+      !CheckHip(state, hipMalloc(reinterpret_cast<void**>(&marker),
+                                sizeof(uint64_t)),
+                "hipMalloc(marker)")) {
+    if (stream != nullptr) (void)hipStreamDestroy(stream);
+    return;
+  }
+
+  if (!CheckHip(state,
+                hipStreamWriteValue64(stream, marker, 0,
+                                      hipStreamWriteValueDefault),
+                "warm-up hipStreamWriteValue64") ||
+      !CheckHip(state, hipStreamSynchronize(stream),
+                "warm-up hipStreamSynchronize")) {
+    (void)hipFree(marker);
+    (void)hipStreamDestroy(stream);
+    return;
+  }
+
+  double enqueue_seconds = 0;
+  double sync_seconds = 0;
+  int64_t operations = 0;
+  uint64_t value = 0;
+  for (auto _ : state) {
+    auto enqueue_start = Clock::now();
+    int marker_count = coalesced ? 1 : logical_teardowns;
+    for (int i = 0; i < marker_count; ++i) {
+      if (!CheckHip(state,
+                    hipStreamWriteValue64(stream, marker, ++value,
+                                          hipStreamWriteValueDefault),
+                    "hipStreamWriteValue64")) {
+        break;
+      }
+    }
+    auto enqueue_end = Clock::now();
+    if (!CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize")) {
+      break;
+    }
+    auto sync_end = Clock::now();
+    enqueue_seconds += Seconds(enqueue_end - enqueue_start);
+    sync_seconds += Seconds(sync_end - enqueue_end);
+    operations += logical_teardowns;
+    state.SetIterationTime(Seconds(sync_end - enqueue_start));
+  }
+
+  SetBatchCounters(state, enqueue_seconds, sync_seconds, operations);
+  state.counters["marker_calls/batch"] = coalesced ? 1 : logical_teardowns;
+  (void)hipFree(marker);
+  (void)hipStreamDestroy(stream);
+}
+
 #define REGISTER_LAUNCH(ARITY, ARG_PATH, PACKED, STREAM_NAME, STREAM_FLAGS) \
   BENCHMARK_CAPTURE(BM_ModuleLaunchKernel,                              \
                     args##ARITY##_##ARG_PATH##_##STREAM_NAME, ARITY,    \
@@ -659,6 +869,21 @@ BENCHMARK_CAPTURE(BM_GraphReplay, steady_no_upload, 128, false, false)
 BENCHMARK_CAPTURE(BM_GraphReplay, steady_after_upload, 128, true, false)
     ->UseManualTime();
 
+#define REGISTER_ALLOCATION_SIZE(NAME, SIZE)                     \
+  BENCHMARK_CAPTURE(BM_HipMallocFree, NAME, SIZE)->UseManualTime(); \
+  BENCHMARK_CAPTURE(BM_HipMallocAsyncFree, NAME, SIZE)              \
+      ->UseManualTime();                                             \
+  BENCHMARK_CAPTURE(BM_BfcReuse, NAME, SIZE)->UseManualTime()
+
+REGISTER_ALLOCATION_SIZE(bytes_4k, 4 << 10);
+REGISTER_ALLOCATION_SIZE(bytes_1m, 1 << 20);
+
+BENCHMARK_CAPTURE(BM_StreamWriteValue64, markers_128, 128, false)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_StreamWriteValue64, coalesced_128, 128, true)
+    ->UseManualTime();
+
+#undef REGISTER_ALLOCATION_SIZE
 #undef REGISTER_GRAPH_SIZE
 #undef REGISTER_LAUNCH_ARITY
 #undef REGISTER_LAUNCH
