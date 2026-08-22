@@ -122,6 +122,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":rocm_context",
         ":rocm_performance_counters",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
@@ -281,6 +282,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":rocm_context",
         ":rocm_status",
         "//xla/stream_executor:activate_context",
         "//xla/stream_executor:kernel",
@@ -350,6 +352,7 @@ xla_cc_test(
         "rocm-only",
     ],
     deps = [
+        ":rocm_context",
         ":rocm_host_overhead_benchmark_kernels",
         "//xla/tsl/framework:bfc_allocator",
         "//xla/tsl/platform:test_main",
@@ -1042,6 +1045,7 @@ cc_library(
         "rocm-only",
     ],
     deps = [
+        ":rocm_context",
         ":rocm_event",
         ":rocm_kernel",
         ":rocm_performance_counters",
@@ -1164,6 +1168,7 @@ cc_library(
     ],
     deps = [
         ":delay_kernel_rocm",
+        ":rocm_context",
         ":rocm_event",
         ":rocm_performance_counters",
         ":rocm_status",
