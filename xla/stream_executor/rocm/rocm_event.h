@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_STREAM_EXECUTOR_ROCM_ROCM_EVENT_H_
 
 #include <cstdint>
+#include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -39,6 +40,10 @@ class RocmEvent : public Event {
                                           bool allow_timing);
 
   hipEvent_t GetHandle() const { return handle_; }
+
+  // Releases the raw event without destroying it. The caller must ensure that
+  // the event is eventually destroyed while its HIP device is active.
+  hipEvent_t ReleaseHandle() { return std::exchange(handle_, nullptr); }
 
   ~RocmEvent() override;
   RocmEvent(const RocmEvent&) = delete;

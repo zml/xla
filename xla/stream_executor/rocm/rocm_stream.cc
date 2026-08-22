@@ -70,16 +70,15 @@ ScopedRocmActivateContext ActivateRocm(StreamExecutor* executor) {
 // hipStreamDestroy in RocmStream::~RocmStream() and hipStreamCreate in
 // RocmStream::Create(), idle handles are kept in this cache and reused.
 //
-// Cache key: (device_ordinal, creation_flags, creation_priority_int).
-// Flags and priority are queried from the live stream via hipStreamGetFlags /
-// hipStreamGetPriority before insertion, so a retrieved handle is guaranteed
-// to match the creation parameters of the new stream.
+// Cache key: (device_ordinal, creation_flags, creation_priority_int). Normal
+// retirement carries the immutable creation parameters with the wrapper; the
+// synchronous fallback queries them from the live stream before insertion.
 //
 // Safety invariants:
-//   - A handle is inserted only after BlockHostUntilDone() confirms it is
-//     fully idle (hipStreamSynchronize ran in RocmStream::~RocmStream()).
-//   - hipStreamQuery is re-checked at insertion time; any stream in an error
-//     state is destroyed rather than cached.
+//   - An active handle first enters a retirement queue with a tail event and is
+//     inserted into the ready cache only after hipEventQuery reports complete.
+//   - A stream or retirement event in an error state is destroyed rather than
+//     cached.
 //   - The GPU context is activated (executor->Activate()) for all HIP calls.
 //
 // Intentional no-destructor: the singleton holds at most one vector of handles
@@ -89,15 +88,100 @@ ScopedRocmActivateContext ActivateRocm(StreamExecutor* executor) {
 //
 // Thread safety: mu guards all map accesses.
 struct HipStreamHandleCache {
+  using Key = std::tuple<int, unsigned int, int>;
+
+  struct RetiredHandle {
+    hipStream_t stream;
+    hipEvent_t completion_event;
+  };
+
   absl::Mutex mu;
   // Key: (device_ordinal, flags, priority_int)
-  absl::btree_map<std::tuple<int, unsigned int, int>, std::vector<hipStream_t>>
-      handles ABSL_GUARDED_BY(mu);
+  absl::btree_map<Key, std::vector<hipStream_t>> handles ABSL_GUARDED_BY(mu);
+  // Handles stay here until a tail event proves that all previously enqueued
+  // work, including host callbacks, has completed.
+  absl::btree_map<Key, std::vector<RetiredHandle>> retired
+      ABSL_GUARDED_BY(mu);
 };
 
 HipStreamHandleCache& GetHipStreamHandleCache() {
   static absl::NoDestructor<HipStreamHandleCache> cache;
   return *cache;
+}
+
+void CacheReadyStream(StreamExecutor* executor, hipStream_t stream,
+                      unsigned int flags, int priority) {
+  auto& cache = GetHipStreamHandleCache();
+  absl::MutexLock lock(&cache.mu);
+  auto key = std::make_tuple(executor->device_ordinal(), flags, priority);
+  cache.handles[key].push_back(stream);
+  VLOG(2) << "cached ready HIP stream " << stream << " for device "
+          << executor->device_ordinal() << " flags=" << flags
+          << " priority=" << priority;
+}
+
+void DestroyStreamWithoutCaching(StreamExecutor* executor,
+                                 hipStream_t stream) {
+  if (stream == nullptr) {
+    return;
+  }
+  auto activation = ActivateRocm(executor);
+  hipError_t result = hipStreamDestroy(stream);
+  if (result != hipSuccess) {
+    LOG(ERROR) << "failed to destroy ROCM stream for device "
+               << executor->device_ordinal() << ": " << ToString(result);
+  }
+}
+
+void HarvestRetiredStreams(StreamExecutor* executor,
+                           const HipStreamHandleCache::Key& key) {
+  auto activation = ActivateRocm(executor);
+  auto& cache = GetHipStreamHandleCache();
+  absl::MutexLock lock(&cache.mu);
+  auto it = cache.retired.find(key);
+  if (it == cache.retired.end()) {
+    return;
+  }
+
+  auto& retired = it->second;
+  for (size_t i = 0; i < retired.size();) {
+    hipError_t result = hipEventQuery(retired[i].completion_event);
+    if (result == hipErrorNotReady) {
+      ++i;
+      continue;
+    }
+
+    hipStream_t stream = retired[i].stream;
+    hipEvent_t event = retired[i].completion_event;
+    retired[i] = retired.back();
+    retired.pop_back();
+
+    hipError_t event_destroy_result = hipEventDestroy(event);
+    if (event_destroy_result != hipSuccess) {
+      LOG(ERROR) << "failed to destroy HIP stream retirement event: "
+                 << ToString(event_destroy_result);
+    }
+
+    if (result == hipSuccess) {
+      cache.handles[key].push_back(stream);
+      VLOG(2) << "harvested retired HIP stream " << stream << " for device "
+              << std::get<0>(key);
+      continue;
+    }
+
+    LOG(WARNING) << "retired HIP stream completed with an error: "
+                 << ToString(result) << " — destroying instead of caching";
+    hipError_t stream_destroy_result = hipStreamDestroy(stream);
+    if (stream_destroy_result != hipSuccess) {
+      LOG(ERROR) << "failed to destroy errored HIP stream for device "
+                 << std::get<0>(key) << ": "
+                 << ToString(stream_destroy_result);
+    }
+  }
+
+  if (retired.empty()) {
+    cache.retired.erase(it);
+  }
 }
 
 absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
@@ -106,12 +190,16 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
   // legacy null-stream synchronization. Match CUDA's nonblocking stream
   // semantics and include the flag in the cache key.
   constexpr unsigned int kFlags = hipStreamNonBlocking;
+  auto key = std::make_tuple(executor->device_ordinal(), kFlags, priority);
+
+  // Poll tail events before consulting the ready cache. This is nonblocking;
+  // a handle with outstanding work remains retired and cannot be reused.
+  HarvestRetiredStreams(executor, key);
 
   // Check the cache for an idle handle with matching (device, flags, priority).
   {
     auto& cache = GetHipStreamHandleCache();
     absl::MutexLock lock(&cache.mu);
-    auto key = std::make_tuple(executor->device_ordinal(), kFlags, priority);
     auto it = cache.handles.find(key);
     if (it != cache.handles.end() && !it->second.empty()) {
       hipStream_t h = it->second.back();
@@ -138,6 +226,55 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
   VLOG(2) << "successfully created stream " << stream << " for device "
           << executor->device_ordinal() << " on thread";
   return stream;
+}
+
+void RetireStream(StreamExecutor* executor, hipStream_t stream,
+                  hipEvent_t completion_event, unsigned int flags,
+                  int priority) {
+  constexpr size_t kMaxRetiredStreamsPerKey = 256;
+  auto key = std::make_tuple(executor->device_ordinal(), flags, priority);
+
+  HarvestRetiredStreams(executor, key);
+
+  {
+    auto& cache = GetHipStreamHandleCache();
+    absl::MutexLock lock(&cache.mu);
+    auto& retired = cache.retired[key];
+    if (retired.size() < kMaxRetiredStreamsPerKey) {
+      retired.push_back({stream, completion_event});
+      VLOG(2) << "retired active HIP stream " << stream << " for device "
+              << executor->device_ordinal();
+      return;
+    }
+  }
+
+  // Keep the process-level queue bounded. This path is expected only during
+  // extreme stream churn; wait for this one handle rather than accumulating
+  // unbounded raw HIP resources.
+  auto activation = ActivateRocm(executor);
+  hipError_t synchronize_result = hipEventSynchronize(completion_event);
+  hipError_t event_destroy_result = hipEventDestroy(completion_event);
+  if (event_destroy_result != hipSuccess) {
+    LOG(ERROR) << "failed to destroy HIP stream retirement event: "
+               << ToString(event_destroy_result);
+  }
+
+  if (synchronize_result != hipSuccess) {
+    LOG(WARNING) << "failed to synchronize a saturated retired HIP stream: "
+                 << ToString(synchronize_result)
+                 << " — destroying instead of caching";
+    hipError_t destroy_result = hipStreamDestroy(stream);
+    if (destroy_result != hipSuccess) {
+      LOG(ERROR) << "failed to destroy HIP stream for device "
+                 << executor->device_ordinal() << ": "
+                 << ToString(destroy_result);
+    }
+    return;
+  }
+
+  auto& cache = GetHipStreamHandleCache();
+  absl::MutexLock lock(&cache.mu);
+  cache.handles[key].push_back(stream);
 }
 
 absl::Status RecordEvent(StreamExecutor* executor, hipEvent_t event,
@@ -312,7 +449,8 @@ absl::StatusOr<std::unique_ptr<RocmStream>> RocmStream::Create(
                                      /*allow_timing=*/false));
 
   return std::unique_ptr<RocmStream>(new RocmStream(
-      executor, std::move(completed_event), priority, stream_handle));
+      executor, std::move(completed_event), priority, stream_handle,
+      hipStreamNonBlocking, stream_priority));
 }
 
 absl::Status RocmStream::WaitFor(Stream* other) {
@@ -347,11 +485,9 @@ void DestroyStream(StreamExecutor* executor, hipStream_t stream) {
   // Activate the device context for all HIP calls below.
   auto activation = ActivateRocm(executor);
 
-  // Verify the stream is fully idle before caching.
-  // BlockHostUntilDone() ran in ~RocmStream() before this call, so under
-  // normal conditions this query always succeeds. An error here indicates a
-  // GPU fault or driver issue; destroy the stream rather than poisoning the
-  // cache with a broken handle.
+  // Verify the stream is fully idle before caching. This is the synchronous
+  // fallback for poisoned streams and retirement-event failures; an error here
+  // destroys the handle rather than poisoning the ready cache.
   hipError_t query_res = hipStreamQuery(stream);
   if (query_res != hipSuccess) {
     LOG(WARNING) << "stream not idle on destroy: " << ToString(query_res)
@@ -406,10 +542,46 @@ void DestroyStream(StreamExecutor* executor, hipStream_t stream) {
 }  // namespace
 
 RocmStream::~RocmStream() {
-  BlockHostUntilDone().IgnoreError();
+  // Most streams are already idle at wrapper destruction. Query first because
+  // it is cheaper than either synchronizing or recording a system-scope event.
+  hipError_t query_result = hipErrorUnknown;
+  if (ok()) {
+    auto activation = ActivateRocm(executor_);
+    query_result = hipStreamQuery(stream_handle_);
+  }
+
+  if (query_result == hipSuccess) {
+    executor_->DeallocateStream(this);
+    CacheReadyStream(executor_, std::exchange(stream_handle_, nullptr),
+                     creation_flags_, creation_priority_);
+    return;
+  }
+
+  if (!ok() || query_result != hipErrorNotReady) {
+    executor_->DeallocateStream(this);
+    DestroyStreamWithoutCaching(executor_,
+                                std::exchange(stream_handle_, nullptr));
+    return;
+  }
+
+  // An active stream gets a tail event so its wrapper can be destroyed without
+  // blocking. Event completion proves all earlier device work and callbacks
+  // are finished before the handle is returned to the ready cache.
+  absl::Status retirement_status = RecordCompletedEvent();
   executor_->DeallocateStream(this);
 
-  DestroyStream(executor_, stream_handle_);
+  if (retirement_status.ok()) {
+    RetireStream(executor_, std::exchange(stream_handle_, nullptr),
+                 completed_event_.ReleaseHandle(), creation_flags_,
+                 creation_priority_);
+    return;
+  }
+
+  // Preserve the synchronous correctness fallback for poisoned streams and
+  // event-record failures. DestroyStream will cache only if synchronization
+  // and its final idle query both succeed.
+  BlockHostUntilDone().IgnoreError();
+  DestroyStream(executor_, std::exchange(stream_handle_, nullptr));
 }
 
 absl::Status RocmStream::Memset32(DeviceAddressBase* location, uint32_t pattern,
