@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "benchmark/benchmark.h"
+#include "rocm/include/hip/hip_ext.h"
 #include "rocm/include/hip/hip_runtime.h"
 #include "rocm/include/rocblas/rocblas.h"
 #include "xla/stream_executor/rocm/rocm_context.h"
@@ -176,6 +177,112 @@ void BM_ModuleLaunchKernel(benchmark::State& state, int arity,
   }
 
   SetBatchCounters(state, enqueue_seconds, sync_seconds, operations);
+  (void)hipStreamDestroy(stream);
+}
+
+enum class ProfiledLaunchMode { kSeparateEvents, kLaunchExtension };
+
+void BM_ProfiledModuleLaunchKernel(benchmark::State& state,
+                                   ProfiledLaunchMode mode, int batch_size) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipFunction_t function = nullptr;
+  if (!CheckHip(state, GetRocmHostOverheadBenchmarkKernel(1, &function),
+                "GetRocmHostOverheadBenchmarkKernel")) {
+    return;
+  }
+
+  hipStream_t stream = nullptr;
+  if (!CheckHip(state, hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags")) {
+    return;
+  }
+
+  std::array<hipEvent_t, kBatchSize> starts{};
+  std::array<hipEvent_t, kBatchSize> stops{};
+  for (int i = 0; i < kBatchSize; ++i) {
+    if (!CheckHip(
+            state,
+            hipEventCreateWithFlags(&starts[i], hipEventDisableSystemFence),
+            "hipEventCreateWithFlags(start)") ||
+        !CheckHip(
+            state,
+            hipEventCreateWithFlags(&stops[i], hipEventDisableSystemFence),
+            "hipEventCreateWithFlags(stop)")) {
+      for (hipEvent_t event : stops) {
+        if (event != nullptr) (void)hipEventDestroy(event);
+      }
+      for (hipEvent_t event : starts) {
+        if (event != nullptr) (void)hipEventDestroy(event);
+      }
+      (void)hipStreamDestroy(stream);
+      return;
+    }
+  }
+
+  uint64_t argument = 0;
+  void* argument_address = &argument;
+  auto launch = [&](int i) {
+    if (mode == ProfiledLaunchMode::kSeparateEvents) {
+      return CheckHip(state, hipEventRecord(starts[i], stream),
+                      "hipEventRecord(start)") &&
+             CheckHip(state,
+                      hipModuleLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+                                            stream, &argument_address, nullptr),
+                      "hipModuleLaunchKernel") &&
+             CheckHip(state, hipEventRecord(stops[i], stream),
+                      "hipEventRecord(stop)");
+    }
+    return CheckHip(state,
+                    hipExtModuleLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+                                             stream, &argument_address, nullptr,
+                                             starts[i], stops[i],
+                                             /*flags=*/0),
+                    "hipExtModuleLaunchKernel");
+  };
+
+  if (!launch(0) || !CheckHip(state, hipStreamSynchronize(stream),
+                              "warm-up hipStreamSynchronize")) {
+    for (hipEvent_t event : stops) (void)hipEventDestroy(event);
+    for (hipEvent_t event : starts) (void)hipEventDestroy(event);
+    (void)hipStreamDestroy(stream);
+    return;
+  }
+
+  double enqueue_seconds = 0;
+  double sync_seconds = 0;
+  double gpu_milliseconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto enqueue_start = Clock::now();
+    for (int i = 0; i < batch_size; ++i) {
+      if (!launch(i)) break;
+    }
+    auto enqueue_end = Clock::now();
+    if (!CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize")) {
+      break;
+    }
+    auto sync_end = Clock::now();
+    for (int i = 0; i < batch_size; ++i) {
+      float milliseconds = 0;
+      if (!CheckHip(state,
+                    hipEventElapsedTime(&milliseconds, starts[i], stops[i]),
+                    "hipEventElapsedTime")) {
+        break;
+      }
+      gpu_milliseconds += milliseconds;
+    }
+    enqueue_seconds += Seconds(enqueue_end - enqueue_start);
+    sync_seconds += Seconds(sync_end - enqueue_end);
+    operations += batch_size;
+    state.SetIterationTime(Seconds(sync_end - enqueue_start));
+  }
+
+  SetBatchCounters(state, enqueue_seconds, sync_seconds, operations);
+  state.counters["gpu_ns/op"] = gpu_milliseconds * 1e6 / operations;
+  for (hipEvent_t event : stops) (void)hipEventDestroy(event);
+  for (hipEvent_t event : starts) (void)hipEventDestroy(event);
   (void)hipStreamDestroy(stream);
 }
 
@@ -895,6 +1002,19 @@ BENCHMARK_CAPTURE(BM_GraphReplay, first_after_upload, 128, true, true)
 BENCHMARK_CAPTURE(BM_GraphReplay, steady_no_upload, 128, false, false)
     ->UseManualTime();
 BENCHMARK_CAPTURE(BM_GraphReplay, steady_after_upload, 128, true, false)
+    ->UseManualTime();
+
+BENCHMARK_CAPTURE(BM_ProfiledModuleLaunchKernel, separate_events_batch_1,
+                  ProfiledLaunchMode::kSeparateEvents, 1)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_ProfiledModuleLaunchKernel, launch_extension_batch_1,
+                  ProfiledLaunchMode::kLaunchExtension, 1)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_ProfiledModuleLaunchKernel, separate_events_batch_256,
+                  ProfiledLaunchMode::kSeparateEvents, kBatchSize)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_ProfiledModuleLaunchKernel, launch_extension_batch_256,
+                  ProfiledLaunchMode::kLaunchExtension, kBatchSize)
     ->UseManualTime();
 
 #define REGISTER_ALLOCATION_SIZE(NAME, SIZE)                     \
