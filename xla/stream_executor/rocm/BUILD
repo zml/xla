@@ -652,6 +652,7 @@ cc_library(
     deps = [
         ":hipfft_if_static",  # buildcleaner: keep
         ":rocm_complex_converters",
+        ":rocm_context",
         ":rocm_performance_counters",
         ":rocm_platform_id",
         "//xla/stream_executor:activate_context",
@@ -664,11 +665,39 @@ cc_library(
         "//xla/stream_executor/gpu:gpu_helpers_header",
         "//xla/stream_executor/platform:initialize",
         "//xla/tsl/platform:logging",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
         "@local_config_rocm//rocm:rocm_headers",
     ],
     alwayslink = True,
+)
+
+xla_test(
+    name = "rocm_fft_test",
+    srcs = ["rocm_fft_test.cc"],
+    backends = ["gpu"],
+    env = {"XLA_ROCM_PERFORMANCE_COUNTERS": "1"},
+    tags = ["rocm-only"],
+    deps = [
+        ":hipfft_plugin",
+        ":rocm_performance_counters",
+        ":rocm_platform_id",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:fft",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:scratch_allocator",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_rocm//rocm:rocm_headers",
+    ],
 )
 
 cc_library(
