@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/casts.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -50,6 +51,7 @@ limitations under the License.
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/util/env_var.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -119,6 +121,16 @@ template <typename T>
 absl::Status SetAttr(hipblasLtMatmulPreference_t handle,
                      hipblasLtMatmulPreferenceAttributes_t attr, T value) {
   return SET_ATTR(hipblasLtMatmulPreferenceSetAttribute, handle, attr, value);
+}
+
+bool DisableHipblasLtTuning() {
+  static const bool disabled = [] {
+    bool value = false;
+    CHECK_OK(tsl::ReadBoolFromEnvVar(
+        "XLA_ROCM_HIPBLASLT_DISABLE_TUNING", /*default_val=*/false, &value));
+    return value;
+  }();
+  return disabled;
 }
 
 static absl::StatusOr<hipblasLtEpilogue_t> AsHipblasLtEpilogue(
@@ -226,7 +238,15 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
                                               size_t max_workspace_size) const
     -> absl::StatusOr<std::vector<MatmulAlgorithm>> {
   max_algorithm_count = std::min(max_algorithm_count, size_t{INT_MAX});
-  std::vector<hipblasLtMatmulHeuristicResult_t> results(max_algorithm_count);
+  if (max_algorithm_count == 0) return std::vector<MatmulAlgorithm>();
+
+  struct TunedResults {
+    int32_t streamk_mode;
+    int32_t cu_count_target;
+    std::vector<hipblasLtMatmulHeuristicResult_t> results;
+  };
+  std::vector<hipblasLtMatmulHeuristicResult_t> default_results;
+  std::vector<TunedResults> tuned_results;
   {
     absl::MutexLock lock(blas_lt_.mu_);
     TF_RET_CHECK(blas_lt_.handle_ != nullptr);
@@ -289,23 +309,121 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
       }
     }
 
-    int found_algorithm_count = 0;
-    auto error = hipblasLtMatmulAlgoGetHeuristic(
-        blas_lt_.handle_.get(), op_desc_.get(), a_desc_.get(), b_desc_.get(),
-        c_desc_.get(), d_desc_.get(), preference.get(), max_algorithm_count,
-        results.data(), &found_algorithm_count);
-    if (error != 0) {
-      VLOG(0) << "hipblasLtMatmulAlgoGetHeuristic returned " << (int)error;
-      SE_HIPBLAS_RETURN_IF_ERROR(error);
+    auto reset_descriptor = [&]() -> absl::Status {
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
+          HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF));
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET, 0));
+      applied_streamk_mode_ = HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF;
+      applied_cu_count_target_ = 0;
+      return absl::OkStatus();
+    };
+    auto cleanup = absl::MakeCleanup([&] {
+      applied_streamk_mode_.reset();
+      applied_cu_count_target_.reset();
+      if (absl::Status status = reset_descriptor(); !status.ok()) {
+        LOG(ERROR) << "Failed to reset hipBLASLt tuning attributes: "
+                   << status;
+      }
+    });
+
+    auto get_heuristics = [&](size_t count, int32_t streamk_mode,
+                              int32_t cu_count_target)
+        -> absl::StatusOr<
+            std::vector<hipblasLtMatmulHeuristicResult_t>> {
+      blas_lt_.mu_.AssertHeld();
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
+          streamk_mode));
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+          cu_count_target));
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          hip_preference, HIPBLASLT_MATMUL_PREF_SM_COUNT_TARGET,
+          cu_count_target));
+
+      std::vector<hipblasLtMatmulHeuristicResult_t> results(count);
+      int found_algorithm_count = 0;
+      auto error = hipblasLtMatmulAlgoGetHeuristic(
+          blas_lt_.handle_.get(), op_desc_.get(), a_desc_.get(), b_desc_.get(),
+          c_desc_.get(), d_desc_.get(), preference.get(), count, results.data(),
+          &found_algorithm_count);
+      if (error != HIPBLAS_STATUS_SUCCESS) {
+        VLOG(0) << "hipblasLtMatmulAlgoGetHeuristic returned " << (int)error;
+        SE_HIPBLAS_RETURN_IF_ERROR(error);
+      }
+      results.resize(found_algorithm_count);
+      return results;
+    };
+
+    ASSIGN_OR_RETURN(default_results,
+                     get_heuristics(
+                         max_algorithm_count,
+                         HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
+                         /*cu_count_target=*/0));
+
+    // Preserve all existing algorithm indices, then append a bounded number
+    // of ROCm 7.14 scheduling variants. Existing serialized HLO therefore
+    // continues to resolve the same algorithm index after this optimization.
+    if (max_algorithm_count > 1) {
+      constexpr size_t kAlgorithmsPerTuningVariant = 16;
+      const size_t count =
+          std::min(max_algorithm_count, kAlgorithmsPerTuningVariant);
+      const int32_t core_count = static_cast<int32_t>(
+          blas_lt_.executor_->GetDeviceDescription().core_count());
+      const int32_t reduced_cu_target = core_count * 7 / 8;
+
+      ASSIGN_OR_RETURN(
+          auto streamk_results,
+          get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_ON,
+                         /*cu_count_target=*/0));
+      tuned_results.push_back(
+          {HIPBLASLT_STREAMK_TILE_SCHEDULING_ON, 0,
+           std::move(streamk_results)});
+
+      if (reduced_cu_target > 0 && reduced_cu_target < core_count) {
+        ASSIGN_OR_RETURN(
+            auto reduced_results,
+            get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
+                           reduced_cu_target));
+        tuned_results.push_back({HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
+                                 reduced_cu_target,
+                                 std::move(reduced_results)});
+
+        ASSIGN_OR_RETURN(
+            auto reduced_streamk_results,
+            get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_ON,
+                           reduced_cu_target));
+        tuned_results.push_back({HIPBLASLT_STREAMK_TILE_SCHEDULING_ON,
+                                 reduced_cu_target,
+                                 std::move(reduced_streamk_results)});
+      }
     }
-    results.resize(found_algorithm_count);
+
+    RETURN_IF_ERROR(reset_descriptor());
+    std::move(cleanup).Cancel();
   }  // end mutex block
 
   std::vector<MatmulAlgorithm> algorithms;
-  algorithms.reserve(results.size());
-  for (const hipblasLtMatmulHeuristicResult_t& result : results) {
+  size_t result_count = default_results.size();
+  for (const TunedResults& tuned : tuned_results) {
+    result_count += tuned.results.size();
+  }
+  algorithms.reserve(result_count);
+  for (const hipblasLtMatmulHeuristicResult_t& result : default_results) {
     if (result.state == HIPBLAS_STATUS_SUCCESS) {  // Skip failed algos.
       algorithms.push_back({result.algo, result.workspaceSize});
+    }
+  }
+  for (const TunedResults& tuned : tuned_results) {
+    for (const hipblasLtMatmulHeuristicResult_t& result : tuned.results) {
+      if (result.state == HIPBLAS_STATUS_SUCCESS) {
+        algorithms.push_back(
+            {TunedMatmulAlgorithm{result.algo, tuned.streamk_mode,
+                                  tuned.cu_count_target},
+             result.workspaceSize});
+      }
     }
   }
   return algorithms;
@@ -638,6 +756,25 @@ absl::Status BlasLt::RocBlasGemmPlan::ExecuteOnStream(
   return run(alpha, beta);
 }
 
+absl::Status BlasLt::RegularMatmulPlan::SetAlgorithm(
+    const MatmulAlgorithm& algorithm) {
+  if (const auto* tuned =
+          std::any_cast<TunedMatmulAlgorithm>(&algorithm.opaque_algo)) {
+    algorithm_ = tuned->algorithm;
+    streamk_mode_ = tuned->streamk_mode;
+    cu_count_target_ = tuned->cu_count_target;
+  } else if (const auto* plain =
+                 std::any_cast<hipblasLtMatmulAlgo_t>(&algorithm.opaque_algo)) {
+    algorithm_ = *plain;
+    streamk_mode_ = HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF;
+    cu_count_target_ = 0;
+  } else {
+    return absl::InternalError("Invalid algorithm type!");
+  }
+  workspace_size_ = algorithm.workspace_size;
+  return absl::OkStatus();
+}
+
 absl::Status BlasLt::RegularMatmulPlan::ExecuteOnStream(
     Stream* stream, const gpu::BlasLt::MemoryArgs& args,
     blas::ProfileResult* profile_result) const {
@@ -676,6 +813,26 @@ absl::Status BlasLt::RegularMatmulPlan::ExecuteOnStream(
   {
     absl::MutexLock lock(blas_lt_.mu_);
     TF_RET_CHECK(blas_lt_.handle_ != nullptr);
+    const int32_t desired_streamk_mode =
+        DisableHipblasLtTuning()
+            ? HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF
+            : streamk_mode_;
+    const int32_t desired_cu_count_target =
+        DisableHipblasLtTuning() ? 0 : cu_count_target_;
+    if (!applied_streamk_mode_ ||
+        *applied_streamk_mode_ != desired_streamk_mode) {
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
+          desired_streamk_mode));
+      applied_streamk_mode_ = desired_streamk_mode;
+    }
+    if (!applied_cu_count_target_ ||
+        *applied_cu_count_target_ != desired_cu_count_target) {
+      RETURN_IF_ERROR(SetAttr<int32_t>(
+          op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+          desired_cu_count_target));
+      applied_cu_count_target_ = desired_cu_count_target;
+    }
     // We must set the bias and aux pointers while holding the mutex, to avoid a
     // potential race condition from multiple threads sharing the same plan.
     if (op_desc_.has_bias_epilogue() && args.bias != nullptr) {
