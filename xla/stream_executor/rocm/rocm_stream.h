@@ -117,11 +117,14 @@ class RocmStream : public StreamCommon {
  private:
   RocmStream(StreamExecutor* executor, RocmEvent completed_event,
              std::optional<std::variant<StreamPriority, int>> priority,
-             hipStream_t stream_handle)
+             hipStream_t stream_handle, unsigned int creation_flags,
+             int creation_priority)
       : StreamCommon(executor, priority),
         executor_(executor),
         completed_event_(std::move(completed_event)),
-        stream_handle_(stream_handle) {}
+        stream_handle_(stream_handle),
+        creation_flags_(creation_flags),
+        creation_priority_(creation_priority) {}
 
   absl::Status RecordCompletedEvent();
 
@@ -134,6 +137,8 @@ class RocmStream : public StreamCommon {
   StreamExecutor* executor_;
   RocmEvent completed_event_;
   hipStream_t stream_handle_;
+  unsigned int creation_flags_;
+  int creation_priority_;
 
   absl::once_flag capture_stream_once_;
   absl::StatusOr<std::unique_ptr<Stream>> capture_stream_{
