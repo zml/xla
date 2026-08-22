@@ -212,6 +212,25 @@ TEST_F(DeviceAddressVmmAllocatorTest, ExplicitDeallocate) {
   scoped_address.Release();
 }
 
+TEST_F(DeviceAddressVmmAllocatorTest,
+       StreamWriteSelfTestLeavesDeferredTimelineUsable) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto allocator,
+      gpu::RocmDeviceAddressVmmAllocator::Create(executor_, stream_.get()));
+
+  const int ordinal = executor_->device_ordinal();
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto address,
+      allocator->Allocate(ordinal, sizeof(uint64_t),
+                          /*retry_on_failure=*/true,
+                          static_cast<int64_t>(MemorySpace::kCollective)));
+  ASSERT_THAT(allocator->Deallocate(ordinal, address.Release()), IsOk());
+
+  // This flushes the first real sequence number after the initialization
+  // sentinel. It would retire early if initialization did not restore zero.
+  ASSERT_THAT(allocator->SynchronizePendingOperations(ordinal), IsOk());
+}
+
 TEST_F(DeviceAddressVmmAllocatorTest, DeallocateNull) {
   TF_ASSERT_OK_AND_ASSIGN(
       auto allocator,
