@@ -290,6 +290,8 @@ void BM_ProfiledModuleLaunchKernel(benchmark::State& state,
 
 enum class EventVisibility { kSystem, kDevice, kTiming, kTimingNoSystemFence };
 
+enum class StreamRetirementMode { kSynchronize, kQueryReady, kTailEvent };
+
 unsigned int EventFlags(EventVisibility visibility) {
   switch (visibility) {
     case EventVisibility::kSystem:
@@ -367,6 +369,92 @@ void BM_EventRecordWait(benchmark::State& state,
   for (hipEvent_t event : events) (void)hipEventDestroy(event);
   (void)hipStreamDestroy(consumer);
   (void)hipStreamDestroy(producer);
+}
+
+void BM_StreamRetirement(benchmark::State& state,
+                         StreamRetirementMode mode) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  hipStream_t stream = nullptr;
+  if (!CheckHip(state,
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags")) {
+    return;
+  }
+
+  std::array<hipEvent_t, kBatchSize> events{};
+  if (mode == StreamRetirementMode::kTailEvent) {
+    for (hipEvent_t& event : events) {
+      if (!CheckHip(state,
+                    hipEventCreateWithFlags(
+                        &event, hipEventDisableTiming | hipEventReleaseToSystem),
+                    "hipEventCreateWithFlags")) {
+        for (hipEvent_t created : events) {
+          if (created != nullptr) (void)hipEventDestroy(created);
+        }
+        (void)hipStreamDestroy(stream);
+        return;
+      }
+    }
+  }
+
+  double retire_seconds = 0;
+  double completion_seconds = 0;
+  double harvest_seconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto retire_start = Clock::now();
+    for (int i = 0; i < kBatchSize; ++i) {
+      hipError_t result;
+      if (mode == StreamRetirementMode::kSynchronize) {
+        result = hipStreamSynchronize(stream);
+      } else if (mode == StreamRetirementMode::kQueryReady) {
+        result = hipStreamQuery(stream);
+      } else {
+        result = hipEventRecord(events[i], stream);
+      }
+      if (!CheckHip(state, result,
+                    mode == StreamRetirementMode::kSynchronize
+                        ? "hipStreamSynchronize"
+                        : mode == StreamRetirementMode::kQueryReady
+                              ? "hipStreamQuery"
+                              : "hipEventRecord")) {
+        break;
+      }
+    }
+    auto retire_end = Clock::now();
+
+    if (mode == StreamRetirementMode::kTailEvent &&
+        !CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize(tail events)")) {
+      break;
+    }
+    auto completion_end = Clock::now();
+
+    if (mode == StreamRetirementMode::kTailEvent) {
+      for (hipEvent_t event : events) {
+        if (!CheckHip(state, hipEventQuery(event), "hipEventQuery")) break;
+      }
+    }
+    auto harvest_end = Clock::now();
+
+    retire_seconds += Seconds(retire_end - retire_start);
+    completion_seconds += Seconds(completion_end - retire_end);
+    harvest_seconds += Seconds(harvest_end - completion_end);
+    operations += kBatchSize;
+    state.SetIterationTime(Seconds(harvest_end - retire_start));
+  }
+
+  state.counters["retire_host_ns/op"] = retire_seconds * 1e9 / operations;
+  state.counters["completion_ns/batch"] =
+      completion_seconds * 1e9 / state.iterations();
+  state.counters["harvest_ns/op"] = harvest_seconds * 1e9 / operations;
+  state.SetItemsProcessed(operations);
+
+  for (hipEvent_t event : events) {
+    if (event != nullptr) (void)hipEventDestroy(event);
+  }
+  (void)hipStreamDestroy(stream);
 }
 
 enum class StatePattern { kSame, kAlternate, kCachedSame };
@@ -1086,6 +1174,16 @@ BENCHMARK_CAPTURE(BM_EventRecordWait, timing,
     ->UseManualTime();
 BENCHMARK_CAPTURE(BM_EventRecordWait, timing_no_system_fence,
                   EventVisibility::kTimingNoSystemFence)
+    ->UseManualTime();
+
+BENCHMARK_CAPTURE(BM_StreamRetirement, synchronize,
+                  StreamRetirementMode::kSynchronize)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_StreamRetirement, query_ready,
+                  StreamRetirementMode::kQueryReady)
+    ->UseManualTime();
+BENCHMARK_CAPTURE(BM_StreamRetirement, tail_event,
+                  StreamRetirementMode::kTailEvent)
     ->UseManualTime();
 
 BENCHMARK_CAPTURE(BM_RocblasSetStream, same_stream, StatePattern::kSame)
