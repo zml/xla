@@ -59,6 +59,8 @@ namespace stream_executor::vulkan {
 namespace {
 
 constexpr char kValidationLayer[] = "VK_LAYER_KHRONOS_validation";
+constexpr uint32_t kAmdVendorId = 0x1002;
+constexpr uint32_t kNvidiaVendorId = 0x10de;
 
 struct VulkanDevicePerformanceProperties {
   std::optional<int> core_count;
@@ -80,6 +82,84 @@ struct VulkanDevicePerformanceProperties {
 bool HasExtension(const std::set<std::string>& extensions,
                   absl::string_view name) {
   return extensions.find(std::string(name)) != extensions.end();
+}
+
+void ApplyAmdPerformanceDefaults(
+    const VkPhysicalDeviceProperties& properties,
+    VulkanDevicePerformanceProperties* performance) {
+  struct AmdDefaults {
+    int core_count;
+    int fpus_per_core;
+    int64_t memory_bandwidth;
+    int64_t l2_cache_size;
+    float clock_rate_ghz;
+    const char* description;
+  };
+
+  auto set_defaults = [&](const AmdDefaults& defaults) {
+    performance->threads_per_core = std::max<uint32_t>(
+        1, properties.limits.maxComputeWorkGroupInvocations);
+    performance->core_count = defaults.core_count;
+    performance->fpus_per_core = defaults.fpus_per_core;
+    performance->memory_bandwidth = defaults.memory_bandwidth;
+    performance->l2_cache_size = defaults.l2_cache_size;
+    performance->clock_rate_ghz = defaults.clock_rate_ghz;
+    performance->probe_diagnostics.push_back(defaults.description);
+  };
+
+  const std::string name(properties.deviceName);
+  auto name_contains = [&](absl::string_view needle) {
+    return name.find(std::string(needle)) != std::string::npos;
+  };
+
+  // AMD exposes Vulkan devices for many RADV/AMDVLK names that do not map to
+  // CUDA/NVML-like counters. Match the common RADV architecture strings, then
+  // fall back to conservative RDNA-family defaults so every AMD Vulkan device
+  // has a complete DeviceDescription.
+  if (properties.deviceID == 0x13c0 || name_contains("RAPHAEL_MENDOCINO")) {
+    set_defaults({2, 64, 51'200'000'000LL, 2 * 1024 * 1024, 2.2f,
+                  "AMD Vulkan defaults applied for RAPHAEL_MENDOCINO"});
+  } else if (name_contains("W7800")) {
+    set_defaults({70, 64, 576'000'000'000LL, 64LL * 1024 * 1024, 2.5f,
+                  "AMD Vulkan defaults applied for Radeon PRO W7800"});
+  } else if (name_contains("NAVI31")) {
+    set_defaults({96, 64, 864'000'000'000LL, 96LL * 1024 * 1024, 2.5f,
+                  "AMD Vulkan defaults applied for NAVI31"});
+  } else if (name_contains("NAVI32")) {
+    set_defaults({60, 64, 432'000'000'000LL, 64LL * 1024 * 1024, 2.5f,
+                  "AMD Vulkan defaults applied for NAVI32"});
+  } else if (name_contains("NAVI33")) {
+    set_defaults({32, 64, 288'000'000'000LL, 32LL * 1024 * 1024, 2.5f,
+                  "AMD Vulkan defaults applied for NAVI33"});
+  } else if (name_contains("NAVI21")) {
+    set_defaults({80, 64, 512'000'000'000LL, 128LL * 1024 * 1024, 2.2f,
+                  "AMD Vulkan defaults applied for NAVI21"});
+  } else if (name_contains("NAVI22")) {
+    set_defaults({40, 64, 384'000'000'000LL, 96LL * 1024 * 1024, 2.4f,
+                  "AMD Vulkan defaults applied for NAVI22"});
+  } else if (name_contains("NAVI23")) {
+    set_defaults({32, 64, 256'000'000'000LL, 32LL * 1024 * 1024, 2.4f,
+                  "AMD Vulkan defaults applied for NAVI23"});
+  } else if (name_contains("NAVI24")) {
+    set_defaults({16, 64, 144'000'000'000LL, 16LL * 1024 * 1024, 2.4f,
+                  "AMD Vulkan defaults applied for NAVI24"});
+  } else if (name_contains("PHOENIX") || name_contains("HAWK_POINT") ||
+             name_contains("STRIX")) {
+    set_defaults({12, 64, 120'000'000'000LL, 2LL * 1024 * 1024, 2.8f,
+                  "AMD Vulkan defaults applied for RDNA APU"});
+  } else if (name_contains("REMBRANDT")) {
+    set_defaults({12, 64, 102'000'000'000LL, 2LL * 1024 * 1024, 2.4f,
+                  "AMD Vulkan defaults applied for REMBRANDT"});
+  } else if (name_contains("VANGOGH")) {
+    set_defaults({8, 64, 88'000'000'000LL, 2LL * 1024 * 1024, 1.6f,
+                  "AMD Vulkan defaults applied for VANGOGH"});
+  } else {
+    set_defaults({1, 64, 51'200'000'000LL, 2LL * 1024 * 1024, 1.0f,
+                  "Generic AMD Vulkan defaults applied"});
+    performance->probe_diagnostics.push_back(absl::StrFormat(
+        "Unknown AMD Vulkan device ID 0x%04x; using generic defaults",
+        properties.deviceID));
+  }
 }
 
 template <typename T>
@@ -973,14 +1053,16 @@ QueryDevicePerformanceProperties(VkPhysicalDevice physical_device,
         "VK_EXT_pci_bus_info is not supported");
   }
 
-  if (properties->vendorID == 0x10de) {
+  if (properties->vendorID == kNvidiaVendorId) {
     ProbeCuda(&performance);
     ProbeNvml(&performance);
+  } else if (properties->vendorID == kAmdVendorId) {
+    ApplyAmdPerformanceDefaults(*properties, &performance);
   } else {
-    return absl::FailedPreconditionError(absl::StrFormat(
-        "Vulkan performance discovery supports NVIDIA devices only; device "
-        "%s has vendor ID 0x%04x",
-        properties->deviceName, properties->vendorID));
+    performance.probe_diagnostics.push_back(absl::StrFormat(
+        "Skipping CUDA/NVML performance probing for non-NVIDIA Vulkan vendor "
+        "0x%04x",
+        properties->vendorID));
   }
 
   ABSL_RETURN_IF_ERROR(ApplyPositiveIntegerOverride(
