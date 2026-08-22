@@ -187,12 +187,34 @@ bool CacheRocblasStreamState() {
   return cache_stream_state;
 }
 
+bool CacheRocblasAtomicsMode() {
+  static bool cache_atomics_mode = [] {
+    bool disable = false;
+    CHECK_OK(tsl::ReadBoolFromEnvVar(
+        "XLA_ROCM_DISABLE_ROCBLAS_ATOMICS_CACHE", false, &disable));
+    return !disable;
+  }();
+  return cache_atomics_mode;
+}
+
 bool ROCMBlas::Init() {
   std::unique_ptr<ActivateContext> activation = parent_->Activate();
   rocblas_status ret = rocblas_create_handle(&blas_);
   if (ret != rocblas_status_success) {
     LOG(ERROR) << "failed to create rocBLAS handle: " << ToString(ret);
     return false;
+  }
+
+  if (cache_atomics_mode_) {
+    absl::MutexLock lock{mu_};
+    rocblas_atomics_mode mode;
+    ret = rocblas_get_atomics_mode(blas_, &mode);
+    if (ret != rocblas_status_success) {
+      LOG(ERROR) << "failed to query initial rocBLAS atomics mode: "
+                 << ToString(ret);
+      return false;
+    }
+    current_atomics_mode_ = mode;
   }
 
   if (!blas_lt_.Init().ok()) {
@@ -216,7 +238,8 @@ ROCMBlas::ROCMBlas(StreamExecutor* parent)
     : parent_(CHECK_NOTNULL(parent)),
       blas_(nullptr),
       blas_lt_(parent),
-      cache_stream_state_(CacheRocblasStreamState()) {}
+      cache_stream_state_(CacheRocblasStreamState()),
+      cache_atomics_mode_(CacheRocblasAtomicsMode()) {}
 
 ROCMBlas::~ROCMBlas() {
   if (blas_ != nullptr) {
@@ -241,6 +264,23 @@ bool ROCMBlas::SetStream(Stream *stream) {
     return false;
   }
   current_stream_ = handle;
+  return true;
+}
+
+bool ROCMBlas::SetAtomicsMode(rocblas_atomics_mode mode) {
+  CHECK(blas_ != nullptr);
+  if (cache_atomics_mode_ && current_atomics_mode_ &&
+      *current_atomics_mode_ == mode) {
+    return true;
+  }
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kRocblasSetAtomicsMode);
+  if (auto ret = rocblas_set_atomics_mode(blas_, mode);
+      ret != rocblas_status_success) {
+    LOG(ERROR) << "failed to set rocBLAS atomics mode: " << ToString(ret);
+    return false;
+  }
+  current_atomics_mode_ = mode;
   return true;
 }
 
@@ -444,16 +484,14 @@ absl::Status ROCMBlas::DoBlasInternalImpl(FuncT rocblas_func, Stream *stream,
     return absl::InternalError("Setting stream failed");
   }
 
-  rocblas_status ret;
-  // set the atomics mode, leaving default to library
-  bool allow_atomics = !OpDeterminismRequired();
-  if (!allow_atomics) {
-    ret = rocblas_set_atomics_mode(blas_, rocblas_atomics_not_allowed);
-    if (err_on_failure && ret != rocblas_status_success) {
-      LOG(ERROR) << "failed to set atomics mode before " << FuncT::kName << ": "
-                 << ToString(ret);
-    }
+  rocblas_atomics_mode desired_atomics_mode =
+      OpDeterminismRequired() ? rocblas_atomics_not_allowed
+                              : rocblas_atomics_allowed;
+  if ((cache_atomics_mode_ || OpDeterminismRequired()) &&
+      !SetAtomicsMode(desired_atomics_mode)) {
+    return absl::InternalError("Setting rocBLAS atomics mode failed");
   }
+  rocblas_status ret;
 #if 0
 // pemeliya: the feature is disabled since rocblas does not perform well under
 // graph capture. rocblas_set_workspace seems to use blocking memory functions
