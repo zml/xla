@@ -104,13 +104,13 @@ CommandBufferThunk::CommandBufferThunk(
   TrackCommandBuffers(state_);
 }
 
-std::vector<BufferAllocation::Index>
+Command::UpdatedAllocations
 CommandBufferThunk::ExecutorCommandBuffer::UpdateBufferAllocations(
     const CommandExecutor& commands, const Thunk::ExecuteParams& params,
     absl::Span<const BufferAllocation::Index> persistent_alloc_indices) {
-  std::vector<BufferAllocation::Index> updated_allocs;
+  Command::UpdatedAllocations updated_allocs;
   const BufferAllocations* allocs = params.buffer_allocations;
-  std::vector<BufferAllocation::Index> dynamic_alloc_indices;
+  Command::UpdatedAllocations dynamic_alloc_indices;
 
   absl::c_set_difference(commands.allocs_indices(), persistent_alloc_indices,
                          std::back_inserter(dynamic_alloc_indices));
@@ -256,7 +256,7 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
     uint64_t start_micros = tsl::Env::Default()->NowMicros();
 
     // Update recorded buffer allocations.
-    std::optional<std::vector<BufferAllocation::Index>> updated_allocs =
+    std::optional<Command::UpdatedAllocations> updated_allocs =
         cmd_buffer->UpdateBufferAllocations(commands_, execute_params,
                                             *params.persistent_alloc_indices);
 
