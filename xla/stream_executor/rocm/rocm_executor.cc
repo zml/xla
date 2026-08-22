@@ -950,6 +950,9 @@ void RocmExecutor::DeallocateStream(Stream* stream) {
     if (blas_ != nullptr) {
       blas_->NotifyStreamDestroyed(stream);
     }
+    if (fft_ != nullptr) {
+      fft_->NotifyStreamDestroyed(stream);
+    }
   }
   RocmStream* rocm_stream = static_cast<RocmStream*>(stream);
   absl::MutexLock l(alive_gpu_streams_mu_);

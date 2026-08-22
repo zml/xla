@@ -88,6 +88,10 @@ class FftSupport {
  public:
   virtual ~FftSupport() {}
 
+  // Notifies stateful library plans before a Stream wrapper is destroyed.
+  // Backends that cache raw stream handles can invalidate cached state here.
+  virtual void NotifyStreamDestroyed(Stream* stream) {}
+
   // Creates a batched FFT plan with scratch allocator.
   //
   // stream:          The GPU stream in which the FFT runs.

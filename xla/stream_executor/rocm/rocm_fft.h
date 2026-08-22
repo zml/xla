@@ -20,10 +20,14 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_ROCM_ROCM_FFT_H_
 #define XLA_STREAM_EXECUTOR_ROCM_ROCM_FFT_H_
 
+#include <atomic>
 #include <cstdint>
+#include <optional>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "rocm/include/hipfft/hipfft.h"
 #include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/plugin_registry.h"
@@ -34,6 +38,8 @@ namespace stream_executor {
 
 namespace gpu {
 
+class ROCMFft;
+
 // ROCMFftPlan uses deferred initialization. Only a single call of
 // Initialize() is allowed to properly create hipfft plan and set member
 // variable is_initialized_ to true. Newly added interface that uses member
@@ -41,13 +47,7 @@ namespace gpu {
 // member variables are valid.
 class ROCMFftPlan : public fft::Plan {
  public:
-  ROCMFftPlan()
-      : parent_(nullptr),
-        plan_(),
-        fft_type_(fft::Type::kInvalid),
-        scratch_(nullptr),
-        scratch_size_bytes_(0),
-        is_initialized_(false) {}
+  explicit ROCMFftPlan(ROCMFft* owner);
   ~ROCMFftPlan() override;
 
   // Get FFT direction in hipFFT based on FFT type.
@@ -78,17 +78,23 @@ class ROCMFftPlan : public fft::Plan {
 
   ScratchAllocator *GetScratchAllocator() const { return scratch_allocator_; }
 
+  bool SetStream(Stream* stream);
+  void NotifyStreamDestroyed(hipStream_t stream);
+
  protected:
   bool IsInitialized() const { return is_initialized_; }
   ScratchAllocator *scratch_allocator_;
 
  private:
+  ROCMFft* owner_;
   StreamExecutor *parent_;
   hipfftHandle plan_;
   fft::Type fft_type_;
   DeviceAddress<uint8_t> scratch_;
   size_t scratch_size_bytes_;
   bool is_initialized_;
+  std::atomic<hipStream_t> current_stream_{nullptr};
+  std::optional<void*> current_work_area_;
 };
 
 // FFT support for ROCM platform via rocFFT library.
@@ -109,8 +115,17 @@ class ROCMFft : public fft::FftSupport {
 
   TENSORFLOW_STREAM_EXECUTOR_GPU_FFT_SUPPORT_OVERRIDES
 
+  void NotifyStreamDestroyed(Stream* stream) override;
+
  private:
+  friend class ROCMFftPlan;
+
+  void RegisterPlan(ROCMFftPlan* plan);
+  void UnregisterPlan(ROCMFftPlan* plan);
+
   StreamExecutor *parent_;
+  absl::Mutex plans_mu_;
+  absl::flat_hash_set<ROCMFftPlan*> plans_ ABSL_GUARDED_BY(plans_mu_);
 
   // Two helper functions that execute dynload::hipfftExec?2?.
 

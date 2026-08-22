@@ -83,6 +83,7 @@ constexpr std::array<absl::string_view, kRocmPerformanceCounterCount>
         "rocblas_set_stream",
         "miopen_set_stream",
         "fft_set_stream",
+        "fft_set_work_area",
         "vmm_map",
         "vmm_unmap",
         "vmm_timeline_write",
