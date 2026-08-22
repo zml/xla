@@ -360,6 +360,7 @@ xla_cc_test(
         "@local_config_rocm//rocm:hip",
         "@local_config_rocm//rocm:rocblas",
         "@local_config_rocm//rocm:rocm_headers",
+        "@tsl//tsl/platform:platform_port",
     ],
 )
 
