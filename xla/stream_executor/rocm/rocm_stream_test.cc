@@ -372,6 +372,16 @@ TEST_F(RocmStreamTest, StreamHandleIsReusedAfterDestruction) {
       << "hipStream_t handle was not reused from the cache";
 }
 
+TEST_F(RocmStreamTest, StreamIsNonBlocking) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<RocmStream> stream,
+      RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+
+  unsigned int flags = hipStreamDefault;
+  ASSERT_EQ(hipStreamGetFlags(stream->stream_handle(), &flags), hipSuccess);
+  EXPECT_EQ(flags, hipStreamNonBlocking);
+}
+
 // The cache stores one vector of handles per key; verify that N handles can be
 // deposited and then all retrieved (in LIFO order, so the set must match).
 TEST_F(RocmStreamTest, MultipleStreamHandlesAreCachedAndReused) {
