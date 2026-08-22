@@ -35,6 +35,8 @@ inline constexpr absl::string_view kMetalScaledMatmulCallTarget =
 
 enum class MetalScaledMatmulScheme {
   kNvfp4Group16,
+  kMxfp8Group32,
+  kMxfp4Group32,
   kFp8Block128,
   kFp8PerChannel,
 };
@@ -49,6 +51,18 @@ inline std::optional<MetalScaledMatmulScheme> ClassifyMetalScaledMatmul(
   const int64_t scale_n = scale.dimensions(0);
   const int64_t scale_k = scale.dimensions(1);
 
+  if (scale.element_type() == F8E8M0FNU) {
+    if (scale_n != n || scale_k == 0 || k != scale_k * 32) {
+      return std::nullopt;
+    }
+    if (weights.element_type() == F8E4M3FN) {
+      return MetalScaledMatmulScheme::kMxfp8Group32;
+    }
+    if (weights.element_type() == F4E2M1FN) {
+      return MetalScaledMatmulScheme::kMxfp4Group32;
+    }
+    return std::nullopt;
+  }
   if (weights.element_type() == F4E2M1FN &&
       scale.element_type() == F8E4M3FN) {
     if (scale_n == n && scale_k != 0 && k == scale_k * 16) {

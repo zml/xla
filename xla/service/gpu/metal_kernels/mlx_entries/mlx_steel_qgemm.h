@@ -544,25 +544,21 @@ METAL_FUNC void fp_gather_qmm_rhs_impl(
 // MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
 
 ///////////////////////////////////////////////////////////////////////////////
-// NVFP4 tiled q-GEMM (prefill) -- the 1-D group-scale family.
+// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
 //
 // Unlike the DeepSeek Fp8BlockLoader above (128x128 bf16 block scale), this is
-// MLX's ORIGINAL fp_quantized path: a per-(output-row, K-group) uint8 scale and
-// a sub-byte weight. The helpers XlaQuantizedBlockLoader / mxfp_qmm_t_impl are
-// derived from MLX's fp8.h / fp4.h / fp_quantized.h, with XLA constant-buffer
-// ABI, rectangular-tile bounds, and K tail handling, reusing the same Steel
-// BlockMMA / BlockLoader core.
-//
-// This family was written for OCP microscaling (mxfp8/mxfp4: group-32 E8M0
-// scales), hence the mxfp_/`_mx` names throughout. Those entries are gone -- no
-// model emits e8m0 -- and NVFP4 (group-16 e4m3 scales, E2M1 weights) is the only
-// scheme left instantiating them.
+// MLX's ORIGINAL fp_quantized path: a per-(output-row, 32-element-K-group) E8M0
+// (uint8) scale and an E4M3 (mxfp8) / E2M1 (mxfp4) weight. The dequant helpers
+// XlaQuantizedBlockLoader / mxfp_qmm_t_impl are derived from MLX's fp8.h /
+// fp4.h / fp_quantized.h, with XLA constant-buffer ABI, rectangular-tile
+// bounds, and K tail handling, reusing the same Steel BlockMMA / BlockLoader
+// core.
 ///////////////////////////////////////////////////////////////////////////////
 
 // fp8.h / fp4.h value+scale decodes (verbatim, MLX numerics).
 //
-// XLA DELTA: these are renamed copies of upstream's fp8_e4m3 / fp4_e2m1
-// (fp8.h, fp4.h), reachable only through fp_quantized.h -- which this
+// XLA DELTA: these are renamed copies of upstream's fp8_e4m3 / fp8_e8m0 /
+// fp4_e2m1 (fp8.h, fp4.h), reachable only through fp_quantized.h -- which this
 // TU deliberately does not include (see the file header). The `mlx_` prefix is
 // a flattening artifact from when this bundle was one TU with the Steel span
 // and the names collided; it is NOT a fork. Each body is upstream's, and each
@@ -581,6 +577,14 @@ struct mlx_fp8_e4m3 {
   operator bfloat() { return static_cast<bfloat>(this->operator float()); }
   uint8_t bits;
 };
+struct mlx_fp8_e8m0 {
+  operator float() {
+    uint32_t out = (bits == 0 ? 0x400000 : (static_cast<uint16_t>(bits) << 23));
+    return as_type<float>(out);
+  }
+  operator bfloat() { return static_cast<bfloat>(this->operator float()); }
+  uint8_t bits;
+};
 struct mlx_fp4_e2m1 {
   operator float() {
     half converted = as_type<half>(ushort((bits & 7) << 9));
@@ -591,30 +595,34 @@ struct mlx_fp4_e2m1 {
   uint8_t bits;
 };
 
-// NVFP4's group-16 e4m3 scale decode. The E8M0 arm (group_size 32) went with
-// the mxfp entries; static_assert rather than a silent fallthrough, so adding a
-// group size back is a compile error and not a wrong answer.
 template <typename T, int group_size>
 static inline T dequantize_scale_mx(uint8_t s) {
-  static_assert(group_size == 16, "only NVFP4 group-16 e4m3 scales remain");
-  return T(*(thread mlx_fp8_e4m3*)(&s));
+  if (group_size == 16) {
+    return T(*(thread mlx_fp8_e4m3*)(&s));
+  } else {
+    return T(*(thread mlx_fp8_e8m0*)(&s));
+  }
 }
 
-// NVFP4 weight decode. The bits==8 arm decoded mxfp8's e4m3 WEIGHTS (not to be
-// confused with e4m3 SCALES above) and went with the mxfp entries.
 template <int bits, typename U = float>
 struct DequantizeMx {
   U operator()(uint8_t x) {
-    static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-    return U(*(thread mlx_fp4_e2m1*)(&x));
+    if (bits == 8) {
+      return U(*(thread mlx_fp8_e4m3*)(&x));
+    } else {
+      return U(*(thread mlx_fp4_e2m1*)(&x));
+    }
   }
 };
 
 template <typename U, int bits>
 inline void dequantize_mx(uint8_t w, U scale, threadgroup U* w_local) {
-  static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-  w_local[0] = scale * DequantizeMx<4, U>{}(w);
-  w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
+  if (bits == 4) {
+    w_local[0] = scale * DequantizeMx<4, U>{}(w);
+    w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
+  } else {
+    w_local[0] = scale * DequantizeMx<8, U>{}(w);
+  }
 }
 
 // XlaQuantizedBlockLoader — 1-D per-(row, K-group) uint8 scales.
@@ -885,7 +893,7 @@ METAL_FUNC void mxfp_qmm_t_impl(
   x += y_row * static_cast<int64_t>(K);
   wl += static_cast<int64_t>(y_col) * K_w;
   scales += static_cast<int64_t>(y_col) * K_g;
-  // 1-D per-row group-scale base
+  // 1-D per-row E8M0 scale base
   y = y_tile;
 
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
@@ -960,15 +968,10 @@ METAL_FUNC void mxfp_qmm_t_impl(
 // Concrete kernel entry points
 ///////////////////////////////////////////////////////////////////////////////
 
-// Dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims} ABI. w is
-// uint32-packed (cast to bytes), scales uint8 [N, K/GS]. Tiles BM=16, BK=32,
-// BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N unsafe loads
-// when N%BN==0; grid = (ceil(N/64), ceil(M/16), 1), tg=(32,2,2).
-//
-// The MXFP_ names are historical: this macro and mxfp_qmm_t_impl were written
-// for the OCP-microscaling mxfp8/mxfp4 entries, which are gone (no producer).
-// NVFP4 is the only scheme instantiating them now; the names are kept because
-// renaming would churn the compiler input for the 26B golden and buy nothing.
+// MXFP8/MXFP4 dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims}
+// ABI. w is uint32-packed (cast to bytes), scales uint8 E8M0 [N, K/32]. Tiles
+// BM=16, BK=32, BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N
+// unsafe loads when N%BN==0; grid = (ceil(N/64), ceil(M/16), 1), tg=(32,2,2).
 #define MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, ALIGNED_N)                    \
   kernel void NAME(                                                          \
       device const bfloat* x [[buffer(0)]],                                 \
@@ -989,8 +992,15 @@ METAL_FUNC void mxfp_qmm_t_impl(
         tid, lid, sg, sl);                                                  \
   }
 
-// NVFP4 dense q-GEMM: group_size 16, bits 4. The grid spans M, so every tile row
-// is a real row (static_M == active_M == dims.x).
+#define MXFP_QMM_T_ENTRY(NAME, GS, BITS) \
+  MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, false)
+
+MXFP_QMM_T_ENTRY(mxfp8_qmm_t, 32, 8)
+MXFP_QMM_T_ENTRY(mxfp4_qmm_t, 32, 4)
+
+// NVFP4 dense q-GEMM shares the MX entry verbatim: group_size 16, bits 4, and
+// the same {x, w, scales, y, dims} ABI. The grid spans M, so every tile row is
+// a real row (static_M == active_M == dims.x).
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t, 16, 4, false)
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t_alN, 16, 4, true)
 

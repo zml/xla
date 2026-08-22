@@ -296,6 +296,9 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitMetalScaledMatmulThunk(
       const HloCustomCallInstruction* hlo);
 
+  absl::StatusOr<ThunkSequence> EmitMetalMxMatmulThunk(
+      const HloCustomCallInstruction* hlo);
+
   absl::StatusOr<ThunkSequence> EmitMetalNvfp4MatmulThunk(
       const HloCustomCallInstruction* hlo);
 

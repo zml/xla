@@ -160,6 +160,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/metal_moe_gemv_thunk.h"
 #include "xla/backends/gpu/runtime/metal_nvfp4_matmul_thunk.h"
 #include "xla/backends/gpu/runtime/metal_workspace.h"
+#include "xla/backends/gpu/runtime/metal_mx_matmul_thunk.h"
 #include "xla/backends/gpu/runtime/metal_gdn_thunk.h"
 #include "xla/backends/gpu/runtime/metal_kv_write_thunk.h"
 #include "xla/backends/gpu/runtime/metal_paged_attn_thunk.h"
@@ -1350,10 +1351,114 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalScaledMatmulThunk(
   switch (*scheme) {
     case MetalScaledMatmulScheme::kNvfp4Group16:
       return EmitMetalNvfp4MatmulThunk(instr);
+    case MetalScaledMatmulScheme::kMxfp8Group32:
+    case MetalScaledMatmulScheme::kMxfp4Group32:
+      return EmitMetalMxMatmulThunk(instr);
     case MetalScaledMatmulScheme::kFp8Block128:
     case MetalScaledMatmulScheme::kFp8PerChannel:
       return EmitMetalFp8GemvThunk(instr, *scheme);
   }
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalMxMatmulThunk(
+    const HloCustomCallInstruction* instr) {
+  if (instr->operand_count() != 3) {
+    return absl::InvalidArgumentError(
+        "zml$scaled_matmul (MX) expects 3 operands (x, w, scales).");
+  }
+  const Shape& x_shape = instr->operand(0)->shape();
+  const Shape& w_shape = instr->operand(1)->shape();
+  const Shape& scales_shape = instr->operand(2)->shape();
+
+  const bool is_tuple = instr->shape().IsTuple();
+  const Shape& out_shape =
+      is_tuple ? instr->shape().tuple_shapes(0) : instr->shape();
+
+  if (x_shape.dimensions().size() != 2 || w_shape.dimensions().size() != 2 ||
+      scales_shape.dimensions().size() != 2 ||
+      out_shape.dimensions().size() != 2) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): x, w, scales, out must all be rank 2.");
+  }
+
+  const int64_t m = x_shape.dimensions(0);
+  const int64_t k = x_shape.dimensions(1);
+  const int64_t n = w_shape.dimensions(0);
+  const int64_t w_cols = w_shape.dimensions(1);
+  const int64_t scale_cols = scales_shape.dimensions(1);
+
+  if (m == 0 || k == 0 || n == 0 || w_cols == 0 || scale_cols == 0) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): invalid dimension (must be > 0).");
+  }
+  int64_t bits;
+  const PrimitiveType wt = w_shape.element_type();
+  const PrimitiveType st = scales_shape.element_type();
+  if (wt == F8E4M3FN || wt == F4E2M1FN) {
+    bits = (wt == F8E4M3FN) ? 8 : 4;
+    if (w_cols != k) {
+      return absl::UnimplementedError(
+          "zml$scaled_matmul (MX): native-f8 weight must be [N, K] (K minor).");
+    }
+    if (st != F8E8M0FNU) {
+      return absl::UnimplementedError(
+          "zml$scaled_matmul (MX): native-f8 weight needs f8e8m0 scales.");
+    }
+  } else if (wt == U32) {
+    if (st != U8) {
+      return absl::UnimplementedError(
+          "zml$scaled_matmul (MX): u32-packed weight needs u8 scales.");
+    }
+    if (k % w_cols != 0) {
+      return absl::UnimplementedError(
+          "zml$scaled_matmul (MX): K must be a multiple of the packed w minor.");
+    }
+    const int64_t pack = k / w_cols;  // values per uint32 word
+    bits = 32 / pack;
+    if ((bits != 8 && bits != 4) || pack * bits != 32) {
+      return absl::UnimplementedError(absl::StrCat(
+          "zml$scaled_matmul (MX): unsupported packing (K=", k,
+          ", w_cols=", w_cols, " -> bits=", bits, ")."));
+    }
+  } else {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): w must be f8e4m3fn / f4e2m1 / packed u32.");
+  }
+  if (k % scale_cols != 0) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): K must be a multiple of the scale minor dim.");
+  }
+  const int64_t group_size = k / scale_cols;  // 32 for MX
+  if (group_size != 32) {
+    return absl::UnimplementedError(absl::StrCat(
+        "zml$scaled_matmul (MX): only 32-element MX groups supported (got ",
+        group_size, ")."));
+  }
+  if (out_shape.dimensions(0) != m || out_shape.dimensions(1) != n) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): out shape must be [M, N].");
+  }
+  if (x_shape.element_type() != BF16 || out_shape.element_type() != BF16) {
+    return absl::UnimplementedError(
+        "zml$scaled_matmul (MX): x and out must be bf16.");
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice x,
+                      GetAllocationSliceForHlo(instr->operand(0), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice w,
+                      GetAllocationSliceForHlo(instr->operand(1), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scales,
+                      GetAllocationSliceForHlo(instr->operand(2), {}));
+  TF_ASSIGN_OR_RETURN(
+      BufferAllocation::Slice out,
+      GetAllocationSliceForHlo(instr, is_tuple ? ShapeIndex{0} : ShapeIndex{}));
+
+  auto thunk = std::make_unique<MetalMxMatmulThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(
+          instr, ir_emitter_context_->GetNextThunkId()),
+      x, x_shape, w, w_shape, scales, scales_shape, out, out_shape, m, k, n,
+      bits, group_size);
+  return ThunkSequence::Of(std::move(thunk));
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalNvfp4MatmulThunk(

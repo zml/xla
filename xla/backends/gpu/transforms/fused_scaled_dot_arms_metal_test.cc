@@ -199,17 +199,33 @@ TEST(MetalScaledMatmulSchemeTest, BlockOneTwentyEightStaysBf16Only) {
           .has_value());
 }
 
-TEST(MetalScaledMatmulSchemeTest, E8m0ScalesAreNeverClassified) {
+TEST(MetalScaledMatmulSchemeTest, E8m0ScalesClassifyAsMx) {
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 64}),
+                                      ShapeUtil::MakeShape(F8E8M0FNU, {8, 2})),
+            MetalScaledMatmulScheme::kMxfp8Group32);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F4E2M1FN, {8, 64}),
+                                      ShapeUtil::MakeShape(F8E8M0FNU, {8, 2})),
+            MetalScaledMatmulScheme::kMxfp4Group32);
+  EXPECT_EQ(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
+                                      ShapeUtil::MakeShape(F8E8M0FNU, {8, 1})),
+            MetalScaledMatmulScheme::kMxfp8Group32);
+  EXPECT_EQ(
+      ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {6656, 19968}),
+                                ShapeUtil::MakeShape(F8E8M0FNU, {6656, 624})),
+      MetalScaledMatmulScheme::kMxfp8Group32);
+}
+
+TEST(MetalScaledMatmulSchemeTest, E8m0OffGridIsNotClassified) {
   EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F4E2M1FN, {8, 32}),
                                          ShapeUtil::MakeShape(F8E8M0FNU, {8, 2}))
-                   .has_value());
-  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {8, 32}),
-                                         ShapeUtil::MakeShape(F8E8M0FNU, {8, 1}))
                    .has_value());
   EXPECT_FALSE(
       ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(F8E4M3FN, {256, 256}),
                                 ShapeUtil::MakeShape(F8E8M0FNU, {2, 2}))
           .has_value());
+  EXPECT_FALSE(ClassifyMetalScaledMatmul(ShapeUtil::MakeShape(BF16, {8, 64}),
+                                         ShapeUtil::MakeShape(F8E8M0FNU, {8, 2}))
+                   .has_value());
 }
 
 TEST(MetalScaledMatmulSchemeTest, RejectsDegenerateAndOffGridShapes) {
@@ -288,7 +304,7 @@ TEST_F(MetalFusedScaledDotRewriterTest, Fp8UnrecognizedScaleGridIsNotFused) {
   )", /*expect_fused=*/false);
 }
 
-TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32HasNoThunkAndIsNotFused) {
+TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32Fp8IsFused) {
   ExpectMetalScaledMatmul(R"(
     HloModule module
 
@@ -301,10 +317,10 @@ TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32HasNoThunkAndIsNotFused) {
         lhs_contracting_dims={1},
         rhs_contracting_dims={1}
     }
-  )", /*expect_fused=*/false);
+  )", /*expect_fused=*/true);
 }
 
-TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32Fp4HasNoThunkAndIsNotFused) {
+TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32Fp4IsFused) {
   ExpectMetalScaledMatmul(R"(
     HloModule module
 
@@ -317,7 +333,7 @@ TEST_F(MetalFusedScaledDotRewriterTest, MxGroup32Fp4HasNoThunkAndIsNotFused) {
         lhs_contracting_dims={1},
         rhs_contracting_dims={1}
     }
-  )", /*expect_fused=*/false);
+  )", /*expect_fused=*/true);
 }
 
 TEST_F(MetalFusedScaledDotRewriterTest, DenseNonOneConstantIsNotIdentityScale) {

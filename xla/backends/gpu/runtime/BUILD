@@ -5678,6 +5678,36 @@ cc_library(
 )
 
 cc_library(
+    name = "metal_mx_matmul_thunk",
+    srcs = ["metal_mx_matmul_thunk.cc"],
+    hdrs = ["metal_mx_matmul_thunk.h"],
+    tags = ["gpu"],
+    deps = [
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/service/gpu:metal_air_toolchain",
+        "//xla/service/gpu/metal_kernels:mlx_kernels",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_executor",
+        "//xla/stream_executor/metal:metal_runtime",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_library(
     name = "metal_fp8_gemv_thunk",
     srcs = ["metal_fp8_gemv_thunk.cc"],
     hdrs = ["metal_fp8_gemv_thunk.h"],
@@ -5748,6 +5778,33 @@ xla_cc_test(
         "//xla/service/gpu/metal_kernels:mlx_kernels",
         "//xla/service/gpu/metal_kernels:moe_argsort",
         "//xla/service/gpu/metal_kernels:permute_rows",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:kernel",
+        "//xla/stream_executor:kernel_args",
+        "//xla/stream_executor:launch_dim",
+        "//xla/stream_executor:metal_platform",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/metal:metal_executor",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "metal_mx_kernel_test",
+    size = "medium",
+    srcs = ["metal_mx_kernel_test.cc"],
+    tags = [
+        "gpu",
+        "metal-only",
+    ],
+    deps = [
+        "//xla/service/gpu:metal_air_toolchain",
+        "//xla/service/gpu/metal_kernels:mlx_kernels",
         "//xla/stream_executor:device_address",
         "//xla/stream_executor:kernel",
         "//xla/stream_executor:kernel_args",

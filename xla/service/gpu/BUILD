@@ -563,6 +563,7 @@ cc_library(
         "//xla/backends/gpu/runtime:metal_gemm_thunk",
         "//xla/backends/gpu/runtime:metal_kv_write_thunk",
         "//xla/backends/gpu/runtime:metal_moe_gemv_thunk",
+        "//xla/backends/gpu/runtime:metal_mx_matmul_thunk",
         "//xla/backends/gpu/runtime:metal_nvfp4_matmul_thunk",
         "//xla/backends/gpu/runtime:metal_paged_attn_thunk",
         "//xla/backends/gpu/runtime:metal_print_thunk",
