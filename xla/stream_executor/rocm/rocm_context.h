@@ -71,6 +71,26 @@ class RocmContext : public Context {
   const int device_ordinal_;
 };
 
+// Stack-owned ROCm activation for concrete helpers that already know the
+// device ordinal. ROCm contexts contain only an ordinal, so this preserves the
+// ScopedActivateContext nesting and restoration semantics without allocating
+// the generic virtual ActivateContext handle.
+class ScopedRocmActivateContext {
+ public:
+  explicit ScopedRocmActivateContext(int device_ordinal)
+      : context_(device_ordinal), activation_(&context_) {}
+
+  ScopedRocmActivateContext(ScopedRocmActivateContext&&) = delete;
+  ScopedRocmActivateContext(const ScopedRocmActivateContext&) = delete;
+  ScopedRocmActivateContext& operator=(ScopedRocmActivateContext&&) = delete;
+  ScopedRocmActivateContext& operator=(const ScopedRocmActivateContext&) =
+      delete;
+
+ private:
+  RocmContext context_;
+  ScopedActivateContext activation_;
+};
+
 }  // namespace stream_executor::gpu
 
 #endif  // XLA_STREAM_EXECUTOR_ROCM_ROCM_CONTEXT_H_

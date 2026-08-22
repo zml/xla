@@ -28,6 +28,7 @@ limitations under the License.
 #include "rocm/include/hip/hip_runtime.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/event.h"
+#include "xla/stream_executor/rocm/rocm_context.h"
 #include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/tsl/platform/errors.h"
@@ -36,9 +37,13 @@ limitations under the License.
 namespace stream_executor {
 namespace gpu {
 namespace {
+ScopedRocmActivateContext ActivateRocm(StreamExecutor* executor) {
+  return ScopedRocmActivateContext(executor->device_ordinal());
+}
+
 absl::Status WaitStreamOnEvent(StreamExecutor *executor, hipStream_t stream,
                                hipEvent_t event) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventWait);
   ABSL_RETURN_IF_ERROR(ToStatus(hipStreamWaitEvent(stream, event, 0 /* = flags */),
                            "could not wait stream on event"));
@@ -60,7 +65,7 @@ absl::StatusOr<hipEvent_t> InitEvent(StreamExecutor *executor,
       LOG(FATAL) << "impossible event flags: " << int(hipflags);
   }
 
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   hipEvent_t event;
   IncrementRocmPerformanceCounter(
       flags == EventFlags::kTimingOnly
@@ -84,7 +89,7 @@ void DestroyEvent(StreamExecutor *executor, hipEvent_t event) {
     return;
   }
 
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   hipError_t res = hipEventDestroy(event);
 
   if (res != hipSuccess) {
@@ -97,7 +102,7 @@ void DestroyEvent(StreamExecutor *executor, hipEvent_t event) {
 }  // namespace
 
 Event::Status RocmEvent::PollForStatus() {
-  std::unique_ptr<ActivateContext> activated = executor_->Activate();
+  auto activated = ActivateRocm(executor_);
   hipError_t res = hipEventQuery(handle_);
 
   if (res == hipSuccess) {
@@ -115,7 +120,7 @@ absl::Status RocmEvent::WaitForEventOnExternalStream(std::intptr_t stream) {
 }
 
 absl::Status RocmEvent::Synchronize() {
-  std::unique_ptr<ActivateContext> activation = executor_->Activate();
+  auto activation = ActivateRocm(executor_);
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventSynchronize);
   return ToStatus(hipEventSynchronize(handle_),
                   "could not synchronize on ROCm event");
