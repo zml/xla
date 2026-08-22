@@ -134,6 +134,27 @@ TEST(KernelTest, PackPodArguments) {
   ASSERT_EQ(packed.size(), 4);
 }
 
+TEST(KernelTest, PackedArgumentAddressesSurviveStorageGrowth) {
+  auto args = std::make_unique<KernelArgsPackedArray>(1);
+  for (int64_t i = 0; i < 32; ++i) {
+    args->add_argument(i);
+  }
+
+  auto arg_addresses = args->argument_addresses();
+  ASSERT_EQ(arg_addresses.size(), 32);
+  for (int64_t i = 0; i < 32; ++i) {
+    EXPECT_EQ(*reinterpret_cast<const int64_t*>(arg_addresses[i]), i);
+  }
+
+  auto packed_args = args->packed_args();
+  ASSERT_EQ(packed_args.size(), 32);
+  for (int64_t i = 0; i < 32; ++i) {
+    EXPECT_EQ(*reinterpret_cast<const int64_t*>(
+                  packed_args[i]->argument_address()),
+              i);
+  }
+}
+
 TEST(KernelTest, PackPackedArguments) {
   // Instead of passing int32_t as POD argument, pack it into opaque storage. We
   // test that we can hide the actual type of the argument behind the opaque
