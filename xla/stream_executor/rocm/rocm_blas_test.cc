@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
+#include "xla/tsl/util/determinism.h"
 
 namespace stream_executor::gpu {
 namespace {
@@ -38,6 +39,11 @@ namespace {
 uint64_t RocblasSetStreamCalls() {
   return GetRocmPerformanceCounterSnapshot()[static_cast<size_t>(
       RocmPerformanceCounter::kRocblasSetStream)];
+}
+
+uint64_t RocblasSetAtomicsModeCalls() {
+  return GetRocmPerformanceCounterSnapshot()[static_cast<size_t>(
+      RocmPerformanceCounter::kRocblasSetAtomicsMode)];
 }
 
 bool StreamCacheDisabled() {
@@ -108,6 +114,33 @@ TEST_F(RocmBlasTest, RebindsAfterStreamWrapperLifetimeEnds) {
   EXPECT_EQ(RocblasSetStreamCalls(), StreamCacheDisabled() ? 4 : 2);
 
   EXPECT_THAT(reused_stream->BlockHostUntilDone(), absl_testing::IsOk());
+  executor_->Deallocate(&values);
+}
+
+TEST_F(RocmBlasTest, CachesAtomicsModeAndRestoresItAcrossTransitions) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<Stream> stream,
+                          executor_->CreateStream(std::nullopt));
+  DeviceAddress<float> values = executor_->AllocateArray<float>(4, 0);
+  ASSERT_NE(values.opaque(), nullptr);
+
+  bool was_deterministic = tsl::OpDeterminismRequired();
+  tsl::EnableOpDeterminism(false);
+  ResetRocmPerformanceCountersForTest();
+  EXPECT_TRUE(Scale(stream.get(), &values));
+  EXPECT_TRUE(Scale(stream.get(), &values));
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 0);
+
+  tsl::EnableOpDeterminism(true);
+  EXPECT_TRUE(Scale(stream.get(), &values));
+  EXPECT_TRUE(Scale(stream.get(), &values));
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 1);
+
+  tsl::EnableOpDeterminism(false);
+  EXPECT_TRUE(Scale(stream.get(), &values));
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 2);
+  tsl::EnableOpDeterminism(was_deterministic);
+
+  EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
   executor_->Deallocate(&values);
 }
 

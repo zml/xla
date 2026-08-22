@@ -52,6 +52,7 @@ enum class RocmPerformanceCounter : size_t {
   kEventWait,
   kEventSynchronize,
   kRocblasSetStream,
+  kRocblasSetAtomicsMode,
   kMiopenSetStream,
   kFftSetStream,
   kFftSetWorkArea,

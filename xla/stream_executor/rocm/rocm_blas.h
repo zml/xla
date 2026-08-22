@@ -107,6 +107,10 @@ class ROCMBlas : public blas::BlasSupport {
   // invoked before calling into rocBLAS.
   bool SetStream(Stream *stream) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  // Updates rocBLAS atomics mode only when determinism requirements changed.
+  bool SetAtomicsMode(rocblas_atomics_mode mode)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // A helper function that calls the real rocBLAS function together with error
   // handling.
   //
@@ -191,6 +195,11 @@ class ROCMBlas : public blas::BlasSupport {
   // rebind even if HIP recycles the same raw handle value.
   std::optional<hipStream_t> current_stream_ ABSL_GUARDED_BY(mu_);
 
+  // Last atomics mode successfully observed or installed on the rocBLAS
+  // handle. rocBLAS retains this state across operations.
+  std::optional<rocblas_atomics_mode> current_atomics_mode_
+      ABSL_GUARDED_BY(mu_);
+
   // container holding solutions vector (to avoid reallocating it each time)
   std::vector<rocblas_int> solutions_;
 
@@ -202,6 +211,7 @@ class ROCMBlas : public blas::BlasSupport {
   bool has_mfma_ = false;
   bool use_hgemm_alt_impl_ = false;
   bool cache_stream_state_ = true;
+  bool cache_atomics_mode_ = true;
 };
 
 }  // namespace gpu
