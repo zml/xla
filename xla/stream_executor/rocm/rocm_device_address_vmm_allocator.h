@@ -39,9 +39,9 @@ namespace stream_executor::gpu {
 // management, and hipStreamWriteValue64 for batched GPU timeline-based deferred
 // deallocation. Requires ROCm >= 6.0 for HIP VMM API support.
 //
-// The timeline counter is allocated as signal memory via
-// hipExtMallocWithFlags(hipMallocSignalMemory), which is required by
-// hipStreamWriteValue64 on AMD hardware.
+// The timeline counter is allocated in coherent pinned host memory. Allocator
+// initialization verifies that hipStreamWriteValue64 can update that memory
+// and that the value is CPU-visible after synchronizing the allocator stream.
 //
 // Use the Create() factories to obtain an instance.
 class RocmDeviceAddressVmmAllocator : public DeviceAddressVmmAllocator {
@@ -77,9 +77,9 @@ class RocmDeviceAddressVmmAllocator : public DeviceAddressVmmAllocator {
       uint64_t pa_budget = UINT64_MAX);
 
  protected:
-  // Allocates signal memory via hipExtMallocWithFlags(hipMallocSignalMemory)
-  // for the per-device timeline counter, and queries the allocation
-  // granularity via hipMemGetAllocationGranularity.
+  // Allocates coherent pinned host memory for the per-device timeline counter,
+  // validates a 64-bit stream write to it, and queries allocation granularity
+  // via hipMemGetAllocationGranularity.
   absl::Status InitializeDeviceState(PerDeviceState& state) override;
 
   // Creates a physical memory allocation via RocmRawMemoryAllocation::Create.

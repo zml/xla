@@ -141,6 +141,36 @@ absl::Status RocmDeviceAddressVmmAllocator::InitializeDeviceState(
     }
   };
 
+  // ROCm 7.14 has no device attribute that exactly answers whether a target
+  // supports coherent 64-bit stream writes. Validate the operation now so a
+  // stable-address allocator fails with an actionable error during client
+  // initialization instead of hanging later while polling an unwritten
+  // deferred-deallocation marker. This is the allocator's only unconditional
+  // stream synchronization; steady-state deallocation remains asynchronous.
+  constexpr uint64_t kStreamWriteSentinel = 0x584c41564d4d3731ULL;
+  hipStream_t hip_stream =
+      static_cast<hipStream_t>(state.stream->platform_specific_handle().stream);
+  IncrementRocmPerformanceCounter(
+      RocmPerformanceCounter::kVmmTimelineWrite);
+  RETURN_IF_ERROR(ToStatus(
+      hipStreamWriteValue64(hip_stream, host_ptr, kStreamWriteSentinel,
+                            hipStreamWriteValueDefault),
+      "ROCm VMM allocator self-test hipStreamWriteValue64"));
+  RETURN_IF_ERROR(ToStatus(
+      hipStreamSynchronize(hip_stream),
+      "ROCm VMM allocator self-test hipStreamSynchronize"));
+
+  uint64_t observed =
+      __atomic_load_n(state.pinned_timeline, __ATOMIC_ACQUIRE);
+  if (observed != kStreamWriteSentinel) {
+    return absl::FailedPreconditionError(absl::StrFormat(
+        "ROCm device %d cannot provide a coherent 64-bit stream-write "
+        "timeline: wrote 0x%016llx but CPU observed 0x%016llx",
+        ordinal, static_cast<unsigned long long>(kStreamWriteSentinel),
+        static_cast<unsigned long long>(observed)));
+  }
+  __atomic_store_n(state.pinned_timeline, uint64_t{0}, __ATOMIC_RELEASE);
+
   return absl::OkStatus();
 }
 
