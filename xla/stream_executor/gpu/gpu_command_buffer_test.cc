@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/gpu/gpu_test_kernels.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
@@ -127,6 +128,66 @@ TEST(GpuCommandBufferTest, LaunchSingleKernel) {
   std::fill(dst.begin(), dst.end(), 42);
   TF_ASSERT_OK(stream->Memcpy(dst.data(), d, byte_length));
   ASSERT_EQ(dst, expected);
+}
+
+TEST(GpuCommandBufferTest, UpdateKernelDynamicSharedMemory) {
+  Platform* platform = GpuPlatform();
+  StreamExecutor* executor = platform->ExecutorForDevice(0).value();
+
+  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  TF_ASSERT_OK_AND_ASSIGN(auto add, LoadAddI32TestKernel(executor));
+
+  constexpr int64_t kLength = 4;
+  constexpr int64_t kByteLength = sizeof(int32_t) * kLength;
+  constexpr uint32_t kSmallSharedMemoryBytes = 1 << 10;
+  constexpr uint32_t kLargeSharedMemoryBytes = 32 << 10;
+  ASSERT_GE(
+      executor->GetDeviceDescription().shared_memory_per_block_optin(),
+      kLargeSharedMemoryBytes);
+
+  DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(kLength, 0);
+  DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(kLength, 0);
+  DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(kLength, 0);
+  TF_ASSERT_OK(stream->Memset32(&a, 1, kByteLength));
+  TF_ASSERT_OK(stream->Memset32(&b, 2, kByteLength));
+  TF_ASSERT_OK(stream->MemZero(&c, kByteLength));
+
+  auto pack_args = [&](uint32_t shared_memory_bytes,
+                       KernelArgsPackedArray* args) {
+    args->add_argument(a);
+    args->add_argument(b);
+    args->add_argument(c);
+    args->add_shared_bytes(shared_memory_bytes);
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(auto cmd_buffer,
+                          executor->CreateCommandBuffer(primary));
+  KernelArgsPackedArray initial_args(/*num_args=*/3);
+  pack_args(/*shared_memory_bytes=*/0, &initial_args);
+  TF_ASSERT_OK_AND_ASSIGN(
+      const CommandBuffer::Command* launch,
+      cmd_buffer->CreateLaunch(ThreadDim(), BlockDim(kLength), *add,
+                               initial_args, {}));
+  TF_ASSERT_OK(cmd_buffer->Finalize());
+  TF_ASSERT_OK(cmd_buffer->Submit(stream.get()));
+
+  for (uint32_t shared_memory_bytes : {kSmallSharedMemoryBytes,
+                                       kLargeSharedMemoryBytes,
+                                       kSmallSharedMemoryBytes}) {
+    KernelArgsPackedArray updated_args(/*num_args=*/3);
+    pack_args(shared_memory_bytes, &updated_args);
+    TF_ASSERT_OK(cmd_buffer->Update());
+    TF_ASSERT_OK(cmd_buffer->UpdateLaunch(launch, ThreadDim(),
+                                          BlockDim(kLength), *add,
+                                          updated_args));
+    TF_ASSERT_OK(cmd_buffer->Finalize());
+    TF_ASSERT_OK(cmd_buffer->Submit(stream.get()));
+  }
+
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
+  std::vector<int32_t> dst(kLength, 0);
+  TF_ASSERT_OK(stream->Memcpy(dst.data(), c, kByteLength));
+  EXPECT_EQ(dst, std::vector<int32_t>({3, 3, 3, 3}));
 }
 
 TEST(GpuCommandBufferTest, TraceSingleKernel) {
@@ -229,8 +290,8 @@ TEST(GpuCommandBufferTest, UpdateCapturedSingleKernelChildCommand) {
     return TraceCommandBufferFactory::Create(
         executor, stream.get(),
         [&](Stream* capture_stream) {
-          KernelArgsDeviceAddressArray args({a, b, output}, 0);
-          return add->Launch(ThreadDim(), BlockDim(4), capture_stream, args);
+          return add.Launch(ThreadDim(), BlockDim(4), capture_stream, a, b,
+                            output);
         },
         nested);
   };
