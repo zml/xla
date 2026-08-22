@@ -81,6 +81,7 @@ constexpr std::array<absl::string_view, kRocmPerformanceCounterCount>
         "event_wait",
         "event_synchronize",
         "rocblas_set_stream",
+        "rocblas_set_atomics_mode",
         "miopen_set_stream",
         "fft_set_stream",
         "fft_set_work_area",
