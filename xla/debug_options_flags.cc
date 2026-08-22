@@ -319,7 +319,15 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_graph_min_graph_size(5);
   opts.set_xla_gpu_command_buffer_scheduling_mode(DebugOptions::LHS);
   opts.set_xla_gpu_command_buffer_unroll_loops(false);
+#if TENSORFLOW_USE_ROCM
+  // ROCm library command buffers can cycle through more than 16 allocation
+  // signatures during steady-state execution. A capacity of 32 avoids trace
+  // cache thrashing while keeping the cache bounded; users can override it
+  // with --xla_cmd_buffer_trace_cache_size.
+  opts.set_xla_cmd_buffer_trace_cache_size(32);
+#else
   opts.set_xla_cmd_buffer_trace_cache_size(16);
+#endif
 
   // Despite the name, fast min/max on GPUs does not seem to be any faster, and
   // adds very counter-intuitive "NaN-swallowing" behavior.

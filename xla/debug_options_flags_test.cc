@@ -107,6 +107,18 @@ TEST(DebugOptions, FusionCommandBufferDefaultIsPlatformSpecific) {
 #endif
 }
 
+TEST(DebugOptions, TraceCacheCapacityDefaultIsPlatformSpecific) {
+#if TENSORFLOW_USE_ROCM
+  EXPECT_EQ(
+      DefaultDebugOptionsIgnoringFlags().xla_cmd_buffer_trace_cache_size(),
+      32);
+#else
+  EXPECT_EQ(
+      DefaultDebugOptionsIgnoringFlags().xla_cmd_buffer_trace_cache_size(),
+      16);
+#endif
+}
+
 TEST(DebugOptions, CommandBufferUpdateModesParseFromFlags) {
   for (const auto& [name, expected] : std::vector<
            std::pair<const char*, DebugOptions::CommandBufferUpdateMode>>{
