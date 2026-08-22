@@ -20,6 +20,8 @@ limitations under the License.
 #ifndef XLA_STREAM_EXECUTOR_ROCM_ROCM_BLAS_H_
 #define XLA_STREAM_EXECUTOR_ROCM_ROCM_BLAS_H_
 
+#include <optional>
+
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
@@ -90,6 +92,8 @@ class ROCMBlas : public blas::BlasSupport {
   ~ROCMBlas() override;
 
   TENSORFLOW_STREAM_EXECUTOR_GPU_BLAS_SUPPORT_OVERRIDES
+
+  void NotifyStreamDestroyed(Stream* stream) override;
 
   gpu::BlasLt *GetBlasLt() override {
     return &blas_lt_;
@@ -182,6 +186,11 @@ class ROCMBlas : public blas::BlasSupport {
   // rocBLAS library handle on the device.
   rocblas_handle blas_ ABSL_GUARDED_BY(mu_);
 
+  // The stream currently retained by rocBLAS. An empty optional means the
+  // wrapper owning that stream was destroyed, so the next operation must
+  // rebind even if HIP recycles the same raw handle value.
+  std::optional<hipStream_t> current_stream_ ABSL_GUARDED_BY(mu_);
+
   // container holding solutions vector (to avoid reallocating it each time)
   std::vector<rocblas_int> solutions_;
 
@@ -192,6 +201,7 @@ class ROCMBlas : public blas::BlasSupport {
 
   bool has_mfma_ = false;
   bool use_hgemm_alt_impl_ = false;
+  bool cache_stream_state_ = true;
 };
 
 }  // namespace gpu
