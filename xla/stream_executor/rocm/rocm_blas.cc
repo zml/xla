@@ -60,6 +60,7 @@ limitations under the License.
 #include "xla/tsl/platform/macros.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/determinism.h"
+#include "xla/tsl/util/env_var.h"
 
 using tsl::OpDeterminismRequired;
 
@@ -176,6 +177,16 @@ static std::string ToString(rocblas_status status) {
 #undef XVAL
 }
 
+bool CacheRocblasStreamState() {
+  static bool cache_stream_state = [] {
+    bool disable = false;
+    CHECK_OK(tsl::ReadBoolFromEnvVar(
+        "XLA_ROCM_DISABLE_ROCBLAS_STREAM_CACHE", false, &disable));
+    return !disable;
+  }();
+  return cache_stream_state;
+}
+
 bool ROCMBlas::Init() {
   std::unique_ptr<ActivateContext> activation = parent_->Activate();
   rocblas_status ret = rocblas_create_handle(&blas_);
@@ -202,7 +213,10 @@ bool ROCMBlas::Init() {
 }
 
 ROCMBlas::ROCMBlas(StreamExecutor* parent)
-    : parent_(CHECK_NOTNULL(parent)), blas_(nullptr), blas_lt_(parent) {}
+    : parent_(CHECK_NOTNULL(parent)),
+      blas_(nullptr),
+      blas_lt_(parent),
+      cache_stream_state_(CacheRocblasStreamState()) {}
 
 ROCMBlas::~ROCMBlas() {
   if (blas_ != nullptr) {
@@ -217,13 +231,26 @@ bool ROCMBlas::SetStream(Stream *stream) {
       (stream != nullptr)
           ? static_cast<hipStream_t>(stream->platform_specific_handle().stream)
           : nullptr;
+  if (cache_stream_state_ && current_stream_ && *current_stream_ == handle) {
+    return true;
+  }
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kRocblasSetStream);
   if (auto ret = rocblas_set_stream(blas_, handle);
       ret != rocblas_status_success) {
     LOG(ERROR) << "failed to set stream for rocBLAS calls: " << ToString(ret);
     return false;
   }
+  current_stream_ = handle;
   return true;
+}
+
+void ROCMBlas::NotifyStreamDestroyed(Stream* stream) {
+  hipStream_t handle = static_cast<hipStream_t>(
+      stream->platform_specific_handle().stream);
+  absl::MutexLock lock{mu_};
+  if (current_stream_ && *current_stream_ == handle) {
+    current_stream_.reset();
+  }
 }
 
 absl::StatusOr<bool> ROCMBlas::IsMainStreamSet() const {
@@ -444,7 +471,9 @@ absl::Status ROCMBlas::DoBlasInternalImpl(FuncT rocblas_func, Stream *stream,
 #endif
 
   ret = rocblas_func(blas_, std::forward<Args>(args)...);
-  SetStream(nullptr);  // Resetting stream after the function call
+  if (!cache_stream_state_) {
+    SetStream(nullptr);
+  }
 
   if (ret != rocblas_status_success) {
     auto err_str =

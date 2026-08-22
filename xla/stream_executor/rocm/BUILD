@@ -531,6 +531,7 @@ cc_library(
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/util:determinism",
+        "//xla/tsl/util:env_var",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
@@ -542,6 +543,29 @@ cc_library(
         "@local_config_rocm//rocm:rocm_headers",
     ],
     alwayslink = True,
+)
+
+xla_test(
+    name = "rocm_blas_test",
+    srcs = ["rocm_blas_test.cc"],
+    backends = ["gpu"],
+    env = {"XLA_ROCM_PERFORMANCE_COUNTERS": "1"},
+    tags = ["rocm-only"],
+    deps = [
+        ":rocblas_plugin",
+        ":rocm_performance_counters",
+        ":rocm_platform_id",
+        "//xla/stream_executor:blas",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(
