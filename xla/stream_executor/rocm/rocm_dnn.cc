@@ -563,6 +563,12 @@ using ScopedConvolutionDescriptor =
 using ScopedPoolingDescriptor = ScopedDescriptor<miopenPoolingDescriptor_t>;
 using ScopedNormalizeDescriptor = ScopedDescriptor<miopenLRNDescriptor_t>;
 
+namespace {
+miopenDataType_t ToMIOpenDataType(
+    dnn::DataType data_type,
+    dnn::DataLayout data_layout = dnn::DataLayout::kBatchDepthYX);
+}  // namespace
+
 absl::StatusOr<ScopedTensorDescriptor> scope(
     const BatchDescriptor& batch_descriptor, miopenDataType_t data_type) {
   ScopedTensorDescriptor obj;
@@ -743,6 +749,44 @@ absl::StatusOr<ScopedConvolutionDescriptor> scope(
     }
   }
   return obj;
+}
+
+struct ScopedConvolutionDescriptors {
+  ScopedTensorDescriptor input;
+  ScopedTensorDescriptor output;
+  ScopedFilterDescriptor filter;
+  ScopedConvolutionDescriptor convolution;
+};
+
+absl::StatusOr<ScopedConvolutionDescriptors> ScopeConvolutionDescriptors(
+    dnn::ConvolutionKind kind, dnn::DataType input_type,
+    dnn::DataType output_type, const dnn::BatchDescriptor& input_descriptor,
+    const dnn::FilterDescriptor& filter_descriptor,
+    const dnn::BatchDescriptor& output_descriptor,
+    const dnn::ConvolutionDescriptor& convolution_descriptor) {
+  ASSIGN_OR_RETURN(auto input,
+                   scope(input_descriptor, ToMIOpenDataType(input_type)));
+  ASSIGN_OR_RETURN(auto output,
+                   scope(output_descriptor, ToMIOpenDataType(output_type)));
+  ASSIGN_OR_RETURN(auto filter,
+                   scope(filter_descriptor, ToMIOpenDataType(input_type)));
+  ASSIGN_OR_RETURN(auto convolution, scope(convolution_descriptor));
+
+  const bool is_backprop = kind == dnn::ConvolutionKind::BACKWARD_DATA ||
+                           kind == dnn::ConvolutionKind::BACKWARD_FILTER;
+  if (is_backprop && ToMIOpenDataType(input_type) == miopenHalf) {
+    auto status = miopenSetConvolutionAttribute(
+        convolution.handle(), MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
+    if (status != miopenStatusSuccess) {
+      return absl::InternalError(
+          "could not set MIOpen FP16 convolution implementation: " +
+          ToString(status));
+    }
+  }
+
+  return ScopedConvolutionDescriptors{std::move(input), std::move(output),
+                                      std::move(filter),
+                                      std::move(convolution)};
 }
 
 absl::StatusOr<ScopedPoolingDescriptor> scope(
@@ -1574,9 +1618,8 @@ const char* getTypeName(dnn::DataType data_type) {
   }
 }
 
-miopenDataType_t ToMIOpenDataType(
-    dnn::DataType data_type,
-    dnn::DataLayout data_layout = dnn::DataLayout::kBatchDepthYX) {
+miopenDataType_t ToMIOpenDataType(dnn::DataType data_type,
+                                  dnn::DataLayout data_layout) {
   switch (data_type) {
     case dnn::DataType::kBF16:
       return miopenBFloat16;
@@ -3121,19 +3164,27 @@ bool MIOpenSupport::GetMIOpenConvolveAlgorithms(
     const dnn::ConvolutionDescriptor& convolution_descriptor,
     ScratchAllocator* scratch_allocator,
     std::vector<dnn::ProfileResult>* out_algorithms) {
-  // TODO(rocm): Create handles only once and reuse them between the methods
-  if (!PopulateMIOpenFindDb(kind, input_type, output_type, stream,
-                            input_descriptor, input_data, filter_descriptor,
-                            filter_data, output_descriptor, output_data,
-                            convolution_descriptor, scratch_allocator)
+  auto miopen = miopen_->GetHandle(parent_, stream);
+  auto descriptors = ScopeConvolutionDescriptors(
+      kind, input_type, output_type, input_descriptor, filter_descriptor,
+      output_descriptor, convolution_descriptor);
+  if (!descriptors.ok()) {
+    return false;
+  }
+
+  if (!PopulateMIOpenFindDbWithDescriptors(
+           kind, miopen.handle(), descriptors->input.handle(), input_data,
+           descriptors->filter.handle(), filter_data,
+           descriptors->output.handle(), output_data,
+           descriptors->convolution.handle(), scratch_allocator)
            .ok()) {
     return false;
   }
-  return GetMIOpenConvolveAlgorithmsImmediateMode(
-             kind, input_type, output_type, stream, input_descriptor,
-             filter_descriptor, output_descriptor, convolution_descriptor,
-             out_algorithms,
-             /* maxSolutionCount= */ 1)
+  return GetMIOpenConvolveAlgorithmsImmediateModeWithDescriptors(
+             kind, miopen.handle(), descriptors->input.handle(),
+             descriptors->output.handle(), descriptors->filter.handle(),
+             descriptors->convolution.handle(), out_algorithms,
+             /*max_solution_count=*/1)
       .ok();
 }
 
@@ -3146,29 +3197,30 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
     const dnn::ConvolutionDescriptor& convolution_descriptor,
     std::vector<dnn::ProfileResult>* out_algorithms, size_t maxSolutionCount) {
   auto miopen = miopen_->GetHandle(parent_, stream);
+  ASSIGN_OR_RETURN(auto descriptors,
+                   ScopeConvolutionDescriptors(
+                       kind, input_type, output_type, input_descriptor,
+                       filter_descriptor, output_descriptor,
+                       convolution_descriptor));
+  return GetMIOpenConvolveAlgorithmsImmediateModeWithDescriptors(
+      kind, miopen.handle(), descriptors.input.handle(),
+      descriptors.output.handle(), descriptors.filter.handle(),
+      descriptors.convolution.handle(), out_algorithms, maxSolutionCount);
+}
 
-  ASSIGN_OR_RETURN(auto input_nd,
-                   scope(input_descriptor, ToMIOpenDataType(input_type)));
-  ASSIGN_OR_RETURN(auto output_nd,
-                   scope(output_descriptor, ToMIOpenDataType(output_type)));
-  ASSIGN_OR_RETURN(auto filter,
-                   scope(filter_descriptor, ToMIOpenDataType(input_type)));
-  ASSIGN_OR_RETURN(auto conv, scope(convolution_descriptor));
-
-  bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
-                      (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
-
-  if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
-    miopenSetConvolutionAttribute(conv.handle(),
-                                  MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
-  }
+absl::Status
+MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateModeWithDescriptors(
+    dnn::ConvolutionKind kind, miopenHandle_t handle,
+    miopenTensorDescriptor_t input, miopenTensorDescriptor_t output,
+    miopenTensorDescriptor_t filter,
+    miopenConvolutionDescriptor_t convolution,
+    std::vector<dnn::ProfileResult>* out_algorithms, size_t maxSolutionCount) {
 
   if (maxSolutionCount == -1) {
     switch (kind) {
       case dnn::ConvolutionKind::FORWARD: {
         auto status = miopenConvolutionForwardGetSolutionCount(
-            miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-            output_nd.handle(), &maxSolutionCount);
+            handle, filter, input, convolution, output, &maxSolutionCount);
         if (status != miopenStatusSuccess) {
           return absl::InternalError(
               "call to miopenConvolutionForwardGetSolutionCount failed: " +
@@ -3178,8 +3230,7 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
       }
       case dnn::ConvolutionKind::BACKWARD_DATA: {
         auto status = miopenConvolutionBackwardDataGetSolutionCount(
-            miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-            input_nd.handle(), &maxSolutionCount);
+            handle, output, filter, convolution, input, &maxSolutionCount);
         if (status != miopenStatusSuccess) {
           return absl::InternalError(
               "call to miopenConvolutionBackwardDataGetSolutionCount "
@@ -3190,8 +3241,7 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
       }
       case dnn::ConvolutionKind::BACKWARD_FILTER: {
         auto status = miopenConvolutionBackwardWeightsGetSolutionCount(
-            miopen.handle(), output_nd.handle(), input_nd.handle(),
-            conv.handle(), filter.handle(), &maxSolutionCount);
+            handle, output, input, convolution, filter, &maxSolutionCount);
         if (status != miopenStatusSuccess) {
           return absl::InternalError(
               "call to miopenConvolutionBackwardWeightsGetSolutionCount "
@@ -3217,9 +3267,8 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
   switch (kind) {
     case dnn::ConvolutionKind::FORWARD: {
       auto status = miopenConvolutionForwardGetSolution(
-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-          output_nd.handle(), maxSolutionCount, &solutionCount,
-          solutions.get());
+          handle, filter, input, convolution, output, maxSolutionCount,
+          &solutionCount, solutions.get());
 
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
@@ -3231,8 +3280,8 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
 
     case dnn::ConvolutionKind::BACKWARD_DATA: {
       auto status = miopenConvolutionBackwardDataGetSolution(
-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-          input_nd.handle(), maxSolutionCount, &solutionCount, solutions.get());
+          handle, output, filter, convolution, input, maxSolutionCount,
+          &solutionCount, solutions.get());
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
             "call to miopenConvolutionBackwardDataGetSolution failed: " +
@@ -3242,8 +3291,8 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
     }
     case dnn::ConvolutionKind::BACKWARD_FILTER: {
       auto status = miopenConvolutionBackwardWeightsGetSolution(
-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
-          filter.handle(), maxSolutionCount, &solutionCount, solutions.get());
+          handle, output, input, convolution, filter, maxSolutionCount,
+          &solutionCount, solutions.get());
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
             "call to miopenConvolutionBackwardWeightsGetSolution failed: " +
@@ -3275,41 +3324,19 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
   return absl::OkStatus();
 }
 
-absl::Status MIOpenSupport::PopulateMIOpenFindDb(
-    dnn::ConvolutionKind kind, dnn::DataType input_type,
-    dnn::DataType output_type, Stream* stream,
-    const dnn::BatchDescriptor& input_descriptor, DeviceAddressBase input_data,
-    const dnn::FilterDescriptor& filter_descriptor,
-    DeviceAddressBase filter_data,
-    const dnn::BatchDescriptor& output_descriptor,
-    DeviceAddressBase output_data,
-    const dnn::ConvolutionDescriptor& convolution_descriptor,
+absl::Status MIOpenSupport::PopulateMIOpenFindDbWithDescriptors(
+    dnn::ConvolutionKind kind, miopenHandle_t handle,
+    miopenTensorDescriptor_t input, DeviceAddressBase input_data,
+    miopenTensorDescriptor_t filter, DeviceAddressBase filter_data,
+    miopenTensorDescriptor_t output, DeviceAddressBase output_data,
+    miopenConvolutionDescriptor_t convolution,
     ScratchAllocator* scratch_allocator) {
-  auto miopen = miopen_->GetHandle(parent_, stream);
-
-  ASSIGN_OR_RETURN(auto input_nd,
-                   scope(input_descriptor, ToMIOpenDataType(input_type)));
-  ASSIGN_OR_RETURN(auto output_nd,
-                   scope(output_descriptor, ToMIOpenDataType(output_type)));
-  ASSIGN_OR_RETURN(auto filter,
-                   scope(filter_descriptor, ToMIOpenDataType(input_type)));
-  ASSIGN_OR_RETURN(auto conv, scope(convolution_descriptor));
-
-  bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
-                      (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
-
-  if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
-    miopenSetConvolutionAttribute(conv.handle(),
-                                  MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
-  }
-
   // Determine the workspace memory size that will need by the call to Find
   size_t scratch_memory_size = 0;
   switch (kind) {
     case dnn::ConvolutionKind::FORWARD: {
       auto status = miopenConvolutionForwardGetWorkSpaceSize(
-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-          output_nd.handle(), &scratch_memory_size);
+          handle, filter, input, convolution, output, &scratch_memory_size);
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
             "call to miopenConvolutionForwardGetWorkspaceSize failed: " +
@@ -3319,8 +3346,7 @@ absl::Status MIOpenSupport::PopulateMIOpenFindDb(
     }
     case dnn::ConvolutionKind::BACKWARD_DATA: {
       auto status = miopenConvolutionBackwardDataGetWorkSpaceSize(
-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-          input_nd.handle(), &scratch_memory_size);
+          handle, output, filter, convolution, input, &scratch_memory_size);
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
             "call to miopenConvolutionBackwardDataGetWorkspaceSize failed: " +
@@ -3330,8 +3356,7 @@ absl::Status MIOpenSupport::PopulateMIOpenFindDb(
     }
     case dnn::ConvolutionKind::BACKWARD_FILTER: {
       auto status = miopenConvolutionBackwardWeightsGetWorkSpaceSize(
-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
-          filter.handle(), &scratch_memory_size);
+          handle, output, input, convolution, filter, &scratch_memory_size);
       if (status != miopenStatusSuccess) {
         return absl::InternalError(
             "call to miopenConvolutionBackwardWeightsGetWorkspaceSize "
@@ -3379,9 +3404,8 @@ absl::Status MIOpenSupport::PopulateMIOpenFindDb(
   switch (kind) {
     case dnn::ConvolutionKind::FORWARD: {
       auto status = miopenFindConvolutionForwardAlgorithm(
-          miopen.handle(), input_nd.handle(), input_data.opaque(),
-          filter.handle(), filter_data.opaque(), conv.handle(),
-          output_nd.handle(), output_data.opaque(), requestedAlgorithmCount,
+          handle, input, input_data.opaque(), filter, filter_data.opaque(),
+          convolution, output, output_data.opaque(), requestedAlgorithmCount,
           &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
           scratch_memory_size, exhaustiveSearch);
       if (status != miopenStatusSuccess) {
@@ -3393,9 +3417,8 @@ absl::Status MIOpenSupport::PopulateMIOpenFindDb(
     }
     case dnn::ConvolutionKind::BACKWARD_DATA: {
       auto status = miopenFindConvolutionBackwardDataAlgorithm(
-          miopen.handle(), output_nd.handle(), output_data.opaque(),
-          filter.handle(), filter_data.opaque(), conv.handle(),
-          input_nd.handle(), input_data.opaque(), requestedAlgorithmCount,
+          handle, output, output_data.opaque(), filter, filter_data.opaque(),
+          convolution, input, input_data.opaque(), requestedAlgorithmCount,
           &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
           scratch_memory_size, exhaustiveSearch);
       if (status != miopenStatusSuccess) {
@@ -3407,9 +3430,8 @@ absl::Status MIOpenSupport::PopulateMIOpenFindDb(
     }
     case dnn::ConvolutionKind::BACKWARD_FILTER: {
       auto status = miopenFindConvolutionBackwardWeightsAlgorithm(
-          miopen.handle(), output_nd.handle(), output_data.opaque(),
-          input_nd.handle(), input_data.opaque(), conv.handle(),
-          filter.handle(), filter_data.opaque(), requestedAlgorithmCount,
+          handle, output, output_data.opaque(), input, input_data.opaque(),
+          convolution, filter, filter_data.opaque(), requestedAlgorithmCount,
           &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
           scratch_memory_size, exhaustiveSearch);
       if (status != miopenStatusSuccess) {
