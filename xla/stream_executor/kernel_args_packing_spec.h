@@ -61,7 +61,7 @@ class KernelArgPackingSpec {
   // must contain at least the number of arguments referenced in the packing
   // spec, otherwise an error will be returned.
   absl::StatusOr<std::vector<char>> BuildArgument(
-      absl::Span<const std::unique_ptr<PackedArgBase>> args) const;
+      absl::Span<const PackedArgBase* const> args) const;
 
   // Builds KernelArgPackingSpec that refers to the given arg number.
   static KernelArgPackingSpec BuildArgRelocation(int argument_index);
@@ -167,7 +167,7 @@ class KernelArgsPackingSpec {
   // must contain at least the number of arguments referenced in the packing
   // spec, otherwise an error will be returned.
   absl::StatusOr<std::unique_ptr<KernelArgsPackedVector>> BuildArguments(
-      absl::Span<const std::unique_ptr<PackedArgBase>> args,
+      absl::Span<const PackedArgBase* const> args,
       size_t shared_memory_bytes) const;
 
   absl::StatusOr<KernelArgsPackingSpecProto> ToProto() const;
