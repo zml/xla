@@ -267,16 +267,19 @@ class MIOpenSupport : public dnn::DnnSupport {
       const dnn::ConvolutionDescriptor& convolution_descriptor,
       std::vector<dnn::ProfileResult>* out_algorithms, size_t maxSolutionCount);
 
-  absl::Status PopulateMIOpenFindDb(
-      dnn::ConvolutionKind kind, dnn::DataType input_type,
-      dnn::DataType output_type, Stream* stream,
-      const dnn::BatchDescriptor& input_descriptor,
-      DeviceAddressBase input_data,
-      const dnn::FilterDescriptor& filter_descriptor,
-      DeviceAddressBase filter_data,
-      const dnn::BatchDescriptor& output_descriptor,
-      DeviceAddressBase output_data,
-      const dnn::ConvolutionDescriptor& convolution_descriptor,
+  absl::Status GetMIOpenConvolveAlgorithmsImmediateModeWithDescriptors(
+      dnn::ConvolutionKind kind, miopenHandle_t handle,
+      miopenTensorDescriptor_t input, miopenTensorDescriptor_t output,
+      miopenTensorDescriptor_t filter,
+      miopenConvolutionDescriptor_t convolution,
+      std::vector<dnn::ProfileResult>* out_algorithms, size_t max_solution_count);
+
+  absl::Status PopulateMIOpenFindDbWithDescriptors(
+      dnn::ConvolutionKind kind, miopenHandle_t handle,
+      miopenTensorDescriptor_t input, DeviceAddressBase input_data,
+      miopenTensorDescriptor_t filter, DeviceAddressBase filter_data,
+      miopenTensorDescriptor_t output, DeviceAddressBase output_data,
+      miopenConvolutionDescriptor_t convolution,
       ScratchAllocator* scratch_allocator);
 
   bool GetRnnAlgorithms(
