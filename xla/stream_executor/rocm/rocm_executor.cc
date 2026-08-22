@@ -461,10 +461,13 @@ void DeviceDeallocate(Context* context, void* location) {
 absl::StatusOr<void*> HostAllocate(Context* context, uint64_t bytes) {
   ScopedActivateContext activation(context);
   void* host_mem = nullptr;
-  // "Portable" memory is visible to all ROCM contexts. Safe for our use model.
-  RETURN_IF_ERROR(
-      ToStatus(hipHostMalloc(&host_mem, bytes, hipHostMallocPortable),
-               "failed to allocate host memory"));
+  // "Portable" memory is visible to all ROCM contexts. Coherent host memory
+  // avoids the extra synchronization cost of small host-to-device transfers on
+  // AMD GPUs, and is also safe for host/device synchronization words.
+  RETURN_IF_ERROR(ToStatus(
+      hipHostMalloc(&host_mem, bytes,
+                    hipHostMallocPortable | hipHostMallocCoherent),
+      "failed to allocate host memory"));
   VLOG(2) << "allocated " << host_mem << " for context " << context << " of "
           << bytes << " bytes of host memory";
   return host_mem;
