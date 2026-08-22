@@ -463,26 +463,60 @@ absl::Status RocmStream::Memcpy(void* host_dst,
 }
 
 namespace {
-void InternalHostCallback(void* data) {
-  auto* callback = reinterpret_cast<absl::AnyInvocable<void() &&>*>(data);
-  std::move (*callback)();
-  delete callback;
+struct RocmHostCallbackState {
+  absl::AnyInvocable<absl::Status() &&> callback;
+  absl::AnyInvocable<void(absl::Status) &&> error_callback;
+};
+
+void ReportHostCallbackError(
+    absl::AnyInvocable<void(absl::Status) &&> error_callback,
+    absl::Status status) {
+  if (error_callback) {
+    std::move(error_callback)(std::move(status));
+  } else {
+    LOG(WARNING) << "Host callback failed: " << status;
+  }
+}
+
+void InternalHostCallback(hipStream_t /*stream*/, hipError_t stream_status,
+                          void* data) {
+  std::unique_ptr<RocmHostCallbackState> state(
+      static_cast<RocmHostCallbackState*>(data));
+  if (stream_status != hipSuccess) {
+    ReportHostCallbackError(
+        std::move(state->error_callback),
+        ToStatus(stream_status, "HIP stream failed before host callback"));
+    return;
+  }
+
+  absl::Status status = std::move(state->callback)();
+  if (!status.ok()) {
+    ReportHostCallbackError(std::move(state->error_callback),
+                            std::move(status));
+  }
 }
 }  // namespace
 
 absl::Status RocmStream::DoHostCallbackWithStatus(
     absl::AnyInvocable<absl::Status() &&> callback) {
-  auto callback_ptr =
-      new absl::AnyInvocable<void() &&>([cb = std::move(callback)]() mutable {
-        absl::Status s = std::move(cb)();
-        if (!s.ok()) {
-          LOG(WARNING) << "Host callback failed: " << s;
-        }
-      });
-  return ToStatus(
-      hipLaunchHostFunc(stream_handle_, (hipHostFn_t)InternalHostCallback,
-                        callback_ptr),
-      "unable to add host callback");
+  return DoHostCallbackWithStatus(std::move(callback), nullptr);
+}
+
+absl::Status RocmStream::DoHostCallbackWithStatus(
+    absl::AnyInvocable<absl::Status() &&> callback,
+    absl::AnyInvocable<void(absl::Status) &&> error_cb) {
+  auto* state =
+      new RocmHostCallbackState{std::move(callback), std::move(error_cb)};
+  hipError_t result =
+      hipStreamAddCallback(stream_handle_, InternalHostCallback, state, 0);
+  if (result == hipSuccess) {
+    return absl::OkStatus();
+  }
+
+  absl::Status status = ToStatus(result, "unable to add host callback");
+  ReportHostCallbackError(std::move(state->error_callback), status);
+  delete state;
+  return status;
 }
 
 namespace {

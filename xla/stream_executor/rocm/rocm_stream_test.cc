@@ -196,6 +196,50 @@ TEST_F(RocmStreamTest, DoHostCallback) {
   EXPECT_TRUE(callback_called);
 }
 
+TEST_F(RocmStreamTest, DoHostCallbackWithStatusSuccess) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<RocmStream> stream,
+                          RocmStream::Create(&executor_.value(),
+                                             /*priority=*/std::nullopt));
+
+  bool callback_called = false;
+  bool error_callback_called = false;
+  EXPECT_THAT(stream->DoHostCallbackWithStatus(
+                  [&callback_called]() {
+                    callback_called = true;
+                    return absl::OkStatus();
+                  },
+                  [&error_callback_called](absl::Status) {
+                    error_callback_called = true;
+                  }),
+              absl_testing::IsOk());
+
+  EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
+  EXPECT_TRUE(callback_called);
+  EXPECT_FALSE(error_callback_called);
+}
+
+TEST_F(RocmStreamTest, DoHostCallbackWithStatusError) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<RocmStream> stream,
+                          RocmStream::Create(&executor_.value(),
+                                             /*priority=*/std::nullopt));
+
+  bool error_callback_called = false;
+  absl::Status callback_status;
+  EXPECT_THAT(stream->DoHostCallbackWithStatus(
+                  []() { return absl::InternalError("Test error"); },
+                  [&error_callback_called, &callback_status](absl::Status s) {
+                    error_callback_called = true;
+                    callback_status = std::move(s);
+                  }),
+              absl_testing::IsOk());
+
+  EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
+  EXPECT_TRUE(error_callback_called);
+  EXPECT_THAT(callback_status,
+              absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                     "Test error"));
+}
+
 TEST_F(RocmStreamTest, LaunchKernel) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<RocmStream> stream,
                           RocmStream::Create(&executor_.value(),
