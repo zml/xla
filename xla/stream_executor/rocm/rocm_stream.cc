@@ -102,11 +102,10 @@ HipStreamHandleCache& GetHipStreamHandleCache() {
 
 absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
                                          int priority) {
-  // XLA always creates streams with hipStreamDefault. This constant is used
-  // as part of the cache key so that if the flag changes in the future the
-  // cache will not silently return a handle with the wrong synchronisation
-  // semantics.
-  constexpr unsigned int kFlags = hipStreamDefault;
+  // StreamExecutor expresses dependencies with events and does not rely on
+  // legacy null-stream synchronization. Match CUDA's nonblocking stream
+  // semantics and include the flag in the cache key.
+  constexpr unsigned int kFlags = hipStreamNonBlocking;
 
   // Check the cache for an idle handle with matching (device, flags, priority).
   {
@@ -128,13 +127,12 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
   auto activation = ActivateRocm(executor);
   hipStream_t stream;
   if (priority == 0) {
-    ABSL_RETURN_IF_ERROR(ToStatus(
-        hipStreamCreateWithFlags(&stream, hipStreamDefault),
-        "Failed to create stream"));  // switch to hipStreamNonBlocking?
+    ABSL_RETURN_IF_ERROR(ToStatus(hipStreamCreateWithFlags(&stream, kFlags),
+                                  "Failed to create stream"));
   } else {
     ABSL_RETURN_IF_ERROR(ToStatus(
-        hipStreamCreateWithPriority(&stream, hipStreamDefault, priority),
-        "Failed to create stream"));  // switch to hipStreamNonBlocking?
+        hipStreamCreateWithPriority(&stream, kFlags, priority),
+        "Failed to create stream"));
   }
 
   VLOG(2) << "successfully created stream " << stream << " for device "
