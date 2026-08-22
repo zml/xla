@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "absl/functional/any_invocable.h"
@@ -180,7 +181,12 @@ class RocmCommandBuffer : public GpuCommandBuffer {
   StreamExecutor* stream_exec_ = nullptr;
   hipGraph_t graph_ = nullptr;
   bool is_owned_graph_ = true;
+  bool was_traced_ = false;
   hipGraphExec_t exec_ = nullptr;
+  // HIP 7.14 can transplant opaque captured kernel parameters into a parent
+  // graph. Remember the resulting direct nodes so updates use the matching
+  // executable-kernel API instead of the slower child-graph API.
+  std::unordered_set<hipGraphNode_t> flattened_child_kernels_;
 };
 
 }  // namespace stream_executor::gpu

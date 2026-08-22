@@ -202,6 +202,66 @@ TEST(GpuCommandBufferTest, TraceEmptyChildCommand) {
   ASSERT_OK(stream->BlockHostUntilDone());
 }
 
+TEST(GpuCommandBufferTest, UpdateCapturedSingleKernelChildCommand) {
+  Platform* platform = GpuPlatform();
+  StreamExecutor* executor = platform->ExecutorForDevice(0).value();
+
+  if (executor->GetPlatform()->id() == cuda::kCudaPlatformId &&
+      !IsAtLeastCuda12300(executor)) {
+    GTEST_SKIP() << "Command buffer tracing is supported after CUDA 12.3";
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
+  TF_ASSERT_OK_AND_ASSIGN(auto add, LoadAddI32TestKernel(executor));
+
+  int64_t length = 4;
+  int64_t byte_length = sizeof(int32_t) * length;
+  DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
+  DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
+  DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
+  DeviceAddress<int32_t> d = executor->AllocateArray<int32_t>(length, 0);
+
+  TF_ASSERT_OK(stream->Memset32(&a, 1, byte_length));
+  TF_ASSERT_OK(stream->Memset32(&b, 2, byte_length));
+  TF_ASSERT_OK(stream->MemZero(&c, byte_length));
+  TF_ASSERT_OK(stream->MemZero(&d, byte_length));
+
+  auto trace_add = [&](DeviceAddress<int32_t> output) {
+    return TraceCommandBufferFactory::Create(
+        executor, stream.get(),
+        [&](Stream* capture_stream) {
+          KernelArgsDeviceAddressArray args({a, b, output}, 0);
+          return add->Launch(ThreadDim(), BlockDim(4), capture_stream, args);
+        },
+        nested);
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(auto traced_c, trace_add(c));
+  TF_ASSERT_OK_AND_ASSIGN(auto primary_cmd,
+                          executor->CreateCommandBuffer(primary));
+  TF_ASSERT_OK_AND_ASSIGN(auto* child,
+                          primary_cmd->CreateChildCommand(*traced_c, {}));
+  traced_c.reset();
+  TF_ASSERT_OK(primary_cmd->Finalize());
+  TF_ASSERT_OK(primary_cmd->Submit(stream.get()));
+
+  std::vector<int32_t> dst(4, 42);
+  TF_ASSERT_OK(stream->Memcpy(dst.data(), c, byte_length));
+  std::vector<int32_t> expected = {3, 3, 3, 3};
+  ASSERT_EQ(dst, expected);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto traced_d, trace_add(d));
+  TF_ASSERT_OK(primary_cmd->Update());
+  TF_ASSERT_OK(primary_cmd->UpdateChildCommand(child, *traced_d));
+  traced_d.reset();
+  TF_ASSERT_OK(primary_cmd->Finalize());
+  TF_ASSERT_OK(primary_cmd->Submit(stream.get()));
+
+  std::fill(dst.begin(), dst.end(), 42);
+  TF_ASSERT_OK(stream->Memcpy(dst.data(), d, byte_length));
+  ASSERT_EQ(dst, expected);
+}
+
 TEST(GpuCommandBufferTest, LaunchNestedCommandBuffer) {
   Platform* platform = GpuPlatform();
   StreamExecutor* executor = platform->ExecutorForDevice(0).value();

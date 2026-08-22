@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -52,6 +53,18 @@ limitations under the License.
 
 namespace stream_executor::gpu {
 namespace {
+
+// ROCm 7.14 supports copying opaque parameters out of captured kernel nodes.
+// Keep an environment rollback while this fast path gains production mileage.
+bool FlattenSingleKernelChildGraphs() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("XLA_ROCM_FLATTEN_SINGLE_KERNEL_CHILD_GRAPHS");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled;
+}
+
 absl::StatusOr<hipGraph_t> CreateGraph() {
   VLOG(2) << "Create new HIP graph";
   hipGraph_t graph;
@@ -241,6 +254,38 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateClonedChildNode(
 
   std::vector<hipGraphNode_t> deps = ToHipGraphHandles(dependencies);
 
+  if (FlattenSingleKernelChildGraphs() && child_command_buffer.was_traced_) {
+    size_t child_node_count = 0;
+    hipError_t result =
+        hipGraphGetNodes(child_graph, nullptr, &child_node_count);
+    if (result == hipSuccess && child_node_count == 1) {
+      hipGraphNode_t child_node = nullptr;
+      size_t node_capacity = 1;
+      hipGraphNodeType node_type = hipGraphNodeTypeEmpty;
+      result = hipGraphGetNodes(child_graph, &child_node, &node_capacity);
+      if (result == hipSuccess) {
+        result = hipGraphNodeGetType(child_node, &node_type);
+      }
+      if (result == hipSuccess && node_type == hipGraphNodeTypeKernel) {
+        hipKernelNodeParams params{};
+        result = hipGraphKernelNodeGetParams(child_node, &params);
+        if (result == hipSuccess) {
+          hipGraphNode_t node_handle = nullptr;
+          IncrementRocmPerformanceCounter(
+              RocmPerformanceCounter::kGraphNodeCreateKernel);
+          result = hipGraphAddKernelNode(&node_handle, graph_, deps.data(),
+                                         deps.size(), &params);
+          if (result == hipSuccess) {
+            flattened_child_kernels_.insert(node_handle);
+            return FromHipGraphHandle(node_handle);
+          }
+        }
+      }
+    }
+    VLOG(3) << "Single-kernel child graph flattening is not applicable; "
+               "falling back to a child graph node";
+  }
+
   hipGraphNode_t node_handle = nullptr;
   IncrementRocmPerformanceCounter(
       RocmPerformanceCounter::kGraphNodeCreateChild);
@@ -261,13 +306,49 @@ absl::Status RocmCommandBuffer::UpdateClonedChildNode(
   hipGraph_t child_graph =
       absl::down_cast<const RocmCommandBuffer&>(nested).graph_;
 
+  hipGraphNode_t hip_node_handle = ToHipGraphHandle(node_handle);
+  if (flattened_child_kernels_.find(hip_node_handle) !=
+      flattened_child_kernels_.end()) {
+    size_t child_node_count = 0;
+    RETURN_IF_ERROR(
+        ToStatus(hipGraphGetNodes(child_graph, nullptr, &child_node_count),
+                 "Failed to query flattened child graph node count"));
+    if (child_node_count != 1) {
+      return absl::InternalError(
+          "Flattened child graph topology changed during update");
+    }
+
+    hipGraphNode_t child_node = nullptr;
+    size_t node_capacity = 1;
+    RETURN_IF_ERROR(
+        ToStatus(hipGraphGetNodes(child_graph, &child_node, &node_capacity),
+                 "Failed to get flattened child graph kernel node"));
+    hipGraphNodeType node_type = hipGraphNodeTypeEmpty;
+    RETURN_IF_ERROR(ToStatus(hipGraphNodeGetType(child_node, &node_type),
+                             "Failed to get flattened child graph node type"));
+    if (node_type != hipGraphNodeTypeKernel) {
+      return absl::InternalError(
+          "Flattened child graph kernel changed node type during update");
+    }
+
+    hipKernelNodeParams params{};
+    RETURN_IF_ERROR(
+        ToStatus(hipGraphKernelNodeGetParams(child_node, &params),
+                 "Failed to get flattened child graph kernel parameters"));
+    IncrementRocmPerformanceCounter(
+        RocmPerformanceCounter::kGraphNodeUpdateKernel);
+    return ToStatus(
+        hipGraphExecKernelNodeSetParams(exec_, hip_node_handle, &params),
+        "Failed to update flattened child graph kernel node");
+  }
+
   VLOG(2) << "Set child node params " << node_handle << " in graph executable "
           << exec_ << "to params contained in " << child_graph;
 
   IncrementRocmPerformanceCounter(
       RocmPerformanceCounter::kGraphNodeUpdateChild);
   return ToStatus(hipGraphExecChildGraphNodeSetParams(
-                      exec_, ToHipGraphHandle(node_handle), child_graph),
+                      exec_, hip_node_handle, child_graph),
                   "Failed to set HIP graph child node params");
 }
 
@@ -429,6 +510,8 @@ absl::Status RocmCommandBuffer::Trace(
     ASSIGN_OR_RETURN(auto* empty, CreateEmptyCmd({}, StreamPriority::Default));
     (void)empty;
   }
+
+  was_traced_ = true;
 
   return absl::OkStatus();
 }
