@@ -8,7 +8,7 @@
 // @mlx archive pinned in //third_party/mlx:workspace.bzl, which
 // MetalIncludeRoot() hands to the Metal compiler as -I. So the compiler reads
 // upstream's bytes and "verbatim" is true by construction. To change upstream's
-// bytes, add a patch to //third_party/mlx:series.bzl, where a bump re-verifies
+// bytes, add a patch to //third_party/mlx:workspace.bzl, where a bump re-verifies
 // it at fetch time.
 //
 // The includes are the first three lines of upstream's own prologue, copied from
@@ -29,13 +29,21 @@
 // Everything below is OURS: the block-FP8 / NVFP4 / MoE loaders, impls and entry
 // points that have no upstream counterpart, plus two adaptations of upstream
 // bodies that are marked XLA DELTA at their definitions -- XlaQuantizedBlockLoader
-// (a rename-fork) and the dequantize_scale_mx / DequantizeMx pair.
+// (a rename-fork) and the mlx_fp8_e4m3 / mlx_fp8_e8m0 / mlx_fp4_e2m1 renamed
+// copies of upstream's value+scale decodes.
 //
-// This bundle ships the dense block-FP8 path Qwen3.6-27B-FP8 decodes on
-// (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk), the MoE block-FP8 gather path
-// (fp8_gather_qmm_rhs via MetalMoeGemvThunk / __metal$moe_gemm$f8), and the
-// NVFP4 MoE path gemma-4-26B-A4B-NVFP4 decodes on (nvfp4_gather_qmm_rhs via
-// MetalMoeGemvThunk). Dense + MoE FP8 share Fp8BlockLoader.
+// This bundle is the TILED half of the Metal q-GEMM family -- the thin-M / b==1
+// decode legs live in the qmv bundles beside it, not here. It ships:
+//   * dense block-FP8 for b > 1 (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk,
+//     which routes b == 1 to the fp8_gemv / fp8_gemv_pc bundles instead),
+//   * dense MXFP8 / MXFP4 prefill (mxfp8_qmm_t / mxfp4_qmm_t via
+//     MetalMxMatmulThunk, whose decode leg is mlx_mxfp_qmv.h),
+//   * dense NVFP4 (nvfp4_qmm_t[_alN], the split-K pair and nvfp4_splitk_sum,
+//     via MetalNvfp4MatmulThunk),
+//   * the MoE Steel gathers (fp8_gather_qmm_rhs, nvfp4_gather_qmm_rhs and
+//     bf16_gather_mm_rhs via MetalMoeGemvThunk / __metal$moe_gemm*); that thunk
+//     owns which of its legs a given R and expert count takes.
+// Dense + MoE FP8 share Fp8BlockLoader.
 //
 // NOTE: this bundle is a standalone TU compiled by CompileMetalSourceToMetallib.
 // It is a .h rather than a .metal only to match the family's convention -- the
@@ -83,17 +91,6 @@ static inline float decode_e4m3fn(uchar b) {
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
-
-// NVFP4 MoE only: whether the call carries a trailing f32[E] per-expert global
-// scale (the compressed-tensors weight-encode divisor). When unset, no buffer
-// is bound and nvfp4_gather_qmm_rhs behaves exactly as before. The MX entries
-// never reference this constant.
-//
-// XLA DELTA: 440 is the same logical constant as mlx_fp4_qmv.h's; both bundles
-// bind it from MetalMoeGemvThunk. It sits in our 4xx range because upstream MLX
-// owns 0-26, 100, 101, 110, 199, 200-202 and 300-302 across its kernel tree, and
-// our custom/ shaders already number from 420. Never allocate ours below 400.
-constant bool moe_has_global_scale [[function_constant(440)]];
 
 ///////////////////////////////////////////////////////////////////////////////
 // Fp8BlockLoader — DeepSeek 128x128-block adaptation of MLX QuantizedBlockLoader
@@ -552,28 +549,28 @@ METAL_FUNC void fp_gather_qmm_rhs_impl(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
-
-///////////////////////////////////////////////////////////////////////////////
-// NVFP4 tiled q-GEMM (prefill) -- the 1-D group-scale family.
+// The 1-D group-scale q-GEMM family: MXFP8 / MXFP4 (OCP microscaling, group-32
+// E8M0 scales) AND NVFP4 (group-16 E4M3 scales). Everything under this banner
+// is shared by both -- dequantize_scale_mx picks the scale decode off
+// group_size, DequantizeMx picks the weight decode off bits, and
+// XlaQuantizedBlockLoader / mxfp_qmm_t_impl are instantiated by the nvfp4_qmm_t
+// entries as well as the mxfp8_/mxfp4_ ones. Editing anything here moves NVFP4
+// too; the `mxfp_` / `_mx` names are historical.
 //
 // Unlike the DeepSeek Fp8BlockLoader above (128x128 bf16 block scale), this is
-// MLX's ORIGINAL fp_quantized path: a per-(output-row, K-group) uint8 scale and
-// a sub-byte weight. The helpers XlaQuantizedBlockLoader / mxfp_qmm_t_impl are
-// derived from MLX's fp8.h / fp4.h / fp_quantized.h, with XLA constant-buffer
-// ABI, rectangular-tile bounds, and K tail handling, reusing the same Steel
-// BlockMMA / BlockLoader core.
-//
-// This family was written for OCP microscaling (mxfp8/mxfp4: group-32 E8M0
-// scales), hence the mxfp_/`_mx` names throughout. Those entries are gone -- no
-// model emits e8m0 -- and NVFP4 (group-16 e4m3 scales, E2M1 weights) is the only
-// scheme left instantiating them.
+// MLX's ORIGINAL fp_quantized path: one uint8 scale per (output row, K group)
+// -- E8M0 at group 32, E4M3 at group 16 -- over an E4M3 (mxfp8) or E2M1
+// (mxfp4 / nvfp4) weight. The dequant helpers
+// XlaQuantizedBlockLoader / mxfp_qmm_t_impl are derived from MLX's fp8.h /
+// fp4.h / fp_quantized.h, with XLA constant-buffer ABI, rectangular-tile
+// bounds, and K tail handling, reusing the same Steel BlockMMA / BlockLoader
+// core.
 ///////////////////////////////////////////////////////////////////////////////
 
 // fp8.h / fp4.h value+scale decodes (verbatim, MLX numerics).
 //
-// XLA DELTA: these are renamed copies of upstream's fp8_e4m3 / fp4_e2m1
-// (fp8.h, fp4.h), reachable only through fp_quantized.h -- which this
+// XLA DELTA: these are renamed copies of upstream's fp8_e4m3 / fp8_e8m0 /
+// fp4_e2m1 (fp8.h, fp4.h), reachable only through fp_quantized.h -- which this
 // TU deliberately does not include (see the file header). The `mlx_` prefix is
 // a flattening artifact from when this bundle was one TU with the Steel span
 // and the names collided; it is NOT a fork. Each body is upstream's, and each
@@ -592,6 +589,14 @@ struct mlx_fp8_e4m3 {
   operator bfloat() { return static_cast<bfloat>(this->operator float()); }
   uint8_t bits;
 };
+struct mlx_fp8_e8m0 {
+  operator float() {
+    uint32_t out = (bits == 0 ? 0x400000 : (static_cast<uint16_t>(bits) << 23));
+    return as_type<float>(out);
+  }
+  operator bfloat() { return static_cast<bfloat>(this->operator float()); }
+  uint8_t bits;
+};
 struct mlx_fp4_e2m1 {
   operator float() {
     half converted = as_type<half>(ushort((bits & 7) << 9));
@@ -602,44 +607,35 @@ struct mlx_fp4_e2m1 {
   uint8_t bits;
 };
 
-// NVFP4's group-16 e4m3 scale decode. The E8M0 arm (group_size 32) went with
-// the mxfp entries; static_assert rather than a silent fallthrough, so adding a
-// group size back is a compile error and not a wrong answer.
 template <typename T, int group_size>
 static inline T dequantize_scale_mx(uint8_t s) {
-  static_assert(group_size == 16, "only NVFP4 group-16 e4m3 scales remain");
-  return T(*(thread mlx_fp8_e4m3*)(&s));
+  if (group_size == 16) {
+    return T(*(thread mlx_fp8_e4m3*)(&s));
+  } else {
+    return T(*(thread mlx_fp8_e8m0*)(&s));
+  }
 }
 
-// NVFP4 weight decode. The bits==8 arm decoded mxfp8's e4m3 WEIGHTS (not to be
-// confused with e4m3 SCALES above) and went with the mxfp entries.
 template <int bits, typename U = float>
 struct DequantizeMx {
   U operator()(uint8_t x) {
-    static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-    return U(*(thread mlx_fp4_e2m1*)(&x));
+    if (bits == 8) {
+      return U(*(thread mlx_fp8_e4m3*)(&x));
+    } else {
+      return U(*(thread mlx_fp4_e2m1*)(&x));
+    }
   }
 };
 
 template <typename U, int bits>
 inline void dequantize_mx(uint8_t w, U scale, threadgroup U* w_local) {
-  static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-  w_local[0] = scale * DequantizeMx<4, U>{}(w);
-  w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
+  if (bits == 4) {
+    w_local[0] = scale * DequantizeMx<4, U>{}(w);
+    w_local[1] = scale * DequantizeMx<4, U>{}(w >> 4);
+  } else {
+    w_local[0] = scale * DequantizeMx<8, U>{}(w);
+  }
 }
-
-// NVFP4 MoE global-scale fold: same as dequantize_mx, but the group scale
-// arrives in f32 (already multiplied by the per-expert global reciprocal) and
-// is rounded into the bf16 tile exactly once. Rounding the folded scale to
-// bf16 first would round twice: an e4m3 scale times an f4 value is otherwise
-// exact in bf16, so the unfolded path stores an exact product.
-template <typename T, int bits>
-inline void dequantize_mx_global(uint8_t w, float scale, threadgroup T* w_local) {
-  static_assert(bits == 4, "only NVFP4 4-bit weights remain");
-  w_local[0] = T(scale * DequantizeMx<4, float>{}(w));
-  w_local[1] = T(scale * DequantizeMx<4, float>{}(w >> 4));
-}
-
 
 // XlaQuantizedBlockLoader — 1-D per-(row, K-group) uint8 scales.
 //
@@ -831,168 +827,6 @@ struct XlaQuantizedBlockLoader {
   }
 };
 
-// QuantizedBlockLoader with the NVFP4 MoE per-expert global reciprocal folded
-// into the group scale (see nvfp4_gather_qmm_rhs). Structurally identical to
-// the loader above; only the two scale decodes differ.
-//
-// This is a separate struct, not a template parameter on QuantizedBlockLoader,
-// because MSL supports neither inheritance nor a conditionally-present member:
-// an unconditional `float` member repacks the shared struct and grows the
-// shipping mxfp4_qmm_t / mxfp8_qmm_t loader stack frame from 64 to 72 bytes
-// (verified by diffing the emitted AIR). The MX entries must stay untouched, so
-// the fold lives here. Keep the two loaders in sync.
-template <
-    typename T,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short reduction_dim,
-    short tgp_size,
-    short group_size,
-    short bits>
-struct Nvfp4GlobalQuantizedBlockLoader {
-  MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
-  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads =
-      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size < BCOLS ? 1 : group_size / BCOLS;
-  MLX_MTL_CONST short scale_step = group_size < BCOLS ? BCOLS / group_size : 1;
-
-  static_assert(
-      (n_reads * pack_factor) <= group_size,
-      "The number of reads per thread must be less than the group size.");
-
-  const int src_ld;
-  const int64_t tile_stride;
-  short group_step_cnt;
-  const int64_t group_stride;
-
-  const short thread_idx;
-  const short bi;
-  const short bj;
-
-  threadgroup T* dst;
-  const device uint8_t* src;
-  const device uint8_t* scales;
-  // 1/g_ct for this tile's expert, or 1.0f when the call carries no global
-  // scale -- in which case every store below is bit-identical to the loader
-  // above (an e4m3 scale times an f4 value is exact in bf16, so the f32 and T
-  // multiplies round to the same product).
-  const float global_scale_recip;
-
-  // The fold must happen in f32 and round into the tile exactly once; folding
-  // into a T group scale first would round twice.
-  float group_scale() const {
-    return dequantize_scale_mx<float, group_size>(*scales) * global_scale_recip;
-  }
-
-  Nvfp4GlobalQuantizedBlockLoader(
-      const device uint8_t* src_,
-      const device uint8_t* scales_,
-      const int src_ld_,
-      threadgroup T* dst_,
-      ushort simd_group_id,
-      ushort simd_lane_id,
-      float global_scale_recip_)
-      : src_ld(src_ld_),
-        tile_stride(reduction_dim
-                        ? static_cast<int64_t>(BCOLS_PACKED) * bytes_per_pack
-                        : static_cast<int64_t>(BROWS) * src_ld *
-                            bytes_per_pack / pack_factor),
-        group_step_cnt(0),
-        group_stride(
-            static_cast<int64_t>(BROWS) * src_ld / group_size),
-        thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(n_reads * thread_idx / BCOLS_PACKED),
-        bj((n_reads * thread_idx) % BCOLS_PACKED),
-        dst(dst_ + bi * dst_ld + bj * pack_factor),
-        src(src_ + static_cast<int64_t>(bi) * src_ld * bytes_per_pack /
-                pack_factor +
-            static_cast<int64_t>(bj) * bytes_per_pack),
-        scales(
-            scales_ + static_cast<int64_t>(bi) * src_ld / group_size +
-            (bj * pack_factor) / group_size),
-        global_scale_recip(global_scale_recip_) {}
-
-  void load_unsafe() const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-    float scale = group_scale();
-    for (int i = 0; i < n_reads; i++) {
-      dequantize_mx_global<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
-  }
-
-  void load_safe(short2 src_tile_dim) const {
-    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
-      return;
-    }
-
-    if (reduction_dim == 1) {
-      const short valid_k = src_tile_dim.x;
-      const short valid_rows = src_tile_dim.y;
-      if (!quantized_mx_row_in_bounds(bi, valid_rows) ||
-          quantized_mx_valid_values<pack_factor>(bj, 0, valid_k) == 0) {
-        for (int i = 0; i < n_reads * pack_factor; i++) {
-          dst[i] = T(0);
-        }
-        return;
-      }
-
-      float scale = group_scale();
-      for (int i = 0; i < n_reads; i++) {
-        const short valid_values =
-            quantized_mx_valid_values<pack_factor>(bj, short(i), valid_k);
-        if (valid_values == 0) {
-          for (short j = 0; j < pack_factor; j++) {
-            dst[i * pack_factor + j] = T(0);
-          }
-          continue;
-        }
-
-        dequantize_mx_global<T, bits>(
-            src[i * bytes_per_pack], scale, dst + i * pack_factor);
-        for (short j = valid_values; j < pack_factor; j++) {
-          dst[i * pack_factor + j] = T(0);
-        }
-      }
-      return;
-    }
-
-    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
-      for (int i = 0; i < n_reads * pack_factor; i++) {
-        dst[i] = T(0);
-      }
-      return;
-    }
-    float scale = group_scale();
-    for (int i = 0; i < n_reads; i++) {
-      dequantize_mx_global<T, bits>(
-          src[i * bytes_per_pack], scale, dst + i * pack_factor);
-    }
-  }
-
-  void next() {
-    src += tile_stride;
-    if (reduction_dim == 1) {
-      if (group_steps > 1) {
-        group_step_cnt++;
-        if (group_step_cnt == group_steps) {
-          group_step_cnt = 0;
-          scales++;
-        }
-      } else {
-        scales += scale_step;
-      }
-    } else {
-      scales += group_stride;
-    }
-  }
-};
-
 // mxfp_qmm_t_impl — adapted MLX fp_qmm_t_impl (by-value dimensions,
 // rectangular tiles, and a predicated final K tile).
 template <
@@ -1071,7 +905,7 @@ METAL_FUNC void mxfp_qmm_t_impl(
   x += y_row * static_cast<int64_t>(K);
   wl += static_cast<int64_t>(y_col) * K_w;
   scales += static_cast<int64_t>(y_col) * K_g;
-  // 1-D per-row group-scale base
+  // 1-D per-row E8M0 scale base
   y = y_tile;
 
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
@@ -1146,16 +980,21 @@ METAL_FUNC void mxfp_qmm_t_impl(
 // Concrete kernel entry points
 ///////////////////////////////////////////////////////////////////////////////
 
-// Dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims} ABI. w is
-// uint32-packed (cast to bytes), scales uint8 [N, K/GS]. Tiles BM=16, BK=32,
-// BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N unsafe loads
-// when N%BN==0; grid = (ceil(N/64), ceil(M/16), 1), tg=(32,2,2).
+// MXFP8/MXFP4 dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims}
+// ABI. w is uint32-packed (cast to bytes), scales uint8 E8M0 [N, K/32]. Tiles
+// BM_, BK=32, BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N
+// unsafe loads when N%BN==0; grid = (ceil(N/64), ceil(M/BM_), 1), tg=(32,2,2).
 //
-// The MXFP_ names are historical: this macro and mxfp_qmm_t_impl were written
-// for the OCP-microscaling mxfp8/mxfp4 entries, which are gone (no producer).
-// NVFP4 is the only scheme instantiating them now; the names are kept because
-// renaming would churn the compiler input for the 26B golden and buy nothing.
-#define MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, ALIGNED_N)                    \
+// BM is a parameter because the weight loader's cost does not depend on it:
+// XlaQuantizedBlockLoader is instantiated on <BN, BK> and not on BM, so a wider
+// tile amortises the same dequantise-and-stage work over more MMA. Worth 1.27x
+// at a 256-row prefill chunk and 2.9x *worse* at a 16-row decode bucket, so the
+// tile is chosen per shape -- see SelectNvfp4QmmTile, which carries the sweep.
+//
+// BK is not a knob to widen alongside it: XlaQuantizedBlockLoader
+// static_asserts n_reads * pack_factor <= group_size, which at BK=64 with 128
+// threads fails for group-16 NVFP4.
+#define MXFP_QMM_T_ENTRY_TILE(NAME, GS, BITS, ALIGNED_N, BM_)                \
   kernel void NAME(                                                          \
       device const bfloat* x [[buffer(0)]],                                 \
       device const uint32_t* w [[buffer(1)]],                               \
@@ -1166,7 +1005,7 @@ METAL_FUNC void mxfp_qmm_t_impl(
       uint lid [[thread_index_in_threadgroup]],                             \
       uint sg [[simdgroup_index_in_threadgroup]],                           \
       uint sl [[thread_index_in_simdgroup]]) {                              \
-    constexpr int BM = 16, BK = 32, BN = 64;                                \
+    constexpr int BM = BM_, BK = 32, BN = 64;                               \
     constexpr int BK_padded = (BK + 16 / sizeof(bfloat));                   \
     threadgroup bfloat Xs[BM * BK_padded];                                  \
     threadgroup bfloat Ws[BN * BK_padded];                                  \
@@ -1175,10 +1014,29 @@ METAL_FUNC void mxfp_qmm_t_impl(
         tid, lid, sg, sl);                                                  \
   }
 
-// NVFP4 dense q-GEMM: group_size 16, bits 4. The grid spans M, so every tile row
-// is a real row (static_M == active_M == dims.x).
+// The BM=16 spelling, so every existing entry expands exactly as before.
+#define MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, ALIGNED_N) \
+  MXFP_QMM_T_ENTRY_TILE(NAME, GS, BITS, ALIGNED_N, 16)
+
+#define MXFP_QMM_T_ENTRY(NAME, GS, BITS) \
+  MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, false)
+
+MXFP_QMM_T_ENTRY(mxfp8_qmm_t, 32, 8)
+MXFP_QMM_T_ENTRY(mxfp4_qmm_t, 32, 4)
+
+// NVFP4 dense q-GEMM shares the MX entry verbatim: group_size 16, bits 4, and
+// the same {x, w, scales, y, dims} ABI. The grid spans M, so every tile row is
+// a real row (static_M == active_M == dims.x).
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t, 16, 4, false)
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t_alN, 16, 4, true)
+
+// The large-M tiles, as fp8_qmm_t_bm64 below already is for the fp8 sibling.
+// Only BM differs, so these must agree with the BM=16 entry bit for bit --
+// a difference would be a fragment-indexing bug, not a numeric one.
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm32, 16, 4, false, 32)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm32_alN, 16, 4, true, 32)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm64, 16, 4, false, 64)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm64_alN, 16, 4, true, 64)
 
 // NVFP4 split-K dense q-GEMM (MLX fp_qmm_t_splitk intent).
 // Uses the SAME BM=16,BK=32,BN=64 tile as nvfp4_qmm_t (proven multi-M path);
@@ -1290,8 +1148,7 @@ kernel void fp8_qmm_t(
 }
 
 // Prefill-tuned variant of fp8_qmm_t: BM=64 (more rows per threadgroup) for
-// large-M (prefill) matmuls -- the best BM in {16,32,64,128} for M~256 (A/B'd:
-// ~1.3x over BM=16 and over the dequant floor). Same 128x128-block f8 dequant,
+// large-M (prefill) matmuls. Same 128x128-block f8 dequant,
 // BN=64, WM=WN=2 (128 threads); only the M-tile grows. Grid BlockDim over
 // ceil(M/BM). Small-M batched decode stays on the BM=16 fp8_qmm_t.
 kernel void fp8_qmm_t_bm64(
@@ -1323,8 +1180,12 @@ kernel void fp8_qmm_t_bm64(
 // output column within the [BN, BK] weight tile), read once and applied to every
 // decoded byte, and next() never advances it. The impl bases `scales` at the tile's
 // N column (y_col); this loader adds the thread's row bi. reduction_dim is always 1.
+// ST is the scale's storage type, separate from T: ModelOpt writes a per-tensor
+// scale as f32, and rounding it to bf16 to match the tiles would put a coherent
+// per-channel bias on the whole projection.
 template <
     typename T,
+    typename ST,
     short BROWS,
     short BCOLS,
     short dst_ld,
@@ -1345,11 +1206,15 @@ struct PerChannelFp8BlockLoader {
 
   threadgroup T* dst;
   const device uchar* src;
-  const device T* scales;  // one bf16 per output row n; points at scales[bi]
+  // One scale per output row n, at stride `scale_stride_`: 1 for a genuine
+  // [N, 1] per-channel grid, 0 for a [1, 1] whole-tensor scale, which is the
+  // same kernel with every row reading element 0.
+  const device ST* scales;
 
   PerChannelFp8BlockLoader(
       const device uchar* src_,
-      const device T* scales_,
+      const device ST* scales_,
+      const short scale_stride_,
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -1364,15 +1229,15 @@ struct PerChannelFp8BlockLoader {
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi) {}  // per-row scale (constant across K)
+        scales(scales_ + bi * scale_stride_) {}  // constant across K
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
-    T scale = *scales;
+    const float scale = static_cast<float>(*scales);
     for (int i = 0; i < n_reads; i++) {
-      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack]) * scale);
     }
   }
 
@@ -1380,7 +1245,14 @@ struct PerChannelFp8BlockLoader {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
-    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+    // Steel's source-tile convention is (valid columns, valid rows), and this
+    // loader is transposed: `bi` walks output channels, i.e. rows. Guarding it
+    // against `.x` -- the valid K extent -- zeroed every row past BK, so an N
+    // tail wider than BK came out as zeros: at N=100 the second tile has
+    // num_outs=36 against BK=32, and output columns 96..99 were zero. Callers
+    // only ever pass a full BK for the column extent, so K needs no check of
+    // its own. Same reasoning as XlaQuantizedBlockLoader::load_safe above.
+    if (reduction_dim == 1 && bi >= src_tile_dim.y) {
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -1392,9 +1264,9 @@ struct PerChannelFp8BlockLoader {
       }
       return;
     }
-    T scale = *scales;
+    const float scale = static_cast<float>(*scales);
     for (int i = 0; i < n_reads; i++) {
-      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack])) * scale;
+      dst[i] = static_cast<T>(decode_e4m3fn(src[i * bytes_per_pack]) * scale);
     }
   }
 
@@ -1407,6 +1279,7 @@ struct PerChannelFp8BlockLoader {
 // the scale base at y_col (not the 2-D block index).
 template <
     typename T,
+    typename ST,
     const int group_size,
     const int bits,
     const bool aligned_N,
@@ -1415,7 +1288,8 @@ template <
     const int BN = 64>
 METAL_FUNC void fp_qmm_t_pc_impl(
     const device uchar* w,
-    const device T* scales,
+    const device ST* scales,
+    const short scale_stride,
     const device T* x,
     device T* y,
     threadgroup T* Xs,
@@ -1443,7 +1317,7 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t =
-      PerChannelFp8BlockLoader<T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+      PerChannelFp8BlockLoader<T, ST, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
 
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
@@ -1451,13 +1325,13 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   auto wl = (const device uchar*)w;
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * static_cast<int64_t>(K);
-  scales += y_col;  // per-channel scale base: the tile's N column
+  scales += y_col * scale_stride;  // scale base: the tile's N column
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-  loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, scale_stride, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
@@ -1514,19 +1388,26 @@ METAL_FUNC void fp_qmm_t_pc_impl(
   }
 }
 
-// Per-channel dense q-GEMM entries (bf16[M,K] . f8e4m3fn[N,K] with bf16 [N,1]
+// Per-channel dense q-GEMM entries (bf16[M,K] . f8e4m3fn[N,K] with a bf16
 // scale -> bf16[M,N]). Small-M (batched decode) BM=16, large-M (prefill) BM=64.
-kernel void fp8_qmm_t_pc(
+//
+// dims.w carries the scale's row stride, not K/128 as the block-128 entries
+// read it: 1 for a [N, 1] per-channel grid, and a negative sentinel for a
+// [1, 1] whole-tensor scale, which is stride 0. It has to be a value the host's
+// old `k / 128` could never produce -- and that is exactly 1 for every
+// K in {128, 160, 192, 224}, all legal under K % 32 -- so 0 would be
+// indistinguishable from a stale write. Negative cannot be.
+template <typename ST, int BM>
+[[kernel]] void fp8_qmm_t_pc_entry(
     device const bfloat* x [[buffer(0)]],
     device const uchar* w [[buffer(1)]],
-    device const bfloat* scale [[buffer(2)]],
+    device const ST* scale [[buffer(2)]],
     device bfloat* y [[buffer(3)]],
     constant int4& dims [[buffer(4)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
-  constexpr int BM = 16;
   constexpr int BK = 32;
   constexpr int BN = 64;
   constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
@@ -1535,32 +1416,25 @@ kernel void fp8_qmm_t_pc(
   const int M = dims.x;
   const int K = dims.y;
   const int N = dims.z;
-  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
-      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
+  const short ss = dims.w < 0 ? 0 : 1;
+  fp_qmm_t_pc_impl<bfloat, ST, 128, 8, false, BM, BK, BN>(
+      w, scale, ss, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
 }
 
-kernel void fp8_qmm_t_pc_bm64(
-    device const bfloat* x [[buffer(0)]],
-    device const uchar* w [[buffer(1)]],
-    device const bfloat* scale [[buffer(2)]],
-    device bfloat* y [[buffer(3)]],
-    constant int4& dims [[buffer(4)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint sl [[thread_index_in_simdgroup]]) {
-  constexpr int BM = 64;
-  constexpr int BK = 32;
-  constexpr int BN = 64;
-  constexpr int BK_padded = (BK + 16 / sizeof(bfloat));
-  threadgroup bfloat Xs[BM * BK_padded];
-  threadgroup bfloat Ws[BN * BK_padded];
-  const int M = dims.x;
-  const int K = dims.y;
-  const int N = dims.z;
-  fp_qmm_t_pc_impl<bfloat, 128, 8, false, BM, BK, BN>(
-      w, scale, x, y, Xs, Ws, K, N, M, K, tid, lid, sg, sl);
-}
+// The tiles stay bfloat; only the scale's storage type varies. An MSL entry
+// point cannot itself be a template, so each (scale dtype, BM) pair is stamped
+// out by name -- the same idiom as gdn_linear_attention and the splitk bundle.
+#define instantiate_fp8_qmm_t_pc(name, st, bm)                        \
+  template [[host_name(name)]] [[kernel]] void                        \
+  fp8_qmm_t_pc_entry<st, bm>(                                         \
+      device const bfloat*, device const uchar*, device const st*,    \
+      device bfloat*, constant int4&, uint3, uint, uint, uint);
+
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc", bfloat, 16)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_bm64", bfloat, 64)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_f32", float, 16)
+instantiate_fp8_qmm_t_pc("fp8_qmm_t_pc_bm64_f32", float, 64)
+
 
 // MoE gather variant (transpose=true): each output row r selects expert
 // indices[r]; out[r,n] = sum_k x[r,k] * dequant(w[indices[r], n, k]).
@@ -1784,6 +1658,7 @@ kernel void bf16_gather_mm_rhs(
 //   y:       bfloat [R, N]
 //   mnk = {R, N, K, _}
 // Tiles BM=16, BN=32, BK=32, WM=1, WN=2 (64 threads) — same as fp8 gather.
+// out = sum x * f4(w) * e4m3(scale); per-expert global scale is applied outside.
 ///////////////////////////////////////////////////////////////////////////////
 template <
     typename T,
@@ -1804,7 +1679,6 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
     const int M,
     const int N,
     const int K,
-    const device float* w_global_scale,  // f32[E], or null when absent
     threadgroup T* Xs,
     threadgroup T* Ws,
     uint3 tid,
@@ -1820,10 +1694,7 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
       transpose ? BK_padded : BN_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  // One instantiation carries the fold; an absent operand passes a reciprocal
-  // of 1.0f, which is bit-identical (an e4m3 scale times an f4 value is exact
-  // in bf16, so both paths round to the same product) and reads no buffer.
-  using loader_w_t = Nvfp4GlobalQuantizedBlockLoader<
+  using loader_w_t = XlaQuantizedBlockLoader<
       T,
       transpose ? BN : BK,
       transpose ? BK : BN,
@@ -1885,12 +1756,9 @@ METAL_FUNC void nvfp4_gather_qmm_rhs_impl(
 
     thread mma_t mma_op(simd_group_id, simd_lane_id);
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
-    // Same `index` the weight/scale offsets above already trust; the fold is
-    // one indexed f32 load per expert run.
     thread loader_w_t loader_w(
         wl + index * stride_w, scales + index * stride_s,
-        transpose ? K : N, Ws, simd_group_id, simd_lane_id,
-        w_global_scale ? 1.0f / w_global_scale[index] : 1.0f);
+        transpose ? K : N, Ws, simd_group_id, simd_lane_id);
 
     if (align_M && align_N) {
       gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
@@ -1954,8 +1822,6 @@ kernel void nvfp4_gather_qmm_rhs(
     device const uint* indices [[buffer(3)]],
     device bfloat* y [[buffer(4)]],
     constant int4& mnk [[buffer(5)]],  // {R, N, K, _}
-    device const float* w_global_scale
-        [[buffer(6), function_constant(moe_has_global_scale)]],  // f32[E]
     uint3 tid [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]]) {
@@ -1975,13 +1841,6 @@ kernel void nvfp4_gather_qmm_rhs(
   const int N = mnk.y;
   const int K = mnk.z;
 
-  // A conditionally-declared argument may only be read under its own function
-  // constant; hoisting it to a null pointer keeps the fold in one instantiation.
-  const device float* gs = nullptr;
-  if (moe_has_global_scale) {
-    gs = w_global_scale;
-  }
-
   nvfp4_gather_qmm_rhs_impl<bfloat, 16, 4, BM, BN, BK, WM, WN, transpose>(
-      x, w, scale, indices, y, R, N, K, gs, Xs, Ws, tid, sg, sl);
+      x, w, scale, indices, y, R, N, K, Xs, Ws, tid, sg, sl);
 }
