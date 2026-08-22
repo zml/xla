@@ -97,6 +97,16 @@ const PJRT_Api* GetGpuPjrtApi();
 
 std::atomic<int> vulkan_client_count{0};
 
+std::optional<std::string> CanonicalizeGpuPlatformName(
+    std::optional<std::string> platform_name) {
+  if (!platform_name.has_value()) return std::nullopt;
+  if (*platform_name == "CUDA") return std::string(xla::CudaName());
+  if (*platform_name == "ROCM") return std::string(xla::RocmName());
+  if (*platform_name == "ONEAPI") return std::string(xla::OneapiName());
+  if (*platform_name == "VULKAN") return std::string(xla::VulkanName());
+  return platform_name;
+}
+
 PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
       "PJRT_Client_Create_Args", PJRT_Client_Create_Args_STRUCT_SIZE,
@@ -135,6 +145,7 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
       it != create_options.end()) {
     platform_name.emplace(std::get<std::string>(it->second));
   }
+  platform_name = CanonicalizeGpuPlatformName(std::move(platform_name));
   xla::GpuAllocatorConfig allocator_config;
   if (auto it = create_options.find("allocator"); it != create_options.end()) {
     auto allocator_name = std::get<std::string>(it->second);
