@@ -17,6 +17,7 @@ limitations under the License.
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "xla/stream_executor/rocm/rocm_host_overhead_benchmark_kernels.h"
 #include "xla/tsl/framework/allocator.h"
 #include "xla/tsl/framework/bfc_allocator.h"
+#include "tsl/platform/numa.h"
 
 namespace stream_executor::gpu {
 namespace {
@@ -860,6 +862,129 @@ void BM_BfcReuse(benchmark::State& state, size_t allocation_size) {
   state.SetItemsProcessed(operations);
 }
 
+enum class HostAllocationMode {
+  kPortable,
+  kPortableNumaUser,
+  kPortableCoherent,
+  kPortableNonCoherent,
+  kExplicitNumaRegister,
+};
+
+bool AllocateHostBuffer(benchmark::State& state, HostAllocationMode mode,
+                        int numa_node, size_t size, void** pointer) {
+  if (mode == HostAllocationMode::kExplicitNumaRegister) {
+    *pointer = tsl::port::NUMAMalloc(numa_node, size,
+                                     /*minimum_alignment=*/256);
+    if (*pointer == nullptr) {
+      state.SkipWithError("NUMAMalloc failed");
+      return false;
+    }
+    if (!CheckHip(state,
+                  hipHostRegister(*pointer, size, hipHostRegisterPortable),
+                  "hipHostRegister")) {
+      tsl::port::NUMAFree(*pointer, size);
+      *pointer = nullptr;
+      return false;
+    }
+    return true;
+  }
+
+  unsigned int flags = hipHostMallocPortable;
+  switch (mode) {
+    case HostAllocationMode::kPortable:
+      break;
+    case HostAllocationMode::kPortableNumaUser:
+      flags |= hipHostMallocNumaUser;
+      break;
+    case HostAllocationMode::kPortableCoherent:
+      flags |= hipHostMallocCoherent;
+      break;
+    case HostAllocationMode::kPortableNonCoherent:
+      flags |= hipHostMallocNonCoherent;
+      break;
+    case HostAllocationMode::kExplicitNumaRegister:
+      break;
+  }
+  return CheckHip(state, hipHostMalloc(pointer, size, flags), "hipHostMalloc");
+}
+
+void FreeHostBuffer(HostAllocationMode mode, void* pointer, size_t size) {
+  if (mode == HostAllocationMode::kExplicitNumaRegister) {
+    (void)hipHostUnregister(pointer);
+    tsl::port::NUMAFree(pointer, size);
+  } else {
+    (void)hipHostFree(pointer);
+  }
+}
+
+void BM_PinnedHostCopy(benchmark::State& state, HostAllocationMode mode,
+                       hipMemcpyKind direction, size_t size, int numa_node) {
+  if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
+
+  void* host = nullptr;
+  if (!AllocateHostBuffer(state, mode, numa_node, size, &host)) return;
+  std::memset(host, 0x5a, size);
+
+  void* device = nullptr;
+  hipStream_t stream = nullptr;
+  if (!CheckHip(state, hipMalloc(&device, size), "hipMalloc") ||
+      !CheckHip(state,
+                hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags")) {
+    if (device != nullptr) (void)hipFree(device);
+    FreeHostBuffer(mode, host, size);
+    return;
+  }
+
+  void* destination = direction == hipMemcpyHostToDevice ? device : host;
+  const void* source = direction == hipMemcpyHostToDevice ? host : device;
+  if (!CheckHip(state, hipMemcpyAsync(destination, source, size, direction,
+                                      stream),
+                "warm-up hipMemcpyAsync") ||
+      !CheckHip(state, hipStreamSynchronize(stream),
+                "warm-up hipStreamSynchronize")) {
+    (void)hipStreamDestroy(stream);
+    (void)hipFree(device);
+    FreeHostBuffer(mode, host, size);
+    return;
+  }
+
+  const int batch_size = size >= (64 << 20) ? 4 : 256;
+  double enqueue_seconds = 0;
+  double sync_seconds = 0;
+  int64_t operations = 0;
+  for (auto _ : state) {
+    auto enqueue_start = Clock::now();
+    for (int i = 0; i < batch_size; ++i) {
+      if (!CheckHip(state,
+                    hipMemcpyAsync(destination, source, size, direction, stream),
+                    "hipMemcpyAsync")) {
+        break;
+      }
+    }
+    auto enqueue_end = Clock::now();
+    if (!CheckHip(state, hipStreamSynchronize(stream),
+                  "hipStreamSynchronize")) {
+      break;
+    }
+    auto sync_end = Clock::now();
+    benchmark::DoNotOptimize(static_cast<unsigned char*>(host)[0]);
+    enqueue_seconds += Seconds(enqueue_end - enqueue_start);
+    sync_seconds += Seconds(sync_end - enqueue_end);
+    operations += batch_size;
+    state.SetIterationTime(Seconds(sync_end - enqueue_start));
+  }
+
+  SetBatchCounters(state, enqueue_seconds, sync_seconds, operations);
+  state.counters["GiB/s"] =
+      static_cast<double>(size) * operations /
+      ((enqueue_seconds + sync_seconds) * (1ULL << 30));
+  state.counters["numa_node"] = tsl::port::NUMAGetMemAffinity(host);
+  (void)hipStreamDestroy(stream);
+  (void)hipFree(device);
+  FreeHostBuffer(mode, host, size);
+}
+
 void BM_StreamWriteValue64(benchmark::State& state, int logical_teardowns,
                            bool coalesced) {
   if (!CheckHip(state, hipSetDevice(0), "hipSetDevice")) return;
@@ -1026,6 +1151,33 @@ BENCHMARK_CAPTURE(BM_ProfiledModuleLaunchKernel, launch_extension_batch_256,
 REGISTER_ALLOCATION_SIZE(bytes_4k, 4 << 10);
 REGISTER_ALLOCATION_SIZE(bytes_1m, 1 << 20);
 
+#define REGISTER_HOST_COPY(MODE_NAME, MODE, DIRECTION_NAME, DIRECTION, SIZE_NAME, \
+                           SIZE)                                                \
+  BENCHMARK_CAPTURE(BM_PinnedHostCopy,                                          \
+                    MODE_NAME##_##DIRECTION_NAME##_##SIZE_NAME, MODE, DIRECTION, \
+                    SIZE, 1)                                                    \
+      ->UseManualTime()
+
+#define REGISTER_HOST_COPY_SIZE(MODE_NAME, MODE, SIZE_NAME, SIZE)       \
+  REGISTER_HOST_COPY(MODE_NAME, MODE, h2d, hipMemcpyHostToDevice,       \
+                     SIZE_NAME, SIZE);                                  \
+  REGISTER_HOST_COPY(MODE_NAME, MODE, d2h, hipMemcpyDeviceToHost,       \
+                     SIZE_NAME, SIZE)
+
+#define REGISTER_HOST_COPY_MODE(MODE_NAME, MODE)                  \
+  REGISTER_HOST_COPY_SIZE(MODE_NAME, MODE, bytes_4k, 4 << 10);     \
+  REGISTER_HOST_COPY_SIZE(MODE_NAME, MODE, bytes_64m, 64 << 20)
+
+REGISTER_HOST_COPY_MODE(portable, HostAllocationMode::kPortable);
+REGISTER_HOST_COPY_MODE(portable_numa_user,
+                        HostAllocationMode::kPortableNumaUser);
+REGISTER_HOST_COPY_MODE(portable_coherent,
+                        HostAllocationMode::kPortableCoherent);
+REGISTER_HOST_COPY_MODE(portable_noncoherent,
+                        HostAllocationMode::kPortableNonCoherent);
+REGISTER_HOST_COPY_MODE(explicit_numa_register,
+                        HostAllocationMode::kExplicitNumaRegister);
+
 BENCHMARK_CAPTURE(BM_StreamWriteValue64, markers_128, 128, false)
     ->UseManualTime();
 BENCHMARK_CAPTURE(BM_StreamWriteValue64, coalesced_128, 128, true)
@@ -1033,6 +1185,9 @@ BENCHMARK_CAPTURE(BM_StreamWriteValue64, coalesced_128, 128, true)
 
 #undef REGISTER_ALLOCATION_SIZE
 #undef REGISTER_GRAPH_SIZE
+#undef REGISTER_HOST_COPY
+#undef REGISTER_HOST_COPY_MODE
+#undef REGISTER_HOST_COPY_SIZE
 #undef REGISTER_LAUNCH_ARITY
 #undef REGISTER_LAUNCH
 
