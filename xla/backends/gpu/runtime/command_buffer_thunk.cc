@@ -200,7 +200,10 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
 
   ABSL_ASSIGN_OR_RETURN(std::shared_ptr<ExecutorCommandBuffer> cmd_buffer,
                    GetOrCreateCommandBuffer(params.executor));
+  TraceMe lock_wait("command_buffer::initialize_lock_wait");
   absl::MutexLock lock(cmd_buffer->mutex);
+  lock_wait.Stop();
+  TraceMe lock_hold("command_buffer::initialize_lock_hold");
 
   // If there are no thunks, or command buffer does not require warmup,
   // we can mark warm up as done immediately.
@@ -312,7 +315,10 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
   ABSL_ASSIGN_OR_RETURN(std::shared_ptr<ExecutorCommandBuffer> cmd_buffer,
                    GetOrCreateCommandBuffer(executor));
 
+  TraceMe lock_wait("command_buffer::execute_lock_wait");
   absl::MutexLock lock(cmd_buffer->mutex);
+  lock_wait.Stop();
+  TraceMe lock_hold("command_buffer::execute_lock_hold");
 
   // warm up iteration, run through thunks if they are present.
   if (!cmd_buffer->warmup_done && thunks_) {
