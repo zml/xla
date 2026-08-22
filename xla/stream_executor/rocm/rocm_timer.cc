@@ -28,6 +28,7 @@ limitations under the License.
 #include "xla/stream_executor/gpu/gpu_semaphore.h"
 #include "xla/stream_executor/rocm/delay_kernel.h"
 #include "xla/stream_executor/rocm/rocm_event.h"
+#include "xla/stream_executor/rocm/rocm_context.h"
 #include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream.h"
@@ -39,7 +40,7 @@ namespace stream_executor::gpu {
 namespace {
 absl::StatusOr<float> GetEventElapsedTime(StreamExecutor* executor,
                                           hipEvent_t start, hipEvent_t stop) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  ScopedRocmActivateContext activation(executor->device_ordinal());
   // The stop event must have completed in order for hipEventElapsedTime to
   // work.
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventSynchronize);

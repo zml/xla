@@ -24,6 +24,7 @@ limitations under the License.
 #include "benchmark/benchmark.h"
 #include "rocm/include/hip/hip_runtime.h"
 #include "rocm/include/rocblas/rocblas.h"
+#include "xla/stream_executor/rocm/rocm_context.h"
 #include "xla/stream_executor/rocm/rocm_host_overhead_benchmark_kernels.h"
 #include "xla/tsl/framework/allocator.h"
 #include "xla/tsl/framework/bfc_allocator.h"
@@ -89,6 +90,24 @@ void SetBatchCounters(benchmark::State& state, double enqueue_seconds,
   state.counters["total_ns/op"] =
       (enqueue_seconds + sync_seconds) * 1e9 / operations;
   state.SetItemsProcessed(operations);
+}
+
+void BM_ActivateContext(benchmark::State& state, bool heap_allocated,
+                        bool nested) {
+  std::unique_ptr<ScopedRocmActivateContext> outer;
+  if (nested) {
+    outer = std::make_unique<ScopedRocmActivateContext>(/*device_ordinal=*/0);
+  }
+
+  for (auto _ : state) {
+    if (heap_allocated) {
+      auto activation =
+          std::make_unique<ScopedRocmActivateContext>(/*device_ordinal=*/0);
+      benchmark::DoNotOptimize(activation);
+    } else {
+      ScopedRocmActivateContext activation(/*device_ordinal=*/0);
+    }
+  }
 }
 
 void BM_ModuleLaunchKernel(benchmark::State& state, int arity,
@@ -814,6 +833,15 @@ REGISTER_LAUNCH_ARITY(1);
 REGISTER_LAUNCH_ARITY(4);
 REGISTER_LAUNCH_ARITY(16);
 REGISTER_LAUNCH_ARITY(64);
+
+BENCHMARK_CAPTURE(BM_ActivateContext, nested_heap,
+                  /*heap_allocated=*/true, /*nested=*/true);
+BENCHMARK_CAPTURE(BM_ActivateContext, nested_stack,
+                  /*heap_allocated=*/false, /*nested=*/true);
+BENCHMARK_CAPTURE(BM_ActivateContext, outermost_heap,
+                  /*heap_allocated=*/true, /*nested=*/false);
+BENCHMARK_CAPTURE(BM_ActivateContext, outermost_stack,
+                  /*heap_allocated=*/false, /*nested=*/false);
 
 BENCHMARK_CAPTURE(BM_EventRecordWait, system_scope,
                   EventVisibility::kSystem)

@@ -48,6 +48,7 @@ limitations under the License.
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_event.h"
+#include "xla/stream_executor/rocm/rocm_context.h"
 #include "xla/stream_executor/rocm/rocm_kernel.h"
 #include "xla/stream_executor/rocm/rocm_performance_counters.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
@@ -57,6 +58,10 @@ limitations under the License.
 
 namespace stream_executor::gpu {
 namespace {
+
+ScopedRocmActivateContext ActivateRocm(StreamExecutor* executor) {
+  return ScopedRocmActivateContext(executor->device_ordinal());
+}
 
 // ---------------------------------------------------------------------------
 // Process-level HIP stream handle cache
@@ -120,7 +125,7 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
   }
 
   // Cold path: create a new HIP stream.
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   hipStream_t stream;
   if (priority == 0) {
     RETURN_IF_ERROR(ToStatus(
@@ -139,7 +144,7 @@ absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,
 
 absl::Status RecordEvent(StreamExecutor* executor, hipEvent_t event,
                          hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventRecord);
   hipError_t res = hipEventRecord(event, stream);
   switch (res) {
@@ -159,7 +164,7 @@ absl::Status RecordEvent(StreamExecutor* executor, hipEvent_t event,
 
 absl::Status WaitStreamOnEvent(StreamExecutor* executor, hipStream_t stream,
                                hipEvent_t event) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   IncrementRocmPerformanceCounter(RocmPerformanceCounter::kEventWait);
   RETURN_IF_ERROR(ToStatus(hipStreamWaitEvent(stream, event, 0 /* = flags */),
                            "could not wait stream on event"));
@@ -169,7 +174,7 @@ absl::Status WaitStreamOnEvent(StreamExecutor* executor, hipStream_t stream,
 absl::Status AsynchronousMemcpyD2H(StreamExecutor* executor, void* host_dst,
                                    hipDeviceptr_t gpu_src, uint64_t size,
                                    hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   RETURN_IF_ERROR(ToStatus(
       hipMemcpyDtoHAsync(host_dst, gpu_src, size, stream),
       absl::StrFormat(
@@ -187,7 +192,7 @@ absl::Status AsynchronousMemcpyD2H(StreamExecutor* executor, void* host_dst,
 absl::Status AsynchronousMemcpyH2D(StreamExecutor* executor,
                                    hipDeviceptr_t gpu_dst, const void* host_src,
                                    uint64_t size, hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   RETURN_IF_ERROR(ToStatus(
       hipMemcpyHtoDAsync(gpu_dst, const_cast<void*>(host_src), size, stream),
       absl::StrFormat(
@@ -206,7 +211,7 @@ absl::Status AsynchronousMemcpyD2D(StreamExecutor* executor,
                                    hipDeviceptr_t gpu_dst,
                                    hipDeviceptr_t gpu_src, uint64_t size,
                                    hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   RETURN_IF_ERROR(ToStatus(
       hipMemcpyDtoDAsync(gpu_dst, gpu_src, size, stream),
       absl::StrFormat("failed to enqueue async memcpy from device to device: "
@@ -222,7 +227,7 @@ absl::Status AsynchronousMemcpyD2D(StreamExecutor* executor,
 }
 
 absl::Status SynchronizeStream(StreamExecutor* executor, hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   RETURN_IF_ERROR(ToStatus(hipStreamSynchronize(stream),
                            "Could not synchronize on ROCM stream"));
   VLOG(2) << "successfully synchronized stream " << stream << " on device "
@@ -232,7 +237,7 @@ absl::Status SynchronizeStream(StreamExecutor* executor, hipStream_t stream) {
 
 absl::StatusOr<bool> StreamIsCapturing(StreamExecutor* executor,
                                        hipStream_t stream) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   hipStreamCaptureStatus status;
   RETURN_IF_ERROR(ToStatus(hipStreamIsCapturing(stream, &status),
                            "Failed to check HIP stream capture status"));
@@ -342,7 +347,7 @@ void DestroyStream(StreamExecutor* executor, hipStream_t stream) {
   }
 
   // Activate the device context for all HIP calls below.
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
 
   // Verify the stream is fully idle before caching.
   // BlockHostUntilDone() ran in ~RocmStream() before this call, so under
@@ -427,7 +432,7 @@ absl::Status RocmStream::MemZero(DeviceAddressBase* location, uint64_t size) {
       size % sizeof(uint32_t) == 0) {
     return Memset32(location, 0x0, size);
   } else {
-    std::unique_ptr<ActivateContext> activation = executor_->Activate();
+    auto activation = ActivateRocm(executor_);
     return ToStatus(
         hipMemsetAsync(location->opaque(), 0x0, size, stream_handle_),
         "Failed to enqueue async memset operation");
@@ -487,7 +492,7 @@ absl::Status LaunchRocmKernel(
     unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
     unsigned int block_dim_z, unsigned int shared_mem_bytes, hipStream_t stream,
     void** kernel_params, void** extra) {
-  std::unique_ptr<ActivateContext> activation = executor->Activate();
+  auto activation = ActivateRocm(executor);
   VLOG(2) << "launching kernel: " << kernel_name << "; gdx: " << grid_dim_x
           << " gdy: " << grid_dim_y << " gdz: " << grid_dim_z
           << " bdx: " << block_dim_x << " bdy: " << block_dim_y

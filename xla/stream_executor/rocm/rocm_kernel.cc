@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/kernel_metadata.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/rocm/rocm_context.h"
 #include "xla/stream_executor/rocm/rocm_status.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/tsl/platform/errors.h"
@@ -56,7 +57,7 @@ absl::StatusOr<int32_t> RocmKernel::GetMaxOccupiedBlocksPerCore(
           << "; threads_per_block: " << threads_per_block
           << "; dynamic_shared_memory_bytes: " << dynamic_shared_memory_bytes;
 
-  std::unique_ptr<ActivateContext> activation = executor_->Activate();
+  ScopedRocmActivateContext activation(executor_->device_ordinal());
 
   int max_blocks = 0;
   RETURN_IF_ERROR(ToStatus(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
