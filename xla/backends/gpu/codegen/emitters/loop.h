@@ -37,9 +37,20 @@ namespace gpu {
 // Generic loop fusion.
 class LoopFusion final : public MlirKernelEmitter {
  public:
-  explicit LoopFusion(const HloFusionAnalysis& analysis)
-      : analysis_(analysis),
-        unroll_factor_(ComputeLoopFusionConfig(analysis)) {}
+  explicit LoopFusion(const HloFusionAnalysis& analysis,
+                      bool use_fly_memory = false)
+      : analysis_(analysis), unroll_factor_(ComputeLoopFusionConfig(analysis)) {
+    if (use_fly_memory) {
+      EnableFlyMemory();
+      const BlockLevelFusionConfig& config =
+          analysis_.fusion_backend_config().block_level_fusion_config();
+      if (config.output_tiles_size() == 1 &&
+          config.output_tiles(0).sizes_size() == 1 &&
+          config.output_tiles(0).sizes(0) > 0) {
+        unroll_factor_ = config.output_tiles(0).sizes(0);
+      }
+    }
+  }
   LaunchDimensions launch_dimensions() const override;
   int unroll_factor() const override { return unroll_factor_; }
 

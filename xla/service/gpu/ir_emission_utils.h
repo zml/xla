@@ -96,6 +96,9 @@ inline constexpr absl::string_view kCustomFusionKind = "__custom_fusion";
 // kTritonGemmFusionKind.
 inline constexpr absl::string_view kTritonFusionKind = "__triton";
 
+// Generic fusions lowered through the Fly/FlyROCDL dialects.
+inline constexpr absl::string_view kFlyFusionKind = "__fly";
+
 // Used for fusions that codegen a collective.
 inline constexpr absl::string_view kTritonCollectiveFusionKind =
     "__triton_collective";

@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/backends/gpu/codegen/emitters/loop.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -24,6 +25,9 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "xla/tsl/platform/status_macros.h"
+#if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/compiler.h"
+#endif
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
@@ -43,7 +47,9 @@ limitations under the License.
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/util.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
@@ -100,6 +106,27 @@ LaunchDimensions LoopFusion::launch_dimensions() const {
       analysis_.fusion_spec());
   auto dims = CalculateLaunchDimensions(indexing_shape, analysis_.device_info(),
                                         unroll_factor_);
+  if (uses_fly_memory()) {
+    const BlockLevelFusionConfig& config =
+        analysis_.fusion_backend_config().block_level_fusion_config();
+    if (config.num_warps() > 0) {
+      int64_t num_elements = CeilOfRatio(ShapeUtil::ElementsIn(indexing_shape),
+                                         int64_t{unroll_factor_});
+      if (num_elements > 1) {
+        const auto& device = analysis_.device_info();
+        int64_t threads_per_block =
+            std::min({num_elements,
+                      int64_t{config.num_warps()} * device.threads_per_warp(),
+                      device.threads_per_block_limit()});
+        int64_t num_blocks_total = CeilOfRatio(num_elements, threads_per_block);
+        int64_t num_blocks_y =
+            CeilOfRatio<uint64_t>(num_blocks_total, device.block_dim_limit().x);
+        int64_t num_blocks_x = CeilOfRatio(num_blocks_total, num_blocks_y);
+        dims = LaunchDimensions(se::BlockDim(num_blocks_x, num_blocks_y, 1),
+                                se::ThreadDim(threads_per_block, 1, 1));
+      }
+    }
+  }
   const auto& blocks = dims.block_counts();
   auto split_x = MaybeSplitGridDimensionX(dims.thread_counts_per_block().x,
                                           blocks.x, analysis_.device_info());
@@ -131,7 +158,16 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> LoopFusion::CreateMLIRModule(
       BackendKind::kGpu);
 
   ASSIGN_OR_RETURN(auto kernel_definition, emitter.EmitKernelDefinition());
-  return std::move(kernel_definition).TakeSource().TakeModule();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      std::move(kernel_definition).TakeSource().TakeModule();
+#if TENSORFLOW_USE_ROCM
+  if (uses_fly_memory()) {
+    flydsl::MarkGenericFusion(module.get());
+  }
+#else
+  CHECK(!uses_fly_memory());
+#endif
+  return module;
 }
 
 absl::Status LoopFusion::EmitEntryFunction(

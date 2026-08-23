@@ -317,6 +317,9 @@ message FlyGemmConfig {
   // half its FP32 partial tile for its partner through the reusable A/B LDS
   // allocation, then reduces and stores the half it retained in VGPRs.
   bool local_split_k = 16;
+  // Group this many neighboring N macro-tiles before advancing to the next
+  // group. Zero preserves row-major workgroup order.
+  int32 workgroup_mapping_n = 17;
 }
 
 // A backend config for dynamic-slice and dynamic-update-slice instructions

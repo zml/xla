@@ -133,6 +133,9 @@ Value GetDestinationBuffer(Value dest) {
     } else if (auto buffer_store =
                    dest.getDefiningOp<gpu::BufferStoreOp>()) {
       dest = buffer_store.getDestination();
+    } else if (auto tile_buffer_store =
+                   dest.getDefiningOp<gpu::TileBufferStoreOp>()) {
+      dest = tile_buffer_store.getDestination();
     } else {
       dest.getDefiningOp()->emitOpError("unsupported dest type");
       return nullptr;
@@ -602,6 +605,57 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   }
 };
 
+struct RewriteTileBufferStore : OpRewritePattern<gpu::TileBufferStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::TileBufferStoreOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value destination = GetDestinationBuffer(op.getDestination());
+    if (!destination) return failure();
+    auto tensor_destination =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(destination);
+
+    Value scalar_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getTileIndex()}, b);
+    Value destination_ptr =
+        CreateGep(tensor_destination, scalar_linear_index, b);
+    Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
+    Value num_records =
+        ml::ConstantOp::create(b, b.getI64Type(), 0x7ffffffe);
+    Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x27000);
+    auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
+    Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
+        b, resource_ptr, destination_ptr, stride, num_records, flags);
+
+    const int64_t element_bytes = tensor_destination.getType()
+                                      .getElementType()
+                                      .getIntOrFloatBitWidth() /
+                                  8;
+    Value element_bytes_value =
+        arith::ConstantIndexOp::create(b, element_bytes);
+    Value vector_byte_offset = arith::MulIOp::create(
+        b, GetLinearIndex(mlir::ValueRange{op.getVectorIndex()}, b),
+        element_bytes_value);
+    vector_byte_offset = arith::IndexCastOp::create(
+        b, b.getI32Type(), vector_byte_offset);
+    Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
+
+    mlir::LLVMTypeConverter converter(getContext());
+    Value stored_value = UnrealizedConversionCastOp::create(
+                             b, converter.convertType(op.getValue().getType()),
+                             op.getValue())
+                             .getResult(0);
+    mlir::ROCDL::RawPtrBufferStoreOp::create(
+        b, stored_value, resource, vector_byte_offset, zero,
+        op.getCachePolicyAttr(), mlir::ArrayAttr{}, mlir::ArrayAttr{},
+        mlir::ArrayAttr{});
+    rewriter.replaceOp(op, op.getDestination());
+    return success();
+  }
+};
+
 struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -645,6 +699,44 @@ struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
         b, op.getResult().getType(), resource, vector_byte_offset,
         scalar_byte_offset, b.getI32IntegerAttr(0), mlir::ArrayAttr{},
         mlir::ArrayAttr{}, mlir::ArrayAttr{});
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+struct RewriteTileBufferLoad : OpRewritePattern<gpu::TileBufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::TileBufferLoadOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto source =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(op.getSource());
+
+    Value tile_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getTileIndex()}, b);
+    Value source_ptr = CreateGep(source, tile_linear_index, b);
+    Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
+    Value num_records =
+        ml::ConstantOp::create(b, b.getI64Type(), 0x7ffffffe);
+    Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x27000);
+    auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
+    Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
+        b, resource_ptr, source_ptr, stride, num_records, flags);
+
+    const int64_t element_bytes =
+        source.getType().getElementType().getIntOrFloatBitWidth() / 8;
+    Value vector_byte_offset = arith::MulIOp::create(
+        b, GetLinearIndex(mlir::ValueRange{op.getVectorIndex()}, b),
+        arith::ConstantIndexOp::create(b, element_bytes));
+    vector_byte_offset = arith::IndexCastOp::create(
+        b, b.getI32Type(), vector_byte_offset);
+    Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
+    Value loaded = mlir::ROCDL::RawPtrBufferLoadOp::create(
+        b, op.getResult().getType(), resource, vector_byte_offset, zero,
+        b.getI32IntegerAttr(0), mlir::ArrayAttr{}, mlir::ArrayAttr{},
+        mlir::ArrayAttr{});
     rewriter.replaceOp(op, loaded);
     return success();
   }
@@ -1633,7 +1725,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
     tensor_patterns.add<
         RewriteAllocateShared, RewriteAsyncCopyGlobalToShared,
         RewriteBufferLoad, RewriteBufferStore, RewriteGetDynamicDimSize,
-        RewriteNonScalarConstants, RewriteSplitBufferLoad, RewriteSyncThreads,
+        RewriteNonScalarConstants, RewriteSplitBufferLoad,
+        RewriteTileBufferLoad, RewriteTileBufferStore, RewriteSyncThreads,
         RewriteTensorExtract,
         RewriteTensorInsert, RewriteTransferRead, RewriteTransferWrite>(
         mlir_context);

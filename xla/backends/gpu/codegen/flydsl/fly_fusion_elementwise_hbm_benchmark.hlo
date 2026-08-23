@@ -1,0 +1,18 @@
+HloModule fly_fusion_elementwise_hbm_benchmark
+
+%fused_elementwise (p0: bf16[16384,8192], p1: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %p1 = bf16[16384,8192]{1,0} parameter(1)
+  %add = bf16[16384,8192]{1,0} add(%p0, %p1)
+  %scale = bf16[] constant(1.5)
+  %broadcast = bf16[16384,8192]{1,0} broadcast(%scale), dimensions={}
+  %multiply = bf16[16384,8192]{1,0} multiply(%add, %broadcast)
+  ROOT %maximum = bf16[16384,8192]{1,0} maximum(%multiply, %p0)
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8192], p1: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %p1 = bf16[16384,8192]{1,0} parameter(1)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0, %p1), kind=kLoop,
+    calls=%fused_elementwise
+}

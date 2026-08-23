@@ -806,6 +806,10 @@ message DebugOptions {
   // xla_gpu_enable_triton_gemm is enabled.
   optional bool xla_gpu_enable_flydsl_gemm = 515;
 
+  // Enables FlyDSL as a generic fusion code generation and autotuning backend
+  // on ROCm. The backend is compared against XLA's native and Triton emitters.
+  optional bool xla_gpu_enable_flydsl_fusion = 517;
+
   // Enable double buffering for loops.
   optional bool xla_gpu_enable_while_loop_double_buffering = 248;
 

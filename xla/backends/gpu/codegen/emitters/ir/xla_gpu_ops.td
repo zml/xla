@@ -139,6 +139,33 @@ def XLAGPU_BufferStoreOp : XLAGPU_Op<"buffer_store", [
   }];
 }
 
+def XLAGPU_TileBufferStoreOp : XLAGPU_Op<"tile_buffer_store", [
+    TypesMatchWith<"result type matches destination type",
+                   "destination", "result", "$_self">
+  ]> {
+  let summary = "Stores a vector through a tile-scoped AMD buffer descriptor.";
+
+  let description = [{
+    Stores a contiguous vector through a descriptor whose base pointer is
+    advanced to a workgroup-uniform tile offset. The remaining vector offset
+    maps to the lane-varying voffset operand. This matches the descriptor form
+    used by Triton for fully in-bounds tiled kernels.
+  }];
+
+  let arguments = (ins AnyVectorOfNonZeroRank:$value,
+                       AnyRankedTensor:$destination,
+                       Index:$vector_index,
+                       Index:$tile_index,
+                       I32Attr:$cache_policy);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $value `,` $destination `[` $tile_index `+` $vector_index `]`
+    `cache_policy` `=` $cache_policy attr-dict
+    `:` type($value) `,` type($destination)
+  }];
+}
+
 def XLAGPU_SplitBufferLoadOp : XLAGPU_Op<"split_buffer_load"> {
   let summary = "Loads a contiguous vector with split AMD buffer offsets.";
 
@@ -155,6 +182,26 @@ def XLAGPU_SplitBufferLoadOp : XLAGPU_Op<"split_buffer_load"> {
 
   let assemblyFormat = [{
     $source `[` $vector_index `+` $scalar_index `]` attr-dict
+    `:` type($source) `->` type($result)
+  }];
+}
+
+def XLAGPU_TileBufferLoadOp : XLAGPU_Op<"tile_buffer_load"> {
+  let summary = "Loads a vector through a tile-scoped AMD buffer descriptor.";
+
+  let description = [{
+    Loads a contiguous vector through a descriptor whose base pointer is
+    advanced to a workgroup-uniform tile offset. The remaining vector offset
+    maps to the lane-varying voffset operand. This operation is intended for
+    specialized kernels whose tile accesses are known to be fully in bounds.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source, Index:$vector_index,
+                       Index:$tile_index);
+  let results = (outs AnyVectorOfNonZeroRank:$result);
+
+  let assemblyFormat = [{
+    $source `[` $tile_index `+` $vector_index `]` attr-dict
     `:` type($source) `->` type($result)
   }];
 }

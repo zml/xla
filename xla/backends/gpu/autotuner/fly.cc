@@ -15,9 +15,11 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/fly.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -25,41 +27,236 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/gpu_fusible.h"
+#include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/gpu/reduction_utils.h"
 #include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
 namespace {
 
-const HloInstruction* FindDot(const HloInstruction& instr) {
+const HloInstruction* FindContraction(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) {
     return nullptr;
   }
-  return hlo_query::GetFirstInstructionWithOpcode(
+  const HloInstruction* contraction = hlo_query::GetFirstInstructionWithOpcode(
       *instr.fused_instructions_computation(), HloOpcode::kDot);
+  if (contraction != nullptr) {
+    return contraction;
+  }
+  return hlo_query::GetFirstInstructionWithOpcode(
+      *instr.fused_instructions_computation(), HloOpcode::kScaledDot);
 }
 
-bool IsSupportedDot(const HloInstruction& dot) {
+HloInstruction* FindContraction(HloInstruction& instr) {
+  return const_cast<HloInstruction*>(
+      FindContraction(static_cast<const HloInstruction&>(instr)));
+}
+
+const HloInstruction* FindContractionInputParameter(
+    const HloInstruction& input) {
+  if (input.shape().element_type() != BF16) {
+    return nullptr;
+  }
+  const HloInstruction* value = &input;
+  bool converted_from_f32 = false;
+  bool physical_mapping_fixed = false;
+  bool has_dynamic_slice = false;
+  while (value->opcode() == HloOpcode::kBitcast ||
+         value->opcode() == HloOpcode::kConvert ||
+         value->opcode() == HloOpcode::kSlice ||
+         value->opcode() == HloOpcode::kDynamicSlice) {
+    const bool is_dynamic_slice = value->opcode() == HloOpcode::kDynamicSlice;
+    if ((!is_dynamic_slice && value->operand_count() != 1) ||
+        (is_dynamic_slice &&
+         value->operand_count() != value->shape().dimensions_size() + 1)) {
+      return nullptr;
+    }
+    const HloInstruction* operand = value->operand(0);
+    if (value->opcode() == HloOpcode::kBitcast) {
+      if (value->shape().element_type() != operand->shape().element_type() ||
+          ShapeUtil::ElementsIn(value->shape()) !=
+              ShapeUtil::ElementsIn(operand->shape())) {
+        return nullptr;
+      }
+      physical_mapping_fixed = true;
+    } else if (value->opcode() == HloOpcode::kConvert) {
+      if (converted_from_f32 || value->shape().element_type() != BF16 ||
+          operand->shape().element_type() != F32 ||
+          !ShapeUtil::SameDimensions(value->shape(), operand->shape())) {
+        return nullptr;
+      }
+      converted_from_f32 = true;
+    } else if (value->opcode() == HloOpcode::kSlice) {
+      if (physical_mapping_fixed ||
+          value->shape().dimensions_size() !=
+              operand->shape().dimensions_size() ||
+          !std::all_of(value->slice_strides().begin(),
+                       value->slice_strides().end(),
+                       [](int64_t stride) { return stride == 1; })) {
+        return nullptr;
+      }
+    } else {
+      if (physical_mapping_fixed || has_dynamic_slice ||
+          value->shape().dimensions_size() !=
+              operand->shape().dimensions_size()) {
+        return nullptr;
+      }
+      for (int64_t dimension = 0; dimension < value->shape().dimensions_size();
+           ++dimension) {
+        const HloInstruction* start = value->operand(dimension + 1);
+        if (!ShapeUtil::IsScalar(start->shape()) ||
+            (start->shape().element_type() != S32 &&
+             start->shape().element_type() != S64) ||
+            (start->opcode() != HloOpcode::kParameter &&
+             start->opcode() != HloOpcode::kConstant)) {
+          return nullptr;
+        }
+      }
+      has_dynamic_slice = true;
+    }
+    value = operand;
+  }
+  const PrimitiveType parameter_type = converted_from_f32 ? F32 : BF16;
+  return value->opcode() == HloOpcode::kParameter &&
+                 value->shape().element_type() == parameter_type
+             ? value
+             : nullptr;
+}
+
+struct ConcatInputInfo {
+  int64_t dimension;
+  int64_t fragment_size;
+};
+
+std::optional<ConcatInputInfo> FindSupportedConcatInput(
+    const HloInstruction& input) {
+  if (input.opcode() != HloOpcode::kConcatenate || input.operand_count() < 2 ||
+      input.shape().element_type() != BF16) {
+    return std::nullopt;
+  }
+  const int64_t dimension = input.concatenate_dimension();
+  const Shape& first_shape = input.operand(0)->shape();
+  PrimitiveType parameter_type = PRIMITIVE_TYPE_INVALID;
+  for (const HloInstruction* operand : input.operands()) {
+    if (!ShapeUtil::Equal(operand->shape(), first_shape)) {
+      return std::nullopt;
+    }
+    const HloInstruction* parameter = nullptr;
+    if (operand->opcode() == HloOpcode::kParameter &&
+        operand->shape().element_type() == BF16) {
+      parameter = operand;
+    } else if (operand->opcode() == HloOpcode::kConvert &&
+               operand->operand_count() == 1 &&
+               operand->shape().element_type() == BF16 &&
+               operand->operand(0)->opcode() == HloOpcode::kParameter &&
+               operand->operand(0)->shape().element_type() == F32 &&
+               ShapeUtil::SameDimensions(operand->shape(),
+                                         operand->operand(0)->shape())) {
+      parameter = operand->operand(0);
+    }
+    if (parameter == nullptr ||
+        (parameter_type != PRIMITIVE_TYPE_INVALID &&
+         parameter->shape().element_type() != parameter_type)) {
+      return std::nullopt;
+    }
+    parameter_type = parameter->shape().element_type();
+  }
+  return ConcatInputInfo{dimension, first_shape.dimensions(dimension)};
+}
+
+bool IsSupportedContractionInput(const HloInstruction& input) {
+  return FindContractionInputParameter(input) != nullptr ||
+         FindSupportedConcatInput(input).has_value();
+}
+
+bool IsGlobalSplitKContraction(const HloInstruction& dot) {
+  if (dot.shape().dimensions_size() != 3) {
+    return false;
+  }
+  const DotDimensionNumbers& dims = dot.dot_dimension_numbers();
+  return dims.lhs_batch_dimensions_size() == 1 &&
+         dims.rhs_batch_dimensions_size() == 1 &&
+         dims.lhs_batch_dimensions(0) == 1 &&
+         dims.rhs_batch_dimensions(0) == 1 &&
+         dims.lhs_contracting_dimensions_size() == 1 &&
+         dims.rhs_contracting_dimensions_size() == 1 &&
+         dims.lhs_contracting_dimensions(0) == 2 &&
+         dims.rhs_contracting_dimensions(0) == 2 &&
+         dot.shape().element_type() == F32;
+}
+
+bool IsBatchedContraction(const HloInstruction& dot) {
+  if (dot.shape().dimensions_size() != 3) {
+    return false;
+  }
+  const DotDimensionNumbers& dims = dot.dot_dimension_numbers();
+  return dims.lhs_batch_dimensions_size() == 1 &&
+         dims.rhs_batch_dimensions_size() == 1 &&
+         dims.lhs_batch_dimensions(0) == 0 &&
+         dims.rhs_batch_dimensions(0) == 0 &&
+         dims.lhs_contracting_dimensions_size() == 1 &&
+         dims.rhs_contracting_dimensions_size() == 1 &&
+         dims.lhs_contracting_dimensions(0) == 2 &&
+         (dims.rhs_contracting_dimensions(0) == 1 ||
+          dims.rhs_contracting_dimensions(0) == 2);
+}
+
+bool IsSupportedContraction(const HloInstruction& dot) {
   const int64_t rank = dot.shape().dimensions_size();
-  if (dot.operand_count() != 2 || (rank != 2 && rank != 3) ||
+  const bool is_scaled_dot = dot.opcode() == HloOpcode::kScaledDot;
+  const int64_t expected_operands = is_scaled_dot ? 4 : 2;
+  if (dot.operand_count() != expected_operands || (rank != 2 && rank != 3) ||
       dot.operand(0)->shape().dimensions_size() != rank ||
       dot.operand(1)->shape().dimensions_size() != rank ||
       dot.operand(0)->shape().element_type() != BF16 ||
       dot.operand(1)->shape().element_type() != BF16 ||
+      !IsSupportedContractionInput(*dot.operand(0)) ||
+      !IsSupportedContractionInput(*dot.operand(1)) ||
       (dot.shape().element_type() != BF16 &&
        dot.shape().element_type() != F32)) {
+    return false;
+  }
+  auto is_uniform_bf16_scale = [](const HloInstruction* scale) {
+    return scale->opcode() == HloOpcode::kParameter &&
+           scale->shape().element_type() == BF16 &&
+           scale->shape().dimensions_size() == 2 &&
+           scale->shape().dimensions(0) == 1 &&
+           scale->shape().dimensions(1) == 1;
+  };
+  if (is_scaled_dot && (rank != 2 || dot.shape().dimensions(0) == 1 ||
+                        dot.shape().dimensions(1) == 1 ||
+                        !is_uniform_bf16_scale(dot.operand(2)) ||
+                        !is_uniform_bf16_scale(dot.operand(3)))) {
     return false;
   }
   const DotDimensionNumbers& dims = dot.dot_dimension_numbers();
   if (dims.lhs_contracting_dimensions_size() != 1 ||
       dims.rhs_contracting_dimensions_size() != 1) {
+    return false;
+  }
+  const std::optional<ConcatInputInfo> lhs_concat =
+      FindSupportedConcatInput(*dot.operand(0));
+  const std::optional<ConcatInputInfo> rhs_concat =
+      FindSupportedConcatInput(*dot.operand(1));
+  if ((lhs_concat.has_value() || rhs_concat.has_value()) &&
+      (is_scaled_dot || rank != 2 || dot.shape().dimensions(0) == 1 ||
+       dot.shape().dimensions(1) == 1 ||
+       (lhs_concat.has_value() && lhs_concat->dimension != 0) ||
+       (rhs_concat.has_value() &&
+        rhs_concat->dimension != 1 - dims.rhs_contracting_dimensions(0)))) {
     return false;
   }
   if (rank == 2) {
@@ -69,16 +266,137 @@ bool IsSupportedDot(const HloInstruction& dot) {
            (dims.rhs_contracting_dimensions(0) == 0 ||
             dims.rhs_contracting_dimensions(0) == 1);
   }
-  // SplitkRewriter turns [M,K] x [N,K] into a rank-3 batched dot whose batch
-  // dimension enumerates independent K partitions. XLA reduces the FP32
-  // partials after this fusion.
-  return dims.lhs_batch_dimensions_size() == 1 &&
-         dims.rhs_batch_dimensions_size() == 1 &&
-         dims.lhs_batch_dimensions(0) == 1 &&
-         dims.rhs_batch_dimensions(0) == 1 &&
-         dims.lhs_contracting_dimensions(0) == 2 &&
-         dims.rhs_contracting_dimensions(0) == 2 &&
-         dot.shape().element_type() == F32;
+  // SplitkRewriter uses the middle dimension as a batch of K partitions.
+  // Ordinary batched GEMM instead keeps batch as the major dimension and may
+  // store the RHS as either [B,K,N] or [B,N,K].
+  return IsGlobalSplitKContraction(dot) || IsBatchedContraction(dot);
+}
+
+bool ContainsInstruction(const HloInstruction& root,
+                         const HloInstruction& target) {
+  if (&root == &target) {
+    return true;
+  }
+  return std::any_of(root.operands().begin(), root.operands().end(),
+                     [&](const HloInstruction* operand) {
+                       return ContainsInstruction(*operand, target);
+                     });
+}
+
+bool IsNarrowingConvert(const HloInstruction& value) {
+  return value.opcode() == HloOpcode::kConvert && value.operand_count() == 1 &&
+         value.operand(0)->shape().element_type() == F32 &&
+         value.shape().element_type() == BF16 &&
+         ShapeUtil::SameDimensions(value.shape(), value.operand(0)->shape());
+}
+
+bool IsSupportedBroadcastInput(const HloInstruction& broadcast,
+                               const HloInstruction& operation) {
+  if (broadcast.opcode() != HloOpcode::kBroadcast ||
+      broadcast.operand_count() != 1 || broadcast.dimensions().size() > 1 ||
+      !ShapeUtil::SameDimensions(broadcast.shape(), operation.shape())) {
+    return false;
+  }
+  const HloInstruction* input = broadcast.operand(0);
+  const int64_t input_rank = input->shape().dimensions_size();
+  const bool scalar = input_rank == 0 && broadcast.dimensions().empty();
+  const bool vector =
+      input_rank == 1 && broadcast.dimensions().size() == 1 &&
+      (broadcast.dimensions(0) == 0 || broadcast.dimensions(0) == 1) &&
+      input->shape().dimensions(0) ==
+          operation.shape().dimensions(broadcast.dimensions(0));
+  const bool supported_value =
+      input->opcode() == HloOpcode::kParameter ||
+      (scalar && input->opcode() == HloOpcode::kConstant &&
+       input->literal().GetAsDouble({}).has_value());
+  return supported_value && (scalar || vector) &&
+         input->shape().element_type() == operation.shape().element_type();
+}
+
+bool IsSupportedBinaryEpilogue(HloOpcode opcode) {
+  return opcode == HloOpcode::kAdd || opcode == HloOpcode::kMultiply ||
+         opcode == HloOpcode::kSubtract || opcode == HloOpcode::kDivide ||
+         opcode == HloOpcode::kMaximum || opcode == HloOpcode::kMinimum;
+}
+
+bool IsSupportedEpilogue(const HloInstruction& instr,
+                         const HloInstruction& dot) {
+  const HloInstruction* root =
+      instr.fused_instructions_computation()->root_instruction();
+  if (root == &dot) {
+    return true;
+  }
+  if (dot.shape().dimensions_size() != 2) {
+    return false;
+  }
+
+  // XLA commonly narrows an FP32 accumulator directly or after the
+  // elementwise epilogue. Strip that final output conversion first.
+  const HloInstruction* value = root;
+  if (root->opcode() == HloOpcode::kConvert) {
+    if (!IsNarrowingConvert(*root)) {
+      return false;
+    }
+    value = root->operand(0);
+  }
+  if (value == &dot) {
+    return true;
+  }
+
+  // Accept a bounded chain of scalar operations, row/column broadcasts,
+  // min/max activations, and negate. A small fixed grammar keeps autotuner
+  // eligibility predictable while covering alpha/beta and bias/ReLU patterns.
+  // A narrowing conversion on the contraction side of any step is retained as
+  // an explicit HLO rounding boundary.
+  if (dot.shape().dimensions(0) == 1 || dot.shape().dimensions(1) == 1) {
+    return false;
+  }
+  if (root->shape().element_type() != BF16) {
+    return false;
+  }
+
+  constexpr int64_t kMaxEpilogueSteps = 3;
+  for (int64_t step = 0; step < kMaxEpilogueSteps; ++step) {
+    if (value == &dot ||
+        (IsNarrowingConvert(*value) && value->operand(0) == &dot)) {
+      return true;
+    }
+    if (!ShapeUtil::SameDimensions(value->shape(), dot.shape())) {
+      return false;
+    }
+
+    const HloInstruction* contraction_value = nullptr;
+    if (value->opcode() == HloOpcode::kNegate && value->operand_count() == 1 &&
+        ContainsInstruction(*value->operand(0), dot) &&
+        value->operand(0)->shape().element_type() ==
+            value->shape().element_type()) {
+      contraction_value = value->operand(0);
+    } else if (IsSupportedBinaryEpilogue(value->opcode()) &&
+               value->operand_count() == 2) {
+      const bool lhs_contains = ContainsInstruction(*value->operand(0), dot);
+      const bool rhs_contains = ContainsInstruction(*value->operand(1), dot);
+      if (lhs_contains == rhs_contains) {
+        return false;
+      }
+      const int64_t contraction_operand = lhs_contains ? 0 : 1;
+      contraction_value = value->operand(contraction_operand);
+      if (!IsSupportedBroadcastInput(*value->operand(1 - contraction_operand),
+                                     *value) ||
+          contraction_value->shape().element_type() !=
+              value->shape().element_type()) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+
+    if (IsNarrowingConvert(*contraction_value)) {
+      contraction_value = contraction_value->operand(0);
+    }
+    value = contraction_value;
+  }
+  return value == &dot ||
+         (IsNarrowingConvert(*value) && value->operand(0) == &dot);
 }
 
 std::unique_ptr<BackendConfig> MakeConfig(
@@ -119,10 +437,9 @@ bool FlyBackend::IsSupported(const HloInstruction& instr) {
   if (!target_config().device_description.gpu_compute_capability().IsRocm()) {
     return false;
   }
-  const HloInstruction* dot = FindDot(instr);
-  return dot != nullptr &&
-         instr.fused_instructions_computation()->root_instruction() == dot &&
-         IsSupportedDot(*dot);
+  const HloInstruction* dot = FindContraction(instr);
+  return dot != nullptr && IsSupportedContraction(*dot) &&
+         IsSupportedEpilogue(instr, *dot);
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -132,10 +449,17 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return configs;
   }
 
-  const HloInstruction* dot = FindDot(instr);
-  const bool global_split_k = dot->shape().dimensions_size() == 3;
-  const int64_t m = dot->shape().dimensions(global_split_k ? 1 : 0);
-  const int64_t n = dot->shape().dimensions(global_split_k ? 2 : 1);
+  const HloInstruction* dot = FindContraction(instr);
+  const PrimitiveType output_element_type =
+      instr.fused_instructions_computation()
+          ->root_instruction()
+          ->shape()
+          .element_type();
+  const bool is_scaled_dot = dot->opcode() == HloOpcode::kScaledDot;
+  const bool rank_three = dot->shape().dimensions_size() == 3;
+  const bool global_split_k = IsGlobalSplitKContraction(*dot);
+  const int64_t m = dot->shape().dimensions(rank_three ? 1 : 0);
+  const int64_t n = dot->shape().dimensions(rank_three ? 2 : 1);
   const int64_t k = dot->operand(0)->shape().dimensions(
       dot->dot_dimension_numbers().lhs_contracting_dimensions(0));
   const int64_t rhs_contracting_dimension =
@@ -144,6 +468,10 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       dot->operand(1)->shape().has_layout() &&
       dot->operand(1)->shape().layout().minor_to_major(0) ==
           rhs_contracting_dimension;
+  const std::optional<ConcatInputInfo> lhs_concat =
+      FindSupportedConcatInput(*dot->operand(0));
+  const std::optional<ConcatInputInfo> rhs_concat =
+      FindSupportedConcatInput(*dot->operand(1));
   if ((m != 1 && m % 16 != 0) || (n != 1 && n % 16 != 0) || k % 16 != 0) {
     return configs;
   }
@@ -226,7 +554,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     constexpr int64_t kMinStagedOutputElements = 8 * 1024;
     constexpr int64_t kMaxStagedOutputElements = 32 * 1024;
     const bool can_stage_output =
-        dot->shape().element_type() == BF16 &&
+        output_element_type == BF16 &&
         block_m * block_n >= kMinStagedOutputElements &&
         block_m * block_n <= kMaxStagedOutputElements;
     if (can_stage_output) {
@@ -256,16 +584,32 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     }
     for (int64_t num_warps : num_warps_values) {
       for (bool stage_output : {false, true}) {
-        if (stage_output && dot->shape().element_type() != BF16) {
+        if (stage_output && output_element_type != BF16) {
           continue;
         }
-        for (bool schedule : {false, true}) {
-          configs.push_back(MakeConfig(block_m, block_n, block_k, num_warps,
-                                       FlyGemmConfig::FLY_MFMA_16X16X16,
-                                       /*prefetch_rhs=*/false, stage_output,
-                                       /*waves_per_eu=*/0,
-                                       /*schedule_instructions=*/schedule,
-                                       /*stage_rhs=*/true));
+        const std::vector<int32_t> waves_per_eu_values =
+            k < 1024 && block_m <= 32 && block_n <= 32
+                ? std::vector<int32_t>{0, 2, 4}
+                : std::vector<int32_t>{0};
+        const std::vector<int32_t> workgroup_mapping_values =
+            k < 1024 && block_m == 32 && block_n == 16 && block_k == 128 &&
+                    num_warps == 2
+                ? std::vector<int32_t>{0, 4, 8, 16}
+                : std::vector<int32_t>{0};
+        for (int32_t workgroup_mapping_n : workgroup_mapping_values) {
+          for (int32_t waves_per_eu : waves_per_eu_values) {
+            for (bool schedule : {false, true}) {
+              std::unique_ptr<BackendConfig> config =
+                  MakeConfig(block_m, block_n, block_k, num_warps,
+                             FlyGemmConfig::FLY_MFMA_16X16X16,
+                             /*prefetch_rhs=*/false, stage_output, waves_per_eu,
+                             /*schedule_instructions=*/schedule,
+                             /*stage_rhs=*/true);
+              config->mutable_fly()->set_workgroup_mapping_n(
+                  workgroup_mapping_n);
+              configs.push_back(std::move(config));
+            }
+          }
         }
       }
     }
@@ -283,7 +627,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       return;
     }
     const bool can_stage_output =
-        dot->shape().element_type() == BF16 &&
+        output_element_type == BF16 &&
         block_m * block_n * sizeof(uint16_t) <= kMaxLdsBytes;
     for (int64_t num_warps : num_warps_values) {
       const int64_t wave_tiles = (block_m / 16) * (block_n / 16);
@@ -387,8 +731,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       // B_TO_LDS=false, asynchronous A global-to-LDS copies, and the next B
       // tile retained in VGPRs. The rank-3 address helpers account for XLA's
       // split batch, so this is the preferred faithful split-K pipeline.
-      if (rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 &&
-          k % 64 == 0) {
+      if (rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 && k % 64 == 0) {
         for (int64_t num_warps : {4, 8, 16}) {
           for (bool schedule : {false, true}) {
             configs.push_back(MakeConfig(
@@ -403,8 +746,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       add_preloaded_rhs_configs(/*block_m=*/64, /*block_n=*/64,
                                 /*block_k=*/64,
                                 /*num_warps_values=*/{2, 4});
-      if (rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 &&
-          k % 128 == 0) {
+      if (rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 && k % 128 == 0) {
         for (bool rolling_refill : {false, true}) {
           for (bool schedule : {false, true}) {
             configs.push_back(MakeConfig(
@@ -433,8 +775,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
             /*rolling_refill=*/false,
             /*local_split_k=*/true));
       }
-      if (rhs_k_contiguous && m % 128 == 0 && n % 256 == 0 &&
-          k % 32 == 0) {
+      if (rhs_k_contiguous && m % 128 == 0 && n % 256 == 0 && k % 32 == 0) {
         configs.push_back(MakeConfig(
             /*block_m=*/128, /*block_n=*/256, /*block_k=*/32,
             /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_32X32X8,
@@ -444,8 +785,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
             /*preload_lds_fragments=*/true,
             /*single_buffer_lds=*/true));
       }
-      if (rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 &&
-          k % 64 == 0) {
+      if (rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 && k % 64 == 0) {
         configs.push_back(MakeConfig(
             /*block_m=*/128, /*block_n=*/128, /*block_k=*/64,
             /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_32X32X8,
@@ -475,10 +815,67 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         /*prefetch_rhs=*/true, /*stage_output=*/false,
         /*waves_per_eu=*/0, /*schedule_instructions=*/true));
   }
-  // Apply FlyDSL's gfx942 A+B LDS pipeline to its native square tile and the
-  // small tile selected by Triton. Both geometries fit a two-stage pipeline
-  // in the MI300X 64 KiB LDS allocation.
+  // The native 64x64x64 FlyDSL A+B pipeline is also valid for short
+  // contractions. It avoids the generic path's repeated global RHS loads and
+  // is especially useful when launch-scale 256/512 GEMMs need more work per
+  // workgroup. The larger-K search below adds the same family with its other
+  // long-pipeline candidates.
+  if (k >= 128 && k < 1024) {
+    add_preloaded_rhs_configs(/*block_m=*/64, /*block_n=*/64,
+                              /*block_k=*/64,
+                              /*num_warps_values=*/{2, 4});
+    // Short square GEMMs need enough workgroups to fill MI300X. Explore the
+    // small geometries selected by Triton while retaining Fly's explicit A+B
+    // LDS staging. K128 permits two resident workgroups; K256 trades that
+    // occupancy for fewer barriers.
+    if (k >= 256) {
+      add_staged_rhs_configs(/*block_m=*/16, /*block_n=*/16,
+                             /*block_k=*/128,
+                             /*num_warps_values=*/{1});
+      add_staged_rhs_configs(/*block_m=*/32, /*block_n=*/16,
+                             /*block_k=*/128,
+                             /*num_warps_values=*/{1, 2});
+      add_staged_rhs_configs(/*block_m=*/32, /*block_n=*/32,
+                             /*block_k=*/128,
+                             /*num_warps_values=*/{4});
+      add_staged_rhs_configs(/*block_m=*/32, /*block_n=*/16,
+                             /*block_k=*/256,
+                             /*num_warps_values=*/{1, 2});
+    }
+  }
+  // Row-major RHS needs a K/N register transpose before LDS. Pair adjacent K
+  // rows, then overlap the single-buffer refill with the second half of the
+  // MFMA tile. Four K128 stages are already sufficient to amortize this
+  // pipeline in batched K512 GEMMs.
+  if (k >= 256 && !rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 &&
+      k % 128 == 0) {
+    configs.push_back(MakeConfig(
+        /*block_m=*/128, /*block_n=*/64, /*block_k=*/128,
+        /*num_warps=*/8, FlyGemmConfig::FLY_MFMA_32X32X8,
+        /*prefetch_rhs=*/false, /*stage_output=*/false,
+        /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+        /*stage_rhs=*/true, /*async_lhs=*/false,
+        /*preload_lds_fragments=*/true,
+        /*single_buffer_lds=*/true, /*direct_to_vgpr=*/false,
+        /*rolling_refill=*/true));
+  }
+  // Apply the remaining gfx942 A+B LDS pipelines selected for long row-major
+  // RHS inputs. Both geometries fit within the MI300X 64 KiB LDS allocation.
   if (k >= 1024) {
+    if (!rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 && k % 64 == 0) {
+      // Keep one 32 KiB A/B tile in LDS while the next tile is prefetched in
+      // VGPRs. The output-staging epilogue restores coalesced stores from the
+      // native MFMA32 accumulator layout without increasing the LDS footprint.
+      configs.push_back(MakeConfig(
+          /*block_m=*/128, /*block_n=*/128, /*block_k=*/64,
+          /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_32X32X8,
+          /*prefetch_rhs=*/false, /*stage_output=*/true,
+          /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+          /*stage_rhs=*/true, /*async_lhs=*/false,
+          /*preload_lds_fragments=*/true,
+          /*single_buffer_lds=*/false, /*direct_to_vgpr=*/false,
+          /*rolling_refill=*/false));
+    }
     add_staged_rhs_configs(/*block_m=*/64, /*block_n=*/32, /*block_k=*/128,
                            /*num_warps_values=*/{2, 4});
     add_staged_rhs_configs(/*block_m=*/128, /*block_n=*/128, /*block_k=*/64,
@@ -529,18 +926,18 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           }
         }
       }
-      if (dot->shape().element_type() == BF16) {
+      if (output_element_type == BF16) {
         configs.push_back(MakeConfig(
-          /*block_m=*/128, /*block_n=*/64, /*block_k=*/128,
-          /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_16X16X16,
-          /*prefetch_rhs=*/false, /*stage_output=*/false,
-          /*waves_per_eu=*/0, /*schedule_instructions=*/true,
-          /*stage_rhs=*/true, /*async_lhs=*/false,
-          /*preload_lds_fragments=*/true,
-          /*single_buffer_lds=*/true,
-          /*direct_to_vgpr=*/false,
-          /*rolling_refill=*/false,
-          /*local_split_k=*/true));
+            /*block_m=*/128, /*block_n=*/64, /*block_k=*/128,
+            /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_16X16X16,
+            /*prefetch_rhs=*/false, /*stage_output=*/false,
+            /*waves_per_eu=*/0, /*schedule_instructions=*/true,
+            /*stage_rhs=*/true, /*async_lhs=*/false,
+            /*preload_lds_fragments=*/true,
+            /*single_buffer_lds=*/true,
+            /*direct_to_vgpr=*/false,
+            /*rolling_refill=*/false,
+            /*local_split_k=*/true));
         configs.push_back(MakeConfig(
             /*block_m=*/128, /*block_n=*/64, /*block_k=*/128,
             /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_16X16X16,
@@ -682,6 +1079,34 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       }
     }
   }
+  if (is_scaled_dot) {
+    const bool can_scale_source_swapped_epilogue = output_element_type == BF16;
+    configs.erase(
+        std::remove_if(configs.begin(), configs.end(),
+                       [can_scale_source_swapped_epilogue](
+                           const std::unique_ptr<BackendConfig>& config) {
+                         const FlyGemmConfig& fly = config->fly();
+                         const bool source_swapped_wide_tile =
+                             (fly.block_m() == 256 && fly.block_n() == 224) ||
+                             (fly.block_m() == 224 && fly.block_n() == 256);
+                         return !can_scale_source_swapped_epilogue &&
+                                source_swapped_wide_tile;
+                       }),
+        configs.end());
+  }
+  if (lhs_concat.has_value() || rhs_concat.has_value()) {
+    configs.erase(
+        std::remove_if(
+            configs.begin(), configs.end(),
+            [&](const std::unique_ptr<BackendConfig>& config) {
+              const FlyGemmConfig& fly = config->fly();
+              return (lhs_concat.has_value() &&
+                      lhs_concat->fragment_size % fly.block_m() != 0) ||
+                     (rhs_concat.has_value() &&
+                      rhs_concat->fragment_size % fly.block_n() != 0);
+            }),
+        configs.end());
+  }
   return configs;
 }
 
@@ -711,12 +1136,10 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
                    instr.backend_config<GpuBackendConfig>());
   FusionBackendConfig* fusion_config =
       gpu_config.mutable_fusion_backend_config();
-  HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
-      *instr.fused_instructions_computation(), HloOpcode::kDot);
+  HloInstruction* dot = FindContraction(instr);
   const int64_t output_rank = dot->shape().dimensions_size();
-  const bool is_gemv =
-      dot->shape().dimensions(output_rank - 2) == 1 ||
-      dot->shape().dimensions(output_rank - 1) == 1;
+  const bool is_gemv = dot->shape().dimensions(output_rank - 2) == 1 ||
+                       dot->shape().dimensions(output_rank - 1) == 1;
   fusion_config->set_kind(is_gemv ? kFlyGemvFusionKind : kFlyGemmFusionKind);
   *fusion_config->mutable_fly_gemm_config() = fly_config;
 
@@ -739,6 +1162,197 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
   contraction_tile.add_sizes(fly_config.block_k());
   RETURN_IF_ERROR(dot->set_backend_config(contraction_tile));
   return instr.set_backend_config(gpu_config);
+}
+
+bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
+  if (!debug_options().xla_gpu_enable_flydsl_fusion() ||
+      !target_config().device_description.gpu_compute_capability().IsRocm() ||
+      instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  const auto* fusion = Cast<const HloFusionInstruction>(&instr);
+  if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+    return false;
+  }
+  HloFusionAnalysis analysis =
+      HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (flydsl::IsFlySoftmaxFusion(analysis)) {
+    return true;
+  }
+  if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
+    return true;
+  }
+  return analysis.emitter_fusion_kind() ==
+             HloFusionAnalysis::EmitterFusionKind::kLoop ||
+         analysis.emitter_fusion_kind() ==
+             HloFusionAnalysis::EmitterFusionKind::kReduction ||
+         analysis.emitter_fusion_kind() ==
+             HloFusionAnalysis::EmitterFusionKind::kTranspose;
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  if (!IsSupported(instr)) {
+    return configs;
+  }
+
+  HloFusionAnalysis analysis =
+      HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (flydsl::IsFlySoftmaxFusion(analysis)) {
+    const Shape& shape = analysis.first_result_shape();
+    const int64_t columns = shape.dimensions(1);
+    for (int64_t num_warps : {1, 2, 4, 8, 16}) {
+      const int64_t threads = num_warps * 64;
+      if (columns % threads != 0 || columns / threads > 64) {
+        continue;
+      }
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      Tile* tile = block->add_output_tiles();
+      tile->add_sizes(1);
+      tile->add_sizes(columns);
+      block->set_num_warps(num_warps);
+      block->set_num_ctas(1);
+      block->set_num_stages(1);
+      configs.push_back(std::move(config));
+    }
+    return configs;
+  }
+  if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
+    auto config = std::make_unique<BackendConfig>();
+    BlockLevelFusionConfig* block = config->mutable_block_level();
+    Tile* tile = block->add_output_tiles();
+    tile->add_sizes(64);
+    tile->add_sizes(64);
+    block->set_num_warps(4);
+    block->set_num_ctas(1);
+    block->set_num_stages(1);
+    configs.push_back(std::move(config));
+    return configs;
+  }
+  if (analysis.emitter_fusion_kind() ==
+      HloFusionAnalysis::EmitterFusionKind::kTranspose) {
+    auto config = std::make_unique<BackendConfig>();
+    BlockLevelFusionConfig* block = config->mutable_block_level();
+    Tile* tile = block->add_output_tiles();
+    for (int64_t dimension = 0;
+         dimension < analysis.first_result_shape().dimensions_size();
+         ++dimension) {
+      tile->add_sizes(1);
+    }
+    block->set_num_warps(4);
+    block->set_num_ctas(1);
+    block->set_num_stages(1);
+    configs.push_back(std::move(config));
+    return configs;
+  }
+  if (analysis.emitter_fusion_kind() ==
+      HloFusionAnalysis::EmitterFusionKind::kReduction) {
+    const HloInstruction* hero = analysis.FindHeroReduction();
+    if (hero == nullptr) {
+      return configs;
+    }
+    ReductionDimensions dimensions =
+        GetReductionKindAndContiguousComponents(*hero);
+    auto add_reduction_config = [&](int64_t elements_per_thread,
+                                    int64_t num_warps) {
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      Tile* tile = block->add_output_tiles();
+      tile->add_sizes(elements_per_thread);
+      block->set_num_warps(num_warps);
+      block->set_num_ctas(1);
+      block->set_num_stages(1);
+      configs.push_back(std::move(config));
+    };
+    if (dimensions.is_row_reduction) {
+      // Start with XLA's native geometry, then cover one to sixteen AMD waves
+      // per row while preserving a single-block reduction.
+      add_reduction_config(/*elements_per_thread=*/16, /*num_warps=*/4);
+      add_reduction_config(/*elements_per_thread=*/8, /*num_warps=*/8);
+      add_reduction_config(/*elements_per_thread=*/4, /*num_warps=*/16);
+      add_reduction_config(/*elements_per_thread=*/32, /*num_warps=*/2);
+      add_reduction_config(/*elements_per_thread=*/64, /*num_warps=*/1);
+    } else {
+      add_reduction_config(/*elements_per_thread=*/1, /*num_warps=*/4);
+    }
+    return configs;
+  }
+
+  const int64_t elements = ShapeUtil::ElementsIn(analysis.first_result_shape());
+  const int64_t native_unroll = ComputeLoopFusionConfig(analysis);
+
+  auto add_config = [&](int64_t unroll, int64_t num_warps) {
+    if (unroll <= 0 || unroll > elements) {
+      return;
+    }
+    for (const auto& existing : configs) {
+      if (existing->block_level().output_tiles(0).sizes(0) == unroll &&
+          existing->block_level().num_warps() == num_warps) {
+        return;
+      }
+    }
+    auto config = std::make_unique<BackendConfig>();
+    BlockLevelFusionConfig* block = config->mutable_block_level();
+    Tile* tile = block->add_output_tiles();
+    tile->add_sizes(unroll);
+    block->set_num_warps(num_warps);
+    block->set_num_ctas(1);
+    block->set_num_stages(1);
+    configs.push_back(std::move(config));
+  };
+
+  add_config(native_unroll, 4);
+  for (int64_t num_warps : {1, 2, 4, 8}) {
+    for (int64_t unroll : {1, 2, 4, 8}) {
+      add_config(unroll, num_warps);
+    }
+  }
+  return configs;
+}
+
+absl::StatusOr<std::unique_ptr<BackendConfig>>
+FlyFusionBackend::GetDefaultConfig(const HloInstruction& instr) {
+  ASSIGN_OR_RETURN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                   GetSupportedConfigs(instr));
+  if (configs.empty()) {
+    return absl::InvalidArgumentError(
+        "FlyFusionBackend has no supported configuration for this "
+        "instruction.");
+  }
+  return std::move(configs.front());
+}
+
+absl::Status FlyFusionBackend::ApplyConfig(HloInstruction& instr,
+                                           const BackendConfig& config) {
+  if (!IsSupported(instr)) {
+    return absl::InvalidArgumentError(
+        "FlyFusionBackend does not support this instruction.");
+  }
+  if (!config.has_block_level() ||
+      config.block_level().output_tiles_size() != 1 ||
+      config.block_level().output_tiles(0).sizes().empty()) {
+    return absl::InvalidArgumentError(
+        "Expected a non-empty Fly fusion tile configuration.");
+  }
+  for (int64_t size : config.block_level().output_tiles(0).sizes()) {
+    if (size <= 0) {
+      return absl::InvalidArgumentError(
+          "Expected positive Fly fusion tile sizes.");
+    }
+  }
+
+  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   instr.backend_config<GpuBackendConfig>());
+  FusionBackendConfig* fusion_config =
+      gpu_config.mutable_fusion_backend_config();
+  fusion_config->set_kind(kFlyFusionKind);
+  *fusion_config->mutable_block_level_fusion_config() = config.block_level();
+  gpu_config.clear_native_emitter_backend_config();
+  RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+  instr.set_fusion_kind(HloInstruction::FusionKind::kCustom);
+  return absl::OkStatus();
 }
 
 }  // namespace xla::gpu
