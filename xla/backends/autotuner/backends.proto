@@ -41,4 +41,5 @@ enum Backend {
   HIPBLASLT_FISSION = 16;
   FLY = 17;
   FLY_FUSION = 18;
+  FLY_FISSION = 19;
 }

@@ -1,0 +1,37 @@
+HloModule fly_fusion_bf16_softmax_tail_benchmark
+
+%maximum (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %max = f32[] maximum(%lhs, %rhs)
+}
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%fused_softmax (p0: bf16[65536,4093]) -> bf16[65536,4093] {
+  %p0 = bf16[65536,4093]{1,0} parameter(0)
+  %converted = f32[65536,4093]{1,0} convert(%p0)
+  %minus_inf = f32[] constant(-inf)
+  %row_max = f32[65536]{0} reduce(%converted, %minus_inf), dimensions={1},
+    to_apply=%maximum
+  %broadcast_max = f32[65536,4093]{1,0} broadcast(%row_max), dimensions={0}
+  %shifted = f32[65536,4093]{1,0} subtract(%converted, %broadcast_max)
+  %exponential = f32[65536,4093]{1,0} exponential(%shifted)
+  %zero = f32[] constant(0)
+  %row_sum = f32[65536]{0} reduce(%exponential, %zero), dimensions={1},
+    to_apply=%add
+  %broadcast_sum = f32[65536,4093]{1,0} broadcast(%row_sum), dimensions={0}
+  %normalized = f32[65536,4093]{1,0} divide(%exponential, %broadcast_sum)
+  ROOT %result = bf16[65536,4093]{1,0} convert(%normalized)
+}
+
+ENTRY %entry_computation (p0: bf16[65536,4093]) -> bf16[65536,4093] {
+  %p0 = bf16[65536,4093]{1,0} parameter(0)
+  ROOT %fusion = bf16[65536,4093]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_softmax,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}

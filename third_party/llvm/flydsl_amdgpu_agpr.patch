@@ -1,0 +1,70 @@
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp b/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
+@@ -1295,6 +1295,8 @@ struct AAAMDGPUMinAGPRAlloc
+   using Base = StateWrapper<DecIntegerState<>, AbstractAttribute>;
+   AAAMDGPUMinAGPRAlloc(const IRPosition &IRP, Attributor &A) : Base(IRP) {}
+ 
++  std::optional<unsigned> ExplicitMaxNumAGPRs;
++
+   static AAAMDGPUMinAGPRAlloc &createForPosition(const IRPosition &IRP,
+                                                  Attributor &A) {
+     if (IRP.getPositionKind() == IRPosition::IRP_FUNCTION)
+@@ -1305,6 +1307,9 @@ struct AAAMDGPUMinAGPRAlloc
+ 
+   void initialize(Attributor &A) override {
+     Function *F = getAssociatedFunction();
++    if (auto Alloc = AMDGPU::getIntegerPairAttribute(
++            *F, "amdgpu-agpr-alloc", /*OnlyFirstRequired=*/true))
++      ExplicitMaxNumAGPRs = Alloc->second;
+     auto [MinNumAGPR, MaxNumAGPR] =
+         AMDGPU::getIntegerPairAttribute(*F, "amdgpu-agpr-alloc", {~0u, ~0u},
+                                         /*OnlyFirstRequired=*/true);
+@@ -1415,6 +1420,8 @@ struct AAAMDGPUMinAGPRAlloc
+     LLVMContext &Ctx = getAssociatedFunction()->getContext();
+     SmallString<4> Buffer;
+     raw_svector_ostream OS(Buffer);
+     OS << getAssumed();
++    if (ExplicitMaxNumAGPRs)
++      OS << ',' << *ExplicitMaxNumAGPRs;
+ 
+     return A.manifestAttrs(
+         getIRPosition(), {Attribute::get(Ctx, "amdgpu-agpr-alloc", OS.str())});
+diff --git a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp
+--- a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp
++++ b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.cpp
+@@ -91,6 +91,10 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
+         AMDGPU::getIntegerPairAttribute(F, "amdgpu-agpr-alloc", {~0u, ~0u},
+                                         /*OnlyFirstRequired=*/true);
+     MinNumAGPRs = MinNumAGPRAttr;
++    Attribute MFMAForm = F.getFnAttribute("amdgpu-mfma-vgpr-form");
++    ForceMFMAAGPRForm =
++        MFMAForm.isStringAttribute() &&
++        MFMAForm.getValueAsString().equals_insensitive("false");
+   }
+ 
+   if (!isEntryFunction()) {
+diff --git a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.h b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.h
+--- a/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.h
++++ b/llvm/lib/Target/AMDGPU/SIMachineFunctionInfo.h
+@@ -520,6 +520,10 @@ class SIMachineFunctionInfo final : public AMDGPUMachineFunction {
+   /// relevant for gfx90a-gfx950. For gfx908, this should be infinite.
+   unsigned MinNumAGPRs = ~0u;
+ 
++  /// Override the global MFMA form policy for kernels whose accumulator
++  /// layout is explicitly constrained by amdgpu-agpr-alloc.
++  bool ForceMFMAAGPRForm = false;
++
+   // The hard-wired high half of the address of the global information table
+   // for AMDPAL OS type. 0xffffffff represents no hard-wired high half, since
+   // current hardware only allows a 16 bit value.
+@@ -1224,7 +1228,8 @@ public:
+   /// Return true if an MFMA that requires at least \p NumRegs should select to
+   /// the AGPR form, instead of the VGPR form.
+   bool selectAGPRFormMFMA(unsigned NumRegs) const {
+-    return !MFMAVGPRForm && getMinNumAGPRs() >= NumRegs;
++    return ForceMFMAAGPRForm ||
++           (!MFMAVGPRForm && getMinNumAGPRs() >= NumRegs);
+   }
+ 
+   // \returns true if a function has a use of AGPRs via inline asm or

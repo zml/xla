@@ -23,8 +23,9 @@ limitations under the License.
 
 namespace xla::gpu::flydsl {
 
-// Recognizes the canonical rank-2 BF16 softmax produced by XLA: convert to
-// FP32, row maximum, exp, row sum, normalize, and convert back to BF16.
+// Recognizes the canonical rank-2 F16, BF16, or F32 softmax produced by XLA:
+// optional conversion to FP32, row maximum, exp, row sum, normalize, and an
+// optional conversion back to the interface type.
 bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis);
 
 // Emits one workgroup per row. Values remain in registers across the maximum

@@ -490,3 +490,20 @@ func.func @get_dynamic_dim_size(%in: tensor<16x8x4xf32>) -> (i32) {
 // CHECK-LABEL: func.func @get_dynamic_dim_size(
 // CHECK-SAME:      %[[TENSOR:.*]]: tensor<512xf32>) -> i32 {
 // CHECK:         xla.get_dynamic_dim_size %[[TENSOR]] 1 : tensor<512xf32>
+
+// -----
+
+func.func @accumulator_store(%out: tensor<2x4xf32>,
+                             %value: vector<4xf32>, %index: index)
+    -> tensor<2x4xf32> {
+  %stored = xla_gpu.accumulator_store %value, %out[%index]
+    : vector<4xf32>, tensor<2x4xf32>
+  return %stored : tensor<2x4xf32>
+}
+// CHECK-LABEL: func.func @accumulator_store(
+// CHECK-SAME:      %[[OUT:.*]]: tensor<8xf32>,
+// CHECK-SAME:      %[[VALUE:.*]]: vector<4xf32>, %[[INDEX:.*]]: index)
+// CHECK-SAME:      -> tensor<8xf32> {
+// CHECK:         %[[STORED:.*]] = xla_gpu.accumulator_store %[[VALUE]], %[[OUT]][%[[INDEX]]]
+// CHECK-SAME:      : vector<4xf32>, tensor<8xf32>
+// CHECK:         return %[[STORED]] : tensor<8xf32>

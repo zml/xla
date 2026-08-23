@@ -7,7 +7,10 @@ def repo():
     tf_http_archive(
         name = "flydsl",
         build_file = "//third_party/flydsl:flydsl.BUILD.bazel",
-        patch_file = ["//third_party/flydsl:mlir_property_ref.patch"],
+        patch_file = [
+            "//third_party/flydsl:mlir_property_ref.patch",
+            "//third_party/flydsl:xf32_mfma.patch",
+        ],
         sha256 = "bb124ad3819dfcd5b7739108d12025d00dbbd14e9f70a9cb33a5405cec5f6d27",
         strip_prefix = "FlyDSL-{commit}".format(commit = flydsl_commit),
         urls = tf_mirror_urls(

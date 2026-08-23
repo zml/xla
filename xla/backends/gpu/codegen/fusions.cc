@@ -74,6 +74,13 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
   const auto& analysis = fusion_info.analysis();
 #if TENSORFLOW_USE_ROCM
   if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
+    if (IsDynamicUpdateSliceFusion(analysis.fusion_spec()) &&
+        fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
+      auto emitter =
+          std::make_unique<InPlaceDynamicUpdateSliceFusion>(analysis);
+      emitter->EnableFlyMemory();
+      return std::make_unique<MlirKernelFusion>(std::move(emitter));
+    }
     if (flydsl::IsFlySoftmaxFusion(analysis)) {
       return std::make_unique<MlirKernelFusion>(
           flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
@@ -107,11 +114,6 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
         flydsl::CreateFlyXTileGemmEmitter(analysis));
   }
   if (analysis.fusion_backend_config().kind() == kFlyGemvFusionKind) {
-    const HloInstruction& root = analysis.fusion_root(0).instruction();
-    if (root.shape().dimensions(0) == 1) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileGemmEmitter(analysis));
-    }
     return std::make_unique<MlirKernelFusion>(
         flydsl::CreateFlyXTileGemvEmitter(analysis));
   }

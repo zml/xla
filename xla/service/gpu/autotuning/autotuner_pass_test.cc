@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/status/status_matchers.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/autotuner/config_assigner.h"
@@ -56,6 +57,7 @@ limitations under the License.
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_address_allocator.h"
 #include "xla/tsl/platform/env.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/threadpool.h"
 #include "xla/tsl/util/proto/proto_matchers.h"
@@ -88,6 +90,40 @@ class AutotunerPassTest : public HloHardwareIndependentTestBase {
   std::unique_ptr<se::DeviceAddressAllocator> allocator_;
   NVPTXCompiler compiler_;
 };
+
+TEST_F(AutotunerPassTest, GenericTritonCustomFusionIsAutotuned) {
+  constexpr absl::string_view kHlo = R"(
+HloModule generic_triton_custom_fusion
+
+fused_computation {
+  p0 = f32[1024]{0} parameter(0)
+  ROOT result = f32[1024]{0} negate(p0)
+}
+
+ENTRY main {
+  p0 = f32[1024]{0} parameter(0)
+  ROOT fusion = f32[1024]{0} fusion(p0), kind=kCustom,
+    calls=fused_computation,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_autotune_level(3);
+  debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(true);
+  InstructionFilterFn should_autotune = GetShouldAutotuneInstructionFn(
+      debug_options,
+      stream_executor_->GetDeviceDescription().gpu_compute_capability());
+  EXPECT_TRUE(should_autotune(*fusion));
+
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  gpu_config.mutable_fusion_backend_config()->set_kind("__custom");
+  ASSERT_OK(fusion->set_backend_config(gpu_config));
+  EXPECT_FALSE(should_autotune(*fusion));
+}
 
 const char kCublasCustomCallHlo[] = R"(
 HloModule module, entry_computation_layout={(f32[100,100]{1,0}, f32[100,100]{1,0})->f32[100,100]{1,0}}
@@ -500,7 +536,7 @@ INSTANTIATE_TEST_SUITE_P(
         {true, true, false},
         {true, false, true},
         {false, true, false},
-        {false, false, false},
+        {false, false, true},
     }),
     [](const ::testing::TestParamInfo<AutotunerRegSpillsTest::ParamType>&
            info) {

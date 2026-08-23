@@ -106,7 +106,8 @@ def XLAGPU_BufferLoadOp : XLAGPU_Op<"buffer_load"> {
   }];
 
   let arguments = (ins AnyRankedTensor:$source, Index:$source_index);
-  let results = (outs AnyVectorOfNonZeroRank:$result);
+  // Packed sub-byte loads may use i32 to fetch eight S4 values at once.
+  let results = (outs AnyTypeOf<[AnyVectorOfNonZeroRank, I32]>:$result);
 
   let assemblyFormat = [{
     $source `[` $source_index `]` attr-dict `:` type($source) `->` type($result)
@@ -135,6 +136,32 @@ def XLAGPU_BufferStoreOp : XLAGPU_Op<"buffer_store", [
   let assemblyFormat = [{
     $value `,` $destination `[` $destination_index `]`
     `cache_policy` `=` $cache_policy attr-dict
+    `:` type($value) `,` type($destination)
+  }];
+}
+
+def XLAGPU_AccumulatorStoreOp : XLAGPU_Op<"accumulator_store", [
+    TypesMatchWith<"result type matches destination type",
+                   "destination", "result", "$_self">
+  ]> {
+  let summary = "Stores four FP32 accumulator values directly from AGPRs.";
+
+  let description = [{
+    Stores four contiguous FP32 values with an AMD `global_store_dwordx4`
+    whose payload is constrained to the accumulator register file. This
+    avoids four explicit AGPR-to-VGPR reads in wide MFMA epilogues. The
+    destination index must be in bounds; unlike `buffer_store`, this operation
+    does not use descriptor bounds to suppress invalid writes. Its byte offset
+    must fit in 32 bits.
+  }];
+
+  let arguments = (ins VectorOfLengthAndType<[4], [F32]>:$value,
+                       AnyRankedTensor:$destination,
+                       Index:$destination_index);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $value `,` $destination `[` $destination_index `]` attr-dict
     `:` type($value) `,` type($destination)
   }];
 }
@@ -173,12 +200,15 @@ def XLAGPU_SplitBufferLoadOp : XLAGPU_Op<"split_buffer_load"> {
     Loads a contiguous vector using separate lane-varying and uniform physical
     linear tensor offsets. The lowering maps these to the voffset and soffset
     operands of an AMD raw buffer instruction, allowing loop-varying uniform
-    offsets to remain in SGPRs instead of being combined in every lane.
+    offsets to remain in SGPRs instead of being combined in every lane. For a
+    sub-byte source, both logical offsets must independently be byte-aligned.
   }];
 
   let arguments = (ins AnyRankedTensor:$source, Index:$vector_index,
                        Index:$scalar_index);
-  let results = (outs AnyVectorOfNonZeroRank:$result);
+  // Packed sub-byte loads may use an integer result whose bit width matches
+  // the physical bytes fetched by the buffer instruction.
+  let results = (outs AnyTypeOf<[AnyVectorOfNonZeroRank, I32]>:$result);
 
   let assemblyFormat = [{
     $source `[` $vector_index `+` $scalar_index `]` attr-dict

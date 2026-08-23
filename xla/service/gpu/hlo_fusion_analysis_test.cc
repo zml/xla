@@ -453,6 +453,7 @@ TEST_F(HloFusionAnalysisTest, ClassifiesFlyFusionSeparatelyFromLoopFusion) {
       *module->entry_computation()->root_instruction(), device_info);
   EXPECT_EQ(analysis.emitter_fusion_kind(),
             HloFusionAnalysis::EmitterFusionKind::kFly);
+  EXPECT_EQ(analysis.FindHeroReduction(), nullptr);
 }
 
 TEST_F(HloFusionAnalysisTest,

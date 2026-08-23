@@ -117,7 +117,7 @@ TEST(FlyDslCompilerTest, WrapsKernelArgumentMemoryInFlyAndLowersBackToLlvm) {
     module {
       llvm.func @kernel(%input: !llvm.ptr, %output: !llvm.ptr) {
         %value = llvm.load %input invariant {alignment = 4 : i64} : !llvm.ptr -> f32
-        llvm.store %value, %output : f32, !llvm.ptr
+        llvm.store %value, %output {alignment = 4 : i64} : f32, !llvm.ptr
         llvm.return
       }
     }
@@ -153,9 +153,134 @@ TEST(FlyDslCompilerTest, WrapsKernelArgumentMemoryInFlyAndLowersBackToLlvm) {
     EXPECT_TRUE(load.getInvariant());
     EXPECT_EQ(load.getAlignment(), 4);
   });
-  module->walk([&](mlir::LLVM::StoreOp) { ++llvm_stores; });
+  module->walk([&](mlir::LLVM::StoreOp store) {
+    ++llvm_stores;
+    EXPECT_EQ(store.getAlignment(), 4);
+  });
   EXPECT_EQ(llvm_loads, 1);
   EXPECT_EQ(llvm_stores, 1);
+}
+
+TEST(FlyDslCompilerTest, UsesRawBuffersForBoundedKernelArguments) {
+  mlir::DialectRegistry registry;
+  RegisterDialects(registry);
+  registry.insert<mlir::arith::ArithDialect, mlir::LLVM::LLVMDialect,
+                  mlir::ROCDL::ROCDLDialect>();
+  mlir::MLIRContext context(registry);
+  constexpr llvm::StringLiteral kModule = R"mlir(
+    module {
+      llvm.func @kernel(
+          %input: !llvm.ptr {llvm.dereferenceable = 4096 : index},
+          %output: !llvm.ptr {llvm.dereferenceable = 4096 : index}) {
+        %index = llvm.mlir.constant(3 : i64) : i64
+        %input_element = llvm.getelementptr %input[%index] :
+          (!llvm.ptr, i64) -> !llvm.ptr, f32
+        %output_element = llvm.getelementptr %output[%index] :
+          (!llvm.ptr, i64) -> !llvm.ptr, f32
+        %value = llvm.load %input_element : !llvm.ptr -> f32
+        llvm.store %value, %output_element : f32, !llvm.ptr
+        llvm.return
+      }
+    }
+  )mlir";
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kModule, &context);
+  ASSERT_TRUE(module);
+
+  mlir::PassManager wrap_pm(&context);
+  AddGenericMemoryPasses(wrap_pm);
+  ASSERT_TRUE(mlir::succeeded(wrap_pm.run(*module)));
+
+  int make_pointers = 0;
+  int add_offsets = 0;
+  module->walk([&](mlir::fly::MakePtrOp op) {
+    ++make_pointers;
+    auto pointer_type = op.getResult().getType();
+    EXPECT_TRUE(mlir::fly::isTargetAddressSpace<
+                mlir::fly_rocdl::BufferDescAddressAttr>(
+        pointer_type.getAddressSpace()));
+  });
+  module->walk([&](mlir::fly::AddOffsetOp) { ++add_offsets; });
+  EXPECT_EQ(make_pointers, 2);
+  EXPECT_EQ(add_offsets, 2);
+
+  mlir::PassManager lower_pm(&context);
+  AddLoweringPasses(lower_pm, /*restore_generic_memory_metadata=*/true);
+  ASSERT_TRUE(mlir::succeeded(lower_pm.run(*module)));
+  EXPECT_FALSE(HasOperations(*module));
+
+  int raw_loads = 0;
+  int raw_stores = 0;
+  module->walk([&](mlir::ROCDL::RawPtrBufferLoadOp) { ++raw_loads; });
+  module->walk([&](mlir::ROCDL::RawPtrBufferStoreOp) { ++raw_stores; });
+  EXPECT_EQ(raw_loads, 1);
+  EXPECT_EQ(raw_stores, 1);
+}
+
+TEST(FlyDslCompilerTest, KeepsFourGiBAllocationsOnGlobalPointerPath) {
+  mlir::DialectRegistry registry;
+  RegisterDialects(registry);
+  registry.insert<mlir::arith::ArithDialect, mlir::LLVM::LLVMDialect,
+                  mlir::ROCDL::ROCDLDialect>();
+  mlir::MLIRContext context(registry);
+  constexpr llvm::StringLiteral kModule = R"mlir(
+    module {
+      llvm.func @kernel(
+          %input: !llvm.ptr {llvm.dereferenceable = 4294967296 : index},
+          %output: !llvm.ptr {llvm.dereferenceable = 4294967296 : index}) {
+        %value = llvm.load %input : !llvm.ptr -> f32
+        llvm.store %value, %output : f32, !llvm.ptr
+        llvm.return
+      }
+    }
+  )mlir";
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kModule, &context);
+  ASSERT_TRUE(module);
+
+  mlir::PassManager wrap_pm(&context);
+  AddGenericMemoryPasses(wrap_pm);
+  ASSERT_TRUE(mlir::succeeded(wrap_pm.run(*module)));
+
+  int make_pointers = 0;
+  int integer_to_pointers = 0;
+  module->walk([&](mlir::fly::MakePtrOp) { ++make_pointers; });
+  module->walk([&](mlir::fly::IntToPtrOp) { ++integer_to_pointers; });
+  EXPECT_EQ(make_pointers, 0);
+  EXPECT_EQ(integer_to_pointers, 2);
+}
+
+TEST(FlyDslCompilerTest, KeepsWideVectorsOnGlobalPointerPath) {
+  mlir::DialectRegistry registry;
+  RegisterDialects(registry);
+  registry.insert<mlir::arith::ArithDialect, mlir::LLVM::LLVMDialect,
+                  mlir::ROCDL::ROCDLDialect>();
+  mlir::MLIRContext context(registry);
+  constexpr llvm::StringLiteral kModule = R"mlir(
+    module {
+      llvm.func @kernel(
+          %input: !llvm.ptr {llvm.dereferenceable = 4096 : index},
+          %output: !llvm.ptr {llvm.dereferenceable = 4096 : index}) {
+        %value = llvm.load %input : !llvm.ptr -> vector<8xf32>
+        llvm.store %value, %output : vector<8xf32>, !llvm.ptr
+        llvm.return
+      }
+    }
+  )mlir";
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kModule, &context);
+  ASSERT_TRUE(module);
+
+  mlir::PassManager wrap_pm(&context);
+  AddGenericMemoryPasses(wrap_pm);
+  ASSERT_TRUE(mlir::succeeded(wrap_pm.run(*module)));
+
+  int make_pointers = 0;
+  int integer_to_pointers = 0;
+  module->walk([&](mlir::fly::MakePtrOp) { ++make_pointers; });
+  module->walk([&](mlir::fly::IntToPtrOp) { ++integer_to_pointers; });
+  EXPECT_EQ(make_pointers, 0);
+  EXPECT_EQ(integer_to_pointers, 2);
 }
 
 }  // namespace

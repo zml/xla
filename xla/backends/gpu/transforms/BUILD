@@ -2748,6 +2748,36 @@ cc_library(
 )
 
 cc_library(
+    name = "fly_gemm_fission_rewriter",
+    srcs = ["fly_gemm_fission_rewriter.cc"],
+    hdrs = ["fly_gemm_fission_rewriter.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "fly_gemm_fission_rewriter_test",
+    srcs = ["fly_gemm_fission_rewriter_test.cc"],
+    deps = [
+        ":fly_gemm_fission_rewriter",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "composite_rewriter",
     srcs = ["composite_rewriter.cc"],
     hdrs = ["composite_rewriter.h"],

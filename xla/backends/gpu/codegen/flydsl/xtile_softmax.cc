@@ -132,7 +132,8 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
  public:
   explicit FlyXTileSoftmaxEmitter(const HloFusionAnalysis& analysis)
       : rows_(analysis.first_result_shape().dimensions(0)),
-        columns_(analysis.first_result_shape().dimensions(1)) {
+        columns_(analysis.first_result_shape().dimensions(1)),
+        element_type_(analysis.first_result_shape().element_type()) {
     const BlockLevelFusionConfig& config =
         analysis.fusion_backend_config().block_level_fusion_config();
     num_warps_ = config.num_warps();
@@ -193,7 +194,8 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
                           mlir::func::FuncOp add_reducer) const {
     TF_RET_CHECK(entry_function.getNumArguments() == 2);
     const int64_t threads = num_warps_ * 64;
-    TF_RET_CHECK(num_warps_ > 0 && num_warps_ <= 16 && columns_ % threads == 0);
+    TF_RET_CHECK(num_warps_ > 0 && num_warps_ <= 16 && columns_ > 0 &&
+                 (columns_ + threads - 1) / threads <= 64);
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
@@ -213,15 +215,38 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
         llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(),
                               /*negative=*/true));
 
+    auto load_input = [&](Value column) -> Value {
+      Value in_bounds = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, column,
+          IndexConstant(builder, columns_));
+      mlir::scf::IfOp load = mlir::scf::IfOp::create(
+          builder, mlir::TypeRange{builder.getF32Type()}, in_bounds,
+          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(load.thenBlock());
+        Value value = mlir::tensor::ExtractOp::create(
+            builder, input, mlir::ValueRange{block_id, column});
+        if (!value.getType().isF32()) {
+          value = mlir::arith::ExtFOp::create(builder, builder.getF32Type(),
+                                              value);
+        }
+        mlir::scf::YieldOp::create(builder, value);
+        builder.setInsertionPointToStart(load.elseBlock());
+        mlir::scf::YieldOp::create(builder, minus_inf);
+      }
+      builder.setInsertionPointAfter(load);
+      return load.getResult(0);
+    };
+
     std::vector<Value> values;
-    values.reserve(columns_ / threads);
+    const int64_t values_per_thread = (columns_ + threads - 1) / threads;
+    values.reserve(values_per_thread);
     Value local_max = minus_inf;
-    for (int64_t i = 0; i < columns_ / threads; ++i) {
+    for (int64_t i = 0; i < values_per_thread; ++i) {
       Value column =
           Add(builder, thread_id, IndexConstant(builder, i * threads));
-      Value value = mlir::tensor::ExtractOp::create(
-          builder, input, mlir::ValueRange{block_id, column});
-      value = mlir::arith::ExtFOp::create(builder, builder.getF32Type(), value);
+      Value value = load_input(column);
       values.push_back(value);
       local_max = mlir::arith::MaximumFOp::create(builder, local_max, value);
     }
@@ -321,15 +346,47 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     Value block_sum = block_reduce(local_sum, add_reducer, zero);
     Value reciprocal =
         mlir::ROCDL::ROCDLRcp::create(builder, builder.getF32Type(), block_sum);
+    mlir::Type result_type;
+    switch (element_type_) {
+      case F16:
+        result_type = builder.getF16Type();
+        break;
+      case BF16:
+        result_type = builder.getBF16Type();
+        break;
+      case F32:
+        result_type = builder.getF32Type();
+        break;
+      default:
+        return absl::InvalidArgumentError(
+            "Fly softmax requires F16, BF16, or F32 results.");
+    }
     for (int64_t i = 0; i < exponentials.size(); ++i) {
       Value normalized =
           mlir::arith::MulFOp::create(builder, exponentials[i], reciprocal);
-      Value result = mlir::arith::TruncFOp::create(
-          builder, builder.getBF16Type(), normalized);
+      Value result = normalized;
+      if (!result_type.isF32()) {
+        result = mlir::arith::TruncFOp::create(builder, result_type, result);
+      }
       Value column =
           Add(builder, thread_id, IndexConstant(builder, i * threads));
-      output = mlir::tensor::InsertOp::create(
-          builder, result, output, mlir::ValueRange{block_id, column});
+      Value in_bounds = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, column,
+          IndexConstant(builder, columns_));
+      mlir::scf::IfOp store = mlir::scf::IfOp::create(
+          builder, mlir::TypeRange{output.getType()}, in_bounds,
+          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(store.thenBlock());
+        Value updated = mlir::tensor::InsertOp::create(
+            builder, result, output, mlir::ValueRange{block_id, column});
+        mlir::scf::YieldOp::create(builder, updated);
+        builder.setInsertionPointToStart(store.elseBlock());
+        mlir::scf::YieldOp::create(builder, output);
+      }
+      builder.setInsertionPointAfter(store);
+      output = store.getResult(0);
     }
 
     mlir::func::ReturnOp::create(builder, output);
@@ -338,6 +395,7 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
 
   int64_t rows_;
   int64_t columns_;
+  PrimitiveType element_type_;
   int64_t num_warps_ = 4;
   LaunchDimensions launch_dimensions_;
 };
@@ -349,12 +407,19 @@ bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis) {
     return false;
   }
   const HloInstruction* root = &analysis.fusion_root(0).instruction();
-  if (root->opcode() != HloOpcode::kConvert ||
-      root->shape().element_type() != BF16 ||
+  const PrimitiveType element_type = root->shape().element_type();
+  if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
       root->shape().dimensions_size() != 2) {
     return false;
   }
-  const HloInstruction* normalized = root->operand(0);
+  const HloInstruction* normalized = root;
+  if (element_type != F32) {
+    if (root->opcode() != HloOpcode::kConvert || root->operand_count() != 1 ||
+        root->operand(0)->shape().element_type() != F32) {
+      return false;
+    }
+    normalized = root->operand(0);
+  }
   if (normalized->opcode() != HloOpcode::kDivide) {
     return false;
   }
@@ -371,19 +436,26 @@ bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis) {
   }
   const HloInstruction* converted = shifted->operand(0);
   const HloInstruction* row_max = BroadcastOperand(shifted->operand(1));
-  if (converted->opcode() != HloOpcode::kConvert ||
-      converted->shape().element_type() != F32 ||
-      converted->operand(0)->opcode() != HloOpcode::kParameter ||
-      converted->operand(0)->shape().element_type() != BF16 ||
-      row_max == nullptr ||
+  const HloInstruction* input = converted;
+  if (element_type != F32) {
+    if (converted->opcode() != HloOpcode::kConvert ||
+        converted->operand_count() != 1 ||
+        converted->shape().element_type() != F32) {
+      return false;
+    }
+    input = converted->operand(0);
+  }
+  if (input->opcode() != HloOpcode::kParameter ||
+      input->shape().element_type() != element_type || row_max == nullptr ||
       !IsRowReduction(row_max, HloOpcode::kMaximum, converted) ||
       !IsScalarConstant(row_max->operand(1),
                         -std::numeric_limits<double>::infinity())) {
     return false;
   }
   const int64_t columns = root->shape().dimensions(1);
-  return columns >= 64 && columns % 64 == 0 &&
-         root->shape() == converted->operand(0)->shape();
+  constexpr int64_t kMaxColumns = 16 * 64 * 64;
+  return columns > 0 && columns <= kMaxColumns &&
+         root->shape() == input->shape();
 }
 
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileSoftmaxEmitter(

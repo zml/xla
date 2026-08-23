@@ -31,6 +31,7 @@ HloModule fly_fusion_bf16_softmax_benchmark
 
 ENTRY %entry_computation (p0: bf16[65536,4096]) -> bf16[65536,4096] {
   %p0 = bf16[65536,4096]{1,0} parameter(0)
-  ROOT %fusion = bf16[65536,4096]{1,0} fusion(%p0), kind=kInput,
-    calls=%fused_softmax
+  ROOT %fusion = bf16[65536,4096]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_softmax,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
 }

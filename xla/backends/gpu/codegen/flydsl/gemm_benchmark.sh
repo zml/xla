@@ -13,7 +13,18 @@ fi
 workspace_name="${TEST_WORKSPACE:-xla}"
 autotuner="${runfiles_root}/${workspace_name}/xla/backends/gpu/autotuner/autotuner_main"
 benchmark_modes=0
-for mode in FLY_GEMM_BENCHMARK_SCALED FLY_GEMM_BENCHMARK_NARROWING \
+for mode in FLY_GEMM_BENCHMARK_SCALED FLY_GEMM_BENCHMARK_SCALED_FP8 \
+            FLY_GEMM_BENCHMARK_BLOCK_SCALED_FP8 \
+            FLY_GEMM_BENCHMARK_NARROWING \
+            FLY_GEMM_BENCHMARK_F32_OUTPUT \
+            FLY_GEMM_BENCHMARK_F32 \
+            FLY_GEMM_BENCHMARK_F16 \
+            FLY_GEMM_BENCHMARK_F16_BATCHED \
+            FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE \
+            FLY_GEMM_BENCHMARK_FP8 \
+            FLY_GEMM_BENCHMARK_BATCHED_FP8 \
+            FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8 \
+            FLY_GEMM_BENCHMARK_INT4 \
             FLY_GEMM_BENCHMARK_SCALAR FLY_GEMM_BENCHMARK_VECTOR \
             FLY_GEMM_BENCHMARK_CHAIN FLY_GEMM_BENCHMARK_CONVERTED_INPUTS \
             FLY_GEMM_BENCHMARK_BITCAST_INPUTS \
@@ -31,9 +42,42 @@ if [[ "${benchmark_modes}" -gt 1 ]]; then
 elif [[ "${FLY_GEMM_BENCHMARK_SCALED:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/scaled_gemm_benchmark.hlo.tpl"
   benchmark_name="bf16_scaled_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_SCALED_FP8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/scaled_fp8_gemm_benchmark.hlo.tpl"
+  benchmark_name="fnuz_fp8_scaled_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_BLOCK_SCALED_FP8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/block_scaled_fp8_gemm_benchmark.hlo.tpl"
+  benchmark_name="fnuz_fp8_block_scaled_gemm"
 elif [[ "${FLY_GEMM_BENCHMARK_NARROWING:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/narrowing_gemm_benchmark.hlo.tpl"
   benchmark_name="f32_dot_bf16_epilogue"
+elif [[ "${FLY_GEMM_BENCHMARK_F32_OUTPUT:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/f32_output_gemm_benchmark.hlo.tpl"
+  benchmark_name="bf16_f32_output_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_F32:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/f32_gemm_benchmark.hlo.tpl"
+  benchmark_name="f32_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_F16:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/f16_gemm_benchmark.hlo.tpl"
+  benchmark_name="f16_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/f16_batched_gemm_benchmark.hlo.tpl"
+  benchmark_name="f16_batched_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/f16_batched_epilogue_gemm_benchmark.hlo.tpl"
+  benchmark_name="f16_batched_epilogue_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/batched_fp8_gemm_benchmark.hlo.tpl"
+  benchmark_name="fnuz_fp8_batched_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/batched_scaled_fp8_gemm_benchmark.hlo.tpl"
+  benchmark_name="fnuz_fp8_batched_scaled_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_FP8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/fp8_gemm_benchmark.hlo.tpl"
+  benchmark_name="fnuz_fp8_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_INT4:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/int4_gemm_benchmark.hlo.tpl"
+  benchmark_name="s4_dequantized_gemm"
 elif [[ "${FLY_GEMM_BENCHMARK_SCALAR:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/scalar_gemm_benchmark.hlo.tpl"
   benchmark_name="f32_dot_scalar_epilogue"
@@ -90,7 +134,7 @@ fi
 
 output_dir="${FLY_GEMM_BENCHMARK_OUTPUT_DIR:-/tmp/fly_gemm_benchmark}"
 mkdir -p "${output_dir}"
-autotune_backends="${FLY_GEMM_BENCHMARK_BACKENDS:-triton,fly,hipblaslt_fission}"
+autotune_backends="${FLY_GEMM_BENCHMARK_BACKENDS:-triton,fly,fly_fission,hipblaslt_fission}"
 
 rhs_layout="${FLY_GEMM_BENCHMARK_RHS_LAYOUT:-1,0}"
 if [[ "${rhs_layout}" != "1,0" && "${rhs_layout}" != "0,1" ]]; then
@@ -99,7 +143,11 @@ if [[ "${rhs_layout}" != "1,0" && "${rhs_layout}" != "0,1" ]]; then
 fi
 
 if [[ "$#" -eq 0 ]]; then
-  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ]]; then
+  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
     set -- 8x256x256x256 8x512x512x512 8x1024x1024x1024
   else
     set -- 256x256x256 512x512x512 1024x1024x1024
@@ -108,7 +156,11 @@ fi
 
 for shape in "$@"; do
   batch=1
-  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ]]; then
+  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
     IFS=x read -r batch m n k extra <<<"${shape}"
     expected_shape="BxMxNxK"
   else
@@ -120,6 +172,11 @@ for shape in "$@"; do
         ! "${m}" =~ ^[0-9]+$ || ! "${n}" =~ ^[0-9]+$ ||
         ! "${k}" =~ ^[0-9]+$ ]]; then
     echo "Invalid shape '${shape}'; expected ${expected_shape}." >&2
+    exit 1
+  fi
+  if [[ "${FLY_GEMM_BENCHMARK_BLOCK_SCALED_FP8:-0}" == "1" ]] &&
+      ((k % 32 != 0)); then
+    echo "Block-scaled FP8 benchmark requires K divisible by 32; got '${shape}'." >&2
     exit 1
   fi
 
@@ -135,6 +192,7 @@ for shape in "$@"; do
   end_k=$((k + 32))
   half_m=$((m / 2))
   half_n=$((n / 2))
+  scale_k=$((k / 32))
   if [[ "${rhs_layout}" == "1,0" ]]; then
     batch_rhs_layout="2,1,0"
   else
@@ -147,6 +205,7 @@ for shape in "$@"; do
   fi
   sed -e "s/__B__/${batch}/g" -e "s/__M__/${m}/g" \
     -e "s/__N__/${n}/g" -e "s/__K__/${k}/g" \
+    -e "s/__KB__/${scale_k}/g" \
     -e "s/__MH__/${half_m}/g" -e "s/__NH__/${half_n}/g" \
     -e "s/__MP__/${padded_m}/g" -e "s/__NP__/${padded_n}/g" \
     -e "s/__KP__/${padded_k}/g" -e "s/__MEND__/${end_m}/g" \
@@ -157,7 +216,7 @@ for shape in "$@"; do
   rm -f "${log}"
 
   XLA_FLAGS="${XLA_FLAGS:-} \
---xla_gpu_autotune_level=3 \
+--xla_gpu_autotune_level=${FLY_GEMM_BENCHMARK_AUTOTUNE_LEVEL:-3} \
 --xla_gpu_autotune_num_repetitions=${FLY_GEMM_BENCHMARK_REPETITIONS:-5} \
 --xla_gpu_enable_flydsl_gemm=true \
 --xla_gpu_experimental_autotune_backends=${autotune_backends} \
@@ -186,10 +245,13 @@ for shape in "$@"; do
     /^[[:space:]]+triton \{/ { backend = "TRITON" }
     /^[[:space:]]+gemm \{/ { backend = "HIPBLASLT" }
     /name: "FLY"/ { backend = "FLY" }
+    /name: "FLY_FISSION"/ { backend = "FLY_FISSION" }
     END {
       record_result()
-      for (i = 1; i <= 3; ++i) {
-        name = (i == 1 ? "FLY" : (i == 2 ? "TRITON" : "HIPBLASLT"))
+      for (i = 1; i <= 4; ++i) {
+        name = (i == 1 ? "FLY" :
+                (i == 2 ? "FLY_FISSION" :
+                 (i == 3 ? "TRITON" : "HIPBLASLT")))
         if (name in best) {
           printf "  best %-10s %10.3f us\n", name, best[name] / 1000.0
         }

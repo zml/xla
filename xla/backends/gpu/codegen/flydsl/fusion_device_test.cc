@@ -72,6 +72,98 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
 }
 
+TEST_F(FlyFusionDeviceTest, F16Softmax31x125Tail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_f16_softmax_tail
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax {
+  p0 = f16[31,125]{1,0} parameter(0)
+  converted = f32[31,125]{1,0} convert(p0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[31]{0} reduce(converted, minus_inf), dimensions={1},
+    to_apply=maximum
+  broadcast_max = f32[31,125]{1,0} broadcast(row_max), dimensions={0}
+  shifted = f32[31,125]{1,0} subtract(converted, broadcast_max)
+  exponential = f32[31,125]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[31]{0} reduce(exponential, zero), dimensions={1}, to_apply=add
+  broadcast_sum = f32[31,125]{1,0} broadcast(row_sum), dimensions={0}
+  normalized = f32[31,125]{1,0} divide(exponential, broadcast_sum)
+  ROOT result = f16[31,125]{1,0} convert(normalized)
+}
+
+ENTRY main {
+  p0 = f16[31,125]{1,0} parameter(0)
+  ROOT fusion = f16[31,125]{1,0} fusion(p0), kind=kCustom,
+    calls=softmax,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","125"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionDeviceTest, F32Softmax31x125Tail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_f32_softmax_tail
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax {
+  p0 = f32[31,125]{1,0} parameter(0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[31]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+  broadcast_max = f32[31,125]{1,0} broadcast(row_max), dimensions={0}
+  shifted = f32[31,125]{1,0} subtract(p0, broadcast_max)
+  exponential = f32[31,125]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[31]{0} reduce(exponential, zero), dimensions={1}, to_apply=add
+  broadcast_sum = f32[31,125]{1,0} broadcast(row_sum), dimensions={0}
+  ROOT result = f32[31,125]{1,0} divide(exponential, broadcast_sum)
+}
+
+ENTRY main {
+  p0 = f32[31,125]{1,0} parameter(0)
+  ROOT fusion = f32[31,125]{1,0} fusion(p0), kind=kCustom,
+    calls=softmax,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","125"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(RunAndCompareNoHloPasses(
+      kHlo, ErrorSpec{/*aabs=*/0.0001, /*arel=*/0.001}));
+}
+
 TEST_F(FlyFusionDeviceTest, Bf16Transpose128x192) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_bf16_transpose
@@ -90,6 +182,54 @@ ENTRY main {
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["64","64"]}],
         "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, Bf16Transpose32Tile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_transpose_32_tile
+
+transpose {
+  p0 = bf16[96,160]{1,0} parameter(0)
+  ROOT result = bf16[160,96]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = bf16[96,160]{1,0} parameter(0)
+  ROOT fusion = bf16[160,96]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["32","32"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, Bf16Transpose128Tile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_transpose_128_tile
+
+transpose {
+  p0 = bf16[256,384]{1,0} parameter(0)
+  ROOT result = bf16[384,256]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = bf16[256,384]{1,0} parameter(0)
+  ROOT fusion = bf16[384,256]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["128","128"]}],
+        "num_stages":"1", "num_warps":"16", "num_ctas":"1"}}}
 })";
 
   EXPECT_TRUE(
@@ -200,6 +340,40 @@ ENTRY main {
       "kind":"__fly",
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["8"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, GenericInPlaceDynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_generic_in_place_dynamic_update_slice
+
+update_slice {
+  input = f32[64,96]{1,0} parameter(0)
+  update = f32[17,31]{1,0} parameter(1)
+  row = s32[] parameter(2)
+  column = s32[] parameter(3)
+  scale = f32[] constant(1.25)
+  broadcast = f32[17,31]{1,0} broadcast(scale), dimensions={}
+  scaled = f32[17,31]{1,0} multiply(update, broadcast)
+  ROOT result = f32[64,96]{1,0} dynamic-update-slice(
+      input, scaled, row, column)
+}
+
+ENTRY main {
+  input = f32[64,96]{1,0} parameter(0)
+  update = f32[17,31]{1,0} parameter(1)
+  row = s32[] parameter(2)
+  column = s32[] parameter(3)
+  ROOT fusion = f32[64,96]{1,0} fusion(input, update, row, column),
+    kind=kCustom, calls=update_slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
         "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
 

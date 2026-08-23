@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/native_emitter.h"
 #include "xla/backends/gpu/autotuner/triton.h"
 #include "xla/backends/gpu/transforms/dot_algorithm_rewriter.h"
+#include "xla/backends/gpu/transforms/fly_gemm_fission_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_rewriter.h"
 #include "xla/backends/gpu/transforms/scaled_dot_rewriter.h"
 #include "xla/hlo/analysis/alias_info.h"
@@ -75,6 +76,14 @@ std::unique_ptr<HloPassPipeline> GetGemmRewriterPipeline(
   return pipeline;
 }
 
+std::unique_ptr<HloPassPipeline> GetFlyFissionPipeline() {
+  auto pipeline =
+      std::make_unique<HloPassPipeline>("fly_fission_rewriter_pipeline");
+  pipeline->AddPass(std::make_unique<ScaledDotRewriter>());
+  pipeline->AddPass(std::make_unique<FlyGemmFissionRewriter>());
+  return pipeline;
+}
+
 }  // namespace
 
 std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForROCm(
@@ -89,6 +98,10 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForROCm(
       debug_options, compiler, target_config, alias_info, mlir_context));
   backends.push_back(
       std::make_unique<FlyBackend>(debug_options, compiler, target_config));
+  backends.push_back(std::make_unique<FissionBackend>(
+      debug_options, compiler, target_config,
+      std::make_unique<FlyBackend>(debug_options, compiler, target_config),
+      GetFlyFissionPipeline(), alias_info, mlir_context));
   backends.push_back(std::make_unique<FlyFusionBackend>(debug_options, compiler,
                                                         target_config));
   backends.push_back(

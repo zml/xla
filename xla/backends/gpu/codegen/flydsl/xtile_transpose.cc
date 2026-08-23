@@ -51,8 +51,6 @@ namespace {
 
 using mlir::Value;
 
-constexpr int64_t kTileSize = 64;
-constexpr int64_t kThreads = 256;
 constexpr int64_t kVectorWidth = 8;
 
 Value IndexConstant(mlir::ImplicitLocOpBuilder& builder, int64_t value) {
@@ -87,9 +85,19 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     const HloInstruction& root = analysis.fusion_root(0).instruction();
     rows_ = root.operand(0)->shape().dimensions(0);
     columns_ = root.operand(0)->shape().dimensions(1);
+    const BlockLevelFusionConfig& config =
+        analysis.fusion_backend_config().block_level_fusion_config();
+    CHECK_EQ(config.output_tiles_size(), 1);
+    CHECK_EQ(config.output_tiles(0).sizes_size(), 2);
+    CHECK_EQ(config.output_tiles(0).sizes(0),
+             config.output_tiles(0).sizes(1));
+    tile_size_ = config.output_tiles(0).sizes(0);
+    CHECK(tile_size_ == 32 || tile_size_ == 64 || tile_size_ == 128);
+    threads_ = tile_size_ * tile_size_ / (2 * kVectorWidth);
+    CHECK_EQ(config.num_warps() * 64, threads_);
     launch_dimensions_ = LaunchDimensions(
-        se::BlockDim((rows_ / kTileSize) * (columns_ / kTileSize), 1, 1),
-        se::ThreadDim(kThreads, 1, 1));
+        se::BlockDim((rows_ / tile_size_) * (columns_ / tile_size_), 1, 1),
+        se::ThreadDim(threads_, 1, 1));
   }
 
   LaunchDimensions launch_dimensions() const override {
@@ -148,15 +156,15 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     // workgroup order used by Triton's transpose emitter: the input row tile
     // varies fastest, so neighboring workgroups write neighboring output
     // column tiles instead of regions separated by an entire output row.
-    Value tile_rows = IndexConstant(builder, rows_ / kTileSize);
+    Value tile_rows = IndexConstant(builder, rows_ / tile_size_);
     Value block_row =
         mlir::arith::RemUIOp::create(builder, block_id, tile_rows);
-    Value block_column = Div(builder, block_id, rows_ / kTileSize);
-    Value input_row_base = Mul(builder, block_row, kTileSize);
-    Value input_column_base = Mul(builder, block_column, kTileSize);
+    Value block_column = Div(builder, block_id, rows_ / tile_size_);
+    Value input_row_base = Mul(builder, block_row, tile_size_);
+    Value input_column_base = Mul(builder, block_column, tile_size_);
 
-    Value local_row_pair = Div(builder, thread_id, kTileSize / kVectorWidth);
-    Value vector_group = Rem(builder, thread_id, kTileSize / kVectorWidth);
+    Value local_row_pair = Div(builder, thread_id, tile_size_ / kVectorWidth);
+    Value vector_group = Rem(builder, thread_id, tile_size_ / kVectorWidth);
     Value local_column = Mul(builder, vector_group, kVectorWidth);
     Value first_input_row = Mul(builder, local_row_pair, 2);
     Value second_input_row =
@@ -177,8 +185,6 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
                                  "xla_gpu.tile_buffer_store");
       state.addOperands({value, destination, vector_index, tile_index});
       state.addTypes(destination.getType());
-      // This is a streaming write-only transpose output. Avoid retaining the
-      // output lines in L2; gfx942 maps cache-policy bit 1 to non-temporal.
       state.addAttribute("cache_policy", builder.getI32IntegerAttr(2));
       return builder.create(state)->getResult(0);
     };
@@ -196,8 +202,8 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     // row pair with a four-bank rotation per eight input columns. Stores then
     // hit every LDS bank exactly twice per wave (the wave64 minimum), while
     // four adjacent row pairs remain a contiguous 128-bit output read.
-    constexpr int64_t kRowPairs = kTileSize / 2;
-    auto shared_type = mlir::RankedTensorType::get({kTileSize * kRowPairs},
+    const int64_t row_pairs = tile_size_ / 2;
+    auto shared_type = mlir::RankedTensorType::get({tile_size_ * row_pairs},
                                                    builder.getI32Type());
     Value shared = AllocateSharedOp::create(builder, shared_type);
     auto pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
@@ -218,7 +224,7 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
       Value column_group_rotation = Mul(builder, Div(builder, column, 8), 4);
       Value physical_pair = Xor(builder, local_row_pair, column_group_rotation);
       Value shared_write_index =
-          Add(builder, Mul(builder, column, kRowPairs), physical_pair);
+          Add(builder, Mul(builder, column, row_pairs), physical_pair);
       shared = mlir::tensor::InsertOp::create(
           builder, word, shared, mlir::ValueRange{shared_write_index});
     }
@@ -226,11 +232,11 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
         SyncThreadsOp::create(builder, mlir::TypeRange{shared_type}, shared)
             .getResult(0);
 
-    Value output_local_row = Div(builder, thread_id, kTileSize / kVectorWidth);
+    Value output_local_row = Div(builder, thread_id, tile_size_ / kVectorWidth);
     Value second_output_local_row =
-        Add(builder, output_local_row, IndexConstant(builder, kTileSize / 2));
+        Add(builder, output_local_row, IndexConstant(builder, tile_size_ / 2));
     Value output_local_column =
-        Mul(builder, Rem(builder, thread_id, kTileSize / kVectorWidth),
+        Mul(builder, Rem(builder, thread_id, tile_size_ / kVectorWidth),
             kVectorWidth);
     auto packed_words_type =
         mlir::VectorType::get({kVectorWidth / 2}, builder.getI32Type());
@@ -239,7 +245,7 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
       Value column_group_rotation = Mul(builder, Div(builder, row, 8), 4);
       Value physical_pair = Xor(builder, pair_start, column_group_rotation);
       Value shared_read_index =
-          Add(builder, Mul(builder, row, kRowPairs), physical_pair);
+          Add(builder, Mul(builder, row, row_pairs), physical_pair);
       Value packed_words = mlir::vector::TransferReadOp::create(
           builder, packed_words_type, shared,
           mlir::ValueRange{shared_read_index}, /*padding=*/std::nullopt,
@@ -267,6 +273,8 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
 
   int64_t rows_ = 0;
   int64_t columns_ = 0;
+  int64_t tile_size_ = 0;
+  int64_t threads_ = 0;
   LaunchDimensions launch_dimensions_;
 };
 
@@ -282,8 +290,8 @@ bool IsFlyXTileTransposeFusion(const HloFusionAnalysis& analysis) {
          root.shape().element_type() == BF16 &&
          root.shape().dimensions_size() == 2 && root.dimensions().size() == 2 &&
          root.dimensions(0) == 1 && root.dimensions(1) == 0 &&
-         root.operand(0)->shape().dimensions(0) % kTileSize == 0 &&
-         root.operand(0)->shape().dimensions(1) % kTileSize == 0;
+         root.operand(0)->shape().dimensions(0) % 32 == 0 &&
+         root.operand(0)->shape().dimensions(1) % 32 == 0;
 }
 
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(

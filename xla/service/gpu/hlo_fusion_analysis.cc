@@ -342,6 +342,13 @@ const HloInstruction* HloFusionAnalysis::FindHeroReduction() const {
       return &hero.instruction();
     }
   }
+  // Fly is an emitter family rather than a reduction-only emitter. Fly GEMM,
+  // GEMV, transpose, and generic fusions legitimately have no reduction hero.
+  // Alias analysis uses a null hero to disable the reduction-specific buffer
+  // sharing exception for those fusions.
+  if (emitter_fusion_kind_ == EmitterFusionKind::kFly) {
+    return nullptr;
+  }
   LOG(FATAL) << "Did not find a hero reduction";
 }
 

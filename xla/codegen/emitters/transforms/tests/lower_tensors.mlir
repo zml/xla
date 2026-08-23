@@ -495,6 +495,48 @@ func.func @i4_load(%arg: tensor<10xi4>, %i: index)
 
 // -----
 
+func.func @buffer_load_i4(%arg: tensor<18xi4>, %i: index) -> i32 {
+  %v = xla_gpu.buffer_load %arg[%i] : tensor<18xi4> -> i32
+  return %v : i32
+}
+
+// CHECK-LABEL: @buffer_load_i4(
+// CHECK:         arith.shrui
+// CHECK:         arith.trunci
+// CHECK:         rocdl.raw.ptr.buffer.load
+
+// -----
+
+func.func @large_buffer_load(%arg: tensor<2147483648xbf16>, %i: index)
+    -> vector<2xbf16> {
+  %v = xla_gpu.buffer_load %arg[%i]
+      : tensor<2147483648xbf16> -> vector<2xbf16>
+  return %v : vector<2xbf16>
+}
+
+// CHECK-LABEL: @large_buffer_load(
+// CHECK:         llvm.getelementptr
+// CHECK-NOT:     rocdl.raw.ptr.buffer.load
+// CHECK:         llvm.load
+// CHECK:         return
+
+// -----
+
+func.func @split_buffer_load_i4(%arg: tensor<32xi4>, %vector: index,
+                                %scalar: index) -> i32 {
+  %v = xla_gpu.split_buffer_load %arg[%vector + %scalar] : tensor<32xi4> -> i32
+  return %v : i32
+}
+
+// CHECK-LABEL: @split_buffer_load_i4(
+// CHECK:         arith.shrui
+// CHECK:         arith.shrui
+// CHECK:         arith.trunci
+// CHECK:         arith.trunci
+// CHECK:         rocdl.raw.ptr.buffer.load
+
+// -----
+
 func.func @i4_store(%arg: tensor<10xi4>, %v: i4, %i: index)
     -> tensor<10xi4> {
   %r = tensor.insert %v into %arg[%i] : tensor<10xi4>
@@ -1203,3 +1245,19 @@ func.func @get_dynamic_dim_size_unaligned(%arg0: tensor<7xf16>) -> i32 {
   %0 = xla.get_dynamic_dim_size %arg0 1 : tensor<7xf16>
   func.return %0 : i32
 }
+
+// -----
+
+func.func @accumulator_store(
+    %out: tensor<8xf32> {xla.slice_index = 0},
+    %value: vector<4xf32>, %index: index) -> tensor<8xf32> {
+  %stored = xla_gpu.accumulator_store %value, %out[%index]
+    : vector<4xf32>, tensor<8xf32>
+  return %stored : tensor<8xf32>
+}
+// CHECK-GFX942-MI300-LABEL: func.func @accumulator_store(
+// CHECK-GFX942-MI300:         %[[OFFSET:.*]] = arith.muli %{{.*}}, %{{.*}} : i32
+// CHECK-GFX942-MI300:         llvm.inline_asm has_side_effects
+// CHECK-GFX942-MI300-SAME:      "global_store_dwordx4 $1, $0, $2;\0A"
+// CHECK-GFX942-MI300-SAME:      "a,v,s,~{memory}"
+// CHECK-GFX942-MI300-SAME:      %{{.*}}, %[[OFFSET]], %{{.*}}
