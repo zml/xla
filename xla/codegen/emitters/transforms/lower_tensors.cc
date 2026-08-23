@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -130,6 +131,9 @@ Value GetDestinationBuffer(Value dest) {
     } else if (auto transfer_write =
                    dest.getDefiningOp<vector::TransferWriteOp>()) {
       dest = transfer_write.getBase();
+    } else if (auto accumulator_store =
+                   dest.getDefiningOp<gpu::AccumulatorStoreOp>()) {
+      dest = accumulator_store.getDestination();
     } else if (auto buffer_store =
                    dest.getDefiningOp<gpu::BufferStoreOp>()) {
       dest = buffer_store.getDestination();
@@ -338,6 +342,22 @@ Value GetLinearIndex(ValueRange indices, mlir::ImplicitLocOpBuilder& b) {
   return mlir::arith::IndexCastUIOp::create(b, index_ty, index);
 }
 
+// AMD buffer operations take their byte offsets as i32. Linear tensor indices
+// are represented using the target's pointer-sized integer, which is commonly
+// i64, so converting the offset is an integer truncation rather than an
+// index_cast.
+Value CastBufferOffsetToI32(Value offset, mlir::ImplicitLocOpBuilder& b) {
+  if (offset.getType() == b.getI32Type()) return offset;
+  if (mlir::isa<mlir::IndexType>(offset.getType())) {
+    return arith::IndexCastUIOp::create(b, b.getI32Type(), offset);
+  }
+  auto integer_type = mlir::cast<mlir::IntegerType>(offset.getType());
+  if (integer_type.getWidth() > 32) {
+    return arith::TruncIOp::create(b, b.getI32Type(), offset);
+  }
+  return arith::ExtUIOp::create(b, b.getI32Type(), offset);
+}
+
 // If the provided type is a sub-byte type get its bit-width, else nullopt.
 std::optional<int> GetSubByteBitWidth(Type element_type) {
   if (element_type.isIntOrFloat()) {
@@ -466,11 +486,11 @@ struct RewriteAsyncCopyGlobalToShared
         UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
     Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
     Value num_records = ml::ConstantOp::create(
-        b, b.getI64Type(), source.getType().getNumElements() *
-                                 source.getType()
-                                     .getElementType()
-                                     .getIntOrFloatBitWidth() /
-                                 8);
+        b, b.getI64Type(),
+        CeilOfRatio<int64_t>(
+            source.getType().getNumElements() *
+                source.getType().getElementType().getIntOrFloatBitWidth(),
+            8));
     // CDNA buffer descriptor: DATA_FORMAT=7 and NUM_FORMAT=4.
     Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x20070);
     auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
@@ -483,8 +503,7 @@ struct RewriteAsyncCopyGlobalToShared
         b, source_linear_index,
         arith::ConstantIndexOp::create(
             b, source.getType().getElementType().getIntOrFloatBitWidth() / 8));
-    source_byte_offset =
-        arith::IndexCastOp::create(b, b.getI32Type(), source_byte_offset);
+    source_byte_offset = CastBufferOffsetToI32(source_byte_offset, b);
 
     Value destination_linear_index =
         GetLinearIndex(mlir::ValueRange{op.getDestinationIndex()}, b);
@@ -516,29 +535,61 @@ struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
     auto source =
         mlir::cast<TypedValue<mlir::RankedTensorType>>(op.getSource());
 
+    Value source_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getSourceIndex()}, b);
+    std::optional<int> sub_byte_width =
+        GetSubByteBitWidth(source.getType().getElementType());
+    const int64_t source_bytes = CeilOfRatio<int64_t>(
+        source.getType().getNumElements() *
+            source.getType().getElementType().getIntOrFloatBitWidth(),
+        8);
+    // AMD raw-buffer instructions have a 32-bit byte offset and descriptor
+    // extent. At 4 GiB the extent wraps, and offsets beyond it silently read
+    // out-of-bounds zeros. Preserve 64-bit addressing for large allocations by
+    // using an ordinary global vector load instead.
+    if (source_bytes > std::numeric_limits<uint32_t>::max()) {
+      if (sub_byte_width.has_value()) {
+        Value unused_sub_byte_shift;
+        std::tie(source_linear_index, unused_sub_byte_shift) =
+            GetSubByteIndex(source_linear_index, *sub_byte_width, b);
+      }
+      Value source_ptr = CreateGep(source, source_linear_index, b);
+      mlir::LLVMTypeConverter converter(getContext());
+      Type llvm_result_type = converter.convertType(op.getResult().getType());
+      Value loaded = ml::LoadOp::create(b, llvm_result_type, source_ptr);
+      rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
+          op, op.getResult().getType(), loaded);
+      return success();
+    }
+
     auto generic_ptr = ml::LLVMPointerType::get(b.getContext());
     Value source_ptr =
         UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
     Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
     Value num_records = ml::ConstantOp::create(
-        b, b.getI64Type(), source.getType().getNumElements() *
-                                 source.getType()
-                                     .getElementType()
-                                     .getIntOrFloatBitWidth() /
-                                 8);
+        b, b.getI64Type(),
+        CeilOfRatio<int64_t>(
+            source.getType().getNumElements() *
+                source.getType().getElementType().getIntOrFloatBitWidth(),
+            8));
     Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x20070);
     auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
     Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
         b, resource_ptr, source_ptr, stride, num_records, flags);
 
-    Value source_linear_index =
-        GetLinearIndex(mlir::ValueRange{op.getSourceIndex()}, b);
-    Value source_byte_offset = arith::MulIOp::create(
-        b, source_linear_index,
-        arith::ConstantIndexOp::create(
-            b, source.getType().getElementType().getIntOrFloatBitWidth() / 8));
-    source_byte_offset =
-        arith::IndexCastOp::create(b, b.getI32Type(), source_byte_offset);
+    Value source_byte_offset;
+    if (sub_byte_width.has_value()) {
+      Value unused_sub_byte_shift;
+      std::tie(source_byte_offset, unused_sub_byte_shift) =
+          GetSubByteIndex(source_linear_index, *sub_byte_width, b);
+    } else {
+      source_byte_offset = arith::MulIOp::create(
+          b, source_linear_index,
+          arith::ConstantIndexOp::create(
+              b,
+              source.getType().getElementType().getIntOrFloatBitWidth() / 8));
+    }
+    source_byte_offset = CastBufferOffsetToI32(source_byte_offset, b);
     Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
     Value loaded = mlir::ROCDL::RawPtrBufferLoadOp::create(
         b, op.getResult().getType(), resource, source_byte_offset, zero,
@@ -605,6 +656,58 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   }
 };
 
+struct RewriteAccumulatorStore
+    : OpRewritePattern<gpu::AccumulatorStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::AccumulatorStoreOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value destination = GetDestinationBuffer(op.getDestination());
+    if (!destination) return failure();
+    auto tensor_destination =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(destination);
+
+    auto generic_ptr = ml::LLVMPointerType::get(b.getContext());
+    Value destination_ptr =
+        UnrealizedConversionCastOp::create(b, generic_ptr, tensor_destination)
+            .getResult(0);
+    Value destination_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getDestinationIndex()}, b);
+    Value destination_element_offset;
+    if (destination_linear_index.getType().isIndex()) {
+      destination_element_offset = arith::IndexCastOp::create(
+          b, b.getI32Type(), destination_linear_index);
+    } else if (destination_linear_index.getType() == b.getI32Type()) {
+      destination_element_offset = destination_linear_index;
+    } else {
+      destination_element_offset = arith::TruncIOp::create(
+          b, b.getI32Type(), destination_linear_index);
+    }
+    Value destination_byte_offset = arith::MulIOp::create(
+        b, destination_element_offset,
+        arith::ConstantIntOp::create(b, b.getI32Type(), sizeof(float)));
+
+    mlir::LLVMTypeConverter converter(getContext());
+    Value stored_value = UnrealizedConversionCastOp::create(
+                             b, converter.convertType(op.getValue().getType()),
+                             op.getValue())
+                             .getResult(0);
+    ml::InlineAsmOp::create(
+        b, mlir::TypeRange{},
+        mlir::ValueRange{stored_value, destination_byte_offset,
+                         destination_ptr},
+        "global_store_dwordx4 $1, $0, $2;\n", "a,v,s,~{memory}",
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false, ml::TailCallKind::None,
+        ml::AsmDialectAttr::get(b.getContext(), ml::AsmDialect::AD_ATT),
+        /*operand_attrs=*/mlir::ArrayAttr());
+    rewriter.replaceOp(op, op.getDestination());
+    return success();
+  }
+};
+
 struct RewriteTileBufferStore : OpRewritePattern<gpu::TileBufferStoreOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -638,8 +741,7 @@ struct RewriteTileBufferStore : OpRewritePattern<gpu::TileBufferStoreOp> {
     Value vector_byte_offset = arith::MulIOp::create(
         b, GetLinearIndex(mlir::ValueRange{op.getVectorIndex()}, b),
         element_bytes_value);
-    vector_byte_offset = arith::IndexCastOp::create(
-        b, b.getI32Type(), vector_byte_offset);
+    vector_byte_offset = CastBufferOffsetToI32(vector_byte_offset, b);
     Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
 
     mlir::LLVMTypeConverter converter(getContext());
@@ -671,30 +773,42 @@ struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
         UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
     Value stride = ml::ConstantOp::create(b, b.getI16Type(), 0);
     Value num_records = ml::ConstantOp::create(
-        b, b.getI64Type(), source.getType().getNumElements() *
-                                 source.getType()
-                                     .getElementType()
-                                     .getIntOrFloatBitWidth() /
-                                 8);
+        b, b.getI64Type(),
+        CeilOfRatio<int64_t>(
+            source.getType().getNumElements() *
+                source.getType().getElementType().getIntOrFloatBitWidth(),
+            8));
     Value flags = ml::ConstantOp::create(b, b.getI32Type(), 0x20070);
     auto resource_ptr = ml::LLVMPointerType::get(b.getContext(), 8);
     Value resource = mlir::ROCDL::MakeBufferRsrcOp::create(
         b, resource_ptr, source_ptr, stride, num_records, flags);
 
-    const int64_t element_bytes =
-        source.getType().getElementType().getIntOrFloatBitWidth() / 8;
-    Value element_bytes_value =
-        arith::ConstantIndexOp::create(b, element_bytes);
-    Value vector_byte_offset = arith::MulIOp::create(
-        b, GetLinearIndex(mlir::ValueRange{op.getVectorIndex()}, b),
-        element_bytes_value);
-    vector_byte_offset = arith::IndexCastOp::create(
-        b, b.getI32Type(), vector_byte_offset);
-    Value scalar_byte_offset = arith::MulIOp::create(
-        b, GetLinearIndex(mlir::ValueRange{op.getScalarIndex()}, b),
-        element_bytes_value);
-    scalar_byte_offset = arith::IndexCastOp::create(
-        b, b.getI32Type(), scalar_byte_offset);
+    Value vector_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getVectorIndex()}, b);
+    Value scalar_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getScalarIndex()}, b);
+    Value vector_byte_offset;
+    Value scalar_byte_offset;
+    if (std::optional<int> sub_byte_width =
+            GetSubByteBitWidth(source.getType().getElementType())) {
+      // Split sub-byte loads are emitted only when each logical offset is
+      // byte-aligned. Keeping the two divisions separate preserves the AMD
+      // voffset/soffset split without materializing a per-lane address add.
+      Value unused_sub_byte_shift;
+      std::tie(vector_byte_offset, unused_sub_byte_shift) =
+          GetSubByteIndex(vector_linear_index, *sub_byte_width, b);
+      std::tie(scalar_byte_offset, unused_sub_byte_shift) =
+          GetSubByteIndex(scalar_linear_index, *sub_byte_width, b);
+    } else {
+      Value element_bytes_value = arith::ConstantIndexOp::create(
+          b, source.getType().getElementType().getIntOrFloatBitWidth() / 8);
+      vector_byte_offset =
+          arith::MulIOp::create(b, vector_linear_index, element_bytes_value);
+      scalar_byte_offset =
+          arith::MulIOp::create(b, scalar_linear_index, element_bytes_value);
+    }
+    vector_byte_offset = CastBufferOffsetToI32(vector_byte_offset, b);
+    scalar_byte_offset = CastBufferOffsetToI32(scalar_byte_offset, b);
     Value loaded = mlir::ROCDL::RawPtrBufferLoadOp::create(
         b, op.getResult().getType(), resource, vector_byte_offset,
         scalar_byte_offset, b.getI32IntegerAttr(0), mlir::ArrayAttr{},
@@ -1723,7 +1837,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
 
     tensor_patterns.add<RewriteAtomicRMW>(mlir_context, device_spec_);
     tensor_patterns.add<
-        RewriteAllocateShared, RewriteAsyncCopyGlobalToShared,
+        RewriteAccumulatorStore, RewriteAllocateShared,
+        RewriteAsyncCopyGlobalToShared,
         RewriteBufferLoad, RewriteBufferStore, RewriteGetDynamicDimSize,
         RewriteNonScalarConstants, RewriteSplitBufferLoad,
         RewriteTileBufferLoad, RewriteTileBufferStore, RewriteSyncThreads,

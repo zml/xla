@@ -188,8 +188,19 @@ AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
   }
   auto fusion = Cast<const HloFusionInstruction>(&instruction);
   if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
-    return AutotuneDecision::Forbid(
-        "Custom fusions are not supported for generic fusion autotuning");
+    auto gpu_config = instruction.backend_config<GpuBackendConfig>();
+    if (!gpu_config.ok()) {
+      return AutotuneDecision::Forbid(absl::StrCat(
+          "Failed to get GPU backend config: ", gpu_config.status().message()));
+    }
+    // SoftmaxRewriterTriton and the block-level fusion rewriter run before
+    // autotuning and mark their results as custom __triton fusions. They are
+    // still generic, tiled HLO fusions and can be emitted by another backend.
+    // Keep other custom kinds pinned to their owning code generators.
+    if (gpu_config->fusion_backend_config().kind() != kTritonFusionKind) {
+      return AutotuneDecision::Forbid(
+          "Custom fusion is not a generic Triton fusion");
+    }
   }
   if (absl::c_any_of(fusion->fused_instructions_computation()->instructions(),
                      HloPredicateIsOp<HloOpcode::kScatter>)) {
@@ -306,18 +317,18 @@ CodegenOrchestrator::Options GetCodegenOrchestratorOptions(
   CodegenOrchestrator::Options options;
   options.exclude_cublas_config = !debug_options.xla_gpu_cublas_fallback();
   if (!debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling()) {
-    options.allow_reg_spills_fn = [](const HloInstruction& instr) {
-      return static_cast<bool>(AllowRegSpillsForGpuInstruction(instr));
-    };
-  }
-  // xla_gpu_filter_kernels_spilling_registers_on_autotuning is true by default,
-  // but some autotuner passes need to set it to false explicitly as there
-  // aren't enough configs to guarantee that no config will spill. So we allow
-  // allow_reg_spills to override the autotuner config unless this flag is
-  // explicitly set to false.
-  if (!debug_options
-           .xla_gpu_filter_kernels_spilling_registers_on_autotuning()) {
-    options.allow_reg_spills_fn = [](const HloInstruction&) { return false; };
+    // Disabling the autotuning spill filter is an explicit request to profile
+    // every successfully compiled candidate, including GEMM configurations.
+    // Otherwise retain the default policy that permits spills only for
+    // instructions where they may be the only viable configurations.
+    if (!debug_options
+             .xla_gpu_filter_kernels_spilling_registers_on_autotuning()) {
+      options.allow_reg_spills_fn = [](const HloInstruction&) { return true; };
+    } else {
+      options.allow_reg_spills_fn = [](const HloInstruction& instr) {
+        return static_cast<bool>(AllowRegSpillsForGpuInstruction(instr));
+      };
+    }
   }
   return options;
 }

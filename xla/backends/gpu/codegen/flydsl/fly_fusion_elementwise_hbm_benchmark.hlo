@@ -13,6 +13,7 @@ HloModule fly_fusion_elementwise_hbm_benchmark
 ENTRY %entry_computation (p0: bf16[16384,8192], p1: bf16[16384,8192]) -> bf16[16384,8192] {
   %p0 = bf16[16384,8192]{1,0} parameter(0)
   %p1 = bf16[16384,8192]{1,0} parameter(1)
-  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0, %p1), kind=kLoop,
-    calls=%fused_elementwise
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0, %p1), kind=kCustom,
+    calls=%fused_elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
 }

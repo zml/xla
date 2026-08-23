@@ -247,6 +247,17 @@ absl::StatusOr<MlirKernelSource> MlirKernelEmitter::Emit(
   ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
                    CreateMLIRModule(*mlir_context, fusion, entry_function_name,
                                     buffer_assignment));
+#if TENSORFLOW_USE_ROCM
+  // Most emitters use the base CreateMLIRModule implementation, which marks
+  // Fly generic fusions itself. Emitters that construct their module directly
+  // (notably in-place dynamic-update-slice) bypass that implementation, so
+  // mark the completed module here as well.
+  if (uses_fly_memory()) {
+    flydsl::MarkGenericFusion(module.get());
+  }
+#else
+  CHECK(!uses_fly_memory());
+#endif
   return MlirKernelSource(nullptr, std::move(module));
 }
 
@@ -354,6 +365,31 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
                          fusion->backend_config<GpuBackendConfig>());
         const FusionBackendConfig& fusion_backend_config =
             gpu_backend_config.fusion_backend_config();
+        if (gpu_device_info.gpu_compute_capability().IsRocm() &&
+            fusion_backend_config.kind() == "__fly_gemm" &&
+            fusion_backend_config.has_fly_gemm_config()) {
+          const FlyGemmConfig& fly =
+              fusion_backend_config.fly_gemm_config();
+          const bool wide_direct_fp8 =
+              fly.direct_to_vgpr() &&
+              fly.mfma_atom() ==
+                  FlyGemmConfig::FLY_MFMA_16X16X32_FP8 &&
+              ((fly.block_m() == 256 && fly.block_n() == 224) ||
+               (fly.block_m() == 224 && fly.block_n() == 256));
+          const bool wide_direct_half =
+              fly.direct_to_vgpr() &&
+              fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X16 &&
+              ((fly.block_m() == 256 && fly.block_n() == 224) ||
+               (fly.block_m() == 224 && fly.block_n() == 256));
+          if (wide_direct_fp8 || wide_direct_half) {
+            // This tile has exactly 56 vector<4xf32> accumulators per wave.
+            // Keep them in the 224-register AGPR bank, as Tensile does,
+            // rather than allowing LLVM's loop coalescer to grow the bank to
+            // 256 registers and crowd out the global/LDS pipeline.
+            kernel_func->addFnAttr("amdgpu-mfma-vgpr-form", "false");
+            kernel_func->addFnAttr("amdgpu-agpr-alloc", "4,224");
+          }
+        }
         const int waves_per_eu =
             fusion_backend_config.block_level_fusion_config().waves_per_eu();
         if (gpu_device_info.gpu_compute_capability().IsRocm() &&

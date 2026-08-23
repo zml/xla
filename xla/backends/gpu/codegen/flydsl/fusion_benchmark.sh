@@ -27,6 +27,9 @@ export HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL="${HIPBLASLT_ROCROLLER_NO_CUSTOM_KER
 
 declare -A hlo_files=(
   [softmax]="fly_fusion_bf16_softmax_benchmark.hlo"
+  [softmax_bf16_tail]="fly_fusion_bf16_softmax_tail_benchmark.hlo"
+  [softmax_f16_tail]="fly_fusion_f16_softmax_tail_benchmark.hlo"
+  [softmax_f32_tail]="fly_fusion_f32_softmax_tail_benchmark.hlo"
   [bf16_reduce]="fly_fusion_bf16_row_reduction_benchmark.hlo"
   [f32_reduce]="fly_fusion_row_reduction_benchmark.hlo"
   [elementwise]="fly_fusion_elementwise_hbm_benchmark.hlo"
@@ -56,7 +59,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-    echo "Available benchmarks: softmax bf16_reduce f32_reduce elementwise transpose transpose_1024 transpose_4096 transpose_4096x16384" >&2
+    echo "Available benchmarks: softmax softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f32_reduce elementwise transpose transpose_1024 transpose_4096 transpose_4096x16384" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"
@@ -66,12 +69,14 @@ for benchmark in "$@"; do
     echo "Missing benchmark HLO: ${hlo}" >&2
     exit 1
   fi
+  rm -f "${log}"
 
   # The block-level emitter is XLA's Triton-based generic fusion path.
   XLA_FLAGS="${XLA_FLAGS:-} \
 --xla_gpu_autotune_level=3 \
 --xla_gpu_autotune_num_repetitions=${FLY_FUSION_BENCHMARK_REPETITIONS:-5} \
 --xla_gpu_enable_flydsl_fusion=true \
+--xla_gpu_experimental_all_fusions_with_triton=true \
 --xla_gpu_experimental_autotune_backends=${backends} \
 --xla_gpu_dump_autotune_logs_to=${log}" \
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \

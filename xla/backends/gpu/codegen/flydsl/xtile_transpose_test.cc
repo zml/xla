@@ -80,13 +80,13 @@ TEST_F(FlyXTileTransposeTest, RejectsPartialTiles) {
 HloModule transpose
 
 transpose {
-  p0 = bf16[96,192]{1,0} parameter(0)
-  ROOT result = bf16[192,96]{1,0} transpose(p0), dimensions={1,0}
+  p0 = bf16[96,200]{1,0} parameter(0)
+  ROOT result = bf16[200,96]{1,0} transpose(p0), dimensions={1,0}
 }
 
 ENTRY entry {
-  p0 = bf16[96,192]{1,0} parameter(0)
-  ROOT fusion = bf16[192,96]{1,0} fusion(p0), kind=kInput,
+  p0 = bf16[96,200]{1,0} parameter(0)
+  ROOT fusion = bf16[200,96]{1,0} fusion(p0), kind=kInput,
     calls=transpose
 }
 )"));

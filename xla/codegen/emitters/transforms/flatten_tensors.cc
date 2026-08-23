@@ -852,6 +852,34 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   }
 };
 
+struct RewriteAccumulatorStore
+    : OpRewritePattern<gpu::AccumulatorStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::AccumulatorStoreOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getDestination().getType())) {
+      return rewriter.notifyMatchFailure(op,
+                                         "the destination is already flat");
+    }
+
+    Location loc = op.getLoc();
+    Value flat_destination = Flatten(op.getDestination(), rewriter);
+    auto new_op = gpu::AccumulatorStoreOp::create(
+        rewriter, loc, flat_destination.getType(), op.getValue(),
+        flat_destination, op.getDestinationIndex());
+
+    Value result = new_op.getResult();
+    if (result.getType() != op.getResult().getType()) {
+      result = UnrealizedConversionCastOp::create(
+                   rewriter, loc, op.getResult().getType(), result)
+                   .getResult(0);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
 struct RewriteTileBufferStore : OpRewritePattern<gpu::TileBufferStoreOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -947,6 +975,7 @@ class FlattenTensorsPass
     patterns.add<
         RewriteAllocateShared,
         RewriteAsyncCopyGlobalToShared,
+        RewriteAccumulatorStore,
         RewriteBufferLoad,
         RewriteBufferStore,
         RewriteTileBufferStore,

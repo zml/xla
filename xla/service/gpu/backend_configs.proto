@@ -276,6 +276,11 @@ message FlyGemmConfig {
   enum MfmaAtom {
     FLY_MFMA_16X16X16 = 0;
     FLY_MFMA_32X32X8 = 1;
+    FLY_MFMA_16X16X32_FP8 = 2;
+    FLY_MFMA_32X32X16_FP8 = 3;
+    FLY_MFMA_16X16X4_F32 = 4;
+    FLY_MFMA_32X32X2_F32 = 5;
+    FLY_MFMA_32X32X4_XF32 = 6;
   }
 
   int64 block_m = 1;
@@ -320,6 +325,24 @@ message FlyGemmConfig {
   // Group this many neighboring N macro-tiles before advancing to the next
   // group. Zero preserves row-major workgroup order.
   int32 workgroup_mapping_n = 17;
+  // Number of neighboring output columns accumulated by one wave in the
+  // K-contiguous vector-by-matrix GEMV kernel. Zero preserves the historical
+  // one-output-per-wave behavior for serialized/preconfigured HLOs.
+  int32 gemv_outputs_per_wave = 18;
+  // Number of physically contiguous K elements loaded by each lane in the
+  // K-contiguous vector-by-matrix GEMV kernel. Zero is interpreted as one for
+  // serialized/preconfigured HLOs.
+  int32 gemv_k_vector_width = 19;
+  // Partition K across every wave in a workgroup, spill the per-wave partials
+  // to LDS, and let wave zero reduce them. This is useful when N is physically
+  // contiguous: every wave cooperatively covers the complete output tile and
+  // shares each LHS value across several adjacent output columns.
+  bool gemv_split_k = 20;
+  // Dequantize block-scaled FP8 fragments to BF16 in registers before using
+  // the gfx942 BF16 MFMA atom. This moves software scaling from every output
+  // accumulator to the two input fragments and avoids materializing the
+  // dequantized operands in global memory.
+  bool dequantize_block_scales = 21;
 }
 
 // A backend config for dynamic-slice and dynamic-update-slice instructions
