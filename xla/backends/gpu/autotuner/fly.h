@@ -52,7 +52,32 @@ class FlyBackend final : public GpuCodegenBackend {
 
  private:
   bool IsSupported(const HloInstruction& instr) override;
+};
 
+// Autotuning backend for generic elementwise fusions emitted through the
+// Fly/FlyROCDL dialects. The initial search space tunes the amount of work per
+// thread; block-level Fly layouts are added on top of the same backend.
+class FlyFusionBackend final : public GpuCodegenBackend {
+ public:
+  FlyFusionBackend(const DebugOptions* debug_options, Compiler* compiler,
+                   const Compiler::GpuTargetConfig* target_config)
+      : GpuCodegenBackend(autotuner::Backend::FLY_FUSION, debug_options,
+                          compiler, target_config) {}
+
+  absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+  GetSupportedConfigs(const HloInstruction& instr) override;
+
+  absl::StatusOr<std::unique_ptr<BackendConfig>> GetDefaultConfig(
+      const HloInstruction& instr) override;
+
+  absl::Status ApplyConfig(HloInstruction& instr,
+                           const BackendConfig& config) override;
+
+  bool CanProduceWrongResults() const override { return true; }
+  std::string version() const override { return "fly-rocdl-fusion-v1"; }
+
+ private:
+  bool IsSupported(const HloInstruction& instr) override;
 };
 
 }  // namespace xla::gpu

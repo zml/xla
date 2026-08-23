@@ -72,6 +72,10 @@ class MlirKernelEmitter {
   virtual LaunchDimensions launch_dimensions() const = 0;
   virtual int unroll_factor() const { return 0; }
 
+  // Routes the target memory boundary through the Fly dialect after XLA's
+  // shared indexing and elemental/reduction lowering has run.
+  void EnableFlyMemory() { use_fly_memory_ = true; }
+
   absl::StatusOr<MlirKernelSource> Emit(
       mlir::MLIRContext* mlir_context, const HloFusionInstruction& fusion,
       const std::string& entry_function_name,
@@ -108,6 +112,8 @@ class MlirKernelEmitter {
                                  mlir::MLIRContext* ctx) const = 0;
 
  protected:
+  bool uses_fly_memory() const { return use_fly_memory_; }
+
   // Returns the set of instructions that will be isolated in the partitioned,
   // i.e., they will get their own subgraph. We won't automatically emit
   // functions for these instructions.
@@ -151,6 +157,8 @@ class MlirKernelEmitter {
       const Shape& shape, mlir::MLIRContext* mlir_context);
 
  private:
+  bool use_fly_memory_ = false;
+
   // Emits MLIR for the given fusion. The entry function has one tensor argument
   // per fusion parameter and output and one tensor result per fusion output.
   // The fuson outputs may only be used with `tensor.insert` ops.a

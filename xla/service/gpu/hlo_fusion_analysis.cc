@@ -127,7 +127,8 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
     return HloFusionAnalysis::EmitterFusionKind::kTriton;
   }
 
-  if (fusion_backend_config.kind() == kFlyGemmFusionKind ||
+  if (fusion_backend_config.kind() == kFlyFusionKind ||
+      fusion_backend_config.kind() == kFlyGemmFusionKind ||
       fusion_backend_config.kind() == kFlyGemvFusionKind) {
     return HloFusionAnalysis::EmitterFusionKind::kFly;
   }
@@ -325,7 +326,8 @@ const Shape& HloFusionAnalysis::first_result_shape() const {
 }
 
 const HloInstruction* HloFusionAnalysis::FindHeroReduction() const {
-  if (emitter_fusion_kind_ != EmitterFusionKind::kReduction) {
+  if (emitter_fusion_kind_ != EmitterFusionKind::kReduction &&
+      emitter_fusion_kind_ != EmitterFusionKind::kFly) {
     return nullptr;
   }
   const auto& roots = fusion_roots();

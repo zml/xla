@@ -350,9 +350,8 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
         // Block-level MLIR emitters share XLA's occupancy contract. Triton
         // applies this attribute in its standalone compiler; apply the same
         // contract here for FlyDSL and other MLIR kernel emitters.
-        ASSIGN_OR_RETURN(
-            GpuBackendConfig gpu_backend_config,
-            fusion->backend_config<GpuBackendConfig>());
+        ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
+                         fusion->backend_config<GpuBackendConfig>());
         const FusionBackendConfig& fusion_backend_config =
             gpu_backend_config.fusion_backend_config();
         const int waves_per_eu =
@@ -483,6 +482,13 @@ MlirKernelEmitter::CreateMLIRModule(
   SetBackendKind(&mlir_context, entry_func, BackendKind::kGpu);
 
   RETURN_IF_ERROR(EmitMlir(module.get(), entry_func, fusion, mlir_context));
+#if TENSORFLOW_USE_ROCM
+  if (uses_fly_memory()) {
+    flydsl::MarkGenericFusion(module.get());
+  }
+#else
+  CHECK(!uses_fly_memory());
+#endif
   return module;
 }
 
@@ -717,11 +723,22 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
     }
   }
 #if TENSORFLOW_USE_ROCM
-  if (flydsl::HasOperations(module.get())) {
+  const bool has_fly_operations = flydsl::HasOperations(module.get());
+  const bool is_generic_fly_fusion = flydsl::IsGenericFusion(module.get());
+  if (has_fly_operations) {
     flydsl::AddLoweringPasses(pm);
   }
 #endif
   AddLoweringPasses(pm, device);
+#if TENSORFLOW_USE_ROCM
+  // Generic XLA fusions first use the shared XLA tensor/loop pipeline. Once
+  // that has materialized the pointer ABI and memory operations, express the
+  // kernel's global-memory boundary in Fly and lower it through FlyROCDL.
+  if (is_generic_fly_fusion) {
+    flydsl::AddGenericMemoryPasses(pm);
+    flydsl::AddLoweringPasses(pm, /*restore_generic_memory_metadata=*/true);
+  }
+#endif
 
   RETURN_IF_ERROR(
       RunPassPipeline(module.get(), hlo_module, pm, entry_function_name));
@@ -731,8 +748,7 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   if (has_native_gpu_entry) {
     mlir::gpu::GPUModuleOp gpu_module;
     module->walk([&](mlir::gpu::GPUModuleOp candidate) {
-      if (candidate.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
-              entry_function_name)) {
+      if (candidate.lookupSymbol<mlir::LLVM::LLVMFuncOp>(entry_function_name)) {
         gpu_module = candidate;
       }
     });

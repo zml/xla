@@ -248,7 +248,9 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
-    ],
+    ] + if_rocm_is_configured([
+        "//xla/backends/gpu/codegen/flydsl:compiler",
+    ]),
 )
 
 cc_library(

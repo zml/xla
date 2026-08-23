@@ -1,0 +1,21 @@
+HloModule fly_fusion_bf16_row_reduction_benchmark
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%fused_reduction (p0: bf16[131072,4096]) -> f32[131072] {
+  %p0 = bf16[131072,4096]{1,0} parameter(0)
+  %converted = f32[131072,4096]{1,0} convert(%p0)
+  %zero = f32[] constant(0)
+  ROOT %reduce = f32[131072]{0} reduce(%converted, %zero), dimensions={1},
+    to_apply=%add
+}
+
+ENTRY %entry_computation (p0: bf16[131072,4096]) -> f32[131072] {
+  %p0 = bf16[131072,4096]{1,0} parameter(0)
+  ROOT %fusion = f32[131072]{0} fusion(%p0), kind=kInput,
+    calls=%fused_reduction
+}

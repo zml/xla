@@ -841,7 +841,20 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
     : ReductionFusion(analysis) {
   CHECK(reduction_dimensions_.is_row_reduction);
   Vector3 shape = reduction_dimensions_.dimensions;
-  int64_t kMinorReducedElementsPerThread = 16;
+  int64_t minor_reduced_elements_per_thread = 16;
+  int64_t threads_per_block_target = 256;
+  if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
+    const BlockLevelFusionConfig& config =
+        analysis.fusion_backend_config().block_level_fusion_config();
+    if (config.output_tiles_size() == 1 &&
+        config.output_tiles(0).sizes_size() == 1 &&
+        config.output_tiles(0).sizes(0) > 0) {
+      minor_reduced_elements_per_thread = config.output_tiles(0).sizes(0);
+    }
+    if (config.num_warps() > 0) {
+      threads_per_block_target = config.num_warps() * WarpSize();
+    }
+  }
 
   int64_t num_threads_kept = 1;
   // Number of threads doing the reduction.
@@ -849,7 +862,7 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
     int64_t max_block_size = MinThreadsXRowReduction();
     return std::min(max_block_size,
                     RoundUpTo(CeilOfRatio(shape[kRowMinorReduced],
-                                          kMinorReducedElementsPerThread),
+                                          minor_reduced_elements_per_thread),
                               WarpSize()));
   }();
 
@@ -858,15 +871,14 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
   // parallelizing the z dimension (major reduced dimensions). The general
   // recommendation is to use between 128 and 512 threads, so we just go for
   // 256. See https://forums.developer.nvidia.com/t/55529
-  constexpr int64_t kThreadsPerBlockTarget = 256;
-  if (num_threads_reduced * 2 <= kThreadsPerBlockTarget) {
+  if (num_threads_reduced * 2 <= threads_per_block_target) {
     int64_t kept_size = reduction_dimensions_.dimensions[kRowKept];
     // Increase the size of the y dimension as long as there's remaining
     // parallelism.
-    if (kept_size * num_threads_reduced <= kThreadsPerBlockTarget) {
+    if (kept_size * num_threads_reduced <= threads_per_block_target) {
       num_threads_kept = kept_size;
     } else {
-      num_threads_kept = kThreadsPerBlockTarget / num_threads_reduced;
+      num_threads_kept = threads_per_block_target / num_threads_reduced;
     }
   }
 
@@ -883,7 +895,7 @@ RowReductionFusion::RowReductionFusion(const HloFusionAnalysis& analysis)
   //
   // Tighten the bound of s1 to [0, 1].
   int minor_reduced_tile_size =
-      std::min(kMinorReducedElementsPerThread / vector_size,
+      std::min(minor_reduced_elements_per_thread / vector_size,
                CeilOfRatio(input_shape_[2], num_threads_[1]));
 
   tile_sizes_per_thread_ = {shape[0], minor_reduced_tile_size, vector_size};

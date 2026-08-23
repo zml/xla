@@ -14,9 +14,6 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/backends/gpu/codegen/flydsl/compiler.h"
 
-#include "flydsl/Dialect/Fly/IR/FlyDialect.h"
-#include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
-#include "gtest/gtest.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -30,6 +27,9 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "flydsl/Dialect/Fly/IR/FlyDialect.h"
+#include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
+#include "gtest/gtest.h"
 
 namespace xla::gpu::flydsl {
 namespace {
@@ -106,6 +106,56 @@ TEST(FlyDslCompilerTest, LowersBf16MfmaToRocdl) {
   });
   EXPECT_TRUE(found_mfma);
   EXPECT_FALSE(HasOperations(*module));
+}
+
+TEST(FlyDslCompilerTest, WrapsKernelArgumentMemoryInFlyAndLowersBackToLlvm) {
+  mlir::DialectRegistry registry;
+  RegisterDialects(registry);
+  registry.insert<mlir::LLVM::LLVMDialect, mlir::ROCDL::ROCDLDialect>();
+  mlir::MLIRContext context(registry);
+  constexpr llvm::StringLiteral kModule = R"mlir(
+    module {
+      llvm.func @kernel(%input: !llvm.ptr, %output: !llvm.ptr) {
+        %value = llvm.load %input invariant {alignment = 4 : i64} : !llvm.ptr -> f32
+        llvm.store %value, %output : f32, !llvm.ptr
+        llvm.return
+      }
+    }
+  )mlir";
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kModule, &context);
+  ASSERT_TRUE(module);
+
+  MarkGenericFusion(*module);
+  EXPECT_TRUE(IsGenericFusion(*module));
+
+  mlir::PassManager wrap_pm(&context);
+  AddGenericMemoryPasses(wrap_pm);
+  ASSERT_TRUE(mlir::succeeded(wrap_pm.run(*module)));
+  EXPECT_TRUE(HasOperations(*module));
+
+  int fly_loads = 0;
+  int fly_stores = 0;
+  module->walk([&](mlir::fly::PtrLoadOp) { ++fly_loads; });
+  module->walk([&](mlir::fly::PtrStoreOp) { ++fly_stores; });
+  EXPECT_EQ(fly_loads, 1);
+  EXPECT_EQ(fly_stores, 1);
+
+  mlir::PassManager lower_pm(&context);
+  AddLoweringPasses(lower_pm, /*restore_generic_memory_metadata=*/true);
+  ASSERT_TRUE(mlir::succeeded(lower_pm.run(*module)));
+  EXPECT_FALSE(HasOperations(*module));
+
+  int llvm_loads = 0;
+  int llvm_stores = 0;
+  module->walk([&](mlir::LLVM::LoadOp load) {
+    ++llvm_loads;
+    EXPECT_TRUE(load.getInvariant());
+    EXPECT_EQ(load.getAlignment(), 4);
+  });
+  module->walk([&](mlir::LLVM::StoreOp) { ++llvm_stores; });
+  EXPECT_EQ(llvm_loads, 1);
+  EXPECT_EQ(llvm_stores, 1);
 }
 
 }  // namespace

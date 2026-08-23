@@ -27,9 +27,22 @@ void RegisterDialects(mlir::DialectRegistry& registry);
 // Returns true if module contains operations owned by FlyDSL dialects.
 bool HasOperations(mlir::ModuleOp module);
 
+// Marks an XLA-emitted module whose global memory boundary must be expressed
+// through Fly before translation to LLVM IR.
+void MarkGenericFusion(mlir::ModuleOp module);
+
+// Returns true for modules marked by MarkGenericFusion.
+bool IsGenericFusion(mlir::ModuleOp module);
+
+// Re-expresses ordinary LLVM global loads and stores rooted at kernel
+// arguments as fly.ptr.load/fly.ptr.store. This pass runs after XLA has
+// lowered its tensor ABI and before the Fly-to-ROCDL conversion.
+void AddGenericMemoryPasses(mlir::OpPassManager& pm);
+
 // Lowers Fly IR to upstream MLIR and ROCDL. XLA's standard GPU pipeline is
 // responsible for subsequent lowering to the LLVM dialect and LLVM IR.
-void AddLoweringPasses(mlir::OpPassManager& pm);
+void AddLoweringPasses(mlir::OpPassManager& pm,
+                       bool restore_generic_memory_metadata = false);
 
 }  // namespace xla::gpu::flydsl
 

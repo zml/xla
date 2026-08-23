@@ -30,6 +30,8 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
 #if TENSORFLOW_USE_ROCM
 #include "xla/backends/gpu/codegen/flydsl/xtile_gemm.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
 #endif
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/sort.h"
@@ -71,6 +73,35 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
     const FusionInfo& fusion_info) {
   const auto& analysis = fusion_info.analysis();
 #if TENSORFLOW_USE_ROCM
+  if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
+    if (flydsl::IsFlySoftmaxFusion(analysis)) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
+    }
+    if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileTransposeEmitter(analysis));
+    }
+    for (const HloInstructionAdaptor& hero : analysis.fusion_heroes()) {
+      if (GetDescriptionForTiledTransposeEmitter(hero.instruction())
+              .has_value()) {
+        std::unique_ptr<MlirKernelEmitter> emitter =
+            CreateTransposeFusion(analysis);
+        emitter->EnableFlyMemory();
+        return std::make_unique<MlirKernelFusion>(std::move(emitter));
+      }
+    }
+    for (const HloInstructionAdaptor& hero : analysis.fusion_heroes()) {
+      if (hero.opcode() == HloOpcode::kReduce) {
+        std::unique_ptr<ReductionFusion> emitter =
+            CreateReductionFusion(analysis);
+        emitter->EnableFlyMemory();
+        return std::make_unique<MlirKernelFusion>(std::move(emitter));
+      }
+    }
+    return std::make_unique<MlirKernelFusion>(
+        std::make_unique<LoopFusion>(analysis, /*use_fly_memory=*/true));
+  }
   if (analysis.fusion_backend_config().kind() == kFlyGemmFusionKind) {
     return std::make_unique<MlirKernelFusion>(
         flydsl::CreateFlyXTileGemmEmitter(analysis));

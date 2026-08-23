@@ -852,6 +852,34 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   }
 };
 
+struct RewriteTileBufferStore : OpRewritePattern<gpu::TileBufferStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::TileBufferStoreOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getDestination().getType())) {
+      return rewriter.notifyMatchFailure(op,
+                                         "the destination is already flat");
+    }
+
+    Location loc = op.getLoc();
+    Value flat_destination = Flatten(op.getDestination(), rewriter);
+    auto new_op = gpu::TileBufferStoreOp::create(
+        rewriter, loc, flat_destination.getType(), op.getValue(),
+        flat_destination, op.getVectorIndex(), op.getTileIndex(),
+        op.getCachePolicyAttr());
+
+    Value result = new_op.getResult();
+    if (result.getType() != op.getResult().getType()) {
+      result = UnrealizedConversionCastOp::create(
+                   rewriter, loc, op.getResult().getType(), result)
+                   .getResult(0);
+    }
+    rewriter.replaceOp(op, result);
+    return mlir::success();
+  }
+};
+
 struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -865,6 +893,23 @@ struct RewriteSplitBufferLoad : OpRewritePattern<gpu::SplitBufferLoadOp> {
     rewriter.replaceOpWithNewOp<gpu::SplitBufferLoadOp>(
         op, op.getResult().getType(), flat_source, op.getVectorIndex(),
         op.getScalarIndex());
+    return mlir::success();
+  }
+};
+
+struct RewriteTileBufferLoad : OpRewritePattern<gpu::TileBufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::TileBufferLoadOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getSource().getType())) {
+      return rewriter.notifyMatchFailure(op, "the source is already flat");
+    }
+
+    Value flat_source = Flatten(op.getSource(), rewriter);
+    rewriter.replaceOpWithNewOp<gpu::TileBufferLoadOp>(
+        op, op.getResult().getType(), flat_source, op.getVectorIndex(),
+        op.getTileIndex());
     return mlir::success();
   }
 };
@@ -904,7 +949,9 @@ class FlattenTensorsPass
         RewriteAsyncCopyGlobalToShared,
         RewriteBufferLoad,
         RewriteBufferStore,
+        RewriteTileBufferStore,
         RewriteSplitBufferLoad,
+        RewriteTileBufferLoad,
         RewriteAtomicRMW,
         RewriteConstant,
         RewriteCpuLoad,
