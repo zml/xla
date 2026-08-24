@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/factory.h"
 #include "xla/backends/gpu/autotuner/fission_backend.h"
 #include "xla/backends/gpu/autotuner/native_emitter.h"
+#include "xla/backends/gpu/autotuner/fp8_block_gemv.h"
 #include "xla/backends/gpu/autotuner/nvfp4_decode_dot.h"
 #include "xla/backends/gpu/autotuner/tile_ir.h"
 #include "xla/backends/gpu/autotuner/triton.h"
@@ -102,6 +103,8 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForCuda(
       debug_options, compiler, shape_size_fn, target_config));
   backends.push_back(std::make_unique<TileIrBackend>(
       debug_options, compiler, target_config, mlir_context));
+  backends.push_back(std::make_unique<Fp8BlockGemvBackend>(
+      debug_options, compiler, target_config));
   backends.push_back(std::make_unique<Nvfp4DecodeDotBackend>(
       debug_options, compiler, target_config, mlir_context));
   backends.push_back(std::make_unique<Nvfp4DecodeDotBackend>(
