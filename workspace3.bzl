@@ -76,6 +76,11 @@ def workspace():
     # Details: https://github.com/google-ml-infra/rules_ml_toolchain
     tf_http_archive(
         name = "rules_ml_toolchain",
+        # cuda_json_ext takes no tags, so a cuDNN version the pinned dict does
+        # not carry can only be added by patching the dict itself.
+        patch_file = [
+            "@xla//third_party/rules_ml_toolchain:cudnn_9_24.patch",
+        ],
         sha256 = "8b33d5ab357623ba31ec463347371163aa2078b70752be0b44fdb132b91687a0",
         strip_prefix = "rules_ml_toolchain-236a498d8624bef88e35ce2518a833204b0db19f",
         urls = tf_mirror_urls(

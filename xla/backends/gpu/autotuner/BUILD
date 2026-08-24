@@ -221,6 +221,7 @@ cc_library(
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/transforms:block_scaling_rewriter",
         "//xla/backends/gpu/transforms:cudnn_fusion_compiler",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_query",
@@ -247,6 +248,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
     ],
 )
 
