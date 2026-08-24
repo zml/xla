@@ -1,7 +1,9 @@
 #include "xla/backends/gpu/autotuner/tile_ir.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,11 +13,16 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "llvm/Support/MathExtras.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/transforms/convert_triton_gemm_config.h"
@@ -36,44 +43,107 @@ namespace xla {
 namespace gpu {
 namespace {
 
-constexpr int64_t kCandidateTiles[][2] = {
+constexpr int64_t kScaleBlockSize = 16;
+
+using OutputTile = std::array<int64_t, 2>;
+
+struct TileIrLimits {
+  absl::Span<const OutputTile> output_tiles;
+  absl::Span<const int64_t> contracting_tiles;
+  OutputTile default_tile;
+  int64_t default_contracting_tile;
+  int64_t min_block_m;
+  int64_t min_contracting_tile;
+  int64_t decline_below_rows;
+  int64_t decline_below_contracting;
+  int64_t max_operand_tile_bytes;
+};
+
+constexpr OutputTile kOutputTilesSm120[] = {
     {16, 32},  {16, 64},   {16, 128},  {16, 256},
     {32, 128}, {64, 128},  {128, 128}, {128, 256}, {256, 128},
 };
+constexpr int64_t kContractingTilesSm120[] = {128, 256, 384};
 
-constexpr int64_t kScaleBlockSize = 16;
+constexpr OutputTile kOutputTilesSm103[] = {
+    {128, 128}, {128, 256}, {256, 128},
+};
+constexpr int64_t kContractingTilesSm103[] = {256, 384, 512};
 
-constexpr int64_t kCandidateContractingTiles[] = {128, 256, 384};
+constexpr int64_t kSm103SafeContractingTile = 160;
+constexpr int64_t kSm103PerfContractingTile = 256;
+static_assert(kSm103PerfContractingTile >= kSm103SafeContractingTile,
+              "The performance floor must not reopen the faulting block_k "
+              "band; see the LDGSTS.E.64 note above.");
+static_assert(kSm103SafeContractingTile % kScaleBlockSize == 0,
+              "A contracting tile must be a whole number of scale blocks.");
 
-constexpr int64_t kDefaultContractingTileSize = 256;
-constexpr int64_t kDefaultTile[2] = {32, 128};
+bool IsBlackwellUltra(const stream_executor::CudaComputeCapability& cc) {
+  return cc.major == stream_executor::CudaComputeCapability::kBlackwell &&
+         cc.minor == 3;
+}
 
-constexpr int64_t kMaxOperandTileBytes = 64 * 1024;
+const TileIrLimits& LimitsFor(const stream_executor::CudaComputeCapability& cc) {
+  static const TileIrLimits kSm103 = {
+      /*output_tiles=*/kOutputTilesSm103,
+      /*contracting_tiles=*/kContractingTilesSm103,
+      /*default_tile=*/{128, 128},
+      /*default_contracting_tile=*/256,
+      /*min_block_m=*/128,
+      /*min_contracting_tile=*/kSm103PerfContractingTile,
+      /*decline_below_rows=*/128,
+      /*decline_below_contracting=*/kSm103PerfContractingTile,
+      /*max_operand_tile_bytes=*/112 * 1024,
+  };
+  static const TileIrLimits kDefault = {
+      /*output_tiles=*/kOutputTilesSm120,
+      /*contracting_tiles=*/kContractingTilesSm120,
+      /*default_tile=*/{32, 128},
+      /*default_contracting_tile=*/256,
+      /*min_block_m=*/16,
+      /*min_contracting_tile=*/kScaleBlockSize,
+      /*decline_below_rows=*/0,
+      /*decline_below_contracting=*/0,
+      /*max_operand_tile_bytes=*/64 * 1024,
+  };
+  return IsBlackwellUltra(cc) ? kSm103 : kDefault;
+}
 
-constexpr int64_t kMmaBlockM = 16;
+const TileIrLimits& LimitsForOrDie(
+    const stream_executor::CudaComputeCapability* cc) {
+  CHECK(cc != nullptr);
+  return LimitsFor(*cc);
+}
 
-int64_t ClampBlockM(int64_t block_m, int64_t max_m) {
-  return std::max(kMmaBlockM, std::min(block_m, max_m));
+int64_t ClampBlockM(const TileIrLimits& limits, int64_t block_m,
+                    int64_t max_m) {
+  return std::max(limits.min_block_m, std::min(block_m, max_m));
 }
 
 int64_t OperandTileBytes(int64_t block_m, int64_t block_n, int64_t block_k) {
   return (block_m * block_k + block_k * block_n) * 9 / 16;
 }
 
-int64_t ClampContractingTile(int64_t block_k, int64_t contracting_size) {
+int64_t ClampContractingTile(const TileIrLimits& limits, int64_t block_k,
+                             int64_t contracting_size) {
   if (contracting_size <= 0) {
     return block_k;
   }
-  return std::max(kScaleBlockSize, std::min(block_k, contracting_size));
+  // Keep decline_below_contracting and min_contracting_tile equal in
+  // TileIrLimits, or a floor above the whole contraction becomes reachable.
+  return std::max(limits.min_contracting_tile,
+                  std::min(block_k, contracting_size));
 }
 
-std::vector<int64_t> ContractingTilesForOutputTile(int64_t block_m,
+std::vector<int64_t> ContractingTilesForOutputTile(const TileIrLimits& limits,
+                                                   int64_t block_m,
                                                    int64_t block_n,
                                                    int64_t contracting_size) {
   std::vector<int64_t> tiles;
-  for (int64_t candidate : kCandidateContractingTiles) {
-    int64_t block_k = ClampContractingTile(candidate, contracting_size);
-    if (OperandTileBytes(block_m, block_n, block_k) > kMaxOperandTileBytes) {
+  for (int64_t candidate : limits.contracting_tiles) {
+    int64_t block_k = ClampContractingTile(limits, candidate, contracting_size);
+    if (OperandTileBytes(block_m, block_n, block_k) >
+        limits.max_operand_tile_bytes) {
       continue;
     }
     tiles.push_back(block_k);
@@ -126,6 +196,38 @@ bool CanLower(const HloInstruction& fusion, const HloInstruction& dot) {
                           HloPredicateIsOp<HloOpcode::kScaledDot>) == 1;
 }
 
+bool IsBigEnough(const TileIrLimits& limits, const HloInstruction& fusion,
+                 const HloInstruction& dot) {
+  const Shape& root_shape =
+      fusion.fused_instructions_computation()->root_instruction()->shape();
+  if (!root_shape.IsArray() || root_shape.dimensions().size() < 2) {
+    return false;
+  }
+  int64_t rows = root_shape.dimensions(root_shape.dimensions().size() - 2);
+  return rows >= limits.decline_below_rows &&
+         ContractingSize(dot) >= limits.decline_below_contracting;
+}
+
+std::optional<std::tuple<int64_t, int64_t, int64_t>> ForcedTile() {
+  static const std::optional<std::tuple<int64_t, int64_t, int64_t>> forced = [] {
+    std::optional<std::tuple<int64_t, int64_t, int64_t>> result;
+    const char* env = std::getenv("XLA_TILE_IR_FORCE_TILE");
+    if (env == nullptr) {
+      return result;
+    }
+    std::vector<absl::string_view> parts = absl::StrSplit(env, ',');
+    int64_t m, n, k;
+    if (parts.size() != 3 || !absl::SimpleAtoi(parts[0], &m) ||
+        !absl::SimpleAtoi(parts[1], &n) || !absl::SimpleAtoi(parts[2], &k)) {
+      LOG(ERROR) << "XLA_TILE_IR_FORCE_TILE must be m,n,k; got " << env;
+      return result;
+    }
+    result = std::make_tuple(m, n, k);
+    return result;
+  }();
+  return forced;
+}
+
 }  // namespace
 
 bool TileIrBackend::IsSupported(const HloInstruction& instr) {
@@ -139,7 +241,8 @@ bool TileIrBackend::IsSupported(const HloInstruction& instr) {
     return false;
   }
   const HloInstruction* dot = GetScaledDot(instr);
-  return dot != nullptr && CanLower(instr, *dot);
+  return dot != nullptr && CanLower(instr, *dot) &&
+         IsBigEnough(LimitsFor(*cc), instr, *dot);
 }
 
 std::optional<TileIrBackend::GemmBounds> TileIrBackend::GetGemmBounds(
@@ -198,12 +301,24 @@ TileIrBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return configs;
   }
 
+  if (std::optional<std::tuple<int64_t, int64_t, int64_t>> forced = ForcedTile();
+      forced.has_value()) {
+    auto [block_m, block_n, block_k] = *forced;
+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<BackendConfig> config,
+                     ConfigForTile(*bounds->dot, block_m, block_n, block_k));
+    configs.push_back(std::move(config));
+    return configs;
+  }
+
+  const TileIrLimits& limits = LimitsForOrDie(
+      target_config().device_description.gpu_compute_capability()
+          .cuda_compute_capability());
   absl::flat_hash_set<std::tuple<int64_t, int64_t, int64_t>> seen;
-  for (const auto& tile : kCandidateTiles) {
-    int64_t block_m = ClampBlockM(tile[0], bounds->max_m);
+  for (const OutputTile& tile : limits.output_tiles) {
+    int64_t block_m = ClampBlockM(limits, tile[0], bounds->max_m);
     int64_t block_n = std::min(tile[1], bounds->max_n);
     for (int64_t block_k : ContractingTilesForOutputTile(
-             block_m, block_n, bounds->contracting_size)) {
+             limits, block_m, block_n, bounds->contracting_size)) {
       if (!seen.insert({block_m, block_n, block_k}).second) {
         continue;
       }
@@ -227,10 +342,14 @@ absl::StatusOr<std::unique_ptr<BackendConfig>> TileIrBackend::GetDefaultConfig(
     const HloInstruction& instr) {
   if (std::optional<GemmBounds> bounds = GetGemmBounds(instr);
       bounds.has_value()) {
-    int64_t block_m = ClampBlockM(kDefaultTile[0], bounds->max_m);
-    int64_t block_n = std::min(kDefaultTile[1], bounds->max_n);
-    int64_t block_k = ClampContractingTile(kDefaultContractingTileSize,
-                                           bounds->contracting_size);
+    const TileIrLimits& limits = LimitsForOrDie(
+        target_config().device_description.gpu_compute_capability()
+            .cuda_compute_capability());
+    int64_t block_m =
+        ClampBlockM(limits, limits.default_tile[0], bounds->max_m);
+    int64_t block_n = std::min(limits.default_tile[1], bounds->max_n);
+    int64_t block_k = ClampContractingTile(
+        limits, limits.default_contracting_tile, bounds->contracting_size);
     absl::StatusOr<std::unique_ptr<BackendConfig>> config =
         ConfigForTile(*bounds->dot, block_m, block_n, block_k);
     if (config.ok()) {
