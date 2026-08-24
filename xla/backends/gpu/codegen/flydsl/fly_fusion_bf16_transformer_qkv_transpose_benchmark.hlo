@@ -1,0 +1,17 @@
+HloModule fly_fusion_bf16_transformer_qkv_transpose_benchmark
+
+%fused_transpose (p0: bf16[256,3072]) -> bf16[2,1,16,64,128] {
+  %p0 = bf16[256,3072]{1,0} parameter(0)
+  %view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(%p0)
+  %value = bf16[2,128,1,16,64]{4,3,2,1,0} slice(%view),
+    slice={[0:2], [0:128], [2:3], [0:16], [0:64]}
+  ROOT %transpose = bf16[2,1,16,64,128]{4,3,2,1,0}
+    transpose(%value), dimensions={0,2,3,4,1}
+}
+
+ENTRY %entry_computation (p0: bf16[256,3072])
+    -> bf16[2,1,16,64,128] {
+  %p0 = bf16[256,3072]{1,0} parameter(0)
+  ROOT %fusion = bf16[2,1,16,64,128]{4,3,2,1,0} fusion(%p0),
+    kind=kInput, calls=%fused_transpose
+}

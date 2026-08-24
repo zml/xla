@@ -121,5 +121,69 @@ TEST_F(FlyXTileSoftmaxTest, RejectsIncorrectMaximumIdentity) {
   EXPECT_FALSE(IsSupported("0"));
 }
 
+TEST_F(FlyXTileSoftmaxTest,
+       RecognizesRank4DoubleStabilizedBf16Softmax) {
+  constexpr char kSoftmaxHlo[] = R"(
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+maximum.1 {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax {
+  p0 = bf16[32,128,128]{2,1,0} parameter(0)
+  view = bf16[2,16,128,128]{3,2,1,0} bitcast(p0)
+  converted = f32[2,16,128,128]{3,2,1,0} convert(view)
+  minus_inf = f32[] constant(-inf)
+  row_max.0 = f32[2,16,128]{2,1,0} reduce(converted, minus_inf),
+    dimensions={3}, to_apply=maximum
+  broadcast_max.0 = f32[2,16,128,128]{3,2,1,0}
+    broadcast(row_max.0), dimensions={0,1,2}
+  shifted.0 = f32[2,16,128,128]{3,2,1,0}
+    subtract(converted, broadcast_max.0)
+  row_max.1 = f32[2,16,128]{2,1,0} reduce(shifted.0, minus_inf),
+    dimensions={3}, to_apply=maximum.1
+  broadcast_max.1 = f32[2,16,128,128]{3,2,1,0}
+    broadcast(row_max.1), dimensions={0,1,2}
+  shifted.1 = f32[2,16,128,128]{3,2,1,0}
+    subtract(shifted.0, broadcast_max.1)
+  exponential = f32[2,16,128,128]{3,2,1,0} exponential(shifted.1)
+  zero = f32[] constant(0)
+  row_sum = f32[2,16,128]{2,1,0} reduce(exponential, zero),
+    dimensions={3}, to_apply=add
+  broadcast_sum = f32[2,16,128,128]{3,2,1,0}
+    broadcast(row_sum), dimensions={0,1,2}
+  normalized = f32[2,16,128,128]{3,2,1,0}
+    divide(exponential, broadcast_sum)
+  ROOT result = bf16[2,16,128,128]{3,2,1,0} convert(normalized)
+}
+
+ENTRY entry {
+  p0 = bf16[32,128,128]{2,1,0} parameter(0)
+  ROOT fusion = bf16[2,16,128,128]{3,2,1,0} fusion(p0), kind=kInput,
+    calls=softmax
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kSoftmaxHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlySoftmaxFusion(analysis));
+}
+
 }  // namespace
 }  // namespace xla::gpu::flydsl

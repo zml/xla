@@ -16,10 +16,12 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/multi_output_fusion.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -57,6 +59,133 @@ namespace {
 bool IsProfitableOperand(HloInstruction* instr) {
   // Effective scalars are not a profitable shared operand. Skip them.
   return !ShapeUtil::IsEffectiveScalar(instr->shape());
+}
+
+struct QkvTransposeDescription {
+  std::array<int64_t, 5> dimensions;
+  absl::flat_hash_set<int64_t> selectors;
+};
+
+std::optional<std::pair<std::array<int64_t, 5>, int64_t>> MatchQkvTransposeRoot(
+    const HloInstruction& root,
+    const absl::flat_hash_set<const HloInstruction*>& parameters) {
+  if (root.opcode() != HloOpcode::kTranspose ||
+      root.shape().element_type() != BF16 ||
+      root.shape().dimensions_size() != 5 || root.dimensions().size() != 5 ||
+      root.dimensions(0) != 0 || root.dimensions(1) != 2 ||
+      root.dimensions(2) != 3 || root.dimensions(3) != 4 ||
+      root.dimensions(4) != 1 || root.operand_count() != 1) {
+    return std::nullopt;
+  }
+  const HloInstruction* slice = root.operand(0);
+  if (slice->opcode() != HloOpcode::kSlice || slice->operand_count() != 1 ||
+      slice->shape().dimensions_size() != 5 ||
+      slice->slice_starts().size() != 5 || slice->slice_limits().size() != 5 ||
+      slice->slice_strides().size() != 5) {
+    return std::nullopt;
+  }
+  const HloInstruction* bitcast = slice->operand(0);
+  if (bitcast->opcode() != HloOpcode::kBitcast ||
+      bitcast->operand_count() != 1 ||
+      bitcast->shape().dimensions_size() != 5 ||
+      !parameters.contains(bitcast->operand(0))) {
+    return std::nullopt;
+  }
+  std::array<int64_t, 5> dimensions;
+  for (int64_t dimension = 0; dimension < 5; ++dimension) {
+    dimensions[dimension] = bitcast->shape().dimensions(dimension);
+    const int64_t start = slice->slice_starts()[dimension];
+    const int64_t limit = slice->slice_limits()[dimension];
+    if (slice->slice_strides()[dimension] != 1 ||
+        (dimension == 2 ? limit != start + 1
+                        : start != 0 || limit != dimensions[dimension])) {
+      return std::nullopt;
+    }
+  }
+  const int64_t selector = slice->slice_starts()[2];
+  if (dimensions[2] != 3 || selector < 0 || selector >= dimensions[2] ||
+      root.shape().dimensions(0) != dimensions[0] ||
+      root.shape().dimensions(1) != 1 ||
+      root.shape().dimensions(2) != dimensions[3] ||
+      root.shape().dimensions(3) != dimensions[4] ||
+      root.shape().dimensions(4) != dimensions[1]) {
+    return std::nullopt;
+  }
+  return std::pair<std::array<int64_t, 5>, int64_t>{dimensions, selector};
+}
+
+std::optional<QkvTransposeDescription> MatchQkvTransposeFusion(
+    const HloInstruction& instruction, const HloInstruction& parent) {
+  const auto* fusion = DynCast<HloFusionInstruction>(&instruction);
+  if (fusion == nullptr) {
+    return std::nullopt;
+  }
+  absl::flat_hash_set<const HloInstruction*> parameters;
+  for (int64_t index = 0; index < fusion->operand_count(); ++index) {
+    if (fusion->operand(index) == &parent) {
+      parameters.insert(fusion->fused_parameter(index));
+    }
+  }
+  if (parameters.empty()) {
+    return std::nullopt;
+  }
+  const HloInstruction* fusion_root = fusion->fused_expression_root();
+  std::vector<const HloInstruction*> roots;
+  if (fusion_root->opcode() == HloOpcode::kTuple) {
+    roots.assign(fusion_root->operands().begin(),
+                 fusion_root->operands().end());
+  } else {
+    roots.push_back(fusion_root);
+  }
+  QkvTransposeDescription description;
+  bool initialized = false;
+  for (const HloInstruction* root : roots) {
+    std::optional<std::pair<std::array<int64_t, 5>, int64_t>> matched =
+        MatchQkvTransposeRoot(*root, parameters);
+    if (!matched.has_value() ||
+        (initialized && description.dimensions != matched->first) ||
+        !description.selectors.insert(matched->second).second) {
+      return std::nullopt;
+    }
+    description.dimensions = matched->first;
+    initialized = true;
+  }
+  return initialized ? std::optional<QkvTransposeDescription>(description)
+                     : std::nullopt;
+}
+
+bool AreFlyQkvTransposeSiblings(const HloInstruction& instruction_1,
+                                const HloInstruction& instruction_2,
+                                const HloInstruction& parent) {
+  if (!parent.GetModule()
+           ->config()
+           .debug_options()
+           .xla_gpu_enable_flydsl_fusion()) {
+    return false;
+  }
+  std::optional<QkvTransposeDescription> description_1 =
+      MatchQkvTransposeFusion(instruction_1, parent);
+  std::optional<QkvTransposeDescription> description_2 =
+      MatchQkvTransposeFusion(instruction_2, parent);
+  if (!description_1.has_value() || !description_2.has_value() ||
+      description_1->dimensions != description_2->dimensions) {
+    return false;
+  }
+  return absl::c_none_of(description_1->selectors, [&](int64_t selector) {
+    return description_2->selectors.contains(selector);
+  });
+}
+
+bool HasFlyQkvTransposeSiblingPair(const HloInstruction& parent) {
+  for (auto first = parent.users().begin(); first != parent.users().end();
+       ++first) {
+    for (auto second = first + 1; second != parent.users().end(); ++second) {
+      if (AreFlyQkvTransposeSiblings(**first, **second, parent)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // Finds and returns the unique `slice` op where `parent` is used in `instr`.
@@ -100,6 +229,13 @@ FusionDecision ParameterSlicesAreNonOverlapping(const HloInstruction& instr1,
   // Allow MOF if the parameter is small, even if there's no overlap. 1024 bytes
   // were arbitrarily chosen as the threshold.
   if (ShapeUtil::ByteSizeOfElements(parent->shape()) < 1024) {
+    return FusionDecision::Allow();
+  }
+
+  // Q, K and V are intentionally disjoint slices, but executing their three
+  // small transposes in one Fly kernel removes two launch latencies. Retain
+  // the general disjoint-slice heuristic for other sibling fusions.
+  if (AreFlyQkvTransposeSiblings(instr1, instr2, *parent)) {
     return FusionDecision::Allow();
   }
 
@@ -450,7 +586,13 @@ absl::StatusOr<bool> MultiOutputFusion::DoMultiOutputFusion() {
       VLOG(3) << producer->name() << " is a constant.";
       continue;
     }
-    if (producer->IsCustomFusion()) {
+    // Custom producers are generally opaque to this pass. The QKV GEMM is a
+    // custom fusion too, however, and its three structurally verified slice /
+    // transpose users can still be sibling-fused without looking through or
+    // modifying the GEMM itself.
+    const bool is_custom_qkv_parent =
+        producer->IsCustomFusion() && HasFlyQkvTransposeSiblingPair(*producer);
+    if (producer->IsCustomFusion() && !is_custom_qkv_parent) {
       continue;
     }
     // First, fuse the consumer ops of the current op, which are siblings.
@@ -463,6 +605,9 @@ absl::StatusOr<bool> MultiOutputFusion::DoMultiOutputFusion() {
                      },
                      &fusion_info_cache, &cost_analysis)) {
       changed = true;
+    }
+    if (is_custom_qkv_parent) {
+      continue;
     }
     // Second, perform producer-consumer multi-output fusion. This order will
     // ensure that all get-tuple-element ops inserted as a by-product of

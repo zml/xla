@@ -92,5 +92,100 @@ ENTRY entry {
 )"));
 }
 
+TEST_F(FlyXTileTransposeTest, RecognizesTransformerQkvSliceTranspose) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule qkv_slice_transpose
+
+transpose {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  q = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [1:2], [0:16], [0:64]}
+  ROOT result = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(q),
+    dimensions={0,2,3,4,1}
+}
+
+ENTRY entry {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  ROOT fusion = bf16[2,1,16,64,128]{4,3,2,1,0} fusion(p0),
+    kind=kInput, calls=transpose
+}
+)"));
+}
+
+TEST_F(FlyXTileTransposeTest, RecognizesMultiOutputTransformerQkvTranspose) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule qkv_multi_output_transpose
+
+transpose {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  q_slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [0:1], [0:16], [0:64]}
+  q = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(q_slice),
+    dimensions={0,2,3,4,1}
+  k_slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [1:2], [0:16], [0:64]}
+  k = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(k_slice),
+    dimensions={0,2,3,4,1}
+  v_slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [2:3], [0:16], [0:64]}
+  v = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(v_slice),
+    dimensions={0,2,3,4,1}
+  ROOT result = (bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0}) tuple(q, k, v)
+}
+
+ENTRY entry {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  ROOT fusion = (bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0}) fusion(p0), kind=kInput,
+    calls=transpose
+}
+)"));
+}
+
+TEST_F(FlyXTileTransposeTest, RecognizesTransformerContextTranspose) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule context_transpose
+
+transpose {
+  p0 = bf16[32,64,128]{2,1,0} parameter(0)
+  view = bf16[2,16,64,128]{3,2,1,0} bitcast(p0)
+  ROOT result = bf16[2,128,16,64]{3,2,1,0} transpose(view),
+    dimensions={0,3,1,2}
+}
+
+ENTRY entry {
+  p0 = bf16[32,64,128]{2,1,0} parameter(0)
+  ROOT fusion = bf16[2,128,16,64]{3,2,1,0} fusion(p0), kind=kInput,
+    calls=transpose
+}
+)"));
+}
+
+TEST_F(FlyXTileTransposeTest, RejectsNonUnitQkvSlice) {
+  EXPECT_FALSE(IsSupported(R"(
+HloModule qkv_wide_slice_transpose
+
+transpose {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  qk = bf16[2,128,2,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [0:2], [0:16], [0:64]}
+  ROOT result = bf16[2,2,16,64,128]{4,3,2,1,0} transpose(qk),
+    dimensions={0,2,3,4,1}
+}
+
+ENTRY entry {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  ROOT fusion = bf16[2,2,16,64,128]{4,3,2,1,0} fusion(p0),
+    kind=kInput, calls=transpose
+}
+)"));
+}
+
 }  // namespace
 }  // namespace xla::gpu::flydsl

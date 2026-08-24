@@ -27,16 +27,28 @@ export HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL="${HIPBLASLT_ROCROLLER_NO_CUSTOM_KER
 
 declare -A hlo_files=(
   [softmax]="fly_fusion_bf16_softmax_benchmark.hlo"
+  [softmax_transformer]="fly_fusion_bf16_transformer_softmax_benchmark.hlo"
   [softmax_bf16_tail]="fly_fusion_bf16_softmax_tail_benchmark.hlo"
   [softmax_f16_tail]="fly_fusion_f16_softmax_tail_benchmark.hlo"
   [softmax_f32_tail]="fly_fusion_f32_softmax_tail_benchmark.hlo"
   [bf16_reduce]="fly_fusion_bf16_row_reduction_benchmark.hlo"
+  [bf16_narrowing_reduce]="fly_fusion_bf16_narrowing_row_reduction_benchmark.hlo"
+  [bf16_ragged_narrowing_reduce]="fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark.hlo"
+  [bf16_squared_difference_reduce]="fly_fusion_bf16_squared_difference_reduction_benchmark.hlo"
   [f32_reduce]="fly_fusion_row_reduction_benchmark.hlo"
   [elementwise]="fly_fusion_elementwise_hbm_benchmark.hlo"
+  [elementwise_f16]="fly_fusion_f16_elementwise_hbm_benchmark.hlo"
+  [elementwise_f32]="fly_fusion_f32_elementwise_hbm_benchmark.hlo"
+  [ragged_elementwise]="fly_fusion_ragged_elementwise_hbm_benchmark.hlo"
+  [multi_output_elementwise]="fly_fusion_multi_output_elementwise_hbm_benchmark.hlo"
+  [sigmoid]="fly_fusion_bf16_sigmoid_benchmark.hlo"
   [transpose]="fly_fusion_bf16_transpose_benchmark.hlo"
   [transpose_1024]="fly_fusion_bf16_transpose_1024_benchmark.hlo"
   [transpose_4096]="fly_fusion_bf16_transpose_4096_benchmark.hlo"
   [transpose_4096x16384]="fly_fusion_bf16_transpose_4096x16384_benchmark.hlo"
+  [transpose_transformer_qkv]="fly_fusion_bf16_transformer_qkv_transpose_benchmark.hlo"
+  [transpose_transformer_qkv_multi_output]="fly_fusion_bf16_transformer_qkv_multi_output_transpose_benchmark.hlo"
+  [transpose_transformer_context]="fly_fusion_bf16_transformer_context_transpose_benchmark.hlo"
 )
 
 if [[ "$#" -eq 0 ]]; then
@@ -59,7 +71,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-    echo "Available benchmarks: softmax softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f32_reduce elementwise transpose transpose_1024 transpose_4096 transpose_4096x16384" >&2
+    echo "Available benchmarks: softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce f32_reduce elementwise elementwise_f16 elementwise_f32 ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"
@@ -71,12 +83,16 @@ for benchmark in "$@"; do
   fi
   rm -f "${log}"
 
-  # The block-level emitter is XLA's Triton-based generic fusion path.
+  # Triton still gates tuple formation behind an unsupported flag; enable it
+  # here so multi-output benchmarks have a real Triton candidate to compare
+  # against. Fly formation itself does not depend on this flag.
   XLA_FLAGS="${XLA_FLAGS:-} \
 --xla_gpu_autotune_level=3 \
 --xla_gpu_autotune_num_repetitions=${FLY_FUSION_BENCHMARK_REPETITIONS:-5} \
 --xla_gpu_enable_flydsl_fusion=true \
+--xla_gpu_fusion_autotune_top_k_configs=${FLY_FUSION_AUTOTUNE_TOP_K:-8} \
 --xla_gpu_experimental_all_fusions_with_triton=true \
+--xla_gpu_unsupported_enable_triton_multi_output_fusion=true \
 --xla_gpu_experimental_autotune_backends=${backends} \
 --xla_gpu_dump_autotune_logs_to=${log}" \
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \

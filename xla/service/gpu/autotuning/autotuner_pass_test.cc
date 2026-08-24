@@ -120,6 +120,10 @@ ENTRY main {
 
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                        fusion->backend_config<GpuBackendConfig>());
+  gpu_config.mutable_fusion_backend_config()->set_kind("__fly");
+  ASSERT_OK(fusion->set_backend_config(gpu_config));
+  EXPECT_TRUE(should_autotune(*fusion));
+
   gpu_config.mutable_fusion_backend_config()->set_kind("__custom");
   ASSERT_OK(fusion->set_backend_config(gpu_config));
   EXPECT_FALSE(should_autotune(*fusion));

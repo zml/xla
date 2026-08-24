@@ -46,6 +46,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "xla/debug_options_flags.h"
 #include "xla/future.h"
 #include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -1117,7 +1118,11 @@ absl::StatusOr<xla::CompileOptions> ParseCompileOptions(
     return absl::InvalidArgumentError(
         "PJRT_Client_Compile: failed to deserialize CompileOptionsProto");
   }
-  return xla::CompileOptions::FromProto(options_proto);
+  TF_ASSIGN_OR_RETURN(xla::CompileOptions options,
+                      xla::CompileOptions::FromProto(options_proto));
+  xla::ApplyPjRtPluginFlyDslDebugOptionOverrides(
+      options.executable_build_options.mutable_debug_options());
+  return options;
 }
 
 using ProgramVariant =

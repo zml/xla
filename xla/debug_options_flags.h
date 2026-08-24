@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_DEBUG_OPTIONS_FLAGS_H_
 #define XLA_DEBUG_OPTIONS_FLAGS_H_
 
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "absl/log/log.h"
@@ -88,6 +90,19 @@ FlagStatus GetFlagStatus(absl::string_view flag_name);
 // Flags must be registered with the flags parser using AppendDebugOptionsFlags
 // first.
 DebugOptions GetDebugOptionsFromFlags();
+
+// Applies GPU plugin-scoped FlyDSL options and the optional autotune repetition
+// count to the process-wide debug options. This supports external PJRT plugins
+// loaded by a host whose embedded XLA flag parser predates these fields. Call
+// this while creating the client, before compilation starts.
+void ApplyPjRtPluginFlyDslDebugOptions(
+    std::optional<bool> enable_flydsl_gemm,
+    std::optional<bool> enable_flydsl_fusion,
+    std::optional<int64_t> autotune_num_repetitions = std::nullopt);
+
+// Applies the client-create overrides above to compile options deserialized
+// from a potentially older PJRT host.
+void ApplyPjRtPluginFlyDslDebugOptionOverrides(DebugOptions* debug_options);
 
 // Gets a DebugOptions proto that reflects the defaults as if no flags were set.
 DebugOptions DefaultDebugOptionsIgnoringFlags();

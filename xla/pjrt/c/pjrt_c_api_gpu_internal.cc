@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "google/protobuf/text_format.h"
+#include "xla/debug_options_flags.h"
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/profiler/plugin/plugin_tracer_impl.h"
 #include "xla/backends/profiler/plugin/profiler_c_api.h"
@@ -119,6 +120,14 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
           {"enable_mock_nccl", PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
           {"mock_gpu_topology", PJRT_NamedValue_Type::PJRT_NamedValue_kString},
           {"partition_index", PJRT_NamedValue_Type::PJRT_NamedValue_kInt64},
+#if TENSORFLOW_USE_ROCM
+          {"xla_gpu_enable_flydsl_gemm",
+           PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
+          {"xla_gpu_enable_flydsl_fusion",
+           PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
+          {"xla_gpu_autotune_num_repetitions",
+           PJRT_NamedValue_Type::PJRT_NamedValue_kInt64},
+#endif
       });
   PJRT_RETURN_IF_ERROR(
       ValidateCreateOptions(create_options, kExpectedOptionNameAndTypes));
@@ -206,6 +215,30 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
       it != create_options.end()) {
     partition_index = std::get<int64_t>(it->second);
   }
+#if TENSORFLOW_USE_ROCM
+  std::optional<bool> enable_flydsl_gemm;
+  if (auto it = create_options.find("xla_gpu_enable_flydsl_gemm");
+      it != create_options.end()) {
+    enable_flydsl_gemm = std::get<bool>(it->second);
+  }
+  std::optional<bool> enable_flydsl_fusion;
+  if (auto it = create_options.find("xla_gpu_enable_flydsl_fusion");
+      it != create_options.end()) {
+    enable_flydsl_fusion = std::get<bool>(it->second);
+  }
+  std::optional<int64_t> autotune_num_repetitions;
+  if (auto it = create_options.find("xla_gpu_autotune_num_repetitions");
+      it != create_options.end()) {
+    autotune_num_repetitions = std::get<int64_t>(it->second);
+    if (*autotune_num_repetitions < 0) {
+      return StatusToPjRtError(absl::InvalidArgumentError(
+          "xla_gpu_autotune_num_repetitions must be non-negative"));
+    }
+  }
+  xla::ApplyPjRtPluginFlyDslDebugOptions(enable_flydsl_gemm,
+                                         enable_flydsl_fusion,
+                                         autotune_num_repetitions);
+#endif
 
   xla::GpuClientOptions options;
   options.allocator_config = allocator_config;

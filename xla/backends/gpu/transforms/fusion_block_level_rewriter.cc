@@ -40,6 +40,8 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/layout_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/gpu_fusible.h"
+#include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/model/fusion_analysis_cache.h"
 #include "xla/service/gpu/model/gpu_indexing_performance_model.h"
@@ -155,7 +157,7 @@ bool ShouldRewriteReductionFusion(
 
 absl::StatusOr<bool> ShouldTryRewriteFusion(
     const HloFusionInstruction* fusion,
-    const se::DeviceDescription& device_description) {
+    const se::DeviceDescription& device_description, bool use_fly) {
   // If a dot fusion can be handled by Triton, GemmRewriter would have already
   // taken care of it.
   for (const HloInstruction* instr :
@@ -164,6 +166,25 @@ absl::StatusOr<bool> ShouldTryRewriteFusion(
         instr->opcode() == HloOpcode::kScaledDot) {
       return false;
     }
+  }
+
+  if (use_fly) {
+    // This pass runs after autotuning. Preserve every custom fusion because
+    // its backend may be the measured winner. Ordinary fusions seen here were
+    // created after autotuning (for example by the post-scheduling
+    // FusionWrapper), so give them a default Fly configuration now.
+    if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+      return false;
+    }
+
+    HloFusionAnalysis analysis =
+        HloFusionAnalysis::Create(*fusion, device_description);
+    return analysis.emitter_fusion_kind() ==
+               HloFusionAnalysis::EmitterFusionKind::kLoop ||
+           analysis.emitter_fusion_kind() ==
+               HloFusionAnalysis::EmitterFusionKind::kReduction ||
+           analysis.emitter_fusion_kind() ==
+               HloFusionAnalysis::EmitterFusionKind::kTranspose;
   }
 
   if (fusion->IsMultiOutputFusion() &&
@@ -187,18 +208,75 @@ absl::StatusOr<bool> ShouldTryRewriteFusion(
          ShouldRewriteReductionFusion(fusion, device_description);
 }
 
+BlockLevelFusionConfig GetDefaultFlyFusionConfig(
+    const HloFusionAnalysis& analysis) {
+  BlockLevelFusionConfig config;
+  config.set_num_warps(4);
+  config.set_num_ctas(1);
+  config.set_num_stages(1);
+  Tile* tile = config.add_output_tiles();
+
+  const HloInstruction& root = analysis.fusion_root(0).instruction();
+  const bool is_xtile_transpose =
+      analysis.fusion_root_count() == 1 &&
+      root.opcode() == HloOpcode::kTranspose && root.operand_count() == 1 &&
+      root.operand(0)->opcode() == HloOpcode::kParameter &&
+      root.shape().element_type() == BF16 &&
+      root.shape().dimensions_size() == 2 && root.dimensions().size() == 2 &&
+      root.dimensions(0) == 1 && root.dimensions(1) == 0 &&
+      root.operand(0)->shape().dimensions(0) % 32 == 0 &&
+      root.operand(0)->shape().dimensions(1) % 32 == 0;
+  if (is_xtile_transpose) {
+    const bool use_tile_64 =
+        root.operand(0)->shape().dimensions(0) % 64 == 0 &&
+        root.operand(0)->shape().dimensions(1) % 64 == 0;
+    const int64_t tile_size = use_tile_64 ? 64 : 32;
+    tile->add_sizes(tile_size);
+    tile->add_sizes(tile_size);
+    config.set_num_warps(use_tile_64 ? 4 : 1);
+    return config;
+  }
+
+  if (analysis.emitter_fusion_kind() ==
+      HloFusionAnalysis::EmitterFusionKind::kLoop) {
+    tile->add_sizes(ComputeLoopFusionConfig(analysis));
+    return config;
+  }
+  if (analysis.emitter_fusion_kind() ==
+      HloFusionAnalysis::EmitterFusionKind::kReduction) {
+    tile->add_sizes(16);
+    return config;
+  }
+
+  // A custom generic fusion (for example, a rewritten softmax) no longer
+  // exposes its underlying emitter kind through HloFusionAnalysis. Seed a
+  // rank-shaped tile. Fly's specialized softmax only consumes num_warps, while
+  // generic XLA emitters safely retain their own launch geometry.
+  const Shape& result_shape = analysis.first_result_shape();
+  for (int64_t dimension = 0;
+       dimension < result_shape.dimensions_size(); ++dimension) {
+    tile->add_sizes(1);
+  }
+  if (tile->sizes().empty()) {
+    tile->add_sizes(1);
+  }
+  return config;
+}
+
 absl::StatusOr<bool> ProcessFusionInstruction(
     HloFusionInstruction* fusion_instruction,
     const se::DeviceDescription& device_info,
     HloCostAnalysis::ShapeSizeFunction shape_size,
-    mlir::MLIRContext* mlir_context, bool use_experimental_tiling) {
+    mlir::MLIRContext* mlir_context, bool use_experimental_tiling,
+    bool use_fly) {
   bool dump_fusion_visualization = fusion_instruction->GetModule()
                                        ->config()
                                        .debug_options()
                                        .xla_dump_fusion_visualization();
 
   ASSIGN_OR_RETURN(bool should_try_rewrite,
-                   ShouldTryRewriteFusion(fusion_instruction, device_info));
+                   ShouldTryRewriteFusion(fusion_instruction, device_info,
+                                          use_fly));
   if (!should_try_rewrite) {
     VLOG(2) << "Not rewriting fusion " << fusion_instruction->ToString()
             << " because it is not supported.";
@@ -207,83 +285,102 @@ absl::StatusOr<bool> ProcessFusionInstruction(
 
   const HloComputation* fusion_computation =
       fusion_instruction->fused_instructions_computation();
-  if (CodegenDecision can_codegen = IsTritonSupportedComputation(
-          *fusion_computation, device_info.gpu_compute_capability());
-      !can_codegen) {
-    VLOG(2) << "Can't rewrite fusion " << fusion_instruction->ToString()
-            << " because one or more instructions is not supported by Triton: "
-            << can_codegen.Explain();
-    if (dump_fusion_visualization) {
-      RegisterFusionState(
-          *fusion_instruction->parent(),
-          absl::StrCat("Can't rewrite |", fusion_instruction->name(),
-                       "|: not supported by Triton: ", can_codegen.Explain()),
-          *fusion_instruction);
+  if (!use_fly) {
+    CodegenDecision can_codegen = IsTritonSupportedComputation(
+        *fusion_computation, device_info.gpu_compute_capability());
+    if (!can_codegen) {
+      VLOG(2) << "Can't rewrite fusion " << fusion_instruction->ToString()
+              << " because one or more instructions is not supported by "
+                 "Triton: "
+              << can_codegen.Explain();
+      if (dump_fusion_visualization) {
+        RegisterFusionState(
+            *fusion_instruction->parent(),
+            absl::StrCat("Can't rewrite |", fusion_instruction->name(),
+                         "|: not supported by Triton: ",
+                         can_codegen.Explain()),
+            *fusion_instruction);
+      }
+      return false;
     }
-    return false;
   }
 
   ASSIGN_OR_RETURN(auto backend_config,
                    fusion_instruction->backend_config<GpuBackendConfig>());
 
-  if (backend_config.has_fusion_backend_config() &&
-      backend_config.fusion_backend_config().has_block_level_fusion_config()) {
-    // Fusion is already block-level! Skip.
+  const bool has_block_level_config =
+      backend_config.has_fusion_backend_config() &&
+      backend_config.fusion_backend_config().has_block_level_fusion_config();
+  if (has_block_level_config && !use_fly) {
+    // The Triton path does not retarget an existing block-level fusion.
     return false;
   }
 
-  HloFusionAnalysisCache fusion_analysis_cache(device_info);
-  GpuPerformanceModelWithIndexingAnalysis indexing_performance_model(
-      &device_info, &fusion_analysis_cache, shape_size, mlir_context,
-      use_experimental_tiling);
+  BlockLevelFusionConfig block_level_config;
+  if (use_fly && has_block_level_config) {
+    block_level_config =
+        backend_config.fusion_backend_config().block_level_fusion_config();
+  } else if (use_fly) {
+    block_level_config = GetDefaultFlyFusionConfig(
+        HloFusionAnalysis::Create(*fusion_instruction, device_info));
+  } else {
+    HloFusionAnalysisCache fusion_analysis_cache(device_info);
+    GpuPerformanceModelWithIndexingAnalysis indexing_performance_model(
+        &device_info, &fusion_analysis_cache, shape_size, mlir_context,
+        use_experimental_tiling);
 
-  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(
-      Cast<HloFusionInstruction>(fusion_instruction));
+    auto fusion_adaptor = HloFusionAdaptor::ForInstruction(
+        Cast<HloFusionInstruction>(fusion_instruction));
 
-  ASSIGN_OR_RETURN(
-      TiledRunTimeDataOrError tiled_runtime_data_or_error,
-      indexing_performance_model.TryFindBestTilingForFusion(*fusion_adaptor));
+    ASSIGN_OR_RETURN(
+        TiledRunTimeDataOrError tiled_runtime_data_or_error,
+        indexing_performance_model.TryFindBestTilingForFusion(*fusion_adaptor));
 
-  if (const auto* fusion_decision =
-          std::get_if<FusionDecision>(&tiled_runtime_data_or_error)) {
-    // Can't rewrite this fusion because we can't tile it, skip!
-    VLOG(2) << "Can't rewrite fusion " << fusion_instruction->ToString()
-            << " because tiling search failed. (The most likely cause for "
-            << "is that SymbolicTileAnalysis failed.)";
-    if (dump_fusion_visualization) {
-      RegisterFusionState(
-          *fusion_instruction->parent(),
-          absl::StrCat("Can't rewrite |", fusion_instruction->name(),
-                       "|: tiling search failed: ", fusion_decision->Explain()),
-          *fusion_instruction);
+    if (const auto* fusion_decision =
+            std::get_if<FusionDecision>(&tiled_runtime_data_or_error)) {
+      // Can't rewrite this fusion because we can't tile it, skip!
+      VLOG(2) << "Can't rewrite fusion " << fusion_instruction->ToString()
+              << " because tiling search failed. (The most likely cause for "
+              << "is that SymbolicTileAnalysis failed.)";
+      if (dump_fusion_visualization) {
+        RegisterFusionState(
+            *fusion_instruction->parent(),
+            absl::StrCat("Can't rewrite |", fusion_instruction->name(),
+                         "|: tiling search failed: ",
+                         fusion_decision->Explain()),
+            *fusion_instruction);
+      }
+      return false;
     }
-    return false;
-  }
 
-  TiledRunTimeData tiled_runtime_data =
-      std::get<TiledRunTimeData>(std::move(tiled_runtime_data_or_error));
-  VLOG(1)
-      << "Found parameters "
-      << absl::StrCat(
-             "sizes=[",
-             absl::StrJoin(
-                 tiled_runtime_data.block_level_parameters.output_tile_sizes[0],
-                 ", "),
-             "], num_warps=",
-             tiled_runtime_data.block_level_parameters.num_warps)
-      << " for fusion computation " << fusion_computation->ToString();
+    TiledRunTimeData tiled_runtime_data =
+        std::get<TiledRunTimeData>(std::move(tiled_runtime_data_or_error));
+    VLOG(1)
+        << "Found parameters "
+        << absl::StrCat(
+               "sizes=[",
+               absl::StrJoin(tiled_runtime_data.block_level_parameters
+                                 .output_tile_sizes[0],
+                             ", "),
+               "], num_warps=",
+               tiled_runtime_data.block_level_parameters.num_warps)
+        << " for fusion computation " << fusion_computation->ToString();
+    block_level_config =
+        tiled_runtime_data.block_level_parameters.ToBlockLevelFusionConfig();
+  }
 
   *backend_config.mutable_fusion_backend_config()
-       ->mutable_block_level_fusion_config() =
-      tiled_runtime_data.block_level_parameters.ToBlockLevelFusionConfig();
-  backend_config.mutable_fusion_backend_config()->set_kind(kTritonFusionKind);
+       ->mutable_block_level_fusion_config() = std::move(block_level_config);
+  backend_config.mutable_fusion_backend_config()->set_kind(
+      use_fly ? kFlyFusionKind : kTritonFusionKind);
   RETURN_IF_ERROR(fusion_instruction->set_backend_config(backend_config));
   fusion_instruction->set_fusion_kind(HloInstruction::FusionKind::kCustom);
 
   if (dump_fusion_visualization) {
     RegisterFusionState(*fusion_instruction->parent(),
                         absl::StrCat("Rewrote |", fusion_instruction->name(),
-                                     "| to Triton block-level fusion"),
+                                     "| to ", use_fly ? "Fly" : "Triton",
+                                     " block-level fusion"),
                         *fusion_instruction);
   }
   return true;
@@ -294,8 +391,13 @@ absl::StatusOr<bool> ProcessFusionInstruction(
 absl::StatusOr<bool> FusionBlockLevelRewriter::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
-  RETURN_IF_ERROR(EnsureTritonSupportsComputeCapability(
-      device_info_.gpu_compute_capability()));
+  const bool use_fly =
+      device_info_.gpu_compute_capability().IsRocm() &&
+      module->config().debug_options().xla_gpu_enable_flydsl_fusion();
+  if (!use_fly) {
+    RETURN_IF_ERROR(EnsureTritonSupportsComputeCapability(
+        device_info_.gpu_compute_capability()));
+  }
 
   bool has_changed = false;
 
@@ -312,7 +414,8 @@ absl::StatusOr<bool> FusionBlockLevelRewriter::RunImpl(
             fusion_instruction, device_info_, shape_size_, mlir_context_,
             module->config()
                 .debug_options()
-                .xla_gpu_experimental_enable_tiling_propagation()));
+                .xla_gpu_experimental_enable_tiling_propagation(),
+            use_fly));
 
     has_changed |= changed;
   }

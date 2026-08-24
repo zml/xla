@@ -269,6 +269,10 @@ message BlockLevelFusionConfig {
 
   // Number of waves per execution unit (0 = no restriction).
   int32 waves_per_eu = 8;
+
+  // Width in bits of vectorized global-memory accesses. Zero lets the selected
+  // backend choose its default. Backends may reject unsupported widths.
+  int32 vector_size_bits = 9;
 }
 
 // FlyDSL-specific parameters for an xTile GEMM fusion.

@@ -1831,6 +1831,7 @@ cc_library(
         "//xla/backends/gpu/transforms:scatter_determinism_expander",
         "//xla/backends/gpu/transforms:scatter_expander",
         "//xla/backends/gpu/transforms:scatter_slice_simplifier",
+        "//xla/backends/gpu/transforms:softmax_rewriter_fly",
         "//xla/backends/gpu/transforms:softmax_rewriter_triton",
         "//xla/backends/gpu/transforms:sort_rewriter",
         "//xla/backends/gpu/transforms:splitk_rewriter",

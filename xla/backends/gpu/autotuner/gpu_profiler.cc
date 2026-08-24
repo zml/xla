@@ -290,15 +290,29 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
     result.scratch_bytes = GetScratchBytes(*gpu_executable);
   }
   {
-    // Warm up run.
-    std::vector<ExecutionInput> execution_inputs =
-        CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
-                                         rz_buffers.input_shapes());
-    RETURN_IF_ERROR(Execute(executable, std::move(execution_inputs),
-                            /*profile=*/nullptr)
-                        .status());
+    // A single short kernel launch does not bring ROCm devices to a stable
+    // performance state. That systematically penalizes the first autotuning
+    // candidate relative to later backends. Warm the device once per profiler,
+    // then retain the existing per-candidate warmup for cache-local effects.
+    constexpr int kInitialRocmWarmupRuns = 32;
+    const bool needs_initial_rocm_warmup =
+        !initial_device_warmup_done_ &&
+        stream_executor_->GetDeviceDescription()
+            .gpu_compute_capability()
+            .IsRocm();
+    const int warmup_runs =
+        needs_initial_rocm_warmup ? kInitialRocmWarmupRuns : 1;
+    for (int warmup = 0; warmup < warmup_runs; ++warmup) {
+      std::vector<ExecutionInput> execution_inputs =
+          CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
+                                           rz_buffers.input_shapes());
+      RETURN_IF_ERROR(Execute(executable, std::move(execution_inputs),
+                              /*profile=*/nullptr)
+                          .status());
+    }
 
     RETURN_IF_ERROR(stream_->BlockHostUntilDone());
+    initial_device_warmup_done_ = true;
   }
 
   std::vector<absl::Duration> durations;

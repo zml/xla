@@ -1,0 +1,30 @@
+HloModule fly_fusion_bf16_squared_difference_reduction_benchmark
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%fused_reduction (p0: bf16[65536,4096], p1: bf16[65536,4096]) -> f32[65536] {
+  %p0 = bf16[65536,4096]{1,0} parameter(0)
+  %p1 = bf16[65536,4096]{1,0} parameter(1)
+  %lhs = f32[65536,4096]{1,0} convert(%p0)
+  %rhs = f32[65536,4096]{1,0} convert(%p1)
+  %difference = f32[65536,4096]{1,0} subtract(%lhs, %rhs)
+  %square = f32[65536,4096]{1,0} multiply(%difference, %difference)
+  %zero = f32[] constant(0)
+  %row_sum = f32[65536]{0} reduce(%square, %zero), dimensions={1},
+    to_apply=%add
+  %scale = f32[] constant(0.25)
+  %scales = f32[65536]{0} broadcast(%scale), dimensions={}
+  ROOT %result = f32[65536]{0} multiply(%row_sum, %scales)
+}
+
+ENTRY %entry_computation (p0: bf16[65536,4096], p1: bf16[65536,4096]) -> f32[65536] {
+  %p0 = bf16[65536,4096]{1,0} parameter(0)
+  %p1 = bf16[65536,4096]{1,0} parameter(1)
+  ROOT %fusion = f32[65536]{0} fusion(%p0, %p1), kind=kCustom,
+    calls=%fused_reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["8"]}],"num_warps":"8","num_ctas":1,"num_stages":1}}}
+}

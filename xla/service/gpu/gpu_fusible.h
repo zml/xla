@@ -230,6 +230,9 @@ std::vector<const HloInstruction*> GetFusionRoots(
 // Whether the instruction is a generic Triton fusion.
 bool IsGenericTritonFusion(const HloInstruction& instr);
 
+// Whether the instruction is a generic Fly fusion.
+bool IsGenericFlyFusion(const HloInstruction& instr);
+
 // Whether there is an expected performance drop when unrolling due to the
 // instructions contained in the fusion, e.g. potential register spilling or not
 // enough parallelism.

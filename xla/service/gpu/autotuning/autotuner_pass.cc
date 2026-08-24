@@ -193,13 +193,14 @@ AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
       return AutotuneDecision::Forbid(absl::StrCat(
           "Failed to get GPU backend config: ", gpu_config.status().message()));
     }
-    // SoftmaxRewriterTriton and the block-level fusion rewriter run before
-    // autotuning and mark their results as custom __triton fusions. They are
-    // still generic, tiled HLO fusions and can be emitted by another backend.
-    // Keep other custom kinds pinned to their owning code generators.
-    if (gpu_config->fusion_backend_config().kind() != kTritonFusionKind) {
+    // Softmax and block-level fusion rewriting run before autotuning and may
+    // mark their results as custom __triton or __fly fusions. They are still
+    // generic, tiled HLO fusions and can be emitted by another backend. Keep
+    // other custom kinds pinned to their owning code generators.
+    absl::string_view kind = gpu_config->fusion_backend_config().kind();
+    if (kind != kTritonFusionKind && kind != kFlyFusionKind) {
       return AutotuneDecision::Forbid(
-          "Custom fusion is not a generic Triton fusion");
+          "Custom fusion is not a generic block-level fusion");
     }
   }
   if (absl::c_any_of(fusion->fused_instructions_computation()->instructions(),

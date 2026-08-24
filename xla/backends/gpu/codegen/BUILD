@@ -187,7 +187,9 @@ cc_library(
         "//xla/service/gpu:ir_emission_utils",
         "@com_google_absl//absl/status:statusor",
     ] + if_rocm_is_configured([
+        "//xla/backends/gpu/codegen/flydsl:xtile_elementwise",
         "//xla/backends/gpu/codegen/flydsl:xtile_gemm",
+        "//xla/backends/gpu/codegen/flydsl:xtile_reduction",
         "//xla/backends/gpu/codegen/flydsl:xtile_softmax",
         "//xla/backends/gpu/codegen/flydsl:xtile_transpose",
     ]),

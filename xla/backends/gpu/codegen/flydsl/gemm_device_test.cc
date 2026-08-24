@@ -3491,6 +3491,72 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
 }
 
+TEST_F(FlyGemmDeviceTest, Bf16CurrentGlobalSplitKOperandLayout) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_current_global_split_k_layout
+
+fly_gemm {
+  lhs = bf16[64,2,512]{2,1,0} parameter(0)
+  rhs = bf16[2,512,64]{2,1,0} parameter(1)
+  ROOT dot = f32[2,64,64]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={1}, lhs_contracting_dims={2},
+      rhs_batch_dims={0}, rhs_contracting_dims={1},
+      backend_config={"sizes":["128"]}
+}
+
+ENTRY main {
+  lhs = bf16[64,2,512]{2,1,0} parameter(0)
+  rhs = bf16[2,512,64]{2,1,0} parameter(1)
+  ROOT fusion = f32[2,64,64]{2,1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"64", "block_n":"32",
+          "block_k":"128", "num_warps":"2",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_rhs":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1","64","32"]}],
+          "num_stages":"1", "num_warps":"2", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16CurrentGlobalSplitKMfma32SingleBuffer) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_current_global_split_k_mfma32
+
+fly_gemm {
+  lhs = bf16[128,2,128]{2,1,0} parameter(0)
+  rhs = bf16[2,128,64]{2,1,0} parameter(1)
+  ROOT dot = f32[2,128,64]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={1}, lhs_contracting_dims={2},
+      rhs_batch_dims={0}, rhs_contracting_dims={1},
+      backend_config={"sizes":["128"]}
+}
+
+ENTRY main {
+  lhs = bf16[128,2,128]{2,1,0} parameter(0)
+  rhs = bf16[2,128,64]{2,1,0} parameter(1)
+  ROOT fusion = f32[2,128,64]{2,1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"64",
+          "block_k":"128", "num_warps":"8",
+          "mfma_atom":"FLY_MFMA_32X32X8",
+          "schedule_instructions":true, "stage_rhs":true,
+          "preload_lds_fragments":true, "single_buffer_lds":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1","128","64"]}],
+          "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.03}));
+}
+
 TEST_F(FlyGemmDeviceTest, Bf16LocalSplitKWithTransposedRhsDotDimension) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_bf16_local_split_k_transposed_rhs

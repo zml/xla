@@ -139,6 +139,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/scatter_determinism_expander.h"
 #include "xla/backends/gpu/transforms/scatter_expander.h"
 #include "xla/backends/gpu/transforms/scatter_slice_simplifier.h"
+#include "xla/backends/gpu/transforms/softmax_rewriter_fly.h"
 #include "xla/backends/gpu/transforms/softmax_rewriter_triton.h"
 #include "xla/backends/gpu/transforms/sort_rewriter.h"
 #include "xla/backends/gpu/transforms/splitk_rewriter.h"
@@ -2058,12 +2059,17 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<HloCSE>(/*is_layout_sensitive=*/true);
       pipeline.AddPass<HloConstantFolding>();
       pipeline.AddPass<HloDCE>();
-      pipeline.AddPass<SoftmaxRewriterTriton>(
-          gpu_target_config.device_description, ShapeSizeBytesFunction(),
-          alias_info, mlir_context,
-          /*only_fuse_if_profitable=*/true,
-          /*use_experimental_tiling=*/
-          debug_options.xla_gpu_experimental_enable_tiling_propagation());
+      if (rocm_cc != nullptr &&
+          debug_options.xla_gpu_enable_flydsl_fusion()) {
+        pipeline.AddPass<SoftmaxRewriterFly>();
+      } else {
+        pipeline.AddPass<SoftmaxRewriterTriton>(
+            gpu_target_config.device_description, ShapeSizeBytesFunction(),
+            alias_info, mlir_context,
+            /*only_fuse_if_profitable=*/true,
+            /*use_experimental_tiling=*/
+            debug_options.xla_gpu_experimental_enable_tiling_propagation());
+      }
     }
 
     pipeline.AddPass<ReductionDimensionGrouper>();
@@ -3294,7 +3300,11 @@ absl::Status GpuCompiler::RunPostSchedulingPipelines(
 
   const auto* cuda_cc =
       gpu_device_info.gpu_compute_capability().cuda_compute_capability();
-  if (cuda_cc != nullptr && cuda_cc->IsAtLeastAmpere()) {
+  const bool use_fly_fusion_dispatch =
+      gpu_device_info.gpu_compute_capability().IsRocm() &&
+      module->config().debug_options().xla_gpu_enable_flydsl_fusion();
+  if ((cuda_cc != nullptr && cuda_cc->IsAtLeastAmpere()) ||
+      use_fly_fusion_dispatch) {
     // This needs to run after every pass affecting fusions. The last passes
     // that create new fusions are FusionWrapper and StreamAttributeAnnotator.
     main_pipeline.AddPass<HloPassPipeline>(FusionDispatchPipeline(
