@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/cudnn.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -25,9 +26,11 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/target_config/target_config.h"
+#include "xla/backends/gpu/transforms/block_scaling_rewriter.h"
 #include "xla/backends/gpu/transforms/cudnn_fusion_compiler.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -114,6 +117,15 @@ absl::Status ApplyConfigAndUpdateWorkspaceInOutputTuple(
   return absl::OkStatus();
 }
 
+// True below 128 on either trailing output dimension: cuDNN's block-scaled
+// kernels execute an illegal instruction there and poison the CUDA context.
+bool ScaledDotOutputIsThin(const HloInstruction& scaled_dot) {
+  const Shape& shape = scaled_dot.shape();
+  const int64_t rank = shape.dimensions().size();
+  return !shape.IsArray() || rank < 2 || shape.dimensions(rank - 2) < 128 ||
+         shape.dimensions(rank - 1) < 128;
+}
+
 bool IsSupportedCudnnFusion(const HloInstruction& instr,
                             const GpuTargetConfig& target_config,
                             const DebugOptions& debug_options) {
@@ -148,13 +160,35 @@ bool IsSupportedCudnnFusion(const HloInstruction& instr,
   }
 
   if (hero->opcode() == HloOpcode::kConvolution ||
-      hero->opcode() == HloOpcode::kRaggedDot ||
-      hero->opcode() == HloOpcode::kScaledDot) {
+      hero->opcode() == HloOpcode::kRaggedDot) {
     return true;
   }
 
   stream_executor::CudaComputeCapability compute_capability =
       target_config.device_description.cuda_compute_capability();
+
+  if (hero->opcode() == HloOpcode::kScaledDot) {
+    static const bool allow_any = [] {
+      const char* env = std::getenv("XLA_CUDNN_ALLOW_ANY_BLOCK_SCALED");
+      return env != nullptr && absl::string_view(env) == "1";
+    }();
+    const bool is_sm100 =
+        compute_capability.major == se::CudaComputeCapability::kBlackwell &&
+        compute_capability.minor == 0 && !ScaledDotOutputIsThin(*hero);
+    const bool has_fixed_cudnn =
+        target_config.device_description.dnn_version() >=
+        se::SemanticVersion(9, 24, 0);
+    const bool is_sm120_with_fixed_cudnn =
+        compute_capability.major == se::CudaComputeCapability::kBlackwell_12 &&
+        has_fixed_cudnn;
+    const bool is_sm103_with_enough_rows =
+        compute_capability.major == se::CudaComputeCapability::kBlackwell &&
+        compute_capability.minor == 3 && has_fixed_cudnn &&
+        !ScaledDotOutputIsThin(*hero);
+    return allow_any || is_sm100 || is_sm120_with_fixed_cudnn ||
+           is_sm103_with_enough_rows;
+  }
+
   if ((compute_capability.IsAtLeastAmpere() &&
        debug_options.xla_gpu_cudnn_gemm_fusion_level() > 1) ||
       (compute_capability.IsAtLeastBlackwell() &&
@@ -344,13 +378,20 @@ GetConvolutionCustomCallConfigs(const HloCustomCallInstruction* instr,
 
 absl::Status ApplyConfigToCudnnFusion(HloInstruction& instr,
                                       const CudnnBackendConfig& config) {
+  HloInstruction* fusion = &instr;
+  if (hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(), HloOpcode::kScaledDot) !=
+      nullptr) {
+    ABSL_ASSIGN_OR_RETURN(fusion, CudnnScaledDotHelper::AddScaleSwizzle(
+                                      Cast<HloFusionInstruction>(&instr)));
+  }
   ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
-                   instr.backend_config<GpuBackendConfig>());
+                        fusion->backend_config<GpuBackendConfig>());
   FusionBackendConfig* backend_config =
       gpu_config.mutable_fusion_backend_config();
   backend_config->set_kind(kCuDnnFusionKind);
   backend_config->mutable_cudnn_fusion_config()->set_plan_id(config.algo_id());
-  ABSL_RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+  ABSL_RETURN_IF_ERROR(fusion->set_backend_config(std::move(gpu_config)));
   return absl::OkStatus();
 }
 
