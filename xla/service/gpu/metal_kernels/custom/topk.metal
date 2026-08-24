@@ -62,6 +62,9 @@ kernel void radix_gather32(device const uint* logits [[buffer(0)]], constant TKA
 }
 
 inline bool sgt(uint2 a, uint2 b) { return a.x == b.x ? a.y < b.y : a.x > b.x; }
+
+// Skip the bubble when the candidate loses to t[K-1]: t lives in thread
+// scratch, and an unconditional bubble is catastrophic on a heavily tied row.
 #define SEL(NAME, K, OUTT, CONV) \
 kernel void NAME(device const uint* cok [[buffer(0)]], device const uint* cix [[buffer(1)]], device atomic_uint* ccount [[buffer(2)]], \
                  constant TKA& a [[buffer(3)]], device OUTT* outv [[buffer(4)]], device uint* outi [[buffer(5)]], \
@@ -76,7 +79,8 @@ kernel void NAME(device const uint* cok [[buffer(0)]], device const uint* cix [[
     for (uint c = 0; c < cn; ++c) { uint2 kv; \
       if (c < n_gt) kv = uint2(co[c], ci[c]); \
       else { uint e = c - n_gt; kv = e < nsc ? sc[e] : uint2(co[kreq + e], ci[kreq + e]); } \
-      bool p = sgt(t[K-1], kv); t[K-1] = p ? t[K-1] : kv; \
+      if (sgt(t[K-1], kv)) continue; \
+      t[K-1] = kv; \
       for (int j = K - 2; j >= 0; --j) { bool q = sgt(t[j], kv); uint2 tt = t[j]; t[j] = q ? t[j] : t[j+1]; t[j+1] = q ? t[j+1] : tt; } } \
     device OUTT* ov = outv + (ulong)b * kreq; device uint* oi = outi + (ulong)b * kreq; \
     for (uint i = 0; i < kreq; ++i) { ov[i] = CONV(t[i].x); oi[i] = t[i].y; } \
@@ -99,7 +103,8 @@ kernel void NAME(device const INT* logits [[buffer(0)]], constant TKA& a [[buffe
   device const INT* row = logits + (ulong)b * n; \
   uint2 t[K]; for (int i = 0; i < K; ++i) t[i] = uint2(0u, 0xffffffffu); \
   for (uint c = tid; c < n; c += nt) { uint2 kv = uint2(OKEY(row[c]), c); \
-    bool p = sgt(t[K-1], kv); t[K-1] = p ? t[K-1] : kv; \
+    if (sgt(t[K-1], kv)) continue; \
+    t[K-1] = kv; \
     for (int j = K - 2; j >= 0; --j) { bool q = sgt(t[j], kv); uint2 tt = t[j]; t[j] = q ? t[j] : t[j+1]; t[j+1] = q ? t[j+1] : tt; } } \
   for (int i = 0; i < K; ++i) sc[tid * K + i] = t[i]; \
   threadgroup_barrier(mem_flags::mem_threadgroup); \
