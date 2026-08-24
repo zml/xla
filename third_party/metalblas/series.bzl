@@ -66,4 +66,23 @@ metalblas_patch_list = [
     # upstream adopts an equivalent on-GPU clamp under the same __MB_TOKCLAMP__
     # token that metalblas_gemm.cc substitutes.
     "//third_party/metalblas:mb_tokclamp.patch",
+    # MB_GT2GIB -- mpp_tensor.h addressed every operand through one whole-tensor
+    # `tensor` view and sliced that view per threadgroup. matmul2d requires a
+    # 32-bit index type (MPPTensorOpsMatMul2dImpl.h static_asserts "Index type
+    # must be int") and the offset a view forms from those indices is in BYTES,
+    # so a view spanning more than 2 GiB wraps. Measured with
+    # //experiments/mppgemm against a bf16 [202048, 6656] rhs (2.5 GiB, the
+    # Muse-Glimmer lm_head): every output column from 161344 on is garbage, and
+    # 161344 is exactly the first BN tile whose byte offset into the rhs crosses
+    # 2^31; the same shape at N=100000 (1.2 GiB) is correct at every M. In llmd
+    # this silently corrupted DFlash verification -- the logits for tokens above
+    # 161344 are junk, so a verification step occasionally sampled one, which is
+    # why `--dflash-draft-count` was only ever correct at its default.
+    #
+    # The fix slices in the POINTER rather than in the view: each base advances
+    # to its own tile in 64-bit and the view then describes only that tile, so
+    # the largest offset any descriptor forms is one tile. m_off is a multiple
+    # of BM and n_off of BN, so the advance preserves operand alignment.
+    # Delete only if upstream takes 64-bit-safe addressing itself.
+    "//third_party/metalblas:mb_gt2gib.patch",
 ]

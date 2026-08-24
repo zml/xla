@@ -1,0 +1,88 @@
+--- a/metalblas/shaders/mpp_tensor.h	2026-08-22 11:30:33
++++ b/metalblas/shaders/mpp_tensor.h	2026-08-22 11:30:33
+@@ -96,11 +96,6 @@
+   #endif
+ #endif
+     int gM = gP.M, gN = gP.N, gK = gP.K;
+-    auto eA = TRANS_A ? dextents<int32_t, 2>(gM, gK) : dextents<int32_t, 2>(gK, gM);
+-    auto eB = TRANS_B ? dextents<int32_t, 2>(gK, gN) : dextents<int32_t, 2>(gN, gK);
+-    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(A, eA, array<int32_t, 2>{1, gP.lda});
+-    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tB(B, eB, array<int32_t, 2>{1, gP.ldb});
+-    tensor<device OUT_T, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(gN, gM), array<int32_t, 2>{1, gP.ldc});
+ 
+     constexpr auto desc = matmul2d_descriptor(
+         BM, BN, dynamic_extent, TRANS_A, TRANS_B, RELAXED,
+@@ -128,17 +123,44 @@
+     if (*mb_numtok > 0 && m_off >= *mb_numtok) return;
+ #endif
+ 
++    // TILE-LOCAL TENSOR VIEWS. matmul2d hard-requires a 32-bit index type
++    // (MPPTensorOpsMatMul2dImpl.h: static_assert "Index type must be int"), and
++    // the offset a tensor view forms from those indices is in BYTES -- so a view
++    // that spans a whole >2 GiB operand wraps. Measured on an lm_head-shaped
++    // bf16 B of [202048, 6656] (2.5 GiB): every output column from 161344 on was
++    // garbage, and 161344 is exactly the first BN-tile whose byte offset into B
++    // crosses 2^31. Same operand at N=100000 (1.2 GiB) is correct at every M.
++    //
++    // The fix is to slice in the pointer instead of in the view: advance each
++    // base by this threadgroup's tile in 64-bit, then describe only the tile.
++    // The largest offset any descriptor then forms is one tile
++    // (BN * ldb elements), which no supported shape can push past 2 GiB.
++    // Alignment is preserved: m_off is a multiple of BM and n_off of BN, so
++    // every advance is a whole number of tile rows/columns.
++    const int m_ext = min(BM, gM - m_off);
++    const int n_ext = min(BN, gN - n_off);
++    device IN_T* pA = A + (TRANS_A ? (int64_t)m_off
++                                   : (int64_t)m_off * (int64_t)gP.lda);
++    device IN_T* pB = B + (TRANS_B ? (int64_t)n_off * (int64_t)gP.ldb
++                                   : (int64_t)n_off);
++    device OUT_T* pC = C + (int64_t)n_off + (int64_t)m_off * (int64_t)gP.ldc;
++    auto eA = TRANS_A ? dextents<int32_t, 2>(m_ext, gK) : dextents<int32_t, 2>(gK, m_ext);
++    auto eB = TRANS_B ? dextents<int32_t, 2>(gK, n_ext) : dextents<int32_t, 2>(n_ext, gK);
++    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(pA, eA, array<int32_t, 2>{1, gP.lda});
++    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tB(pB, eB, array<int32_t, 2>{1, gP.ldb});
++    tensor<device OUT_T, dextents<int32_t, 2>, tensor_inline> tC(pC, dextents<int32_t, 2>(n_ext, m_ext), array<int32_t, 2>{1, gP.ldc});
++
+ #if STATIC_SLICE
+     // Non-transposed fast path: static-extent slices mark each interior tile exactly
+     // BM x BN and in-bounds, dropping dynamic-slice edge predication (still fp32 accum).
+   #if !MN_ALIGNED
+     // Partial edge tiles (M%BM or N%BN != 0) fall back to a dynamic slice with
+     // the per-element validity mask; interior tiles take the static path below.
+-    bool inside = (m_off + BM <= gM) && (n_off + BN <= gN);
++    bool inside = (m_ext == BM) && (n_ext == BN);
+     if (!inside) {
+-        auto mA = tA.slice(0, m_off);
+-        auto mB = tB.slice(n_off, 0);
+-        auto mC = tC.slice(n_off, m_off);
++        auto mA = tA.slice(0, 0);
++        auto mB = tB.slice(0, 0);
++        auto mC = tC.slice(0, 0);
+         auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+         op.run(mA, mB, cT_f32);
+         auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
+@@ -147,18 +169,18 @@
+         return;
+     }
+   #endif
+-    auto mA = tA.slice<dynamic_extent, BM>(0, m_off);
+-    auto mB = tB.slice<BN, dynamic_extent>(n_off, 0);
+-    auto mC = tC.slice<BN, BM>(n_off, m_off);
++    auto mA = tA.slice<dynamic_extent, BM>(0, 0);
++    auto mB = tB.slice<BN, dynamic_extent>(0, 0);
++    auto mC = tC.slice<BN, BM>(0, 0);
+     auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+     op.run(mA, mB, cT_f32);
+     auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
+     MB_STORE_TILE(0);
+     cT_out.store(mC);
+ #else
+-    auto mA = TRANS_A ? tA.slice(m_off, 0) : tA.slice(0, m_off);
+-    auto mB = TRANS_B ? tB.slice(0, n_off) : tB.slice(n_off, 0);
+-    auto mC = tC.slice(n_off, m_off);
++    auto mA = tA.slice(0, 0);
++    auto mB = tB.slice(0, 0);
++    auto mC = tC.slice(0, 0);
+     auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+     op.run(mA, mB, cT_f32);
+     auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
