@@ -50,8 +50,10 @@ namespace gpu {
 namespace {
 
 absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
-    HloComputation* comp, HloScaledDotInstruction* dot) {
-  std::optional<Fp8BlockGemvConfig> config = Fp8BlockGemvConfigFor(*dot);
+    HloComputation* comp, HloScaledDotInstruction* dot,
+    const se::GpuComputeCapability& gpu_version) {
+  std::optional<Fp8BlockGemvConfig> config =
+      Fp8BlockGemvConfigFor(*dot, gpu_version);
   if (!config.has_value()) return nullptr;
   VLOG(1) << "fused scaled dot claimed " << dot->name() << ": "
           << dot->shape().ToString() << " tile " << dot->shape().dimensions(0)
@@ -59,7 +61,8 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
           << config->num_warps << " warps, " << config->num_stages
           << " stages";
 
-  HloComputation::Builder builder(absl::StrCat("fused_", dot->name()));
+  HloComputation::Builder builder(
+      absl::StrCat(kFp8BlockGemvComputationPrefix, dot->name()));
   std::vector<HloInstruction*> operands;
   std::vector<HloInstruction*> parameters;
   operands.reserve(dot->operand_count());

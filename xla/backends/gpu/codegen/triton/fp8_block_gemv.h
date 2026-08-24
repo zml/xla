@@ -26,6 +26,7 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla::gpu {
 
@@ -41,6 +42,9 @@ struct Fp8BlockGemvSpec {
 
 inline constexpr int64_t kMaxFp8BlockGemvBatch = 16;
 
+inline constexpr absl::string_view kFp8BlockGemvComputationPrefix =
+    "fp8_block_gemv_";
+
 std::optional<Fp8BlockGemvSpec> MatchFp8BlockGemv(
     const HloFusionInstruction& fusion);
 
@@ -51,7 +55,8 @@ struct Fp8BlockGemvConfig {
   int num_stages;
 };
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
-    const HloScaledDotInstruction& dot);
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version);
 
 bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot);
 

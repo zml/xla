@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/functional/function_ref.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/SmallVector.h"
@@ -65,6 +66,8 @@ using ::xla::xtile::CreateConst;
 
 constexpr int64_t kScaleBlock = 128;
 
+constexpr int64_t kMaxBlockK = 512;
+
 const HloInstruction* SkipBitcasts(const HloInstruction* instr) {
   while (instr->opcode() == HloOpcode::kBitcast ||
          instr->opcode() == HloOpcode::kReshape) {
@@ -90,7 +93,7 @@ bool IsIdentityScale(const HloInstruction* scale) {
 std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
     const HloScaledDotInstruction& dot,
     absl::FunctionRef<const HloInstruction*(const HloInstruction*)> resolve,
-    const char** reason = nullptr) {
+    const char** reason = nullptr, bool scale_proven_identity = false) {
   auto no = [&](const char* why) -> std::optional<Fp8BlockGemvSpec> {
     if (reason != nullptr) *reason = why;
     return std::nullopt;
@@ -109,7 +112,7 @@ std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
   const HloInstruction* act_scale = dot.operand(2);
   const HloInstruction* scale = dot.operand(3);
 
-  if (!IsIdentityScale(resolve(act_scale))) {
+  if (!scale_proven_identity && !IsIdentityScale(resolve(act_scale))) {
     return no("act-scale-not-identity");
   }
   if (activation->shape().element_type() != BF16 ||
@@ -169,14 +172,14 @@ int TunedInt(const char* name, int fallback) {
   return value;
 }
 
-int64_t ChooseBlockK(int64_t block_n, int64_t k) {
+int64_t ChooseBlockK(int64_t block_n, int64_t k, int64_t max_block_k) {
   int64_t budget = 32 * 1024;
   if (const char* env = std::getenv("XLA_FP8_BUDGET_KB")) {
     int parsed = 0;
     if (absl::SimpleAtoi(env, &parsed) && parsed > 0) budget = parsed * 1024;
   }
   int64_t block_k = budget / (block_n * static_cast<int64_t>(sizeof(float)));
-  block_k = std::min<int64_t>(block_k, 512);
+  block_k = std::min<int64_t>(block_k, max_block_k);
   block_k = std::max<int64_t>(block_k, kScaleBlock);
   block_k = (block_k / kScaleBlock) * kScaleBlock;
   while (block_k > kScaleBlock && k % block_k != 0) {
@@ -187,16 +190,18 @@ int64_t ChooseBlockK(int64_t block_n, int64_t k) {
 }  // namespace
 
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
-    const HloScaledDotInstruction& dot) {
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version) {
   std::optional<Fp8BlockGemvSpec> spec =
       MatchScaledDotStructure(dot, [](const HloInstruction* v) { return v; });
   if (!spec.has_value()) return std::nullopt;
+
   const bool single_row = spec->batch == 1;
   const int64_t block_n = single_row ? TunedInt("XLA_FP8_GEMV_BN", 16)
                                      : TunedInt("XLA_FP8_GEMM_BN", 32);
   return Fp8BlockGemvConfig{
       block_n,
-      ChooseBlockK(block_n, spec->k),
+      ChooseBlockK(block_n, spec->k, TunedInt("XLA_FP8_MAXBK", kMaxBlockK)),
       single_row ? TunedInt("XLA_FP8_GEMV_W", 8)
                  : TunedInt("XLA_FP8_GEMM_W", 4),
       single_row ? TunedInt("XLA_FP8_GEMV_STAGES", 3)
@@ -220,13 +225,15 @@ std::optional<Fp8BlockGemvSpec> MatchFp8BlockGemv(
   if (root->opcode() == HloOpcode::kScaledDot) {
     const auto* scaled = Cast<HloScaledDotInstruction>(root);
     const char* reason = "?";
+    const bool scale_proven_identity = absl::StartsWith(
+        computation->name(), kFp8BlockGemvComputationPrefix);
     std::optional<Fp8BlockGemvSpec> spec = MatchScaledDotStructure(
         *scaled,
         [&](const HloInstruction* value) -> const HloInstruction* {
           if (value->opcode() != HloOpcode::kParameter) return value;
           return fusion.operand(value->parameter_number());
         },
-        &reason);
+        &reason, scale_proven_identity);
     if (!spec.has_value()) {
       VLOG(1) << "fp8 block gemv scaled-dot no match " << fusion.name() << ": "
               << reason;
@@ -267,7 +274,15 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
 
   const HloComputation* computation = fusion.fused_instructions_computation();
 
-  const int64_t block_k = ChooseBlockK(block_n, spec.k);
+  int64_t block_k = 0;
+  if (absl::StatusOr<xla::xtile::Tile> tile =
+          SkipBitcasts(computation->root_instruction())->backend_config<xla::xtile::Tile>();
+      tile.ok() && tile->sizes_size() > 0) {
+    block_k = tile->sizes(tile->sizes_size() - 1);
+  }
+  if (block_k <= 0 || block_k % kScaleBlock != 0 || spec.k % block_k != 0) {
+    block_k = ChooseBlockK(block_n, spec.k, kMaxBlockK);
+  }
   if (spec.n % block_n != 0 || spec.k % block_k != 0 ||
       block_k % kScaleBlock != 0) {
     return absl::InvalidArgumentError("fp8 block gemv needs whole tiles");
@@ -379,7 +394,10 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
       Value act_2d = mlir::stablehlo::BroadcastInDimOp::create(
           b, mlir::RankedTensorType::get({block_n, block_k}, f32), scaled_act,
           llvm::SmallVector<int64_t>{1});
-      Value weight_f32 = xtile::Cast(b, weight_tile, f32);
+      // Via f16 on purpose: e4m3 to f16 is exact and converts two elements per
+      // instruction, e4m3 to f32 one.
+      Value weight_f32 =
+          xtile::Cast(b, xtile::Cast(b, weight_tile, b.getF16Type()), f32);
       Value product = mlir::stablehlo::MulOp::create(b, weight_f32, act_2d);
 
       Value zero = CreateConst(b, f32, 0.0f, {});
