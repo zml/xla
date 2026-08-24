@@ -79,6 +79,69 @@ Value ZeroOfType(ImplicitLocOpBuilder& builder, mlir::Type type) {
   return arith::ConstantOp::create(builder, builder.getZeroAttr(type));
 }
 
+Value I32Constant(ImplicitLocOpBuilder& builder, uint32_t value) {
+  return arith::ConstantOp::create(builder, builder.getI32IntegerAttr(value));
+}
+
+mlir::Type PortableBf16StorageType(mlir::Type type, OpBuilder& builder) {
+  auto shaped = mlir::dyn_cast<mlir::ShapedType>(type);
+  if (shaped == nullptr || !shaped.getElementType().isBF16()) {
+    return type;
+  }
+  return shaped.clone(builder.getI16Type());
+}
+
+void UsePortableBf16StorageAbi(mlir::func::FuncOp function,
+                               OpBuilder& builder) {
+  mlir::FunctionType type = function.getFunctionType();
+  SmallVector<mlir::Type> inputs;
+  SmallVector<mlir::Type> results;
+  inputs.reserve(type.getNumInputs());
+  results.reserve(type.getNumResults());
+  for (mlir::Type input : type.getInputs()) {
+    inputs.push_back(PortableBf16StorageType(input, builder));
+  }
+  for (mlir::Type result : type.getResults()) {
+    results.push_back(PortableBf16StorageType(result, builder));
+  }
+  function.setType(mlir::FunctionType::get(function.getContext(), inputs,
+                                            results));
+}
+
+Value Bf16BitsToF32(ImplicitLocOpBuilder& builder, Value value) {
+  Value bits = arith::ExtUIOp::create(builder, builder.getI32Type(), value);
+  bits = arith::ShLIOp::create(builder, bits, I32Constant(builder, 16));
+  return arith::BitcastOp::create(builder, builder.getF32Type(), bits);
+}
+
+Value F32ToBf16Bits(ImplicitLocOpBuilder& builder, Value value) {
+  Value bits = arith::BitcastOp::create(builder, builder.getI32Type(), value);
+  Value upper = arith::ShRUIOp::create(builder, bits, I32Constant(builder, 16));
+  Value lsb = arith::AndIOp::create(builder, upper, I32Constant(builder, 1));
+  Value bias = arith::AddIOp::create(builder, I32Constant(builder, 0x7fff), lsb);
+  Value rounded = arith::AddIOp::create(builder, bits, bias);
+  Value encoded = arith::TruncIOp::create(
+      builder, builder.getI16Type(),
+      arith::ShRUIOp::create(builder, rounded, I32Constant(builder, 16)));
+
+  Value exponent = arith::AndIOp::create(
+      builder, bits, I32Constant(builder, 0x7f800000));
+  Value mantissa = arith::AndIOp::create(
+      builder, bits, I32Constant(builder, 0x007fffff));
+  Value exponent_all_ones = arith::CmpIOp::create(
+      builder, arith::CmpIPredicate::eq, exponent,
+      I32Constant(builder, 0x7f800000));
+  Value mantissa_nonzero = arith::CmpIOp::create(
+      builder, arith::CmpIPredicate::ne, mantissa, I32Constant(builder, 0));
+  Value is_nan =
+      arith::AndIOp::create(builder, exponent_all_ones, mantissa_nonzero);
+  Value quiet_nan = arith::OrIOp::create(
+      builder, encoded,
+      arith::TruncIOp::create(builder, builder.getI16Type(),
+                              I32Constant(builder, 0x40)));
+  return arith::SelectOp::create(builder, is_nan, quiet_nan, encoded);
+}
+
 Value SelectTensorElementOrZero(ImplicitLocOpBuilder& builder, Value condition,
                                 Value tensor_value, ValueRange indices) {
   mlir::Type element_type =
@@ -114,7 +177,7 @@ std::optional<VulkanGemmConfig> MatchVulkanGemm(
   const se::DeviceDescription& device = analysis.device_info();
   const se::VulkanComputeCapability* capability =
       device.gpu_compute_capability().vulkan_compute_capability();
-  if (capability == nullptr || !capability->shader_bfloat16() ||
+  if (capability == nullptr ||
       !capability->storage_buffer_16bit_access() ||
       device.threads_per_block_limit() < kThreadsPerBlock ||
       analysis.fusion_root_count() != 1) {
@@ -203,6 +266,7 @@ VulkanGemmEmitter::CreateMLIRModule(
                    emitters::EmitKernelApi(*module, fusion, buffer_assignment,
                                            GetDefaultBufferAlignment(),
                                            entry_function_name));
+  UsePortableBf16StorageAbi(entry_function, builder);
   SetBackendKind(&mlir_context, entry_function, BackendKind::kGpu);
   emitters::SetIndexDataLayout(*module, fusion);
   ABSL_RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
@@ -291,8 +355,7 @@ absl::Status VulkanGemmEmitter::EmitKernel(
         arith::AndIOp::create(builder, lhs_row_valid, lhs_k_valid);
     Value lhs_value = SelectTensorElementOrZero(
         builder, lhs_valid, lhs, ValueRange{row, lhs_k});
-    lhs_value =
-        arith::ExtFOp::create(builder, builder.getF32Type(), lhs_value);
+    lhs_value = Bf16BitsToF32(builder, lhs_value);
     Value written_lhs = tensor::InsertOp::create(
         builder, lhs_value, loop_lhs_tile,
         ValueRange{thread_row, thread_col});
@@ -313,8 +376,7 @@ absl::Status VulkanGemmEmitter::EmitKernel(
             : SmallVector<Value, 2>{thread_col, thread_row};
     Value rhs_value = SelectTensorElementOrZero(
         builder, rhs_valid, rhs, ValueRange(rhs_indices));
-    rhs_value =
-        arith::ExtFOp::create(builder, builder.getF32Type(), rhs_value);
+    rhs_value = Bf16BitsToF32(builder, rhs_value);
     Value written_rhs = tensor::InsertOp::create(
         builder, rhs_value, loop_rhs_tile, ValueRange(rhs_tile_indices));
 
@@ -361,8 +423,7 @@ absl::Status VulkanGemmEmitter::EmitKernel(
       /*withElseRegion=*/true);
   OpBuilder then_builder = store.getThenBodyBuilder();
   ImplicitLocOpBuilder implicit_then(builder.getLoc(), then_builder);
-  Value result = arith::TruncFOp::create(
-      implicit_then, implicit_then.getBF16Type(), tile_loop.getResult(0));
+  Value result = F32ToBf16Bits(implicit_then, tile_loop.getResult(0));
   Value stored = tensor::InsertOp::create(implicit_then, result, output,
                                           ValueRange{row, col});
   scf::YieldOp::create(implicit_then, stored);

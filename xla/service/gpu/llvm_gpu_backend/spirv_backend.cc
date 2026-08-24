@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/status/status_macros.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/Utils/Local.h"
@@ -195,6 +197,45 @@ bool UsesBFloat16(const llvm::Module& module) {
   return false;
 }
 
+llvm::Value* DecodeBFloat16Storage(llvm::IRBuilder<>& builder,
+                                   llvm::Value* storage,
+                                   const llvm::Twine& name = "") {
+  llvm::Value* bits = builder.CreateZExt(storage, builder.getInt32Ty());
+  bits = builder.CreateShl(bits, builder.getInt32(16));
+  return builder.CreateBitCast(bits, builder.getFloatTy(), name);
+}
+
+llvm::Value* EncodeBFloat16Storage(llvm::IRBuilder<>& builder,
+                                   llvm::Value* value,
+                                   const llvm::Twine& name = "") {
+  llvm::Value* bits = builder.CreateBitCast(value, builder.getInt32Ty());
+  llvm::Value* lsb = builder.CreateAnd(
+      builder.CreateLShr(bits, builder.getInt32(16)), builder.getInt32(1));
+  llvm::Value* rounding_bias = builder.CreateAdd(builder.getInt32(0x7fff), lsb);
+  llvm::Value* rounded = builder.CreateAdd(bits, rounding_bias);
+  return builder.CreateTrunc(builder.CreateLShr(rounded, builder.getInt32(16)),
+                             builder.getInt16Ty(), name);
+}
+
+llvm::Type* BFloat16StorageType(llvm::Type* type, llvm::LLVMContext& context) {
+  if (type->isBFloatTy()) {
+    return llvm::Type::getInt16Ty(context);
+  }
+  if (auto* vector = llvm::dyn_cast<llvm::FixedVectorType>(type);
+      vector != nullptr && vector->getElementType()->isBFloatTy()) {
+    return llvm::FixedVectorType::get(llvm::Type::getInt16Ty(context),
+                                      vector->getNumElements());
+  }
+  return nullptr;
+}
+
+bool IsBFloat16StorageTypePair(llvm::Type* logical_type,
+                               llvm::Type* storage_type) {
+  llvm::Type* logical_storage_type =
+      BFloat16StorageType(logical_type, logical_type->getContext());
+  return logical_storage_type != nullptr && logical_storage_type == storage_type;
+}
+
 // LLVM represents unordered floating-point predicates directly, but the
 // corresponding SPIR-V comparison instructions are not available in the
 // Vulkan Shader environment. General bfloat16 relational instructions also
@@ -284,6 +325,201 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
   }
 
   const llvm::DataLayout& data_layout = module->getDataLayout();
+  auto bfloat_storage_constant = [](llvm::Constant* constant,
+                                    llvm::Type* storage_type)
+      -> llvm::Constant* {
+    if (llvm::isa<llvm::PoisonValue>(constant)) {
+      return llvm::PoisonValue::get(storage_type);
+    }
+    if (llvm::isa<llvm::UndefValue>(constant)) {
+      return llvm::UndefValue::get(storage_type);
+    }
+    if (auto* fp = llvm::dyn_cast<llvm::ConstantFP>(constant);
+        fp != nullptr && constant->getType()->isBFloatTy()) {
+      return llvm::ConstantInt::get(
+          storage_type, fp->getValueAPF().bitcastToAPInt());
+    }
+    return nullptr;
+  };
+  llvm::SmallVector<llvm::GlobalVariable*> bfloat_globals;
+  for (llvm::GlobalVariable& global : module->globals()) {
+    if (global.getAddressSpace() != 0 &&
+        BFloat16StorageType(global.getValueType(), module->getContext()) !=
+            nullptr) {
+      bfloat_globals.push_back(&global);
+    }
+  }
+  for (llvm::GlobalVariable* global : bfloat_globals) {
+    llvm::Type* storage_type =
+        BFloat16StorageType(global->getValueType(), module->getContext());
+    llvm::Constant* initializer = nullptr;
+    if (global->hasInitializer()) {
+      initializer = bfloat_storage_constant(global->getInitializer(),
+                                            storage_type);
+      if (initializer == nullptr) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Vulkan bfloat16 global has unsupported initializer ",
+            PrintLlvmValue(*global->getInitializer())));
+      }
+    }
+    auto* storage_global = new llvm::GlobalVariable(
+        *module, storage_type, global->isConstant(), global->getLinkage(),
+        initializer, global->getName() + ".storage", nullptr,
+        global->getThreadLocalMode(), global->getAddressSpace());
+    storage_global->setAlignment(global->getAlign());
+    storage_global->setUnnamedAddr(global->getUnnamedAddr());
+    storage_global->setVisibility(global->getVisibility());
+    storage_global->setDSOLocal(global->isDSOLocal());
+    global->replaceAllUsesWith(storage_global);
+    storage_global->takeName(global);
+    global->eraseFromParent();
+  }
+  llvm::SmallDenseMap<llvm::Value*, llvm::Value*, 32> bfloat_storage_values;
+
+  std::function<absl::StatusOr<llvm::Value*>(llvm::Value*, llvm::Instruction*)>
+      get_bfloat_storage_value;
+  std::function<absl::Status(llvm::Value*, llvm::Value*)>
+      rewrite_bfloat_storage_uses;
+
+  get_bfloat_storage_value = [&](llvm::Value* value,
+                                 llvm::Instruction* insertion_point)
+      -> absl::StatusOr<llvm::Value*> {
+    if (auto it = bfloat_storage_values.find(value);
+        it != bfloat_storage_values.end()) {
+      return it->second;
+    }
+    llvm::Type* storage_type =
+        BFloat16StorageType(value->getType(), module->getContext());
+    if (storage_type == nullptr) {
+      return absl::InternalError(absl::StrCat(
+          "Expected a bfloat16 storage value, got ",
+          PrintLlvmType(*value->getType())));
+    }
+
+    llvm::Value* storage_value = nullptr;
+    if (llvm::isa<llvm::PoisonValue>(value)) {
+      storage_value = llvm::PoisonValue::get(storage_type);
+    } else if (llvm::isa<llvm::UndefValue>(value)) {
+      storage_value = llvm::UndefValue::get(storage_type);
+    } else if (auto* constant = llvm::dyn_cast<llvm::ConstantFP>(value);
+               constant != nullptr && value->getType()->isBFloatTy()) {
+      storage_value = llvm::ConstantInt::get(
+          storage_type, constant->getValueAPF().bitcastToAPInt());
+    } else if (auto* truncate = llvm::dyn_cast<llvm::FPTruncInst>(value);
+               truncate != nullptr &&
+               truncate->getOperand(0)->getType()->isFloatTy()) {
+      llvm::IRBuilder<> builder(truncate);
+      storage_value = EncodeBFloat16Storage(builder, truncate->getOperand(0),
+                                            truncate->getName() + ".storage");
+    } else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+               load != nullptr && load->isSimple() &&
+               load->getPointerAddressSpace() != 0) {
+      llvm::IRBuilder<> builder(load);
+      llvm::LoadInst* storage_load = builder.CreateAlignedLoad(
+          storage_type, load->getPointerOperand(), load->getAlign(),
+          load->getName() + ".storage");
+      storage_load->copyMetadata(*load);
+      storage_value = storage_load;
+    } else if (auto* insert = llvm::dyn_cast<llvm::InsertElementInst>(value)) {
+      llvm::Value* vector_storage;
+      llvm::Value* element_storage;
+      auto vector_or = get_bfloat_storage_value(insert->getOperand(0), insert);
+      if (!vector_or.ok()) return vector_or.status();
+      vector_storage = *vector_or;
+      auto element_or = get_bfloat_storage_value(insert->getOperand(1), insert);
+      if (!element_or.ok()) return element_or.status();
+      element_storage = *element_or;
+      llvm::IRBuilder<> builder(insert);
+      storage_value = builder.CreateInsertElement(
+          vector_storage, element_storage, insert->getOperand(2),
+          insert->getName() + ".storage");
+    } else if (auto* extract = llvm::dyn_cast<llvm::ExtractElementInst>(value)) {
+      auto vector_or = get_bfloat_storage_value(extract->getOperand(0), extract);
+      if (!vector_or.ok()) return vector_or.status();
+      llvm::IRBuilder<> builder(extract);
+      storage_value = builder.CreateExtractElement(
+          *vector_or, extract->getOperand(1), extract->getName() + ".storage");
+    } else if (auto* shuffle = llvm::dyn_cast<llvm::ShuffleVectorInst>(value)) {
+      auto lhs_or = get_bfloat_storage_value(shuffle->getOperand(0), shuffle);
+      if (!lhs_or.ok()) return lhs_or.status();
+      auto rhs_or = get_bfloat_storage_value(shuffle->getOperand(1), shuffle);
+      if (!rhs_or.ok()) return rhs_or.status();
+      llvm::IRBuilder<> builder(shuffle);
+      storage_value = builder.CreateShuffleVector(*lhs_or, *rhs_or,
+                                                  shuffle->getShuffleMask(),
+                                                  shuffle->getName() + ".storage");
+    } else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value)) {
+      auto true_or = get_bfloat_storage_value(select->getTrueValue(), select);
+      if (!true_or.ok()) return true_or.status();
+      auto false_or = get_bfloat_storage_value(select->getFalseValue(), select);
+      if (!false_or.ok()) return false_or.status();
+      llvm::IRBuilder<> builder(select);
+      storage_value = builder.CreateSelect(select->getCondition(), *true_or,
+                                           *false_or,
+                                           select->getName() + ".storage");
+    } else if (auto* freeze = llvm::dyn_cast<llvm::FreezeInst>(value)) {
+      auto operand_or = get_bfloat_storage_value(freeze->getOperand(0), freeze);
+      if (!operand_or.ok()) return operand_or.status();
+      llvm::IRBuilder<> builder(freeze);
+      storage_value = builder.CreateFreeze(*operand_or,
+                                           freeze->getName() + ".storage");
+    } else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+      llvm::PHINode* storage_phi = llvm::PHINode::Create(
+          storage_type, phi->getNumIncomingValues(),
+          phi->getName() + ".storage");
+      storage_phi->insertBefore(phi->getIterator());
+      bfloat_storage_values[value] = storage_phi;
+      for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+        auto incoming_or =
+            get_bfloat_storage_value(phi->getIncomingValue(i),
+                                     phi->getIncomingBlock(i)->getTerminator());
+        if (!incoming_or.ok()) return incoming_or.status();
+        storage_phi->addIncoming(*incoming_or, phi->getIncomingBlock(i));
+      }
+      storage_value = storage_phi;
+    } else {
+      return absl::UnimplementedError(absl::StrCat(
+          "Vulkan bfloat16 storage value has unsupported producer ",
+          PrintLlvmValue(*value)));
+    }
+
+    bfloat_storage_values[value] = storage_value;
+    return storage_value;
+  };
+
+  rewrite_bfloat_storage_uses = [&](llvm::Value* logical_value,
+                                    llvm::Value* storage_value) -> absl::Status {
+    llvm::SmallVector<llvm::User*> users(logical_value->users());
+    for (llvm::User* user : users) {
+      if (auto* extend = llvm::dyn_cast<llvm::FPExtInst>(user);
+          extend != nullptr && extend->getType()->isFloatTy()) {
+        llvm::IRBuilder<> builder(extend);
+        extend->replaceAllUsesWith(
+            DecodeBFloat16Storage(builder, storage_value, extend->getName()));
+        extend->eraseFromParent();
+      } else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                 store != nullptr && store->getValueOperand() == logical_value) {
+        store->setOperand(0, storage_value);
+      } else if (BFloat16StorageType(user->getType(), module->getContext()) !=
+                 nullptr) {
+        auto user_storage_or =
+            get_bfloat_storage_value(llvm::cast<llvm::Value>(user),
+                                     llvm::cast<llvm::Instruction>(user));
+        if (!user_storage_or.ok()) return user_storage_or.status();
+        auto* user_instruction = llvm::cast<llvm::Instruction>(user);
+        ABSL_RETURN_IF_ERROR(rewrite_bfloat_storage_uses(
+            llvm::cast<llvm::Value>(user), *user_storage_or));
+        if (user_instruction->use_empty()) {
+          user_instruction->eraseFromParent();
+        }
+      } else {
+        return absl::UnimplementedError(absl::StrCat(
+            "Vulkan bfloat16 storage value has unsupported user ",
+            PrintLlvmValue(*llvm::cast<llvm::Value>(user))));
+      }
+    }
+    return absl::OkStatus();
+  };
   for (llvm::Instruction* operation : memory_operations) {
     llvm::Value* pointer =
         llvm::isa<llvm::LoadInst>(operation)
@@ -385,15 +621,24 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
           byte_offset,
           llvm::ConstantInt::get(index_type, type_size.getFixedValue()));
     }
+    auto aggregate_zero_index = [&]() -> llvm::Value* {
+      llvm::Constant* zero = llvm::ConstantInt::get(index_type, 0);
+      llvm::BinaryOperator* materialized_zero =
+          llvm::BinaryOperator::CreateAdd(zero, zero, "xla.spv.zero");
+      materialized_zero->insertBefore(operation->getIterator());
+      return materialized_zero;
+    };
     auto element_pointer = [&](uint64_t lane) {
       llvm::Value* lane_index = element_index;
       if (lane != 0) {
         lane_index = builder.CreateAdd(
             element_index, llvm::ConstantInt::get(index_type, lane));
       }
-      return builder.CreateGEP(
-          storage_array, root,
-          {llvm::ConstantInt::get(index_type, 0), lane_index});
+      if (element_type->isIntegerTy(8)) {
+        return builder.CreateGEP(element_type, root, lane_index);
+      }
+      return builder.CreateGEP(storage_array, root,
+                               {aggregate_zero_index(), lane_index});
     };
     llvm::Value* normalized_pointer = element_pointer(0);
 
@@ -464,6 +709,13 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
               element_type, normalized_pointer, load->getAlign(),
               load->getName() + ".resource");
           resource_load->copyMetadata(*load);
+          if (IsBFloat16StorageTypePair(load->getType(), element_type)) {
+            bfloat_storage_values[load] = resource_load;
+            ABSL_RETURN_IF_ERROR(
+                rewrite_bfloat_storage_uses(load, resource_load));
+            load->eraseFromParent();
+            continue;
+          }
           llvm::Value* converted = builder.CreateBitCast(
               resource_load, load->getType(), load->getName());
           load->replaceAllUsesWith(converted);
@@ -560,8 +812,25 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
         if (store->isSimple() && !store_size.isScalable() &&
             !element_size.isScalable() &&
             store_size.getFixedValue() == element_size.getFixedValue()) {
-          llvm::Value* converted =
-              builder.CreateBitCast(store->getValueOperand(), element_type);
+          llvm::Value* converted;
+          if (IsBFloat16StorageTypePair(store_type, element_type)) {
+            auto* truncate = llvm::dyn_cast<llvm::FPTruncInst>(
+                store->getValueOperand());
+            if (truncate != nullptr &&
+                truncate->getOperand(0)->getType()->isFloatTy()) {
+              converted = EncodeBFloat16Storage(
+                  builder, truncate->getOperand(0),
+                  store->getName() + ".bf16");
+            } else {
+              auto converted_or =
+                  get_bfloat_storage_value(store->getValueOperand(), store);
+              if (!converted_or.ok()) return converted_or.status();
+              converted = *converted_or;
+            }
+          } else {
+            converted = builder.CreateBitCast(store->getValueOperand(),
+                                              element_type);
+          }
           llvm::StoreInst* resource_store = builder.CreateAlignedStore(
               converted, normalized_pointer, store->getAlign());
           resource_store->copyMetadata(*store);
@@ -579,7 +848,7 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
 
 absl::StatusOr<std::string> EmitModuleToSPIRV(
     llvm::Module* module, llvm::TargetMachine* target_machine,
-    bool normalize_vulkan_buffers) {
+    bool normalize_vulkan_buffers, bool allow_bfloat16) {
   std::string spirv_binary;
   llvm::raw_string_ostream string_stream(spirv_binary);
   llvm::legacy::PassManager scalarize_pm;
@@ -597,6 +866,10 @@ absl::StatusOr<std::string> EmitModuleToSPIRV(
     llvm::legacy::PassManager cleanup_pm;
     cleanup_pm.add(llvm::createDeadCodeEliminationPass());
     cleanup_pm.run(*module);
+  }
+  if (!allow_bfloat16 && UsesBFloat16(*module)) {
+    return absl::InternalError(
+        "Non-native Vulkan bfloat16 legalization left shader bfloat16 IR");
   }
 
   {
@@ -819,7 +1092,8 @@ llvm::GlobalVariable* CreateVulkanResourceName(llvm::Module* module,
       absl::StrCat(".vulkan.resource.", entry_name, ".", binding));
 }
 
-absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
+absl::Status WrapVulkanEntryPoints(llvm::Module* module,
+                                  bool native_shader_bfloat16) {
   llvm::LLVMContext& context = module->getContext();
   llvm::SmallVector<llvm::Function*> entries;
   for (llvm::Function& function : *module) {
@@ -915,6 +1189,9 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
         }
         element_type =
             llvm_ir::PrimitiveTypeToIrType(primitive_type, context);
+        if (primitive_type == BF16 && !native_shader_bfloat16) {
+          element_type = llvm::Type::getInt16Ty(context);
+        }
         if (element_type == nullptr ||
             (!element_type->isIntegerTy() &&
              !element_type->isFloatingPointTy()) ||
@@ -931,6 +1208,9 @@ absl::Status WrapVulkanEntryPoints(llvm::Module* module) {
             InferVulkanBufferElementType(argument, entry_name, binding));
         if (element_type == nullptr) {
           element_type = builder.getInt32Ty();
+        }
+        if (element_type->isBFloatTy() && !native_shader_bfloat16) {
+          element_type = llvm::Type::getInt16Ty(context);
         }
       }
       llvm::Type* runtime_array = llvm::ArrayType::get(element_type, 0);
@@ -1127,7 +1407,8 @@ absl::StatusOr<std::string> CompileToSPIRV(
   }
 
   return EmitModuleToSPIRV(module, target_machine.get(),
-                           /*normalize_vulkan_buffers=*/false);
+                           /*normalize_vulkan_buffers=*/false,
+                           /*allow_bfloat16=*/true);
 }
 
 absl::StatusOr<std::string> CompileToVulkanSPIRV(
@@ -1138,20 +1419,17 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(
       GetSPIRVBackendOptions(debug_options));
 
-  ABSL_RETURN_IF_ERROR(WrapVulkanEntryPoints(module));
   const auto* vulkan_capability = gpu_version.vulkan_compute_capability();
-  if (UsesBFloat16(*module)) {
-    if (vulkan_capability == nullptr ||
-        !vulkan_capability->shader_bfloat16()) {
-      return absl::UnimplementedError(
-          "Vulkan bfloat16 kernels require VK_KHR_shader_bfloat16 and "
-          "shaderBFloat16Type support");
-    }
-    if (!vulkan_capability->storage_buffer_16bit_access()) {
-      return absl::UnimplementedError(
-          "Vulkan bfloat16 buffers require storageBuffer16BitAccess support");
-    }
+  const bool native_shader_bfloat16 =
+      vulkan_capability != nullptr && vulkan_capability->shader_bfloat16();
+  if (UsesBFloat16(*module) &&
+      (vulkan_capability == nullptr ||
+       !vulkan_capability->storage_buffer_16bit_access())) {
+    return absl::UnimplementedError(
+        "Vulkan bfloat16 buffers require storageBuffer16BitAccess support");
   }
+  ABSL_RETURN_IF_ERROR(
+      WrapVulkanEntryPoints(module, native_shader_bfloat16));
 
   llvm::Triple target_triple("spirv1.5-unknown-vulkan1.2-compute");
   std::unique_ptr<llvm::TargetMachine> target_machine =
@@ -1163,7 +1441,11 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
       static_cast<llvm::SPIRVTargetMachine*>(target_machine.get());
   llvm::ExtensionSet available_extensions;
   if (vulkan_capability != nullptr &&
-      vulkan_capability->shader_bfloat16()) {
+      vulkan_capability->storage_buffer_16bit_access()) {
+    available_extensions.insert(
+        llvm::SPIRV::Extension::SPV_KHR_16bit_storage);
+  }
+  if (native_shader_bfloat16) {
     available_extensions.insert(llvm::SPIRV::Extension::SPV_KHR_bfloat16);
   }
   const_cast<llvm::SPIRVSubtarget*>(spirv_target->getSubtargetImpl())
@@ -1178,7 +1460,8 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   ABSL_ASSIGN_OR_RETURN(
       std::string spirv_binary,
       EmitModuleToSPIRV(module, target_machine.get(),
-                        /*normalize_vulkan_buffers=*/true));
+                        /*normalize_vulkan_buffers=*/true,
+                        /*allow_bfloat16=*/native_shader_bfloat16));
   AddVariablePointersStorageBufferCapability(&spirv_binary);
   return spirv_binary;
 }

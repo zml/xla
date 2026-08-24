@@ -90,6 +90,66 @@ Value ZeroOfType(ImplicitLocOpBuilder& builder, mlir::Type type) {
   return arith::ConstantOp::create(builder, builder.getZeroAttr(type));
 }
 
+Value I32Constant(ImplicitLocOpBuilder& builder, uint32_t value) {
+  return arith::ConstantOp::create(builder, builder.getI32IntegerAttr(value));
+}
+
+mlir::Type PortableBf16StorageType(mlir::Type type, OpBuilder& builder) {
+  auto shaped = mlir::dyn_cast<mlir::ShapedType>(type);
+  if (shaped == nullptr || !shaped.getElementType().isBF16()) {
+    return type;
+  }
+  return shaped.clone(builder.getI16Type());
+}
+
+void UsePortableBf16StorageAbi(mlir::func::FuncOp function,
+                               OpBuilder& builder) {
+  mlir::FunctionType type = function.getFunctionType();
+  SmallVector<mlir::Type> inputs;
+  SmallVector<mlir::Type> results;
+  for (mlir::Type input : type.getInputs()) {
+    inputs.push_back(PortableBf16StorageType(input, builder));
+  }
+  for (mlir::Type result : type.getResults()) {
+    results.push_back(PortableBf16StorageType(result, builder));
+  }
+  function.setType(mlir::FunctionType::get(function.getContext(), inputs,
+                                            results));
+}
+
+Value Bf16BitsToF32(ImplicitLocOpBuilder& builder, Value value) {
+  Value bits = arith::ExtUIOp::create(builder, builder.getI32Type(), value);
+  bits = arith::ShLIOp::create(builder, bits, I32Constant(builder, 16));
+  return arith::BitcastOp::create(builder, builder.getF32Type(), bits);
+}
+
+Value F32ToBf16Bits(ImplicitLocOpBuilder& builder, Value value) {
+  Value bits = arith::BitcastOp::create(builder, builder.getI32Type(), value);
+  Value upper = arith::ShRUIOp::create(builder, bits, I32Constant(builder, 16));
+  Value lsb = arith::AndIOp::create(builder, upper, I32Constant(builder, 1));
+  Value rounded = arith::AddIOp::create(
+      builder, bits,
+      arith::AddIOp::create(builder, I32Constant(builder, 0x7fff), lsb));
+  Value encoded = arith::TruncIOp::create(
+      builder, builder.getI16Type(),
+      arith::ShRUIOp::create(builder, rounded, I32Constant(builder, 16)));
+  Value exponent = arith::AndIOp::create(
+      builder, bits, I32Constant(builder, 0x7f800000));
+  Value mantissa = arith::AndIOp::create(
+      builder, bits, I32Constant(builder, 0x007fffff));
+  Value is_nan = arith::AndIOp::create(
+      builder,
+      arith::CmpIOp::create(builder, arith::CmpIPredicate::eq, exponent,
+                            I32Constant(builder, 0x7f800000)),
+      arith::CmpIOp::create(builder, arith::CmpIPredicate::ne, mantissa,
+                            I32Constant(builder, 0)));
+  Value quiet_nan = arith::OrIOp::create(
+      builder, encoded,
+      arith::TruncIOp::create(builder, builder.getI16Type(),
+                              I32Constant(builder, 0x40)));
+  return arith::SelectOp::create(builder, is_nan, quiet_nan, encoded);
+}
+
 }  // namespace
 
 namespace internal {
@@ -128,7 +188,7 @@ ValueRange UpdateIf(
 }
 
 Value ToF32(ImplicitLocOpBuilder& builder, Value value) {
-  return arith::ExtFOp::create(builder, builder.getF32Type(), value);
+  return Bf16BitsToF32(builder, value);
 }
 
 Value ShuffleSum(ImplicitLocOpBuilder& builder, Value value,
@@ -219,6 +279,7 @@ VulkanFlashAttentionEmitter::CreateMLIRModule(
                    emitters::EmitKernelApi(*module, fusion, buffer_assignment,
                                            GetDefaultBufferAlignment(),
                                            entry_function_name));
+  UsePortableBf16StorageAbi(entry_function, builder);
   SetBackendKind(&mlir_context, entry_function, BackendKind::kGpu);
   emitters::SetIndexDataLayout(*module, fusion);
   ABSL_RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
@@ -398,10 +459,9 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
   output = UpdateIf(
       builder, write0, ValueRange{output},
       [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
-        Value bf16 =
-            arith::TruncFOp::create(nested, nested.getBF16Type(), normalized0);
+        Value bf16_bits = F32ToBf16Bits(nested, normalized0);
         return {tensor::InsertOp::create(
-            nested, bf16, output, ValueRange{query_head, query_row, tid})};
+            nested, bf16_bits, output, ValueRange{query_head, query_row, tid})};
       })[0];
 
   if (head_dim_ > kThreadsPerBlock) {
@@ -416,10 +476,9 @@ absl::Status VulkanFlashAttentionEmitter::EmitKernel(
     output = UpdateIf(
         builder, write1, ValueRange{output},
         [&](ImplicitLocOpBuilder& nested) -> SmallVector<Value> {
-          Value bf16 = arith::TruncFOp::create(nested, nested.getBF16Type(),
-                                               normalized1);
+          Value bf16_bits = F32ToBf16Bits(nested, normalized1);
           return {tensor::InsertOp::create(
-              nested, bf16, output, ValueRange{query_head, query_row, dim1})};
+              nested, bf16_bits, output, ValueRange{query_head, query_row, dim1})};
         })[0];
   }
 

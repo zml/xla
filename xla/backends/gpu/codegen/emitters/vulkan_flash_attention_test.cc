@@ -32,6 +32,9 @@ limitations under the License.
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/raw_ostream.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/codegen/llvm_kernel_source.h"
 #include "xla/codegen/mlir_kernel_source.h"
@@ -127,11 +130,14 @@ ENTRY main {
   se::DeviceDescription device = TestGpuDeviceInfo::RTXA6000DeviceInfo();
   device.set_vulkan_compute_capability(
       /*api_version_major=*/1, /*api_version_minor=*/4,
-      /*shader_bfloat16=*/true, /*storage_buffer_16bit_access=*/true,
+      /*shader_bfloat16=*/false, /*storage_buffer_16bit_access=*/true,
       /*subgroup_size=*/32, /*subgroup_basic=*/true,
       /*subgroup_shuffle=*/true);
 
   std::unique_ptr<mlir::MLIRContext> context = CreateMlirContext();
+  context->appendDialectRegistry(
+      MlirKernelEmitter::GetDialectRegistry());
+  context->loadAllAvailableDialects();
   VulkanFlashAttentionEmitter emitter(*fusion, device);
   ASSERT_OK_AND_ASSIGN(
       mlir::OwningOpRef<mlir::ModuleOp> emitted_module,
@@ -142,6 +148,15 @@ ENTRY main {
       CompileMlirToLlvm(device, *module, "vulkan_flash_attention",
                         /*unroll_factor=*/0, *context,
                         MlirKernelSource(std::move(emitted_module))));
+  llvm::Function* llvm_entry =
+      llvm_source.module()->getFunction("vulkan_flash_attention");
+  ASSERT_NE(llvm_entry, nullptr);
+  llvm_entry->addFnAttr("hlsl.shader", "compute");
+  llvm_entry->addFnAttr("hlsl.numthreads", "128,1,1");
+  std::string llvm_ir;
+  llvm::raw_string_ostream llvm_stream(llvm_ir);
+  llvm_source.module()->print(llvm_stream, nullptr);
+  EXPECT_EQ(llvm_ir.find("bfloat"), std::string::npos);
   ASSERT_OK_AND_ASSIGN(
       std::string spirv,
       spirv::CompileToVulkanSPIRV(llvm_source.module(),

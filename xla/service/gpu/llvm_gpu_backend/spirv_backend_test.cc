@@ -46,6 +46,14 @@ stream_executor::GpuComputeCapability TestVulkanComputeCapability() {
       stream_executor::VulkanComputeCapability(1, 2));
 }
 
+stream_executor::GpuComputeCapability
+TestVulkanStorage16WithoutShaderBFloat16ComputeCapability() {
+  return stream_executor::GpuComputeCapability(
+      stream_executor::VulkanComputeCapability(
+          1, 2, /*shader_bfloat16=*/false,
+          /*storage_buffer_16bit_access=*/true));
+}
+
 absl::StatusOr<std::unique_ptr<llvm::Module>> ParseLlvmIr(
     absl::string_view ir, llvm::LLVMContext& context) {
   llvm::SMDiagnostic diagnostic;
@@ -122,6 +130,106 @@ attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="64,1,1" }
   EXPECT_OK(CompileToVulkanSPIRV(module.get(),
                                  TestVulkanComputeCapability(),
                                  DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageWithFloatCompute) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_storage_float_compute(ptr %in, ptr %out) #0 {
+entry:
+  %value = load bfloat, ptr %in, align 2
+  %float_value = fpext bfloat %value to float
+  %sum = fadd float %float_value, 1.000000e+00
+  %bf16_sum = fptrunc float %sum to bfloat
+  store bfloat %bf16_sum, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageCopy) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_storage_copy(ptr %in, ptr %out) #0 {
+entry:
+  %value = load bfloat, ptr %in, align 2
+  store bfloat %value, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageVectorMovement) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_storage_vector_movement(ptr %in, ptr %out) #0 {
+entry:
+  %value = load bfloat, ptr %in, align 2
+  %vector = insertelement <2 x bfloat> poison, bfloat %value, i32 0
+  %selected = extractelement <2 x bfloat> %vector, i32 0
+  store bfloat %selected, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageSelectFromConstantLoads) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+@lhs = internal addrspace(11) constant bfloat 0xR3F80, align 2
+@rhs = internal addrspace(11) constant bfloat 0xR4000, align 2
+
+define void @bf16_storage_select_from_constant_loads(ptr %pred_ptr, ptr %out) #0 {
+entry:
+  %pred = load i1, ptr %pred_ptr, align 1
+  %lhs_value = load bfloat, ptr addrspace(11) @lhs, align 2
+  %rhs_value = load bfloat, ptr addrspace(11) @rhs, align 2
+  %selected = select i1 %pred, bfloat %lhs_value, bfloat %rhs_value
+  store bfloat %selected, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
 }
 
 }  // namespace
