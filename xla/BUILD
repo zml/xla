@@ -1318,6 +1318,7 @@ xla_cc_test(
         ":parse_flags_from_env",
         ":xla_data_proto_cc",
         ":xla_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:test_main",
         "@com_google_absl//absl/container:flat_hash_set",

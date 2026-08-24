@@ -24,8 +24,10 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
@@ -1766,6 +1768,85 @@ class TransposeMultiOutputFusionTest : public MultiOutputFusionTest {
     return debug_options;
   }
 };
+
+class FlyQkvMultiOutputFusionTest : public MultiOutputFusionTest {
+  DebugOptions GetDebugOptionsForTest() const override {
+    DebugOptions debug_options =
+        MultiOutputFusionTest::GetDebugOptionsForTest();
+    debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+    return debug_options;
+  }
+};
+
+TEST_F(FlyQkvMultiOutputFusionTest, FusesThreeDisjointQkvTransposes) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_qkv_multi_output
+
+qkv_gemm {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  ROOT result = bf16[256,3072]{1,0} copy(p0)
+}
+
+q {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [0:1], [0:16], [0:64]}
+  ROOT result = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(slice),
+    dimensions={0,2,3,4,1}
+}
+
+k {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [1:2], [0:16], [0:64]}
+  ROOT result = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(slice),
+    dimensions={0,2,3,4,1}
+}
+
+v {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  view = bf16[2,128,3,16,64]{4,3,2,1,0} bitcast(p0)
+  slice = bf16[2,128,1,16,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [2:3], [0:16], [0:64]}
+  ROOT result = bf16[2,1,16,64,128]{4,3,2,1,0} transpose(slice),
+    dimensions={0,2,3,4,1}
+}
+
+ENTRY main {
+  p0 = bf16[256,3072]{1,0} parameter(0)
+  qkv = bf16[256,3072]{1,0} fusion(p0), kind=kCustom, calls=qkv_gemm,
+    backend_config={"fusion_backend_config":{"kind":"__test_qkv_gemm"}}
+  q_fusion = bf16[2,1,16,64,128]{4,3,2,1,0} fusion(qkv), kind=kInput,
+    calls=q
+  k_fusion = bf16[2,1,16,64,128]{4,3,2,1,0} fusion(qkv), kind=kInput,
+    calls=k
+  v_fusion = bf16[2,1,16,64,128]{4,3,2,1,0} fusion(qkv), kind=kInput,
+    calls=v
+  ROOT outputs = (bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0},
+    bf16[2,1,16,64,128]{4,3,2,1,0})
+    tuple(q_fusion, k_fusion, v_fusion)
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  MultiOutputFusion pass{device_info_, &alias_info_,
+                         HloCostAnalysis::DefaultShapeSize};
+  EXPECT_TRUE(pass.Run(module.get()).value());
+  EXPECT_EQ(CountMultiOutputFusions(module.get()), 1);
+  const HloFusionInstruction* fusion = nullptr;
+  for (const HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    if (instruction->IsMultiOutputFusion()) {
+      fusion = Cast<const HloFusionInstruction>(instruction);
+    }
+  }
+  ASSERT_NE(fusion, nullptr);
+  EXPECT_EQ(fusion->fused_expression_root()->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(fusion->fused_expression_root()->operand_count(), 3);
+}
 
 TEST_F(TransposeMultiOutputFusionTest, MultipleTransposes) {
   const char* hlo = R"(

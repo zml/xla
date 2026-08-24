@@ -553,6 +553,42 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 static absl::once_flag flags_init;
 static DebugOptions* flag_values;
 static std::vector<tsl::Flag>* flag_objects;
+static std::optional<bool> pjrt_plugin_enable_flydsl_gemm;
+static std::optional<bool> pjrt_plugin_enable_flydsl_fusion;
+static std::optional<int64_t> pjrt_plugin_autotune_num_repetitions;
+
+static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
+  auto add_autotune_backend = [debug_options](autotuner::Backend backend) {
+    if (!absl::c_linear_search(
+            debug_options->xla_gpu_experimental_autotune_backends(),
+            backend)) {
+      debug_options->add_xla_gpu_experimental_autotune_backends(backend);
+    }
+  };
+
+  if (pjrt_plugin_enable_flydsl_gemm.has_value()) {
+    debug_options->set_xla_gpu_enable_flydsl_gemm(
+        *pjrt_plugin_enable_flydsl_gemm);
+    if (*pjrt_plugin_enable_flydsl_gemm) {
+      // A PJRT host built against an older XLA serializes an explicit backend
+      // allowlist which cannot contain the newer Fly enum values. Restore the
+      // Fly backends when the plugin-scoped option enables them.
+      add_autotune_backend(autotuner::Backend::FLY);
+      add_autotune_backend(autotuner::Backend::FLY_FISSION);
+    }
+  }
+  if (pjrt_plugin_enable_flydsl_fusion.has_value()) {
+    debug_options->set_xla_gpu_enable_flydsl_fusion(
+        *pjrt_plugin_enable_flydsl_fusion);
+    if (*pjrt_plugin_enable_flydsl_fusion) {
+      add_autotune_backend(autotuner::Backend::FLY_FUSION);
+    }
+  }
+  if (pjrt_plugin_autotune_num_repetitions.has_value()) {
+    debug_options->set_xla_gpu_autotune_num_repetitions(
+        *pjrt_plugin_autotune_num_repetitions);
+  }
+}
 
 // Maps pass -> initial fuel values (parsed when AllocateFlags was run).
 static absl::flat_hash_map<std::string, int64_t>* const initial_fuel =
@@ -3578,7 +3614,30 @@ xla::DebugOptions GetDebugOptionsFromFlags() {
     ParseFlagsFromEnvAndDieIfUnknown("XLA_FLAGS", *flag_objects,
                                      /*reset_envvar=*/true);
   }
-  return *flag_values;
+  DebugOptions debug_options = *flag_values;
+  ApplyPjRtPluginFlyDslOverrides(&debug_options);
+  return debug_options;
+}
+
+void ApplyPjRtPluginFlyDslDebugOptions(
+    std::optional<bool> enable_flydsl_gemm,
+    std::optional<bool> enable_flydsl_fusion,
+    std::optional<int64_t> autotune_num_repetitions) {
+  absl::call_once(flags_init, &AllocateFlags, nullptr);
+  if (enable_flydsl_gemm.has_value()) {
+    pjrt_plugin_enable_flydsl_gemm = enable_flydsl_gemm;
+  }
+  if (enable_flydsl_fusion.has_value()) {
+    pjrt_plugin_enable_flydsl_fusion = enable_flydsl_fusion;
+  }
+  if (autotune_num_repetitions.has_value()) {
+    pjrt_plugin_autotune_num_repetitions = autotune_num_repetitions;
+  }
+}
+
+void ApplyPjRtPluginFlyDslDebugOptionOverrides(
+    DebugOptions* debug_options) {
+  ApplyPjRtPluginFlyDslOverrides(debug_options);
 }
 
 DebugOptions GetDebugOptionsFromProtoAndFlags(
@@ -3590,6 +3649,7 @@ DebugOptions GetDebugOptionsFromProtoAndFlags(
     MakeDebugOptionsFlags(&flag_list, &debug_options);
     ParseFlagsFromEnvAndDieIfUnknown("XLA_FLAGS", flag_list,
                                      /*reset_envvar=*/true);
+    ApplyPjRtPluginFlyDslOverrides(&debug_options);
     return debug_options;
   }
 

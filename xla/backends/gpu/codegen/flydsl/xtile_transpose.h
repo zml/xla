@@ -16,21 +16,33 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_CODEGEN_FLYDSL_XTILE_TRANSPOSE_H_
 #define XLA_BACKENDS_GPU_CODEGEN_FLYDSL_XTILE_TRANSPOSE_H_
 
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <utility>
 
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
 namespace xla::gpu::flydsl {
 
-// Recognizes a rank-2 BF16 transpose whose dimensions are exact multiples of
-// the register/LDS tile. More general transpose fusions use XLA's transpose
-// emitter with their global-memory boundary lowered through Fly.
+// Returns the logical input matrix shape (rows, columns) for a native BF16
+// transpose. Besides a direct rank-2 transpose, this recognizes the batched
+// bitcast/transpose and bitcast/slice/transpose views used by transformer
+// attention. All matrix dimensions must be exact multiples of the LDS tile.
+std::optional<std::pair<int64_t, int64_t>> GetFlyXTileTransposeMatrixShape(
+    const HloFusionAnalysis& analysis);
+
 bool IsFlyXTileTransposeFusion(const HloFusionAnalysis& analysis);
 
-// Emits a 64x64 tile per 256-thread workgroup. Every thread transfers 32 bytes
-// in each direction. Adjacent BF16 input rows are packed into LDS dwords so the
-// transposed output is recovered with two 128-bit LDS reads per thread.
+// Returns whether the selected block-level config is compatible with the
+// native xTile emitter. Structural matching remains separate so the Fly
+// autotuner can replace an existing rank-preserving Triton/legacy config.
+bool IsFlyXTileTransposeConfigSupported(const HloFusionAnalysis& analysis);
+
+// Emits one square matrix tile per workgroup. Every thread transfers 32 bytes
+// in each direction. Adjacent BF16 input rows are packed into LDS dwords so
+// the transposed output is recovered with two 128-bit LDS reads per thread.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(
     const HloFusionAnalysis& analysis);
 

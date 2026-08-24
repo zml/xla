@@ -55,23 +55,22 @@ std::optional<int64_t> getConstantIntValue(mlir::Value v) {
   return std::nullopt;
 }
 
-// Returns true if `op` is a transcendental or special-function op that is
-// lowered to the VALU special-function unit on AMDGPU (v_exp_f32, v_log_f32,
-// v_sqrt_f32, v_rcp_f32, etc.).
+// Returns true if `op` is a transcendental operation that can provide enough
+// independent VALU work to hide a ds_bpermute reduction tree.
+//
+// A post-reduction sqrt, rsqrt, or divide is deliberately not included. It is
+// data-dependent on the reduction and therefore cannot overlap the shuffle
+// latency. This distinction matters for normalization kernels: keeping their
+// shuffles as ds_bpermute made the native Fly RMSNorm reduction materially
+// more expensive than the DPP sequence emitted by Triton.
 bool IsSpecialFunctionOp(mlir::Operation* op) {
   if (mlir::isa<mlir::math::ExpOp, mlir::math::Exp2Op, mlir::math::ExpM1Op,
                 mlir::math::LogOp, mlir::math::Log2Op, mlir::math::Log10Op,
                 mlir::math::Log1pOp, mlir::math::SinOp, mlir::math::CosOp,
                 mlir::math::TanOp, mlir::math::TanhOp, mlir::math::AtanOp,
-                mlir::math::Atan2Op, mlir::math::SqrtOp, mlir::math::RsqrtOp,
-                mlir::math::ErfOp, mlir::math::PowFOp, mlir::math::CbrtOp>(
-          op)) {
+                mlir::math::Atan2Op, mlir::math::ErfOp, mlir::math::PowFOp,
+                mlir::math::CbrtOp>(op)) {
     return true;
-  }
-  // arith.divf on floats lowers to v_rcp_f32 + v_mul_f32, also consuming the
-  // special-function VALU unit.
-  if (auto div = mlir::dyn_cast<mlir::arith::DivFOp>(op)) {
-    return mlir::isa<mlir::FloatType>(div.getType());
   }
   return false;
 }

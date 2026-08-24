@@ -60,6 +60,18 @@ bool HasTritonBlockLevelFusionConfig(const HloInstruction* fusion) {
                  .kind() == kTritonFusionKind;
 }
 
+bool HasFlyBlockLevelFusionConfig(const HloInstruction* fusion) {
+  return HloPredicateIsOp<HloOpcode::kFusion>(fusion) &&
+         fusion->has_backend_config() &&
+         fusion->backend_config<GpuBackendConfig>().ok() &&
+         fusion->backend_config<GpuBackendConfig>()
+             ->fusion_backend_config()
+             .has_block_level_fusion_config() &&
+         fusion->backend_config<GpuBackendConfig>()
+                 ->fusion_backend_config()
+                 .kind() == kFlyFusionKind;
+}
+
 class FusionBlockLevelRewriterTest : public HloHardwareIndependentTestBase {
  public:
   FusionBlockLevelRewriterTest() {
@@ -79,6 +91,138 @@ class FusionBlockLevelRewriterTest : public HloHardwareIndependentTestBase {
   }
   mlir::MLIRContext mlir_context_;
 };
+
+class FlyFusionBlockLevelRewriterTest
+    : public HloHardwareIndependentTestBase {
+ public:
+  FlyFusionBlockLevelRewriterTest() {
+    RegisterSymbolicExprStorage(&mlir_context_);
+  }
+
+ protected:
+  DebugOptions GetDebugOptionsForTest() const override {
+    DebugOptions debug_options =
+        HloHardwareIndependentTestBase::GetDebugOptionsForTest();
+    debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+    return debug_options;
+  }
+
+  se::DeviceDescription device_info_{TestGpuDeviceInfo::AMDMI210DeviceInfo()};
+  mlir::MLIRContext mlir_context_;
+};
+
+TEST_F(FlyFusionBlockLevelRewriterTest,
+       PreservesAutotunedTritonSoftmaxFusion) {
+  constexpr absl::string_view kHlo = R"(
+max_computation {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add_computation {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax_computation {
+  p0 = bf16[64,125]{1,0} parameter(0)
+  converted = f32[64,125]{1,0} convert(p0)
+  neg_inf = f32[] constant(-inf)
+  row_max = f32[64]{0} reduce(converted, neg_inf), dimensions={1}, to_apply=max_computation
+  row_max_broadcast = f32[64,125]{1,0} broadcast(row_max), dimensions={0}
+  shifted = f32[64,125]{1,0} subtract(converted, row_max_broadcast)
+  exponential = f32[64,125]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[64]{0} reduce(exponential, zero), dimensions={1}, to_apply=add_computation
+  row_sum_broadcast = f32[64,125]{1,0} broadcast(row_sum), dimensions={0}
+  normalized = f32[64,125]{1,0} divide(exponential, row_sum_broadcast)
+  ROOT result = bf16[64,125]{1,0} convert(normalized)
+}
+
+ENTRY entry {
+  p0 = bf16[64,125]{1,0} parameter(0)
+  ROOT fusion = bf16[64,125]{1,0} fusion(p0), kind=kCustom,
+    calls=softmax_computation,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":[1,125]}],"num_warps":2,"num_ctas":1,"num_stages":1}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_TRUE(device_info_.gpu_compute_capability().IsRocm());
+  ASSERT_TRUE(
+      module->config().debug_options().xla_gpu_enable_flydsl_fusion());
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(false));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kCustom);
+  EXPECT_TRUE(HasTritonBlockLevelFusionConfig(root));
+}
+
+TEST_F(FlyFusionBlockLevelRewriterTest, RewritesLateLoopFusionToFly) {
+  constexpr absl::string_view kHlo = R"(
+fusion_computation {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  ROOT add = bf16[128,64]{1,0} add(p0, p1)
+}
+
+ENTRY entry {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  ROOT fusion = bf16[128,64]{1,0} fusion(p0, p1), kind=kLoop,
+    calls=fusion_computation
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(true));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kCustom);
+  EXPECT_TRUE(HasFlyBlockLevelFusionConfig(root));
+}
+
+TEST_F(FlyFusionBlockLevelRewriterTest,
+       RewritesLateMultiOutputFusionWithoutTritonFlag) {
+  constexpr absl::string_view kHlo = R"(
+fusion_computation {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  sum = bf16[128,64]{1,0} add(p0, p1)
+  product = bf16[128,64]{1,0} multiply(sum, p0)
+  ROOT tuple = (bf16[128,64]{1,0}, bf16[128,64]{1,0})
+    tuple(sum, product)
+}
+
+ENTRY entry {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  ROOT fusion = (bf16[128,64]{1,0}, bf16[128,64]{1,0})
+    fusion(p0, p1), kind=kLoop, calls=fusion_computation
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_FALSE(module->config()
+                   .debug_options()
+                   .xla_gpu_unsupported_enable_triton_multi_output_fusion());
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(true));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kCustom);
+  EXPECT_TRUE(HasFlyBlockLevelFusionConfig(root));
+}
 
 TEST_F(FusionBlockLevelRewriterTest,
        DoesNotRewriteFusionThatIsAlreadyBlockLevel) {

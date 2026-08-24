@@ -183,3 +183,40 @@ module {
 
 // CHECK-LABEL: @shuffle_down_16_i32
 // CHECK: amdgpu.swizzle_bitmode %{{.*}} 31 0 16 : i32
+
+// -----
+
+// A data-dependent rsqrt after a reduction cannot hide shuffle latency. Keep
+// promoting the shuffle so normalization fusions use DPP.
+module {
+  func.func @shuffle_down_before_rsqrt(%arg0: f32) -> f32 {
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %shfl, %valid = gpu.shuffle down %arg0, %c1, %c64 : f32
+    %result = math.rsqrt %shfl : f32
+    return %result : f32
+  }
+}
+
+// CHECK-LABEL: @shuffle_down_before_rsqrt
+// CHECK: %[[DPP:.*]] = amdgpu.dpp %{{.*}} %{{.*}} row_shl(1 : i32) {bound_ctrl = true} : f32
+// CHECK: math.rsqrt %[[DPP]] : f32
+
+// -----
+
+// Independent exponential work can hide ds_bpermute latency and competes with
+// DPP for the VALU issue port, so retain the generic shuffle in this case.
+module {
+  func.func @shuffle_down_with_exp(%arg0: f32, %arg1: f32) -> f32 {
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %shfl, %valid = gpu.shuffle down %arg0, %c1, %c64 : f32
+    %exp = math.exp %arg1 : f32
+    %result = arith.addf %shfl, %exp : f32
+    return %result : f32
+  }
+}
+
+// CHECK-LABEL: @shuffle_down_with_exp
+// CHECK: gpu.shuffle down
+// CHECK-NOT: amdgpu.dpp

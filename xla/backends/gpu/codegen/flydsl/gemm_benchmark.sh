@@ -24,6 +24,7 @@ for mode in FLY_GEMM_BENCHMARK_SCALED FLY_GEMM_BENCHMARK_SCALED_FP8 \
             FLY_GEMM_BENCHMARK_FP8 \
             FLY_GEMM_BENCHMARK_BATCHED_FP8 \
             FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8 \
+            FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K \
             FLY_GEMM_BENCHMARK_INT4 \
             FLY_GEMM_BENCHMARK_SCALAR FLY_GEMM_BENCHMARK_VECTOR \
             FLY_GEMM_BENCHMARK_CHAIN FLY_GEMM_BENCHMARK_CONVERTED_INPUTS \
@@ -72,6 +73,9 @@ elif [[ "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ]]; then
 elif [[ "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/batched_scaled_fp8_gemm_benchmark.hlo.tpl"
   benchmark_name="fnuz_fp8_batched_scaled_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/global_split_k_gemm_benchmark.hlo.tpl"
+  benchmark_name="bf16_global_split_k_gemm"
 elif [[ "${FLY_GEMM_BENCHMARK_FP8:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/fp8_gemm_benchmark.hlo.tpl"
   benchmark_name="fnuz_fp8_gemm"
@@ -147,8 +151,13 @@ if [[ "$#" -eq 0 ]]; then
         "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
-        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
-    set -- 8x256x256x256 8x512x512x512 8x1024x1024x1024
+        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
+    if [[ "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
+      set -- 2x256x1024x512 4x256x1024x1024
+    else
+      set -- 8x256x256x256 8x512x512x512 8x1024x1024x1024
+    fi
   else
     set -- 256x256x256 512x512x512 1024x1024x1024
   fi
@@ -160,7 +169,8 @@ for shape in "$@"; do
         "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
-        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ]]; then
+        "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
     IFS=x read -r batch m n k extra <<<"${shape}"
     expected_shape="BxMxNxK"
   else

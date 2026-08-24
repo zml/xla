@@ -1,0 +1,20 @@
+HloModule fly_fusion_bf16_sigmoid_benchmark
+
+%fused_sigmoid (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %converted = f32[16384,8192]{1,0} convert(%p0)
+  %negated = f32[16384,8192]{1,0} negate(%converted)
+  %exponential = f32[16384,8192]{1,0} exponential(%negated)
+  %one = f32[] constant(1)
+  %one_broadcast = f32[16384,8192]{1,0} broadcast(%one), dimensions={}
+  %denominator = f32[16384,8192]{1,0} add(%exponential, %one_broadcast)
+  %sigmoid = f32[16384,8192]{1,0} divide(%one_broadcast, %denominator)
+  ROOT %result = bf16[16384,8192]{1,0} convert(%sigmoid)
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_sigmoid,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

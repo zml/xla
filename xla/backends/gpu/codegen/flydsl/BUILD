@@ -27,6 +27,46 @@ cc_library(
 )
 
 cc_library(
+    name = "xtile_elementwise",
+    srcs = ["xtile_elementwise.cc"],
+    hdrs = ["xtile_elementwise.h"],
+    visibility = [
+        "//xla/backends/gpu/autotuner:__pkg__",
+        "//xla/backends/gpu/codegen:__subpackages__",
+    ],
+    deps = [
+        ":compiler",
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
+        "//xla/codegen:ir_emission_utils",
+        "//xla/codegen/emitters:type_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@flydsl//:FlyDialect",
+        "@flydsl//:FlyROCDLDialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AMDGPUDialect",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:UBDialect",
+        "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+cc_library(
     name = "xtile_gemm",
     srcs = ["xtile_gemm.cc"],
     hdrs = ["xtile_gemm.h"],
@@ -66,6 +106,57 @@ cc_library(
 )
 
 cc_library(
+    name = "xtile_reduction",
+    srcs = ["xtile_reduction.cc"],
+    hdrs = ["xtile_reduction.h"],
+    visibility = [
+        "//xla/backends/gpu/autotuner:__pkg__",
+        "//xla/backends/gpu/codegen:__subpackages__",
+    ],
+    deps = [
+        ":compiler",
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
+        "//xla/codegen:ir_emission_utils",
+        "//xla/codegen/emitters:type_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@flydsl//:FlyDialect",
+        "@flydsl//:FlyROCDLDialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:UBDialect",
+        "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+cc_library(
+    name = "softmax_support",
+    srcs = ["softmax_support.cc"],
+    hdrs = ["softmax_support.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:hlo_fusion_analysis",
+    ],
+)
+
+cc_library(
     name = "xtile_softmax",
     srcs = ["xtile_softmax.cc"],
     hdrs = ["xtile_softmax.h"],
@@ -75,8 +166,8 @@ cc_library(
     ],
     deps = [
         ":compiler",
+        ":softmax_support",
         "//xla:status_macros",
-        "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
         "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
@@ -92,12 +183,15 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AMDGPUDialect",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:GPUDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:ROCDLDialect",
         "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:UBDialect",
     ],
 )
 
@@ -135,6 +229,20 @@ cc_library(
 )
 
 xla_cc_test(
+    name = "xtile_elementwise_test",
+    srcs = ["xtile_elementwise_test.cc"],
+    deps = [
+        ":xtile_elementwise",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_cc_test(
     name = "xtile_softmax_test",
     srcs = ["xtile_softmax_test.cc"],
     deps = [
@@ -145,6 +253,20 @@ xla_cc_test(
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/tests:xla_internal_test_main",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_cc_test(
+    name = "xtile_reduction_test",
+    srcs = ["xtile_reduction_test.cc"],
+    deps = [
+        ":xtile_reduction",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/tests:xla_internal_test_main",
         "@com_google_googletest//:gtest",
     ],
 )
@@ -199,9 +321,14 @@ xla_test(
     ],
     deps = [
         "//xla:error_spec",
+        "//xla:xla_proto_cc",
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
         "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:status_matchers",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
     ],
@@ -221,6 +348,7 @@ xla_test(
     ],
     deps = [
         "//xla:error_spec",
+        "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
         "//xla/tests:xla_internal_test_main",
@@ -249,6 +377,7 @@ sh_binary(
         "f32_output_gemm_benchmark.hlo.tpl",
         "f32_gemm_benchmark.hlo.tpl",
         "gemm_benchmark.hlo.tpl",
+        "global_split_k_gemm_benchmark.hlo.tpl",
         "int4_gemm_benchmark.hlo.tpl",
         "narrowing_gemm_benchmark.hlo.tpl",
         "relu_gemm_benchmark.hlo.tpl",
@@ -271,13 +400,25 @@ sh_binary(
     srcs = ["fusion_benchmark.sh"],
     data = [
         "fly_fusion_bf16_row_reduction_benchmark.hlo",
+        "fly_fusion_bf16_narrowing_row_reduction_benchmark.hlo",
+        "fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark.hlo",
+        "fly_fusion_bf16_squared_difference_reduction_benchmark.hlo",
         "fly_fusion_bf16_softmax_benchmark.hlo",
+        "fly_fusion_bf16_transformer_softmax_benchmark.hlo",
         "fly_fusion_bf16_softmax_tail_benchmark.hlo",
         "fly_fusion_bf16_transpose_1024_benchmark.hlo",
         "fly_fusion_bf16_transpose_4096_benchmark.hlo",
         "fly_fusion_bf16_transpose_4096x16384_benchmark.hlo",
         "fly_fusion_bf16_transpose_benchmark.hlo",
+        "fly_fusion_bf16_transformer_context_transpose_benchmark.hlo",
+        "fly_fusion_bf16_transformer_qkv_multi_output_transpose_benchmark.hlo",
+        "fly_fusion_bf16_transformer_qkv_transpose_benchmark.hlo",
         "fly_fusion_elementwise_hbm_benchmark.hlo",
+        "fly_fusion_f16_elementwise_hbm_benchmark.hlo",
+        "fly_fusion_f32_elementwise_hbm_benchmark.hlo",
+        "fly_fusion_ragged_elementwise_hbm_benchmark.hlo",
+        "fly_fusion_multi_output_elementwise_hbm_benchmark.hlo",
+        "fly_fusion_bf16_sigmoid_benchmark.hlo",
         "fly_fusion_f16_softmax_tail_benchmark.hlo",
         "fly_fusion_f32_softmax_tail_benchmark.hlo",
         "fly_fusion_row_reduction_benchmark.hlo",

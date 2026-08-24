@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/transforms/priority_fusion.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -109,7 +110,7 @@ bool IsFusible(const HloInstruction& instr) {
   // Other non-elementwise ops also supported by elemental fusion.
   switch (instr.opcode()) {
     case HloOpcode::kFusion:
-      return IsGenericTritonFusion(instr) ||
+      return IsGenericTritonFusion(instr) || IsGenericFlyFusion(instr) ||
              instr.fusion_kind() != HloInstruction::FusionKind::kCustom;
     case HloOpcode::kCopy:
     case HloOpcode::kIota:
@@ -133,13 +134,13 @@ bool IsFusible(const HloInstruction& instr) {
   }
 }
 
-// Returns a GpuBackendConfig proto for a Triton fusion with the given
-// BlockLevelParameters.
-GpuBackendConfig GetTritonGpuBackendConfig(
-    const BlockLevelParameters& block_level_parameters) {
+// Returns a GpuBackendConfig proto for a block-level fusion with the given
+// parameters and backend kind.
+GpuBackendConfig GetBlockLevelGpuBackendConfig(
+    const BlockLevelParameters& block_level_parameters,
+    absl::string_view fusion_kind) {
   GpuBackendConfig gpu_backend_config;
-  gpu_backend_config.mutable_fusion_backend_config()->set_kind(
-      kTritonFusionKind);
+  gpu_backend_config.mutable_fusion_backend_config()->set_kind(fusion_kind);
   *gpu_backend_config.mutable_fusion_backend_config()
        ->mutable_block_level_fusion_config() =
       block_level_parameters.ToBlockLevelFusionConfig();
@@ -548,7 +549,7 @@ class PriorityFusionQueue {
   }
 
   // Returns a map from consumer to BlockLevelParameters. This is used to
-  // determine if a producer-consumer fusion is a Triton fusion.
+  // determine if a producer-consumer fusion is a block-level fusion.
   absl::flat_hash_map<const HloInstruction*, BlockLevelParameters>
   GetCurrentBlockLevelParametersMap(bool use_multi_output_fusion) {
     absl::flat_hash_map<const HloInstruction*, BlockLevelParameters> result;
@@ -572,6 +573,26 @@ class PriorityFusionQueue {
     }
 
     return result;
+  }
+
+  bool ShouldUseFlyBlockLevelBackend(
+      const HloInstruction* producer, const HloInstruction* consumer,
+      bool use_multi_output_fusion) const {
+    const bool has_fly_fusion =
+        IsGenericFlyFusion(*producer) || IsGenericFlyFusion(*consumer);
+    if (has_fly_fusion) {
+      return true;
+    }
+    if (IsGenericTritonFusion(*producer) ||
+        IsGenericTritonFusion(*consumer)) {
+      return false;
+    }
+    return use_multi_output_fusion &&
+           device_info_->gpu_compute_capability().IsRocm() &&
+           producer->GetModule()
+               ->config()
+               .debug_options()
+               .xla_gpu_enable_flydsl_fusion();
   }
 
   HloInstruction* current_producer() { return current_producer_; }
@@ -604,11 +625,11 @@ class PriorityFusionQueue {
     if (auto fusion_decision = CanFuseWithAllNonBitcastUsers(producer);
         !fusion_decision) {
       // If we cannot fuse `producer` into all non-bitcast consumers, try
-      // Triton multi-output fusion next.
+      // block-level multi-output fusion next.
       std::vector<HloInstruction*> possible_consumers =
-          FindPossibleConsumersForTritonMultiOutputFusion(producer);
-      if (CanFuseTritonMultiOutputWithSingleUser(producer,
-                                                 possible_consumers)) {
+          FindPossibleConsumersForBlockLevelMultiOutputFusion(producer);
+      if (CanFuseBlockLevelMultiOutputWithSingleUser(producer,
+                                                     possible_consumers)) {
         ASSIGN_OR_RETURN(CombinedGpuPerformanceModel::RunTimes run_times,
                          combined_gpu_performance_model_.EstimateRunTimes(
                              producer, cost_analysis_.get(),
@@ -675,7 +696,7 @@ class PriorityFusionQueue {
   }
 
   FusionDecision IsTritonSupported(const HloInstruction& instruction) {
-    if (IsGenericTritonFusion(instruction)) {
+    if (IsGenericTritonFusion(instruction) || IsGenericFlyFusion(instruction)) {
       return FusionDecision::Allow();
     }
 
@@ -696,9 +717,32 @@ class PriorityFusionQueue {
     return FusionDecision::Allow();
   }
 
+  FusionDecision IsFlySupported(const HloInstruction* producer,
+                                const HloInstruction* consumer,
+                                bool use_multi_output_fusion) {
+    FusionBackendConfig backend_config;
+    HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+        std::move(backend_config),
+        HloFusionAdaptor::ForProducerConsumer(
+            producer, consumer, use_multi_output_fusion),
+        device_info_);
+    switch (analysis.emitter_fusion_kind()) {
+      case HloFusionAnalysis::EmitterFusionKind::kLoop:
+      case HloFusionAnalysis::EmitterFusionKind::kReduction:
+      case HloFusionAnalysis::EmitterFusionKind::kTranspose:
+        return FusionDecision::Allow();
+      default:
+        return FusionDecision::Forbid(absl::StrCat(
+            "Fly does not support the underlying ",
+            static_cast<int>(analysis.emitter_fusion_kind()),
+            " fusion emitter kind"));
+    }
+  }
+
   TiledRunTimeDataOrError GetTiledRunTimeDataCached(
       const HloInstruction* producer, const HloInstruction* consumer,
-      bool use_multi_output_fusion = false) {
+      bool use_multi_output_fusion = false,
+      bool use_default_fly_config = false) {
     FusionDeduplicationCache::FusionId fusion_id = [&]() {
       absl::MutexLock lock(fusion_deduplication_cache_mutex_);
       return fusion_deduplication_cache_.GetFusionId(producer, consumer,
@@ -740,14 +784,40 @@ class PriorityFusionQueue {
                        fusion_decision->Explain()));
     }
 
+    // XLA's symbolic tiler does not support every multiple-root graph that
+    // Fly's native elementwise emitter supports. Use a conservative formation
+    // config in that case and let the generic XLA autotuner measure Fly's full
+    // candidate space later. A zero estimate deliberately leaves the combined
+    // performance model free to use its backend-neutral estimate.
+    if (use_default_fly_config &&
+        std::holds_alternative<FusionDecision>(
+            tiled_run_time_data_or_error)) {
+      FusionBackendConfig backend_config;
+      HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+          std::move(backend_config),
+          HloFusionAdaptor::ForProducerConsumer(
+              producer, consumer, use_multi_output_fusion),
+          device_info_);
+      const int64_t elements =
+          ShapeUtil::ElementsIn(analysis.first_result_shape());
+      BlockLevelParameters parameters;
+      parameters.output_tile_sizes = {
+          {std::max<int64_t>(1, std::min<int64_t>(4, elements))}};
+      parameters.num_warps = 4;
+      parameters.num_ctas = 1;
+      parameters.num_stages = 1;
+      tiled_run_time_data_or_error = TiledRunTimeData{
+          EstimateRunTimeData::Zero(), std::move(parameters)};
+    }
+
     absl::MutexLock lock(tiled_run_time_data_cache_mutex_);
     tiled_run_time_data_cache_.emplace(fusion_id, tiled_run_time_data_or_error);
     return tiled_run_time_data_or_error;
   }
 
-  FusionDecision CanFuseTriton(HloInstruction* producer,
-                               HloInstruction* consumer,
-                               bool use_multi_output_fusion = false) {
+  FusionDecision CanFuseBlockLevel(HloInstruction* producer,
+                                   HloInstruction* consumer,
+                                   bool use_multi_output_fusion = false) {
     if (!IsFusible(*producer)) {
       return FusionDecision::Forbid("the producer is not fusible");
     }
@@ -756,18 +826,40 @@ class PriorityFusionQueue {
       return FusionDecision::Forbid("the consumer is not fusible");
     }
 
-    if (!(IsGenericTritonFusion(*producer) ||
-          IsGenericTritonFusion(*consumer) ||
-          triton_heroless_fusion_enabled_)) {
-      return FusionDecision::Forbid("triton heroless fusion is not enabled");
+    const bool producer_is_block_fusion =
+        IsGenericTritonFusion(*producer) || IsGenericFlyFusion(*producer);
+    const bool consumer_is_block_fusion =
+        IsGenericTritonFusion(*consumer) || IsGenericFlyFusion(*consumer);
+    const bool use_fly_backend = ShouldUseFlyBlockLevelBackend(
+        producer, consumer, use_multi_output_fusion);
+    if (!(producer_is_block_fusion || consumer_is_block_fusion ||
+          triton_heroless_fusion_enabled_ ||
+          (use_fly_backend && use_multi_output_fusion))) {
+      return FusionDecision::Forbid("block-level fusion is not enabled");
     }
 
-    if (auto fusion_decision = IsTritonSupported(*producer); !fusion_decision) {
-      return fusion_decision;
+    if ((IsGenericFlyFusion(*producer) && IsGenericTritonFusion(*consumer)) ||
+        (IsGenericTritonFusion(*producer) && IsGenericFlyFusion(*consumer))) {
+      return FusionDecision::Forbid(
+          "cannot merge Fly and Triton block-level fusions");
     }
 
-    if (auto fusion_decision = IsTritonSupported(*consumer); !fusion_decision) {
-      return fusion_decision;
+    if (use_fly_backend) {
+      if (auto fusion_decision =
+              IsFlySupported(producer, consumer, use_multi_output_fusion);
+          !fusion_decision) {
+        return fusion_decision;
+      }
+    } else {
+      if (auto fusion_decision = IsTritonSupported(*producer);
+          !fusion_decision) {
+        return fusion_decision;
+      }
+
+      if (auto fusion_decision = IsTritonSupported(*consumer);
+          !fusion_decision) {
+        return fusion_decision;
+      }
     }
 
     // Avoid cases where we'd create a fusion that hit limitations in ptxas
@@ -780,7 +872,10 @@ class PriorityFusionQueue {
     }
 
     TiledRunTimeDataOrError tiled_run_time_data_or_error =
-        GetTiledRunTimeDataCached(producer, consumer, use_multi_output_fusion);
+        GetTiledRunTimeDataCached(
+            producer, consumer, use_multi_output_fusion,
+            /*use_default_fly_config=*/
+            use_fly_backend && use_multi_output_fusion);
 
     if (const auto* fusion_decision =
             std::get_if<FusionDecision>(&tiled_run_time_data_or_error)) {
@@ -798,8 +893,10 @@ class PriorityFusionQueue {
     // `block_level_parameters_cache_` down below. Currently we only try out
     // multi-output fusion if we cannot fuse into all consumers, and it is tried
     // last, so the final cached value should be what we want.
-    combined_gpu_performance_model_.GetCache().Set(
-        *producer, *consumer, tiled_run_time_data.runtime_data.exec_time);
+    if (tiled_run_time_data.runtime_data.exec_time != absl::ZeroDuration()) {
+      combined_gpu_performance_model_.GetCache().Set(
+          *producer, *consumer, tiled_run_time_data.runtime_data.exec_time);
+    }
 
     return FusionDecision::Allow();
   }
@@ -822,17 +919,18 @@ class PriorityFusionQueue {
       return FusionDecision::Forbid("the consumer is not fusible");
     }
 
-    // Fusing with Triton is our preferred choice. If the producer-consumer
-    // fusion is supported by Triton and all necessary flags are enabled, the
-    // result will be a Triton fusion. If either `producer` or `consumer` is
-    // already a Triton fusion, we can fuse only if the result will also be a
-    // Triton fusion.
+    // Fusing with the block-level backend is our preferred choice. If either
+    // side is already a Triton or Fly fusion, the merged result must remain on
+    // the same backend. Fresh block-level multi-output fusions use Fly on ROCm
+    // when the Fly fusion backend is enabled.
     //
     // Otherwise, we'll check if the fusion is supported by the emitter.
-    FusionDecision can_fuse_triton = CanFuseTriton(producer, consumer);
+    FusionDecision can_fuse_block_level =
+        CanFuseBlockLevel(producer, consumer);
     if (IsGenericTritonFusion(*producer) || IsGenericTritonFusion(*consumer) ||
-        can_fuse_triton) {
-      return can_fuse_triton;
+        IsGenericFlyFusion(*producer) || IsGenericFlyFusion(*consumer) ||
+        can_fuse_block_level) {
+      return can_fuse_block_level;
     }
 
     if (dump_fusion_visualization_) {
@@ -840,8 +938,8 @@ class PriorityFusionQueue {
           *computation_,
           absl::StrCat("Cannot fuse producer |", producer->name(),
                        "| with consumer |", consumer->name(),
-                       "| using Triton (will try fallback): ",
-                       can_fuse_triton.Explain()),
+                       "| using a block-level backend (will try fallback): ",
+                       can_fuse_block_level.Explain()),
           *consumer, producer);
     }
 
@@ -962,14 +1060,18 @@ class PriorityFusionQueue {
     return false;
   }
 
-  std::vector<HloInstruction*> FindPossibleConsumersForTritonMultiOutputFusion(
+  std::vector<HloInstruction*>
+  FindPossibleConsumersForBlockLevelMultiOutputFusion(
       HloInstruction* producer) {
-    bool triton_multi_output_fusion_enabled =
-        producer->GetModule()
-            ->config()
-            .debug_options()
-            .xla_gpu_unsupported_enable_triton_multi_output_fusion();
-    if (!triton_multi_output_fusion_enabled) {
+    const DebugOptions& debug_options =
+        producer->GetModule()->config().debug_options();
+    const bool triton_multi_output_fusion_enabled =
+        debug_options.xla_gpu_unsupported_enable_triton_multi_output_fusion();
+    const bool fly_multi_output_fusion_enabled =
+        device_info_->gpu_compute_capability().IsRocm() &&
+        debug_options.xla_gpu_enable_flydsl_fusion();
+    if (!triton_multi_output_fusion_enabled &&
+        !fly_multi_output_fusion_enabled) {
       return {};
     }
     // Don't fuse across a root instruction. There are situations when a root
@@ -984,15 +1086,20 @@ class PriorityFusionQueue {
       if (IsFusibleBitcast(*user)) {
         continue;
       }
-      if (CanFuseTriton(producer, user, /*use_multi_output_fusion=*/true) &&
-          !OperandReachableFromProducer(producer, user)) {
+      FusionDecision can_fuse = CanFuseBlockLevel(
+          producer, user, /*use_multi_output_fusion=*/true);
+      if (can_fuse && !OperandReachableFromProducer(producer, user)) {
         possible_consumers.push_back(user);
+      } else {
+        VLOG(10) << "Cannot form block-level multi-output fusion of "
+                 << producer->name() << " with " << user->name()
+                 << ": " << can_fuse.Explain();
       }
     }
     return possible_consumers;
   }
 
-  FusionDecision CanFuseTritonMultiOutputWithSingleUser(
+  FusionDecision CanFuseBlockLevelMultiOutputWithSingleUser(
       HloInstruction* producer,
       const std::vector<HloInstruction*>& possible_consumers) {
     if (possible_consumers.empty()) {
@@ -1119,7 +1226,7 @@ class PriorityFusionQueue {
   // HloInstruction.
   std::unique_ptr<HloDfsReachability> reachability_;
 
-  // If true, redirect all fusion decisions to Triton fusion.
+  // If true, redirect otherwise backend-neutral fusion decisions to Triton.
   bool triton_heroless_fusion_enabled_;
 
   const AliasInfo* alias_info_;
@@ -1158,8 +1265,14 @@ FusionDecision PriorityFusion::CanFuseConstant(const HloInstruction* constant,
     return fusion_decision;
   }
 
-  // If user is a Triton fusion, verify that the constant is supported
-  // by Triton.
+  // Fly's XLA-emitter fallback supports effective scalar constants directly.
+  // Do not route Fly legality through Triton's supported-operation table.
+  if (IsGenericFlyFusion(*user)) {
+    return FusionDecision::Allow();
+  }
+
+  // If user is a Triton fusion, verify that the constant is supported by
+  // Triton.
   //
   // Note: `IsFusible` should not be used for Triton fusions. Generally,
   // `IsFusible` returns `false` for Triton fusions, because Triton fusions have
@@ -1253,6 +1366,9 @@ absl::StatusOr<bool> PriorityFusion::RunImpl(
                 << producer->name() << "(" << producer << ")";
 
         int64_t consumer_operand_index = consumer->operand_index(producer);
+        const bool use_fly_backend =
+            fusion_queue->ShouldUseFlyBlockLevelBackend(
+                producer, consumer, use_multi_output_fusion);
 
         fusion_queue->PreFusion(producer, consumer);
         int64_t consumer_pre_fusion_id = consumer->unique_id();
@@ -1262,7 +1378,9 @@ absl::StatusOr<bool> PriorityFusion::RunImpl(
         auto backend_config_it = block_level_parameters_map.find(consumer);
         if (backend_config_it != block_level_parameters_map.end()) {
           RETURN_IF_ERROR(fusion_instruction->set_backend_config(
-              GetTritonGpuBackendConfig(backend_config_it->second)));
+              GetBlockLevelGpuBackendConfig(
+                  backend_config_it->second,
+                  use_fly_backend ? kFlyFusionKind : kTritonFusionKind)));
           fusion_instruction->set_fusion_kind(
               HloInstruction::FusionKind::kCustom);
         }

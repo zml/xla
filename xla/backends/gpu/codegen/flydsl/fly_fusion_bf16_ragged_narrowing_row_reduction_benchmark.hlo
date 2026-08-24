@@ -1,0 +1,23 @@
+HloModule fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%fused_reduction (p0: bf16[131072,4093]) -> bf16[131072] {
+  %p0 = bf16[131072,4093]{1,0} parameter(0)
+  %converted = f32[131072,4093]{1,0} convert(%p0)
+  %zero = f32[] constant(0)
+  %row_sum = f32[131072]{0} reduce(%converted, %zero), dimensions={1},
+    to_apply=%add
+  ROOT %result = bf16[131072]{0} convert(%row_sum)
+}
+
+ENTRY %entry_computation (p0: bf16[131072,4093]) -> bf16[131072] {
+  %p0 = bf16[131072,4093]{1,0} parameter(0)
+  ROOT %fusion = bf16[131072]{0} fusion(%p0), kind=kCustom,
+    calls=%fused_reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["8"]}],"num_warps":"8","num_ctas":1,"num_stages":1}}}
+}

@@ -23,6 +23,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/container/flat_hash_set.h"
 #include "google/protobuf/descriptor.h"
+#include "xla/backends/autotuner/backends.pb.h"
 #include "xla/parse_flags_from_env.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/xla.pb.h"
@@ -31,6 +32,7 @@ limitations under the License.
 
 using ::testing::ElementsAre;
 using ::testing::IsEmpty;
+using ::testing::UnorderedElementsAre;
 
 namespace xla {
 namespace {
@@ -193,6 +195,33 @@ TEST(DebugOptions, EnableNcclSymmetricBuffersForCollectives) {
     EXPECT_FALSE(filter.has_max_size_bytes());
     EXPECT_FALSE(filter.has_op_type());
   }
+}
+
+TEST(DebugOptions, PjRtPluginFlyDslOverridesRestoreNewBackends) {
+  ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/true,
+                                    /*enable_flydsl_fusion=*/true,
+                                    /*autotune_num_repetitions=*/5);
+
+  DebugOptions options;
+  options.add_xla_gpu_experimental_autotune_backends(
+      autotuner::Backend::TRITON);
+  ApplyPjRtPluginFlyDslDebugOptionOverrides(&options);
+  // Applying the override more than once must not duplicate backends.
+  ApplyPjRtPluginFlyDslDebugOptionOverrides(&options);
+
+  EXPECT_TRUE(options.xla_gpu_enable_flydsl_gemm());
+  EXPECT_TRUE(options.xla_gpu_enable_flydsl_fusion());
+  EXPECT_EQ(options.xla_gpu_autotune_num_repetitions(), 5);
+  EXPECT_THAT(options.xla_gpu_experimental_autotune_backends(),
+              UnorderedElementsAre(autotuner::Backend::TRITON,
+                                   autotuner::Backend::FLY,
+                                   autotuner::Backend::FLY_FISSION,
+                                   autotuner::Backend::FLY_FUSION));
+
+  // Do not leak enabled process-wide options into another test in this binary.
+  ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/false,
+                                    /*enable_flydsl_fusion=*/false,
+                                    /*autotune_num_repetitions=*/1);
 }
 
 }  // namespace

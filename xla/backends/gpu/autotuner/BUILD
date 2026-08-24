@@ -356,6 +356,8 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/codegen/flydsl:xtile_elementwise",
+        "//xla/backends/gpu/codegen/flydsl:xtile_reduction",
         "//xla/backends/gpu/codegen/flydsl:xtile_softmax",
         "//xla/backends/gpu/codegen/flydsl:xtile_transpose",
         "//xla/hlo/ir:hlo",

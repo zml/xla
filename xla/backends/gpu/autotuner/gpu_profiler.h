@@ -81,6 +81,7 @@ class GpuProfiler : public Profiler {
   std::unique_ptr<se::DeviceAddressAllocator> owned_allocator_;
   se::Stream* stream_;
   ProfileOptions options_;
+  bool initial_device_warmup_done_ = false;
 };
 
 }  // namespace gpu

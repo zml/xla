@@ -92,6 +92,8 @@ absl::StatusOr<std::optional<BlockLevelFusionConfig>> GetPreExistingConfig(
   ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
                    instr.backend_config<GpuBackendConfig>());
   if (gpu_backend_config.has_fusion_backend_config() &&
+      gpu_backend_config.fusion_backend_config().kind() ==
+          kTritonFusionKind &&
       gpu_backend_config.fusion_backend_config()
           .has_block_level_fusion_config()) {
     return gpu_backend_config.fusion_backend_config()

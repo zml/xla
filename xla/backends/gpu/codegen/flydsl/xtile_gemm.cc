@@ -681,8 +681,24 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     n_ = dot->shape().dimensions(rank_three ? 2 : 1);
     k_ = dot->operand(0)->shape().dimensions(
         dot->dot_dimension_numbers().lhs_contracting_dimensions(0));
+    lhs_contracting_dimension_ =
+        dot->dot_dimension_numbers().lhs_contracting_dimensions(0);
     rhs_contracting_dimension_ =
         dot->dot_dimension_numbers().rhs_contracting_dimensions(0);
+    if (global_split_k_) {
+      lhs_batch_dimension_ = dot_dims.lhs_batch_dimensions(0);
+      rhs_batch_dimension_ = dot_dims.rhs_batch_dimensions(0);
+      for (int64_t dimension = 0; dimension < 3; ++dimension) {
+        if (dimension != lhs_batch_dimension_ &&
+            dimension != lhs_contracting_dimension_) {
+          lhs_noncontracting_dimension_ = dimension;
+        }
+        if (dimension != rhs_batch_dimension_ &&
+            dimension != rhs_contracting_dimension_) {
+          rhs_noncontracting_dimension_ = dimension;
+        }
+      }
+    }
     CHECK(lhs_parameter_numbers_.size() == 1 ||
           lhs_input.concat_dimension == 0);
     CHECK(rhs_parameter_numbers_.size() == 1 ||
@@ -876,7 +892,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         m = Rem(builder, m, lhs_concat_fragment_size_);
       }
       if (global_split_k_) {
-        indices.assign({m, batch_id, k});
+        indices.resize(3);
+        indices[lhs_noncontracting_dimension_] = m;
+        indices[lhs_batch_dimension_] = batch_id;
+        indices[lhs_contracting_dimension_] = k;
       } else if (batched_gemm_) {
         indices.assign({batch_id, m, k});
       } else {
@@ -891,7 +910,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         n = Rem(builder, n, rhs_concat_fragment_size_);
       }
       if (global_split_k_) {
-        indices.assign({n, batch_id, k});
+        indices.resize(3);
+        indices[rhs_noncontracting_dimension_] = n;
+        indices[rhs_batch_dimension_] = batch_id;
+        indices[rhs_contracting_dimension_] = k;
       } else if (batched_gemm_) {
         if (rhs_contracting_dimension_ == 1) {
           indices.assign({batch_id, k, n});
@@ -8374,7 +8396,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<EpilogueStep> epilogue_steps_;
   int64_t split_k_batches_ = 1;
   int64_t batch_count_ = 1;
+  int64_t lhs_batch_dimension_ = 0;
+  int64_t rhs_batch_dimension_ = 0;
+  int64_t lhs_contracting_dimension_ = 0;
   int64_t rhs_contracting_dimension_ = 0;
+  int64_t lhs_noncontracting_dimension_ = 0;
+  int64_t rhs_noncontracting_dimension_ = 0;
   bool rhs_k_contiguous_ = false;
   LaunchDimensions launch_dimensions_;
 };

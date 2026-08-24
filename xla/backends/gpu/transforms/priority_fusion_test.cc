@@ -1005,6 +1005,158 @@ ENTRY main {
             2);
 }
 
+TEST_F(PriorityFusionTest, CanMergeFlyFusionWithBothProducerAndConsumer) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_priority_fusion
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+producer_computation {
+  p0 = f32[125]{0} parameter(0)
+  ROOT broadcast = f32[125,127]{1,0} broadcast(p0), dimensions={0}
+}
+
+fly_computation {
+  p0 = f32[125,127]{1,0} parameter(0)
+  squared = f32[125,127]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[125]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  broadcast = f32[125,127]{1,0} broadcast(row_sum), dimensions={0}
+  ROOT scaled = f32[125,127]{1,0} multiply(squared, broadcast)
+}
+
+consumer_computation {
+  p0 = f32[125,127]{1,0} parameter(0)
+  p1 = f32[125,127]{1,0} parameter(1)
+  ROOT multiply = f32[125,127]{1,0} multiply(p1, p0)
+}
+
+ENTRY main {
+  p0 = f32[125]{0} parameter(0)
+  p1 = f32[125,127]{1,0} parameter(1)
+  producer = f32[125,127]{1,0} fusion(p0), kind=kLoop,
+    calls=producer_computation
+  fly = f32[125,127]{1,0} fusion(producer), kind=kCustom,
+    calls=fly_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","127"]}],"num_warps":"1"}}}
+  ROOT consumer = f32[125,127]{1,0} fusion(p1, fly), kind=kLoop,
+    calls=consumer_computation
+})";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_TRUE(priority_fusion_.Run(module.get()).value());
+  EXPECT_TRUE(verifier().Run(module.get()).status().ok());
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_THAT(root, GmockMatch(m::Fusion(m::Parameter(), m::Parameter())));
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kCustom);
+  EXPECT_TRUE(IsGenericFlyFusion(*root));
+  EXPECT_TRUE(root->backend_config<GpuBackendConfig>()
+                  ->fusion_backend_config()
+                  .has_block_level_fusion_config());
+}
+
+TEST_F(PriorityFusionTest, FlyFusionLegalityDoesNotDependOnTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_priority_fusion_f8
+
+producer_computation {
+  p0 = f8e4m3fn[128]{0} parameter(0)
+  p1 = f8e4m3fn[128]{0} parameter(1)
+  ROOT sum = f8e4m3fn[128]{0} add(p0, p1)
+}
+
+fly_computation {
+  p0 = f8e4m3fn[128]{0} parameter(0)
+  ROOT result = f8e4m3fn[128]{0} negate(p0)
+}
+
+ENTRY main {
+  p0 = f8e4m3fn[128]{0} parameter(0)
+  p1 = f8e4m3fn[128]{0} parameter(1)
+  producer = f8e4m3fn[128]{0} fusion(p0, p1), kind=kLoop,
+    calls=producer_computation
+  ROOT fly = f8e4m3fn[128]{0} fusion(producer), kind=kCustom,
+    calls=fly_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["4"]}],"num_warps":"1"}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_THAT(priority_fusion_.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), absl_testing::IsOk());
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_TRUE(IsGenericFlyFusion(*root));
+  EXPECT_EQ(root->operand_count(), 2);
+  EXPECT_EQ(root->operand(0)->opcode(), HloOpcode::kParameter);
+  bool contains_add = false;
+  for (const HloInstruction* instruction :
+       root->fused_instructions_computation()->instructions()) {
+    contains_add |= instruction->opcode() == HloOpcode::kAdd;
+  }
+  EXPECT_TRUE(contains_add);
+}
+
+TEST_F(PriorityFusionTest,
+       FormsFlyMultiOutputWithoutTritonMultiOutputFlag) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_priority_multi_output
+
+producer_computation {
+  p0 = f32[125]{0} parameter(0)
+  ROOT broadcast = f32[125,127]{1,0} broadcast(p0), dimensions={0}
+}
+
+consumer_computation {
+  p0 = f32[125,127]{1,0} parameter(0)
+  ROOT logarithm = f32[125,127]{1,0} log(p0)
+}
+
+ENTRY main {
+  p0 = f32[125]{0} parameter(0)
+  producer = f32[125,127]{1,0} fusion(p0), kind=kLoop,
+    calls=producer_computation
+  consumer = f32[125,127]{1,0} fusion(producer), kind=kLoop,
+    calls=consumer_computation
+  ROOT tuple = (f32[125,127]{1,0}, f32[125,127]{1,0})
+    tuple(consumer, producer)
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_enable_flydsl_fusion(true);
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
+
+  se::DeviceDescription rocm_device =
+      TestGpuDeviceInfo::AMDMI210DeviceInfo();
+  ASSERT_TRUE(rocm_device.gpu_compute_capability().IsRocm());
+  GpuHloCostAnalysis::Options options;
+  options.count_multiple_input_accesses = true;
+  PriorityFusion fly_priority_fusion(/*thread_pool=*/nullptr, rocm_device,
+                                     &alias_info_, options, &mlir_context_);
+  EXPECT_THAT(fly_priority_fusion.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), absl_testing::IsOk());
+
+  HloInstruction* fusion0 = nullptr;
+  HloInstruction* fusion1 = nullptr;
+  EXPECT_THAT(
+      module->entry_computation()->root_instruction(),
+      GmockMatch(m::Tuple(m::GetTupleElement(m::Fusion(&fusion0), 0),
+                          m::GetTupleElement(m::Fusion(&fusion1), 1))));
+  ASSERT_NE(fusion0, nullptr);
+  EXPECT_EQ(fusion0, fusion1);
+  EXPECT_TRUE(IsGenericFlyFusion(*fusion0));
+}
+
 TEST_F(PriorityFusionTest, FuseTritonProducerWithTwoConsumers) {
   const std::string kHloText = R"(
 HloModule t

@@ -19,14 +19,10 @@ limitations under the License.
 #include <memory>
 
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
+#include "xla/backends/gpu/codegen/flydsl/softmax_support.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
 namespace xla::gpu::flydsl {
-
-// Recognizes the canonical rank-2 F16, BF16, or F32 softmax produced by XLA:
-// optional conversion to FP32, row maximum, exp, row sum, normalize, and an
-// optional conversion back to the interface type.
-bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis);
 
 // Emits one workgroup per row. Values remain in registers across the maximum
 // and sum reductions, avoiding the quadratic recomputation of a loop fusion.

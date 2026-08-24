@@ -29,7 +29,9 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
 #if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_gemm.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
 #endif
@@ -85,9 +87,17 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       return std::make_unique<MlirKernelFusion>(
           flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
     }
-    if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
+    if (flydsl::IsFlyXTileTransposeConfigSupported(analysis)) {
       return std::make_unique<MlirKernelFusion>(
           flydsl::CreateFlyXTileTransposeEmitter(analysis));
+    }
+    if (flydsl::IsFlyXTileElementwiseFusion(analysis)) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileElementwiseEmitter(analysis));
+    }
+    if (flydsl::IsFlyXTileRowReductionFusion(analysis)) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileRowReductionEmitter(analysis));
     }
     for (const HloInstructionAdaptor& hero : analysis.fusion_heroes()) {
       if (GetDescriptionForTiledTransposeEmitter(hero.instruction())
