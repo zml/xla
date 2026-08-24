@@ -2993,6 +2993,7 @@ cc_library(
     deps = [
         ":fused_scaled_dot_rewriter",
         "//xla:shape_util",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_query",

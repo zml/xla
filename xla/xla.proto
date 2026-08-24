@@ -1763,6 +1763,8 @@ message DebugOptions {
 
   optional bool xla_gpu_experimental_scaled_dot_with_tile_ir = 900;
 
+  optional bool xla_gpu_experimental_emit_fp8_block_gemv = 901;
+
   // If true, use MultiGpuBarrierWithNcclKernel in one-shot RaggedAllToAll
   // thunk.
   optional bool xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl =
