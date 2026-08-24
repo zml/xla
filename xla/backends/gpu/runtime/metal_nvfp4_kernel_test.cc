@@ -127,7 +127,7 @@ class MetalNvfp4KernelTest : public ::testing::Test {
   }
 
   void RunDenseCase(int32_t m, int32_t k, int32_t n,
-                    const std::string& kernel_name) {
+                    const std::string& kernel_name, int32_t bm = kNvfp4QmmBM) {
     ASSERT_EQ(k % kNvfp4GroupSize, 0);
 
     std::vector<uint16_t> x(static_cast<size_t>(m) * k, Bfloat16Bits(1.0f));
@@ -169,8 +169,7 @@ class MetalNvfp4KernelTest : public ::testing::Test {
     TF_ASSERT_OK(kernel->Launch(
         se::ThreadDim(32, 2, 2),
         se::BlockDim(static_cast<uint64_t>((n + kNvfp4QmmBN - 1) / kNvfp4QmmBN),
-                     static_cast<uint64_t>((m + kNvfp4QmmBM - 1) / kNvfp4QmmBM),
-                     1),
+                     static_cast<uint64_t>((m + bm - 1) / bm), 1),
         stream.get(), args));
     TF_ASSERT_OK(stream->Memcpy(output.data(), output_device,
                                 output.size() * sizeof(output[0])));
@@ -787,6 +786,16 @@ TEST_F(MetalNvfp4KernelTest, DenseQmmHandlesGroupAlignedKTail) {
 
 TEST_F(MetalNvfp4KernelTest, DenseQmmAlignedNHandlesKTail) {
   RunDenseCase(/*m=*/16, /*k=*/48, /*n=*/64, "nvfp4_qmm_t_alN");
+}
+
+TEST_F(MetalNvfp4KernelTest, DenseQmmLargeTilesHandlePartialMAndN) {
+  RunDenseCase(/*m=*/65, /*k=*/32, /*n=*/63, "nvfp4_qmm_t_bm32", /*bm=*/32);
+  RunDenseCase(/*m=*/65, /*k=*/32, /*n=*/63, "nvfp4_qmm_t_bm64", /*bm=*/64);
+  RunDenseCase(/*m=*/64, /*k=*/48, /*n=*/64, "nvfp4_qmm_t_bm32_alN", /*bm=*/32);
+  RunDenseCase(/*m=*/64, /*k=*/48, /*n=*/64, "nvfp4_qmm_t_bm64_alN", /*bm=*/64);
+  RunDenseCase(/*m=*/256, /*k=*/64, /*n=*/128, "nvfp4_qmm_t_bm64_alN",
+               /*bm=*/64);
+  RunDenseCase(/*m=*/1, /*k=*/32, /*n=*/64, "nvfp4_qmm_t_bm64_alN", /*bm=*/64);
 }
 
 TEST_F(MetalNvfp4KernelTest, DenseQmvHandlesPartialN) {

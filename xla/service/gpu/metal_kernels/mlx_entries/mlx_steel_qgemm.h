@@ -982,9 +982,19 @@ METAL_FUNC void mxfp_qmm_t_impl(
 
 // MXFP8/MXFP4 dense tiled q-GEMM (prefill). Shares the {x, w, scales, y, dims}
 // ABI. w is uint32-packed (cast to bytes), scales uint8 E8M0 [N, K/32]. Tiles
-// BM=16, BK=32, BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N
-// unsafe loads when N%BN==0; grid = (ceil(N/64), ceil(M/16), 1), tg=(32,2,2).
-#define MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, ALIGNED_N)                    \
+// BM_, BK=32, BN=64 (WM=WN=2 => 128 threads). ALIGNED_N selects full-tile N
+// unsafe loads when N%BN==0; grid = (ceil(N/64), ceil(M/BM_), 1), tg=(32,2,2).
+//
+// BM is a parameter because the weight loader's cost does not depend on it:
+// XlaQuantizedBlockLoader is instantiated on <BN, BK> and not on BM, so a wider
+// tile amortises the same dequantise-and-stage work over more MMA. Worth 1.27x
+// at a 256-row prefill chunk and 2.9x *worse* at a 16-row decode bucket, so the
+// tile is chosen per shape -- see SelectNvfp4QmmTile, which carries the sweep.
+//
+// BK is not a knob to widen alongside it: XlaQuantizedBlockLoader
+// static_asserts n_reads * pack_factor <= group_size, which at BK=64 with 128
+// threads fails for group-16 NVFP4.
+#define MXFP_QMM_T_ENTRY_TILE(NAME, GS, BITS, ALIGNED_N, BM_)                \
   kernel void NAME(                                                          \
       device const bfloat* x [[buffer(0)]],                                 \
       device const uint32_t* w [[buffer(1)]],                               \
@@ -995,7 +1005,7 @@ METAL_FUNC void mxfp_qmm_t_impl(
       uint lid [[thread_index_in_threadgroup]],                             \
       uint sg [[simdgroup_index_in_threadgroup]],                           \
       uint sl [[thread_index_in_simdgroup]]) {                              \
-    constexpr int BM = 16, BK = 32, BN = 64;                                \
+    constexpr int BM = BM_, BK = 32, BN = 64;                               \
     constexpr int BK_padded = (BK + 16 / sizeof(bfloat));                   \
     threadgroup bfloat Xs[BM * BK_padded];                                  \
     threadgroup bfloat Ws[BN * BK_padded];                                  \
@@ -1003,6 +1013,10 @@ METAL_FUNC void mxfp_qmm_t_impl(
         w, scales, x, y, Xs, Ws, dims.y, dims.z, dims.x, dims.x, dims.y,    \
         tid, lid, sg, sl);                                                  \
   }
+
+// The BM=16 spelling, so every existing entry expands exactly as before.
+#define MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, ALIGNED_N) \
+  MXFP_QMM_T_ENTRY_TILE(NAME, GS, BITS, ALIGNED_N, 16)
 
 #define MXFP_QMM_T_ENTRY(NAME, GS, BITS) \
   MXFP_QMM_T_ENTRY_ALIGN(NAME, GS, BITS, false)
@@ -1015,6 +1029,14 @@ MXFP_QMM_T_ENTRY(mxfp4_qmm_t, 32, 4)
 // a real row (static_M == active_M == dims.x).
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t, 16, 4, false)
 MXFP_QMM_T_ENTRY_ALIGN(nvfp4_qmm_t_alN, 16, 4, true)
+
+// The large-M tiles, as fp8_qmm_t_bm64 below already is for the fp8 sibling.
+// Only BM differs, so these must agree with the BM=16 entry bit for bit --
+// a difference would be a fragment-indexing bug, not a numeric one.
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm32, 16, 4, false, 32)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm32_alN, 16, 4, true, 32)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm64, 16, 4, false, 64)
+MXFP_QMM_T_ENTRY_TILE(nvfp4_qmm_t_bm64_alN, 16, 4, true, 64)
 
 // NVFP4 split-K dense q-GEMM (MLX fp_qmm_t_splitk intent).
 // Uses the SAME BM=16,BK=32,BN=64 tile as nvfp4_qmm_t (proven multi-M path);

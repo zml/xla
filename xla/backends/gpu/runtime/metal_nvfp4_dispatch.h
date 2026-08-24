@@ -19,6 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 
 namespace xla {
 namespace gpu {
@@ -205,6 +206,58 @@ inline const char* Nvfp4QmvWideKernelName(int vecs_per_tg) {
 
 inline const char* Nvfp4QmmKernelName(int N) {
   return Nvfp4QmmAlignN(N) ? "nvfp4_qmm_t_alN" : "nvfp4_qmm_t";
+}
+
+struct Nvfp4QmmTile {
+  const char* name;
+  int bm;
+  int bn;
+};
+
+inline constexpr int kNvfp4QmmTileCount = 3;
+inline constexpr int kNvfp4QmmTileBM[kNvfp4QmmTileCount] = {16, 32, 64};
+inline constexpr int kNvfp4QmmTileRelCost[kNvfp4QmmTileCount] = {100, 168, 327};
+
+inline constexpr int64_t kNvfp4QmmMinThreadgroups = 128;
+
+inline Nvfp4QmmTile SelectNvfp4QmmTile(int64_t M, int64_t N) {
+  const bool aligned = Nvfp4QmmAlignN(static_cast<int>(N));
+  const int64_t n_tiles = (N + kNvfp4QmmBN - 1) / kNvfp4QmmBN;
+
+  int best = 0;
+  int64_t best_cost = std::numeric_limits<int64_t>::max();
+  for (int i = 0; i < kNvfp4QmmTileCount; ++i) {
+    const int64_t bm = kNvfp4QmmTileBM[i];
+    const int64_t m_tiles = (M + bm - 1) / bm;
+    if (bm > kNvfp4QmmBM && n_tiles * m_tiles < kNvfp4QmmMinThreadgroups) {
+      continue;
+    }
+    const int64_t cost = m_tiles * kNvfp4QmmTileRelCost[i];
+    if (cost < best_cost) {
+      best_cost = cost;
+      best = i;
+    }
+  }
+
+  int chosen = kNvfp4QmmTileBM[best];
+  if (const char* pin = std::getenv("METAL_NVFP4_QMM_BM")) {
+    const int want = std::atoi(pin);
+    for (int i = 0; i < kNvfp4QmmTileCount; ++i) {
+      if (kNvfp4QmmTileBM[i] == want) chosen = want;
+    }
+  }
+
+  switch (chosen) {
+    case 32:
+      return {aligned ? "nvfp4_qmm_t_bm32_alN" : "nvfp4_qmm_t_bm32", 32,
+              kNvfp4QmmBN};
+    case 64:
+      return {aligned ? "nvfp4_qmm_t_bm64_alN" : "nvfp4_qmm_t_bm64", 64,
+              kNvfp4QmmBN};
+    default:
+      return {Nvfp4QmmKernelName(static_cast<int>(N)), kNvfp4QmmBM,
+              kNvfp4QmmBN};
+  }
 }
 
 inline const char* Nvfp4QmmSplitkKernelName(int N) {

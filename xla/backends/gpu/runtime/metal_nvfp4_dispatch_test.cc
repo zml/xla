@@ -94,6 +94,30 @@ TEST(MetalNvfp4DispatchTest, AlignNAndKernelNames) {
   EXPECT_STREQ(Nvfp4QmmSplitkKernelName(2800), "nvfp4_qmm_t_splitk");
 }
 
+TEST(MetalNvfp4DispatchTest, QmmTileFollowsTheMeasuredOptimum) {
+  EXPECT_EQ(SelectNvfp4QmmTile(16, 21504).bm, 16);
+  EXPECT_EQ(SelectNvfp4QmmTile(256, 21504).bm, 64);
+  EXPECT_STREQ(SelectNvfp4QmmTile(256, 21504).name, "nvfp4_qmm_t_bm64_alN");
+  EXPECT_EQ(SelectNvfp4QmmTile(256, 5376).bm, 64);
+
+  EXPECT_EQ(SelectNvfp4QmmTile(48, 21504).bm, 16);
+  EXPECT_EQ(SelectNvfp4QmmTile(96, 21504).bm, 32);
+  EXPECT_EQ(SelectNvfp4QmmTile(32, 21504).bm, 32);
+
+  EXPECT_EQ(SelectNvfp4QmmTile(64, 5376).bm, 32);
+
+  EXPECT_STREQ(SelectNvfp4QmmTile(256, 2800).name, "nvfp4_qmm_t_bm64");
+
+  EXPECT_EQ(kNvfp4SplitkBM, 16);
+  EXPECT_EQ(kNvfp4QmmBM, 16);
+}
+
+TEST(MetalNvfp4DispatchTest, TileChoiceDoesNotDisturbPathOrWorkspace) {
+  EXPECT_EQ(SelectNvfp4DensePath(256, 5376, 21504), Nvfp4DensePath::kQmm);
+  EXPECT_EQ(ComputeNvfp4QmmSplitK(256, 21504, 5376), 1);
+  EXPECT_EQ(SelectNvfp4DensePath(1, 2048, 2048), Nvfp4DensePath::kQmv);
+}
+
 TEST(MetalNvfp4DispatchTest, LargeShapeLimit) {
   EXPECT_EQ(GetNvfp4QmvBatchLimit(8192, 8192), 10);
   EXPECT_EQ(SelectNvfp4DensePath(9, 8192, 8192), Nvfp4DensePath::kQmvWide);

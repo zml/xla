@@ -53,6 +53,9 @@ struct MetalNvfp4MatmulThunk::LoadedState {
   std::unique_ptr<se::Kernel> kernel_qmv;
   std::unique_ptr<se::Kernel> kernel_qmv_wide[kNvfp4QmvWideMaxVecs + 1];
   std::unique_ptr<se::Kernel> kernel_qmm;
+  // The tile kernel_qmm was loaded for; the grid must come from here, since a
+  // wide tile over a narrower grid computes only a prefix of the rows.
+  Nvfp4QmmTile qmm_tile = {nullptr, kNvfp4QmmBM, kNvfp4QmmBN};
   std::unique_ptr<se::Kernel> kernel_splitk;
   std::unique_ptr<se::Kernel> kernel_splitk_sum;
 
@@ -140,10 +143,10 @@ MetalNvfp4MatmulThunk::EnsureLoaded(se::StreamExecutor* executor) {
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
         CompileMetalSourceToMetallibCached(get_mlx_steel_qgemm()));
+    next->qmm_tile = SelectNvfp4QmmTile(m_, n_);
     TF_ASSIGN_OR_RETURN(next->kernel_qmm,
                         metal_exec->LoadKernelWithConstants(
-                            lib, Nvfp4QmmKernelName(static_cast<int>(n_)),
-                            /*arity=*/5, {}));
+                            lib, next->qmm_tile.name, /*arity=*/5, {}));
   } else {
     TF_ASSIGN_OR_RETURN(
         std::vector<uint8_t> lib,
@@ -230,10 +233,10 @@ absl::Status MetalNvfp4MatmulThunk::ExecuteOnStream(
     args.add_argument(state->dims);
     return state->kernel_qmm->Launch(
         se::ThreadDim(32, 2, 2),
-        se::BlockDim(static_cast<uint64_t>((n_ + kNvfp4QmmBN - 1) /
-                                           kNvfp4QmmBN),
-                     static_cast<uint64_t>((m_ + kNvfp4QmmBM - 1) /
-                                           kNvfp4QmmBM),
+        se::BlockDim(static_cast<uint64_t>((n_ + state->qmm_tile.bn - 1) /
+                                           state->qmm_tile.bn),
+                     static_cast<uint64_t>((m_ + state->qmm_tile.bm - 1) /
+                                           state->qmm_tile.bm),
                      1),
         stream, args);
   }
