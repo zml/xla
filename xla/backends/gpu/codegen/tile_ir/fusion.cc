@@ -30,6 +30,7 @@
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/tile_ir/tileiras_compiler.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/backends/gpu/codegen/tile_ir/transforms/passes.h"
 #include "xla/backends/gpu/codegen/xtile/xtile_module.h"
 #include "xla/backends/gpu/runtime/custom_kernel_thunk.h"
@@ -83,15 +84,24 @@ absl::StatusOr<KernelReuseCache::Entry> BuildTileIrKernel(
   LoadMlirDialectsForXTile(mlir_context);
   mlir_context.loadDialect<mlir::cuda_tile::CudaTileDialect>();
 
-  llvm::SmallVector<mlir::Type> no_opaque_args;
-  ABSL_ASSIGN_OR_RETURN(
-      mlir::OwningOpRef<mlir::ModuleOp> module,
-      TileAndEmitXTileModule(
-          kernel_name, fusion, ir_emitter_context.gpu_device_info(),
-          block_level_parameters, absl::MakeSpan(no_opaque_args), mlir_context,
-          debug_options.xla_gpu_experimental_enable_tiling_propagation(),
-          debug_options
-              .xla_gpu_experimental_enable_same_shape_multi_output_fusion()));
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  if (std::optional<Fp8BlockGemvSpec> spec = MatchFp8BlockGemv(fusion);
+      spec.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(module, EmitFp8BlockGemvXTileModule(
+                                 kernel_name, fusion, *spec,
+                                 block_level_parameters, mlir_context));
+  } else {
+    llvm::SmallVector<mlir::Type> no_opaque_args;
+    ABSL_ASSIGN_OR_RETURN(
+        module,
+        TileAndEmitXTileModule(
+            kernel_name, fusion, ir_emitter_context.gpu_device_info(),
+            block_level_parameters, absl::MakeSpan(no_opaque_args),
+            mlir_context,
+            debug_options.xla_gpu_experimental_enable_tiling_propagation(),
+            debug_options
+                .xla_gpu_experimental_enable_same_shape_multi_output_fusion()));
+  }
 
   if (!IsLowerableToCudaTile(module.get())) {
     return absl::CancelledError(

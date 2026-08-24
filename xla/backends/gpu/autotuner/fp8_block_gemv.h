@@ -34,10 +34,17 @@ namespace gpu {
 
 class Fp8BlockGemvBackend : public GpuCodegenBackend {
  public:
-  Fp8BlockGemvBackend(const DebugOptions* debug_options, Compiler* compiler,
-                      const Compiler::GpuTargetConfig* target_config)
-      : GpuCodegenBackend(autotuner::Backend::FP8_BLOCK_GEMV, debug_options,
-                          compiler, target_config) {}
+  enum class Rung { kTriton, kTileIr };
+
+  explicit Fp8BlockGemvBackend(const DebugOptions* debug_options,
+                               Compiler* compiler,
+                               const Compiler::GpuTargetConfig* target_config,
+                               Rung rung = Rung::kTriton)
+      : GpuCodegenBackend(rung == Rung::kTriton
+                              ? autotuner::Backend::FP8_BLOCK_GEMV
+                              : autotuner::Backend::FP8_BLOCK_GEMV_TILE_IR,
+                          debug_options, compiler, target_config),
+        rung_(rung) {}
 
   absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
   GetSupportedConfigs(const HloInstruction& instr) override;
@@ -52,7 +59,12 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
 
   bool CanProduceWrongResults() const override { return false; }
 
-  std::string version() const override { return "1"; }
+  std::string version() const override {
+    return rung_ == Rung::kTriton ? "1" : "tile_ir_13.3";
+  }
+
+ private:
+  Rung rung_;
 };
 
 }  // namespace gpu

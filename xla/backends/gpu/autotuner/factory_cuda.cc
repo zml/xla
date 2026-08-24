@@ -105,6 +105,9 @@ std::vector<std::unique_ptr<CodegenBackend>> GetCodegenBackendsForCuda(
       debug_options, compiler, target_config, mlir_context));
   backends.push_back(std::make_unique<Fp8BlockGemvBackend>(
       debug_options, compiler, target_config));
+  backends.push_back(std::make_unique<Fp8BlockGemvBackend>(
+      debug_options, compiler, target_config,
+      Fp8BlockGemvBackend::Rung::kTileIr));
   backends.push_back(std::make_unique<Nvfp4DecodeDotBackend>(
       debug_options, compiler, target_config, mlir_context));
   backends.push_back(std::make_unique<Nvfp4DecodeDotBackend>(

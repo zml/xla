@@ -348,6 +348,17 @@ absl::StatusOr<TritonKernelSource> CreateTritonModule(
       absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> gemv_module =
           EmitFp8BlockGemvXTileModule(fn_name, fusion, *spec,
                                       block_level_parameters, mlir_context);
+      if (gemv_module.ok()) {
+        const DebugOptions& pre_opts =
+            fusion.GetModule()->config().debug_options();
+        if (DumpingEnabledForHloModule(*hlo_computation->parent()) &&
+            DumpingEnabledForEmitter("triton-fusion", pre_opts)) {
+          DumpToFileInDirOrStdout(
+              *hlo_computation->parent(), "",
+              absl::StrCat(fusion.name(), ".fp8_block_gemv.xtile.txt"),
+              GetModuleIrString(gemv_module->get()));
+        }
+      }
       if (!gemv_module.ok()) {
         status = gemv_module.status();
       } else {
