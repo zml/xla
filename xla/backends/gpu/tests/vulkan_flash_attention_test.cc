@@ -33,8 +33,8 @@ TEST_F(VulkanFlashAttentionTest, DecodeGqa) {
       q = bf16[2,1,16]{2,1,0} parameter(0)
       k = bf16[1,5,16]{2,1,0} parameter(1)
       v = bf16[1,5,16]{2,1,0} parameter(2)
-      token = s32[] constant(4)
-      ROOT attention = bf16[2,1,16]{2,1,0} custom-call(q, k, v, token),
+      token_index = s32[] constant(4)
+      ROOT attention = bf16[2,1,16]{2,1,0} custom-call(q, k, v, token_index),
         custom_call_target="zml$flash_attn"
     })";
 
@@ -90,8 +90,7 @@ TEST_F(VulkanFlashAttentionTest, DecodeGqa) {
       ROOT result = bf16[2,1,16]{2,1,0} convert(output)
     })";
 
-  EXPECT_TRUE(RunAndCompareTwoModules(
-      kCustomCallHlo, kReferenceHlo,
+  EXPECT_TRUE(RunAndCompareTwoModules(kCustomCallHlo, kReferenceHlo,
       ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
 }
 

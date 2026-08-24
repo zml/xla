@@ -25,8 +25,10 @@ limitations under the License.
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -60,10 +62,14 @@ using mlir::TypeRange;
 using mlir::Value;
 using mlir::ValueRange;
 namespace arith = mlir::arith;
+namespace LLVM = mlir::LLVM;
 namespace scf = mlir::scf;
 namespace tensor = mlir::tensor;
+namespace vector = mlir::vector;
 
 constexpr int64_t kTileSize = 16;
+constexpr int64_t kNativeDotWidth = 4;
+constexpr char kNativeBf16DotIntrinsic[] = "llvm.spv.fdot";
 constexpr int64_t kThreadsPerBlock = kTileSize * kTileSize;
 
 Value IndexConstant(ImplicitLocOpBuilder& builder, int64_t value) {
@@ -124,12 +130,12 @@ Value F32ToBf16Bits(ImplicitLocOpBuilder& builder, Value value) {
       builder, builder.getI16Type(),
       arith::ShRUIOp::create(builder, rounded, I32Constant(builder, 16)));
 
-  Value exponent = arith::AndIOp::create(
-      builder, bits, I32Constant(builder, 0x7f800000));
-  Value mantissa = arith::AndIOp::create(
-      builder, bits, I32Constant(builder, 0x007fffff));
-  Value exponent_all_ones = arith::CmpIOp::create(
-      builder, arith::CmpIPredicate::eq, exponent,
+  Value exponent =
+      arith::AndIOp::create(builder, bits, I32Constant(builder, 0x7f800000));
+  Value mantissa =
+      arith::AndIOp::create(builder, bits, I32Constant(builder, 0x007fffff));
+  Value exponent_all_ones =
+      arith::CmpIOp::create(builder, arith::CmpIPredicate::eq, exponent,
       I32Constant(builder, 0x7f800000));
   Value mantissa_nonzero = arith::CmpIOp::create(
       builder, arith::CmpIPredicate::ne, mantissa, I32Constant(builder, 0));
@@ -195,8 +201,7 @@ std::optional<VulkanGemmConfig> MatchVulkanGemm(
   const Shape& lhs = dot.operand(0)->shape();
   const Shape& rhs = dot.operand(1)->shape();
   const Shape& output = dot.shape();
-  if (!IsStaticRowMajorBf16Matrix(lhs) ||
-      !IsStaticRowMajorBf16Matrix(rhs) ||
+  if (!IsStaticRowMajorBf16Matrix(lhs) || !IsStaticRowMajorBf16Matrix(rhs) ||
       !IsStaticRowMajorBf16Matrix(output)) {
     return std::nullopt;
   }
@@ -238,18 +243,22 @@ std::optional<VulkanGemmConfig> MatchVulkanGemm(
     return std::nullopt;
   }
 
-  return VulkanGemmConfig{m, n, k, rhs_layout};
+  VulkanGemmKernelVariant kernel_variant =
+      capability->shader_bfloat16() && capability->shader_bfloat16_dot_product()
+          ? VulkanGemmKernelVariant::kNativeBf16Dot
+          : VulkanGemmKernelVariant::kPortable;
+  return VulkanGemmConfig{m, n, k, rhs_layout, kernel_variant};
 }
 
 VulkanGemmEmitter::VulkanGemmEmitter(VulkanGemmConfig config)
     : m_(config.m),
       n_(config.n),
       k_(config.k),
-      rhs_layout_(config.rhs_layout) {}
+      rhs_layout_(config.rhs_layout),
+      kernel_variant_(config.kernel_variant) {}
 
 LaunchDimensions VulkanGemmEmitter::launch_dimensions() const {
-  return LaunchDimensions(
-      se::BlockDim((n_ + kTileSize - 1) / kTileSize,
+  return LaunchDimensions(se::BlockDim((n_ + kTileSize - 1) / kTileSize,
                    (m_ + kTileSize - 1) / kTileSize, 1),
       se::ThreadDim(kTileSize, kTileSize, 1));
 }
@@ -263,10 +272,12 @@ VulkanGemmEmitter::CreateMLIRModule(
   auto loc = mlir::NameLoc::get(builder.getStringAttr(fusion.name()));
   mlir::OwningOpRef<mlir::ModuleOp> module = llvm_ir::CreateMlirModuleOp(loc);
   ABSL_ASSIGN_OR_RETURN(mlir::func::FuncOp entry_function,
-                   emitters::EmitKernelApi(*module, fusion, buffer_assignment,
-                                           GetDefaultBufferAlignment(),
-                                           entry_function_name));
+                        emitters::EmitKernelApi(
+                            *module, fusion, buffer_assignment,
+                            GetDefaultBufferAlignment(), entry_function_name));
+  if (kernel_variant_ == VulkanGemmKernelVariant::kPortable) {
   UsePortableBf16StorageAbi(entry_function, builder);
+  }
   SetBackendKind(&mlir_context, entry_function, BackendKind::kGpu);
   emitters::SetIndexDataLayout(*module, fusion);
   ABSL_RETURN_IF_ERROR(EmitKernel(entry_function, fusion));
@@ -275,15 +286,14 @@ VulkanGemmEmitter::CreateMLIRModule(
   return module;
 }
 
-std::optional<IndexingMap>
-VulkanGemmEmitter::ComputeThreadIdToOutputIndexing(
+std::optional<IndexingMap> VulkanGemmEmitter::ComputeThreadIdToOutputIndexing(
     int64_t, mlir::MLIRContext*) const {
   return std::nullopt;
 }
 
 std::optional<std::vector<IndexingMap>>
-VulkanGemmEmitter::ComputeThreadIdToInputIndexing(
-    int64_t, mlir::MLIRContext*) const {
+VulkanGemmEmitter::ComputeThreadIdToInputIndexing(int64_t,
+                                                  mlir::MLIRContext*) const {
   return std::nullopt;
 }
 
@@ -315,8 +325,12 @@ absl::Status VulkanGemmEmitter::EmitKernel(
       builder, arith::MulIOp::create(builder, block_col, tile_size),
       thread_col);
 
+  mlir::Type tile_element_type =
+      kernel_variant_ == VulkanGemmKernelVariant::kPortable
+          ? mlir::Type(builder.getF32Type())
+          : mlir::Type(builder.getBF16Type());
   RankedTensorType tile_type =
-      RankedTensorType::get({kTileSize, kTileSize}, builder.getF32Type());
+      RankedTensorType::get({kTileSize, kTileSize}, tile_element_type);
   Value lhs_tile = AllocateSharedOp::create(builder, tile_type);
   Value rhs_tile = AllocateSharedOp::create(builder, tile_type);
   Value zero_index = IndexConstant(builder, 0);
@@ -353,9 +367,11 @@ absl::Status VulkanGemmEmitter::EmitKernel(
         builder, arith::CmpIPredicate::ult, lhs_k, IndexConstant(builder, k_));
     Value lhs_valid =
         arith::AndIOp::create(builder, lhs_row_valid, lhs_k_valid);
-    Value lhs_value = SelectTensorElementOrZero(
-        builder, lhs_valid, lhs, ValueRange{row, lhs_k});
+    Value lhs_value = SelectTensorElementOrZero(builder, lhs_valid, lhs,
+                                                ValueRange{row, lhs_k});
+    if (kernel_variant_ == VulkanGemmKernelVariant::kPortable) {
     lhs_value = Bf16BitsToF32(builder, lhs_value);
+    }
     Value written_lhs = tensor::InsertOp::create(
         builder, lhs_value, loop_lhs_tile,
         ValueRange{thread_row, thread_col});
@@ -374,9 +390,11 @@ absl::Status VulkanGemmEmitter::EmitKernel(
         rhs_layout_ == VulkanGemmRhsLayout::kKxN
             ? SmallVector<Value, 2>{thread_row, thread_col}
             : SmallVector<Value, 2>{thread_col, thread_row};
-    Value rhs_value = SelectTensorElementOrZero(
-        builder, rhs_valid, rhs, ValueRange(rhs_indices));
+    Value rhs_value = SelectTensorElementOrZero(builder, rhs_valid, rhs,
+                                                ValueRange(rhs_indices));
+    if (kernel_variant_ == VulkanGemmKernelVariant::kPortable) {
     rhs_value = Bf16BitsToF32(builder, rhs_value);
+    }
     Value written_rhs = tensor::InsertOp::create(
         builder, rhs_value, loop_rhs_tile, ValueRange(rhs_tile_indices));
 
@@ -389,20 +407,52 @@ absl::Status VulkanGemmEmitter::EmitKernel(
     Value synchronized_lhs = synchronized[0];
     Value synchronized_rhs = synchronized[1];
 
-    scf::ForOp k_loop = scf::ForOp::create(
-        builder, zero_index, tile_size, one_index, ValueRange{accumulator});
+    Value k_step = kernel_variant_ == VulkanGemmKernelVariant::kPortable
+                       ? one_index
+                       : IndexConstant(builder, kNativeDotWidth);
+    scf::ForOp k_loop = scf::ForOp::create(builder, zero_index, tile_size,
+                                           k_step, ValueRange{accumulator});
     {
       OpBuilder::InsertionGuard k_guard(builder);
       builder.setInsertionPointToStart(k_loop.getBody());
       Value inner_k = k_loop.getInductionVar();
       Value sum = k_loop.getRegionIterArgs()[0];
+      Value updated_sum;
+      if (kernel_variant_ == VulkanGemmKernelVariant::kPortable) {
       Value lhs_element = tensor::ExtractOp::create(
           builder, synchronized_lhs, ValueRange{thread_row, inner_k});
       Value rhs_element = tensor::ExtractOp::create(
           builder, synchronized_rhs, ValueRange{inner_k, thread_col});
       Value product =
           arith::MulFOp::create(builder, lhs_element, rhs_element);
-      Value updated_sum = arith::AddFOp::create(builder, sum, product);
+        updated_sum = arith::AddFOp::create(builder, sum, product);
+      } else {
+        SmallVector<Value, kNativeDotWidth> lhs_elements;
+        SmallVector<Value, kNativeDotWidth> rhs_elements;
+        for (int64_t offset = 0; offset < kNativeDotWidth; ++offset) {
+          Value dot_k = offset == 0 ? inner_k
+                                    : arith::AddIOp::create(
+                                          builder, inner_k,
+                                          IndexConstant(builder, offset));
+          lhs_elements.push_back(tensor::ExtractOp::create(
+              builder, synchronized_lhs, ValueRange{thread_row, dot_k}));
+          rhs_elements.push_back(tensor::ExtractOp::create(
+              builder, synchronized_rhs, ValueRange{dot_k, thread_col}));
+        }
+        mlir::VectorType vector_type =
+            mlir::VectorType::get({kNativeDotWidth}, builder.getBF16Type());
+        Value lhs_vector = vector::FromElementsOp::create(
+            builder, vector_type, ValueRange(lhs_elements));
+        Value rhs_vector = vector::FromElementsOp::create(
+            builder, vector_type, ValueRange(rhs_elements));
+        LLVM::CallIntrinsicOp call = LLVM::CallIntrinsicOp::create(
+            builder, builder.getLoc(), builder.getBF16Type(),
+            builder.getStringAttr(kNativeBf16DotIntrinsic),
+            ValueRange{lhs_vector, rhs_vector});
+        Value dot = arith::ExtFOp::create(builder, builder.getF32Type(),
+                                          call.getResult(0));
+        updated_sum = arith::AddFOp::create(builder, sum, dot);
+      }
       scf::YieldOp::create(builder, updated_sum);
     }
 
@@ -418,12 +468,16 @@ absl::Status VulkanGemmEmitter::EmitKernel(
   Value col_valid = arith::CmpIOp::create(
       builder, arith::CmpIPredicate::ult, col, IndexConstant(builder, n_));
   Value output_valid = arith::AndIOp::create(builder, row_valid, col_valid);
-  scf::IfOp store = scf::IfOp::create(
-      builder, TypeRange{output.getType()}, output_valid,
+  scf::IfOp store =
+      scf::IfOp::create(builder, TypeRange{output.getType()}, output_valid,
       /*withElseRegion=*/true);
   OpBuilder then_builder = store.getThenBodyBuilder();
   ImplicitLocOpBuilder implicit_then(builder.getLoc(), then_builder);
-  Value result = F32ToBf16Bits(implicit_then, tile_loop.getResult(0));
+  Value result =
+      kernel_variant_ == VulkanGemmKernelVariant::kPortable
+          ? F32ToBf16Bits(implicit_then, tile_loop.getResult(0))
+          : arith::TruncFOp::create(implicit_then, implicit_then.getBF16Type(),
+                                    tile_loop.getResult(0));
   Value stored = tensor::InsertOp::create(implicit_then, result, output,
                                           ValueRange{row, col});
   scf::YieldOp::create(implicit_then, stored);

@@ -31,21 +31,17 @@ namespace gpu {
 AsyncThunkSequence CustomFusion::Emit(
     IrEmitterContext& ir_emitter_context,
     const HloFusionInstruction& fusion) const {
-  std::optional<std::string> config_name =
-      GetCustomFusionConfigName(&fusion);
-  if (config_name.has_value() &&
-      absl::string_view(*config_name) ==
+  std::optional<std::string> config_name = GetCustomFusionConfigName(&fusion);
+  if (config_name.has_value() && absl::string_view(*config_name) ==
           kVulkanFlashAttentionFusionConfigName) {
-    const se::DeviceDescription& device =
-        ir_emitter_context.gpu_device_info();
+    const se::DeviceDescription& device = ir_emitter_context.gpu_device_info();
     const se::VulkanComputeCapability* capability =
         device.gpu_compute_capability().vulkan_compute_capability();
-    if (capability == nullptr || !capability->shader_bfloat16() ||
-        !capability->storage_buffer_16bit_access() ||
+    if (capability == nullptr || !capability->storage_buffer_16bit_access() ||
         !capability->subgroup_basic() || !capability->subgroup_shuffle()) {
       return absl::FailedPreconditionError(
-          "Vulkan flash-attention requires BF16 arithmetic, 16-bit storage, "
-          "and subgroup basic and shuffle operations");
+          "Vulkan flash-attention requires 16-bit storage and subgroup basic "
+          "and shuffle operations");
     }
     MlirKernelFusion emitter(std::make_unique<VulkanFlashAttentionEmitter>(
         fusion, ir_emitter_context.gpu_device_info()));

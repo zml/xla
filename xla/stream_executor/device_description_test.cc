@@ -155,9 +155,13 @@ TEST(GpuComputeCapability, ProtoConversion) {
                                  /*storage_buffer_16bit_access=*/true,
                                  /*subgroup_size=*/32,
                                  /*subgroup_basic=*/true,
-                                 /*subgroup_shuffle=*/true);
-  EXPECT_THAT(GpuComputeCapability::FromProto(
-                  GpuComputeCapability(vulkan).ToProto()),
+                                 /*subgroup_shuffle=*/true,
+                                 /*shader_bfloat16_dot_product=*/true,
+                                 /*shader_bfloat16_cooperative_matrix=*/true,
+                                 /*bfloat16_cooperative_matrix_shapes=*/
+                                 {{16, 16, 16, 3}});
+  EXPECT_THAT(
+      GpuComputeCapability::FromProto(GpuComputeCapability(vulkan).ToProto()),
               IsOkAndHolds(GpuComputeCapability(vulkan)));
 }
 

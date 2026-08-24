@@ -26,6 +26,13 @@ message RocmComputeCapabilityProto {
 }
 
 message VulkanComputeCapabilityProto {
+  message CooperativeMatrixShapeProto {
+    uint32 m_size = 1;
+    uint32 n_size = 2;
+    uint32 k_size = 3;
+    uint32 scope = 4;
+  }
+
   uint32 api_version_major = 1;
   uint32 api_version_minor = 2;
   bool shader_bfloat16 = 3;
@@ -33,6 +40,9 @@ message VulkanComputeCapabilityProto {
   uint32 subgroup_size = 5;
   bool subgroup_basic = 6;
   bool subgroup_shuffle = 7;
+  bool shader_bfloat16_dot_product = 8;
+  bool shader_bfloat16_cooperative_matrix = 9;
+  repeated CooperativeMatrixShapeProto bfloat16_cooperative_matrix_shapes = 10;
 }
 
 message GpuComputeCapabilityProto {

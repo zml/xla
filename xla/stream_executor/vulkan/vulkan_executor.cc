@@ -16,7 +16,6 @@ limitations under the License.
 #include "xla/stream_executor/vulkan/vulkan_executor.h"
 
 #include <dlfcn.h>
-#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <atomic>
@@ -47,13 +46,13 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include <vulkan/vulkan.h>
 #include "xla/stream_executor/generic_memory_allocation.h"
 #include "xla/stream_executor/generic_memory_allocator.h"
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/stream_common.h"
 #include "tsl/profiler/lib/traceme.h"
-#include "absl/status/status_macros.h"
 
 namespace stream_executor::vulkan {
 namespace {
@@ -97,8 +96,8 @@ void ApplyAmdPerformanceDefaults(
   };
 
   auto set_defaults = [&](const AmdDefaults& defaults) {
-    performance->threads_per_core = std::max<uint32_t>(
-        1, properties.limits.maxComputeWorkGroupInvocations);
+    performance->threads_per_core =
+        std::max<uint32_t>(1, properties.limits.maxComputeWorkGroupInvocations);
     performance->core_count = defaults.core_count;
     performance->fpus_per_core = defaults.fpus_per_core;
     performance->memory_bandwidth = defaults.memory_bandwidth;
@@ -163,8 +162,8 @@ void ApplyAmdPerformanceDefaults(
 }
 
 template <typename T>
-absl::Status ApplyPositiveIntegerOverride(const char* name,
-                                          std::optional<T>* value,
+absl::Status ApplyPositiveIntegerOverride(
+    const char* name, std::optional<T>* value,
                                           std::vector<std::string>* diagnostics) {
   const char* text = std::getenv(name);
   if (text == nullptr) return absl::OkStatus();
@@ -196,8 +195,7 @@ absl::Status ApplyPositiveFloatOverride(const char* name,
   return absl::OkStatus();
 }
 
-std::string FormatUuid(
-    const std::array<uint8_t, VK_UUID_SIZE>& uuid,
+std::string FormatUuid(const std::array<uint8_t, VK_UUID_SIZE>& uuid,
     absl::string_view prefix = {}) {
   std::string result(prefix);
   for (size_t i = 0; i < uuid.size(); ++i) {
@@ -402,8 +400,8 @@ void ProbeCuda(VulkanDevicePerformanceProperties* performance) {
   if (memory_clock_khz.has_value() && memory_bus_width_bits.has_value()) {
     performance->memory_bandwidth =
         2 * *memory_clock_khz * 1000 * *memory_bus_width_bits / 8;
-    performance->probe_diagnostics.push_back(absl::StrFormat(
-        "CUDA derived memory bandwidth=%d bytes/s",
+    performance->probe_diagnostics.push_back(
+        absl::StrFormat("CUDA derived memory bandwidth=%d bytes/s",
         *performance->memory_bandwidth));
   }
 }
@@ -525,12 +523,11 @@ bool ValidationRequested() {
 VKAPI_ATTR VkBool32 VKAPI_CALL ValidationCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT type,
-    const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
-    void*) {
-  const char* message = callback_data == nullptr ? nullptr
-                                                  : callback_data->pMessage;
-  const char* id = callback_data == nullptr ? nullptr
-                                             : callback_data->pMessageIdName;
+    const VkDebugUtilsMessengerCallbackDataEXT* callback_data, void*) {
+  const char* message =
+      callback_data == nullptr ? nullptr : callback_data->pMessage;
+  const char* id =
+      callback_data == nullptr ? nullptr : callback_data->pMessageIdName;
   std::string text = absl::StrFormat(
       "Vulkan validation [%s, type=0x%x]: %s", id == nullptr ? "unknown" : id,
       type, message == nullptr ? "(no message)" : message);
@@ -608,6 +605,9 @@ absl::Status LoadDeviceProc(PFN_vkGetDeviceProcAddr get_device_proc_addr,
 
 struct VulkanShaderFeatures {
   bool shader_bfloat16 = false;
+  bool shader_bfloat16_dot_product = false;
+  bool shader_bfloat16_cooperative_matrix = false;
+  std::vector<VulkanCooperativeMatrixShape> bfloat16_cooperative_matrix_shapes;
   bool storage_buffer_8bit_access = false;
   bool storage_buffer_16bit_access = false;
   bool shader_int8 = false;
@@ -668,11 +668,18 @@ class VulkanDriver {
           physical_device, /*pLayerName=*/nullptr, &extension_count,
           extensions.data()));
     }
-    const bool has_extension = std::any_of(
-        extensions.begin(), extensions.end(), [](const auto& extension) {
-          return std::strcmp(extension.extensionName,
-                             VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) == 0;
+    auto has_extension = [&extensions](const char* name) {
+      return std::any_of(extensions.begin(), extensions.end(),
+                         [name](const VkExtensionProperties& extension) {
+                           return std::strcmp(extension.extensionName, name) ==
+                                  0;
         });
+    };
+    const bool has_bfloat16_extension =
+        has_extension(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+    const bool has_cooperative_matrix_extension =
+        has_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+
     VkPhysicalDevice8BitStorageFeatures storage_8bit_features = {};
     storage_8bit_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
@@ -688,19 +695,76 @@ class VulkanDriver {
     storage_8bit_features.pNext = &storage_16bit_features;
     storage_16bit_features.pNext = &float16_int8_features;
     float16_int8_features.pNext = &variable_pointer_features;
+
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
-    if (has_extension) {
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features =
+        {};
+    void* optional_features = nullptr;
+    if (has_cooperative_matrix_extension) {
+      cooperative_matrix_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+      cooperative_matrix_features.pNext = optional_features;
+      optional_features = &cooperative_matrix_features;
+    }
+    if (has_bfloat16_extension) {
       bfloat16_features.sType =
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
-      variable_pointer_features.pNext = &bfloat16_features;
+      bfloat16_features.pNext = optional_features;
+      optional_features = &bfloat16_features;
     }
+    variable_pointer_features.pNext = optional_features;
+
     VkPhysicalDeviceFeatures2 features = {};
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &storage_8bit_features;
     get_physical_device_features2(physical_device, &features);
+
     VulkanShaderFeatures shader_features;
     shader_features.shader_bfloat16 =
-        has_extension && bfloat16_features.shaderBFloat16Type == VK_TRUE;
+        has_bfloat16_extension &&
+        bfloat16_features.shaderBFloat16Type == VK_TRUE;
+    shader_features.shader_bfloat16_dot_product =
+        shader_features.shader_bfloat16 &&
+        bfloat16_features.shaderBFloat16DotProduct == VK_TRUE;
+    shader_features.shader_bfloat16_cooperative_matrix =
+        shader_features.shader_bfloat16 &&
+        bfloat16_features.shaderBFloat16CooperativeMatrix == VK_TRUE &&
+        has_cooperative_matrix_extension &&
+        cooperative_matrix_features.cooperativeMatrix == VK_TRUE;
+
+    if (shader_features.shader_bfloat16_cooperative_matrix) {
+      auto get_cooperative_matrix_properties = reinterpret_cast<
+          PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+          get_instance_proc_addr_(
+              instance_, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+      if (get_cooperative_matrix_properties != nullptr) {
+        uint32_t property_count = 0;
+        RETURN_IF_VK_ERROR(get_cooperative_matrix_properties(
+            physical_device, &property_count, nullptr));
+        std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+            property_count);
+        for (VkCooperativeMatrixPropertiesKHR& property : properties) {
+          property.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+        }
+        if (property_count != 0) {
+          RETURN_IF_VK_ERROR(get_cooperative_matrix_properties(
+              physical_device, &property_count, properties.data()));
+          properties.resize(property_count);
+        }
+        for (const VkCooperativeMatrixPropertiesKHR& property : properties) {
+          if (property.AType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+              property.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+              property.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+              property.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+              property.saturatingAccumulation == VK_FALSE) {
+            shader_features.bfloat16_cooperative_matrix_shapes.push_back(
+                {property.MSize, property.NSize, property.KSize,
+                 static_cast<uint32_t>(property.scope)});
+          }
+        }
+      }
+    }
+
     shader_features.storage_buffer_8bit_access =
         storage_8bit_features.storageBuffer8BitAccess == VK_TRUE;
     shader_features.storage_buffer_16bit_access =
@@ -757,8 +821,8 @@ class VulkanDriver {
     bool synchronization_validation = false;
 
     PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions = nullptr;
-    ABSL_RETURN_IF_ERROR(LoadGlobalProc(get_instance_proc_addr_,
-                                   "vkEnumerateInstanceExtensionProperties",
+    ABSL_RETURN_IF_ERROR(LoadGlobalProc(
+        get_instance_proc_addr_, "vkEnumerateInstanceExtensionProperties",
                                    &enumerate_extensions));
     uint32_t extension_count = 0;
     RETURN_IF_VK_ERROR(
@@ -863,15 +927,14 @@ class VulkanDriver {
 
     if (validation_requested) {
       PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger = nullptr;
-      ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-          get_instance_proc_addr_, instance_, "vkCreateDebugUtilsMessengerEXT",
+      ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
+                                            "vkCreateDebugUtilsMessengerEXT",
           &create_debug_messenger));
-      ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-          get_instance_proc_addr_, instance_,
+      ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
           "vkDestroyDebugUtilsMessengerEXT",
           &destroy_debug_utils_messenger_));
-      RETURN_IF_VK_ERROR(create_debug_messenger(
-          instance_, &debug_create_info, nullptr, &debug_messenger_));
+      RETURN_IF_VK_ERROR(create_debug_messenger(instance_, &debug_create_info,
+                                                nullptr, &debug_messenger_));
       LOG(INFO) << "Enabled " << kValidationLayer
                 << (synchronization_validation
                         ? " with synchronization validation"
@@ -891,20 +954,20 @@ class VulkanDriver {
     ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
                                      "vkGetPhysicalDeviceFeatures2",
                                      &get_physical_device_features2));
-    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(
+        LoadInstanceProc(get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties",
         &get_physical_device_memory_properties));
-    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(
+        LoadInstanceProc(get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceMemoryProperties2",
         &get_physical_device_memory_properties2));
-    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(
+        LoadInstanceProc(get_instance_proc_addr_, instance_,
         "vkGetPhysicalDeviceQueueFamilyProperties",
         &get_physical_device_queue_family_properties));
-    ABSL_RETURN_IF_ERROR(LoadInstanceProc(
-        get_instance_proc_addr_, instance_,
+    ABSL_RETURN_IF_ERROR(
+        LoadInstanceProc(get_instance_proc_addr_, instance_,
         "vkEnumerateDeviceExtensionProperties",
         &enumerate_device_extension_properties));
     ABSL_RETURN_IF_ERROR(LoadInstanceProc(get_instance_proc_addr_, instance_,
@@ -924,12 +987,12 @@ class VulkanDriver {
     }
 
     physical_devices_.erase(
-        std::remove_if(
-            physical_devices_.begin(), physical_devices_.end(),
+        std::remove_if(physical_devices_.begin(), physical_devices_.end(),
             [this](VkPhysicalDevice device) {
               VkPhysicalDeviceProperties properties = {};
               get_physical_device_properties(device, &properties);
-              if (properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                         if (properties.deviceType !=
+                             VK_PHYSICAL_DEVICE_TYPE_CPU) {
                 return false;
               }
               LOG(INFO) << "Ignoring CPU Vulkan device "
@@ -1119,11 +1182,9 @@ absl::Status ValidateDevicePerformanceProperties(
       "  PCI: %s\n"
       "  missing:",
       properties.deviceName, properties.vendorID, properties.deviceID,
-      performance.has_device_uuid
-          ? FormatUuid(performance.device_uuid)
+      performance.has_device_uuid ? FormatUuid(performance.device_uuid)
           : "unavailable",
-      performance.pci_bus_id.empty() ? "unavailable"
-                                     : performance.pci_bus_id);
+      performance.pci_bus_id.empty() ? "unavailable" : performance.pci_bus_id);
   for (absl::string_view field : missing) {
     absl::StrAppend(&message, "\n    ", field);
   }
@@ -1131,8 +1192,7 @@ absl::Status ValidateDevicePerformanceProperties(
   for (const std::string& diagnostic : performance.probe_diagnostics) {
     absl::StrAppend(&message, "\n    ", diagnostic);
   }
-  absl::StrAppend(
-      &message,
+  absl::StrAppend(&message,
       "\n  Explicit overrides (positive values only):"
       "\n    XLA_VULKAN_CORE_COUNT"
       "\n    XLA_VULKAN_THREADS_PER_CORE"
@@ -1319,8 +1379,7 @@ struct VulkanExecutor::Impl {
     if (result == VK_SUCCESS) {
       VLOG(2) << "Vulkan timeline reached value " << value;
     }
-    return result == VK_SUCCESS
-               ? absl::OkStatus()
+    return result == VK_SUCCESS ? absl::OkStatus()
                : VulkanError("vkWaitSemaphores", result);
   }
 
@@ -1339,10 +1398,9 @@ struct VulkanExecutor::Impl {
     }
   }
 
-  absl::StatusOr<uint64_t> Submit(VkCommandBuffer command_buffer,
-                                  absl::Span<const VkDescriptorPool>
-                                      descriptor_pools,
-                                  uint64_t wait_value,
+  absl::StatusOr<uint64_t> Submit(
+      VkCommandBuffer command_buffer,
+      absl::Span<const VkDescriptorPool> descriptor_pools, uint64_t wait_value,
                                   absl::string_view label) {
     tsl::profiler::TraceMe trace([&] {
       return tsl::profiler::TraceMeEncode(
@@ -1375,8 +1433,8 @@ struct VulkanExecutor::Impl {
     if (result != VK_SUCCESS) return VulkanError("vkQueueSubmit", result);
     VLOG(1) << "Submitted Vulkan command buffer: wait=" << wait_value
             << ", signal=" << signal_value;
-    submissions.push_back(Submission{
-        signal_value, command_buffer,
+    submissions.push_back(
+        Submission{signal_value, command_buffer,
         std::vector<VkDescriptorPool>(descriptor_pools.begin(),
                                       descriptor_pools.end())});
     return signal_value;
@@ -1423,8 +1481,10 @@ struct VulkanExecutor::Impl {
     ABSL_ASSIGN_OR_RETURN(VulkanShaderFeatures shader_features,
                         Driver().GetShaderFeatures(physical_device));
     shader_bfloat16 = shader_features.shader_bfloat16;
-    storage_buffer_16bit_access =
-        shader_features.storage_buffer_16bit_access;
+    shader_bfloat16_dot_product = shader_features.shader_bfloat16_dot_product;
+    shader_bfloat16_cooperative_matrix =
+        shader_features.shader_bfloat16_cooperative_matrix;
+    storage_buffer_16bit_access = shader_features.storage_buffer_16bit_access;
     std::string missing_features;
     auto add_missing_feature = [&missing_features](absl::string_view feature) {
       if (!missing_features.empty()) {
@@ -1468,6 +1528,8 @@ struct VulkanExecutor::Impl {
           "Vulkan timelineSemaphore support is required");
     }
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bfloat16_features = {};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features =
+        {};
     VkPhysicalDevice8BitStorageFeatures storage_8bit_features = {};
     storage_8bit_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
@@ -1484,20 +1546,35 @@ struct VulkanExecutor::Impl {
     timeline_features.pNext = &storage_8bit_features;
     storage_8bit_features.pNext = &float16_int8_features;
     float16_int8_features.pNext = &variable_pointer_features;
-    if (shader_bfloat16) {
-      bfloat16_features.sType =
-          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
-      bfloat16_features.shaderBFloat16Type = VK_TRUE;
-    }
+
+    VkBaseOutStructure* feature_tail =
+        reinterpret_cast<VkBaseOutStructure*>(&variable_pointer_features);
+    auto append_feature = [&feature_tail](void* feature) {
+      VkBaseOutStructure* next = reinterpret_cast<VkBaseOutStructure*>(feature);
+      feature_tail->pNext = next;
+      feature_tail = next;
+    };
     if (storage_buffer_16bit_access) {
       storage_16bit_features.sType =
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
       storage_16bit_features.storageBuffer16BitAccess = VK_TRUE;
-      storage_16bit_features.pNext =
-          shader_bfloat16 ? &bfloat16_features : nullptr;
-      variable_pointer_features.pNext = &storage_16bit_features;
-    } else if (shader_bfloat16) {
-      variable_pointer_features.pNext = &bfloat16_features;
+      append_feature(&storage_16bit_features);
+    }
+    if (shader_bfloat16) {
+      bfloat16_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+      bfloat16_features.shaderBFloat16Type = VK_TRUE;
+      bfloat16_features.shaderBFloat16DotProduct =
+          shader_bfloat16_dot_product ? VK_TRUE : VK_FALSE;
+      bfloat16_features.shaderBFloat16CooperativeMatrix =
+          shader_bfloat16_cooperative_matrix ? VK_TRUE : VK_FALSE;
+      append_feature(&bfloat16_features);
+    }
+    if (shader_bfloat16_cooperative_matrix) {
+      cooperative_matrix_features.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+      cooperative_matrix_features.cooperativeMatrix = VK_TRUE;
+      append_feature(&cooperative_matrix_features);
     }
 
     uint32_t family_count = 0;
@@ -1536,6 +1613,9 @@ struct VulkanExecutor::Impl {
     if (shader_bfloat16) {
       enabled_extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
     }
+    if (shader_bfloat16_cooperative_matrix) {
+      enabled_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(enabled_extensions.size());
     device_info.ppEnabledExtensionNames = enabled_extensions.data();
@@ -1543,8 +1623,8 @@ struct VulkanExecutor::Impl {
         physical_device, &device_info, /*pAllocator=*/nullptr, &device));
 
 #define LOAD_DEVICE_PROC(name)                                                \
-  ABSL_RETURN_IF_ERROR(LoadDeviceProc(Driver().get_device_proc_addr, device, #name, \
-                                 &name))
+  ABSL_RETURN_IF_ERROR(        \
+      LoadDeviceProc(Driver().get_device_proc_addr, device, #name, &name))
     LOAD_DEVICE_PROC(vkDestroyDevice);
     LOAD_DEVICE_PROC(vkGetDeviceQueue);
     LOAD_DEVICE_PROC(vkCreateBuffer);
@@ -1711,6 +1791,8 @@ struct VulkanExecutor::Impl {
   VkPhysicalDeviceProperties properties = {};
   VkPhysicalDeviceMemoryProperties memory_properties = {};
   bool shader_bfloat16 = false;
+  bool shader_bfloat16_dot_product = false;
+  bool shader_bfloat16_cooperative_matrix = false;
   bool storage_buffer_16bit_access = false;
   absl::Mutex allocations_mutex;
   std::map<uintptr_t, std::unique_ptr<Allocation>> allocations;
@@ -1793,8 +1875,7 @@ class VulkanStream final : public StreamCommon {
   absl::Status WaitFor(Event* event) override {
     if (event == nullptr) return absl::OkStatus();
     auto* vulkan_event = dynamic_cast<VulkanEvent*>(event);
-    if (vulkan_event == nullptr ||
-        (vulkan_event->executor() != nullptr &&
+    if (vulkan_event == nullptr || (vulkan_event->executor() != nullptr &&
          vulkan_event->executor() != executor_)) {
       return event->Synchronize();
     }
@@ -1866,10 +1947,10 @@ class VulkanStream final : public StreamCommon {
   uint64_t wait_value_ = 0;
 };
 
-absl::Status VulkanKernel::Launch(
-    const ThreadDim& thread_dims, const BlockDim& block_dims,
-    const std::optional<ClusterDim>& cluster_dims, Stream* stream,
-    const KernelArgs& args) {
+absl::Status VulkanKernel::Launch(const ThreadDim& thread_dims,
+                                  const BlockDim& block_dims,
+                                  const std::optional<ClusterDim>& cluster_dims,
+                                  Stream* stream, const KernelArgs& args) {
   if (cluster_dims.has_value() &&
       (cluster_dims->x != 1 || cluster_dims->y != 1 ||
        cluster_dims->z != 1)) {
@@ -1880,8 +1961,7 @@ absl::Status VulkanKernel::Launch(
   if (vulkan_stream == nullptr) {
     return absl::InvalidArgumentError("Vulkan kernel requires VulkanStream");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      uint64_t value,
+  ABSL_ASSIGN_OR_RETURN(uint64_t value,
       executor_->Launch(*this, thread_dims, block_dims, args,
                         vulkan_stream->wait_value()));
   vulkan_stream->Submitted(value);
@@ -1890,16 +1970,15 @@ absl::Status VulkanKernel::Launch(
 
 absl::StatusOr<std::vector<DeviceAddressBase>> GetDeviceArguments(
     const KernelArgs& args) {
-  if (const auto* device_args =
-          DynCast<KernelArgsDeviceAddressArray>(&args)) {
-    return std::vector<DeviceAddressBase>(device_args->device_addr_args().begin(),
+  if (const auto* device_args = DynCast<KernelArgsDeviceAddressArray>(&args)) {
+    return std::vector<DeviceAddressBase>(
+        device_args->device_addr_args().begin(),
                                           device_args->device_addr_args().end());
   }
   if (const auto* packed = DynCast<KernelArgsPackedArrayBase>(&args)) {
     if (const auto* packed_array =
             dynamic_cast<const KernelArgsPackedArray*>(packed);
-        packed_array != nullptr &&
-        packed_array->device_addresses().size() ==
+        packed_array != nullptr && packed_array->device_addresses().size() ==
             packed->argument_addresses().size()) {
       return std::vector<DeviceAddressBase>(
           packed_array->device_addresses().begin(),
@@ -2061,51 +2140,56 @@ class VulkanCommandBuffer final : public CommandBuffer {
     return Unsupported(#name);                              \
   }
   VULKAN_UNSUPPORTED_CREATE(CreateChildCommand,
-      (const CommandBuffer&, absl::Span<const Command* const>))
+                            (const CommandBuffer&,
+                             absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_COMMAND(UpdateChildCommand,
       (const Command*, const CommandBuffer&))
   VULKAN_UNSUPPORTED_CREATE(CreateChildCommand,
       (absl::AnyInvocable<absl::Status(CommandBuffer*)>,
        absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_COMMAND(UpdateChildCommand,
-      (const Command*, absl::AnyInvocable<absl::Status(CommandBuffer*)>))
+                             (const Command*,
+                              absl::AnyInvocable<absl::Status(CommandBuffer*)>))
   VULKAN_UNSUPPORTED_CREATE(CreateMemcpyD2D,
-      (DeviceAddressBase*, const DeviceAddressBase&, uint64_t,
-       absl::Span<const Command* const>))
+                            (DeviceAddressBase*, const DeviceAddressBase&,
+                             uint64_t, absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_COMMAND(UpdateMemcpyD2D,
-      (const Command*, DeviceAddressBase*, const DeviceAddressBase&, uint64_t))
+                             (const Command*, DeviceAddressBase*,
+                              const DeviceAddressBase&, uint64_t))
   VULKAN_UNSUPPORTED_CREATE(CreateMemset,
       (DeviceAddressBase*, BitPattern, size_t,
        absl::Span<const Command* const>))
-  VULKAN_UNSUPPORTED_COMMAND(UpdateMemset,
-      (const Command*, DeviceAddressBase*, const BitPattern&, size_t))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateMemset, (const Command*, DeviceAddressBase*,
+                                            const BitPattern&, size_t))
   VULKAN_UNSUPPORTED_CREATE(CreateDnnGraphCommand,
-      (dnn::DnnGraph&, Stream&, absl::Span<DeviceAddressBase>,
+                            (dnn::DnnGraph&, Stream&,
+                             absl::Span<DeviceAddressBase>,
        absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_COMMAND(UpdateDnnGraphCommand,
       (const Command*, dnn::DnnGraph&, Stream&,
        absl::Span<DeviceAddressBase>))
-  VULKAN_UNSUPPORTED_CREATE(CreateCase,
-      (DeviceAddress<int32_t>, std::vector<CreateCommands>,
+  VULKAN_UNSUPPORTED_CREATE(CreateCase, (DeviceAddress<int32_t>,
+                                         std::vector<CreateCommands>,
        absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_CREATE(CreateCase,
       (DeviceAddress<bool>, std::vector<CreateCommands>,
        absl::Span<const Command* const>))
   VULKAN_UNSUPPORTED_COMMAND(UpdateCase,
-      (const Command*, DeviceAddress<int32_t>, std::vector<UpdateCommands>))
-  VULKAN_UNSUPPORTED_COMMAND(UpdateCase,
-      (const Command*, DeviceAddress<bool>, std::vector<UpdateCommands>))
+                             (const Command*, DeviceAddress<int32_t>,
+                              std::vector<UpdateCommands>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateCase, (const Command*, DeviceAddress<bool>,
+                                          std::vector<UpdateCommands>))
   VULKAN_UNSUPPORTED_CREATE(CreateWhile,
-      (DeviceAddress<bool>, CreateCommands, CreateCommands,
-       absl::Span<const Command* const>))
-  VULKAN_UNSUPPORTED_COMMAND(UpdateWhile,
-      (const Command*, DeviceAddress<bool>, UpdateCommands, UpdateCommands))
+                            (DeviceAddress<bool>, CreateCommands,
+                             CreateCommands, absl::Span<const Command* const>))
+  VULKAN_UNSUPPORTED_COMMAND(UpdateWhile, (const Command*, DeviceAddress<bool>,
+                                           UpdateCommands, UpdateCommands))
 #undef VULKAN_UNSUPPORTED_CREATE
 #undef VULKAN_UNSUPPORTED_COMMAND
 
  private:
-  absl::Status Trace(
-      Stream*, absl::AnyInvocable<absl::Status(Stream*)>) override {
+  absl::Status Trace(Stream*,
+                     absl::AnyInvocable<absl::Status(Stream*)>) override {
     return Unsupported("Trace");
   }
   absl::Status CheckCreating() const {
@@ -2170,6 +2254,22 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
   ABSL_RETURN_IF_ERROR(
       ValidateDevicePerformanceProperties(properties, performance));
 
+  LOG(INFO) << "Vulkan BF16 capabilities for " << properties.deviceName
+            << ": storageBuffer16BitAccess="
+            << shader_features.storage_buffer_16bit_access
+            << ", shaderBFloat16Type=" << shader_features.shader_bfloat16
+            << ", shaderBFloat16DotProduct="
+            << shader_features.shader_bfloat16_dot_product
+            << ", shaderBFloat16CooperativeMatrix="
+            << shader_features.shader_bfloat16_cooperative_matrix
+            << ", cooperativeMatrixBf16Shapes="
+            << shader_features.bfloat16_cooperative_matrix_shapes.size()
+            << ", selectedGemmVariant="
+            << (shader_features.shader_bfloat16 &&
+                        shader_features.shader_bfloat16_dot_product
+                    ? "native-dot"
+                    : "portable");
+
   auto description = std::make_unique<DeviceDescription>();
   description->set_name(properties.deviceName);
   description->set_model_str(properties.deviceName);
@@ -2183,15 +2283,17 @@ VulkanExecutor::CreateDeviceDescription(int device_ordinal) {
       VK_API_VERSION_MAJOR(properties.apiVersion),
       VK_API_VERSION_MINOR(properties.apiVersion),
       shader_features.shader_bfloat16,
-      shader_features.storage_buffer_16bit_access,
-      performance.subgroup_size, performance.subgroup_basic,
-      performance.subgroup_shuffle);
-  description->set_thread_dim_limit(ThreadDim(
-      properties.limits.maxComputeWorkGroupSize[0],
+      shader_features.storage_buffer_16bit_access, performance.subgroup_size,
+      performance.subgroup_basic, performance.subgroup_shuffle,
+      shader_features.shader_bfloat16_dot_product,
+      shader_features.shader_bfloat16_cooperative_matrix,
+      std::move(shader_features.bfloat16_cooperative_matrix_shapes));
+  description->set_thread_dim_limit(
+      ThreadDim(properties.limits.maxComputeWorkGroupSize[0],
       properties.limits.maxComputeWorkGroupSize[1],
       properties.limits.maxComputeWorkGroupSize[2]));
-  description->set_block_dim_limit(BlockDim(
-      properties.limits.maxComputeWorkGroupCount[0],
+  description->set_block_dim_limit(
+      BlockDim(properties.limits.maxComputeWorkGroupCount[0],
       properties.limits.maxComputeWorkGroupCount[1],
       properties.limits.maxComputeWorkGroupCount[2]));
   description->set_threads_per_block_limit(
@@ -2301,8 +2403,8 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
   layout_info.pBindings = layout_bindings.data();
   RETURN_IF_VK_ERROR(impl_->vkCreateDescriptorSetLayout(
       impl_->device, &layout_info, nullptr, &kernel->descriptor_set_layout_));
-  impl_->SetObjectName(
-      VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, kernel->descriptor_set_layout_,
+  impl_->SetObjectName(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+                       kernel->descriptor_set_layout_,
       absl::StrCat("XLA descriptors: ", kernel->name()));
 
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
@@ -2334,16 +2436,15 @@ absl::StatusOr<std::unique_ptr<Kernel>> VulkanExecutor::LoadKernel(
 
   if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
           spec.kernel_args_packing())) {
-    kernel->set_args_packing(
-        std::get<KernelLoaderSpec::KernelArgsPackingFunc>(
+    kernel->set_args_packing(std::get<KernelLoaderSpec::KernelArgsPackingFunc>(
             spec.kernel_args_packing()));
   }
   return std::move(kernel);
 }
 
 void VulkanExecutor::UnloadKernel(const Kernel* kernel) {
-  auto* vulkan_kernel = const_cast<VulkanKernel*>(
-      dynamic_cast<const VulkanKernel*>(kernel));
+  auto* vulkan_kernel =
+      const_cast<VulkanKernel*>(dynamic_cast<const VulkanKernel*>(kernel));
   if (vulkan_kernel == nullptr || impl_->device == VK_NULL_HANDLE) return;
   if (vulkan_kernel->pipeline_ != VK_NULL_HANDLE) {
     impl_->vkDestroyPipeline(impl_->device, vulkan_kernel->pipeline_, nullptr);
@@ -2663,8 +2764,8 @@ bool VulkanExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t compatible_heaps = 0;
   uint32_t device_local_heaps = 0;
-  for (uint32_t i = 0;
-       i < memory_properties.memoryProperties.memoryTypeCount; ++i) {
+  for (uint32_t i = 0; i < memory_properties.memoryProperties.memoryTypeCount;
+       ++i) {
     const VkMemoryType& type =
         memory_properties.memoryProperties.memoryTypes[i];
     if ((type.propertyFlags & required) == required) {
@@ -2678,8 +2779,8 @@ bool VulkanExecutor::DeviceMemoryUsage(int64_t* free, int64_t* total) const {
 
   uint64_t budget = 0;
   uint64_t available = 0;
-  for (uint32_t i = 0;
-       i < memory_properties.memoryProperties.memoryHeapCount; ++i) {
+  for (uint32_t i = 0; i < memory_properties.memoryProperties.memoryHeapCount;
+       ++i) {
     if ((compatible_heaps & (1u << i)) == 0) continue;
     const uint64_t heap_budget = budget_properties.heapBudget[i];
     const uint64_t heap_usage = budget_properties.heapUsage[i];
@@ -2782,16 +2883,16 @@ absl::StatusOr<uint64_t> VulkanExecutor::SubmitCommandBatch(
   return *submitted;
 }
 
-absl::Status VulkanExecutor::RecordLaunch(
-    CommandBatch* batch,
-    const VulkanKernel& kernel, const ThreadDim& thread_dims,
-    const BlockDim& block_dims, const KernelArgs& args) {
+absl::Status VulkanExecutor::RecordLaunch(CommandBatch* batch,
+                                          const VulkanKernel& kernel,
+                                          const ThreadDim& thread_dims,
+                                          const BlockDim& block_dims,
+                                          const KernelArgs& args) {
   if (batch == nullptr || batch->command_buffer == VK_NULL_HANDLE) {
     return absl::InvalidArgumentError("Vulkan command batch is not recording");
   }
   tsl::profiler::TraceMe trace([&] {
-    return tsl::profiler::TraceMeEncode(
-        "VulkanLaunchKernel",
+    return tsl::profiler::TraceMeEncode("VulkanLaunchKernel",
         {{"kernel", kernel.name()},
          {"grid_x", block_dims.x},
          {"grid_y", block_dims.y},
@@ -2821,12 +2922,14 @@ absl::Status VulkanExecutor::RecordLaunch(
       return absl::InvalidArgumentError("Vulkan descriptor argument is missing");
     }
     const DeviceAddressBase& argument = arguments[binding.argument_index];
-    ABSL_ASSIGN_OR_RETURN(Impl::AllocationView view,
+    ABSL_ASSIGN_OR_RETURN(
+        Impl::AllocationView view,
                      impl_->FindAllocation(argument.opaque(), argument.size()));
     VkDescriptorBufferInfo buffer_info = {};
     buffer_info.buffer = view.allocation->buffer;
     buffer_info.offset = view.offset;
-    buffer_info.range = argument.size() == 0 ? view.allocation->size - view.offset
+    buffer_info.range = argument.size() == 0
+                            ? view.allocation->size - view.offset
                                              : argument.size();
     if (buffer_info.offset %
             impl_->properties.limits.minStorageBufferOffsetAlignment !=
@@ -2932,11 +3035,13 @@ absl::Status VulkanExecutor::RecordLaunch(
   return absl::OkStatus();
 }
 
-absl::StatusOr<uint64_t> VulkanExecutor::Launch(
-    const VulkanKernel& kernel, const ThreadDim& thread_dims,
-    const BlockDim& block_dims, const KernelArgs& args,
+absl::StatusOr<uint64_t> VulkanExecutor::Launch(const VulkanKernel& kernel,
+                                                const ThreadDim& thread_dims,
+                                                const BlockDim& block_dims,
+                                                const KernelArgs& args,
     uint64_t wait_value) {
-  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<CommandBatch> batch, BeginCommandBatch());
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<CommandBatch> batch,
+                        BeginCommandBatch());
   absl::Status recorded =
       RecordLaunch(batch.get(), kernel, thread_dims, block_dims, args);
   if (!recorded.ok()) {

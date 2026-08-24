@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
@@ -33,6 +34,12 @@ const bool kUnused =
        gpu_config.collective_memory_size = 0;
        GpuClientOptions options;
        options.allocator_config = std::move(gpu_config);
+       const char* device_type = std::getenv("XLA_TEST_DEVICE_TYPE");
+       if (device_type != nullptr && std::strcmp(device_type, "plugin") == 0) {
+         if (const char* device = std::getenv("XLA_TEST_DEVICE")) {
+           options.platform_name = device;
+         }
+       }
        return GetXlaPjrtGpuClient(options);
      }),
      true);

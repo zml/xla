@@ -256,6 +256,7 @@ cc_library(
     deps = [
         ":se_gpu_pjrt_client_impl",
         ":se_gpu_pjrt_compiler_cuda_registration",
+        ":se_gpu_pjrt_compiler_vulkan_registration",
         ":se_gpu_topology_description",
         "//xla:executable_run_options",
         "//xla:future",

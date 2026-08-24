@@ -41,30 +41,57 @@ limitations under the License.
 
 namespace stream_executor {
 
+struct VulkanCooperativeMatrixShape {
+  uint32_t m_size = 0;
+  uint32_t n_size = 0;
+  uint32_t k_size = 0;
+  uint32_t scope = 0;
+
+  friend bool operator==(const VulkanCooperativeMatrixShape& lhs,
+                         const VulkanCooperativeMatrixShape& rhs) {
+    return lhs.m_size == rhs.m_size && lhs.n_size == rhs.n_size &&
+           lhs.k_size == rhs.k_size && lhs.scope == rhs.scope;
+  }
+};
+
 class VulkanComputeCapability {
  public:
   VulkanComputeCapability() = default;
-  VulkanComputeCapability(uint32_t api_version_major,
-                          uint32_t api_version_minor,
-                          bool shader_bfloat16 = false,
-                          bool storage_buffer_16bit_access = false,
-                          uint32_t subgroup_size = 0,
-                          bool subgroup_basic = false,
-                          bool subgroup_shuffle = false)
+  VulkanComputeCapability(
+      uint32_t api_version_major, uint32_t api_version_minor,
+      bool shader_bfloat16 = false, bool storage_buffer_16bit_access = false,
+      uint32_t subgroup_size = 0, bool subgroup_basic = false,
+      bool subgroup_shuffle = false, bool shader_bfloat16_dot_product = false,
+      bool shader_bfloat16_cooperative_matrix = false,
+      std::vector<VulkanCooperativeMatrixShape>
+          bfloat16_cooperative_matrix_shapes = {})
       : api_version_major_(api_version_major),
         api_version_minor_(api_version_minor),
         shader_bfloat16_(shader_bfloat16),
         storage_buffer_16bit_access_(storage_buffer_16bit_access),
         subgroup_size_(subgroup_size),
         subgroup_basic_(subgroup_basic),
-        subgroup_shuffle_(subgroup_shuffle) {}
+        subgroup_shuffle_(subgroup_shuffle),
+        shader_bfloat16_dot_product_(shader_bfloat16_dot_product),
+        shader_bfloat16_cooperative_matrix_(shader_bfloat16_cooperative_matrix),
+        bfloat16_cooperative_matrix_shapes_(
+            std::move(bfloat16_cooperative_matrix_shapes)) {}
   explicit VulkanComputeCapability(const VulkanComputeCapabilityProto& proto)
-      : VulkanComputeCapability(proto.api_version_major(),
-                                proto.api_version_minor(),
-                                proto.shader_bfloat16(),
-                                proto.storage_buffer_16bit_access(),
+      : VulkanComputeCapability(
+            proto.api_version_major(), proto.api_version_minor(),
+            proto.shader_bfloat16(), proto.storage_buffer_16bit_access(),
                                 proto.subgroup_size(), proto.subgroup_basic(),
-                                proto.subgroup_shuffle()) {}
+            proto.subgroup_shuffle(), proto.shader_bfloat16_dot_product(),
+            proto.shader_bfloat16_cooperative_matrix(), [&proto] {
+              std::vector<VulkanCooperativeMatrixShape> shapes;
+              shapes.reserve(proto.bfloat16_cooperative_matrix_shapes_size());
+              for (const auto& shape :
+                   proto.bfloat16_cooperative_matrix_shapes()) {
+                shapes.push_back({shape.m_size(), shape.n_size(),
+                                  shape.k_size(), shape.scope()});
+              }
+              return shapes;
+            }()) {}
 
   uint32_t api_version_major() const { return api_version_major_; }
   uint32_t api_version_minor() const { return api_version_minor_; }
@@ -75,6 +102,16 @@ class VulkanComputeCapability {
   uint32_t subgroup_size() const { return subgroup_size_; }
   bool subgroup_basic() const { return subgroup_basic_; }
   bool subgroup_shuffle() const { return subgroup_shuffle_; }
+  bool shader_bfloat16_dot_product() const {
+    return shader_bfloat16_dot_product_;
+  }
+  bool shader_bfloat16_cooperative_matrix() const {
+    return shader_bfloat16_cooperative_matrix_;
+  }
+  absl::Span<const VulkanCooperativeMatrixShape>
+  bfloat16_cooperative_matrix_shapes() const {
+    return bfloat16_cooperative_matrix_shapes_;
+  }
 
   std::string ToString() const;
   VulkanComputeCapabilityProto ToProto() const;
@@ -88,7 +125,13 @@ class VulkanComputeCapability {
                rhs.storage_buffer_16bit_access_ &&
            lhs.subgroup_size_ == rhs.subgroup_size_ &&
            lhs.subgroup_basic_ == rhs.subgroup_basic_ &&
-           lhs.subgroup_shuffle_ == rhs.subgroup_shuffle_;
+           lhs.subgroup_shuffle_ == rhs.subgroup_shuffle_ &&
+           lhs.shader_bfloat16_dot_product_ ==
+               rhs.shader_bfloat16_dot_product_ &&
+           lhs.shader_bfloat16_cooperative_matrix_ ==
+               rhs.shader_bfloat16_cooperative_matrix_ &&
+           lhs.bfloat16_cooperative_matrix_shapes_ ==
+               rhs.bfloat16_cooperative_matrix_shapes_;
   }
 
  private:
@@ -99,6 +142,9 @@ class VulkanComputeCapability {
   uint32_t subgroup_size_ = 0;
   bool subgroup_basic_ = false;
   bool subgroup_shuffle_ = false;
+  bool shader_bfloat16_dot_product_ = false;
+  bool shader_bfloat16_cooperative_matrix_ = false;
+  std::vector<VulkanCooperativeMatrixShape> bfloat16_cooperative_matrix_shapes_;
 };
 
 // Describes the capabilities and performance characteristics of a specific
@@ -660,17 +706,20 @@ class DeviceDescription {
     gpu_compute_capability_ = OneAPIComputeCapability(ip_version);
   }
 
-  void set_vulkan_compute_capability(uint32_t api_version_major,
-                                     uint32_t api_version_minor,
-                                     bool shader_bfloat16 = false,
-                                     bool storage_buffer_16bit_access = false,
-                                     uint32_t subgroup_size = 0,
-                                     bool subgroup_basic = false,
-                                     bool subgroup_shuffle = false) {
+  void set_vulkan_compute_capability(
+      uint32_t api_version_major, uint32_t api_version_minor,
+      bool shader_bfloat16 = false, bool storage_buffer_16bit_access = false,
+      uint32_t subgroup_size = 0, bool subgroup_basic = false,
+      bool subgroup_shuffle = false, bool shader_bfloat16_dot_product = false,
+      bool shader_bfloat16_cooperative_matrix = false,
+      std::vector<VulkanCooperativeMatrixShape>
+          bfloat16_cooperative_matrix_shapes = {}) {
     gpu_compute_capability_ = VulkanComputeCapability(
         api_version_major, api_version_minor, shader_bfloat16,
         storage_buffer_16bit_access, subgroup_size, subgroup_basic,
-        subgroup_shuffle);
+        subgroup_shuffle, shader_bfloat16_dot_product,
+        shader_bfloat16_cooperative_matrix,
+        std::move(bfloat16_cooperative_matrix_shapes));
   }
 
   void set_numa_node(int value) { numa_node_ = value; }

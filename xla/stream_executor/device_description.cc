@@ -51,6 +51,17 @@ VulkanComputeCapabilityProto VulkanComputeCapability::ToProto() const {
   proto.set_subgroup_size(subgroup_size_);
   proto.set_subgroup_basic(subgroup_basic_);
   proto.set_subgroup_shuffle(subgroup_shuffle_);
+  proto.set_shader_bfloat16_dot_product(shader_bfloat16_dot_product_);
+  proto.set_shader_bfloat16_cooperative_matrix(
+      shader_bfloat16_cooperative_matrix_);
+  for (const VulkanCooperativeMatrixShape& shape :
+       bfloat16_cooperative_matrix_shapes_) {
+    auto* shape_proto = proto.add_bfloat16_cooperative_matrix_shapes();
+    shape_proto->set_m_size(shape.m_size);
+    shape_proto->set_n_size(shape.n_size);
+    shape_proto->set_k_size(shape.k_size);
+    shape_proto->set_scope(shape.scope);
+  }
   return proto;
 }
 
@@ -154,7 +165,8 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
         ExecutionUnitDescription::FromProto(proto.matrix_unit_description()));
   }
   if (!proto.driver_version().empty()) {
-    ABSL_ASSIGN_OR_RETURN(device_description.driver_version_,
+    ABSL_ASSIGN_OR_RETURN(
+        device_description.driver_version_,
                      SemanticVersion::ParseFromString(proto.driver_version()));
   }
   if (!proto.kernel_mode_driver_version().empty()) {
@@ -163,7 +175,8 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
         SemanticVersion::ParseFromString(proto.kernel_mode_driver_version()));
   }
   if (!proto.runtime_version().empty()) {
-    ABSL_ASSIGN_OR_RETURN(device_description.runtime_version_,
+    ABSL_ASSIGN_OR_RETURN(
+        device_description.runtime_version_,
                      SemanticVersion::ParseFromString(proto.runtime_version()));
   }
   if (!proto.compile_time_toolkit_version().empty()) {
@@ -172,11 +185,13 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
         SemanticVersion::ParseFromString(proto.compile_time_toolkit_version()));
   }
   if (!proto.dnn_version().empty()) {
-    ABSL_ASSIGN_OR_RETURN(device_description.dnn_version_,
+    ABSL_ASSIGN_OR_RETURN(
+        device_description.dnn_version_,
                      SemanticVersion::ParseFromString(proto.dnn_version()));
   }
   if (!proto.cub_version().empty()) {
-    ABSL_ASSIGN_OR_RETURN(device_description.cub_version_,
+    ABSL_ASSIGN_OR_RETURN(
+        device_description.cub_version_,
                      SemanticVersion::ParseFromString(proto.cub_version()));
   }
   ABSL_ASSIGN_OR_RETURN(

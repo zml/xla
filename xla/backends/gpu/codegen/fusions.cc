@@ -74,7 +74,12 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       return std::make_unique<CustomFusion>();
     case HloFusionAnalysis::EmitterFusionKind::kLoop: {
       if (std::optional<VulkanGemmConfig> config = MatchVulkanGemm(analysis)) {
-        VLOG(1) << "Selecting portable Vulkan bf16 GEMM for M=" << config->m
+        VLOG(1) << "Selecting "
+                << (config->kernel_variant ==
+                            VulkanGemmKernelVariant::kNativeBf16Dot
+                        ? "native-dot"
+                        : "portable")
+                << " Vulkan bf16 GEMM for M=" << config->m
                 << ", N=" << config->n << ", K=" << config->k << ", rhs=["
                 << (config->rhs_layout == VulkanGemmRhsLayout::kKxN ? "K,N"
                                                                     : "N,K")

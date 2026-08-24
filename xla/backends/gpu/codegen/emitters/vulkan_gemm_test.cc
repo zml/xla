@@ -25,6 +25,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -45,27 +48,63 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
-se::DeviceDescription VulkanDeviceInfo() {
+se::DeviceDescription VulkanDeviceInfo(bool native_bf16_dot = false) {
   se::DeviceDescription device = TestGpuDeviceInfo::RTXA6000DeviceInfo();
   device.set_vulkan_compute_capability(
       /*api_version_major=*/1, /*api_version_minor=*/4,
-      /*shader_bfloat16=*/false, /*storage_buffer_16bit_access=*/true,
+      /*shader_bfloat16=*/native_bf16_dot,
+      /*storage_buffer_16bit_access=*/true,
       /*subgroup_size=*/32, /*subgroup_basic=*/true,
-      /*subgroup_shuffle=*/true);
+      /*subgroup_shuffle=*/true,
+      /*shader_bfloat16_dot_product=*/native_bf16_dot);
   return device;
+}
+
+bool HasSpirvOpcode(absl::string_view binary, uint16_t opcode,
+                    std::optional<uint32_t> first_operand = std::nullopt) {
+  if (binary.size() % sizeof(uint32_t) != 0 ||
+      binary.size() < 5 * sizeof(uint32_t)) {
+    return false;
+  }
+  const size_t word_count = binary.size() / sizeof(uint32_t);
+  std::vector<uint32_t> words(word_count);
+  std::memcpy(words.data(), binary.data(), binary.size());
+  for (size_t index = 5; index < word_count;) {
+    uint16_t instruction_words = words[index] >> 16;
+    uint16_t instruction_opcode = words[index] & 0xffff;
+    if (instruction_words == 0 || index + instruction_words > word_count) {
+      return false;
+    }
+    if (instruction_opcode == opcode &&
+        (!first_operand.has_value() ||
+         (instruction_words > 1 && words[index + 1] == *first_operand))) {
+      return true;
+    }
+    index += instruction_words;
+  }
+  return false;
+}
+
+bool HasSpirvCapability(absl::string_view binary, uint32_t capability) {
+  constexpr uint16_t kOpCapability = 17;
+  return HasSpirvOpcode(binary, kOpCapability, capability);
 }
 
 class VulkanGemmEmitterTest : public HloHardwareIndependentTestBase {
  protected:
-  void ExpectLowersToVulkanSpirv(absl::string_view hlo) {
+  void ExpectLowersToVulkanSpirv(absl::string_view hlo,
+                                 bool native_bf16_dot = false) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
                          ParseAndReturnVerifiedModule(hlo));
     HloFusionInstruction* fusion = Cast<HloFusionInstruction>(
         module->entry_computation()->root_instruction());
-    se::DeviceDescription device = VulkanDeviceInfo();
+    se::DeviceDescription device = VulkanDeviceInfo(native_bf16_dot);
     HloFusionAnalysis analysis = HloFusionAnalysis::Create(*fusion, device);
     std::optional<VulkanGemmConfig> config = MatchVulkanGemm(analysis);
     ASSERT_TRUE(config.has_value());
+    EXPECT_EQ(config->kernel_variant,
+              native_bf16_dot ? VulkanGemmKernelVariant::kNativeBf16Dot
+                              : VulkanGemmKernelVariant::kPortable);
 
     std::unique_ptr<mlir::MLIRContext> context = CreateMlirContext();
     context->appendDialectRegistry(
@@ -89,7 +128,11 @@ class VulkanGemmEmitterTest : public HloHardwareIndependentTestBase {
     std::string llvm_ir;
     llvm::raw_string_ostream llvm_stream(llvm_ir);
     llvm_source.module()->print(llvm_stream, nullptr);
-    EXPECT_EQ(llvm_ir.find("bfloat"), std::string::npos);
+    if (native_bf16_dot) {
+      EXPECT_NE(llvm_ir.find("bfloat"), std::string::npos);
+    } else {
+      EXPECT_EQ(llvm_ir.find("bfloat"), std::string::npos);
+    }
     ASSERT_OK_AND_ASSIGN(
         std::string spirv,
         spirv::CompileToVulkanSPIRV(llvm_source.module(),
@@ -100,6 +143,24 @@ class VulkanGemmEmitterTest : public HloHardwareIndependentTestBase {
     uint32_t magic = 0;
     std::memcpy(&magic, spirv.data(), sizeof(magic));
     EXPECT_EQ(magic, 0x07230203);
+
+    constexpr uint32_t kBFloat16TypeCapability = 5116;
+    constexpr uint32_t kBFloat16DotProductCapability = 5117;
+    constexpr uint32_t kBFloat16CooperativeMatrixCapability = 5118;
+    constexpr uint16_t kOpDot = 148;
+    if (native_bf16_dot) {
+      EXPECT_TRUE(HasSpirvCapability(spirv, kBFloat16TypeCapability));
+      EXPECT_TRUE(HasSpirvCapability(spirv, kBFloat16DotProductCapability));
+      EXPECT_FALSE(
+          HasSpirvCapability(spirv, kBFloat16CooperativeMatrixCapability));
+      EXPECT_TRUE(HasSpirvOpcode(spirv, kOpDot));
+    } else {
+      EXPECT_FALSE(HasSpirvCapability(spirv, kBFloat16TypeCapability));
+      EXPECT_FALSE(HasSpirvCapability(spirv, kBFloat16DotProductCapability));
+      EXPECT_FALSE(
+          HasSpirvCapability(spirv, kBFloat16CooperativeMatrixCapability));
+      EXPECT_FALSE(HasSpirvOpcode(spirv, kOpDot));
+    }
   }
 };
 
@@ -231,6 +292,25 @@ ENTRY main {
   rhs = bf16[21,19]{1,0} parameter(1)
   ROOT fusion = bf16[17,19]{1,0} fusion(lhs, rhs), kind=kLoop, calls=gemm
 })");
+}
+
+TEST_F(VulkanGemmEmitterTest, LowersNativeBf16DotToVulkanSpirv) {
+  ExpectLowersToVulkanSpirv(R"(
+HloModule gemm
+
+gemm {
+  lhs = bf16[17,21]{1,0} parameter(0)
+  rhs = bf16[21,19]{1,0} parameter(1)
+  ROOT dot = bf16[17,19]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY main {
+  lhs = bf16[17,21]{1,0} parameter(0)
+  rhs = bf16[21,19]{1,0} parameter(1)
+  ROOT fusion = bf16[17,19]{1,0} fusion(lhs, rhs), kind=kLoop, calls=gemm
+})",
+                            /*native_bf16_dot=*/true);
 }
 
 TEST_F(VulkanGemmEmitterTest, LowersTransposedRhsToVulkanSpirv) {
