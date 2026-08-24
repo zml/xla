@@ -215,14 +215,37 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
   }
   const bool is_thin_m = m < 128;
 
-  // Thin-M decode: search block_m from mma.sync m16, not past padded M.
+  // Thin-M decode: search block_m from mma.sync m16. The ceiling stays at 128
+  // even though M is smaller, because on sm_100/sm_103 that is the difference
+  // between a block-scaled tensor-core dot and no block-scaled dot at all.
+  // Triton's tcgen05 pattern (ScaledBlockedToMMAv5 in AccelerateMatmul.cpp)
+  // declines any tile with retShapePerCTA[0] < 128, and the warp-level pattern
+  // that would otherwise catch a thin tile is sm_120-only -- it emits
+  // mma.sync mxf4nvf4 and builds an SM120-specific scale layout. So a decode
+  // dot capped at block_m=64 matches neither and falls back to
+  // DecomposeScaledBlocked, which upcasts NVFP4 to bf16 and reads four times
+  // the weight bytes. Padding a one-row tile out to 128 rows costs almost
+  // nothing at bs1, where the weights dominate and are read once either way.
+  // Offer both and let the autotuner settle it: on sm_120 the thin tiles still
+  // win, because there the warp-level path handles them natively.
   const int min_block_m = is_thin_m ? 16 : 128;
-  const int max_block_m = is_thin_m ? 64 : 256;
+  const int max_block_m = is_thin_m ? 128 : 256;
 
   for (int block_m = min_block_m; block_m <= max_block_m; block_m *= 2) {
     for (int block_n = 16; block_n <= 256; block_n *= 2) {
-      for (int block_k = 128; block_k <= 256; block_k *= 2) {
-        const int max_stages = is_thin_m ? 4 : 1;
+      // 512 is the measured sweet spot for NVFP4 decode: on the widest
+      // projection the autotuner sees k128=68us, k256=56us, k512=43us, and
+      // k1024 back up at 36-48us, so the ceiling stays where the curve turns.
+      for (int block_k = 128; block_k <= 512; block_k *= 2) {
+        // Decode projections are bandwidth-starved rather than compute-bound:
+        // with M small the tile grid is one row deep, so a narrow-N dot such as
+        // [6656,19968] launches ~104 blocks against 152 SMs and cannot fill the
+        // machine, let alone keep enough loads in flight to reach HBM speed.
+        // Pipeline depth is the lever that adds outstanding loads without
+        // changing the tiling, so search deeper than the 4 stages that were
+        // enough when the ceiling was a 5090-class memory system. Configs that
+        // do not fit in shared memory fail to compile and are simply dropped.
+        const int max_stages = is_thin_m ? 8 : 1;
         const int max_warps = is_thin_m ? 8 : 4;
         for (int num_stages = 1; num_stages <= max_stages; ++num_stages) {
           for (int num_warps = 4; num_warps <= max_warps; num_warps *= 2) {
@@ -231,22 +254,58 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
             // hardcoded 4 and so mis-scored every 8-warp config.
             const int elements_per_thread =
                 (block_m * block_n) / (num_warps * 32);
-            if (!exhaustive_search &&
-                (elements_per_thread > 64 ||
-                 (block_k >= 256 && elements_per_thread >= 32))) {
+            // The block_k>=256 clause is dropped for scaled dots. It exists
+            // to avoid register pressure, but an NVFP4 dot spills 1.1-1.3 KB
+            // whatever tile it picks -- dequantising fp4 with an e4m3 scale per
+            // 16 elements needs the registers -- so pruning on predicted spill
+            // only removes configs, it does not avoid any. A long contraction
+            // like [6656,19968] wants the deeper block_k precisely because it
+            // halves the loop trips, and measuring the whole space instead of
+            // this heuristic is worth +30% end to end on GB300.
+            if (!exhaustive_search && elements_per_thread > 64) {
               VLOG(3) << "Ignoring spill over config: block_m=" << block_m
                       << " block_n=" << block_n << " block_k=" << block_k
                       << " num_warps=" << num_warps;
               continue;
             }
-            auto config = std::make_unique<BackendConfig>();
-            *config->mutable_triton() =
-                TritonGemmConfig(block_m, block_n,
-                                 /*block_k=*/block_k, num_stages, num_warps,
-                                 /*num_ctas=*/1,
-                                 /*is_tma_allowed=*/false)
-                    .ToProto();
-            configs.push_back(std::move(config));
+            // A TMA variant is offered alongside the plain one, but only for
+            // the tiles that reach the tcgen05 path (block_m >= 128). There it
+            // is worth having -- on the widest decode contraction,
+            // [6656,19968] at M=16, TMA loads run 37.3us against 40.3us -- and
+            // restricting it to those tiles keeps the candidate count from
+            // doubling. Below 128 rows Triton is on the warp-level path, whose
+            // loads are already narrow enough that TMA has nothing to add.
+            // TODO(raph): Triton itself is not healthy on every NVFP4 shape on
+            // sm_103. On a 512x2048x2048 scaled dot, 12 of 30 configs fail to
+            // legalize ttng.tc_gen5_mma_scaled, and the first one that does
+            // launch throws CUDA_ERROR_ILLEGAL_INSTRUCTION -- which poisons the
+            // context, so the remaining Triton candidates AND every Tile IR
+            // candidate die after it with "Failed to load in-memory CUBIN" and
+            // the process cores. A default all-backends compile of that shape
+            // aborts. The real model's shapes (e.g. qkv [512,6656]x[8704,6656])
+            // are fine, which is why this has not bitten in anger, but it is a
+            // live sticky-fault path with no guard in front of it. Find which
+            // configs legalize and exclude the rest, the way the scaled-dot
+            // tile floors do for Tile IR.
+            //
+            // Two knobs measured and left alone on GB300: num_ctas=2 (the
+            // 2-CTA tcgen05 MMA cuDNN's own kernels use) runs 113us against
+            // 17us on the decode qkv dot and crashes some candidates outright,
+            // and is_warp_specialization_allowed changes nothing at all --
+            // Triton emits the same kernel either way.
+            for (bool tma : {false, true}) {
+              if (tma && block_m < 128) {
+                continue;
+              }
+              auto config = std::make_unique<BackendConfig>();
+              *config->mutable_triton() =
+                  TritonGemmConfig(block_m, block_n,
+                                   /*block_k=*/block_k, num_stages, num_warps,
+                                   /*num_ctas=*/1,
+                                   /*is_tma_allowed=*/tma)
+                      .ToProto();
+              configs.push_back(std::move(config));
+            }
           }
         }
       }
