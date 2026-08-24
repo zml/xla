@@ -84,6 +84,7 @@ cc_library(
         "//xla/backends/gpu/codegen/kernels:custom_kernel",
         "//xla/backends/gpu/codegen/kernels:ptx_custom_kernel",
         "//xla/backends/gpu/codegen/tile_ir/transforms:passes",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla/backends/gpu/codegen/xtile:xtile_module",
         "//xla/backends/gpu/runtime:custom_kernel_thunk",
         "//xla/backends/gpu/runtime:thunk",
