@@ -214,6 +214,12 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
     }
   }
   const bool is_thin_m = m < 128;
+  // sm_100 / sm_103: the architectures where a thin-M scaled dot only reaches
+  // the block-scaled tensor core by padding its tile out to 128 rows.
+  const se::CudaComputeCapability* cuda_cc = gpu_cc.cuda_compute_capability();
+  const bool is_tcgen05 =
+      cuda_cc != nullptr &&
+      cuda_cc->major == se::CudaComputeCapability::kBlackwell;
 
   // Thin-M decode: search block_m from mma.sync m16. The ceiling stays at 128
   // even though M is smaller, because on sm_100/sm_103 that is the difference
@@ -245,9 +251,26 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
         // changing the tiling, so search deeper than the 4 stages that were
         // enough when the ceiling was a 5090-class memory system. Configs that
         // do not fit in shared memory fail to compile and are simply dropped.
+        // The same argument bounds the search from below on the tcgen05
+        // architectures, and there it is not a preference but a trap. A
+        // pipeline shallower than three stages leaves nothing to overlap the
+        // loads with, so it cannot win a bandwidth-bound decode dot -- and on
+        // every projection in Muse-Glimmer-30B-NVFP4 it does not: the best
+        // stages<=2 config trails the overall best by 12.4%, 13.6%, 4.5% and
+        // 22.1%. Those margins sit inside the autotuner's run-to-run noise, so
+        // offering the shallow configs does not give the autotuner a choice, it
+        // gives it a coin flip. A batch-size=1 server lost that flip on two of
+        // the four projections -- qkv and out came out at num_stages=1 and ran
+        // 23.0 and 13.6 us against the 14.2 and 9.8 us the same dots get at
+        // batch-size 16, which is how bs1 ended up SLOWER than bs16 end to end.
+        // Left alone on sm_120: there thin M goes down Triton's warp-level
+        // path, not the padded-to-128-rows tcgen05 one, and none of this was
+        // measured against it.
+        const int min_stages = (is_thin_m && is_tcgen05) ? 3 : 1;
         const int max_stages = is_thin_m ? 8 : 1;
         const int max_warps = is_thin_m ? 8 : 4;
-        for (int num_stages = 1; num_stages <= max_stages; ++num_stages) {
+        for (int num_stages = min_stages; num_stages <= max_stages;
+             ++num_stages) {
           for (int num_warps = 4; num_warps <= max_warps; num_warps *= 2) {
             // TODO(b/436988479): fine tune the search space.
             // Registers held per thread. Depends on num_warps -- the old form
