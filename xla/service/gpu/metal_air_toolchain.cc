@@ -213,12 +213,30 @@ std::string RewriteInfNanForOldAirAs(absl::string_view source) {
   return out;
 }
 
+// Renames the llvm.* math intrinsics Apple's backend cannot lower to their
+// same-signature precise air.* builtins, never the air.fast_* family.
+// llvm.maximum/minimum are absent on purpose: fmax/fmin do not propagate NaN,
+// so RewriteMathToAir handles them.
+std::string RewriteMathIntrinsicsToAirBuiltins(absl::string_view source) {
+  static const std::regex kSameName(
+      R"(@llvm\.(pow|log10|tan|tanh|asin|acos|atan|atan2|sinh|cosh|exp10)\.)"
+      R"(((?:v\d+)?f(?:16|32))\b)");
+  static const std::regex kRint(
+      R"(@llvm\.(?:roundeven|nearbyint)\.((?:v\d+)?f(?:16|32))\b)");
+  static const std::regex kLdexp(R"(@llvm\.ldexp\.(f(?:16|32))\.i32\b)");
+
+  std::string out = std::regex_replace(std::string(source), kSameName,
+                                       "@air.$1.$2");
+  out = std::regex_replace(out, kRint, "@air.rint.$1");
+  return std::regex_replace(out, kLdexp, "@air.ldexp.$1");
+}
+
 absl::StatusOr<std::vector<uint8_t>> CompileMetalAirToMetallib(
     absl::string_view raw_source, absl::string_view temp_name) {
-  const std::string source =
+  const std::string source = RewriteMathIntrinsicsToAirBuiltins(
       RewriteInfNanForOldAirAs(RewriteHexFloatsForOldAirAs(
           RewriteDecimalFloatsForOldAirAs(
-              ExpandSplatConstantsForOldAirAs(raw_source))));
+              ExpandSplatConstantsForOldAirAs(raw_source)))));
   TF_ASSIGN_OR_RETURN(std::string air_as, FindMetalTool("air-as"));
   TF_ASSIGN_OR_RETURN(std::string air_opt, FindMetalTool("air-opt"));
   TF_ASSIGN_OR_RETURN(std::string metallib, FindMetalTool("metallib"));
