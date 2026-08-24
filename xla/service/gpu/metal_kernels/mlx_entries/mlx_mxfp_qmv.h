@@ -25,15 +25,17 @@
 // 16. So everything below the includes is the four entry points, and nothing
 // else.
 //
-// NOTE: this bundle's RUNTIME path is currently unexercised -- the only model
-// that reaches it (gemma-4-12B-mxfp8) panics in ZML at graph build, well before
-// the thunk. It was migrated on emitted-IR evidence instead; see the commit.
+// These entries are covered by runtime golden values:
+// backends/gpu/runtime/metal_mx_kernel_test.cc checks both formats against the
+// exact arithmetic answer on a real device, over qmv_fast, the guarded qmv and
+// a partial N; the thin-batch case is MXFP8 only.
 //
-// TODO: 0001-k_aligned in series.bzl reaches this path too -- it patches
-// fp_qmv_impl in the archive, which this bundle includes -- so it moves this
-// bundle's codegen with no golden of its own to catch it. Accepted deliberately:
-// MXFP8 is de-scoped and unreachable, so there is nothing here to regress. Mint
-// a gemma-4-12B-mxfp8 golden and re-check this bundle if MXFP8 comes back.
+// TODO: the k_aligned fix that //third_party/mlx:series.bzl argues about would
+// reach this path -- it patches fp_qmv_impl in the archive, which this bundle
+// includes unmodified (the NVFP4 bundle calls our own fork instead, so a patch
+// would not move it). Landing it therefore moves MXFP codegen, which the
+// goldens above check for correctness but nothing checks for speed. Mint an
+// MXFP8 bench before taking that patch.
 
 // clang-format off
 #include "mlx/backend/metal/kernels/utils.h"

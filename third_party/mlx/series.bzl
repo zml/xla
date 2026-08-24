@@ -76,16 +76,16 @@ mlx_patch_list = [
     # k_aligned deserves care: it is a REAL upstream defect (the safe K-tail
     # bodies index thread U x_thread[] with a runtime bound, defeating SROA for
     # the whole function -- worth 90.8 -> 97.3 tok/s), and it is live in
-    # upstream's fp_qmv_impl. It is still not a patch, but the reason is now
-    # narrower than "nothing we compile calls that body". For the NVFP4 family
-    # that remains true -- our fork omits the tail outright (the emitter rejects
+    # upstream's fp_qmv_impl. It is still not a patch, but the reason is
+    # narrower than "nothing we compile calls that body". That holds for the
+    # NVFP4 family -- our fork omits the tail outright (the emitter rejects
     # K%16!=0, so it cannot occur) and upstream's fp_qmv_impl comes in unused.
-    # The restored mxfp bundle, however, DOES call upstream's fp_qmv_impl
-    # unmodified (mlx_entries/mlx_mxfp_qmv.h instantiates it at group_size=32),
-    # so a k_aligned patch would move MXFP codegen -- and MXFP is reachable
-    # again (ModelOpt MIXED_PRECISION checkpoints emit MXFP8). Landing it here
-    # would move a live path with no golden of its own to catch it. Mint an
-    # MXFP8 golden first; then the patch can be considered on its merits.
+    # The mxfp bundle, however, DOES call upstream's fp_qmv_impl unmodified
+    # (mlx_entries/mlx_mxfp_qmv.h instantiates it at group_size=32), so a
+    # k_aligned patch would move live MXFP codegen. Its correctness is covered
+    # (runtime/metal_mx_kernel_test.cc), but its SPEED is not, and speed is the
+    # whole point of that patch. Mint an MXFP8 bench first; then the patch can
+    # be considered on its merits.
     #
     # So: FILE THESE UPSTREAM, do not carry them here. The PRs worth writing are
     # k_aligned, QuantizedBlockLoader::load_safe's per-pack K-tail guard (a

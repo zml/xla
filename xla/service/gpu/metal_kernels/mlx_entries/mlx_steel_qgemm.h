@@ -29,13 +29,21 @@
 // Everything below is OURS: the block-FP8 / NVFP4 / MoE loaders, impls and entry
 // points that have no upstream counterpart, plus two adaptations of upstream
 // bodies that are marked XLA DELTA at their definitions -- XlaQuantizedBlockLoader
-// (a rename-fork) and the dequantize_scale_mx / DequantizeMx pair.
+// (a rename-fork) and the mlx_fp8_e4m3 / mlx_fp8_e8m0 / mlx_fp4_e2m1 renamed
+// copies of upstream's value+scale decodes.
 //
-// This bundle ships the dense block-FP8 path Qwen3.6-27B-FP8 decodes on
-// (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk), the MoE block-FP8 gather path
-// (fp8_gather_qmm_rhs via MetalMoeGemvThunk / __metal$moe_gemm$f8), and the
-// NVFP4 MoE path gemma-4-26B-A4B-NVFP4 decodes on (nvfp4_gather_qmm_rhs via
-// MetalMoeGemvThunk). Dense + MoE FP8 share Fp8BlockLoader.
+// This bundle is the TILED half of the Metal q-GEMM family -- the thin-M / b==1
+// decode legs live in the qmv bundles beside it, not here. It ships:
+//   * dense block-FP8 for b > 1 (fp8_qmm_t{,_bm64,_pc} via MetalFp8GemvThunk,
+//     which routes b == 1 to the fp8_gemv / fp8_gemv_pc bundles instead),
+//   * dense MXFP8 / MXFP4 prefill (mxfp8_qmm_t / mxfp4_qmm_t via
+//     MetalMxMatmulThunk, whose decode leg is mlx_mxfp_qmv.h),
+//   * dense NVFP4 (nvfp4_qmm_t[_alN], the split-K pair and nvfp4_splitk_sum,
+//     via MetalNvfp4MatmulThunk),
+//   * the MoE Steel gathers (fp8_gather_qmm_rhs, nvfp4_gather_qmm_rhs and
+//     bf16_gather_mm_rhs via MetalMoeGemvThunk / __metal$moe_gemm*); that thunk
+//     owns which of its legs a given R and expert count takes.
+// Dense + MoE FP8 share Fp8BlockLoader.
 //
 // NOTE: this bundle is a standalone TU compiled by CompileMetalSourceToMetallib.
 // It is a .h rather than a .metal only to match the family's convention -- the
@@ -541,14 +549,18 @@ METAL_FUNC void fp_gather_qmm_rhs_impl(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
-
-///////////////////////////////////////////////////////////////////////////////
-// MXFP8 / MXFP4 (OCP microscaling) tiled q-GEMM (prefill).
+// The 1-D group-scale q-GEMM family: MXFP8 / MXFP4 (OCP microscaling, group-32
+// E8M0 scales) AND NVFP4 (group-16 E4M3 scales). Everything under this banner
+// is shared by both -- dequantize_scale_mx picks the scale decode off
+// group_size, DequantizeMx picks the weight decode off bits, and
+// XlaQuantizedBlockLoader / mxfp_qmm_t_impl are instantiated by the nvfp4_qmm_t
+// entries as well as the mxfp8_/mxfp4_ ones. Editing anything here moves NVFP4
+// too; the `mxfp_` / `_mx` names are historical.
 //
 // Unlike the DeepSeek Fp8BlockLoader above (128x128 bf16 block scale), this is
-// MLX's ORIGINAL fp_quantized path: a per-(output-row, 32-element-K-group) E8M0
-// (uint8) scale and an E4M3 (mxfp8) / E2M1 (mxfp4) weight. The dequant helpers
+// MLX's ORIGINAL fp_quantized path: one uint8 scale per (output row, K group)
+// -- E8M0 at group 32, E4M3 at group 16 -- over an E4M3 (mxfp8) or E2M1
+// (mxfp4 / nvfp4) weight. The dequant helpers
 // XlaQuantizedBlockLoader / mxfp_qmm_t_impl are derived from MLX's fp8.h /
 // fp4.h / fp_quantized.h, with XLA constant-buffer ABI, rectangular-tile
 // bounds, and K tail handling, reusing the same Steel BlockMMA / BlockLoader
