@@ -1863,6 +1863,14 @@ absl::Status GpuCompiler::OptimizeHloModule(
   const se::DeviceDescription& device_description =
       gpu_topology.gpu_target_config().device_description;
 
+  if (hlo_module->config()
+          .debug_options()
+          .xla_gpu_experimental_emit_fp8_block_gemv()) {
+    hlo_module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);
+  }
+
   ABSL_ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
                    mlir_context_pool_.GetOrCreate());
   mlir::MLIRContext* mlir_context = borrowed_context->get();

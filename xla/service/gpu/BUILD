@@ -1828,6 +1828,7 @@ cc_library(
         "//xla/backends/gpu/runtime:thunk_proto_cc",
         "//xla/backends/gpu/target_config",
         "//xla/backends/gpu/transforms:add_tracking_suffix_to_instruction_names",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
         "//xla/backends/gpu/transforms:algebraic_simplifier",
         "//xla/backends/gpu/transforms:algorithm_checker",
