@@ -157,6 +157,57 @@ attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
       DebugOptions()));
 }
 
+TEST(SpirvBackendTest, CompilesVulkanBFloat16ComparisonSelection) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_comparison_selection(ptr %lhs, ptr %rhs, ptr %out) #0 {
+entry:
+  %lhs_float = load float, ptr %lhs, align 4
+  %rhs_float = load float, ptr %rhs, align 4
+  %lhs_bf16 = fptrunc float %lhs_float to bfloat
+  %rhs_bf16 = fptrunc float %rhs_float to bfloat
+  %take_lhs = fcmp ogt bfloat %lhs_bf16, %rhs_bf16
+  %selected = select i1 %take_lhs, bfloat %lhs_bf16, bfloat %rhs_bf16
+  %result = fpext bfloat %selected to float
+  store float %result, ptr %out, align 4
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16ElementwiseMultiply) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_storage_multiply(ptr %in, ptr %out) #0 {
+entry:
+  %value = load bfloat, ptr %in, align 2
+  %scaled = fmul bfloat %value, 0xR3E00
+  store bfloat %scaled, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
 TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageCopy) {
   llvm::LLVMContext context;
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
@@ -203,6 +254,67 @@ attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
       DebugOptions()));
 }
 
+TEST(SpirvBackendTest, CompilesVulkanBFloat16ScalarizedVectorLoad) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_scalarized_vector_load(ptr %in, ptr %out) #0 {
+entry:
+  %values = load <4 x bfloat>, ptr %in, align 2
+  %v0 = extractelement <4 x bfloat> %values, i32 0
+  %v1 = extractelement <4 x bfloat> %values, i32 1
+  %take_v0 = fcmp ogt bfloat %v0, %v1
+  %selected = select i1 %take_v0, bfloat %v0, bfloat %v1
+  store bfloat %selected, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+TEST(SpirvBackendTest, CompilesVulkanBFloat16WorkgroupArrayMovement) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+@shared = private addrspace(3) global [64 x bfloat] undef
+
+declare void @llvm.spv.all.memory.barrier.with.group.sync()
+declare i32 @llvm.spv.thread.id.in.group.i32(i32)
+
+define void @bf16_workgroup_array_movement(ptr %in, ptr %out) #0 {
+entry:
+  %index32 = call i32 @llvm.spv.thread.id.in.group.i32(i32 0)
+  %index = zext i32 %index32 to i64
+  %input = getelementptr bfloat, ptr %in, i64 %index
+  %value = load bfloat, ptr %input, align 2
+  %shared_ptr = getelementptr [64 x bfloat], ptr addrspace(3) @shared,
+                              i64 0, i64 %index
+  store bfloat %value, ptr addrspace(3) %shared_ptr, align 2
+  call void @llvm.spv.all.memory.barrier.with.group.sync()
+  %moved = load bfloat, ptr addrspace(3) %shared_ptr, align 2
+  %output = getelementptr bfloat, ptr %out, i64 %index
+  store bfloat %moved, ptr %output, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="64,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
 
 TEST(SpirvBackendTest, CompilesVulkanBFloat16StorageSelectFromConstantLoads) {
   llvm::LLVMContext context;

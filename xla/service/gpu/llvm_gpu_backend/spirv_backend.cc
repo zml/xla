@@ -34,6 +34,7 @@ limitations under the License.
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
@@ -188,6 +189,17 @@ bool UsesBFloat16(const llvm::Module& module) {
     for (const llvm::BasicBlock& block : function) {
       for (const llvm::Instruction& instruction : block) {
         if (ContainsBFloat16(instruction.getType(), visited)) return true;
+        if (const auto* gep =
+                llvm::dyn_cast<llvm::GetElementPtrInst>(&instruction);
+            gep != nullptr &&
+            ContainsBFloat16(gep->getSourceElementType(), visited)) {
+          return true;
+        }
+        if (const auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+            alloca != nullptr &&
+            ContainsBFloat16(alloca->getAllocatedType(), visited)) {
+          return true;
+        }
         for (const llvm::Use& operand : instruction.operands()) {
           if (ContainsBFloat16(operand->getType(), visited)) return true;
         }
@@ -213,13 +225,31 @@ llvm::Value* EncodeBFloat16Storage(llvm::IRBuilder<>& builder,
       builder.CreateLShr(bits, builder.getInt32(16)), builder.getInt32(1));
   llvm::Value* rounding_bias = builder.CreateAdd(builder.getInt32(0x7fff), lsb);
   llvm::Value* rounded = builder.CreateAdd(bits, rounding_bias);
-  return builder.CreateTrunc(builder.CreateLShr(rounded, builder.getInt32(16)),
-                             builder.getInt16Ty(), name);
+  llvm::Value* encoded = builder.CreateTrunc(
+      builder.CreateLShr(rounded, builder.getInt32(16)), builder.getInt16Ty(),
+      name);
+  llvm::Value* exponent =
+      builder.CreateAnd(bits, builder.getInt32(0x7f800000));
+  llvm::Value* mantissa =
+      builder.CreateAnd(bits, builder.getInt32(0x007fffff));
+  llvm::Value* is_nan = builder.CreateAnd(
+      builder.CreateICmpEQ(exponent, builder.getInt32(0x7f800000)),
+      builder.CreateICmpNE(mantissa, builder.getInt32(0)));
+  llvm::Value* quiet_nan =
+      builder.CreateOr(encoded, builder.getInt16(0x40));
+  return builder.CreateSelect(is_nan, quiet_nan, encoded);
 }
 
 llvm::Type* BFloat16StorageType(llvm::Type* type, llvm::LLVMContext& context) {
   if (type->isBFloatTy()) {
     return llvm::Type::getInt16Ty(context);
+  }
+  if (auto* array = llvm::dyn_cast<llvm::ArrayType>(type)) {
+    llvm::Type* element_type =
+        BFloat16StorageType(array->getElementType(), context);
+    return element_type == nullptr
+               ? nullptr
+               : llvm::ArrayType::get(element_type, array->getNumElements());
   }
   if (auto* vector = llvm::dyn_cast<llvm::FixedVectorType>(type);
       vector != nullptr && vector->getElementType()->isBFloatTy()) {
@@ -312,7 +342,8 @@ void LegalizeVulkanShaderComparisons(llvm::Module* module) {
 // After scalarization, express Vulkan storage-buffer and workgroup accesses as
 // aggregate GEPs with a leading zero. Logical SPIR-V requires an aggregate
 // base object in order to form OpAccessChain instructions.
-absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
+absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module,
+                                           bool legalize_bfloat16) {
   llvm::SmallVector<llvm::Instruction*> memory_operations;
   for (llvm::Function& function : *module) {
     for (llvm::BasicBlock& block : function) {
@@ -322,6 +353,22 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
         }
       }
     }
+  }
+
+  // Materialize every logical BF16 load's normalized i16 replacement before
+  // rewriting any BF16 SSA users. A vector load is scalarized into several
+  // BF16 loads whose insertelement/select users are connected. Rewriting the
+  // first scalar eagerly can otherwise synthesize i16 loads through the old
+  // BF16 GEPs before the remaining scalar loads have been normalized.
+  if (legalize_bfloat16) {
+    std::stable_partition(
+        memory_operations.begin(), memory_operations.end(),
+        [&](llvm::Instruction* operation) {
+          auto* load = llvm::dyn_cast<llvm::LoadInst>(operation);
+          return load != nullptr &&
+                 BFloat16StorageType(load->getType(), module->getContext()) !=
+                     nullptr;
+        });
   }
 
   const llvm::DataLayout& data_layout = module->getDataLayout();
@@ -343,7 +390,7 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
   };
   llvm::SmallVector<llvm::GlobalVariable*> bfloat_globals;
   for (llvm::GlobalVariable& global : module->globals()) {
-    if (global.getAddressSpace() != 0 &&
+    if (legalize_bfloat16 && global.getAddressSpace() != 0 &&
         BFloat16StorageType(global.getValueType(), module->getContext()) !=
             nullptr) {
       bfloat_globals.push_back(&global);
@@ -411,6 +458,24 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
       llvm::IRBuilder<> builder(truncate);
       storage_value = EncodeBFloat16Storage(builder, truncate->getOperand(0),
                                             truncate->getName() + ".storage");
+    } else if (auto* binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+               binary != nullptr && value->getType()->isBFloatTy()) {
+      auto lhs_or = get_bfloat_storage_value(binary->getOperand(0), binary);
+      if (!lhs_or.ok()) return lhs_or.status();
+      auto rhs_or = get_bfloat_storage_value(binary->getOperand(1), binary);
+      if (!rhs_or.ok()) return rhs_or.status();
+      llvm::IRBuilder<> builder(binary);
+      llvm::Value* lhs = DecodeBFloat16Storage(builder, *lhs_or);
+      llvm::Value* rhs = DecodeBFloat16Storage(builder, *rhs_or);
+      llvm::Value* widened = builder.CreateBinOp(
+          binary->getOpcode(), lhs, rhs, binary->getName() + ".f32");
+      if (auto* widened_instruction =
+              llvm::dyn_cast<llvm::Instruction>(widened)) {
+        widened_instruction->copyIRFlags(binary);
+        widened_instruction->copyMetadata(*binary);
+      }
+      storage_value = EncodeBFloat16Storage(
+          builder, widened, binary->getName() + ".storage");
     } else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
                load != nullptr && load->isSimple() &&
                load->getPointerAddressSpace() != 0) {
@@ -711,9 +776,6 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
           resource_load->copyMetadata(*load);
           if (IsBFloat16StorageTypePair(load->getType(), element_type)) {
             bfloat_storage_values[load] = resource_load;
-            ABSL_RETURN_IF_ERROR(
-                rewrite_bfloat_storage_uses(load, resource_load));
-            load->eraseFromParent();
             continue;
           }
           llvm::Value* converted = builder.CreateBitCast(
@@ -843,6 +905,33 @@ absl::Status NormalizeVulkanMemoryAccesses(llvm::Module* module) {
                         normalized_pointer);
     }
   }
+  auto find_bfloat_value = [&]() -> llvm::Instruction* {
+    for (llvm::Function& function : *module) {
+      for (llvm::BasicBlock& block : function) {
+        for (llvm::Instruction& instruction : block) {
+          if (BFloat16StorageType(instruction.getType(),
+                                  module->getContext()) != nullptr) {
+            return &instruction;
+          }
+        }
+      }
+    }
+    return nullptr;
+  };
+  while (legalize_bfloat16) {
+    llvm::Instruction* logical_value = find_bfloat_value();
+    if (logical_value == nullptr) break;
+    auto storage_or = get_bfloat_storage_value(logical_value, logical_value);
+    if (!storage_or.ok()) return storage_or.status();
+    ABSL_RETURN_IF_ERROR(
+        rewrite_bfloat_storage_uses(logical_value, *storage_or));
+    if (!logical_value->use_empty()) {
+      return absl::InternalError(absl::StrCat(
+          "Vulkan bfloat16 legalization left unsupported uses for ",
+          PrintLlvmValue(*logical_value)));
+    }
+    logical_value->eraseFromParent();
+  }
   return absl::OkStatus();
 }
 
@@ -862,7 +951,8 @@ absl::StatusOr<std::string> EmitModuleToSPIRV(
   scalarize_pm.add(llvm::createScalarizerPass(scalarizer_options));
   scalarize_pm.run(*module);
   if (normalize_vulkan_buffers) {
-    ABSL_RETURN_IF_ERROR(NormalizeVulkanMemoryAccesses(module));
+    ABSL_RETURN_IF_ERROR(
+        NormalizeVulkanMemoryAccesses(module, !allow_bfloat16));
     llvm::legacy::PassManager cleanup_pm;
     cleanup_pm.add(llvm::createDeadCodeEliminationPass());
     cleanup_pm.run(*module);
