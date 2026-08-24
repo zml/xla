@@ -65,15 +65,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  mlir::PassManager pm(&context);
-  // Expand the xla.apply_indexing ops that carry tile offsets into plain
-  // integer arithmetic, which is all the lowering knows how to translate.
-  pm.addPass(xla::emitters::createSimplifyAffinePass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(xla::gpu::tile_ir::createXTileLowerToCudaTilePass());
-  if (mlir::failed(pm.run(*module))) {
-    llvm::errs() << "lowering failed\n";
-    return 1;
+  // An input that is already cuda_tile is passed straight to the writer, so
+  // this tool doubles as a hand-editable cuda_tile -> bytecode assembler.
+  bool already_lowered = false;
+  module->walk([&](mlir::cuda_tile::ModuleOp) { already_lowered = true; });
+  if (!already_lowered) {
+    mlir::PassManager pm(&context);
+    // Expand the xla.apply_indexing ops that carry tile offsets into plain
+    // integer arithmetic, which is all the lowering knows how to translate.
+    pm.addPass(xla::emitters::createSimplifyAffinePass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(xla::gpu::tile_ir::createXTileLowerToCudaTilePass());
+    if (mlir::failed(pm.run(*module))) {
+      llvm::errs() << "lowering failed\n";
+      return 1;
+    }
   }
 
   module->print(llvm::outs());

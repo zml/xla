@@ -100,6 +100,7 @@ cc_library(
         "//xla/service/gpu:launch_dimensions",
         "//xla/service/gpu/model:block_level_parameters",
         "//xla/stream_executor:launch_dim",
+        "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/log",

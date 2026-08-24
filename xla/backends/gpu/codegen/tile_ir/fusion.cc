@@ -1,6 +1,7 @@
 #include "xla/backends/gpu/codegen/tile_ir/fusion.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -48,6 +49,7 @@
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/model/block_level_parameters.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -96,6 +98,19 @@ absl::StatusOr<KernelReuseCache::Entry> BuildTileIrKernel(
                      "does not implement"));
   }
 
+  // XLA_TILE_IR_DUMP_DIR also collects the XTile module, so a kernel that
+  // misbehaves can be replayed through xtile_to_tilebc offline.
+  const char* dump_dir = std::getenv("XLA_TILE_IR_DUMP_DIR");
+  if (dump_dir != nullptr) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    module->print(os);
+    tsl::WriteStringToFile(tsl::Env::Default(),
+                           absl::StrCat(dump_dir, "/", kernel_name, ".xtile"),
+                           text)
+        .IgnoreError();
+  }
+
   mlir::PassManager pm(&mlir_context);
   pm.addPass(emitters::createSimplifyAffinePass());
   pm.addPass(mlir::createCanonicalizerPass());
@@ -112,6 +127,16 @@ absl::StatusOr<KernelReuseCache::Entry> BuildTileIrKernel(
   module->walk([&](mlir::cuda_tile::ModuleOp m) { tile_module = m; });
   if (!tile_module) {
     return Internal("Lowering %s produced no cuda_tile.module.", fusion.name());
+  }
+
+  if (dump_dir != nullptr) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    tile_module->print(os);
+    tsl::WriteStringToFile(
+        tsl::Env::Default(),
+        absl::StrCat(dump_dir, "/", kernel_name, ".cuda_tile.mlir"), text)
+        .IgnoreError();
   }
 
   // Bytecode writer rejects NameLoc; clear locations (no DILoc).
