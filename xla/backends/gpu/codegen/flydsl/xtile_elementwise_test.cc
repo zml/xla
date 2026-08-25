@@ -154,6 +154,53 @@ ENTRY entry {
 )"));
 }
 
+TEST_F(FlyXTileElementwiseTest, RecognizesSmallSplitKResidualReductions) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule small_split_k_residual
+
+add_reduce {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+residual {
+  base = bf16[2,128,1024]{2,1,0} parameter(0)
+  base_f32 = f32[2,128,1024]{2,1,0} convert(base)
+  partial4 = f32[4,256,1024]{2,1,0} parameter(1)
+  zero = f32[] constant(0)
+  sum4 = f32[256,1024]{1,0} reduce(partial4, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded4 = bf16[256,1024]{1,0} convert(sum4)
+  view4 = bf16[2,128,1024]{2,1,0} bitcast(rounded4)
+  value4 = f32[2,128,1024]{2,1,0} convert(view4)
+  partial2 = f32[2,256,1024]{2,1,0} parameter(2)
+  sum2 = f32[256,1024]{1,0} reduce(partial2, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded2 = bf16[256,1024]{1,0} convert(sum2)
+  view2 = bf16[2,128,1024]{2,1,0} bitcast(rounded2)
+  value2 = f32[2,128,1024]{2,1,0} convert(view2)
+  first = f32[2,128,1024]{2,1,0} add(base_f32, value2)
+  total = f32[2,128,1024]{2,1,0} add(first, value4)
+  ROOT result = bf16[2,128,1024]{2,1,0} convert(total)
+}
+
+ENTRY entry {
+  base = bf16[2,128,1024]{2,1,0} parameter(0)
+  partial4 = f32[4,256,1024]{2,1,0} parameter(1)
+  partial2 = f32[2,256,1024]{2,1,0} parameter(2)
+  ROOT fusion = bf16[2,128,1024]{2,1,0}
+      fusion(base, partial4, partial2), kind=kCustom, calls=residual,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly",
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1"]}],
+          "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+          "vector_size_bits":"64"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileElementwiseTest, RecognizesCompareSelectClampDag) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule elementwise_select

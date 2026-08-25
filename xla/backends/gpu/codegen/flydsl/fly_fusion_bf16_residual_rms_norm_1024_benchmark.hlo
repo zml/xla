@@ -1,0 +1,48 @@
+HloModule fly_fusion_bf16_residual_rms_norm_1024_benchmark
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%fused_residual_rms_norm (residual: bf16[2,128,1024],
+                          partials: f32[2,256,1024])
+    -> bf16[2,128,1024] {
+  %residual = bf16[2,128,1024]{2,1,0} parameter(0)
+  %partials = f32[2,256,1024]{2,1,0} parameter(1)
+  %zero = f32[] constant(0)
+  %projected = f32[256,1024]{1,0} reduce(%partials, %zero), dimensions={0},
+    to_apply=%add
+  %projected_bf16 = bf16[256,1024]{1,0} convert(%projected)
+  %projected_view = bf16[2,128,1024]{2,1,0} bitcast(%projected_bf16)
+  %residual_f32 = f32[2,128,1024]{2,1,0} convert(%residual)
+  %projected_f32 = f32[2,128,1024]{2,1,0} convert(%projected_view)
+  %added = f32[2,128,1024]{2,1,0}
+    add(%residual_f32, %projected_f32)
+  %squared = f32[2,128,1024]{2,1,0} multiply(%added, %added)
+  %row_sum = f32[2,128]{1,0} reduce(%squared, %zero), dimensions={2},
+    to_apply=%add
+  %reciprocal_width = f32[] constant(0.0009765625)
+  %widths = f32[2,128]{1,0} broadcast(%reciprocal_width), dimensions={}
+  %mean_square = f32[2,128]{1,0} multiply(%row_sum, %widths)
+  %epsilon = f32[] constant(1e-06)
+  %epsilons = f32[2,128]{1,0} broadcast(%epsilon), dimensions={}
+  %variance = f32[2,128]{1,0} add(%mean_square, %epsilons)
+  %reciprocal_stddev = f32[2,128]{1,0} rsqrt(%variance)
+  %scales = f32[2,128,1024]{2,1,0}
+    broadcast(%reciprocal_stddev), dimensions={0,1}
+  %normalized = f32[2,128,1024]{2,1,0} multiply(%added, %scales)
+  ROOT %result = bf16[2,128,1024]{2,1,0} convert(%normalized)
+}
+
+ENTRY %entry_computation (residual: bf16[2,128,1024],
+                          partials: f32[2,256,1024])
+    -> bf16[2,128,1024] {
+  %residual = bf16[2,128,1024]{2,1,0} parameter(0)
+  %partials = f32[2,256,1024]{2,1,0} parameter(1)
+  ROOT %fusion = bf16[2,128,1024]{2,1,0}
+    fusion(%residual, %partials), kind=kCustom,
+    calls=%fused_residual_rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}

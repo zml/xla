@@ -461,6 +461,25 @@ TEST(DotOperandDimsTest, MapBackwardThroughReshapeMixedCategories) {
   EXPECT_FALSE(mapped_dims.has_value());
 }
 
+TEST(DotOperandDimsTest, BitcastStopsDimensionTraversal) {
+  ASSERT_OK_AND_ASSIGN(Shape input_shape, ParseShape("f32[4,4]{1,0}"));
+  auto param = HloInstruction::CreateParameter(0, input_shape, "param");
+  ASSERT_OK_AND_ASSIGN(Shape output_shape, ParseShape("f32[16]{0}"));
+  auto bitcast = HloInstruction::CreateBitcast(output_shape, param.get());
+
+  DotOperandDims output_dims(output_shape, /*batch_dims=*/{},
+                             /*non_contracting_dims=*/{0},
+                             /*contracting_dims=*/{});
+  ASSERT_OK_AND_ASSIGN(auto backward, output_dims.MapBackward(bitcast.get()));
+  EXPECT_FALSE(backward.has_value());
+
+  DotOperandDims input_dims(input_shape, /*batch_dims=*/{},
+                            /*non_contracting_dims=*/{0, 1},
+                            /*contracting_dims=*/{});
+  ASSERT_OK_AND_ASSIGN(auto forward, input_dims.MapForward(bitcast.get()));
+  EXPECT_FALSE(forward.has_value());
+}
+
 TEST(DotOperandDimsTest, MapBackwardThroughReshapeInsertSize1DimAllowed) {
   ASSERT_OK_AND_ASSIGN(Shape operand_shape, ParseShape("f32[4]"));
   auto param = HloInstruction::CreateParameter(0, operand_shape, "param");

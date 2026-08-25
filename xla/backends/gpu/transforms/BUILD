@@ -1741,6 +1741,43 @@ xla_test(
 )
 
 cc_library(
+    name = "flydsl_replacement_verifier",
+    srcs = ["flydsl_replacement_verifier.cc"],
+    hdrs = ["flydsl_replacement_verifier.h"],
+    deps = [
+        "//xla:xla_proto_cc",
+        "//xla/backends/gpu/codegen/flydsl:fusion_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "flydsl_replacement_verifier_test",
+    srcs = ["flydsl_replacement_verifier_test.cc"],
+    deps = [
+        ":flydsl_replacement_verifier",
+        "//xla:xla_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "gemm_fusion",
     srcs = ["gemm_fusion.cc"],
     hdrs = ["gemm_fusion.h"],
@@ -2298,6 +2335,7 @@ cc_library(
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
         "//xla/backends/gpu/codegen/triton:support",
         "//xla/hlo/analysis:alias_info",
         "//xla/hlo/analysis:hlo_dfs_reachability",
@@ -2964,6 +3002,77 @@ xla_cc_test(
         "//xla/hlo/testlib:filecheck",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "attention_rewriter_fly",
+    srcs = ["attention_rewriter_fly.cc"],
+    hdrs = ["attention_rewriter_fly.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla/backends/gpu/codegen/flydsl:attention_support",
+        "//xla/backends/gpu/codegen/flydsl:softmax_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "paged_attention_rewriter_fly",
+    srcs = ["paged_attention_rewriter_fly.cc"],
+    hdrs = ["paged_attention_rewriter_fly.h"],
+    deps = [
+        "//xla:status_macros",
+        "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "paged_attention_rewriter_fly_test",
+    srcs = ["paged_attention_rewriter_fly_test.cc"],
+    deps = [
+        ":paged_attention_rewriter_fly",
+        "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "attention_rewriter_fly_test",
+    srcs = ["attention_rewriter_fly_test.cc"],
+    deps = [
+        ":attention_rewriter_fly",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],

@@ -200,7 +200,8 @@ TEST(DebugOptions, EnableNcclSymmetricBuffersForCollectives) {
 TEST(DebugOptions, PjRtPluginFlyDslOverridesRestoreNewBackends) {
   ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/true,
                                     /*enable_flydsl_fusion=*/true,
-                                    /*autotune_num_repetitions=*/5);
+                                    /*autotune_num_repetitions=*/5,
+                                    /*replace_triton=*/false);
 
   DebugOptions options;
   options.add_xla_gpu_experimental_autotune_backends(
@@ -221,7 +222,47 @@ TEST(DebugOptions, PjRtPluginFlyDslOverridesRestoreNewBackends) {
   // Do not leak enabled process-wide options into another test in this binary.
   ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/false,
                                     /*enable_flydsl_fusion=*/false,
-                                    /*autotune_num_repetitions=*/1);
+                                    /*autotune_num_repetitions=*/1,
+                                    /*replace_triton=*/false);
+}
+
+TEST(DebugOptions, PjRtPluginFlyDslReplacementRemovesTritonBackends) {
+  ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/false,
+                                    /*enable_flydsl_fusion=*/false,
+                                    /*autotune_num_repetitions=*/7,
+                                    /*replace_triton=*/true);
+
+  DebugOptions options;
+  options.set_xla_gpu_enable_triton_gemm(true);
+  options.set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(true);
+  options.add_xla_gpu_experimental_autotune_backends(
+      autotuner::Backend::TRITON);
+  options.add_xla_gpu_experimental_autotune_backends(
+      autotuner::Backend::BLOCK_LEVEL_EMITTER);
+  options.add_xla_gpu_experimental_autotune_backends(
+      autotuner::Backend::HIPBLASLT);
+  ApplyPjRtPluginFlyDslDebugOptionOverrides(&options);
+  // Applying the override more than once must remain idempotent.
+  ApplyPjRtPluginFlyDslDebugOptionOverrides(&options);
+
+  EXPECT_TRUE(options.xla_gpu_flydsl_replace_triton());
+  EXPECT_TRUE(options.xla_gpu_enable_flydsl_gemm());
+  EXPECT_TRUE(options.xla_gpu_enable_flydsl_fusion());
+  EXPECT_FALSE(options.xla_gpu_enable_triton_gemm());
+  EXPECT_FALSE(
+      options.xla_gpu_unsupported_use_all_reduce_one_shot_kernel());
+  EXPECT_EQ(options.xla_gpu_autotune_num_repetitions(), 7);
+  EXPECT_THAT(options.xla_gpu_experimental_autotune_backends(),
+              UnorderedElementsAre(autotuner::Backend::HIPBLASLT,
+                                   autotuner::Backend::FLY,
+                                   autotuner::Backend::FLY_FISSION,
+                                   autotuner::Backend::FLY_FUSION));
+
+  // Do not leak enabled process-wide options into another test in this binary.
+  ApplyPjRtPluginFlyDslDebugOptions(/*enable_flydsl_gemm=*/false,
+                                    /*enable_flydsl_fusion=*/false,
+                                    /*autotune_num_repetitions=*/1,
+                                    /*replace_triton=*/false);
 }
 
 }  // namespace

@@ -26,9 +26,13 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
+#include "xla/backends/gpu/codegen/flydsl/attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
+#include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
@@ -75,9 +79,8 @@ bool IsFnuzFp8(PrimitiveType type) {
 }
 
 bool IsSupportedScaleType(PrimitiveType type) {
-  return type == BF16 || type == F16 || type == F32 ||
-         type == F8E8M0FNU || type == F8E4M3FN || type == F8E5M2 ||
-         type == S8;
+  return type == BF16 || type == F16 || type == F32 || type == F8E8M0FNU ||
+         type == F8E4M3FN || type == F8E5M2 || type == S8;
 }
 
 bool IsUniformScale(const HloInstruction& scale) {
@@ -92,8 +95,8 @@ bool IsSupportedScale(const HloInstruction& scale,
       scale.shape().dimensions_size() != operand.shape().dimensions_size()) {
     return false;
   }
-  for (int64_t dimension = 0;
-       dimension < operand.shape().dimensions_size(); ++dimension) {
+  for (int64_t dimension = 0; dimension < operand.shape().dimensions_size();
+       ++dimension) {
     const int64_t operand_size = operand.shape().dimensions(dimension);
     const int64_t scale_size = scale.shape().dimensions(dimension);
     if (scale_size <= 0 || operand_size % scale_size != 0) {
@@ -148,11 +151,25 @@ bool IsSupportedContractionConversion(PrimitiveType source,
          (source == S8 && destination == BF16);
 }
 
+// XLA represents the Q operand of a batched attention score contraction as a
+// view of [B, K, M], not as a materialized [B, M, K] buffer.  Keep this first
+// input-transpose grammar deliberately narrow until the emitter supports
+// composing arbitrary permutations with every other input view.
+bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
+  return transpose.opcode() == HloOpcode::kTranspose &&
+         transpose.operand_count() == 1 &&
+         transpose.shape().dimensions_size() == 3 &&
+         transpose.operand(0)->shape().dimensions_size() == 3 &&
+         transpose.shape().element_type() ==
+             transpose.operand(0)->shape().element_type() &&
+         transpose.dimensions() == std::vector<int64_t>({0, 2, 1});
+}
+
 const HloInstruction* FindContractionInputParameter(
     const HloInstruction& input) {
   const PrimitiveType contraction_type = input.shape().element_type();
-  if (!IsHalfPrecisionFloat(contraction_type) &&
-      !IsFnuzFp8(contraction_type) && contraction_type != F32) {
+  if (!IsHalfPrecisionFloat(contraction_type) && !IsFnuzFp8(contraction_type) &&
+      contraction_type != F32) {
     return nullptr;
   }
   const HloInstruction* value = &input;
@@ -163,7 +180,8 @@ const HloInstruction* FindContractionInputParameter(
   while (value->opcode() == HloOpcode::kBitcast ||
          value->opcode() == HloOpcode::kConvert ||
          value->opcode() == HloOpcode::kSlice ||
-         value->opcode() == HloOpcode::kDynamicSlice) {
+         value->opcode() == HloOpcode::kDynamicSlice ||
+         value->opcode() == HloOpcode::kTranspose) {
     const bool is_dynamic_slice = value->opcode() == HloOpcode::kDynamicSlice;
     if ((!is_dynamic_slice && value->operand_count() != 1) ||
         (is_dynamic_slice &&
@@ -171,7 +189,13 @@ const HloInstruction* FindContractionInputParameter(
       return nullptr;
     }
     const HloInstruction* operand = value->operand(0);
-    if (value->opcode() == HloOpcode::kBitcast) {
+    if (value->opcode() == HloOpcode::kTranspose) {
+      if (physical_mapping_fixed || !IsSupportedBatchInnerTranspose(*value)) {
+        return nullptr;
+      }
+      has_input_view = true;
+      physical_mapping_fixed = true;
+    } else if (value->opcode() == HloOpcode::kBitcast) {
       if (value->shape().element_type() != operand->shape().element_type() ||
           ShapeUtil::ElementsIn(value->shape()) !=
               ShapeUtil::ElementsIn(operand->shape())) {
@@ -237,6 +261,18 @@ const HloInstruction* FindContractionInputParameter(
   }
   return parameter_type == contraction_type && !has_conversion ? value
                                                                : nullptr;
+}
+
+bool IsContractingDimensionContiguous(const HloInstruction& input,
+                                      int64_t contracting_dimension) {
+  if (IsSupportedBatchInnerTranspose(input)) {
+    const HloInstruction* operand = input.operand(0);
+    return operand->shape().has_layout() &&
+           operand->shape().layout().minor_to_major(0) ==
+               input.dimensions(contracting_dimension);
+  }
+  return input.shape().has_layout() &&
+         input.shape().layout().minor_to_major(0) == contracting_dimension;
 }
 
 bool IsS4DequantizedInput(const HloInstruction& input) {
@@ -369,8 +405,8 @@ bool IsSupportedContraction(const HloInstruction& dot) {
   if (is_scaled_dot) {
     const int64_t m = dot.shape().dimensions(rank - 2);
     const int64_t n = dot.shape().dimensions(rank - 1);
-    const bool uniform_scale = IsUniformScale(*dot.operand(2)) &&
-                               IsUniformScale(*dot.operand(3));
+    const bool uniform_scale =
+        IsUniformScale(*dot.operand(2)) && IsUniformScale(*dot.operand(3));
     if (is_f32 || (rank == 3 && !IsBatchedContraction(dot)) ||
         ((m == 1 || n == 1) && !uniform_scale) ||
         !ScaledDotKBlockSize(dot).has_value()) {
@@ -429,31 +465,53 @@ bool IsNarrowingConvert(const HloInstruction& value) {
          ShapeUtil::SameDimensions(value.shape(), value.operand(0)->shape());
 }
 
-bool IsSupportedBroadcastInput(const HloInstruction& broadcast,
+bool IsWideningConvertOf(const HloInstruction& value,
+                         const HloInstruction& operand) {
+  return value.opcode() == HloOpcode::kConvert && value.operand_count() == 1 &&
+         value.operand(0) == &operand && value.shape().element_type() == F32 &&
+         IsHalfPrecisionFloat(operand.shape().element_type()) &&
+         ShapeUtil::SameDimensions(value.shape(), operand.shape());
+}
+
+bool IsSupportedBroadcastInput(const HloInstruction& broadcast_input,
                                const HloInstruction& operation) {
-  if (broadcast.opcode() != HloOpcode::kBroadcast ||
-      broadcast.operand_count() != 1 || broadcast.dimensions().size() > 1 ||
-      !ShapeUtil::SameDimensions(broadcast.shape(), operation.shape())) {
+  const HloInstruction* broadcast = &broadcast_input;
+  if (broadcast_input.opcode() == HloOpcode::kConvert) {
+    if (broadcast_input.operand_count() != 1 ||
+        broadcast_input.shape().element_type() != F32 ||
+        !ShapeUtil::SameDimensions(broadcast_input.shape(),
+                                   broadcast_input.operand(0)->shape()) ||
+        !IsHalfPrecisionFloat(
+            broadcast_input.operand(0)->shape().element_type())) {
+      return false;
+    }
+    broadcast = broadcast_input.operand(0);
+  }
+  if (broadcast->opcode() != HloOpcode::kBroadcast ||
+      broadcast->operand_count() != 1 || broadcast->dimensions().size() > 1 ||
+      !ShapeUtil::SameDimensions(broadcast->shape(), operation.shape()) ||
+      broadcast_input.shape().element_type() !=
+          operation.shape().element_type()) {
     return false;
   }
-  const HloInstruction* input = broadcast.operand(0);
+  const HloInstruction* input = broadcast->operand(0);
   const int64_t input_rank = input->shape().dimensions_size();
   const int64_t output_rank = operation.shape().dimensions_size();
-  const bool scalar = input_rank == 0 && broadcast.dimensions().empty();
+  const bool scalar = input_rank == 0 && broadcast->dimensions().empty();
   const bool vector =
-      input_rank == 1 && broadcast.dimensions().size() == 1 &&
+      input_rank == 1 && broadcast->dimensions().size() == 1 &&
       output_rank >= 2 &&
-      (broadcast.dimensions(0) == output_rank - 2 ||
-       broadcast.dimensions(0) == output_rank - 1 ||
-       (output_rank == 3 && broadcast.dimensions(0) == 0)) &&
+      (broadcast->dimensions(0) == output_rank - 2 ||
+       broadcast->dimensions(0) == output_rank - 1 ||
+       (output_rank == 3 && broadcast->dimensions(0) == 0)) &&
       input->shape().dimensions(0) ==
-          operation.shape().dimensions(broadcast.dimensions(0));
+          operation.shape().dimensions(broadcast->dimensions(0));
   const bool supported_value =
       input->opcode() == HloOpcode::kParameter ||
       (scalar && input->opcode() == HloOpcode::kConstant &&
        input->literal().GetAsDouble({}).has_value());
   return supported_value && (scalar || vector) &&
-         input->shape().element_type() == operation.shape().element_type();
+         input->shape().element_type() == broadcast->shape().element_type();
 }
 
 bool IsSupportedBinaryEpilogue(HloOpcode opcode) {
@@ -462,11 +520,49 @@ bool IsSupportedBinaryEpilogue(HloOpcode opcode) {
          opcode == HloOpcode::kMaximum || opcode == HloOpcode::kMinimum;
 }
 
+// Matches the layout transform between the attention-value contraction and
+// the output projection:
+//
+//   [B*H, M, N] -> bitcast [B, H, M, N]
+//                -> transpose [B, N, H, M]
+//
+// The final M dimension is physically contiguous. The Fly emitter writes each
+// lane's four-row MFMA fragment directly with a packed store.
+std::optional<int64_t> OutputTransposeBatchInner(const HloInstruction& root,
+                                                 const HloInstruction& dot) {
+  if (dot.shape().element_type() != BF16 ||
+      dot.shape().dimensions_size() != 3 ||
+      root.opcode() != HloOpcode::kTranspose || root.operand_count() != 1 ||
+      root.shape().element_type() != BF16 ||
+      root.shape().dimensions_size() != 4 ||
+      root.dimensions() != std::vector<int64_t>({0, 3, 1, 2})) {
+    return std::nullopt;
+  }
+  const HloInstruction* bitcast = root.operand(0);
+  if (bitcast->opcode() != HloOpcode::kBitcast ||
+      bitcast->operand_count() != 1 || bitcast->operand(0) != &dot ||
+      bitcast->shape().dimensions_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t batch_outer = bitcast->shape().dimensions(0);
+  const int64_t batch_inner = bitcast->shape().dimensions(1);
+  if (batch_outer <= 0 || batch_inner <= 0 ||
+      batch_outer * batch_inner != dot.shape().dimensions(0) ||
+      bitcast->shape().dimensions(2) != dot.shape().dimensions(1) ||
+      bitcast->shape().dimensions(3) != dot.shape().dimensions(2)) {
+    return std::nullopt;
+  }
+  return batch_inner;
+}
+
 bool IsSupportedEpilogue(const HloInstruction& instr,
                          const HloInstruction& dot) {
   const HloInstruction* root =
       instr.fused_instructions_computation()->root_instruction();
   if (root == &dot) {
+    return true;
+  }
+  if (OutputTransposeBatchInner(*root, dot).has_value()) {
     return true;
   }
   const int64_t output_rank = dot.shape().dimensions_size();
@@ -501,7 +597,8 @@ bool IsSupportedEpilogue(const HloInstruction& instr,
   constexpr int64_t kMaxEpilogueSteps = 3;
   for (int64_t step = 0; step < kMaxEpilogueSteps; ++step) {
     if (value == &dot ||
-        (IsNarrowingConvert(*value) && value->operand(0) == &dot)) {
+        (IsNarrowingConvert(*value) && value->operand(0) == &dot) ||
+        IsWideningConvertOf(*value, dot)) {
       return true;
     }
     if (!ShapeUtil::SameDimensions(value->shape(), dot.shape())) {
@@ -539,7 +636,8 @@ bool IsSupportedEpilogue(const HloInstruction& instr,
     value = contraction_value;
   }
   return value == &dot ||
-         (IsNarrowingConvert(*value) && value->operand(0) == &dot);
+         (IsNarrowingConvert(*value) && value->operand(0) == &dot) ||
+         IsWideningConvertOf(*value, dot);
 }
 
 std::unique_ptr<BackendConfig> MakeConfig(
@@ -579,11 +677,9 @@ std::unique_ptr<BackendConfig> MakeConfig(
 std::unique_ptr<BackendConfig> MakeGemvConfig(
     int64_t block_m, int64_t block_n, int64_t num_warps,
     int32_t outputs_per_wave = 0, int32_t k_vector_width = 0,
-    FlyGemmConfig::MfmaAtom mfma_atom =
-        FlyGemmConfig::FLY_MFMA_16X16X16,
+    FlyGemmConfig::MfmaAtom mfma_atom = FlyGemmConfig::FLY_MFMA_16X16X16,
     bool split_k = false) {
-  return MakeConfig(block_m, block_n, /*block_k=*/32, num_warps,
-                    mfma_atom,
+  return MakeConfig(block_m, block_n, /*block_k=*/32, num_warps, mfma_atom,
                     /*prefetch_rhs=*/false, /*stage_output=*/false,
                     /*waves_per_eu=*/0, /*schedule_instructions=*/false,
                     /*stage_rhs=*/false, /*async_lhs=*/false,
@@ -620,12 +716,10 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           ->root_instruction()
           ->shape()
           .element_type();
-  const bool is_f16 =
-      dot->operand(0)->shape().element_type() == F16 &&
-      dot->operand(1)->shape().element_type() == F16;
-  const bool is_f32 =
-      dot->operand(0)->shape().element_type() == F32 &&
-      dot->operand(1)->shape().element_type() == F32;
+  const bool is_f16 = dot->operand(0)->shape().element_type() == F16 &&
+                      dot->operand(1)->shape().element_type() == F16;
+  const bool is_f32 = dot->operand(0)->shape().element_type() == F32 &&
+                      dot->operand(1)->shape().element_type() == F32;
   const bool is_fp8 = IsFnuzFp8(dot->operand(0)->shape().element_type());
   const bool is_int4 = IsS4DequantizedInput(*dot->operand(0)) ||
                        IsS4DequantizedInput(*dot->operand(1));
@@ -641,16 +735,16 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       dot->dot_dimension_numbers().rhs_contracting_dimensions(0);
   const bool is_scaled_dot = dot->opcode() == HloOpcode::kScaledDot;
   const bool is_block_scaled_dot =
-      is_scaled_dot && (!IsUniformScale(*dot->operand(2)) ||
-                        !IsUniformScale(*dot->operand(3)));
-  const bool lhs_k_contiguous =
-      dot->operand(0)->shape().has_layout() &&
-      dot->operand(0)->shape().layout().minor_to_major(0) ==
-          lhs_contracting_dimension;
-  const bool rhs_k_contiguous =
-      dot->operand(1)->shape().has_layout() &&
-      dot->operand(1)->shape().layout().minor_to_major(0) ==
-          rhs_contracting_dimension;
+      is_scaled_dot &&
+      (!IsUniformScale(*dot->operand(2)) || !IsUniformScale(*dot->operand(3)));
+  const bool has_output_transpose =
+      OutputTransposeBatchInner(
+          *instr.fused_instructions_computation()->root_instruction(), *dot)
+          .has_value();
+  const bool lhs_k_contiguous = IsContractingDimensionContiguous(
+      *dot->operand(0), lhs_contracting_dimension);
+  const bool rhs_k_contiguous = IsContractingDimensionContiguous(
+      *dot->operand(1), rhs_contracting_dimension);
   const std::optional<ConcatInputInfo> lhs_concat =
       FindSupportedConcatInput(*dot->operand(0));
   const std::optional<ConcatInputInfo> rhs_concat =
@@ -692,8 +786,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                 is_fp8 ? FlyGemmConfig::FLY_MFMA_16X16X32_FP8
                        : FlyGemmConfig::FLY_MFMA_16X16X16));
           }
-          if (output_block >= 64 && output_block % 64 == 0 &&
-              num_warps > 1) {
+          if (output_block >= 64 && output_block % 64 == 0 && num_warps > 1) {
             configs.push_back(MakeGemvConfig(
                 /*block_m=*/16, output_block, num_warps,
                 /*outputs_per_wave=*/0, /*k_vector_width=*/0,
@@ -714,8 +807,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
             if (k_vector_width == 4 && !is_fp8) {
               continue;
             }
-            if (k_vector_width > 1 &&
-                k % (64 * k_vector_width) != 0) {
+            if (k_vector_width > 1 && k % (64 * k_vector_width) != 0) {
               continue;
             }
             configs.push_back(MakeGemvConfig(
@@ -728,8 +820,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       }
     }
     if (!is_fp8 && !is_int4 && !is_block_scaled_dot && !global_split_k &&
-        lhs_k_contiguous && n % 16 == 0 && k >= 512 &&
-        k % 256 == 0 &&
+        lhs_k_contiguous && n % 16 == 0 && k >= 512 && k % 256 == 0 &&
         dot->operand(0)->shape().element_type() ==
             dot->operand(1)->shape().element_type()) {
       // Match Triton's successful row-vector tile while using Fly's cheaper
@@ -737,15 +828,17 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       // reduce their K partitions through LDS.
       for (int64_t num_warps : {2, 4}) {
         for (int32_t waves_per_eu : {0, 2, 4}) {
-          configs.insert(configs.begin(), MakeConfig(
-              /*block_m=*/16, /*block_n=*/16, /*block_k=*/256, num_warps,
-              FlyGemmConfig::FLY_MFMA_16X16X16,
-              /*prefetch_rhs=*/false, /*stage_output=*/false, waves_per_eu,
-              /*schedule_instructions=*/false,
-              /*stage_rhs=*/true, /*async_lhs=*/false,
-              /*preload_lds_fragments=*/true,
-              /*single_buffer_lds=*/false, /*direct_to_vgpr=*/false,
-              /*rolling_refill=*/false, /*local_split_k=*/true));
+          configs.insert(
+              configs.begin(),
+              MakeConfig(
+                  /*block_m=*/16, /*block_n=*/16, /*block_k=*/256, num_warps,
+                  FlyGemmConfig::FLY_MFMA_16X16X16,
+                  /*prefetch_rhs=*/false, /*stage_output=*/false, waves_per_eu,
+                  /*schedule_instructions=*/false,
+                  /*stage_rhs=*/true, /*async_lhs=*/false,
+                  /*preload_lds_fragments=*/true,
+                  /*single_buffer_lds=*/false, /*direct_to_vgpr=*/false,
+                  /*rolling_refill=*/false, /*local_split_k=*/true));
         }
       }
     }
@@ -770,15 +863,14 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                 (!lhs_k_contiguous || !rhs_k_contiguous)) {
               continue;
             }
-            if (k_vector_width > 1 &&
-                k % (64 * k_vector_width) != 0) {
+            if (k_vector_width > 1 && k % (64 * k_vector_width) != 0) {
               continue;
             }
-            configs.push_back(MakeGemvConfig(
-                output_block, /*block_n=*/16, num_warps, outputs_per_wave,
-                k_vector_width,
-                is_fp8 ? FlyGemmConfig::FLY_MFMA_16X16X32_FP8
-                       : FlyGemmConfig::FLY_MFMA_16X16X16));
+            configs.push_back(
+                MakeGemvConfig(output_block, /*block_n=*/16, num_warps,
+                               outputs_per_wave, k_vector_width,
+                               is_fp8 ? FlyGemmConfig::FLY_MFMA_16X16X32_FP8
+                                      : FlyGemmConfig::FLY_MFMA_16X16X16));
           }
         }
       }
@@ -808,31 +900,27 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           auto add_variants = [&](FlyGemmConfig::MfmaAtom atom,
                                   bool dequantize_block_scales = false) {
             for (bool schedule : {false, true}) {
-              std::unique_ptr<BackendConfig> config = MakeConfig(
-                  block_m, block_n, block_k, num_warps, atom,
-                  /*prefetch_rhs=*/false, /*stage_output=*/false,
-                  /*waves_per_eu=*/0, schedule);
+              std::unique_ptr<BackendConfig> config =
+                  MakeConfig(block_m, block_n, block_k, num_warps, atom,
+                             /*prefetch_rhs=*/false, /*stage_output=*/false,
+                             /*waves_per_eu=*/0, schedule);
               config->mutable_fly()->set_dequantize_block_scales(
                   dequantize_block_scales);
               configs.push_back(std::move(config));
             }
           };
-          if (num_warps <= mfma16_tiles &&
-              mfma16_tiles % num_warps == 0) {
-            add_variants(is_fp8
-                             ? FlyGemmConfig::FLY_MFMA_16X16X32_FP8
-                             : FlyGemmConfig::FLY_MFMA_16X16X16);
+          if (num_warps <= mfma16_tiles && mfma16_tiles % num_warps == 0) {
+            add_variants(is_fp8 ? FlyGemmConfig::FLY_MFMA_16X16X32_FP8
+                                : FlyGemmConfig::FLY_MFMA_16X16X16);
             if (is_fp8) {
               add_variants(FlyGemmConfig::FLY_MFMA_16X16X16,
                            /*dequantize_block_scales=*/true);
             }
           }
           if (block_m % 32 == 0 && block_n % 32 == 0 &&
-              num_warps <= mfma32_tiles &&
-              mfma32_tiles % num_warps == 0) {
-            add_variants(is_fp8
-                             ? FlyGemmConfig::FLY_MFMA_32X32X16_FP8
-                             : FlyGemmConfig::FLY_MFMA_32X32X8);
+              num_warps <= mfma32_tiles && mfma32_tiles % num_warps == 0) {
+            add_variants(is_fp8 ? FlyGemmConfig::FLY_MFMA_32X32X16_FP8
+                                : FlyGemmConfig::FLY_MFMA_32X32X8);
             if (is_fp8) {
               add_variants(FlyGemmConfig::FLY_MFMA_32X32X8,
                            /*dequantize_block_scales=*/true);
@@ -1132,9 +1220,9 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     constexpr int64_t kMinStagedOutputElements = 8 * 1024;
     constexpr int64_t kMaxStagedOutputElements = 32 * 1024;
     const bool can_stage_output =
-        output_element_type == BF16 &&
-        m % block_m == 0 && n % block_n == 0 &&
-        block_m * block_n >= kMinStagedOutputElements &&
+        output_element_type == BF16 && m % block_m == 0 && n % block_n == 0 &&
+        (has_output_transpose ||
+         block_m * block_n >= kMinStagedOutputElements) &&
         block_m * block_n <= kMaxStagedOutputElements;
     if (can_stage_output) {
       add_variants(/*prefetch_rhs=*/false, /*stage_output=*/true);
@@ -1168,8 +1256,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           constexpr int64_t kMaxLdsBytes = 64 * 1024;
           const int64_t lhs_lds_bytes =
               2 * block_m * block_k * sizeof(uint16_t);
-          if (!supports_gemm_k_tile(block_k) ||
-              lhs_lds_bytes > kMaxLdsBytes) {
+          if (!supports_gemm_k_tile(block_k) || lhs_lds_bytes > kMaxLdsBytes) {
             continue;
           }
           for (int64_t num_warps : {1, 2, 4, 8}) {
@@ -1177,11 +1264,9 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
               add_gemm_configs(block_m, block_n, block_k, num_warps,
                                FlyGemmConfig::FLY_MFMA_16X16X16);
             }
-            const int64_t mfma32_tiles =
-                (block_m / 32) * (block_n / 32);
+            const int64_t mfma32_tiles = (block_m / 32) * (block_n / 32);
             if (block_m % 32 == 0 && block_n % 32 == 0 &&
-                num_warps <= mfma32_tiles &&
-                mfma32_tiles % num_warps == 0) {
+                num_warps <= mfma32_tiles && mfma32_tiles % num_warps == 0) {
               add_gemm_configs(block_m, block_n, block_k, num_warps,
                                FlyGemmConfig::FLY_MFMA_32X32X8);
             }
@@ -1198,8 +1283,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     const int64_t staged_lds_bytes =
         2 * (block_m + block_n) * block_k * sizeof(uint16_t);
     if ((!rhs_k_contiguous && !global_split_k) || block_m > m || block_n > n ||
-        !supports_gemm_k_tile(block_k) ||
-        staged_lds_bytes > kMaxLdsBytes) {
+        !supports_gemm_k_tile(block_k) || staged_lds_bytes > kMaxLdsBytes) {
       return;
     }
     for (int64_t num_warps : num_warps_values) {
@@ -1242,8 +1326,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     const int64_t staged_lds_bytes =
         2 * (block_m + block_n) * block_k * sizeof(uint16_t);
     if ((!rhs_k_contiguous && !global_split_k) || block_m > m || block_n > n ||
-        !supports_gemm_k_tile(block_k) ||
-        staged_lds_bytes > kMaxLdsBytes) {
+        !supports_gemm_k_tile(block_k) || staged_lds_bytes > kMaxLdsBytes) {
       return;
     }
     const bool can_stage_output =
@@ -1281,10 +1364,9 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     constexpr std::array<int64_t, 4> kF32BlockSizes = {16, 32, 64, 128};
     constexpr std::array<int64_t, 5> kF32KBlockSizes = {4, 8, 16, 32, 64};
     const PrecisionConfig& precision = dot->precision_config();
-    const bool default_operand_precision =
-        absl::c_all_of(precision.operand_precision(), [](int value) {
-          return value == PrecisionConfig::DEFAULT;
-        });
+    const bool default_operand_precision = absl::c_all_of(
+        precision.operand_precision(),
+        [](int value) { return value == PrecisionConfig::DEFAULT; });
     const bool allow_xf32 =
         default_operand_precision &&
         (precision.algorithm() == PrecisionConfig::ALG_UNSET ||
@@ -1302,10 +1384,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         for (int64_t block_k : kF32KBlockSizes) {
           // The generic kernel ping-pongs two block_m x block_k FP32 LHS
           // stages and moves four FP32 values per 16-byte VMEM operation.
-          const int64_t lhs_lds_bytes =
-              2 * block_m * block_k * sizeof(float);
-          if ((block_k > k && block_k / 2 >= k) ||
-              lhs_lds_bytes > 64 * 1024) {
+          const int64_t lhs_lds_bytes = 2 * block_m * block_k * sizeof(float);
+          if ((block_k > k && block_k / 2 >= k) || lhs_lds_bytes > 64 * 1024) {
             continue;
           }
           for (int64_t num_warps : {1, 2, 4, 8}) {
@@ -1313,15 +1393,13 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
             if ((block_m * block_k / 4) % block_threads != 0) {
               continue;
             }
-            if (num_warps <= mfma16_tiles &&
-                mfma16_tiles % num_warps == 0) {
-              configs.push_back(MakeConfig(
-                  block_m, block_n, block_k, num_warps,
-                  FlyGemmConfig::FLY_MFMA_16X16X4_F32));
+            if (num_warps <= mfma16_tiles && mfma16_tiles % num_warps == 0) {
+              configs.push_back(
+                  MakeConfig(block_m, block_n, block_k, num_warps,
+                             FlyGemmConfig::FLY_MFMA_16X16X4_F32));
               const int64_t rhs_lds_bytes =
                   2 * block_n * block_k * sizeof(float);
-              if (rhs_k_contiguous && block_k >= 32 &&
-                  block_k % 32 == 0 &&
+              if (rhs_k_contiguous && block_k >= 32 && block_k % 32 == 0 &&
                   (block_n * block_k / 4) % block_threads == 0 &&
                   lhs_lds_bytes + rhs_lds_bytes <= 64 * 1024) {
                 for (int32_t waves_per_eu : {0, 2, 4}) {
@@ -1336,21 +1414,19 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
               }
             }
             if (block_m % 32 == 0 && block_n % 32 == 0 &&
-                num_warps <= mfma32_tiles &&
-                mfma32_tiles % num_warps == 0) {
-              configs.push_back(MakeConfig(
-                  block_m, block_n, block_k, num_warps,
-                  FlyGemmConfig::FLY_MFMA_32X32X2_F32));
+                num_warps <= mfma32_tiles && mfma32_tiles % num_warps == 0) {
+              configs.push_back(
+                  MakeConfig(block_m, block_n, block_k, num_warps,
+                             FlyGemmConfig::FLY_MFMA_32X32X2_F32));
               if (!allow_xf32) {
                 continue;
               }
-              configs.push_back(MakeConfig(
-                  block_m, block_n, block_k, num_warps,
-                  FlyGemmConfig::FLY_MFMA_32X32X4_XF32));
+              configs.push_back(
+                  MakeConfig(block_m, block_n, block_k, num_warps,
+                             FlyGemmConfig::FLY_MFMA_32X32X4_XF32));
               const int64_t rhs_lds_bytes =
                   2 * block_n * block_k * sizeof(float);
-              if (rhs_k_contiguous && block_k >= 32 &&
-                  block_k % 32 == 0 &&
+              if (rhs_k_contiguous && block_k >= 32 && block_k % 32 == 0 &&
                   (block_n * block_k / 4) % block_threads == 0 &&
                   lhs_lds_bytes + rhs_lds_bytes <= 64 * 1024) {
                 for (int32_t waves_per_eu : {0, 2, 4}) {
@@ -1371,8 +1447,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
     if (allow_xf32 && rhs_k_contiguous && k >= 64 && k % 32 == 0) {
       auto add_single_buffer_xf32 = [&](int64_t block_m, int64_t block_n,
-                                        int64_t block_k,
-                                        int64_t num_warps) {
+                                        int64_t block_k, int64_t num_warps) {
         if (block_m > m || block_n > n || m % block_m != 0 ||
             n % block_n != 0 || k % block_k != 0) {
           return;
@@ -1452,8 +1527,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
               /*stage_rhs=*/true, /*async_lhs=*/false,
               /*preload_lds_fragments=*/true, single_buffer_lds,
               /*direct_to_vgpr=*/true);
-          config->mutable_fly()->set_workgroup_mapping_n(
-              workgroup_mapping_n);
+          config->mutable_fly()->set_workgroup_mapping_n(workgroup_mapping_n);
           configs.push_back(std::move(config));
         }
       }
@@ -1571,8 +1645,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       // layout: its K128 tile halves the MFMA issue count relative to the
       // generic MFMA16 staged candidates while retaining eight-wave
       // occupancy for the 128x64 output tile.
-      if (!rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 &&
-          k % 128 == 0) {
+      if (!rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 && k % 128 == 0) {
         configs.push_back(MakeConfig(
             /*block_m=*/128, /*block_n=*/64, /*block_k=*/128,
             /*num_warps=*/8, FlyGemmConfig::FLY_MFMA_32X32X8,
@@ -1644,8 +1717,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         /*block_m=*/64, /*block_n=*/512, /*block_k=*/32, /*num_warps=*/4,
         FlyGemmConfig::FLY_MFMA_16X16X16));
   }
-  if (rank_three && !rhs_k_contiguous && m >= 64 && n >= 256 &&
-      k >= 1024 && supports_gemm_k_tile(/*block_k=*/32)) {
+  if (rank_three && !rhs_k_contiguous && m >= 64 && n >= 256 && k >= 1024 &&
+      supports_gemm_k_tile(/*block_k=*/32)) {
     for (int32_t workgroup_mapping_n : {1, 2, 4, 8}) {
       for (bool schedule : {false, true}) {
         std::unique_ptr<BackendConfig> config = MakeConfig(
@@ -1714,6 +1787,46 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                              /*num_warps_values=*/{1, 2});
     }
   }
+  if (rank_three && !lhs_k_contiguous && !rhs_k_contiguous && k >= 32 &&
+      k <= 128 && m % 64 == 0 && n % 64 == 0) {
+    // Batched attention scores are Q^T K with both source tensors physically
+    // stored as [B,K,S].  Stage contiguous S vectors from both operands and
+    // transpose them into the native FlyDSL [S,K] LDS fragments.  Include the
+    // one-workgroup-per-head geometry chosen by Triton and a 64x64 alternative
+    // that exposes more of MI300X's 304 CUs.
+    for (int64_t block_m : {64, 128}) {
+      for (int64_t block_n : {64, 128}) {
+        if (block_m > m || block_n > n) {
+          continue;
+        }
+        for (int64_t block_k : {32, 64}) {
+          if (!supports_gemm_k_tile(block_k)) {
+            continue;
+          }
+          const int64_t lds_bytes =
+              2 * (block_m + block_n) * block_k * sizeof(uint16_t);
+          if (lds_bytes > 64 * 1024) {
+            continue;
+          }
+          const int64_t wave_tiles = (block_m / 16) * (block_n / 16);
+          for (int64_t num_warps : {4, 8}) {
+            if (num_warps > wave_tiles || wave_tiles % num_warps != 0) {
+              continue;
+            }
+            for (int32_t waves_per_eu : {0, 2, 4}) {
+              for (bool schedule : {false, true}) {
+                configs.push_back(
+                    MakeConfig(block_m, block_n, block_k, num_warps,
+                               FlyGemmConfig::FLY_MFMA_16X16X16,
+                               /*prefetch_rhs=*/false, /*stage_output=*/false,
+                               waves_per_eu, schedule, /*stage_rhs=*/true));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   // Row-major RHS needs a K/N register transpose before LDS. Pair adjacent K
   // rows, then overlap the single-buffer refill with the second half of the
   // MFMA tile. Four K128 stages are already sufficient to amortize this
@@ -1733,8 +1846,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   // Apply the remaining gfx942 A+B LDS pipelines selected for long row-major
   // RHS inputs. Both geometries fit within the MI300X 64 KiB LDS allocation.
   if (k >= 1024) {
-    if (output_element_type == BF16 && !rhs_k_contiguous &&
-        m % 128 == 0 && n % 128 == 0 && k % 64 == 0) {
+    if (output_element_type == BF16 && !rhs_k_contiguous && m % 128 == 0 &&
+        n % 128 == 0 && k % 64 == 0) {
       // Keep one 32 KiB A/B tile in LDS while the next tile is prefetched in
       // VGPRs. Autotune direct stores against the CShuffle epilogue: the
       // latter restores coalescing from the native MFMA32 accumulator layout
@@ -1761,8 +1874,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           /*single_buffer_lds=*/false, /*direct_to_vgpr=*/false,
           /*rolling_refill=*/false));
     }
-    if (output_element_type == BF16 && !rhs_k_contiguous &&
-        m % 128 == 0 && n % 256 == 0 && k % 32 == 0) {
+    if (output_element_type == BF16 && !rhs_k_contiguous && m % 128 == 0 &&
+        n % 256 == 0 && k % 32 == 0) {
       // Match Triton's winning 128x256x32 macro-tile while retaining Fly's
       // explicit one-stage A+B refill. The emitter source-swaps MFMA32 so each
       // lane writes four adjacent BF16 columns directly, avoiding both the
@@ -1974,6 +2087,31 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   }
 
   add_generic_gemm_configs();
+  if (has_output_transpose && rhs_k_contiguous && m % 64 == 0 && n % 64 == 0 &&
+      k % 32 == 0) {
+    // The context-layout epilogue stores four contiguous M values directly
+    // from each MFMA lane. Match Triton's winning M64-oriented short-K tile,
+    // retain its transposed M32xN64 counterpart, and expose occupancy and
+    // instruction scheduling explicitly. Also stage RHS as a measured option:
+    // the four-wave tile reuses each B fragment across multiple M atoms.
+    for (auto [block_m, block_n] :
+         {std::pair<int64_t, int64_t>{64, 32}, {32, 64}}) {
+      for (int32_t waves_per_eu : {0, 2, 4}) {
+        for (bool schedule : {false, true}) {
+          configs.push_back(
+              MakeConfig(block_m, block_n, /*block_k=*/32, /*num_warps=*/4,
+                         FlyGemmConfig::FLY_MFMA_16X16X16,
+                         /*prefetch_rhs=*/false, /*stage_output=*/true,
+                         waves_per_eu, schedule));
+          configs.push_back(
+              MakeConfig(block_m, block_n, /*block_k=*/32, /*num_warps=*/4,
+                         FlyGemmConfig::FLY_MFMA_16X16X16,
+                         /*prefetch_rhs=*/false, /*stage_output=*/true,
+                         waves_per_eu, schedule, /*stage_rhs=*/true));
+        }
+      }
+    }
+  }
   if (lhs_concat.has_value() || rhs_concat.has_value()) {
     configs.erase(
         std::remove_if(
@@ -1985,6 +2123,14 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                      (rhs_concat.has_value() &&
                       rhs_concat->fragment_size % fly.block_n() != 0);
             }),
+        configs.end());
+  }
+  if (has_output_transpose) {
+    configs.erase(
+        std::remove_if(configs.begin(), configs.end(),
+                       [](const std::unique_ptr<BackendConfig>& config) {
+                         return !config->fly().stage_output();
+                       }),
         configs.end());
   }
   return configs;
@@ -2070,11 +2216,24 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   }
   HloFusionAnalysis analysis =
       HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (flydsl::GetFlyPagedAttentionDescriptor(analysis).has_value() ||
+      flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
+          .has_value() ||
+      flydsl::GetFlyPagedAttentionSegmentedReducerDescriptor(analysis)
+          .has_value()) {
+    return true;
+  }
+  if (flydsl::GetFlyAttentionDescriptor(analysis).has_value()) {
+    return true;
+  }
   if (flydsl::IsFlySoftmaxFusion(analysis)) {
     return true;
   }
   if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
     return true;
+  }
+  if (flydsl::ContainsUnsupportedCustomCall(analysis)) {
+    return false;
   }
   // Generic block-level fusions have already been marked custom, so their HLO
   // fusion analysis reports the selected backend instead of the underlying
@@ -2101,6 +2260,106 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
   HloFusionAnalysis analysis =
       HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (std::optional<flydsl::FlyPagedAttentionDescriptor> attention =
+          flydsl::GetFlyPagedAttentionDescriptor(analysis)) {
+    // The two-phase specialization has a fixed four-wave MFMA16 layout.  The
+    // only profitable code-generation knob is the occupancy request.
+    for (int64_t waves_per_eu : {0, 1, 2, 4}) {
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      Tile* tile = block->add_output_tiles();
+      tile->add_sizes(1);
+      tile->add_sizes(1);
+      tile->add_sizes(attention->head_dimension);
+      block->set_num_warps(4);
+      block->set_num_ctas(1);
+      block->set_num_stages(1);
+      block->set_waves_per_eu(waves_per_eu);
+      configs.push_back(std::move(config));
+    }
+    return configs;
+  }
+  if (std::optional<flydsl::FlyPagedAttentionSegmentedProducerDescriptor>
+          producer =
+              flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(
+                  analysis)) {
+    const bool cooperative = producer->attention.max_context >= 65536 &&
+                             producer->attention.gqa_group == 4;
+    for (int64_t num_stages : cooperative
+                                  ? std::initializer_list<int64_t>{1, 2, 3}
+                                  : std::initializer_list<int64_t>{1}) {
+      for (int64_t waves_per_eu : {0, 1, 2, 4}) {
+        auto config = std::make_unique<BackendConfig>();
+        BlockLevelFusionConfig* block = config->mutable_block_level();
+        Tile* output_tile = block->add_output_tiles();
+        output_tile->add_sizes(1);
+        output_tile->add_sizes(1);
+        output_tile->add_sizes(1);
+        output_tile->add_sizes(producer->attention.head_dimension);
+        for (int64_t state = 0; state < 2; ++state) {
+          Tile* state_tile = block->add_output_tiles();
+          state_tile->add_sizes(1);
+          state_tile->add_sizes(1);
+          state_tile->add_sizes(1);
+        }
+        block->set_num_warps(
+            (producer->attention.max_context >= 65536 ||
+             producer->segment_tokens <= 64)
+                ? 2
+                : 4);
+        block->set_num_ctas(1);
+        block->set_num_stages(num_stages);
+        block->set_waves_per_eu(waves_per_eu);
+        configs.push_back(std::move(config));
+      }
+    }
+    return configs;
+  }
+  if (std::optional<flydsl::FlyPagedAttentionSegmentedReducerDescriptor>
+          reducer =
+              flydsl::GetFlyPagedAttentionSegmentedReducerDescriptor(
+                  analysis)) {
+    for (int64_t waves_per_eu : {0, 1, 2, 4}) {
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      Tile* tile = block->add_output_tiles();
+      tile->add_sizes(1);
+      tile->add_sizes(1);
+      tile->add_sizes(reducer->head_dimension);
+      block->set_num_warps(2);
+      block->set_num_ctas(1);
+      block->set_num_stages(1);
+      block->set_waves_per_eu(waves_per_eu);
+      configs.push_back(std::move(config));
+    }
+    return configs;
+  }
+  if (std::optional<flydsl::FlyAttentionDescriptor> attention =
+          flydsl::GetFlyAttentionDescriptor(analysis)) {
+    // The reference FlyDSL gfx942 kernel assigns 32 query rows to every
+    // Wave64. Tune the CTA's query-row tile and occupancy, while retaining
+    // its fixed 64-key streaming tile and MFMA32 register mapping.
+    for (int64_t block_m : {32, 64, 128, 256}) {
+      if (block_m > attention->sequence || attention->sequence % block_m != 0) {
+        continue;
+      }
+      for (int64_t waves_per_eu : {2, 4}) {
+        auto config = std::make_unique<BackendConfig>();
+        BlockLevelFusionConfig* block = config->mutable_block_level();
+        Tile* tile = block->add_output_tiles();
+        tile->add_sizes(1);
+        tile->add_sizes(block_m);
+        tile->add_sizes(1);
+        tile->add_sizes(attention->head_dimension);
+        block->set_num_warps(block_m / 32);
+        block->set_num_ctas(1);
+        block->set_num_stages(1);
+        block->set_waves_per_eu(waves_per_eu);
+        configs.push_back(std::move(config));
+      }
+    }
+    return configs;
+  }
   if (flydsl::IsFlySoftmaxFusion(analysis)) {
     const Shape& shape = analysis.first_result_shape();
     const int64_t rank = shape.dimensions_size();
@@ -2114,17 +2373,15 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       const int64_t rounded_columns = ((columns + 63) / 64) * 64;
       if ((!independent_rows && threads > rounded_columns) ||
           values_per_thread > 64 ||
-          (independent_rows &&
-           shape.dimensions(rank - 2) < num_warps)) {
+          (independent_rows && shape.dimensions(rank - 2) < num_warps)) {
         continue;
       }
       auto config = std::make_unique<BackendConfig>();
       BlockLevelFusionConfig* block = config->mutable_block_level();
       Tile* tile = block->add_output_tiles();
       for (int64_t dimension = 0; dimension < rank - 1; ++dimension) {
-        tile->add_sizes(independent_rows && dimension == rank - 2
-                            ? num_warps
-                            : 1);
+        tile->add_sizes(independent_rows && dimension == rank - 2 ? num_warps
+                                                                  : 1);
       }
       tile->add_sizes(columns);
       block->set_num_warps(num_warps);
@@ -2139,20 +2396,21 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
         flydsl::GetFlyXTileTransposeMatrixShape(analysis);
     TF_RET_CHECK(matrix_shape.has_value());
     auto [rows, columns] = *matrix_shape;
-    for (auto [tile_size, num_warps] :
-         {std::pair<int64_t, int64_t>{32, 1}, {64, 4}, {128, 16}}) {
-      if (rows % tile_size != 0 || columns % tile_size != 0) {
-        continue;
+    for (int64_t tile_rows : {32, 64, 128}) {
+      for (int64_t tile_columns : {32, 64, 128}) {
+        if (rows % tile_rows != 0 || columns % tile_columns != 0) {
+          continue;
+        }
+        auto config = std::make_unique<BackendConfig>();
+        BlockLevelFusionConfig* block = config->mutable_block_level();
+        Tile* tile = block->add_output_tiles();
+        tile->add_sizes(tile_rows);
+        tile->add_sizes(tile_columns);
+        block->set_num_warps(tile_rows * tile_columns / 1024);
+        block->set_num_ctas(1);
+        block->set_num_stages(1);
+        configs.push_back(std::move(config));
       }
-      auto config = std::make_unique<BackendConfig>();
-      BlockLevelFusionConfig* block = config->mutable_block_level();
-      Tile* tile = block->add_output_tiles();
-      tile->add_sizes(tile_size);
-      tile->add_sizes(tile_size);
-      block->set_num_warps(num_warps);
-      block->set_num_ctas(1);
-      block->set_num_stages(1);
-      configs.push_back(std::move(config));
     }
     return configs;
   }
@@ -2161,16 +2419,17 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     // use 128-bit buffer copies on the fast path. Also keep 64-bit copies in
     // the search because the smaller register vectors can win at short row
     // sizes or under register pressure from fused input expressions.
-    auto add_configs = [&](int64_t vector_size_bits) {
+    auto add_configs = [&](int64_t vector_size_bits, int64_t output_partitions,
+                           absl::Span<const int64_t> warp_counts) {
       if (!flydsl::IsFlyXTileRowReductionConfigSupported(
-              analysis, vector_size_bits)) {
+              analysis, vector_size_bits, output_partitions)) {
         return false;
       }
-      for (int64_t num_warps : {1, 2, 4, 8, 16}) {
+      for (int64_t num_warps : warp_counts) {
         auto config = std::make_unique<BackendConfig>();
         BlockLevelFusionConfig* block = config->mutable_block_level();
         Tile* tile = block->add_output_tiles();
-        tile->add_sizes(1);
+        tile->add_sizes(output_partitions);
         block->set_num_warps(num_warps);
         block->set_num_ctas(1);
         block->set_num_stages(1);
@@ -2179,8 +2438,23 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       }
       return true;
     };
+    constexpr std::array<int64_t, 5> kFullRowWarps = {1, 2, 4, 8, 16};
     for (int64_t vector_size_bits : {64, 128}) {
-      add_configs(vector_size_bits);
+      add_configs(vector_size_bits, /*output_partitions=*/1, kFullRowWarps);
+    }
+    // RMSNorm-like fusions with only a few hundred rows underfill MI300X when
+    // one wave owns a whole row. Match the block emitter's successful 128-wide
+    // output geometry by redundantly reducing each row in eight partitions.
+    // The autotuner retains the non-redundant alternatives above for larger
+    // batches and bandwidth-bound reductions.
+    constexpr std::array<int64_t, 3> kPartitionedWarps = {1, 2, 4};
+    for (int64_t output_partitions : {2, 4}) {
+      for (int64_t vector_size_bits : {64, 128}) {
+        add_configs(vector_size_bits, output_partitions, kPartitionedWarps);
+      }
+    }
+    for (int64_t vector_size_bits : {32, 64}) {
+      add_configs(vector_size_bits, /*output_partitions=*/8, kPartitionedWarps);
     }
     return configs;
   }
@@ -2244,12 +2518,27 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const int64_t native_unroll = ComputeLoopFusionConfig(analysis);
   const bool is_native_elementwise =
       flydsl::IsFlyXTileElementwiseFusion(analysis);
+  int64_t max_external_element_bits =
+      primitive_util::BitWidth(analysis.first_result_shape().element_type());
+  for (const HloInstruction* operand : instr.operands()) {
+    max_external_element_bits = std::max<int64_t>(
+        max_external_element_bits,
+        primitive_util::BitWidth(operand->shape().element_type()));
+  }
   const int64_t max_elementwise_configs = std::max<int64_t>(
       1, debug_options().xla_gpu_fusion_autotune_top_k_configs());
 
   auto add_config = [&](int64_t unroll, int64_t num_warps,
                         int64_t vector_size_bits) {
     if (unroll <= 0 || unroll > elements) {
+      return;
+    }
+    if (is_native_elementwise && vector_size_bits > 0 &&
+        vector_size_bits /
+                primitive_util::BitWidth(
+                    analysis.first_result_shape().element_type()) *
+                max_external_element_bits >
+            128) {
       return;
     }
     for (const auto& existing : configs) {
@@ -2277,8 +2566,8 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     // graphs. Interleave dtype-specific alternatives early enough that an
     // explicit wider search still measures their throughput/register-pressure
     // tradeoffs.
-    constexpr std::array<std::array<int64_t, 3>, 8>
-        kAlignedPreferredConfigs = {{
+    constexpr std::array<std::array<int64_t, 3>, 8> kAlignedPreferredConfigs = {
+        {
             {1, 2, 64},
             {1, 2, 128},
             {2, 4, 64},
@@ -2288,17 +2577,16 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
             {4, 4, 64},
             {1, 4, 128},
         }};
-    constexpr std::array<std::array<int64_t, 3>, 8>
-        kTailPreferredConfigs = {{
-            {1, 2, 64},
-            {1, 2, 128},
-            {2, 2, 64},
-            {2, 4, 64},
-            {2, 4, 128},
-            {1, 4, 64},
-            {4, 4, 64},
-            {1, 4, 128},
-        }};
+    constexpr std::array<std::array<int64_t, 3>, 8> kTailPreferredConfigs = {{
+        {1, 2, 64},
+        {1, 2, 128},
+        {2, 2, 64},
+        {2, 4, 64},
+        {2, 4, 128},
+        {1, 4, 64},
+        {4, 4, 64},
+        {1, 4, 128},
+    }};
     constexpr std::array<std::array<int64_t, 3>, 8> kF16PreferredConfigs = {{
         {1, 2, 64},
         {1, 2, 128},
@@ -2323,10 +2611,8 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
         analysis.first_result_shape().element_type();
     const int64_t element_bits = primitive_util::BitWidth(element_type);
     const bool has_scalar_tail = elements % (64 / element_bits) != 0;
-    const auto& preferred_configs = element_type == F16
-                                        ? kF16PreferredConfigs
-                                    : element_type == F32
-                                        ? kF32PreferredConfigs
+    const auto& preferred_configs = element_type == F16   ? kF16PreferredConfigs
+                                    : element_type == F32 ? kF32PreferredConfigs
                                     : has_scalar_tail
                                         ? kTailPreferredConfigs
                                         : kAlignedPreferredConfigs;
@@ -2382,13 +2668,14 @@ absl::Status FlyFusionBackend::ApplyConfig(HloInstruction& instr,
         "FlyFusionBackend does not support this instruction.");
   }
   if (!config.has_block_level() ||
-      config.block_level().output_tiles_size() != 1 ||
-      config.block_level().output_tiles(0).sizes().empty()) {
+      config.block_level().output_tiles().empty()) {
     return absl::InvalidArgumentError(
         "Expected a non-empty Fly fusion tile configuration.");
   }
-  for (int64_t size : config.block_level().output_tiles(0).sizes()) {
-    if (size <= 0) {
+  for (const Tile& output_tile : config.block_level().output_tiles()) {
+    if (output_tile.sizes().empty() ||
+        absl::c_any_of(output_tile.sizes(),
+                       [](int64_t size) { return size <= 0; })) {
       return absl::InvalidArgumentError(
           "Expected positive Fly fusion tile sizes.");
     }

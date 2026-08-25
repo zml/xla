@@ -285,6 +285,39 @@ std::optional<DimOrdersAndReqs> GetUserDimOrdersAndCombinedReqsIfProfitable(
       std::get<DotRequirements>(combined_reqs)};
 }
 
+bool IsFlyAttentionOutputTranspose(const HloInstruction& transpose) {
+  if (!transpose.GetModule()
+           ->config()
+           .debug_options()
+           .xla_gpu_enable_flydsl_gemm() ||
+      transpose.opcode() != HloOpcode::kTranspose ||
+      transpose.shape().element_type() != BF16 ||
+      transpose.shape().dimensions_size() != 4 ||
+      transpose.dimensions() != std::vector<int64_t>({0, 3, 1, 2}) ||
+      transpose.operand_count() != 1) {
+    return false;
+  }
+  const HloInstruction* bitcast = transpose.operand(0);
+  if (bitcast->opcode() != HloOpcode::kBitcast ||
+      bitcast->shape().dimensions_size() != 4 ||
+      bitcast->operand_count() != 1) {
+    return false;
+  }
+  const HloInstruction* dot = bitcast->operand(0);
+  if (dot->opcode() != HloOpcode::kDot ||
+      dot->shape().element_type() != BF16 ||
+      dot->shape().dimensions_size() != 3) {
+    return false;
+  }
+  return bitcast->shape().dimensions(0) > 0 &&
+         bitcast->shape().dimensions(1) > 0 &&
+         bitcast->shape().dimensions(0) *
+                 bitcast->shape().dimensions(1) ==
+             dot->shape().dimensions(0) &&
+         bitcast->shape().dimensions(2) == dot->shape().dimensions(1) &&
+         bitcast->shape().dimensions(3) == dot->shape().dimensions(2);
+}
+
 class FusionPlanBuilder {
  public:
   // Builds and returns the FusionPlan. Clears internal state.
@@ -672,6 +705,20 @@ HlosAndRequirements FuseDotOutput(
     HloComputation::Builder& builder,            // append
     std::vector<HloInstruction*>& fusion_params  // append
 ) {
+  if (gpu_version.IsRocm() && dot.user_count() == 1) {
+    HloInstruction* bitcast = dot.users()[0];
+    if (bitcast->opcode() == HloOpcode::kBitcast &&
+        bitcast->user_count() == 1 &&
+        IsFlyAttentionOutputTranspose(*bitcast->users()[0])) {
+      HloInstruction* transpose = bitcast->users()[0];
+      HloInstruction* fused_bitcast = builder.AddInstruction(
+          bitcast->CloneWithNewOperands(bitcast->shape(), {&fused_dot}));
+      HloInstruction* fused_transpose = builder.AddInstruction(
+          transpose->CloneWithNewOperands(transpose->shape(),
+                                          {fused_bitcast}));
+      return HlosAndRequirements{transpose, fused_transpose, requirements};
+    }
+  }
   const auto context = FusionContext::FromDotOutput(dot, requirements);
   return FuseTowardUsers(dot, fused_dot, context.dim_orders().at(&dot),
                          gpu_version, context.dot_properties(),
@@ -1156,8 +1203,12 @@ bool IsBinaryElementwiseOfBroadcastParamOrConst(const HloInstruction& hlo) {
 FusionDecision ShouldFuseUser(mlir::MLIRContext& mlir_context,
                               HloInstruction* user,
                               const HloInstruction& original_user,
-                              HloInstruction* fusion) {
-  if (triton_fusion::IsOutputWorthFusing(original_user)) {
+                              HloInstruction* fusion,
+                              const se::GpuComputeCapability& gpu_version) {
+  if (triton_fusion::IsOutputWorthFusing(original_user) ||
+      (gpu_version.IsRocm() &&
+       fusion->GetModule()->config().debug_options().xla_gpu_enable_flydsl_gemm() &&
+       IsFlyAttentionOutputTranspose(original_user))) {
     return CanFuse(mlir_context, fusion, user);
   }
   return FusionDecision::Forbid("Not obviously profitable to fuse as output.");
@@ -1300,7 +1351,8 @@ absl::StatusOr<std::variant<Fusion, FusionDecision>> CreateTileableFusion(
     HloInstruction* original_user =
         fusion_search_space.fused_to_original().at(user);
     if (FusionDecision decision =
-            ShouldFuseUser(mlir_context, user, *original_user, fusion);
+            ShouldFuseUser(mlir_context, user, *original_user, fusion,
+                           gpu_version);
         !decision.IsAllowed()) {
       VLOG(5) << "Not fusing user: " << decision.Explain();
       break;
@@ -1446,15 +1498,16 @@ absl::StatusOr<std::variant<Fusion, FusionDecision>> CreateDotFusion(
   return Fusion{std::move(fusion_inputs), builder.Build(), fusion_output};
 }
 
-// Extracts into fused computations parts of HLO graph including dot()
-// operations that can target the triton GEMM emitter.
+// Extracts parts of HLO graphs including dot() operations into fused
+// computations that can target the selected GEMM emitter family.
 class GemmFusionVisitor : public DfsHloRewriteVisitor {
  public:
-  explicit GemmFusionVisitor(const se::GpuComputeCapability& gpu_version)
-      : gpu_version_(gpu_version) {}
-  // Checks that a dot() should be targeting the triton GEMM emitter;
-  // if so - fuses all its compatible inputs and outputs as a new computation
-  // and replaces the original dot() with a call to the computation.
+  GemmFusionVisitor(const se::GpuComputeCapability& gpu_version,
+                    GemmFusionTarget target)
+      : gpu_version_(gpu_version), target_(target) {}
+  // Checks that a dot() should target the selected GEMM emitter family; if so,
+  // fuses all compatible inputs and outputs as a new computation and replaces
+  // the original dot() with a call to that computation.
   absl::Status HandleDot(HloInstruction* dot) override {
     CHECK_EQ(dot->opcode(), HloOpcode::kDot);
 
@@ -1501,7 +1554,9 @@ class GemmFusionVisitor : public DfsHloRewriteVisitor {
                      dot_fusion->backend_config<GpuBackendConfig>());
     FusionBackendConfig& backend_config =
         *gpu_config.mutable_fusion_backend_config();
-    backend_config.set_kind(kTritonGemmFusionKind);
+    backend_config.set_kind(target_ == GemmFusionTarget::kFly
+                                ? kFlyGemmFusionKind
+                                : kTritonGemmFusionKind);
     RETURN_IF_ERROR(dot_fusion->set_backend_config(gpu_config));
 
     HloInstruction* replacement = dot_fusion;
@@ -1568,7 +1623,9 @@ class GemmFusionVisitor : public DfsHloRewriteVisitor {
                      fusion->backend_config<GpuBackendConfig>());
     FusionBackendConfig& backend_config =
         *gpu_config.mutable_fusion_backend_config();
-    backend_config.set_kind(kTritonGemmFusionKind);
+    backend_config.set_kind(target_ == GemmFusionTarget::kFly
+                                ? kFlyGemmFusionKind
+                                : kTritonGemmFusionKind);
     RETURN_IF_ERROR(fusion->set_backend_config(gpu_config));
     HloInstruction* fusion_output = fused_output_and_reqs.original_hlo;
     RETURN_IF_ERROR(ReplaceInstruction(fusion_output, fusion));
@@ -1578,11 +1635,13 @@ class GemmFusionVisitor : public DfsHloRewriteVisitor {
 
  private:
   se::GpuComputeCapability gpu_version_;
+  GemmFusionTarget target_;
 };
 
 absl::StatusOr<bool> RunOnComputation(
-    HloComputation* computation, const se::GpuComputeCapability& gpu_version) {
-  GemmFusionVisitor visitor(gpu_version);
+    HloComputation* computation, const se::GpuComputeCapability& gpu_version,
+    GemmFusionTarget target) {
+  GemmFusionVisitor visitor(gpu_version, target);
   RETURN_IF_ERROR(computation->Accept(&visitor));
   return visitor.changed();
 }
@@ -1592,13 +1651,16 @@ absl::StatusOr<bool> RunOnComputation(
 absl::StatusOr<bool> GemmFusion::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
-  RETURN_IF_ERROR(EnsureTritonSupportsComputeCapability(compute_capability_));
+  if (target_ == GemmFusionTarget::kTriton) {
+    RETURN_IF_ERROR(EnsureTritonSupportsComputeCapability(compute_capability_));
+  }
 
   bool changed = false;
   for (HloComputation* computation :
        GetFusibleComputations(*module, execution_threads)) {
     ASSIGN_OR_RETURN(bool result,
-                     RunOnComputation(computation, compute_capability_));
+                     RunOnComputation(computation, compute_capability_,
+                                      target_));
     changed |= result;
   }
   return changed;

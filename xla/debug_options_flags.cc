@@ -356,6 +356,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_enable_triton_gemm(true);
   opts.set_xla_gpu_enable_flydsl_gemm(false);
   opts.set_xla_gpu_enable_flydsl_fusion(false);
+  opts.set_xla_gpu_flydsl_replace_triton(false);
   opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
   opts.set_xla_gpu_triton_gemm_any(true);
@@ -555,6 +556,7 @@ static DebugOptions* flag_values;
 static std::vector<tsl::Flag>* flag_objects;
 static std::optional<bool> pjrt_plugin_enable_flydsl_gemm;
 static std::optional<bool> pjrt_plugin_enable_flydsl_fusion;
+static std::optional<bool> pjrt_plugin_flydsl_replace_triton;
 static std::optional<int64_t> pjrt_plugin_autotune_num_repetitions;
 
 static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
@@ -565,6 +567,15 @@ static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
       debug_options->add_xla_gpu_experimental_autotune_backends(backend);
     }
   };
+  auto remove_autotune_backend =
+      [debug_options](autotuner::Backend backend) {
+        auto* backends =
+            debug_options->mutable_xla_gpu_experimental_autotune_backends();
+        auto it = FindRepeatedFieldValue(backends, backend);
+        if (it != backends->end()) {
+          backends->erase(it);
+        }
+      };
 
   if (pjrt_plugin_enable_flydsl_gemm.has_value()) {
     debug_options->set_xla_gpu_enable_flydsl_gemm(
@@ -587,6 +598,24 @@ static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
   if (pjrt_plugin_autotune_num_repetitions.has_value()) {
     debug_options->set_xla_gpu_autotune_num_repetitions(
         *pjrt_plugin_autotune_num_repetitions);
+  }
+  if (pjrt_plugin_flydsl_replace_triton.has_value()) {
+    debug_options->set_xla_gpu_flydsl_replace_triton(
+        *pjrt_plugin_flydsl_replace_triton);
+  }
+  if (debug_options->xla_gpu_flydsl_replace_triton()) {
+    // Keep non-Triton backends available: replacement mode is a coverage and
+    // deployment invariant, not a request to disable native XLA or libraries.
+    debug_options->set_xla_gpu_enable_flydsl_gemm(true);
+    debug_options->set_xla_gpu_enable_flydsl_fusion(true);
+    debug_options->set_xla_gpu_enable_triton_gemm(false);
+    debug_options->set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(
+        false);
+    add_autotune_backend(autotuner::Backend::FLY);
+    add_autotune_backend(autotuner::Backend::FLY_FISSION);
+    add_autotune_backend(autotuner::Backend::FLY_FUSION);
+    remove_autotune_backend(autotuner::Backend::TRITON);
+    remove_autotune_backend(autotuner::Backend::BLOCK_LEVEL_EMITTER);
   }
 }
 
@@ -2464,6 +2493,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "Whether to enable the experimental FlyDSL generic fusion and "
       "autotuning backend on ROCm."));
   flag_list->push_back(tsl::Flag(
+      "xla_gpu_flydsl_replace_triton",
+      bool_setter_for(&DebugOptions::set_xla_gpu_flydsl_replace_triton),
+      debug_options->xla_gpu_flydsl_replace_triton(),
+      "Whether FlyDSL should replace Triton GEMM and block-level fusion "
+      "backends and disable Triton collective kernels on ROCm instead of "
+      "competing with them."));
+  flag_list->push_back(tsl::Flag(
       "xla_gpu_unsupported_enable_triton_multi_output_fusion",
       bool_setter_for(
           &DebugOptions::
@@ -3622,7 +3658,8 @@ xla::DebugOptions GetDebugOptionsFromFlags() {
 void ApplyPjRtPluginFlyDslDebugOptions(
     std::optional<bool> enable_flydsl_gemm,
     std::optional<bool> enable_flydsl_fusion,
-    std::optional<int64_t> autotune_num_repetitions) {
+    std::optional<int64_t> autotune_num_repetitions,
+    std::optional<bool> replace_triton) {
   absl::call_once(flags_init, &AllocateFlags, nullptr);
   if (enable_flydsl_gemm.has_value()) {
     pjrt_plugin_enable_flydsl_gemm = enable_flydsl_gemm;
@@ -3632,6 +3669,9 @@ void ApplyPjRtPluginFlyDslDebugOptions(
   }
   if (autotune_num_repetitions.has_value()) {
     pjrt_plugin_autotune_num_repetitions = autotune_num_repetitions;
+  }
+  if (replace_triton.has_value()) {
+    pjrt_plugin_flydsl_replace_triton = replace_triton;
   }
 }
 

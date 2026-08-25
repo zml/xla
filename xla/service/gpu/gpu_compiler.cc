@@ -77,6 +77,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/add_tracking_suffix_to_instruction_names.h"
 #include "xla/backends/gpu/transforms/algebraic_simplifier.h"
 #include "xla/backends/gpu/transforms/algorithm_checker.h"
+#include "xla/backends/gpu/transforms/attention_rewriter_fly.h"
 #include "xla/backends/gpu/transforms/async_wrapper.h"
 #include "xla/backends/gpu/transforms/collectives/all_gather_combiner.h"
 #include "xla/backends/gpu/transforms/collectives/all_gather_dynamic_slice_simplifier.h"
@@ -113,6 +114,8 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/estimate_cub_sort_scratch_size.h"
 #include "xla/backends/gpu/transforms/explicit_collectives_group_async_wrapper.h"
 #include "xla/backends/gpu/transforms/explicit_stream_annotation_async_wrapper.h"
+#include "xla/backends/gpu/transforms/flydsl_replacement_verifier.h"
+#include "xla/backends/gpu/transforms/paged_attention_rewriter_fly.h"
 #include "xla/backends/gpu/transforms/fusion_wrapper.h"
 #include "xla/backends/gpu/transforms/gemm_broadcast_folding_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_fusion.h"
@@ -1881,6 +1884,13 @@ absl::Status GpuCompiler::OptimizeHloModule(
     RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
   }
 
+  {
+    HloPassPipeline pipeline("flydsl-replacement-verification",
+                             compilation_stats);
+    pipeline.AddPass<FlyDslReplacementVerifier>();
+    RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
+  }
+
   return absl::OkStatus();
 }  // NOLINT(readability/fn_size)
 
@@ -2017,7 +2027,10 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
               .xla_gpu_experimental_gemm_fusion_v2());
       pipeline.AddPass<GemvRewriter>();
       pipeline.AddPass<SplitkRewriter>(gpu_target_config.device_description);
-      pipeline.AddPass<GemmFusion>(gpu_version);
+      pipeline.AddPass<GemmFusion>(
+          gpu_version, debug_options.xla_gpu_flydsl_replace_triton()
+                           ? GemmFusionTarget::kFly
+                           : GemmFusionTarget::kTriton);
       pipeline.AddPass<HoistFusedBitcasts>();
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
@@ -2061,7 +2074,9 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<HloDCE>();
       if (rocm_cc != nullptr &&
           debug_options.xla_gpu_enable_flydsl_fusion()) {
+        pipeline.AddPass<PagedAttentionRewriterFly>();
         pipeline.AddPass<SoftmaxRewriterFly>();
+        pipeline.AddPass<AttentionRewriterFly>();
       } else {
         pipeline.AddPass<SoftmaxRewriterTriton>(
             gpu_target_config.device_description, ShapeSizeBytesFunction(),

@@ -1410,6 +1410,7 @@ AsyncThunkSequence ThunkEmitter::EmitTritonCustomCall(
     block_level_parameters.num_stages = call.num_stages;
     block_level_parameters.num_warps = call.num_warps;
     block_level_parameters.num_ctas = 1;
+    block_level_parameters.waves_per_eu = call.waves_per_eu;
     block_level_parameters.global_scratch_memory_size =
         call.global_scratch_memory_size;
     block_level_parameters.is_tma_allowed = call.is_tma_allowed;

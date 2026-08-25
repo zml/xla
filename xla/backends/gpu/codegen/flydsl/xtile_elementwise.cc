@@ -28,8 +28,8 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -72,13 +72,53 @@ bool IsSupportedValueType(PrimitiveType type) {
   return IsSupportedType(type) || type == PRED;
 }
 
-int64_t ElementBits(PrimitiveType type) {
-  return type == F32 ? 32 : 16;
-}
+int64_t ElementBits(PrimitiveType type) { return type == F32 ? 32 : 16; }
 
 bool HasSamePhysicalDimensions(const Shape& lhs, const Shape& rhs) {
   return ShapeUtil::EqualIgnoringElementType(lhs, rhs) &&
          LayoutUtil::Equal(lhs.layout(), rhs.layout());
+}
+
+bool HasSameFlatElements(const Shape& lhs, const Shape& rhs) {
+  return lhs.IsArray() && rhs.IsArray() && lhs.has_layout() &&
+         rhs.has_layout() &&
+         ShapeUtil::ElementsIn(lhs) == ShapeUtil::ElementsIn(rhs);
+}
+
+bool IsSupportedSmallLeadingReduction(const HloInstruction* instruction,
+                                      const Shape& output_shape) {
+  if (instruction->opcode() != HloOpcode::kReduce ||
+      instruction->operand_count() != 2 ||
+      instruction->shape().element_type() != F32 ||
+      !HasSameFlatElements(instruction->shape(), output_shape) ||
+      instruction->dimensions() != std::vector<int64_t>({0})) {
+    return false;
+  }
+  const HloInstruction* input = instruction->operand(0);
+  const HloInstruction* init = instruction->operand(1);
+  if (input->opcode() != HloOpcode::kParameter ||
+      input->shape().element_type() != F32 ||
+      input->shape().dimensions_size() !=
+          instruction->shape().dimensions_size() + 1 ||
+      input->shape().dimensions(0) < 2 || input->shape().dimensions(0) > 8 ||
+      !ShapeUtil::IsScalar(init->shape()) ||
+      init->opcode() != HloOpcode::kConstant ||
+      init->shape().element_type() != F32 ||
+      init->literal().GetFirstElement<float>() != 0.0f) {
+    return false;
+  }
+  for (int64_t dimension = 0;
+       dimension < instruction->shape().dimensions_size(); ++dimension) {
+    if (input->shape().dimensions(dimension + 1) !=
+        instruction->shape().dimensions(dimension)) {
+      return false;
+    }
+  }
+  const HloComputation* reducer = instruction->to_apply();
+  return reducer != nullptr && reducer->num_parameters() == 2 &&
+         reducer->root_instruction()->opcode() == HloOpcode::kAdd &&
+         reducer->root_instruction()->operand_count() == 2 &&
+         reducer->root_instruction()->shape().element_type() == F32;
 }
 
 bool IsSupportedElementwiseGraph(
@@ -109,9 +149,20 @@ bool IsSupportedElementwiseGraph(
       return instruction->operand_count() == 1 &&
              IsSupportedType(instruction->shape().element_type()) &&
              IsSupportedType(instruction->operand(0)->shape().element_type()) &&
-             HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
+             HasSameFlatElements(instruction->shape(), output_shape) &&
              IsSupportedElementwiseGraph(instruction->operand(0), output_shape,
                                          visited);
+    case HloOpcode::kBitcast:
+      return instruction->operand_count() == 1 &&
+             instruction->shape().element_type() ==
+                 instruction->operand(0)->shape().element_type() &&
+             HasSameFlatElements(instruction->shape(), output_shape) &&
+             ShapeUtil::ElementsIn(instruction->shape()) ==
+                 ShapeUtil::ElementsIn(instruction->operand(0)->shape()) &&
+             IsSupportedElementwiseGraph(instruction->operand(0), output_shape,
+                                         visited);
+    case HloOpcode::kReduce:
+      return IsSupportedSmallLeadingReduction(instruction, output_shape);
     case HloOpcode::kAbs:
     case HloOpcode::kCopy:
     case HloOpcode::kExp:
@@ -184,9 +235,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         analysis.fusion_backend_config().block_level_fusion_config();
     CHECK_EQ(config.output_tiles_size(), 1);
     CHECK_GT(config.output_tiles(0).sizes_size(), 0);
-    vector_size_bits_ = config.vector_size_bits() == 0
-                            ? 64
-                            : config.vector_size_bits();
+    vector_size_bits_ =
+        config.vector_size_bits() == 0 ? 64 : config.vector_size_bits();
     CHECK(vector_size_bits_ == 64 || vector_size_bits_ == 128);
     CHECK_EQ(vector_size_bits_ % ElementBits(element_type_), 0);
     vector_width_ = vector_size_bits_ / ElementBits(element_type_);
@@ -197,8 +247,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     const int64_t elements_per_block =
         threads_ * vectors_per_thread_ * vector_width_;
     launch_dimensions_ = LaunchDimensions(
-        se::BlockDim((elements_ + elements_per_block - 1) /
-                         elements_per_block,
+        se::BlockDim((elements_ + elements_per_block - 1) / elements_per_block,
                      1, 1),
         se::ThreadDim(threads_, 1, 1));
   }
@@ -233,9 +282,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         mlir::NameLoc::get(module_builder.getStringAttr(fusion.name()));
     mlir::OwningOpRef<mlir::ModuleOp> module =
         llvm_ir::CreateMlirModuleOp(location);
-    module.get()->setAttr(
-        mlir::gpu::GPUDialect::getContainerModuleAttrName(),
-        module_builder.getUnitAttr());
+    module.get()->setAttr(mlir::gpu::GPUDialect::getContainerModuleAttrName(),
+                          module_builder.getUnitAttr());
 
     module_builder.setInsertionPointToStart(module->getBody());
     mlir::gpu::GPUModuleOp gpu_module = mlir::gpu::GPUModuleOp::create(
@@ -243,15 +291,34 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     module_builder.setInsertionPointToStart(
         &gpu_module.getBodyRegion().front());
 
-    mlir::Type element_mlir_type =
-        emitters::PrimitiveTypeToMlirType(element_type_, module_builder);
     mlir::fly::AddressSpaceAttr global_address =
         mlir::fly::AddressSpaceAttr::get(&context,
                                          mlir::fly::AddressSpace::Global);
-    mlir::fly::PointerType pointer_type =
-        mlir::fly::PointerType::get(element_mlir_type, global_address);
-    llvm::SmallVector<mlir::Type> argument_types(
-        fusion.operand_count() + output_count_, pointer_type);
+    llvm::SmallVector<mlir::Type> argument_types;
+    argument_types.reserve(fusion.operand_count() + output_count_);
+    for (const HloInstruction* operand : fusion.operands()) {
+      argument_types.push_back(mlir::fly::PointerType::get(
+          emitters::PrimitiveTypeToMlirType(operand->shape().element_type(),
+                                            module_builder),
+          global_address));
+    }
+    const HloInstruction* fusion_root = fusion.fused_expression_root();
+    TF_RET_CHECK(fusion_root != nullptr);
+    if (fusion_root->opcode() == HloOpcode::kTuple) {
+      for (const HloInstruction* root : fusion_root->operands()) {
+        argument_types.push_back(mlir::fly::PointerType::get(
+            emitters::PrimitiveTypeToMlirType(root->shape().element_type(),
+                                              module_builder),
+            global_address));
+      }
+    } else {
+      argument_types.push_back(mlir::fly::PointerType::get(
+          emitters::PrimitiveTypeToMlirType(fusion_root->shape().element_type(),
+                                            module_builder),
+          global_address));
+    }
+    TF_RET_CHECK(argument_types.size() ==
+                 fusion.operand_count() + output_count_);
     mlir::FunctionType function_type = mlir::FunctionType::get(
         &context, argument_types, /*results=*/mlir::TypeRange{});
     mlir::gpu::GPUFuncOp kernel = mlir::gpu::GPUFuncOp::create(
@@ -271,23 +338,22 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         "FlyXTileElementwiseEmitter builds a native gpu.func module.");
   }
 
-  Value SplatInteger(mlir::ImplicitLocOpBuilder& builder,
-                     mlir::VectorType type, int64_t value) const {
+  Value SplatInteger(mlir::ImplicitLocOpBuilder& builder, mlir::VectorType type,
+                     int64_t value) const {
     return mlir::arith::ConstantOp::create(
         builder, type,
         mlir::DenseElementsAttr::get(
             type, builder.getIntegerAttr(type.getElementType(), value)));
   }
 
-  Value Bf16PairToF32(mlir::ImplicitLocOpBuilder& builder,
-                      Value pair) const {
+  Value Bf16PairToF32(mlir::ImplicitLocOpBuilder& builder, Value pair) const {
     auto i16_type = mlir::VectorType::get({2}, builder.getI16Type());
     auto i32_type = mlir::VectorType::get({2}, builder.getI32Type());
     auto f32_type = mlir::VectorType::get({2}, builder.getF32Type());
     Value bits = mlir::arith::BitcastOp::create(builder, i16_type, pair);
     bits = mlir::arith::ExtUIOp::create(builder, i32_type, bits);
-    bits = mlir::arith::ShLIOp::create(
-        builder, bits, SplatInteger(builder, i32_type, 16));
+    bits = mlir::arith::ShLIOp::create(builder, bits,
+                                       SplatInteger(builder, i32_type, 16));
     return mlir::arith::BitcastOp::create(builder, f32_type, bits);
   }
 
@@ -303,14 +369,12 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         SplatInteger(builder, i32_type, 1));
     Value rounded = mlir::arith::AddIOp::create(
         builder,
-        mlir::arith::AddIOp::create(
-            builder, bits, SplatInteger(builder, i32_type, 0x7fff)),
+        mlir::arith::AddIOp::create(builder, bits,
+                                    SplatInteger(builder, i32_type, 0x7fff)),
         retained_lsb);
     rounded = mlir::arith::ShRUIOp::create(builder, rounded, shift);
-    Value narrowed =
-        mlir::arith::TruncIOp::create(builder, i16_type, rounded);
-    Value result =
-        mlir::arith::BitcastOp::create(builder, bf16_type, narrowed);
+    Value narrowed = mlir::arith::TruncIOp::create(builder, i16_type, rounded);
+    Value result = mlir::arith::BitcastOp::create(builder, bf16_type, narrowed);
     Value is_nan = mlir::arith::CmpFOp::create(
         builder, mlir::arith::CmpFPredicate::UNO, value, value);
     Value canonical_nan = mlir::arith::BitcastOp::create(
@@ -327,11 +391,10 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       llvm::SmallVector<Value> combined;
       combined.reserve(pairs.size() / 2);
       for (int64_t pair = 0; pair < pairs.size(); pair += 2) {
-        auto input_type =
-            mlir::cast<mlir::VectorType>(pairs[pair].getType());
+        auto input_type = mlir::cast<mlir::VectorType>(pairs[pair].getType());
         const int64_t input_elements = input_type.getNumElements();
-        auto result_type = mlir::VectorType::get(
-            {2 * input_elements}, input_type.getElementType());
+        auto result_type = mlir::VectorType::get({2 * input_elements},
+                                                 input_type.getElementType());
         llvm::SmallVector<int64_t> mask;
         mask.reserve(2 * input_elements);
         for (int64_t element = 0; element < 2 * input_elements; ++element) {
@@ -359,8 +422,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         emitters::PrimitiveTypeToMlirType(destination_type, builder));
     if (source_type == BF16 && destination_type == F32 &&
         vector_width % 2 == 0) {
-      auto bf16_pair_type =
-          mlir::VectorType::get({2}, builder.getBF16Type());
+      auto bf16_pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
       llvm::SmallVector<Value> pairs;
       pairs.reserve(vector_width / 2);
       for (int64_t pair = 0; pair < vector_width / 2; ++pair) {
@@ -373,8 +435,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     }
     if (source_type == F32 && destination_type == BF16 &&
         vector_width % 2 == 0) {
-      auto f32_pair_type =
-          mlir::VectorType::get({2}, builder.getF32Type());
+      auto f32_pair_type = mlir::VectorType::get({2}, builder.getF32Type());
       llvm::SmallVector<Value> pairs;
       pairs.reserve(vector_width / 2);
       for (int64_t pair = 0; pair < vector_width / 2; ++pair) {
@@ -433,16 +494,15 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       return mlir::arith::TruncFOp::create(builder, bf16_type, computed)
           .getResult();
     }
-    auto bf16_pair_type =
-        mlir::VectorType::get({2}, builder.getBF16Type());
+    auto bf16_pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
     llvm::SmallVector<Value> pairs;
     pairs.reserve(vector_width / 2);
     for (int64_t pair = 0; pair < vector_width / 2; ++pair) {
       llvm::SmallVector<int64_t, 2> mask{2 * pair, 2 * pair + 1};
-      Value lhs_pair = mlir::vector::ShuffleOp::create(
-          builder, bf16_pair_type, lhs, lhs, mask);
-      Value rhs_pair = mlir::vector::ShuffleOp::create(
-          builder, bf16_pair_type, rhs, rhs, mask);
+      Value lhs_pair = mlir::vector::ShuffleOp::create(builder, bf16_pair_type,
+                                                       lhs, lhs, mask);
+      Value rhs_pair = mlir::vector::ShuffleOp::create(builder, bf16_pair_type,
+                                                       rhs, rhs, mask);
       lhs_pair = Bf16PairToF32(builder, lhs_pair);
       rhs_pair = Bf16PairToF32(builder, rhs_pair);
       Value computed;
@@ -543,16 +603,15 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       mlir::ImplicitLocOpBuilder& builder,
       llvm::ArrayRef<Value> argument_pointers,
       const HloInstruction* instruction, Value element_offset, Value predicate,
-      Value copy_atom, Value vector_layout,
-      int64_t vector_width,
+      const absl::flat_hash_map<PrimitiveType, Value>& copy_atoms,
+      Value vector_layout, int64_t vector_width,
       absl::flat_hash_map<const HloInstruction*, Value>& cache) const {
     auto existing = cache.find(instruction);
     if (existing != cache.end()) {
       return existing->second;
     }
 
-    const PrimitiveType instruction_type =
-        instruction->shape().element_type();
+    const PrimitiveType instruction_type = instruction->shape().element_type();
     TF_RET_CHECK(IsSupportedValueType(instruction_type));
     auto vector_type = mlir::VectorType::get(
         {vector_width},
@@ -578,12 +637,12 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
             mlir::cast<mlir::fly::PointerType>(pointer.getType())
                 .getAddressSpace(),
             layout_type.getAttr());
-        Value view = mlir::fly::MakeViewOp::create(
-            builder, memref_type, advanced, vector_layout);
+        Value view = mlir::fly::MakeViewOp::create(builder, memref_type,
+                                                   advanced, vector_layout);
         Value poison = mlir::ub::PoisonOp::create(builder, vector_type);
         mlir::fly::CopyAtomCallSSA load = mlir::fly::CopyAtomCallSSA::create(
-            builder, mlir::TypeRange{vector_type}, copy_atom, view, poison,
-            predicate);
+            builder, mlir::TypeRange{vector_type},
+            copy_atoms.at(instruction_type), view, poison, predicate);
         result = load.getResult(0);
         break;
       }
@@ -601,28 +660,59 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             result,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
+        break;
+      }
+      case HloOpcode::kBitcast: {
+        TF_ASSIGN_OR_RETURN(
+            result,
+            EmitVector(builder, argument_pointers, instruction->operand(0),
+                       element_offset, predicate, copy_atoms, vector_layout,
+                       vector_width, cache));
+        break;
+      }
+      case HloOpcode::kReduce: {
+        const HloInstruction* input = instruction->operand(0);
+        const int64_t reduction_size = input->shape().dimensions(0);
+        for (int64_t part = 0; part < reduction_size; ++part) {
+          Value part_offset = element_offset;
+          if (part != 0) {
+            part_offset = mlir::arith::AddIOp::create(
+                builder, element_offset,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), part * elements_));
+          }
+          absl::flat_hash_map<const HloInstruction*, Value> part_cache;
+          TF_ASSIGN_OR_RETURN(
+              Value partial,
+              EmitVector(builder, argument_pointers, input, part_offset,
+                         predicate, copy_atoms, vector_layout, vector_width,
+                         part_cache));
+          result = part == 0
+                       ? partial
+                       : mlir::arith::AddFOp::create(builder, result, partial)
+                             .getResult();
+        }
         break;
       }
       case HloOpcode::kConvert: {
         TF_ASSIGN_OR_RETURN(
             Value operand,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
-            result,
-            EmitConvert(builder,
-                        instruction->operand(0)->shape().element_type(),
-                        instruction_type, operand));
+            result, EmitConvert(builder,
+                                instruction->operand(0)->shape().element_type(),
+                                instruction_type, operand));
         break;
       }
       case HloOpcode::kCopy: {
         TF_ASSIGN_OR_RETURN(
             result,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         break;
       }
@@ -631,18 +721,16 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             Value operand,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         if (instruction->opcode() == HloOpcode::kAbs) {
           result = mlir::math::AbsFOp::create(builder, operand);
         } else if (instruction_type != F32) {
           auto compute_type =
               mlir::VectorType::get({vector_width}, builder.getF32Type());
-          operand =
-              mlir::arith::ExtFOp::create(builder, compute_type, operand);
+          operand = mlir::arith::ExtFOp::create(builder, compute_type, operand);
           operand = mlir::arith::NegFOp::create(builder, operand);
-          result =
-              mlir::arith::TruncFOp::create(builder, vector_type, operand);
+          result = mlir::arith::TruncFOp::create(builder, vector_type, operand);
         } else {
           result = mlir::arith::NegFOp::create(builder, operand);
         }
@@ -656,20 +744,18 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             Value operand,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         if (instruction_type != F32) {
           TF_ASSIGN_OR_RETURN(
-              operand,
-              EmitConvert(builder, instruction_type, F32, operand));
+              operand, EmitConvert(builder, instruction_type, F32, operand));
         }
         TF_ASSIGN_OR_RETURN(
-            result, EmitScalarizedUnaryMath(builder, instruction->opcode(),
-                                            operand));
+            result,
+            EmitScalarizedUnaryMath(builder, instruction->opcode(), operand));
         if (instruction_type != F32) {
           TF_ASSIGN_OR_RETURN(
-              result,
-              EmitConvert(builder, F32, instruction_type, result));
+              result, EmitConvert(builder, F32, instruction_type, result));
         }
         break;
       }
@@ -682,18 +768,17 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             Value lhs,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value rhs,
             EmitVector(builder, argument_pointers, instruction->operand(1),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         if (instruction_type == BF16) {
           TF_ASSIGN_OR_RETURN(
               result,
-              EmitPairwiseBf16Binary(builder, instruction->opcode(), lhs,
-                                     rhs));
+              EmitPairwiseBf16Binary(builder, instruction->opcode(), lhs, rhs));
           break;
         }
         if (instruction_type != F32) {
@@ -725,36 +810,35 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
           default:
             return absl::InternalError("Unexpected Fly elementwise opcode.");
         }
-        result = instruction_type == F32
-                     ? computed
-                     : mlir::arith::TruncFOp::create(builder, vector_type,
-                                                     computed)
-                           .getResult();
+        result = instruction_type == F32 ? computed
+                                         : mlir::arith::TruncFOp::create(
+                                               builder, vector_type, computed)
+                                               .getResult();
         break;
       }
       case HloOpcode::kClamp: {
         TF_ASSIGN_OR_RETURN(
             Value lower,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value operand,
             EmitVector(builder, argument_pointers, instruction->operand(1),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value upper,
             EmitVector(builder, argument_pointers, instruction->operand(2),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         if (instruction_type == BF16) {
           TF_ASSIGN_OR_RETURN(
-              operand, EmitPairwiseBf16Binary(
-                           builder, HloOpcode::kMaximum, lower, operand));
+              operand, EmitPairwiseBf16Binary(builder, HloOpcode::kMaximum,
+                                              lower, operand));
           TF_ASSIGN_OR_RETURN(
-              result, EmitPairwiseBf16Binary(
-                          builder, HloOpcode::kMinimum, operand, upper));
+              result, EmitPairwiseBf16Binary(builder, HloOpcode::kMinimum,
+                                             operand, upper));
         } else {
           if (instruction_type != F32) {
             TF_ASSIGN_OR_RETURN(
@@ -765,12 +849,11 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                 upper, EmitConvert(builder, instruction_type, F32, upper));
           }
           result = mlir::arith::MinimumFOp::create(
-              builder,
-              mlir::arith::MaximumFOp::create(builder, lower, operand), upper);
+              builder, mlir::arith::MaximumFOp::create(builder, lower, operand),
+              upper);
           if (instruction_type != F32) {
             TF_ASSIGN_OR_RETURN(
-                result,
-                EmitConvert(builder, F32, instruction_type, result));
+                result, EmitConvert(builder, F32, instruction_type, result));
           }
         }
         break;
@@ -779,12 +862,12 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             Value lhs,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value rhs,
             EmitVector(builder, argument_pointers, instruction->operand(1),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         const PrimitiveType operand_type =
             instruction->operand(0)->shape().element_type();
@@ -797,25 +880,25 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         TF_ASSIGN_OR_RETURN(
             mlir::arith::CmpFPredicate compare_predicate,
             GetComparePredicate(instruction->comparison_direction()));
-        result = mlir::arith::CmpFOp::create(builder, compare_predicate, lhs,
-                                             rhs);
+        result =
+            mlir::arith::CmpFOp::create(builder, compare_predicate, lhs, rhs);
         break;
       }
       case HloOpcode::kSelect: {
         TF_ASSIGN_OR_RETURN(
             Value condition,
             EmitVector(builder, argument_pointers, instruction->operand(0),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value on_true,
             EmitVector(builder, argument_pointers, instruction->operand(1),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         TF_ASSIGN_OR_RETURN(
             Value on_false,
             EmitVector(builder, argument_pointers, instruction->operand(2),
-                       element_offset, predicate, copy_atom, vector_layout,
+                       element_offset, predicate, copy_atoms, vector_layout,
                        vector_width, cache));
         result = mlir::arith::SelectOp::create(builder, condition, on_true,
                                                on_false);
@@ -846,8 +929,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
 
     mlir::ImplicitLocOpBuilder builder(kernel.getLoc(), kernel);
     builder.setInsertionPointToStart(&kernel.getBody().front());
-    Value thread_id = mlir::gpu::ThreadIdOp::create(
-        builder, mlir::gpu::Dimension::x);
+    Value thread_id =
+        mlir::gpu::ThreadIdOp::create(builder, mlir::gpu::Dimension::x);
     Value block_id =
         mlir::gpu::BlockIdOp::create(builder, mlir::gpu::Dimension::x);
     Value thread_i64 = mlir::arith::IndexCastOp::create(
@@ -877,36 +960,57 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     auto stride_attr = mlir::fly::IntTupleAttr::getLeafStatic(context, 1);
     auto shape_type = mlir::fly::IntTupleType::get(shape_attr);
     auto stride_type = mlir::fly::IntTupleType::get(stride_attr);
-    Value shape = mlir::fly::MakeIntTupleOp::create(
-        builder, shape_type, mlir::ValueRange{});
-    Value stride = mlir::fly::MakeIntTupleOp::create(
-        builder, stride_type, mlir::ValueRange{});
+    Value shape = mlir::fly::MakeIntTupleOp::create(builder, shape_type,
+                                                    mlir::ValueRange{});
+    Value stride = mlir::fly::MakeIntTupleOp::create(builder, stride_type,
+                                                     mlir::ValueRange{});
     auto layout_type = mlir::fly::LayoutType::get(shape_attr, stride_attr);
-    Value vector_layout = mlir::fly::MakeLayoutOp::create(
-        builder, layout_type, shape, stride);
-    auto copy_atom_type = mlir::fly::CopyAtomType::get(
-        mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(context,
-                                                        vector_size_bits_,
-                                                        /*cacheModifier=*/0),
-        ElementBits(element_type_));
-    Value copy_atom = mlir::fly::MakeCopyAtomOp::create(
-        builder, copy_atom_type, ElementBits(element_type_));
+    Value vector_layout =
+        mlir::fly::MakeLayoutOp::create(builder, layout_type, shape, stride);
+    absl::flat_hash_set<PrimitiveType> external_types;
+    for (const HloInstruction* operand : fusion.operands()) {
+      external_types.insert(operand->shape().element_type());
+    }
+    for (const HloInstruction* root : roots) {
+      external_types.insert(root->shape().element_type());
+    }
+    absl::flat_hash_map<PrimitiveType, Value> copy_atoms;
+    for (PrimitiveType type : external_types) {
+      TF_RET_CHECK(IsSupportedType(type));
+      const int64_t copy_bits = vector_width_ * ElementBits(type);
+      TF_RET_CHECK(copy_bits == 64 || copy_bits == 128);
+      auto copy_atom_type = mlir::fly::CopyAtomType::get(
+          mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(context, copy_bits,
+                                                          /*cacheModifier=*/0),
+          ElementBits(type));
+      copy_atoms[type] = mlir::fly::MakeCopyAtomOp::create(
+          builder, copy_atom_type, ElementBits(type));
+    }
 
-    auto buffer_address =
-        mlir::fly_rocdl::BufferDescAddressAttr::get(context);
-    auto buffer_pointer_type = mlir::fly::PointerType::get(
-        emitters::PrimitiveTypeToMlirType(element_type_, builder),
-        buffer_address);
-    Value descriptor_stride = mlir::arith::ConstantIntOp::create(
-        builder, builder.getI16Type(), 0);
-    Value descriptor_extent = mlir::arith::ConstantIntOp::create(
-        builder, builder.getI64Type(),
-        elements_ * (ElementBits(element_type_) / 8));
+    auto buffer_address = mlir::fly_rocdl::BufferDescAddressAttr::get(context);
+    Value descriptor_stride =
+        mlir::arith::ConstantIntOp::create(builder, builder.getI16Type(), 0);
     Value descriptor_flags = mlir::arith::ConstantIntOp::create(
         builder, builder.getI32Type(), 0x27000);
+    llvm::SmallVector<const Shape*> argument_shapes;
+    argument_shapes.reserve(kernel.getNumArguments());
+    for (const HloInstruction* operand : fusion.operands()) {
+      argument_shapes.push_back(&operand->shape());
+    }
+    for (const HloInstruction* root : roots) {
+      argument_shapes.push_back(&root->shape());
+    }
+    TF_RET_CHECK(argument_shapes.size() == kernel.getNumArguments());
     llvm::SmallVector<Value> argument_pointers;
     argument_pointers.reserve(kernel.getNumArguments());
-    for (Value pointer : kernel.getArguments()) {
+    for (auto [index, pointer] : llvm::enumerate(kernel.getArguments())) {
+      const Shape& shape = *argument_shapes[index];
+      const PrimitiveType type = shape.element_type();
+      auto buffer_pointer_type = mlir::fly::PointerType::get(
+          emitters::PrimitiveTypeToMlirType(type, builder), buffer_address);
+      Value descriptor_extent = mlir::arith::ConstantIntOp::create(
+          builder, builder.getI64Type(),
+          ShapeUtil::ElementsIn(shape) * (ElementBits(type) / 8));
       argument_pointers.push_back(mlir::fly::MakePtrOp::create(
           builder, buffer_pointer_type,
           mlir::ValueRange{pointer, descriptor_stride, descriptor_extent,
@@ -918,29 +1022,27 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         context, /*width=*/32, /*divisibility=*/vector_width_);
     auto offset_type = mlir::fly::IntTupleType::get(offset_attr);
 
-    for (int64_t vector = 0;
-         full_elements != 0 && vector < vectors_per_thread_; ++vector) {
+    for (int64_t vector = 0; full_elements != 0 && vector < vectors_per_thread_;
+         ++vector) {
       Value vector_offset = base;
       if (vector != 0) {
         Value vector_index = mlir::arith::ConstantIntOp::create(
             builder, builder.getI64Type(), vector);
-        Value relative = mlir::arith::MulIOp::create(
-            builder, vector_index, thread_stride);
-        vector_offset =
-            mlir::arith::AddIOp::create(builder, base, relative);
+        Value relative =
+            mlir::arith::MulIOp::create(builder, vector_index, thread_stride);
+        vector_offset = mlir::arith::AddIOp::create(builder, base, relative);
       }
-      Value in_bounds = mlir::arith::CmpIOp::create(
-          builder, mlir::arith::CmpIPredicate::ult, vector_offset,
-          element_count);
+      Value in_bounds =
+          mlir::arith::CmpIOp::create(builder, mlir::arith::CmpIPredicate::ult,
+                                      vector_offset, element_count);
       absl::flat_hash_map<const HloInstruction*, Value> cache;
       llvm::SmallVector<Value> results;
       results.reserve(output_count_);
       for (const HloInstruction* root : roots) {
-        TF_ASSIGN_OR_RETURN(
-            Value result,
-            EmitVector(builder, argument_pointers, root, vector_offset,
-                       in_bounds, copy_atom, vector_layout, vector_width_,
-                       cache));
+        TF_ASSIGN_OR_RETURN(Value result,
+                            EmitVector(builder, argument_pointers, root,
+                                       vector_offset, in_bounds, copy_atoms,
+                                       vector_layout, vector_width_, cache));
         results.push_back(result);
       }
 
@@ -961,43 +1063,45 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         Value output_view = mlir::fly::MakeViewOp::create(
             builder, output_memref_type, advanced_output, vector_layout);
         mlir::fly::CopyAtomCallSSA::create(
-            builder, mlir::TypeRange{}, copy_atom, result, output_view,
-            in_bounds);
+            builder, mlir::TypeRange{},
+            copy_atoms.at(roots[output_index]->shape().element_type()), result,
+            output_view, in_bounds);
       }
     }
     if (tail_elements != 0) {
       auto scalar_shape_attr =
           mlir::fly::IntTupleAttr::getLeafStatic(context, 1);
-      auto scalar_shape_type =
-          mlir::fly::IntTupleType::get(scalar_shape_attr);
+      auto scalar_shape_type = mlir::fly::IntTupleType::get(scalar_shape_attr);
       Value scalar_shape = mlir::fly::MakeIntTupleOp::create(
           builder, scalar_shape_type, mlir::ValueRange{});
       Value scalar_stride = mlir::fly::MakeIntTupleOp::create(
           builder, scalar_shape_type, mlir::ValueRange{});
-      auto scalar_layout_type = mlir::fly::LayoutType::get(
-          scalar_shape_attr, scalar_shape_attr);
+      auto scalar_layout_type =
+          mlir::fly::LayoutType::get(scalar_shape_attr, scalar_shape_attr);
       Value scalar_layout = mlir::fly::MakeLayoutOp::create(
           builder, scalar_layout_type, scalar_shape, scalar_stride);
-      const int64_t element_bits = ElementBits(element_type_);
-      auto scalar_copy_atom_type = mlir::fly::CopyAtomType::get(
-          mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(
-              context, element_bits, /*cacheModifier=*/0),
-          element_bits);
-      Value scalar_copy_atom = mlir::fly::MakeCopyAtomOp::create(
-          builder, scalar_copy_atom_type, element_bits);
+      absl::flat_hash_map<PrimitiveType, Value> scalar_copy_atoms;
+      for (PrimitiveType type : external_types) {
+        const int64_t element_bits = ElementBits(type);
+        auto scalar_copy_atom_type = mlir::fly::CopyAtomType::get(
+            mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(
+                context, element_bits, /*cacheModifier=*/0),
+            element_bits);
+        scalar_copy_atoms[type] = mlir::fly::MakeCopyAtomOp::create(
+            builder, scalar_copy_atom_type, element_bits);
+      }
       Value block_zero = mlir::arith::CmpIOp::create(
           builder, mlir::arith::CmpIPredicate::eq, block_i64,
-          mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
-                                             0));
+          mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(), 0));
       Value tail_lane = mlir::arith::CmpIOp::create(
           builder, mlir::arith::CmpIPredicate::ult, thread_i64,
-          mlir::arith::ConstantIntOp::create(
-              builder, builder.getI64Type(), tail_elements));
+          mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
+                                             tail_elements));
       Value tail_valid =
           mlir::arith::AndIOp::create(builder, block_zero, tail_lane);
-      mlir::scf::IfOp tail = mlir::scf::IfOp::create(
-          builder, mlir::TypeRange{}, tail_valid,
-          /*withElseRegion=*/false);
+      mlir::scf::IfOp tail =
+          mlir::scf::IfOp::create(builder, mlir::TypeRange{}, tail_valid,
+                                  /*withElseRegion=*/false);
       {
         mlir::OpBuilder::InsertionGuard tail_guard(builder);
         builder.setInsertionPointToStart(tail.thenBlock());
@@ -1006,8 +1110,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
             mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
                                                full_elements),
             thread_i64);
-        Value true_predicate = mlir::arith::ConstantIntOp::create(
-            builder, builder.getI1Type(), 1);
+        Value true_predicate =
+            mlir::arith::ConstantIntOp::create(builder, builder.getI1Type(), 1);
         absl::flat_hash_map<const HloInstruction*, Value> cache;
         llvm::SmallVector<Value> results;
         results.reserve(output_count_);
@@ -1015,7 +1119,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
           TF_ASSIGN_OR_RETURN(
               Value result,
               EmitVector(builder, argument_pointers, root, tail_offset,
-                         true_predicate, scalar_copy_atom, scalar_layout,
+                         true_predicate, scalar_copy_atoms, scalar_layout,
                          /*vector_width=*/1, cache));
           results.push_back(result);
         }
@@ -1033,17 +1137,18 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
               argument_pointers[fusion.operand_count() + output_index];
           auto output_pointer_type =
               mlir::cast<mlir::fly::PointerType>(output_pointer.getType());
-          auto output_memref_type = mlir::fly::MemRefType::get(
-              output_pointer_type.getElemTy(),
-              output_pointer_type.getAddressSpace(),
-              scalar_layout_type.getAttr());
+          auto output_memref_type =
+              mlir::fly::MemRefType::get(output_pointer_type.getElemTy(),
+                                         output_pointer_type.getAddressSpace(),
+                                         scalar_layout_type.getAttr());
           Value advanced_output = mlir::fly::AddOffsetOp::create(
               builder, output_pointer_type, output_pointer, tail_offset_tuple);
           Value output_view = mlir::fly::MakeViewOp::create(
               builder, output_memref_type, advanced_output, scalar_layout);
           mlir::fly::CopyAtomCallSSA::create(
-              builder, mlir::TypeRange{}, scalar_copy_atom, result,
-              output_view, true_predicate);
+              builder, mlir::TypeRange{},
+              scalar_copy_atoms.at(roots[output_index]->shape().element_type()),
+              result, output_view, true_predicate);
         }
       }
       builder.setInsertionPointAfter(tail);
@@ -1082,8 +1187,7 @@ bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis) {
   absl::flat_hash_set<const HloInstruction*> visited;
   for (int64_t root_index = 0; root_index < analysis.fusion_root_count();
        ++root_index) {
-    const HloInstruction& root =
-        analysis.fusion_root(root_index).instruction();
+    const HloInstruction& root = analysis.fusion_root(root_index).instruction();
     if (root.shape().element_type() != output_shape.element_type() ||
         !HasSamePhysicalDimensions(root.shape(), output_shape) ||
         !IsSupportedElementwiseGraph(&root, output_shape, visited)) {

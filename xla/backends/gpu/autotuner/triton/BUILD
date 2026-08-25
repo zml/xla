@@ -89,6 +89,39 @@ cc_embed_data(
     flatten = True,
 )
 
+cc_embed_data(
+    name = "embed_aiter_unified_attention",
+    srcs = ["aiter_unified_attention_3d.ttir.tpl"],
+    outs = [
+        "embed_aiter_unified_attention.cc",
+        "embed_aiter_unified_attention.h",
+    ],
+    compatible_with = get_compatible_with_portable(),
+    embedopts = ["--namespace=xla::gpu::aiter_unified_attention"],
+    flatten = True,
+)
+
+cc_library(
+    name = "aiter_unified_attention",
+    srcs = ["aiter_unified_attention.cc"],
+    hdrs = ["aiter_unified_attention.h"],
+    tags = ["gpu"],
+    deps = [
+        ":embed_aiter_unified_attention",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/tsl/platform:status_macros",
+        "//xla/tsl/util:file_toc",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
 cc_library(
     name = "triton_configs",
     srcs = ["triton_configs.cc"],

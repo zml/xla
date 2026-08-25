@@ -29,8 +29,13 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
 #if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
+#include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_attention.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_gemm.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_paged_attention.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
@@ -76,6 +81,24 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
   const auto& analysis = fusion_info.analysis();
 #if TENSORFLOW_USE_ROCM
   if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
+    if (flydsl::GetFlyPagedAttentionDescriptor(analysis).has_value() ||
+        flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
+            .has_value() ||
+        flydsl::GetFlyPagedAttentionSegmentedReducerDescriptor(analysis)
+            .has_value()) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTilePagedAttentionEmitter(analysis));
+    }
+    if (flydsl::GetFlyAttentionDescriptor(analysis).has_value()) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileAttentionEmitter(analysis));
+    }
+    if (flydsl::ContainsUnsupportedCustomCall(analysis)) {
+      // A generic XLA loop emitter cannot lower an opaque custom call. Return
+      // an error-producing emitter rather than reaching indexing analysis and
+      // crashing while treating the call as an ordinary elementwise node.
+      return std::make_unique<CustomFusion>();
+    }
     if (IsDynamicUpdateSliceFusion(analysis.fusion_spec()) &&
         fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
       auto emitter =

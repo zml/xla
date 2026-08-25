@@ -15,8 +15,8 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_TRANSFORMS_GEMM_FUSION_H_
 #define XLA_BACKENDS_GPU_TRANSFORMS_GEMM_FUSION_H_
 
-// This file contains the code for fusing dots and other operations into Triton
-// GEMM fusions.
+// This file contains the code for fusing dots and other operations into GPU
+// GEMM fusions consumed by the Triton or FlyDSL autotuning backends.
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
@@ -29,13 +29,20 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-// Rewrite compatible dot() calls into custom calls with fused computations
-// that target Triton-based matmul emitter.
+enum class GemmFusionTarget { kTriton, kFly };
+
+// Rewrite compatible dot() calls into custom fusions for the selected matmul
+// emitter family. Autotuning later installs a concrete backend configuration.
 class GemmFusion : public HloModulePass {
  public:
-  explicit GemmFusion(const se::GpuComputeCapability& compute_capability)
-      : compute_capability_(compute_capability) {}
-  absl::string_view name() const override { return "triton-gemm-rewriter"; }
+  explicit GemmFusion(
+      const se::GpuComputeCapability& compute_capability,
+      GemmFusionTarget target = GemmFusionTarget::kTriton)
+      : compute_capability_(compute_capability), target_(target) {}
+  absl::string_view name() const override {
+    return target_ == GemmFusionTarget::kFly ? "fly-gemm-rewriter"
+                                             : "triton-gemm-rewriter";
+  }
 
  protected:
   absl::StatusOr<bool> RunImpl(
@@ -44,6 +51,7 @@ class GemmFusion : public HloModulePass {
 
  private:
   se::GpuComputeCapability compute_capability_;
+  GemmFusionTarget target_;
 };
 
 }  // namespace gpu

@@ -276,6 +276,16 @@ const HloInstruction* FindContraction(const HloInstruction& root) {
 
 std::vector<int64_t> PhysicalStrides(const Shape& shape);
 
+bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
+  return transpose.opcode() == HloOpcode::kTranspose &&
+         transpose.operand_count() == 1 &&
+         transpose.shape().dimensions_size() == 3 &&
+         transpose.operand(0)->shape().dimensions_size() == 3 &&
+         transpose.shape().element_type() ==
+             transpose.operand(0)->shape().element_type() &&
+         transpose.dimensions() == std::vector<int64_t>({0, 2, 1});
+}
+
 struct ContractionInput {
   std::vector<int64_t> parameter_numbers;
   PrimitiveType parameter_type;
@@ -342,12 +352,28 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
   while (value->opcode() == HloOpcode::kBitcast ||
          value->opcode() == HloOpcode::kConvert ||
          value->opcode() == HloOpcode::kSlice ||
-         value->opcode() == HloOpcode::kDynamicSlice) {
+         value->opcode() == HloOpcode::kDynamicSlice ||
+         value->opcode() == HloOpcode::kTranspose) {
     const bool is_dynamic_slice = value->opcode() == HloOpcode::kDynamicSlice;
     CHECK_EQ(value->operand_count(),
              is_dynamic_slice ? value->shape().dimensions_size() + 1 : 1);
     const HloInstruction* operand = value->operand(0);
-    if (value->opcode() == HloOpcode::kBitcast) {
+    if (value->opcode() == HloOpcode::kTranspose) {
+      CHECK(!physical_mapping_fixed);
+      CHECK(IsSupportedBatchInnerTranspose(*value));
+      std::vector<int64_t> operand_strides = PhysicalStrides(operand->shape());
+      physical_strides.resize(value->shape().dimensions_size());
+      for (int64_t dimension = 0;
+           dimension < value->shape().dimensions_size(); ++dimension) {
+        physical_strides[dimension] =
+            operand_strides[value->dimensions(dimension)];
+        physical_offset +=
+            logical_offsets[dimension] * physical_strides[dimension];
+      }
+      physical_mapping_fixed = true;
+      has_input_view = true;
+      requires_linear_addressing = true;
+    } else if (value->opcode() == HloOpcode::kBitcast) {
       CHECK_EQ(value->shape().element_type(), operand->shape().element_type());
       if (!physical_mapping_fixed) {
         physical_strides = PhysicalStrides(value->shape());
@@ -459,6 +485,33 @@ std::vector<int64_t> PhysicalStrides(const Shape& shape) {
   return strides;
 }
 
+std::optional<int64_t> OutputTransposeBatchInner(
+    const HloInstruction& root, const HloInstruction& dot) {
+  if (dot.shape().element_type() != BF16 ||
+      dot.shape().dimensions_size() != 3 ||
+      root.opcode() != HloOpcode::kTranspose || root.operand_count() != 1 ||
+      root.shape().element_type() != BF16 ||
+      root.shape().dimensions_size() != 4 ||
+      root.dimensions() != std::vector<int64_t>({0, 3, 1, 2})) {
+    return std::nullopt;
+  }
+  const HloInstruction* bitcast = root.operand(0);
+  if (bitcast->opcode() != HloOpcode::kBitcast ||
+      bitcast->operand_count() != 1 || bitcast->operand(0) != &dot ||
+      bitcast->shape().dimensions_size() != 4) {
+    return std::nullopt;
+  }
+  const int64_t batch_outer = bitcast->shape().dimensions(0);
+  const int64_t batch_inner = bitcast->shape().dimensions(1);
+  if (batch_outer <= 0 || batch_inner <= 0 ||
+      batch_outer * batch_inner != dot.shape().dimensions(0) ||
+      bitcast->shape().dimensions(2) != dot.shape().dimensions(1) ||
+      bitcast->shape().dimensions(3) != dot.shape().dimensions(2)) {
+    return std::nullopt;
+  }
+  return batch_inner;
+}
+
 bool ContainsInstruction(const HloInstruction& root,
                          const HloInstruction& target) {
   if (&root == &target) {
@@ -509,6 +562,9 @@ std::vector<EpilogueStep> FindEpilogueSteps(const HloInstruction& root,
       step.contraction_operand = contraction_operand;
       contraction_value = value->operand(contraction_operand);
       const HloInstruction* broadcast = value->operand(1 - contraction_operand);
+      if (broadcast->opcode() == HloOpcode::kConvert) {
+        broadcast = broadcast->operand(0);
+      }
       const HloInstruction* input = broadcast->operand(0);
       step.input_type = input->shape().element_type();
       step.broadcast_dimension =
@@ -526,6 +582,15 @@ std::vector<EpilogueStep> FindEpilogueSteps(const HloInstruction& root,
       step.round_input_type = contraction_value_type;
     }
     if (contraction_value->opcode() == HloOpcode::kConvert) {
+      const PrimitiveType converted_input_type =
+          contraction_value->operand(0)->shape().element_type();
+      if (contraction_value_type == F32 &&
+          IsHalfPrecisionFloat(converted_input_type)) {
+        // A BF16/F16 dot followed by a widening conversion has an observable
+        // rounding boundary before its FP32 epilogue (attention score scaling
+        // is the common case). Preserve it while accumulating the MFMA in F32.
+        step.round_input_type = converted_input_type;
+      }
       contraction_value = contraction_value->operand(0);
     }
     steps.push_back(step);
@@ -582,6 +647,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         std::numeric_limits<uint32_t>::max();
     const HloInstruction* dot = FindContraction(root);
     CHECK_NE(dot, nullptr);
+    output_transpose_batch_inner_ = OutputTransposeBatchInner(root, *dot);
+    CHECK(!output_transpose_batch_inner_.has_value() || stage_output_);
     lhs_element_type_ = dot->operand(0)->shape().element_type();
     rhs_element_type_ = dot->operand(1)->shape().element_type();
     is_fp8_ = IsFnuzFp8(lhs_element_type_);
@@ -625,7 +692,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     rhs_dynamic_offset_constants_ = rhs_input.dynamic_offset_constants;
     rhs_dynamic_offset_limits_ = rhs_input.dynamic_offset_limits;
     rhs_concat_fragment_size_ = rhs_input.concat_fragment_size;
-    epilogue_steps_ = FindEpilogueSteps(root, *dot);
+    epilogue_steps_ = output_transpose_batch_inner_.has_value()
+                          ? std::vector<EpilogueStep>{}
+                          : FindEpilogueSteps(root, *dot);
     epilogue_row_dimension_ = dot->shape().dimensions_size() - 2;
     epilogue_column_dimension_ = dot->shape().dimensions_size() - 1;
     has_vector_epilogue_ = std::any_of(
@@ -703,9 +772,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           lhs_input.concat_dimension == 0);
     CHECK(rhs_parameter_numbers_.size() == 1 ||
           rhs_input.concat_dimension == 1 - rhs_contracting_dimension_);
-    rhs_k_contiguous_ = dot->operand(1)->shape().has_layout() &&
-                        dot->operand(1)->shape().layout().minor_to_major(0) ==
-                            rhs_contracting_dimension_;
+    lhs_k_contiguous_ =
+        lhs_physical_strides_[lhs_contracting_dimension_] == 1;
+    rhs_k_contiguous_ =
+        rhs_physical_strides_[rhs_contracting_dimension_] == 1;
     stage_k_ = is_fp8_ ? 32 : (k_ % 32 == 0 ? 32 : 16);
     absl::StatusOr<Tile> contraction_tile = dot->backend_config<Tile>();
     const bool supports_masked_k_tail =
@@ -1412,7 +1482,15 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           Div(builder, block_n_base, rhs_concat_fragment_size_);
     }
     auto output_indices = [&](Value row, Value column) {
-      llvm::SmallVector<Value, 3> indices;
+      llvm::SmallVector<Value> indices;
+      if (output_transpose_batch_inner_.has_value()) {
+        Value batch_outer =
+            Div(builder, batch_id, *output_transpose_batch_inner_);
+        Value batch_inner =
+            Rem(builder, batch_id, *output_transpose_batch_inner_);
+        indices.assign({batch_outer, column, batch_inner, row});
+        return indices;
+      }
       if (global_split_k_ || batched_gemm_) {
         indices.assign({batch_id, row, column});
       } else {
@@ -2001,8 +2079,13 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                    ? kTensileStageStrideElements + kTensilePhysicalStageElements
                    : pipeline_stages * rhs_stage_elements)
             : 0;
+    // The attention-value output transform makes the MFMA row fragments
+    // contiguous in the final tensor, so it can store packed rows directly.
+    // Other staged epilogues still reuse the operand LDS allocation for C.
+    const bool stage_output_via_lds =
+        stage_output_ && !output_transpose_batch_inner_.has_value();
     const int64_t output_shared_elements =
-        stage_output_ ? block_m_ * block_n_ : 0;
+        stage_output_via_lds ? block_m_ * block_n_ : 0;
     const int64_t local_split_shared_elements =
         local_split_k_ ? 2 * block_m_ * block_n_ : 0;
     auto lhs_shared_type = mlir::RankedTensorType::get(
@@ -3323,6 +3406,90 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     };
     auto emit_lhs_register_stage = [&](Value destination, Value global_k,
                                        Value shared_stage) {
+      if (!lhs_k_contiguous_) {
+        // Attention Q arrives as a fused [B,K,M] -> [B,M,K] transpose.  Load
+        // the physically contiguous M vectors and scatter-transpose them into
+        // the ordinary [M,K] XOR-swizzled LDS tile.  Scalar K gathers are
+        // correct but waste nearly every cache-line transaction for this
+        // layout.
+        CHECK_EQ(block_m_ % load_vector_width, 0);
+        const int64_t vectors_per_k = block_m_ / load_vector_width;
+        const int64_t lhs_vectors = stage_k_ * vectors_per_k;
+        mlir::scf::ForOp load_loop = mlir::scf::ForOp::create(
+            builder, thread_id, IndexConstant(builder, lhs_vectors), load_step,
+            mlir::ValueRange{destination},
+            [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+        {
+          mlir::OpBuilder::InsertionGuard load_guard(builder);
+          builder.setInsertionPointToStart(load_loop.getBody());
+          Value vector_index = load_loop.getInductionVar();
+          Value shared_k = Div(builder, vector_index, vectors_per_k);
+          Value shared_row =
+              Mul(builder, Rem(builder, vector_index, vectors_per_k),
+                  IndexConstant(builder, load_vector_width));
+          Value global_row = Add(builder, block_m_base, shared_row);
+          Value logical_k = Add(builder, global_k, shared_k);
+          llvm::SmallVector<Value, 3> indices =
+              lhs_indices(global_row, logical_k);
+          const int64_t lhs_noncontracting_dimension = batched_gemm_ ? 1 : 0;
+          mlir::AffineMap m_vector_map = mlir::AffineMap::get(
+              /*dimCount=*/indices.size(), /*symbolCount=*/0,
+              builder.getAffineDimExpr(lhs_noncontracting_dimension),
+              builder.getContext());
+          Value loaded;
+          if (m_ % block_m_ == 0 || shift_m_edge) {
+            loaded = emit_input_mapped_transfer_read(
+                lhs, lhs_input_type_, load_vector_type, indices, m_vector_map,
+                lhs_requires_linear_addressing_, lhs_physical_offset_,
+                lhs_physical_strides_);
+          } else {
+            llvm::SmallVector<Value, 8> elements;
+            elements.reserve(load_vector_width);
+            for (int64_t element = 0; element < load_vector_width; ++element) {
+              Value element_row =
+                  Add(builder, global_row, IndexConstant(builder, element));
+              Value in_bounds = mlir::arith::CmpIOp::create(
+                  builder, mlir::arith::CmpIPredicate::ult, element_row,
+                  IndexConstant(builder, m_));
+              Value safe_row = mlir::arith::SelectOp::create(
+                  builder, in_bounds, element_row,
+                  IndexConstant(builder, 0));
+              llvm::SmallVector<Value, 3> element_indices =
+                  lhs_indices(safe_row, logical_k);
+              Value element_value = extract_input_element(
+                  lhs, lhs_input_type_, element_indices,
+                  lhs_requires_linear_addressing_, lhs_physical_offset_,
+                  lhs_physical_strides_);
+              elements.push_back(mlir::arith::SelectOp::create(
+                  builder, in_bounds, element_value,
+                  zero_lhs_input_element));
+            }
+            loaded = mlir::vector::FromElementsOp::create(
+                builder, load_vector_type, elements);
+          }
+          Value written = load_loop.getRegionIterArg(0);
+          for (int64_t element = 0; element < load_vector_width; ++element) {
+            Value scalar = mlir::vector::ExtractOp::create(
+                builder, loaded, llvm::SmallVector<int64_t>{element});
+            Value element_row =
+                Add(builder, shared_row, IndexConstant(builder, element));
+            Value swizzled_k = SwizzleXor16(
+                builder, element_row, shared_k, stage_k_,
+                ContractionElementBytes(lhs_element_type_));
+            Value stage_base =
+                Mul(builder, shared_stage,
+                    IndexConstant(builder, block_m_ * stage_k_));
+            Value row_base =
+                Mul(builder, element_row, IndexConstant(builder, stage_k_));
+            written = mlir::tensor::InsertOp::create(
+                builder, scalar, written,
+                Add(builder, stage_base, Add(builder, row_base, swizzled_k)));
+          }
+          mlir::scf::YieldOp::create(builder, written);
+        }
+        builder.setInsertionPointAfter(load_loop);
+        return load_loop.getResult(0);
+      }
       mlir::scf::ForOp load_loop = mlir::scf::ForOp::create(
           builder, thread_id,
           IndexConstant(builder, block_m_ * lhs_vectors_per_row), load_step,
@@ -3500,6 +3667,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
       const bool can_copy_direct =
           (stage_rhs_ || async_lhs_) &&
+          lhs_k_contiguous_ &&
           (m_ % block_m_ == 0 || shift_m_edge) &&
           (IsHalfPrecisionFloat(lhs_input_type_) ||
            (IsFnuzFp8(lhs_input_type_) &&
@@ -7643,14 +7811,14 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       mlir::func::ReturnOp::create(builder, reduce.getResult(0));
       return absl::OkStatus();
     }
-    if (stage_output_) {
+    if (stage_output_via_lds) {
       TF_RET_CHECK(output_type.isBF16());
       TF_RET_CHECK((m_ % block_m_ == 0 || shift_m_edge) &&
                    (n_ % block_n_ == 0 || shift_n_edge));
       TF_RET_CHECK(block_m_ * block_n_ * sizeof(uint16_t) <= 64 * 1024);
     }
     Value staged_output = lhs_shared;
-    if (stage_output_) {
+    if (stage_output_via_lds) {
       // FlyDSL synchronizes all waves before reusing the A/B LDS allocation
       // for C. Without this barrier, one wave could overwrite a final-tile
       // fragment while another wave is still reading it.
@@ -7670,7 +7838,57 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           /*withElseRegion=*/true));
       builder.setInsertionPointToStart(local_split_store->thenBlock());
     }
-    if (triton_xf32_paired_lds) {
+    if (output_transpose_batch_inner_.has_value()) {
+      // In the final [B,N,H,M] tensor, M is contiguous. A 16x16 BF16 MFMA
+      // gives each lane four adjacent M values for one N column (and a 32x32
+      // MFMA gives four such groups). Store those fragments directly instead
+      // of transposing the complete macro-tile through LDS. The wave's four
+      // lane groups collectively cover 16 contiguous M values per N column.
+      TF_RET_CHECK(stage_output_ && output_type.isBF16() &&
+                   epilogue_steps_.empty() && m_ % block_m_ == 0 &&
+                   n_ % block_n_ == 0);
+      constexpr int64_t kPackedRows = 4;
+      auto packed_f32_type =
+          mlir::VectorType::get({kPackedRows}, builder.getF32Type());
+      auto packed_output_type =
+          mlir::VectorType::get({kPackedRows}, output_type);
+      for (int64_t tile_row = 0; tile_row < wave_tile_rows; ++tile_row) {
+        for (int64_t tile_column = 0; tile_column < wave_tile_columns;
+             ++tile_column) {
+          Value accumulator = final_accumulators[
+              get_accumulator_index(tile_row, tile_column)];
+          Value output_column = Add(
+              builder, wave_column_base,
+              Add(builder, lane_axis,
+                  IndexConstant(builder,
+                                tile_column * tile_column_stride)));
+          for (int64_t group = 0;
+               group < accumulator_elements / kPackedRows; ++group) {
+            llvm::SmallVector<int64_t, kPackedRows> mask;
+            for (int64_t element = 0; element < kPackedRows; ++element) {
+              mask.push_back(group * kPackedRows + element);
+            }
+            Value values = mlir::vector::ShuffleOp::create(
+                builder, packed_f32_type, accumulator, accumulator, mask);
+            Value packed = mlir::arith::TruncFOp::create(
+                builder, packed_output_type, values);
+            Value output_row = Add(
+                builder, wave_row_base,
+                Add(builder,
+                    Mul(builder, lane_group,
+                        IndexConstant(builder, kPackedRows)),
+                    IndexConstant(builder,
+                                  tile_row * tile_row_stride +
+                                      (use_mfma_32_ ? group * 8 : 0))));
+            output = mlir::vector::TransferWriteOp::create(
+                         builder, packed, output,
+                         output_indices(output_row, output_column),
+                         llvm::ArrayRef<bool>{true})
+                         .getResult();
+          }
+        }
+      }
+    } else if (triton_xf32_paired_lds) {
       // Source-swapping the wide XF32 MFMA matches Triton's native output
       // view: each consecutive group of four accumulator elements is four
       // adjacent N columns.  Keep that view through the epilogue so LLVM can
@@ -8229,7 +8447,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             }
             llvm::SmallVector<Value, 3> indices =
                 output_indices(output_row, output_column);
-            if (stage_output_) {
+            if (stage_output_via_lds) {
               Value local_row = Add(
                   builder, wave_row_offset,
                   Add(builder,
@@ -8286,7 +8504,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       output = local_split_store->getResult(0);
     }
 
-    if (stage_output_) {
+    if (stage_output_via_lds) {
       staged_output =
           SyncThreadsOp::create(builder, mlir::TypeRange{lhs_shared_type},
                                 staged_output)
@@ -8391,6 +8609,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> rhs_dynamic_offset_constants_;
   std::vector<int64_t> rhs_dynamic_offset_limits_;
   std::vector<int64_t> output_physical_strides_;
+  std::optional<int64_t> output_transpose_batch_inner_;
   int64_t lhs_concat_fragment_size_ = 0;
   int64_t rhs_concat_fragment_size_ = 0;
   std::vector<EpilogueStep> epilogue_steps_;
@@ -8402,6 +8621,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   int64_t rhs_contracting_dimension_ = 0;
   int64_t lhs_noncontracting_dimension_ = 0;
   int64_t rhs_noncontracting_dimension_ = 0;
+  bool lhs_k_contiguous_ = false;
   bool rhs_k_contiguous_ = false;
   LaunchDimensions launch_dimensions_;
 };

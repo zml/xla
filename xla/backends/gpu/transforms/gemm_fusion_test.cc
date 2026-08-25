@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/hlo/testlib/verified_hlo_module.h"
+#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/triton_fusion_analysis.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
@@ -146,6 +147,35 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param ? "TilingPropagation" : "SymbolicAnalysis";
     });
 
+TEST_F(GemmFusionTestBase, FlyTargetCreatesFlySeedFusion) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+HloModule fly_seed_fusion
+
+ENTRY main {
+  lhs = bf16[32,64] parameter(0)
+  rhs = bf16[64,48] parameter(1)
+  dot = bf16[32,48] dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  scale = bf16[] constant(0.5)
+  broadcast = bf16[32,48] broadcast(scale), dimensions={}
+  ROOT multiply = bf16[32,48] multiply(dot, broadcast)
+})"));
+
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_triton_gemm_any(true);
+  se::GpuComputeCapability rocm{se::RocmComputeCapability{"gfx942"}};
+  ASSERT_THAT(
+      GemmFusion(rocm, GemmFusionTarget::kFly).Run(module.get()),
+      IsOkAndHolds(true));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion);
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(config.fusion_backend_config().kind(), "__fly_gemm");
+  EXPECT_FALSE(config.fusion_backend_config().has_fly_gemm_config());
+}
+
 TEST_P(GemmFusionTestVersioned, TransposeSubdimensionGroup) {
   // This HLO is artificial because unnecessary reshapes get optimized
   // out during compilation. It tests the ability of GemmFusion
@@ -167,6 +197,37 @@ ENTRY e {
   EXPECT_TRUE(GemmFusion(gpu_version_).Run(module.get()).value());
   EXPECT_THAT(module->entry_computation()->root_instruction(),
               GmockMatch(m::Fusion(m::Op(), m::Op())));
+}
+
+TEST_P(GemmFusionTestVersioned, FusesFlyAttentionOutputTranspose) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R"(
+HloModule fly_attention_output_transpose
+
+ENTRY main {
+  lhs = bf16[32,64,128]{2,1,0} parameter(0)
+  rhs = bf16[32,128,128]{2,1,0} parameter(1)
+  dot = bf16[32,64,128]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={0}, rhs_batch_dims={0},
+      lhs_contracting_dims={2}, rhs_contracting_dims={2}
+  bitcast = bf16[2,16,64,128]{3,2,1,0} bitcast(dot)
+  ROOT transpose = bf16[2,128,16,64]{3,2,1,0} transpose(bitcast),
+      dimensions={0,3,1,2}
+})"));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_enable_flydsl_gemm(true);
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_triton_gemm_any(true);
+
+  se::GpuComputeCapability rocm{se::RocmComputeCapability{"gfx942"}};
+  EXPECT_THAT(GemmFusion(rocm).Run(module.get()), IsOkAndHolds(true));
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion);
+  EXPECT_EQ(root->fused_instructions_computation()
+                ->root_instruction()
+                ->opcode(),
+            HloOpcode::kTranspose);
 }
 
 TEST_P(GemmFusionTestV2, BitcastIsHoistedAboveElementwise) {

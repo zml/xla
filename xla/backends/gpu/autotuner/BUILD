@@ -302,6 +302,7 @@ cc_library(
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/autotuner/triton:aiter_unified_attention",
         "//xla/backends/gpu/autotuner/triton:cost_model_config_optimization",
         "//xla/backends/gpu/autotuner/triton:dot_search_space",
         "//xla/backends/gpu/autotuner/triton:triton_configs",
@@ -356,6 +357,9 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/codegen/flydsl:attention_support",
+        "//xla/backends/gpu/codegen/flydsl:fusion_support",
+        "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
         "//xla/backends/gpu/codegen/flydsl:xtile_elementwise",
         "//xla/backends/gpu/codegen/flydsl:xtile_reduction",
         "//xla/backends/gpu/codegen/flydsl:xtile_softmax",
@@ -371,6 +375,7 @@ cc_library(
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -409,6 +414,10 @@ xla_test(
 xla_test(
     name = "triton_test",
     srcs = ["triton_test.cc"],
+    env = {
+        "HIPBLASLT_PRELOAD_KERNELS": "0",
+        "HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL": "1",
+    },
     backend_tags = {
         # TODO(b/445172709): Re-enable once fixed.
         "b200": ["broken"],
@@ -438,6 +447,7 @@ xla_test(
         "//xla/service:hlo_module_config",
         "//xla/service:platform_util",
         "//xla/service/gpu:alias_info",
+        "//xla/service/gpu:triton_call",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:device_description_proto_cc",
         "//xla/stream_executor:platform",

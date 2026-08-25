@@ -40,9 +40,9 @@ bool IsFlyXTileTransposeFusion(const HloFusionAnalysis& analysis);
 // autotuner can replace an existing rank-preserving Triton/legacy config.
 bool IsFlyXTileTransposeConfigSupported(const HloFusionAnalysis& analysis);
 
-// Emits one square matrix tile per workgroup. Every thread transfers 32 bytes
-// in each direction. Adjacent BF16 input rows are packed into LDS dwords so
-// the transposed output is recovered with two 128-bit LDS reads per thread.
+// Emits one rectangular matrix tile per workgroup. Every thread transfers 32
+// bytes in each direction. Adjacent BF16 input rows are packed into LDS dwords
+// so the transposed output is recovered with two 128-bit LDS reads per thread.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(
     const HloFusionAnalysis& analysis);
 

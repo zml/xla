@@ -41,6 +41,7 @@ limitations under the License.
 #include "xla/service/compiler.h"
 #include "xla/service/executable.h"
 #include "xla/service/gpu/alias_info.h"
+#include "xla/service/gpu/triton_call.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/platform_util.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
@@ -63,6 +64,7 @@ using absl_testing::IsOk;
 using absl_testing::StatusIs;
 using TritonBackendConfig = AutotuneResult::TritonGemmKey;
 using ::testing::SizeIs;
+using ::testing::HasSubstr;
 using ::tsl::proto_testing::EqualsProto;
 
 const char kHlo[] = R"(
@@ -228,6 +230,79 @@ TEST_P(TritonBackendTest, GetSupportedConfigsForUnsupportedInstruction) {
       backend_.GetSupportedConfigs(*unsupported_instr);
   EXPECT_THAT(configs, absl_testing::IsOk());
   EXPECT_THAT(configs.value(), testing::IsEmpty());
+}
+
+TEST_P(TritonBackendTest, AutotunesAiterUnifiedAttentionProducerOnRocm) {
+  if (!target_config_.device_description.gpu_compute_capability().IsRocm()) {
+    GTEST_SKIP() << "AITER unified attention is an AMD specialization.";
+  }
+  constexpr absl::string_view kPagedAttentionHlo = R"hlo(
+HloModule aiter_triton_segmented_paged_attention
+
+producer_computation {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[32,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,32]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT partials = (f32[1,16,8,128]{3,2,1,0}, f32[1,16,8]{2,1,0}, f32[1,16,8]{2,1,0})
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode_segmented_producer"
+}
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[32,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,32]{1,0} parameter(4)
+  ROOT producer = (f32[1,16,8,128]{3,2,1,0}, f32[1,16,8]{2,1,0}, f32[1,16,8]{2,1,0})
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=producer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","128"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]}],"num_warps":"2","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)hlo";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kPagedAttentionHlo));
+  HloInstruction* producer =
+      module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(*producer));
+  ASSERT_THAT(configs, SizeIs(6));
+  ASSERT_TRUE(configs[0]->has_block_level());
+  EXPECT_EQ(configs[0]->block_level().num_warps(), 2);
+  EXPECT_EQ(configs[0]->block_level().num_stages(), 2);
+  EXPECT_EQ(configs[0]->block_level().waves_per_eu(), 2);
+
+  if (!GetParam()) {
+    EXPECT_THAT(backend_.Compile(*producer, *configs[0]), IsOk());
+  }
+
+  ASSERT_THAT(backend_.ApplyConfig(*producer, *configs[0]), IsOk());
+  HloInstruction* custom_call =
+      module->entry_computation()->root_instruction();
+  ASSERT_EQ(custom_call->opcode(), HloOpcode::kCustomCall);
+  EXPECT_EQ(custom_call->custom_call_target(), "__gpu$xla.gpu.triton");
+  EXPECT_EQ(custom_call->operand_count(), 5);
+  EXPECT_THAT(custom_call->raw_backend_config_string(),
+              HasSubstr("unnormalized output and log2-domain maximum"));
+  EXPECT_THAT(custom_call->raw_backend_config_string(),
+              ::testing::Not(HasSubstr("partial_output_normalized")));
+  EXPECT_THAT(custom_call->raw_backend_config_string(),
+              ::testing::Not(HasSubstr("natural_domain_max")));
+  EXPECT_THAT(custom_call->raw_backend_config_string(),
+              ::testing::Not(HasSubstr("__ELEMENT_TYPE__")));
+  TritonCall call = TritonCall::Parse(
+      custom_call->raw_backend_config_string(), &mlir_context_);
+  EXPECT_EQ(call.name, "aiter_triton_paged_attention_producer");
+  EXPECT_EQ(call.grid_x, 1);
+  EXPECT_EQ(call.grid_y, 4);
+  EXPECT_EQ(call.grid_z, 8);
+  EXPECT_EQ(call.num_warps, 2);
+  EXPECT_EQ(call.num_stages, 2);
+  EXPECT_EQ(call.waves_per_eu, 2);
 }
 
 TEST_P(TritonBackendTest, GetDefaultConfig) {

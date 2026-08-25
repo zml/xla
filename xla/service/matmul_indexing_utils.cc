@@ -473,6 +473,12 @@ absl::StatusOr<std::optional<DotOperandDims>> DotOperandDims::MapBackward(
     case HloOpcode::kReshape: {
       return Reshape(inst->operand(0)->shape());
     }
+    case HloOpcode::kBitcast:
+      // A bitcast may encode a layout-sensitive reshape that cannot be
+      // represented by the logical dimension-category mapping. Stop source
+      // traversal at the bitcast instead of turning an unsupported merge into
+      // a compilation error.
+      return std::nullopt;
     default:
       return absl::InvalidArgumentError(
           absl::StrCat("Unsupported opcode for MapBackward: ",
@@ -493,6 +499,8 @@ absl::StatusOr<std::optional<DotOperandDims>> DotOperandDims::MapForward(
     case HloOpcode::kReshape: {
       return Reshape(inst->shape());
     }
+    case HloOpcode::kBitcast:
+      return std::nullopt;
     default:
       return absl::InvalidArgumentError(
           absl::StrCat("Unsupported opcode for MapForward: ",

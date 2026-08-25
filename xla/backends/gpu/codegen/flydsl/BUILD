@@ -27,6 +27,160 @@ cc_library(
 )
 
 cc_library(
+    name = "attention_support",
+    srcs = ["attention_support.cc"],
+    hdrs = ["attention_support.h"],
+    visibility = [
+        "//xla/backends/gpu/autotuner:__pkg__",
+        "//xla/backends/gpu/codegen:__subpackages__",
+        "//xla/backends/gpu/transforms:__pkg__",
+    ],
+    deps = [
+        ":softmax_support",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+cc_library(
+    name = "paged_attention_support",
+    srcs = ["paged_attention_support.cc"],
+    hdrs = ["paged_attention_support.h"],
+    visibility = [
+        "//xla/backends/gpu/autotuner:__pkg__",
+        "//xla/backends/gpu/autotuner:__subpackages__",
+        "//xla/backends/gpu/codegen:__subpackages__",
+        "//xla/backends/gpu/transforms:__pkg__",
+    ],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:hlo_fusion_analysis",
+    ],
+)
+
+cc_library(
+    name = "fusion_support",
+    srcs = ["fusion_support.cc"],
+    hdrs = ["fusion_support.h"],
+    visibility = [
+        "//xla/backends/gpu/autotuner:__pkg__",
+        "//xla/backends/gpu/codegen:__pkg__",
+        "//xla/backends/gpu/transforms:__pkg__",
+    ],
+    deps = [
+        ":paged_attention_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_traversal",
+        "//xla/service/gpu:hlo_fusion_analysis",
+    ],
+)
+
+cc_library(
+    name = "xtile_attention",
+    srcs = ["xtile_attention.cc"],
+    hdrs = ["xtile_attention.h"],
+    visibility = ["//xla/backends/gpu/codegen:__subpackages__"],
+    deps = [
+        ":attention_support",
+        ":compiler",
+        "//xla:status_macros",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
+        "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
+        "//xla/codegen:ir_emission_utils",
+        "//xla/codegen/emitters:kernel_api_builder",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:ROCDLDialect",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+xla_cc_test(
+    name = "fusion_support_test",
+    srcs = ["fusion_support_test.cc"],
+    deps = [
+        ":fusion_support",
+        "//xla/backends/gpu/codegen:custom",
+        "//xla/backends/gpu/codegen:fusion_emitter",
+        "//xla/backends/gpu/codegen:fusions",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "xtile_paged_attention",
+    srcs = [
+        "xtile_paged_attention.cc",
+        "xtile_paged_attention_online.cc",
+        "xtile_paged_attention_reduce.cc",
+    ],
+    hdrs = [
+        "xtile_paged_attention.h",
+        "xtile_paged_attention_online.h",
+        "xtile_paged_attention_reduce.h",
+    ],
+    visibility = ["//xla/backends/gpu/codegen:__subpackages__"],
+    deps = [
+        ":compiler",
+        ":paged_attention_support",
+        "//xla:status_macros",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/emitters:mlir_kernel_emitter",
+        "//xla/backends/gpu/codegen/emitters/ir:xla_gpu",
+        "//xla/codegen:ir_emission_utils",
+        "//xla/codegen/emitters:kernel_api_builder",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@flydsl//:FlyDialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:ROCDLDialect",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:SCFUtils",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+cc_library(
     name = "xtile_elementwise",
     srcs = ["xtile_elementwise.cc"],
     hdrs = ["xtile_elementwise.h"],
@@ -321,12 +475,14 @@ xla_test(
     ],
     deps = [
         "//xla:error_spec",
+        "//xla:literal_util",
         "//xla:xla_proto_cc",
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
         "//xla/hlo/ir:hlo",
         "//xla/service/gpu:backend_configs_cc",
         "//xla/service/gpu:ir_emission_utils",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+        "//xla/tests:test_utils",
         "//xla/tests:xla_internal_test_main",
         "//xla/tsl/platform:status_matchers",
         "@com_google_absl//absl/strings:string_view",
@@ -352,6 +508,7 @@ xla_test(
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
         "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
     ],
@@ -396,10 +553,28 @@ sh_binary(
 )
 
 sh_binary(
+    name = "paged_attention_benchmark",
+    srcs = ["paged_attention_benchmark.sh"],
+    data = [
+        "paged_attention_benchmark.hlo.tpl",
+        "paged_attention_preconfigured_benchmark.hlo.tpl",
+        "paged_attention_segmented_preconfigured_benchmark.hlo.tpl",
+        "//xla/backends/gpu/autotuner:autotuner_main",
+    ],
+    tags = [
+        "gpu",
+        "manual",
+        "rocm-only",
+    ],
+)
+
+sh_binary(
     name = "fusion_benchmark",
     srcs = ["fusion_benchmark.sh"],
     data = [
         "fly_fusion_bf16_row_reduction_benchmark.hlo",
+        "fly_fusion_bf16_residual_rms_norm_1024_benchmark.hlo",
+        "fly_fusion_bf16_rms_norm_1024_benchmark.hlo",
         "fly_fusion_bf16_narrowing_row_reduction_benchmark.hlo",
         "fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark.hlo",
         "fly_fusion_bf16_squared_difference_reduction_benchmark.hlo",

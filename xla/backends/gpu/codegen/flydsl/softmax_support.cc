@@ -86,24 +86,22 @@ const HloInstruction* StableShiftInput(const HloInstruction* shifted) {
   return input;
 }
 
-}  // namespace
-
-bool IsFlySoftmaxRoot(const HloInstruction& root) {
+const HloInstruction* GetStableSoftmaxF32Input(const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
   if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
       root.shape().dimensions_size() < 2) {
-    return false;
+    return nullptr;
   }
   const HloInstruction* normalized = &root;
   if (element_type != F32) {
     if (root.opcode() != HloOpcode::kConvert || root.operand_count() != 1 ||
         root.operand(0)->shape().element_type() != F32) {
-      return false;
+      return nullptr;
     }
     normalized = root.operand(0);
   }
   if (normalized->opcode() != HloOpcode::kDivide) {
-    return false;
+    return nullptr;
   }
   const HloInstruction* exponential = normalized->operand(0);
   const HloInstruction* row_sum =
@@ -111,33 +109,85 @@ bool IsFlySoftmaxRoot(const HloInstruction& root) {
   if (exponential->opcode() != HloOpcode::kExp || row_sum == nullptr ||
       !IsRowReduction(row_sum, HloOpcode::kAdd, exponential) ||
       !IsScalarConstant(row_sum->operand(1), 0.0)) {
-    return false;
+    return nullptr;
   }
-  const HloInstruction* converted =
-      StableShiftInput(exponential->operand(0));
-  if (converted == nullptr) {
-    return false;
+  const HloInstruction* input = StableShiftInput(exponential->operand(0));
+  if (input == nullptr) {
+    return nullptr;
   }
   // Accept the second stabilization produced by `x - max(x); softmax(x)`.
   // The native kernel computes the equivalent single stable softmax directly.
-  if (const HloInstruction* original = StableShiftInput(converted)) {
-    converted = original;
+  if (const HloInstruction* original = StableShiftInput(input)) {
+    input = original;
+  }
+  return input;
+}
+
+bool HasCompatibleSoftmaxShape(const HloInstruction& root,
+                               const HloInstruction& input) {
+  if (ShapeUtil::ElementsIn(root.shape()) !=
+      ShapeUtil::ElementsIn(input.shape())) {
+    return false;
+  }
+  const int64_t columns =
+      root.shape().dimensions(root.shape().dimensions_size() - 1);
+  if (input.shape().dimensions_size() < 2 ||
+      input.shape().dimensions(input.shape().dimensions_size() - 1) !=
+          columns) {
+    return false;
+  }
+  constexpr int64_t kMaxColumns = 16 * 64 * 64;
+  return columns > 0 && columns <= kMaxColumns;
+}
+
+}  // namespace
+
+const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
+  const PrimitiveType element_type = root.shape().element_type();
+  const HloInstruction* converted = GetStableSoftmaxF32Input(root);
+  if (converted == nullptr) {
+    return nullptr;
   }
   const HloInstruction* input = converted;
   if (element_type != F32) {
     if (converted->opcode() != HloOpcode::kConvert ||
         converted->operand_count() != 1 ||
         converted->shape().element_type() != F32) {
-      return false;
+      return nullptr;
     }
     input = converted->operand(0);
+  }
+  if (input->shape().element_type() != element_type ||
+      !HasCompatibleSoftmaxShape(root, *input)) {
+    return nullptr;
+  }
+  return input;
+}
+
+const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root) {
+  const HloInstruction* input = GetStableSoftmaxF32Input(root);
+  if (input == nullptr) {
+    return nullptr;
+  }
+  if (input->opcode() == HloOpcode::kConvert && input->operand_count() == 1 &&
+      input->operand(0)->shape().element_type() ==
+          root.shape().element_type()) {
+    input = input->operand(0);
+  }
+  return HasCompatibleSoftmaxShape(root, *input) ? input : nullptr;
+}
+
+bool IsFlySoftmaxRoot(const HloInstruction& root) {
+  const HloInstruction* input = GetFlySoftmaxInput(root);
+  if (input == nullptr) {
+    return false;
   }
   const HloInstruction* parameter = input;
   if (input->opcode() == HloOpcode::kBitcast && input->operand_count() == 1) {
     parameter = input->operand(0);
   }
   if (parameter->opcode() != HloOpcode::kParameter ||
-      parameter->shape().element_type() != element_type ||
+      parameter->shape().element_type() != root.shape().element_type() ||
       ShapeUtil::ElementsIn(root.shape()) !=
           ShapeUtil::ElementsIn(parameter->shape())) {
     return false;
@@ -149,8 +199,7 @@ bool IsFlySoftmaxRoot(const HloInstruction& root) {
           parameter->shape().dimensions_size() - 1) != columns) {
     return false;
   }
-  constexpr int64_t kMaxColumns = 16 * 64 * 64;
-  return columns > 0 && columns <= kMaxColumns;
+  return true;
 }
 
 bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis) {

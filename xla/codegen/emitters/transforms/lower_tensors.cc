@@ -593,8 +593,60 @@ struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
     Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
     Value loaded = mlir::ROCDL::RawPtrBufferLoadOp::create(
         b, op.getResult().getType(), resource, source_byte_offset, zero,
-        b.getI32IntegerAttr(0), mlir::ArrayAttr{}, mlir::ArrayAttr{},
+        op.getCachePolicyAttr(), mlir::ArrayAttr{}, mlir::ArrayAttr{},
         mlir::ArrayAttr{});
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+struct RewriteScalarBufferLoad : OpRewritePattern<gpu::ScalarBufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::ScalarBufferLoadOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto source =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(op.getSource());
+
+    auto generic_ptr = ml::LLVMPointerType::get(b.getContext());
+    Value source_ptr =
+        UnrealizedConversionCastOp::create(b, generic_ptr, source).getResult(0);
+    Value source_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getSourceIndex()}, b);
+    Value source_byte_offset = arith::MulIOp::create(
+        b, source_linear_index, arith::ConstantIndexOp::create(b, 4));
+    source_byte_offset = CastBufferOffsetToI32(source_byte_offset, b);
+    // llvm.amdgcn.s.buffer.load consumes the four resource descriptor dwords
+    // by value.  Do not round-trip an address-space-8 fat pointer through
+    // ptrtoint here: in XLA's LLVM pipeline that preserves only the 64-bit base
+    // and silently zeroes the extent and flags.  Build the CDNA descriptor
+    // directly, matching FlyDSL's working scalar-load path.
+    auto descriptor_type = mlir::VectorType::get({4}, b.getI32Type());
+    Value source_address =
+        ml::PtrToIntOp::create(b, b.getI64Type(), source_ptr);
+    Value address_low = ml::TruncOp::create(b, b.getI32Type(), source_address);
+    Value address_high = ml::TruncOp::create(
+        b, b.getI32Type(),
+        ml::LShrOp::create(b, source_address,
+                           ml::ConstantOp::create(b, b.getI64Type(), 32)));
+    Value descriptor = ml::UndefOp::create(b, descriptor_type);
+    SmallVector<Value, 4> descriptor_dwords{
+        address_low, address_high,
+        ml::ConstantOp::create(b, b.getI32Type(), -1),
+        ml::ConstantOp::create(b, b.getI32Type(), 0x27000)};
+    for (auto [position, dword] : llvm::enumerate(descriptor_dwords)) {
+      descriptor = ml::InsertElementOp::create(
+          b, descriptor, dword,
+          ml::ConstantOp::create(b, b.getI32Type(), position));
+    }
+    Value zero = ml::ConstantOp::create(b, b.getI32Type(), 0);
+    Value loaded =
+        ml::CallIntrinsicOp::create(
+            b, b.getI32Type(), b.getStringAttr("llvm.amdgcn.s.buffer.load.i32"),
+            mlir::ValueRange{descriptor, source_byte_offset, zero})
+            .getResult(0);
     rewriter.replaceOp(op, loaded);
     return success();
   }
@@ -604,8 +656,7 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(
-      gpu::BufferStoreOp op,
-      mlir::PatternRewriter& rewriter) const override {
+      gpu::BufferStoreOp op, mlir::PatternRewriter& rewriter) const override {
     mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     Value destination = GetDestinationBuffer(op.getDestination());
     if (!destination) return failure();
@@ -1841,8 +1892,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
         RewriteAsyncCopyGlobalToShared,
         RewriteBufferLoad, RewriteBufferStore, RewriteGetDynamicDimSize,
         RewriteNonScalarConstants, RewriteSplitBufferLoad,
-        RewriteTileBufferLoad, RewriteTileBufferStore, RewriteSyncThreads,
-        RewriteTensorExtract,
+        RewriteScalarBufferLoad, RewriteTileBufferLoad, RewriteTileBufferStore,
+        RewriteSyncThreads, RewriteTensorExtract,
         RewriteTensorInsert, RewriteTransferRead, RewriteTransferWrite>(
         mlir_context);
     if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),

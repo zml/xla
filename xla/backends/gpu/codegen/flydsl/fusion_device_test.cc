@@ -13,6 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <array>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "gtest/gtest.h"
 #include "xla/backends/autotuner/backends.pb.h"
@@ -21,9 +28,12 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/literal_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/tests/hlo_pjrt_interpreter_reference_mixin.h"
+#include "xla/tests/literal_test_util.h"
+#include "xla/tests/test_utils.h"
 #include "xla/tsl/platform/status_matchers.h"
 #include "xla/xla.pb.h"
 
@@ -37,8 +47,8 @@ class FlyFusionPipelineDeviceTest
     : public HloInterpreterReferenceMixin<HloPjRtGpuTestBase> {
  protected:
   DebugOptions GetDebugOptionsForTest() const override {
-    DebugOptions debug_options =
-        HloPjRtGpuTestBase::GetDebugOptionsForTest();
+    DebugOptions debug_options = HloPjRtGpuTestBase::GetDebugOptionsForTest();
+    debug_options.set_xla_gpu_enable_flydsl_gemm(true);
     debug_options.set_xla_gpu_enable_flydsl_fusion(true);
     debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(false);
     debug_options.set_xla_gpu_autotune_level(0);
@@ -50,8 +60,7 @@ class FlyFusionAutotuningPipelineDeviceTest
     : public HloInterpreterReferenceMixin<HloPjRtGpuTestBase> {
  protected:
   DebugOptions GetDebugOptionsForTest() const override {
-    DebugOptions debug_options =
-        HloPjRtGpuTestBase::GetDebugOptionsForTest();
+    DebugOptions debug_options = HloPjRtGpuTestBase::GetDebugOptionsForTest();
     debug_options.set_xla_gpu_enable_flydsl_fusion(true);
     debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(true);
     debug_options.set_xla_gpu_autotune_level(3);
@@ -61,6 +70,361 @@ class FlyFusionAutotuningPipelineDeviceTest
     return debug_options;
   }
 };
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       ExecutesRaggedPagedAttentionDecodeDtypesAndGqa) {
+  constexpr absl::string_view kPagedHloTemplate = R"(
+HloModule fly_paged_attention_decode
+
+ENTRY main {
+  q = __TYPE__[1,__GQA__,128]{2,1,0} parameter(0)
+  k = __TYPE__[8,16,1,128]{3,2,1,0} parameter(1)
+  v = __TYPE__[8,16,1,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,8]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = __TYPE__[1,__GQA__,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+)";
+
+  constexpr absl::string_view kReferenceHloTemplate = R"(
+HloModule fly_paged_attention_decode_reference
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  q = __TYPE__[1,__GQA__,128]{2,1,0} parameter(0)
+  k = __TYPE__[8,16,1,128]{3,2,1,0} parameter(1)
+  v = __TYPE__[8,16,1,128]{3,2,1,0} parameter(2)
+  used_k_argument = s32[1]{0} parameter(3)
+  table_argument = s32[1,8]{1,0} parameter(4)
+  q_f32 = f32[1,__GQA__,128]{2,1,0} convert(q)
+  k_flat = __TYPE__[128,128]{1,0} reshape(k)
+  k_f32 = f32[128,128]{1,0} convert(k_flat)
+  scores = f32[1,__GQA__,128]{2,1,0} dot(q_f32, k_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={1}
+  scale = f32[] constant(0.0883883476)
+  scale_broadcast = f32[1,__GQA__,128]{2,1,0} broadcast(scale), dimensions={}
+  scaled = f32[1,__GQA__,128]{2,1,0} multiply(scores, scale_broadcast)
+  token_iota = s32[128]{0} iota(), iota_dimension=0
+  used_k = s32[] constant(37)
+  used_broadcast = s32[128]{0} broadcast(used_k), dimensions={}
+  token_valid = pred[128]{0} compare(token_iota, used_broadcast), direction=LT
+  mask = pred[1,__GQA__,128]{2,1,0} broadcast(token_valid), dimensions={2}
+  minus_inf = f32[] constant(-inf)
+  minus_inf_broadcast = f32[1,__GQA__,128]{2,1,0} broadcast(minus_inf), dimensions={}
+  masked = f32[1,__GQA__,128]{2,1,0} select(mask, scaled,
+    minus_inf_broadcast)
+  row_max = f32[1,__GQA__]{1,0} reduce(masked, minus_inf), dimensions={2},
+    to_apply=maximum
+  max_broadcast = f32[1,__GQA__,128]{2,1,0} broadcast(row_max), dimensions={0,1}
+  shifted = f32[1,__GQA__,128]{2,1,0} subtract(masked, max_broadcast)
+  exponential = f32[1,__GQA__,128]{2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[1,__GQA__]{1,0} reduce(exponential, zero), dimensions={2},
+    to_apply=add
+  sum_broadcast = f32[1,__GQA__,128]{2,1,0} broadcast(row_sum), dimensions={0,1}
+  probabilities = f32[1,__GQA__,128]{2,1,0} divide(exponential, sum_broadcast)
+  probabilities_element = __TYPE__[1,__GQA__,128]{2,1,0} convert(probabilities)
+  staged_probabilities = f32[1,__GQA__,128]{2,1,0} convert(probabilities_element)
+  v_flat = __TYPE__[128,128]{1,0} reshape(v)
+  v_f32 = f32[128,128]{1,0} convert(v_flat)
+  result = f32[1,__GQA__,128]{2,1,0} dot(staged_probabilities, v_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={0}
+  ROOT output = __TYPE__[1,__GQA__,128]{2,1,0} convert(result)
+}
+)";
+
+  constexpr std::array<std::pair<absl::string_view, absl::string_view>, 3>
+      kCases = {{{"bf16", "4"}, {"f16", "8"}, {"bf16", "16"}}};
+  for (const auto& [element_type, gqa_group] : kCases) {
+    SCOPED_TRACE(std::string(element_type) + "/GQA" + std::string(gqa_group));
+    const std::string paged_hlo = absl::StrReplaceAll(
+        kPagedHloTemplate,
+        {{"__TYPE__", element_type}, {"__GQA__", gqa_group}});
+    const std::string reference_hlo = absl::StrReplaceAll(
+        kReferenceHloTemplate,
+        {{"__TYPE__", element_type}, {"__GQA__", gqa_group}});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                         ParseAndReturnVerifiedModule(paged_hlo));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> reference_module,
+                         ParseAndReturnVerifiedModule(reference_hlo));
+    module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_disable_binary_libraries(true);
+    reference_module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_disable_binary_libraries(true);
+    ASSERT_OK_AND_ASSIGN(std::vector<Literal> arguments,
+                         MakeFakeArguments(module.get()));
+    arguments[3] = LiteralUtil::CreateR1<int32_t>({37});
+    arguments[4] = LiteralUtil::CreateR2<int32_t>({{0, 1, 2, 3, 4, 5, 6, 7}});
+    std::vector<const Literal*> argument_pointers;
+    argument_pointers.reserve(arguments.size());
+    for (const Literal& argument : arguments) {
+      argument_pointers.push_back(&argument);
+    }
+    ASSERT_OK(PreprocessModuleForTestRunner(module.get()));
+    ASSERT_OK_AND_ASSIGN(
+        Literal actual,
+        test_runner().Execute(std::move(module), argument_pointers,
+                              /*run_hlo_passes=*/true));
+    ASSERT_OK_AND_ASSIGN(Literal expected,
+                         reference_runner().Execute(std::move(reference_module),
+                                                    argument_pointers,
+                                                    /*run_hlo_passes=*/false));
+    EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
+        expected, actual, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
+  }
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       ExecutesStreamingLongContextPagedAttentionDecode) {
+  constexpr absl::string_view kPagedHlo = R"(
+HloModule fly_streaming_paged_attention_decode
+
+ENTRY main {
+  q = bf16[1,4,128]{2,1,0} parameter(0)
+  k = bf16[32,16,1,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,1,128]{3,2,1,0} parameter(2)
+  used_k_argument = s32[1]{0} parameter(3)
+  used_k = s32[1]{0} constant({401})
+  table = s32[1,32]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = bf16[1,4,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+)";
+
+  constexpr absl::string_view kReferenceHlo = R"(
+HloModule fly_streaming_paged_attention_decode_reference
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  q = bf16[1,4,128]{2,1,0} parameter(0)
+  k = bf16[32,16,1,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,1,128]{3,2,1,0} parameter(2)
+  used_k_argument = s32[1]{0} parameter(3)
+  table_argument = s32[1,32]{1,0} parameter(4)
+  q_f32 = f32[1,4,128]{2,1,0} convert(q)
+  k_flat = bf16[512,128]{1,0} reshape(k)
+  k_f32 = f32[512,128]{1,0} convert(k_flat)
+  scores = f32[1,4,512]{2,1,0} dot(q_f32, k_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={1}
+  scale = f32[] constant(0.0883883476)
+  scale_broadcast = f32[1,4,512]{2,1,0} broadcast(scale), dimensions={}
+  scaled = f32[1,4,512]{2,1,0} multiply(scores, scale_broadcast)
+  token_iota = s32[512]{0} iota(), iota_dimension=0
+  used_k = s32[] constant(401)
+  used_broadcast = s32[512]{0} broadcast(used_k), dimensions={}
+  token_valid = pred[512]{0} compare(token_iota, used_broadcast), direction=LT
+  mask = pred[1,4,512]{2,1,0} broadcast(token_valid), dimensions={2}
+  minus_inf = f32[] constant(-inf)
+  minus_inf_broadcast = f32[1,4,512]{2,1,0} broadcast(minus_inf), dimensions={}
+  masked = f32[1,4,512]{2,1,0} select(mask, scaled,
+    minus_inf_broadcast)
+  row_max = f32[1,4]{1,0} reduce(masked, minus_inf), dimensions={2},
+    to_apply=maximum
+  max_broadcast = f32[1,4,512]{2,1,0} broadcast(row_max), dimensions={0,1}
+  shifted = f32[1,4,512]{2,1,0} subtract(masked, max_broadcast)
+  exponential = f32[1,4,512]{2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[1,4]{1,0} reduce(exponential, zero), dimensions={2},
+    to_apply=add
+  sum_broadcast = f32[1,4,512]{2,1,0} broadcast(row_sum), dimensions={0,1}
+  probabilities = f32[1,4,512]{2,1,0} divide(exponential, sum_broadcast)
+  probabilities_element = bf16[1,4,512]{2,1,0} convert(probabilities)
+  staged_probabilities = f32[1,4,512]{2,1,0} convert(probabilities_element)
+  v_flat = bf16[512,128]{1,0} reshape(v)
+  v_f32 = f32[512,128]{1,0} convert(v_flat)
+  result = f32[1,4,128]{2,1,0} dot(staged_probabilities, v_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={0}
+  ROOT output = bf16[1,4,128]{2,1,0} convert(result)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kPagedHlo));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> reference_module,
+                       ParseAndReturnVerifiedModule(kReferenceHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_disable_binary_libraries(true);
+  reference_module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_disable_binary_libraries(true);
+  ASSERT_OK_AND_ASSIGN(std::vector<Literal> arguments,
+                       MakeFakeArguments(module.get()));
+  arguments[3] = LiteralUtil::CreateR1<int32_t>({401});
+  arguments[4] = Literal::CreateFromShape(arguments[4].shape());
+  for (int64_t page = 0; page < 32; ++page) {
+    arguments[4].Set<int32_t>({0, page}, page);
+  }
+  std::vector<const Literal*> argument_pointers;
+  argument_pointers.reserve(arguments.size());
+  for (const Literal& argument : arguments) {
+    argument_pointers.push_back(&argument);
+  }
+  ASSERT_OK(PreprocessModuleForTestRunner(module.get()));
+  ASSERT_OK_AND_ASSIGN(
+      Literal actual,
+      test_runner().Execute(std::move(module), argument_pointers,
+                            /*run_hlo_passes=*/true));
+  ASSERT_OK_AND_ASSIGN(Literal expected,
+                       reference_runner().Execute(std::move(reference_module),
+                                                  argument_pointers,
+                                                  /*run_hlo_passes=*/false));
+  EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
+      expected, actual, ErrorSpec{/*aabs=*/0.04, /*arel=*/0.04}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       ExecutesNonPowerOfTwoSegmentedPagedAttentionDecode) {
+  constexpr absl::string_view kPagedHlo = R"(
+HloModule fly_non_power_of_two_segmented_paged_attention_decode
+
+ENTRY main {
+  q = bf16[1,4,128]{2,1,0} parameter(0)
+  k = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
+  v = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,__PAGES__]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = bf16[1,4,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+)";
+
+  constexpr absl::string_view kReferenceHlo = R"(
+HloModule fly_non_power_of_two_segmented_paged_attention_decode_reference
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  q = bf16[1,4,128]{2,1,0} parameter(0)
+  k = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
+  v = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
+  used_k_argument = s32[1]{0} parameter(3)
+  table_argument = s32[1,__PAGES__]{1,0} parameter(4)
+  q_f32 = f32[1,4,128]{2,1,0} convert(q)
+  k_flat = bf16[__TOKENS__,128]{1,0} reshape(k)
+  k_f32 = f32[__TOKENS__,128]{1,0} convert(k_flat)
+  scores = f32[1,4,__TOKENS__]{2,1,0} dot(q_f32, k_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={1}
+  scale = f32[] constant(0.0883883476)
+  scale_broadcast = f32[1,4,__TOKENS__]{2,1,0} broadcast(scale), dimensions={}
+  scaled = f32[1,4,__TOKENS__]{2,1,0} multiply(scores, scale_broadcast)
+  token_iota = s32[__TOKENS__]{0} iota(), iota_dimension=0
+  used_k = s32[] reshape(used_k_argument)
+  used_broadcast = s32[__TOKENS__]{0} broadcast(used_k), dimensions={}
+  token_valid = pred[__TOKENS__]{0} compare(token_iota, used_broadcast), direction=LT
+  mask = pred[1,4,__TOKENS__]{2,1,0} broadcast(token_valid), dimensions={2}
+  minus_inf = f32[] constant(-inf)
+  minus_inf_broadcast = f32[1,4,__TOKENS__]{2,1,0} broadcast(minus_inf), dimensions={}
+  masked = f32[1,4,__TOKENS__]{2,1,0} select(mask, scaled,
+    minus_inf_broadcast)
+  row_max = f32[1,4]{1,0} reduce(masked, minus_inf), dimensions={2},
+    to_apply=maximum
+  max_broadcast = f32[1,4,__TOKENS__]{2,1,0} broadcast(row_max), dimensions={0,1}
+  shifted = f32[1,4,__TOKENS__]{2,1,0} subtract(masked, max_broadcast)
+  exponential = f32[1,4,__TOKENS__]{2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[1,4]{1,0} reduce(exponential, zero), dimensions={2},
+    to_apply=add
+  sum_broadcast = f32[1,4,__TOKENS__]{2,1,0} broadcast(row_sum), dimensions={0,1}
+  probabilities = f32[1,4,__TOKENS__]{2,1,0} divide(exponential, sum_broadcast)
+  probabilities_element = bf16[1,4,__TOKENS__]{2,1,0} convert(probabilities)
+  staged_probabilities = f32[1,4,__TOKENS__]{2,1,0} convert(probabilities_element)
+  v_flat = bf16[__TOKENS__,128]{1,0} reshape(v)
+  v_f32 = f32[__TOKENS__,128]{1,0} convert(v_flat)
+  result = f32[1,4,128]{2,1,0} dot(staged_probabilities, v_f32),
+    lhs_contracting_dims={2}, rhs_contracting_dims={0}
+  ROOT output = bf16[1,4,128]{2,1,0} convert(result)
+}
+)";
+
+  constexpr std::array<std::array<int64_t, 3>, 2> kCases = {
+      {{4096, 65536, 65521}, {8192, 131072, 131057}}};
+  for (const auto& [pages, tokens, used_tokens] : kCases) {
+    SCOPED_TRACE(std::to_string(tokens));
+    const std::string paged_hlo = absl::StrReplaceAll(
+        kPagedHlo, {{"__PAGES__", std::to_string(pages)}});
+    const std::string reference_hlo = absl::StrReplaceAll(
+        kReferenceHlo,
+        {{"__PAGES__", std::to_string(pages)},
+         {"__TOKENS__", std::to_string(tokens)}});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                         ParseAndReturnVerifiedModule(paged_hlo));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> reference_module,
+                         ParseAndReturnVerifiedModule(reference_hlo));
+    module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_disable_binary_libraries(true);
+    reference_module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_disable_binary_libraries(true);
+    ASSERT_OK_AND_ASSIGN(std::vector<Literal> arguments,
+                         MakeFakeArguments(module.get()));
+    arguments[3] =
+        LiteralUtil::CreateR1<int32_t>({static_cast<int32_t>(used_tokens)});
+    arguments[4] = Literal::CreateFromShape(arguments[4].shape());
+    for (int64_t page = 0; page < pages; ++page) {
+      arguments[4].Set<int32_t>({0, page}, page);
+    }
+    std::vector<const Literal*> argument_pointers;
+    argument_pointers.reserve(arguments.size());
+    for (const Literal& argument : arguments) {
+      argument_pointers.push_back(&argument);
+    }
+    ASSERT_OK(PreprocessModuleForTestRunner(module.get()));
+    ASSERT_OK_AND_ASSIGN(
+        Literal actual,
+        test_runner().Execute(std::move(module), argument_pointers,
+                              /*run_hlo_passes=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        Literal expected,
+        reference_runner().Execute(std::move(reference_module),
+                                   argument_pointers,
+                                   /*run_hlo_passes=*/false));
+    EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
+        expected, actual, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
+  }
+}
 
 TEST_F(FlyFusionPipelineDeviceTest, FormsAndExecutesFlyFusionEndToEnd) {
   constexpr absl::string_view kHlo = R"(
@@ -104,8 +468,7 @@ ENTRY main {
                        root->backend_config<GpuBackendConfig>());
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionPipelineDeviceTest,
@@ -168,8 +531,92 @@ ENTRY main {
                        root->backend_config<GpuBackendConfig>());
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       FormsAndExecutesPackedQkvAttentionEndToEnd) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_packed_qkv_attention_pipeline
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  qkv = bf16[256,192]{1,0} parameter(0)
+  view = bf16[2,128,3,1,64]{4,3,2,1,0} reshape(qkv)
+  q_slice = bf16[2,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [0:1], [0:1], [0:64]}
+  q5 = bf16[2,1,1,64,128]{4,3,2,1,0} transpose(q_slice),
+    dimensions={0,2,3,4,1}
+  q = bf16[2,64,128]{2,1,0} reshape(q5)
+  k_slice = bf16[2,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [1:2], [0:1], [0:64]}
+  k5 = bf16[2,1,1,64,128]{4,3,2,1,0} transpose(k_slice),
+    dimensions={0,2,3,4,1}
+  k = bf16[2,64,128]{2,1,0} reshape(k5)
+  v_slice = bf16[2,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:2], [0:128], [2:3], [0:1], [0:64]}
+  v5 = bf16[2,1,1,64,128]{4,3,2,1,0} transpose(v_slice),
+    dimensions={0,2,3,4,1}
+  v = bf16[2,64,128]{2,1,0} reshape(v5)
+  q_transposed = bf16[2,128,64]{2,1,0} transpose(q),
+    dimensions={0,2,1}
+  scores = bf16[2,128,128]{2,1,0} dot(q_transposed, k),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scores_f32 = f32[2,128,128]{2,1,0} convert(scores)
+  scale_bf16 = bf16[] constant(0.125)
+  scales_bf16 = bf16[2,128,128]{2,1,0} broadcast(scale_bf16), dimensions={}
+  scales = f32[2,128,128]{2,1,0} convert(scales_bf16)
+  scaled = f32[2,128,128]{2,1,0} multiply(scores_f32, scales)
+  scaled_bf16 = bf16[2,128,128]{2,1,0} convert(scaled)
+  score_view = bf16[2,1,128,128]{3,2,1,0} reshape(scaled_bf16)
+  converted = f32[2,1,128,128]{3,2,1,0} convert(score_view)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[2,1,128]{2,1,0} reduce(converted, minus_inf),
+    dimensions={3}, to_apply=maximum
+  maxima = f32[2,1,128,128]{3,2,1,0} broadcast(row_max),
+    dimensions={0,1,2}
+  shifted = f32[2,1,128,128]{3,2,1,0} subtract(converted, maxima)
+  exponential = f32[2,1,128,128]{3,2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,1,128]{2,1,0} reduce(exponential, zero),
+    dimensions={3}, to_apply=add
+  sums = f32[2,1,128,128]{3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,2}
+  normalized = f32[2,1,128,128]{3,2,1,0} divide(exponential, sums)
+  probabilities = bf16[2,1,128,128]{3,2,1,0} convert(normalized)
+  probabilities_bh = bf16[2,128,128]{2,1,0} reshape(probabilities)
+  context = bf16[2,64,128]{2,1,0} dot(v, probabilities_bh),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={2}
+  context_view = bf16[2,1,64,128]{3,2,1,0} reshape(context)
+  ROOT result = bf16[2,128,1,64]{3,2,1,0} transpose(context_view),
+    dimensions={0,3,1,2}
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloComputation* entry = optimized->entry_computation();
+  EXPECT_EQ(entry->instruction_count(), 2) << optimized->ToString();
+  const HloInstruction* root = entry->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_EQ(root->operand_count(), 1) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -196,8 +643,7 @@ ENTRY main {
                        root->backend_config<GpuBackendConfig>());
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
-  EXPECT_TRUE(RunAndCompare(kHlo,
-                            ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -224,8 +670,7 @@ ENTRY main {
                        root->backend_config<GpuBackendConfig>());
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
-  EXPECT_TRUE(RunAndCompare(kHlo,
-                            ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -266,8 +711,7 @@ ENTRY main {
     contains_reduce |= instruction->opcode() == HloOpcode::kReduce;
   }
   EXPECT_TRUE(contains_reduce) << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -301,8 +745,7 @@ ENTRY main {
   EXPECT_EQ(fusion_config.kind(), kFlyFusionKind) << optimized->ToString();
   EXPECT_GE(fusion_config.block_level_fusion_config().vector_size_bits(), 64)
       << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -357,8 +800,7 @@ ENTRY main {
   }
   EXPECT_TRUE(contains_reduce) << optimized->ToString();
   EXPECT_TRUE(contains_rsqrt) << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -408,8 +850,7 @@ ENTRY main {
                        root->backend_config<GpuBackendConfig>());
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.02, /*arel=*/0.02}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.02, /*arel=*/0.02}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -445,8 +886,7 @@ ENTRY main {
     }
   }
   ASSERT_NE(fly_fusion, nullptr) << optimized->ToString();
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionPipelineDeviceTest,
@@ -468,8 +908,7 @@ ENTRY main {
     calls=elementwise
 })";
 
-  EXPECT_TRUE(
-      RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionDeviceTest, Bf16Softmax64x4096) {
@@ -517,6 +956,93 @@ ENTRY main {
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedQkvBf16Attention) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_qkv_attention
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+attention {
+  qkv = bf16[128,192]{1,0} parameter(0)
+  view = bf16[1,128,3,1,64]{4,3,2,1,0} bitcast(qkv)
+  q_slice = bf16[1,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:1], [0:128], [0:1], [0:1], [0:64]}
+  q5 = bf16[1,1,1,64,128]{4,3,2,1,0} transpose(q_slice),
+    dimensions={0,2,3,4,1}
+  q = bf16[1,64,128]{2,1,0} bitcast(q5)
+  k_slice = bf16[1,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:1], [0:128], [1:2], [0:1], [0:64]}
+  k5 = bf16[1,1,1,64,128]{4,3,2,1,0} transpose(k_slice),
+    dimensions={0,2,3,4,1}
+  k = bf16[1,64,128]{2,1,0} bitcast(k5)
+  v_slice = bf16[1,128,1,1,64]{4,3,2,1,0} slice(view),
+    slice={[0:1], [0:128], [2:3], [0:1], [0:64]}
+  v5 = bf16[1,1,1,64,128]{4,3,2,1,0} transpose(v_slice),
+    dimensions={0,2,3,4,1}
+  v = bf16[1,64,128]{2,1,0} bitcast(v5)
+  q_transposed = bf16[1,128,64]{2,1,0} transpose(q),
+    dimensions={0,2,1}
+  scores = bf16[1,128,128]{2,1,0} dot(q_transposed, k),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scores_f32 = f32[1,128,128]{2,1,0} convert(scores)
+  scale_bf16 = bf16[] constant(0.125)
+  scales_bf16 = bf16[1,128,128]{2,1,0} broadcast(scale_bf16),
+    dimensions={}
+  scales = f32[1,128,128]{2,1,0} convert(scales_bf16)
+  scaled = f32[1,128,128]{2,1,0} multiply(scores_f32, scales)
+  scaled_bf16 = bf16[1,128,128]{2,1,0} convert(scaled)
+  score_view = bf16[1,1,128,128]{3,2,1,0} bitcast(scaled_bf16)
+  converted = f32[1,1,128,128]{3,2,1,0} convert(score_view)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[1,1,128]{2,1,0} reduce(converted, minus_inf),
+    dimensions={3}, to_apply=maximum
+  maxima = f32[1,1,128,128]{3,2,1,0} broadcast(row_max),
+    dimensions={0,1,2}
+  shifted = f32[1,1,128,128]{3,2,1,0} subtract(converted, maxima)
+  exponential = f32[1,1,128,128]{3,2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[1,1,128]{2,1,0} reduce(exponential, zero),
+    dimensions={3}, to_apply=add
+  sums = f32[1,1,128,128]{3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,2}
+  normalized = f32[1,1,128,128]{3,2,1,0} divide(exponential, sums)
+  probabilities = bf16[1,1,128,128]{3,2,1,0} convert(normalized)
+  probabilities_bh = bf16[1,128,128]{2,1,0} bitcast(probabilities)
+  context = bf16[1,64,128]{2,1,0} dot(v, probabilities_bh),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={2}
+  context_view = bf16[1,1,64,128]{3,2,1,0} bitcast(context)
+  ROOT result = bf16[1,128,1,64]{3,2,1,0} transpose(context_view),
+    dimensions={0,3,1,2}
+}
+
+ENTRY main {
+  qkv = bf16[128,192]{1,0} parameter(0)
+  ROOT fusion = bf16[1,128,1,64]{3,2,1,0} fusion(qkv),
+    kind=kCustom, calls=attention,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","128","1","64"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "waves_per_eu":"2"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeBf16ElementwiseDag) {
@@ -581,8 +1107,8 @@ ENTRY main {
         "vector_size_bits":"128"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeTinyF32ElementwiseTail) {
@@ -608,8 +1134,8 @@ ENTRY main {
         "vector_size_bits":"128"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1e-5, /*arel=*/1e-5}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-5, /*arel=*/1e-5}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeMultiOutputBf16ElementwiseDag) {
@@ -705,8 +1231,8 @@ ENTRY main {
         "vector_size_bits":"64"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeF32TranscendentalDag) {
@@ -739,8 +1265,8 @@ ENTRY main {
         "vector_size_bits":"128"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1e-5, /*arel=*/1e-5}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-5, /*arel=*/1e-5}));
 }
 
 TEST_F(FlyFusionDeviceTest, F16Softmax31x125Tail) {
@@ -907,6 +1433,54 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
+TEST_F(FlyFusionDeviceTest, Bf16TransposeWideRectangularTile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_transpose_wide_rectangular_tile
+
+transpose {
+  p0 = bf16[128,256]{1,0} parameter(0)
+  ROOT result = bf16[256,128]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = bf16[128,256]{1,0} parameter(0)
+  ROOT fusion = bf16[256,128]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["32","128"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, Bf16TransposeTallRectangularTile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_transpose_tall_rectangular_tile
+
+transpose {
+  p0 = bf16[256,128]{1,0} parameter(0)
+  ROOT result = bf16[128,256]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = bf16[256,128]{1,0} parameter(0)
+  ROOT fusion = bf16[128,256]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["128","32"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
 TEST_F(FlyFusionDeviceTest, TransformerQkvSliceTranspose) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_transformer_qkv_slice_transpose
@@ -1043,8 +1617,8 @@ ENTRY main {
     backend_config={"fusion_backend_config":{
       "kind":"__fly",
       "block_level_fusion_config":{
-        "output_tiles":[{"sizes":["128","128"]}],
-        "num_stages":"1", "num_warps":"16", "num_ctas":"1"}}}
+        "output_tiles":[{"sizes":["32","64"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1"}}}
 })";
 
   EXPECT_TRUE(
@@ -1100,6 +1674,56 @@ ENTRY main {
         "output_tiles":[{"sizes":["4"]}],
         "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeSmallSplitKResidualReduction) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_small_split_k_residual
+
+add_reduce {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+residual {
+  base = bf16[2,17,259]{2,1,0} parameter(0)
+  base_f32 = f32[2,17,259]{2,1,0} convert(base)
+  partial4 = f32[4,34,259]{2,1,0} parameter(1)
+  zero = f32[] constant(0)
+  sum4 = f32[34,259]{1,0} reduce(partial4, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded4 = bf16[34,259]{1,0} convert(sum4)
+  view4 = bf16[2,17,259]{2,1,0} bitcast(rounded4)
+  value4 = f32[2,17,259]{2,1,0} convert(view4)
+  partial2 = f32[2,34,259]{2,1,0} parameter(2)
+  sum2 = f32[34,259]{1,0} reduce(partial2, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded2 = bf16[34,259]{1,0} convert(sum2)
+  view2 = bf16[2,17,259]{2,1,0} bitcast(rounded2)
+  value2 = f32[2,17,259]{2,1,0} convert(view2)
+  first = f32[2,17,259]{2,1,0} add(base_f32, value2)
+  total = f32[2,17,259]{2,1,0} add(first, value4)
+  ROOT result = bf16[2,17,259]{2,1,0} convert(total)
+}
+
+ENTRY main {
+  base = bf16[2,17,259]{2,1,0} parameter(0)
+  partial4 = f32[4,34,259]{2,1,0} parameter(1)
+  partial2 = f32[2,34,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[2,17,259]{2,1,0}
+      fusion(base, partial4, partial2), kind=kCustom, calls=residual,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly",
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1"]}],
+          "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+          "vector_size_bits":"64"}}}
+}
+)";
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
@@ -1239,8 +1863,8 @@ ENTRY main {
         "vector_size_bits":"128"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeRank3Bf16RmsNorm) {
@@ -1285,8 +1909,108 @@ ENTRY main {
         "vector_size_bits":"128"}}}
 })";
 
-  EXPECT_TRUE(RunAndCompareNoHloPasses(
-      kHlo, ErrorSpec{/*aabs=*/1e-2, /*arel=*/1e-2}));
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-2, /*arel=*/1e-2}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePartitionedRank3Bf16RmsNorm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_partitioned_rank3_bf16_rms_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  p0 = bf16[2,17,1024]{2,1,0} parameter(0)
+  converted = f32[2,17,1024]{2,1,0} convert(p0)
+  squared = f32[2,17,1024]{2,1,0} multiply(converted, converted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,17]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,17]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,17]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,17]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,17]{1,0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[2,17]{1,0} rsqrt(variance)
+  scales = f32[2,17,1024]{2,1,0} broadcast(reciprocal_stddev),
+    dimensions={0,1}
+  normalized = f32[2,17,1024]{2,1,0} multiply(converted, scales)
+  ROOT result = bf16[2,17,1024]{2,1,0} convert(normalized)
+}
+
+ENTRY main {
+  p0 = bf16[2,17,1024]{2,1,0} parameter(0)
+  ROOT fusion = bf16[2,17,1024]{2,1,0} fusion(p0), kind=kCustom,
+    calls=rms_norm,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["8"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-2, /*arel=*/1e-2}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePartitionedResidualRmsNorm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_partitioned_residual_rms_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  residual = bf16[2,17,1024]{2,1,0} parameter(0)
+  partials = f32[2,34,1024]{2,1,0} parameter(1)
+  zero = f32[] constant(0)
+  projected = f32[34,1024]{1,0} reduce(partials, zero), dimensions={0},
+    to_apply=add
+  projected_bf16 = bf16[34,1024]{1,0} convert(projected)
+  projected_view = bf16[2,17,1024]{2,1,0} bitcast(projected_bf16)
+  residual_f32 = f32[2,17,1024]{2,1,0} convert(residual)
+  projected_f32 = f32[2,17,1024]{2,1,0} convert(projected_view)
+  added = f32[2,17,1024]{2,1,0} add(residual_f32, projected_f32)
+  squared = f32[2,17,1024]{2,1,0} multiply(added, added)
+  row_sum = f32[2,17]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,17]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,17]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,17]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,17]{1,0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[2,17]{1,0} rsqrt(variance)
+  scales = f32[2,17,1024]{2,1,0} broadcast(reciprocal_stddev),
+    dimensions={0,1}
+  normalized = f32[2,17,1024]{2,1,0} multiply(added, scales)
+  ROOT result = bf16[2,17,1024]{2,1,0} convert(normalized)
+}
+
+ENTRY main {
+  residual = bf16[2,17,1024]{2,1,0} parameter(0)
+  partials = f32[2,34,1024]{2,1,0} parameter(1)
+  ROOT fusion = bf16[2,17,1024]{2,1,0} fusion(residual, partials),
+    kind=kCustom, calls=rms_norm,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["8"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/2e-2, /*arel=*/2e-2}));
 }
 
 TEST_F(FlyFusionDeviceTest, GenericDynamicSliceBitcast) {
