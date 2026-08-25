@@ -28,9 +28,11 @@ namespace xla::gpu::flydsl {
 bool IsFlyXTileRowReductionFusion(const HloFusionAnalysis& analysis);
 
 // Returns whether the native row-reduction emitter can use this global-copy
-// width for the fusion's input/output types and row length.
+// width and number of independently computed output partitions for the
+// fusion's input/output types and row length.
 bool IsFlyXTileRowReductionConfigSupported(const HloFusionAnalysis& analysis,
-                                           int64_t vector_size_bits);
+                                           int64_t vector_size_bits,
+                                           int64_t output_partitions = 1);
 
 // Creates a native Fly emitter for a contiguous minor-dimension reduction.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileRowReductionEmitter(

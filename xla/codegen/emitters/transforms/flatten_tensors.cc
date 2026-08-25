@@ -820,7 +820,24 @@ struct RewriteBufferLoad : OpRewritePattern<gpu::BufferLoadOp> {
 
     Value flat_source = Flatten(op.getSource(), rewriter);
     rewriter.replaceOpWithNewOp<gpu::BufferLoadOp>(
-        op, op.getResult().getType(), flat_source, op.getSourceIndex());
+        op, op.getResult().getType(), flat_source, op.getSourceIndex(),
+        op.getCachePolicyAttr());
+    return mlir::success();
+  }
+};
+
+struct RewriteScalarBufferLoad : OpRewritePattern<gpu::ScalarBufferLoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::ScalarBufferLoadOp op,
+                                PatternRewriter& rewriter) const override {
+    if (IsScalarOrFlat(op.getSource().getType())) {
+      return rewriter.notifyMatchFailure(op, "the source is already flat");
+    }
+
+    Value flat_source = Flatten(op.getSource(), rewriter);
+    rewriter.replaceOpWithNewOp<gpu::ScalarBufferLoadOp>(op, flat_source,
+                                                         op.getSourceIndex());
     return mlir::success();
   }
 };
@@ -977,6 +994,7 @@ class FlattenTensorsPass
         RewriteAsyncCopyGlobalToShared,
         RewriteAccumulatorStore,
         RewriteBufferLoad,
+        RewriteScalarBufferLoad,
         RewriteBufferStore,
         RewriteTileBufferStore,
         RewriteSplitBufferLoad,

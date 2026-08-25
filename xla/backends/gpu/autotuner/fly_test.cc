@@ -187,6 +187,28 @@ ENTRY main {
       backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
 })";
 
+constexpr char kAttentionValueOutputTransposeHlo[] = R"(
+HloModule fly_attention_value_output_transpose
+
+gemm {
+  lhs = bf16[32,64,128]{2,1,0} parameter(0)
+  rhs = bf16[32,128,128]{2,1,0} parameter(1)
+  dot = bf16[32,64,128]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={0}, rhs_batch_dims={0},
+      lhs_contracting_dims={2}, rhs_contracting_dims={2}
+  bitcast = bf16[2,16,64,128]{3,2,1,0} bitcast(dot)
+  ROOT transpose = bf16[2,128,16,64]{3,2,1,0} transpose(bitcast),
+      dimensions={0,3,1,2}
+}
+
+ENTRY main {
+  lhs = bf16[32,64,128]{2,1,0} parameter(0)
+  rhs = bf16[32,128,128]{2,1,0} parameter(1)
+  ROOT fusion = bf16[2,128,16,64]{3,2,1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+
 constexpr char kScaledDotHlo[] = R"(
 HloModule fly_scaled_dot
 
@@ -946,17 +968,41 @@ class FlyFusionBackendTest : public HloHardwareIndependentTestBase {
   FlyFusionBackend backend_;
 };
 
-TEST_F(FlyBackendTest, SupportsOddOutputTailsAndMinimumKTile) {
+TEST_F(FlyFusionBackendTest, RejectsGenericFusionWithOpaqueCustomCall) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_opaque_custom_call
+
+body {
+  p0 = f32[8]{0} parameter(0)
+  ROOT unsupported_call = f32[8]{0} custom-call(p0),
+      custom_call_target="__opaque$unsupported"
+}
+
+ENTRY main {
+  p0 = f32[8]{0} parameter(0)
+  ROOT fusion = f32[8]{0} fusion(p0), kind=kCustom, calls=body,
+      backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["8"]}],"num_warps":"1","num_ctas":"1","num_stages":"1"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
   ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<HloModule> module,
-      ParseAndReturnVerifiedModule(kOddOutputTailBf16GemmHlo));
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+  EXPECT_TRUE(configs.empty());
+}
+
+TEST_F(FlyBackendTest, SupportsOddOutputTailsAndMinimumKTile) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kOddOutputTailBf16GemmHlo));
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 64 && fly.block_n() == 64 &&
                fly.block_k() == 16 && fly.num_warps() == 4 &&
@@ -984,23 +1030,20 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 64 && fly.block_n() == 64 &&
-               fly.block_k() == 64 && fly.num_warps() == 4 &&
-               !fly.stage_rhs();
+               fly.block_k() == 64 && fly.num_warps() == 4 && !fly.stage_rhs();
       }));
   EXPECT_TRUE(std::all_of(
-      configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().block_k() <= 64;
-      }));
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().block_k() <= 64; }));
 }
 
 TEST_F(FlyBackendTest, OffersPreloadedRhsForLongMaskedKTail) {
@@ -1023,15 +1066,14 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
   auto config = std::find_if(configs.begin(), configs.end(), [](const auto& c) {
     const FlyGemmConfig& fly = c->fly();
-    return fly.block_m() == 64 && fly.block_n() == 64 &&
-           fly.block_k() == 64 && fly.num_warps() == 4 && fly.stage_rhs() &&
+    return fly.block_m() == 64 && fly.block_n() == 64 && fly.block_k() == 64 &&
+           fly.num_warps() == 4 && fly.stage_rhs() &&
            fly.preload_lds_fragments() && !fly.stage_output();
   });
   ASSERT_NE(config, configs.end());
@@ -1062,10 +1104,9 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
   auto is_row_major_mfma32 = [](const auto& config) {
     const FlyGemmConfig& fly = config->fly();
@@ -1075,18 +1116,16 @@ ENTRY main {
            fly.stage_rhs() && fly.preload_lds_fragments() &&
            !fly.single_buffer_lds();
   };
-  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(),
-                          [&](const auto& config) {
-                            return is_row_major_mfma32(config) &&
-                                   !config->fly().stage_output() &&
-                                   config->fly().schedule_instructions();
-                          }));
-  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(),
-                          [&](const auto& config) {
-                            return is_row_major_mfma32(config) &&
-                                   config->fly().stage_output() &&
-                                   !config->fly().schedule_instructions();
-                          }));
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [&](const auto& config) {
+        return is_row_major_mfma32(config) && !config->fly().stage_output() &&
+               config->fly().schedule_instructions();
+      }));
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [&](const auto& config) {
+        return is_row_major_mfma32(config) && config->fly().stage_output() &&
+               !config->fly().schedule_instructions();
+      }));
 }
 
 TEST_F(FlyBackendTest, OffersK32PipelineForRaggedBatchedRowMajorRhs) {
@@ -1110,13 +1149,12 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 128 && fly.block_n() == 128 &&
                fly.block_k() == 32 && fly.num_warps() == 4 &&
@@ -1158,23 +1196,21 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_n() == 64 && fly.num_warps() == 4 &&
                fly.gemv_outputs_per_wave() == 4 &&
                fly.gemv_k_vector_width() == 1;
       }));
   EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().block_n() == 128;
-      }));
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().block_n() == 128; }));
 }
 
 TEST_F(FlyBackendTest, OffersMfmaRowVectorLocalSplitK) {
@@ -1184,8 +1220,8 @@ TEST_F(FlyBackendTest, OffersMfmaRowVectorLocalSplitK) {
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
-  auto candidate = std::find_if(
-      configs.begin(), configs.end(), [](const auto& config) {
+  auto candidate =
+      std::find_if(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 16 && fly.block_n() == 16 &&
                fly.block_k() == 256 && fly.num_warps() == 2 &&
@@ -1200,8 +1236,8 @@ TEST_F(FlyBackendTest, OffersMfmaRowVectorLocalSplitK) {
                           fusion->backend_config<GpuBackendConfig>());
   EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 16 && fly.block_n() == 16 &&
                fly.block_k() == 256 && fly.num_warps() == 4 &&
@@ -1231,13 +1267,12 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_n() == 128 && fly.num_warps() == 8 &&
                fly.gemv_split_k();
@@ -1302,21 +1337,19 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 256 && fly.block_n() == 224 &&
-               fly.block_k() == 64 && fly.num_warps() == 4 &&
-               fly.stage_rhs() && fly.preload_lds_fragments() &&
-               fly.direct_to_vgpr();
+               fly.block_k() == 64 && fly.num_warps() == 4 && fly.stage_rhs() &&
+               fly.preload_lds_fragments() && fly.direct_to_vgpr();
       }));
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 256 && fly.block_n() == 128 &&
                fly.block_k() == 64 && fly.num_warps() == 8 &&
@@ -1423,6 +1456,63 @@ ENTRY main {
                 .block_level_fusion_config()
                 .vector_size_bits(),
             64);
+}
+
+TEST_F(FlyFusionBackendTest, TunesSmallSplitKResidualWithMixedBuffers) {
+  constexpr absl::string_view kHlo = R"(
+HloModule small_split_k_residual_autotune
+
+add_reduce {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+residual {
+  base = bf16[2,128,1024]{2,1,0} parameter(0)
+  base_f32 = f32[2,128,1024]{2,1,0} convert(base)
+  partial4 = f32[4,256,1024]{2,1,0} parameter(1)
+  zero = f32[] constant(0)
+  sum4 = f32[256,1024]{1,0} reduce(partial4, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded4 = bf16[256,1024]{1,0} convert(sum4)
+  view4 = bf16[2,128,1024]{2,1,0} bitcast(rounded4)
+  value4 = f32[2,128,1024]{2,1,0} convert(view4)
+  partial2 = f32[2,256,1024]{2,1,0} parameter(2)
+  sum2 = f32[256,1024]{1,0} reduce(partial2, zero), dimensions={0},
+      to_apply=add_reduce
+  rounded2 = bf16[256,1024]{1,0} convert(sum2)
+  view2 = bf16[2,128,1024]{2,1,0} bitcast(rounded2)
+  value2 = f32[2,128,1024]{2,1,0} convert(view2)
+  first = f32[2,128,1024]{2,1,0} add(base_f32, value2)
+  total = f32[2,128,1024]{2,1,0} add(first, value4)
+  ROOT result = bf16[2,128,1024]{2,1,0} convert(total)
+}
+
+ENTRY main {
+  base = bf16[2,128,1024]{2,1,0} parameter(0)
+  partial4 = f32[4,256,1024]{2,1,0} parameter(1)
+  partial2 = f32[2,256,1024]{2,1,0} parameter(2)
+  ROOT fusion = bf16[2,128,1024]{2,1,0}
+      fusion(base, partial4, partial2), kind=kCustom, calls=residual,
+      backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 64;
+  }));
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
 }
 
 TEST_F(FlyFusionBackendTest, LimitsAndRanksNativeElementwiseConfigs) {
@@ -1534,10 +1624,9 @@ ENTRY main {
   for (absl::string_view hlo : {kF16Hlo, kF32Hlo}) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                          ParseAndReturnVerifiedModule(hlo));
-    ASSERT_OK_AND_ASSIGN(
-        std::vector<std::unique_ptr<BackendConfig>> configs,
-        backend_.GetSupportedConfigs(
-            *module->entry_computation()->root_instruction()));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                         backend_.GetSupportedConfigs(
+                             *module->entry_computation()->root_instruction()));
 
     ASSERT_EQ(configs.size(), 1);
     EXPECT_EQ(configs[0]->block_level().output_tiles(0).sizes(0), 1);
@@ -1613,8 +1702,8 @@ ENTRY main {
   ASSERT_EQ(configs.size(), 10);
   for (int64_t vector_size_bits : {64, 128}) {
     for (int64_t num_warps : {1, 2, 4, 8, 16}) {
-      EXPECT_TRUE(std::any_of(
-          configs.begin(), configs.end(), [&](const auto& config) {
+      EXPECT_TRUE(
+          std::any_of(configs.begin(), configs.end(), [&](const auto& config) {
             return config->block_level().vector_size_bits() ==
                        vector_size_bits &&
                    config->block_level().num_warps() == num_warps;
@@ -1656,11 +1745,11 @@ ENTRY main {
 
   ASSERT_EQ(configs.size(), 10);
   for (int64_t vector_size_bits : {64, 128}) {
-    EXPECT_EQ(std::count_if(
-                  configs.begin(), configs.end(), [&](const auto& config) {
-                    return config->block_level().vector_size_bits() ==
-                           vector_size_bits;
-                  }),
+    EXPECT_EQ(std::count_if(configs.begin(), configs.end(),
+                            [&](const auto& config) {
+                              return config->block_level().vector_size_bits() ==
+                                     vector_size_bits;
+                            }),
               5);
   }
 }
@@ -1706,6 +1795,62 @@ ENTRY main {
   EXPECT_EQ(configs.size(), 10);
 }
 
+TEST_F(FlyFusionBackendTest, TunesPartitionedRmsNormRows) {
+  constexpr absl::string_view kHlo = R"(
+HloModule partitioned_rms_norm_autotune
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  p0 = bf16[2,128,1024]{2,1,0} parameter(0)
+  converted = f32[2,128,1024]{2,1,0} convert(p0)
+  squared = f32[2,128,1024]{2,1,0} multiply(converted, converted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,128]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,128]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,128]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,128]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,128]{1,0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[2,128]{1,0} rsqrt(variance)
+  scales = f32[2,128,1024]{2,1,0} broadcast(reciprocal_stddev),
+    dimensions={0,1}
+  normalized = f32[2,128,1024]{2,1,0} multiply(converted, scales)
+  ROOT result = bf16[2,128,1024]{2,1,0} convert(normalized)
+}
+
+ENTRY main {
+  p0 = bf16[2,128,1024]{2,1,0} parameter(0)
+  ROOT fusion = bf16[2,128,1024]{2,1,0} fusion(p0), kind=kCustom,
+    calls=rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 22);
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const BlockLevelFusionConfig& block = c->block_level();
+    return block.output_tiles(0).sizes(0) == 2 &&
+           block.vector_size_bits() == 128 && block.num_warps() == 2;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const BlockLevelFusionConfig& block = c->block_level();
+    return block.output_tiles(0).sizes(0) == 8 &&
+           block.vector_size_bits() == 32 && block.num_warps() == 2;
+  }));
+}
+
 TEST_F(FlyFusionBackendTest, RetilesGenericTritonTransposeFusion) {
   constexpr absl::string_view kHlo = R"(
 HloModule generic_triton_transpose
@@ -1729,7 +1874,7 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 3);
+  ASSERT_EQ(configs.size(), 9);
   ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                        fusion->backend_config<GpuBackendConfig>());
@@ -1756,20 +1901,19 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 3);
-  for (const auto& tile :
-       {std::pair<int64_t, int64_t>{32, 1}, {64, 4}, {128, 16}}) {
-    const int64_t tile_size = tile.first;
-    const int64_t num_warps = tile.second;
-    EXPECT_TRUE(std::any_of(
-        configs.begin(), configs.end(), [&](const auto& config) {
-          const BlockLevelFusionConfig& block = config->block_level();
-          return block.num_warps() == num_warps &&
-                 block.output_tiles_size() == 1 &&
-                 block.output_tiles(0).sizes_size() == 2 &&
-                 block.output_tiles(0).sizes(0) == tile_size &&
-                 block.output_tiles(0).sizes(1) == tile_size;
-        }));
+  ASSERT_EQ(configs.size(), 9);
+  for (int64_t tile_rows : {32, 64, 128}) {
+    for (int64_t tile_columns : {32, 64, 128}) {
+      EXPECT_TRUE(
+          std::any_of(configs.begin(), configs.end(), [&](const auto& config) {
+            const BlockLevelFusionConfig& block = config->block_level();
+            return block.num_warps() == tile_rows * tile_columns / 1024 &&
+                   block.output_tiles_size() == 1 &&
+                   block.output_tiles(0).sizes_size() == 2 &&
+                   block.output_tiles(0).sizes(0) == tile_rows &&
+                   block.output_tiles(0).sizes(1) == tile_columns;
+          }));
+    }
   }
 }
 
@@ -1801,10 +1945,12 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 2);
+  ASSERT_EQ(configs.size(), 6);
   EXPECT_THAT(configs[0]->block_level().output_tiles(0).sizes(),
               ::testing::ElementsAre(32, 32));
   EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
+              ::testing::ElementsAre(32, 64));
+  EXPECT_THAT(configs[3]->block_level().output_tiles(0).sizes(),
               ::testing::ElementsAre(64, 64));
   ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.back()));
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
@@ -1849,11 +1995,11 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 2);
+  ASSERT_EQ(configs.size(), 6);
   EXPECT_THAT(configs[0]->block_level().output_tiles(0).sizes(),
               ::testing::ElementsAre(32, 32));
   EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(64, 64));
+              ::testing::ElementsAre(32, 64));
 }
 
 TEST_F(FlyFusionBackendTest, TunesTransformerContextTranspose) {
@@ -1882,8 +2028,12 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 3);
+  ASSERT_EQ(configs.size(), 9);
+  EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
+              ::testing::ElementsAre(32, 64));
   EXPECT_THAT(configs[2]->block_level().output_tiles(0).sizes(),
+              ::testing::ElementsAre(32, 128));
+  EXPECT_THAT(configs[8]->block_level().output_tiles(0).sizes(),
               ::testing::ElementsAre(128, 128));
 }
 
@@ -1895,23 +2045,22 @@ TEST_F(FlyBackendTest, SupportsNativeF32MfmaGemm) {
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().mfma_atom() ==
-               FlyGemmConfig::FLY_MFMA_16X16X4_F32;
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
+        return config->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X4_F32;
       }));
-  auto mfma32 = std::find_if(
-      configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().mfma_atom() ==
-               FlyGemmConfig::FLY_MFMA_32X32X2_F32;
+  auto mfma32 =
+      std::find_if(configs.begin(), configs.end(), [](const auto& config) {
+        return config->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X2_F32;
       });
   ASSERT_NE(mfma32, configs.end());
-  auto xf32 = std::find_if(configs.begin(), configs.end(), [](const auto& config) {
-    const FlyGemmConfig& fly = config->fly();
-    return fly.block_m() == 64 && fly.block_n() == 32 &&
-           fly.block_k() == 32 && fly.num_warps() == 2 && fly.stage_rhs() &&
-           fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
-  });
+  auto xf32 =
+      std::find_if(configs.begin(), configs.end(), [](const auto& config) {
+        const FlyGemmConfig& fly = config->fly();
+        return fly.block_m() == 64 && fly.block_n() == 32 &&
+               fly.block_k() == 32 && fly.num_warps() == 2 && fly.stage_rhs() &&
+               fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
+      });
   ASSERT_NE(xf32, configs.end());
   EXPECT_THAT(backend_.ApplyConfig(*fusion, **xf32), IsOk());
   TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
@@ -1946,10 +2095,11 @@ ENTRY main {
           *module->entry_computation()->root_instruction()));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::none_of(configs.begin(), configs.end(), [](const auto& config) {
-    return config->fly().mfma_atom() ==
-           FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
-  }));
+  EXPECT_TRUE(
+      std::none_of(configs.begin(), configs.end(), [](const auto& config) {
+        return config->fly().mfma_atom() ==
+               FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
+      }));
 }
 
 TEST_F(FlyBackendTest, SupportsF16GemmWithOptimizedXTilePipelines) {
@@ -1960,30 +2110,27 @@ TEST_F(FlyBackendTest, SupportsF16GemmWithOptimizedXTilePipelines) {
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(
-      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
-        return !config->fly().stage_rhs();
-      }));
+  EXPECT_TRUE(std::any_of(
+      configs.begin(), configs.end(),
+      [](const auto& config) { return !config->fly().stage_rhs(); }));
   EXPECT_TRUE(
       std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         return config->fly().stage_rhs() &&
                config->fly().preload_lds_fragments();
       }));
-  EXPECT_TRUE(
-      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().async_lhs();
-      }));
-  EXPECT_TRUE(
-      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
-        return config->fly().direct_to_vgpr();
-      }));
+  EXPECT_TRUE(std::any_of(
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().async_lhs(); }));
+  EXPECT_TRUE(std::any_of(
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().direct_to_vgpr(); }));
   EXPECT_TRUE(
       std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 256 && fly.block_n() == 224 &&
-               fly.block_k() == 64 && fly.num_warps() == 4 &&
-               fly.stage_rhs() && fly.preload_lds_fragments() &&
-               fly.single_buffer_lds() && fly.direct_to_vgpr();
+               fly.block_k() == 64 && fly.num_warps() == 4 && fly.stage_rhs() &&
+               fly.preload_lds_fragments() && fly.single_buffer_lds() &&
+               fly.direct_to_vgpr();
       }));
   for (int32_t workgroup_mapping_n : {4, 6, 8}) {
     EXPECT_TRUE(
@@ -2005,9 +2152,8 @@ TEST_F(FlyBackendTest, SupportsF16GemmWithOptimizedXTilePipelines) {
 }
 
 TEST_F(FlyBackendTest, DoesNotOfferBf16OnlyOutputStagingForF32Output) {
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<HloModule> module,
-      ParseAndReturnVerifiedModule(kF32OutputBf16GemmHlo));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kF32OutputBf16GemmHlo));
   TF_ASSERT_OK_AND_ASSIGN(
       std::vector<std::unique_ptr<BackendConfig>> configs,
       backend_.GetSupportedConfigs(
@@ -2015,8 +2161,7 @@ TEST_F(FlyBackendTest, DoesNotOfferBf16OnlyOutputStagingForF32Output) {
 
   ASSERT_FALSE(configs.empty());
   for (const auto& config : configs) {
-    EXPECT_FALSE(config->fly().stage_output())
-        << config->fly().DebugString();
+    EXPECT_FALSE(config->fly().stage_output()) << config->fly().DebugString();
   }
 }
 
@@ -2065,9 +2210,9 @@ TEST_F(FlyBackendTest, SupportsBatchedF16Gemv) {
                           backend_.GetSupportedConfigs(*fusion));
 
   EXPECT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& config) {
-    return config->fly().gemv_split_k();
-  }));
+  EXPECT_TRUE(std::any_of(
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().gemv_split_k(); }));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
                           backend_.GetDefaultConfig(*fusion));
   EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
@@ -2084,8 +2229,8 @@ TEST_F(FlyBackendTest, TunesGroupedVectorizedBatchedF16MatrixVector) {
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.gemv_outputs_per_wave() == 8 &&
                fly.gemv_k_vector_width() == 4 && fly.block_m() == 64 &&
@@ -2142,8 +2287,8 @@ TEST_F(FlyBackendTest, SupportsUniformFnuzFp8ScaledDot) {
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::all_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::all_of(configs.begin(), configs.end(), [](const auto& config) {
         return config->fly().mfma_atom() ==
                    FlyGemmConfig::FLY_MFMA_16X16X32_FP8 ||
                config->fly().mfma_atom() ==
@@ -2166,8 +2311,8 @@ TEST_F(FlyBackendTest, SupportsUniformBatchedFnuzFp8ScaledDot) {
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::all_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::all_of(configs.begin(), configs.end(), [](const auto& config) {
         return config->fly().mfma_atom() ==
                    FlyGemmConfig::FLY_MFMA_16X16X32_FP8 ||
                config->fly().mfma_atom() ==
@@ -2198,11 +2343,12 @@ TEST_F(FlyBackendTest, SupportsNonuniformScale) {
       backend_.GetSupportedConfigs(
           *module->entry_computation()->root_instruction()));
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& config) {
-    const FlyGemmConfig& fly = config->fly();
-    return fly.block_k() == 128 && !fly.stage_rhs() &&
-           !fly.direct_to_vgpr() && !fly.local_split_k();
-  }));
+  EXPECT_TRUE(
+      std::all_of(configs.begin(), configs.end(), [](const auto& config) {
+        const FlyGemmConfig& fly = config->fly();
+        return fly.block_k() == 128 && !fly.stage_rhs() &&
+               !fly.direct_to_vgpr() && !fly.local_split_k();
+      }));
 }
 
 TEST_F(FlyBackendTest, TunesDirectAndDequantizedFnuzBlockScaling) {
@@ -2216,8 +2362,7 @@ TEST_F(FlyBackendTest, TunesDirectAndDequantizedFnuzBlockScaling) {
   ASSERT_FALSE(configs.empty());
   EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
     return !c->fly().dequantize_block_scales() &&
-           c->fly().mfma_atom() ==
-               FlyGemmConfig::FLY_MFMA_16X16X32_FP8;
+           c->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X32_FP8;
   }));
   EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
     return c->fly().dequantize_block_scales() &&
@@ -2246,6 +2391,81 @@ TEST_F(FlyBackendTest, SupportsNarrowingBf16Epilogue) {
   EXPECT_TRUE(std::any_of(
       configs.begin(), configs.end(),
       [](const auto& config) { return config->fly().local_split_k(); }));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                          backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+}
+
+TEST_F(FlyBackendTest, SupportsAttentionValueOutputTranspose) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kAttentionValueOutputTransposeHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->fly().stage_output();
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const FlyGemmConfig& fly = c->fly();
+    return fly.block_m() == 64 && fly.block_n() == 32 && fly.block_k() == 32 &&
+           fly.num_warps() == 4 && fly.waves_per_eu() == 4 &&
+           fly.stage_output() && fly.stage_rhs();
+  }));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                          backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+  EXPECT_TRUE(
+      gpu_config.fusion_backend_config().fly_gemm_config().stage_output());
+}
+
+TEST_F(FlyBackendTest, SupportsAttentionScoreInputTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_attention_score_input_transpose
+
+gemm {
+  q = bf16[32,64,128]{2,1,0} parameter(0)
+  q_transposed = bf16[32,128,64]{2,1,0} transpose(q),
+      dimensions={0,2,1}
+  k = bf16[32,64,128]{2,1,0} parameter(1)
+  dot = bf16[32,128,128]{2,1,0} dot(q_transposed, k),
+      lhs_batch_dims={0}, lhs_contracting_dims={2},
+      rhs_batch_dims={0}, rhs_contracting_dims={1}
+  converted = f32[32,128,128]{2,1,0} convert(dot)
+  scale = bf16[] constant(0.125)
+  broadcast = bf16[32,128,128]{2,1,0} broadcast(scale), dimensions={}
+  widened_scale = f32[32,128,128]{2,1,0} convert(broadcast)
+  scaled = f32[32,128,128]{2,1,0} multiply(converted, widened_scale)
+  ROOT narrowed = bf16[32,128,128]{2,1,0} convert(scaled)
+}
+
+ENTRY main {
+  q = bf16[32,64,128]{2,1,0} parameter(0)
+  k = bf16[32,64,128]{2,1,0} parameter(1)
+  ROOT fusion = bf16[32,128,128]{2,1,0} fusion(q, k), kind=kCustom,
+      calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const FlyGemmConfig& fly = c->fly();
+    return fly.block_m() == 128 && fly.block_n() == 128 &&
+           fly.block_k() == 32 && fly.num_warps() == 8 && fly.stage_rhs();
+  }));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
                           backend_.GetDefaultConfig(*fusion));
   EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
@@ -2476,8 +2696,8 @@ TEST_F(FlyBackendTest, OffersFlyDslStagedHomogeneousFnuzFp8) {
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 128 && fly.block_n() == 128 &&
                fly.block_k() == 128 && fly.num_warps() == 4 &&
@@ -2485,8 +2705,8 @@ TEST_F(FlyBackendTest, OffersFlyDslStagedHomogeneousFnuzFp8) {
                fly.stage_rhs() && fly.preload_lds_fragments() &&
                !fly.single_buffer_lds();
       }));
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 256 && fly.block_n() == 224 &&
                fly.block_k() == 128 && fly.num_warps() == 4 &&
@@ -2504,8 +2724,8 @@ TEST_F(FlyBackendTest, OffersWideTileForF32HomogeneousFnuzFp8ScaledDot) {
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 256 && fly.block_n() == 224 &&
                fly.block_k() == 128 && fly.num_warps() == 4 &&
@@ -2524,8 +2744,8 @@ TEST_F(FlyBackendTest, SupportsFnuzFp8GemvAndSplitK) {
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.gemv_split_k() && fly.block_n() == 64 &&
                fly.num_warps() == 8 &&
@@ -2572,20 +2792,20 @@ TEST_F(FlyBackendTest, SupportsUniformScaledFnuzFp8BatchedGemv) {
 }
 
 TEST_F(FlyBackendTest, SupportsFnuzFp8BatchedGemm) {
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<HloModule> module,
-      ParseAndReturnVerifiedModule(kFnuzFp8BatchedGemmHlo));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kFnuzFp8BatchedGemmHlo));
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& config) {
-    return config->fly().mfma_atom() ==
-               FlyGemmConfig::FLY_MFMA_16X16X32_FP8 ||
-           config->fly().mfma_atom() ==
-               FlyGemmConfig::FLY_MFMA_32X32X16_FP8;
-  }));
+  EXPECT_TRUE(
+      std::all_of(configs.begin(), configs.end(), [](const auto& config) {
+        return config->fly().mfma_atom() ==
+                   FlyGemmConfig::FLY_MFMA_16X16X32_FP8 ||
+               config->fly().mfma_atom() ==
+                   FlyGemmConfig::FLY_MFMA_32X32X16_FP8;
+      }));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
                           backend_.GetDefaultConfig(*fusion));
   EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
@@ -2595,17 +2815,16 @@ TEST_F(FlyBackendTest, SupportsFnuzFp8BatchedGemm) {
 }
 
 TEST_F(FlyBackendTest, SupportsFnuzFp8BatchedGemv) {
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<HloModule> module,
-      ParseAndReturnVerifiedModule(kFnuzFp8BatchedGemvHlo));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kFnuzFp8BatchedGemvHlo));
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
   ASSERT_FALSE(configs.empty());
-  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& config) {
-    return config->fly().gemv_split_k();
-  }));
+  EXPECT_TRUE(std::any_of(
+      configs.begin(), configs.end(),
+      [](const auto& config) { return config->fly().gemv_split_k(); }));
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
                           backend_.GetDefaultConfig(*fusion));
   EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
@@ -2752,20 +2971,18 @@ ENTRY main {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 64 && fly.block_n() == 32 &&
-               fly.block_k() == 128 && fly.num_warps() == 2 &&
-               fly.stage_rhs();
+               fly.block_k() == 128 && fly.num_warps() == 2 && fly.stage_rhs();
       }));
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_m() == 128 && fly.block_n() == 64 &&
                fly.block_k() == 128 && fly.num_warps() == 8 &&
@@ -2796,6 +3013,226 @@ TEST_F(FlyBackendTest, SupportsBatchedBf16Gemv) {
   EXPECT_EQ(block.output_tiles(0).sizes(0), 1);
 }
 
+TEST_F(FlyFusionBackendTest, TunesNativePagedAttentionOccupancy) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_paged_attention_autotune
+
+fly_paged_attention {
+  q = bf16[1,32,128]{2,1,0} parameter(0)
+  k = bf16[15,16,8,128]{3,2,1,0} parameter(1)
+  v = bf16[15,16,8,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,8]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = bf16[1,32,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+
+ENTRY main {
+  q = bf16[1,32,128]{2,1,0} parameter(0)
+  k = bf16[15,16,8,128]{3,2,1,0} parameter(1)
+  v = bf16[15,16,8,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,8]{1,0} parameter(4)
+  ROOT fusion = bf16[1,32,128]{2,1,0}
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=fly_paged_attention,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","128"]}],"num_warps":"4","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 4);
+  const std::vector<int64_t> expected_waves_per_eu = {0, 1, 2, 4};
+  for (int64_t i = 0; i < configs.size(); ++i) {
+    const BlockLevelFusionConfig& block = configs[i]->block_level();
+    EXPECT_EQ(block.num_warps(), 4);
+    EXPECT_EQ(block.waves_per_eu(), expected_waves_per_eu[i]);
+    ASSERT_EQ(block.output_tiles_size(), 1);
+    EXPECT_EQ(block.output_tiles(0).sizes(2), 128);
+  }
+
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *configs[1]), IsOk());
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+  EXPECT_EQ(gpu_config.fusion_backend_config()
+                .block_level_fusion_config()
+                .waves_per_eu(),
+            1);
+}
+
+TEST_F(FlyFusionBackendTest, TunesSegmentedPagedAttentionWaveGeometry) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_segmented_paged_attention_autotune
+
+producer_computation {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[32,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,32]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT partials = (f32[1,16,8,128]{3,2,1,0}, f32[1,16,8]{2,1,0}, f32[1,16,8]{2,1,0})
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode_segmented_producer"
+}
+
+reducer_computation {
+  partial_o = f32[1,16,8,128]{3,2,1,0} parameter(0)
+  partial_m = f32[1,16,8]{2,1,0} parameter(1)
+  partial_l = f32[1,16,8]{2,1,0} parameter(2)
+  ROOT attention = bf16[1,16,128]{2,1,0}
+    custom-call(partial_o, partial_m, partial_l),
+    custom_call_target="__fly$paged_attention_decode_segmented_reducer"
+}
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[32,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[32,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,32]{1,0} parameter(4)
+  producer = (f32[1,16,8,128]{3,2,1,0}, f32[1,16,8]{2,1,0}, f32[1,16,8]{2,1,0})
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=producer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","128"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]}],"num_warps":"2","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+  partial_o = f32[1,16,8,128]{3,2,1,0} get-tuple-element(producer), index=0
+  partial_m = f32[1,16,8]{2,1,0} get-tuple-element(producer), index=1
+  partial_l = f32[1,16,8]{2,1,0} get-tuple-element(producer), index=2
+  ROOT reducer = bf16[1,16,128]{2,1,0}
+    fusion(partial_o, partial_m, partial_l), kind=kCustom,
+    calls=reducer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","128"]}],"num_warps":"2","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* reducer = module->entry_computation()->root_instruction();
+  HloInstruction* producer = reducer->mutable_operand(0)->mutable_operand(0);
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> producer_configs,
+      backend_.GetSupportedConfigs(*producer));
+  ASSERT_EQ(producer_configs.size(), 4);
+  for (const std::unique_ptr<BackendConfig>& config : producer_configs) {
+    const BlockLevelFusionConfig& block = config->block_level();
+    EXPECT_EQ(block.num_warps(), 2);
+    ASSERT_EQ(block.output_tiles_size(), 3);
+    EXPECT_THAT(block.output_tiles(0).sizes(),
+                ::testing::ElementsAre(1, 1, 1, 128));
+    EXPECT_THAT(block.output_tiles(1).sizes(),
+                ::testing::ElementsAre(1, 1, 1));
+    EXPECT_THAT(block.output_tiles(2).sizes(),
+                ::testing::ElementsAre(1, 1, 1));
+  }
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> reducer_configs,
+      backend_.GetSupportedConfigs(*reducer));
+  ASSERT_EQ(reducer_configs.size(), 4);
+  for (const std::unique_ptr<BackendConfig>& config : reducer_configs) {
+    const BlockLevelFusionConfig& block = config->block_level();
+    EXPECT_EQ(block.num_warps(), 2);
+    ASSERT_EQ(block.output_tiles_size(), 1);
+    EXPECT_THAT(block.output_tiles(0).sizes(),
+                ::testing::ElementsAre(1, 1, 128));
+  }
+}
+
+TEST_F(FlyFusionBackendTest, UsesFourWavesForLongPagedAttentionSegments) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_long_segment_paged_attention_autotune
+
+producer_computation {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[256,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[256,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,256]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT partials = (f32[1,16,32,128]{3,2,1,0}, f32[1,16,32]{2,1,0}, f32[1,16,32]{2,1,0})
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode_segmented_producer"
+}
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[256,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[256,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,256]{1,0} parameter(4)
+  ROOT producer = (f32[1,16,32,128]{3,2,1,0}, f32[1,16,32]{2,1,0}, f32[1,16,32]{2,1,0})
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=producer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","128"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]}],"num_warps":"4","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* producer = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*producer));
+  ASSERT_EQ(configs.size(), 4);
+  for (const std::unique_ptr<BackendConfig>& config : configs) {
+    EXPECT_EQ(config->block_level().num_warps(), 4);
+  }
+}
+
+TEST_F(FlyFusionBackendTest, TunesCooperativePagedAttentionStageDepth) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_cooperative_paged_attention_autotune
+
+producer_computation {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,4096]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT partials = (f32[1,16,103,128]{3,2,1,0}, f32[1,16,103]{2,1,0}, f32[1,16,103]{2,1,0})
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode_segmented_producer"
+}
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,4096]{1,0} parameter(4)
+  ROOT producer = (f32[1,16,103,128]{3,2,1,0}, f32[1,16,103]{2,1,0}, f32[1,16,103]{2,1,0})
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=producer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","128"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]}],"num_warps":"2","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* producer = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*producer));
+
+  ASSERT_EQ(configs.size(), 12);
+  constexpr std::array<int64_t, 4> kOccupancies = {0, 1, 2, 4};
+  for (int64_t stage = 1; stage <= 3; ++stage) {
+    for (int64_t occupancy = 0; occupancy < kOccupancies.size();
+         ++occupancy) {
+      const BlockLevelFusionConfig& block =
+          configs[(stage - 1) * kOccupancies.size() + occupancy]
+              ->block_level();
+      EXPECT_EQ(block.num_warps(), 2);
+      EXPECT_EQ(block.num_stages(), stage);
+      EXPECT_EQ(block.waves_per_eu(), kOccupancies[occupancy]);
+    }
+  }
+}
+
 TEST_F(FlyBackendTest, TunesGroupedVectorizedKContiguousBatchedGemv) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<HloModule> module,
@@ -2804,15 +3241,15 @@ TEST_F(FlyBackendTest, TunesGroupedVectorizedKContiguousBatchedGemv) {
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
 
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.gemv_outputs_per_wave() == 8 &&
                fly.gemv_k_vector_width() == 2 && !fly.prefetch_rhs() &&
                fly.block_k() == 32;
       }));
-  EXPECT_TRUE(std::any_of(
-      configs.begin(), configs.end(), [](const auto& config) {
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         const FlyGemmConfig& fly = config->fly();
         return fly.block_n() == 2 && fly.num_warps() == 1 &&
                fly.gemv_outputs_per_wave() == 2;

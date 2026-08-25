@@ -19,6 +19,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -45,6 +46,11 @@ TritonCall TritonCall::Parse(absl::string_view backend_config,
       attrs.getAs<mlir::IntegerAttr>("num_stages").getValue().getSExtValue();
   auto num_warps =
       attrs.getAs<mlir::IntegerAttr>("num_warps").getValue().getSExtValue();
+  int32_t waves_per_eu = 0;
+  if (auto attr = attrs.getAs<mlir::IntegerAttr>("waves_per_eu")) {
+    waves_per_eu = static_cast<int32_t>(attr.getValue().getSExtValue());
+    CHECK_GE(waves_per_eu, 0);
+  }
   int64_t global_scratch_memory_size = 0;
   if (auto attr =
           attrs.getAs<mlir::IntegerAttr>("global_scratch_memory_size")) {
@@ -64,8 +70,9 @@ TritonCall TritonCall::Parse(absl::string_view backend_config,
   return TritonCall{std::move(name), std::move(ir),
                     num_stages,      num_warps,
                     grid_x,          grid_y,
-                    grid_z,          global_scratch_memory_size,
-                    is_tma_allowed,  std::move(zeroed_outputs)};
+                    grid_z,          waves_per_eu,
+                    global_scratch_memory_size,
+                    is_tma_allowed, std::move(zeroed_outputs)};
 }
 
 }  // namespace xla::gpu

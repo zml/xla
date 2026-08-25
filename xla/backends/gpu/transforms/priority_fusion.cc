@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/alias_info.h"
@@ -89,6 +90,24 @@ namespace {
 bool IsFusibleBitcast(const HloInstruction& instr) {
   return instr.opcode() == HloOpcode::kBitcast &&
          hlo_instruction_utils::KeepsBitwidth(instr);
+}
+
+bool IsFlySegmentedPagedAttentionFusion(const HloInstruction& instruction) {
+  if (instruction.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  for (const HloInstruction* fused :
+       instruction.fused_instructions_computation()->instructions()) {
+    if (fused->opcode() != HloOpcode::kCustomCall) {
+      continue;
+    }
+    const absl::string_view target = fused->custom_call_target();
+    if (target == flydsl::kFlyPagedAttentionSegmentedProducerCallTarget ||
+        target == flydsl::kFlyPagedAttentionSegmentedReducerCallTarget) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool IsFusible(const HloInstruction& instr) {
@@ -818,6 +837,15 @@ class PriorityFusionQueue {
   FusionDecision CanFuseBlockLevel(HloInstruction* producer,
                                    HloInstruction* consumer,
                                    bool use_multi_output_fusion = false) {
+    // The segmented paged-attention producer and reducer are deliberately two
+    // launches separated by an FP32 workspace. Inlining either custom fusion
+    // into the other removes that workspace from buffer assignment and cannot
+    // be represented by a single MlirKernelEmitter.
+    if (IsFlySegmentedPagedAttentionFusion(*producer) ||
+        IsFlySegmentedPagedAttentionFusion(*consumer)) {
+      return FusionDecision::Forbid(
+          "segmented Fly paged attention requires a kernel boundary");
+    }
     if (!IsFusible(*producer)) {
       return FusionDecision::Forbid("the producer is not fusible");
     }

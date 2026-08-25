@@ -98,7 +98,8 @@ DebugOptions GetDebugOptionsFromFlags();
 void ApplyPjRtPluginFlyDslDebugOptions(
     std::optional<bool> enable_flydsl_gemm,
     std::optional<bool> enable_flydsl_fusion,
-    std::optional<int64_t> autotune_num_repetitions = std::nullopt);
+    std::optional<int64_t> autotune_num_repetitions = std::nullopt,
+    std::optional<bool> replace_triton = std::nullopt);
 
 // Applies the client-create overrides above to compile options deserialized
 // from a potentially older PJRT host.

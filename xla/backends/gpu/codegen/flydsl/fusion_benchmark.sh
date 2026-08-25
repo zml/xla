@@ -35,6 +35,8 @@ declare -A hlo_files=(
   [bf16_narrowing_reduce]="fly_fusion_bf16_narrowing_row_reduction_benchmark.hlo"
   [bf16_ragged_narrowing_reduce]="fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark.hlo"
   [bf16_squared_difference_reduce]="fly_fusion_bf16_squared_difference_reduction_benchmark.hlo"
+  [rms_norm_1024]="fly_fusion_bf16_rms_norm_1024_benchmark.hlo"
+  [residual_rms_norm_1024]="fly_fusion_bf16_residual_rms_norm_1024_benchmark.hlo"
   [f32_reduce]="fly_fusion_row_reduction_benchmark.hlo"
   [elementwise]="fly_fusion_elementwise_hbm_benchmark.hlo"
   [elementwise_f16]="fly_fusion_f16_elementwise_hbm_benchmark.hlo"
@@ -71,7 +73,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-    echo "Available benchmarks: softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce f32_reduce elementwise elementwise_f16 elementwise_f32 ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
+  echo "Available benchmarks: softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce elementwise elementwise_f16 elementwise_f32 ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"

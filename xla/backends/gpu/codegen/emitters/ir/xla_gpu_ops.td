@@ -103,11 +103,31 @@ def XLAGPU_BufferLoadOp : XLAGPU_Op<"buffer_load"> {
     Loads a contiguous vector from a physical linear tensor offset using an
     AMD raw buffer instruction. This preserves the BufferCopy128b operation
     used by FlyDSL kernels instead of allowing a generic global vector load.
+    `cache_policy` is forwarded to the target instruction; gfx942 uses bit 1
+    for the non-temporal policy used by single-use attention K/V tiles.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source, Index:$source_index,
+                       DefaultValuedAttr<I32Attr, "0">:$cache_policy);
+  // Packed sub-byte loads may use i32 to fetch eight S4 values at once.
+  let results = (outs AnyTypeOf<[AnyVectorOfNonZeroRank, I32]>:$result);
+
+  let assemblyFormat = [{
+    $source `[` $source_index `]` attr-dict `:` type($source) `->` type($result)
+  }];
+}
+
+def XLAGPU_ScalarBufferLoadOp : XLAGPU_Op<"scalar_buffer_load"> {
+  let summary = "Loads wave-uniform i32 metadata into an AMD scalar register.";
+
+  let description = [{
+    Loads one i32 from a wave-uniform physical tensor offset using
+    llvm.amdgcn.s.buffer.load. This is intended for kernel metadata such as
+    sequence lengths and page-table entries that must remain in SGPRs.
   }];
 
   let arguments = (ins AnyRankedTensor:$source, Index:$source_index);
-  // Packed sub-byte loads may use i32 to fetch eight S4 values at once.
-  let results = (outs AnyTypeOf<[AnyVectorOfNonZeroRank, I32]>:$result);
+  let results = (outs I32:$result);
 
   let assemblyFormat = [{
     $source `[` $source_index `]` attr-dict `:` type($source) `->` type($result)

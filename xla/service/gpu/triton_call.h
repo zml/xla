@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "absl/strings/string_view.h"
 #include "mlir/IR/MLIRContext.h"
@@ -32,6 +33,7 @@ struct TritonCall {
   int32_t grid_x;
   int32_t grid_y;
   int32_t grid_z;
+  int32_t waves_per_eu = 0;
   int64_t global_scratch_memory_size = 0;
   bool is_tma_allowed = false;
   std::vector<int64_t> zeroed_outputs;

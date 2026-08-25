@@ -21,7 +21,18 @@ limitations under the License.
 
 namespace xla::gpu::flydsl {
 
-// Recognizes the canonical rank-2 F16, BF16, or F32 softmax produced by XLA:
+// Returns the tensor entering a canonical stable softmax, or nullptr when the
+// root is not a supported softmax. Unlike IsFlySoftmaxRoot, this accepts a
+// producer expression instead of requiring the input to be a fusion parameter;
+// compound kernels such as attention use it to keep that producer on chip.
+const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root);
+
+// Like GetFlySoftmaxInput, but retains a mixed-precision F32 producer when the
+// softmax result is narrowed to F16/BF16. Compound attention uses this to see
+// canonical select(-inf) masks instead of treating them as external inputs.
+const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root);
+
+// Recognizes the canonical row-wise F16, BF16, or F32 softmax produced by XLA:
 // optional conversion to FP32, row maximum, exp, row sum, normalize, and an
 // optional conversion back to the interface type.
 bool IsFlySoftmaxRoot(const HloInstruction& root);

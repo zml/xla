@@ -125,6 +125,8 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
            PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
           {"xla_gpu_enable_flydsl_fusion",
            PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
+          {"xla_gpu_flydsl_replace_triton",
+           PJRT_NamedValue_Type::PJRT_NamedValue_kBool},
           {"xla_gpu_autotune_num_repetitions",
            PJRT_NamedValue_Type::PJRT_NamedValue_kInt64},
 #endif
@@ -235,9 +237,15 @@ PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
           "xla_gpu_autotune_num_repetitions must be non-negative"));
     }
   }
+  std::optional<bool> replace_triton;
+  if (auto it = create_options.find("xla_gpu_flydsl_replace_triton");
+      it != create_options.end()) {
+    replace_triton = std::get<bool>(it->second);
+  }
   xla::ApplyPjRtPluginFlyDslDebugOptions(enable_flydsl_gemm,
                                          enable_flydsl_fusion,
-                                         autotune_num_repetitions);
+                                         autotune_num_repetitions,
+                                         replace_triton);
 #endif
 
   xla::GpuClientOptions options;

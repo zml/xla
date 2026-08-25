@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -223,6 +224,72 @@ static absl::Status InitializeBuffersIfRequiredByOpcode(
           gpu_buffers, stream,
           instr->operand_count() - 1,  // Last parameter is group sizes
           group_sizes.data(), total_elements * sizeof(int64_t)));
+    }
+  }
+
+  // Paged attention has two integer metadata inputs that cannot be filled with
+  // arbitrary bytes: per-sequence context lengths and the logical-to-physical
+  // page table. In particular, zero-initialized lengths make the producer exit
+  // before doing any attention work, so autotuning would select occupancy from
+  // an empty workload. Profile the largest legal context represented by the
+  // operand shapes and use an in-bounds sequential block mapping. Production
+  // inputs remain fully dynamic; this only initializes the private profiling
+  // buffers allocated above.
+  if (instr->opcode() == HloOpcode::kFusion && instr->operand_count() == 5) {
+    const HloInstruction* root = instr->fused_expression_root();
+    const bool is_paged_attention =
+        root->opcode() == HloOpcode::kCustomCall &&
+        (root->custom_call_target() == "__fly$paged_attention_decode" ||
+         root->custom_call_target() ==
+             "__fly$paged_attention_decode_segmented_producer");
+    if (is_paged_attention) {
+      const Shape& key_cache_shape = instr->operand(1)->shape();
+      const Shape& used_k_shape = instr->operand(3)->shape();
+      const Shape& block_table_shape = instr->operand(4)->shape();
+      if (key_cache_shape.dimensions_size() != 4 ||
+          used_k_shape.element_type() != S32 ||
+          used_k_shape.dimensions_size() != 1 ||
+          block_table_shape.element_type() != S32 ||
+          block_table_shape.dimensions_size() != 2 ||
+          used_k_shape.dimensions(0) != block_table_shape.dimensions(0)) {
+        return absl::InvalidArgumentError(
+            "Malformed Fly paged-attention profiling operands.");
+      }
+
+      const int64_t sequences = block_table_shape.dimensions(0);
+      const int64_t pages_per_sequence = block_table_shape.dimensions(1);
+      const int64_t page_size = key_cache_shape.dimensions(1);
+      const int64_t cache_blocks = key_cache_shape.dimensions(0);
+      if (sequences <= 0 || pages_per_sequence <= 0 || page_size <= 0 ||
+          cache_blocks <= 0) {
+        return absl::InvalidArgumentError(
+            "Empty Fly paged-attention profiling operands.");
+      }
+      const int64_t max_context = pages_per_sequence * page_size;
+      if (max_context > std::numeric_limits<int32_t>::max()) {
+        return absl::InvalidArgumentError(
+            "Fly paged-attention profiling context exceeds S32.");
+      }
+
+      std::vector<int32_t> used_k(sequences,
+                                  static_cast<int32_t>(max_context));
+      std::vector<int32_t> block_table(sequences * pages_per_sequence);
+      for (int64_t sequence = 0; sequence < sequences; ++sequence) {
+        for (int64_t page = 0; page < pages_per_sequence; ++page) {
+          block_table[sequence * pages_per_sequence + page] =
+              static_cast<int32_t>(
+                  (sequence * pages_per_sequence + page) % cache_blocks);
+        }
+      }
+      RETURN_IF_ERROR(InitializeInputBuffer(
+          gpu_buffers, stream, /*buffer_index=*/3, used_k.data(),
+          used_k.size() * sizeof(int32_t)));
+      RETURN_IF_ERROR(InitializeInputBuffer(
+          gpu_buffers, stream, /*buffer_index=*/4, block_table.data(),
+          block_table.size() * sizeof(int32_t)));
+      VLOG(3) << "Initialized Fly paged-attention autotune inputs with "
+              << max_context << " tokens per sequence and " << cache_blocks
+              << " cache blocks.";
     }
   }
 

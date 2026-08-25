@@ -810,6 +810,13 @@ message DebugOptions {
   // on ROCm. The backend is compared against XLA's native and Triton emitters.
   optional bool xla_gpu_enable_flydsl_fusion = 517;
 
+  // Makes FlyDSL replace Triton on ROCm instead of merely competing with it.
+  // This implies both FlyDSL enable flags, disables Triton GEMM formation, and
+  // removes the Triton GEMM and block-level fusion autotuning backends, and
+  // disables Triton collective kernels. Native XLA emitters and binary
+  // libraries remain eligible.
+  optional bool xla_gpu_flydsl_replace_triton = 518;
+
   // Enable double buffering for loops.
   optional bool xla_gpu_enable_while_loop_double_buffering = 248;
 

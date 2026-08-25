@@ -333,14 +333,16 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
         analysis.fusion_backend_config().block_level_fusion_config();
     CHECK_EQ(config.output_tiles_size(), 1);
     CHECK_EQ(config.output_tiles(0).sizes_size(), 2);
-    CHECK_EQ(config.output_tiles(0).sizes(0), config.output_tiles(0).sizes(1));
-    tile_size_ = config.output_tiles(0).sizes(0);
-    CHECK(tile_size_ == 32 || tile_size_ == 64 || tile_size_ == 128);
-    threads_ = tile_size_ * tile_size_ / (2 * kVectorWidth);
+    tile_rows_ = config.output_tiles(0).sizes(0);
+    tile_columns_ = config.output_tiles(0).sizes(1);
+    CHECK(tile_rows_ == 32 || tile_rows_ == 64 || tile_rows_ == 128);
+    CHECK(tile_columns_ == 32 || tile_columns_ == 64 ||
+          tile_columns_ == 128);
+    threads_ = tile_rows_ * tile_columns_ / (2 * kVectorWidth);
     CHECK_EQ(config.num_warps() * 64, threads_);
     launch_dimensions_ = LaunchDimensions(
-        se::BlockDim(descriptions_.front().batch_count * (rows_ / tile_size_) *
-                         (columns_ / tile_size_),
+        se::BlockDim(descriptions_.front().batch_count * (rows_ / tile_rows_) *
+                         (columns_ / tile_columns_),
                      1, 1),
         se::ThreadDim(threads_, 1, 1));
   }
@@ -400,18 +402,20 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     // workgroup order used by Triton's transpose emitter: the input row tile
     // varies fastest, so neighboring workgroups write neighboring output
     // column tiles instead of regions separated by an entire output row.
-    const int64_t tile_rows = rows_ / tile_size_;
-    const int64_t tile_columns = columns_ / tile_size_;
-    const int64_t tiles_per_matrix = tile_rows * tile_columns;
+    const int64_t row_tile_count = rows_ / tile_rows_;
+    const int64_t column_tile_count = columns_ / tile_columns_;
+    const int64_t tiles_per_matrix = row_tile_count * column_tile_count;
     Value matrix = Div(builder, block_id, tiles_per_matrix);
     Value matrix_tile = Rem(builder, block_id, tiles_per_matrix);
-    Value block_row = Rem(builder, matrix_tile, tile_rows);
-    Value block_column = Div(builder, matrix_tile, tile_rows);
-    Value input_row_base = Mul(builder, block_row, tile_size_);
-    Value input_column_base = Mul(builder, block_column, tile_size_);
+    Value block_row = Rem(builder, matrix_tile, row_tile_count);
+    Value block_column = Div(builder, matrix_tile, row_tile_count);
+    Value input_row_base = Mul(builder, block_row, tile_rows_);
+    Value input_column_base = Mul(builder, block_column, tile_columns_);
 
-    Value local_row_pair = Div(builder, thread_id, tile_size_ / kVectorWidth);
-    Value vector_group = Rem(builder, thread_id, tile_size_ / kVectorWidth);
+    Value local_row_pair =
+        Div(builder, thread_id, tile_columns_ / kVectorWidth);
+    Value vector_group =
+        Rem(builder, thread_id, tile_columns_ / kVectorWidth);
     Value local_column = Mul(builder, vector_group, kVectorWidth);
     Value first_input_row = Mul(builder, local_row_pair, 2);
     Value second_input_row =
@@ -440,24 +444,30 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     // row pair with a four-bank rotation per eight input columns. Stores then
     // hit every LDS bank exactly twice per wave (the wave64 minimum), while
     // four adjacent row pairs remain a contiguous 128-bit output read.
-    const int64_t row_pairs = tile_size_ / 2;
-    auto shared_type = mlir::RankedTensorType::get({tile_size_ * row_pairs},
+    const int64_t row_pairs = tile_rows_ / 2;
+    auto shared_type = mlir::RankedTensorType::get({tile_columns_ * row_pairs},
                                                    builder.getI32Type());
     Value shared = AllocateSharedOp::create(builder, shared_type);
     auto pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
     auto word_vector_type = mlir::VectorType::get({1}, builder.getI32Type());
 
-    Value output_local_row = Div(builder, thread_id, tile_size_ / kVectorWidth);
+    Value output_local_row =
+        Div(builder, thread_id, tile_rows_ / kVectorWidth);
     Value second_output_local_row =
-        Add(builder, output_local_row, IndexConstant(builder, tile_size_ / 2));
+        Add(builder, output_local_row,
+            IndexConstant(builder, tile_columns_ / 2));
     Value output_local_column =
-        Mul(builder, Rem(builder, thread_id, tile_size_ / kVectorWidth),
+        Mul(builder, Rem(builder, thread_id, tile_rows_ / kVectorWidth),
             kVectorWidth);
     auto packed_words_type =
         mlir::VectorType::get({kVectorWidth / 2}, builder.getI32Type());
     auto read_output = [&](Value row) {
       Value pair_start = Div(builder, output_local_column, 2);
       Value column_group_rotation = Mul(builder, Div(builder, row, 8), 4);
+      if (tile_columns_ > tile_rows_) {
+        column_group_rotation =
+            Rem(builder, column_group_rotation, row_pairs);
+      }
       Value physical_pair = Xor(builder, pair_start, column_group_rotation);
       Value shared_read_index =
           Add(builder, Mul(builder, row, row_pairs), physical_pair);
@@ -515,7 +525,12 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
             builder, word_vector, llvm::ArrayRef<int64_t>{0});
         Value column =
             Add(builder, local_column, IndexConstant(builder, element));
-        Value column_group_rotation = Mul(builder, Div(builder, column, 8), 4);
+        Value column_group_rotation =
+            Mul(builder, Div(builder, column, 8), 4);
+        if (tile_columns_ > tile_rows_) {
+          column_group_rotation =
+              Rem(builder, column_group_rotation, row_pairs);
+        }
         Value physical_pair =
             Xor(builder, local_row_pair, column_group_rotation);
         Value shared_write_index =
@@ -552,7 +567,8 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
 
   int64_t rows_ = 0;
   int64_t columns_ = 0;
-  int64_t tile_size_ = 0;
+  int64_t tile_rows_ = 0;
+  int64_t tile_columns_ = 0;
   int64_t threads_ = 0;
   std::vector<TransposeDescription> descriptions_;
   LaunchDimensions launch_dimensions_;
@@ -579,19 +595,28 @@ bool IsFlyXTileTransposeFusion(const HloFusionAnalysis& analysis) {
 }
 
 bool IsFlyXTileTransposeConfigSupported(const HloFusionAnalysis& analysis) {
-  if (!IsFlyXTileTransposeFusion(analysis)) {
+  std::optional<std::pair<int64_t, int64_t>> matrix_shape =
+      GetFlyXTileTransposeMatrixShape(analysis);
+  if (!matrix_shape.has_value()) {
     return false;
   }
   const BlockLevelFusionConfig& config =
       analysis.fusion_backend_config().block_level_fusion_config();
   if (config.output_tiles_size() != 1 ||
-      config.output_tiles(0).sizes_size() != 2 ||
-      config.output_tiles(0).sizes(0) != config.output_tiles(0).sizes(1)) {
+      config.output_tiles(0).sizes_size() != 2) {
     return false;
   }
-  const int64_t tile_size = config.output_tiles(0).sizes(0);
-  return (tile_size == 32 || tile_size == 64 || tile_size == 128) &&
-         config.num_warps() * 64 == tile_size * tile_size / (2 * kVectorWidth);
+  const int64_t tile_rows = config.output_tiles(0).sizes(0);
+  const int64_t tile_columns = config.output_tiles(0).sizes(1);
+  const auto is_supported_tile_extent = [](int64_t extent) {
+    return extent == 32 || extent == 64 || extent == 128;
+  };
+  auto [rows, columns] = *matrix_shape;
+  return is_supported_tile_extent(tile_rows) &&
+         is_supported_tile_extent(tile_columns) && rows % tile_rows == 0 &&
+         columns % tile_columns == 0 &&
+         config.num_warps() * 64 ==
+             tile_rows * tile_columns / (2 * kVectorWidth);
 }
 
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(

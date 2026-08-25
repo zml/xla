@@ -445,6 +445,81 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.04}));
 }
 
+TEST_F(FlyGemmDeviceTest, Bf16AttentionValueOutputTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_attention_value_output_transpose
+
+fly_gemm {
+  lhs = bf16[32,64,128]{2,1,0} parameter(0)
+  rhs = bf16[32,128,128]{2,1,0} parameter(1)
+  dot = bf16[32,64,128]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={0}, rhs_batch_dims={0},
+      lhs_contracting_dims={2}, rhs_contracting_dims={2},
+      backend_config={"sizes":["32"]}
+  bitcast = bf16[2,16,64,128]{3,2,1,0} bitcast(dot)
+  ROOT transpose = bf16[2,128,16,64]{3,2,1,0} transpose(bitcast),
+      dimensions={0,3,1,2}
+}
+
+ENTRY main {
+  lhs = bf16[32,64,128]{2,1,0} parameter(0)
+  rhs = bf16[32,128,128]{2,1,0} parameter(1)
+  ROOT fusion = bf16[2,128,16,64]{3,2,1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"32", "block_n":"64",
+          "block_k":"32", "num_warps":"4",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_output":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1","32","64"]}],
+          "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.04}));
+}
+
+TEST_F(FlyGemmDeviceTest, Bf16AttentionScoreInputTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_attention_score_input_transpose
+
+fly_gemm {
+  q = bf16[32,64,128]{2,1,0} parameter(0)
+  q_transposed = bf16[32,128,64]{2,1,0} transpose(q),
+      dimensions={0,2,1}
+  k = bf16[32,64,128]{2,1,0} parameter(1)
+  dot = bf16[32,128,128]{2,1,0} dot(q_transposed, k),
+      lhs_batch_dims={0}, lhs_contracting_dims={2},
+      rhs_batch_dims={0}, rhs_contracting_dims={1},
+      backend_config={"sizes":["32"]}
+  converted = f32[32,128,128]{2,1,0} convert(dot)
+  scale = bf16[] constant(0.125)
+  broadcast = bf16[32,128,128]{2,1,0} broadcast(scale), dimensions={}
+  widened_scale = f32[32,128,128]{2,1,0} convert(broadcast)
+  scaled = f32[32,128,128]{2,1,0} multiply(converted, widened_scale)
+  ROOT narrowed = bf16[32,128,128]{2,1,0} convert(scaled)
+}
+
+ENTRY main {
+  q = bf16[32,64,128]{2,1,0} parameter(0)
+  k = bf16[32,64,128]{2,1,0} parameter(1)
+  ROOT fusion = bf16[32,128,128]{2,1,0} fusion(q, k),
+      kind=kCustom, calls=fly_gemm,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly_gemm",
+        "fly_gemm_config":{"block_m":"128", "block_n":"128",
+          "block_k":"32", "num_warps":"8",
+          "mfma_atom":"FLY_MFMA_16X16X16", "stage_rhs":true},
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1","128","128"]}],
+          "num_stages":"1", "num_warps":"8", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.04}));
+}
+
 TEST_F(FlyGemmDeviceTest, Bf16Mfma32SingleBufferShiftsBothOutputEdges) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_bf16_mfma32_single_buffer_both_output_edges

@@ -32,6 +32,7 @@ limitations under the License.
 #include "google/protobuf/text_format.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
+#include "xla/backends/gpu/autotuner/triton/aiter_unified_attention.h"
 #include "xla/backends/gpu/autotuner/triton/cost_model_config_optimization.h"
 #include "xla/backends/gpu/autotuner/triton/dot_search_space.h"
 #include "xla/backends/gpu/autotuner/triton/triton_configs.h"
@@ -116,6 +117,25 @@ absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
 TritonBackend::GetSupportedConfigs(const HloInstruction& instr) {
   if (!IsSupported(instr)) {
     return std::vector<std::unique_ptr<BackendConfig>>();
+  }
+  if (GetAiterTritonPagedAttentionDescriptor(instr).ok()) {
+    // Keep AITER's published MI300 launch as the first/default candidate,
+    // then independently probe the two scheduler controls that can affect the
+    // latency-bound paged-decode loop.
+    constexpr std::pair<int32_t, int32_t> kLaunchConfigs[] = {
+        {2, 2}, {1, 2}, {3, 2}, {2, 0}, {2, 1}, {2, 4}};
+    std::vector<std::unique_ptr<BackendConfig>> configs;
+    configs.reserve(std::size(kLaunchConfigs));
+    for (auto [num_stages, waves_per_eu] : kLaunchConfigs) {
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      block->set_num_warps(2);
+      block->set_num_ctas(1);
+      block->set_num_stages(num_stages);
+      block->set_waves_per_eu(waves_per_eu);
+      configs.push_back(std::move(config));
+    }
+    return configs;
   }
   ASSIGN_OR_RETURN(
       std::vector<std::unique_ptr<BackendConfig>> overridden_configs,
@@ -282,6 +302,13 @@ absl::Status TritonBackend::ApplyConfig(HloInstruction& instr,
     return absl::InvalidArgumentError(
         "TritonBackend does not support this instruction.");
   }
+  if (GetAiterTritonPagedAttentionDescriptor(instr).ok()) {
+    if (!config.has_block_level()) {
+      return absl::InvalidArgumentError(
+          "Expected block-level config for AITER Triton paged attention.");
+    }
+    return ApplyAiterTritonPagedAttentionConfig(instr, config.block_level());
+  }
   if (!config.has_triton()) {
     return absl::InvalidArgumentError(
         "Expected TritonGemmKey config for TritonBackend.");
@@ -339,6 +366,12 @@ absl::StatusOr<std::unique_ptr<HloModule>> TritonBackend::RunHloPasses(
 bool TritonBackend::IsSupported(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) {
     return false;
+  }
+  if (GetAiterTritonPagedAttentionDescriptor(instr).ok()) {
+    const auto& gpu_cc =
+        target_config().device_description.gpu_compute_capability();
+    return gpu_cc.IsRocm() &&
+           gpu_cc.rocm_compute_capability()->gfx9_mi300();
   }
   auto gpu_config = instr.backend_config<GpuBackendConfig>();
   if (!gpu_config.ok()) {
