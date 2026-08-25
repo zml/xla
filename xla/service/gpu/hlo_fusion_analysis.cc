@@ -129,7 +129,8 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
 
   if (fusion_backend_config.kind() == kFlyFusionKind ||
       fusion_backend_config.kind() == kFlyGemmFusionKind ||
-      fusion_backend_config.kind() == kFlyGemvFusionKind) {
+      fusion_backend_config.kind() == kFlyGemvFusionKind ||
+      fusion_backend_config.kind() == kFlyCollectiveFusionKind) {
     return HloFusionAnalysis::EmitterFusionKind::kFly;
   }
 

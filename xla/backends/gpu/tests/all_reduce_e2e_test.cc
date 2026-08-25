@@ -14,9 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -32,6 +32,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
@@ -55,6 +56,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/stream_executor/gpu/all_reduce_kernel.h"
 #include "xla/tests/literal_test_util.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "xla/types.h"
@@ -376,34 +378,29 @@ static absl::StatusOr<InputsOutputs> BuildTestInputsOutputs(
       GetReductionIdentity(reduction_kind, kElementType)
           .value()
           .Get<ElementType>({});
-  std::vector<Array<ElementType>> expected_outputs(
-      num_replicas, Array<ElementType>(shape.dimensions(), identity));
-
-  for (int i = 0; i < num_replicas; ++i) {
-    expected_outputs[i].Each(
-        [&](absl::Span<const int64_t> indices, ElementType* val) {
-          constexpr PrimitiveType primitive_type =
-              primitive_util::NativeToPrimitiveType<ElementType>();
-          for (const int64_t replica : device_to_groups[i]) {
-            auto result = Evaluate(*val, inputs[replica](indices), hlo_opcode);
-            if (!result.has_value()) {
-              GTEST_FAIL() << "Unsupported reduction kind for element type: "
-                           << absl::StrFormat("%v : %v", primitive_type,
-                                              hlo_opcode);
+  std::vector<Array<ElementType>> iteration_inputs = inputs;
+  std::vector<Array<ElementType>> expected_outputs;
+  for (int64_t iteration = 0; iteration < num_iterations; ++iteration) {
+    expected_outputs.assign(
+        num_replicas, Array<ElementType>(shape.dimensions(), identity));
+    for (int i = 0; i < num_replicas; ++i) {
+      expected_outputs[i].Each(
+          [&](absl::Span<const int64_t> indices, ElementType* val) {
+            constexpr PrimitiveType primitive_type =
+                primitive_util::NativeToPrimitiveType<ElementType>();
+            for (const int64_t replica : device_to_groups[i]) {
+              auto result = Evaluate(*val, iteration_inputs[replica](indices),
+                                     hlo_opcode);
+              if (!result.has_value()) {
+                GTEST_FAIL()
+                    << "Unsupported reduction kind for element type: "
+                    << absl::StrFormat("%v : %v", primitive_type, hlo_opcode);
+              }
+              *val = result.value();
             }
-            *val = result.value();
-          }
-          if constexpr (IsNumeric(primitive_type)) {
-            if (hlo_opcode == HloOpcode::kAdd) {
-              // Each iteration after the first,the output is doubled.
-              *val *= static_cast<ElementType>(
-                  std::pow(device_to_groups[i].size(), num_iterations - 1));
-            } else if (num_iterations > 1) {
-              GTEST_FAIL()
-                  << "Iterations > 1 not supported for non-add reductions.";
-            }
-          }
-        });
+          });
+    }
+    iteration_inputs = expected_outputs;
   }
   for (auto& expected_output : expected_outputs) {
     expected_output_literals.push_back(LiteralUtil::CreateFromArrayWithLayout(
@@ -499,6 +496,108 @@ class AllReduceLayoutAwareTest
     return opts;
   }
 };
+
+#if TENSORFLOW_USE_ROCM
+class FlyAllReduceTest : public AllReduceTestNoParams {
+ protected:
+  DebugOptions GetDebugOptionsForTest() const override {
+    DebugOptions opts = CollectiveOpsWithFlagsBase::GetDebugOptionsForTest();
+    opts.set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(true);
+    opts.set_xla_gpu_flydsl_replace_triton(true);
+    return opts;
+  }
+
+  void RunRepeatedBf16AllReduce(int64_t elements, int64_t num_replicas = 2) {
+    constexpr int64_t kNumIterations = 3;
+    if (!CheckDeviceCount(num_replicas)) {
+      return;
+    }
+
+    const std::string module_str = absl::StrFormat(
+        R"(
+HloModule fly_all_reduce
+
+apply_op {
+  x = bf16[] parameter(0)
+  y = bf16[] parameter(1)
+  ROOT result = bf16[] add(x, y)
+}
+
+while_condition {
+  state = (s32[], bf16[%2$d]{0}) parameter(0)
+  iteration = s32[] get-tuple-element(state), index=0
+  limit = s32[] constant(%1$d)
+  ROOT result = pred[] compare(iteration, limit), direction=LT
+}
+
+while_body {
+  state = (s32[], bf16[%2$d]{0}) parameter(0)
+  iteration = s32[] get-tuple-element(state), index=0
+  value = bf16[%2$d]{0} get-tuple-element(state), index=1
+  reduced = bf16[%2$d]{0} all-reduce(value), to_apply=apply_op,
+      replica_groups={__REPLICA_GROUP__}
+  one = s32[] constant(1)
+  next_iteration = s32[] add(iteration, one)
+  ROOT result = (s32[], bf16[%2$d]{0}) tuple(next_iteration, reduced)
+}
+
+ENTRY main {
+  input = bf16[%2$d]{0} parameter(0)
+  zero = s32[] constant(0)
+  initial = (s32[], bf16[%2$d]{0}) tuple(zero, input)
+  loop = (s32[], bf16[%2$d]{0}) while(initial),
+      condition=while_condition, body=while_body
+  ROOT result = bf16[%2$d]{0} get-tuple-element(loop), index=1
+}
+)",
+        kNumIterations, elements);
+    std::vector<int64_t> replicas(num_replicas);
+    std::iota(replicas.begin(), replicas.end(), 0);
+    const std::string replica_group =
+        absl::StrCat("{", absl::StrJoin(replicas, ","), "}");
+    const std::string configured_module = absl::StrReplaceAll(
+        module_str, {{"__REPLICA_GROUP__", replica_group}});
+
+    ASSERT_OK_AND_ASSIGN(
+        auto module,
+        ParseAndReturnVerifiedModule(configured_module, num_replicas));
+    ASSERT_OK_AND_ASSIGN(
+        InputsOutputs test_io,
+        (BuildTestInputsOutputs<PrimitiveType::BF16>(
+            HloOpcode::kAdd, *module, num_replicas, kNumIterations)));
+    ASSERT_OK_AND_ASSIGN(
+        ExecutionResult execution_result,
+        ExecuteReplicated(std::move(module),
+                          /*arguments=*/test_io.InputLiteralPtrs()));
+    ASSERT_EQ(execution_result.results.size(), num_replicas);
+    for (int i = 0; i < num_replicas; ++i) {
+      ASSERT_TRUE(LiteralTestUtil::Equal(test_io.expected_outputs[i],
+                                         execution_result.results[i]))
+          << "ExpectedOutput != Result at rank " << i;
+    }
+  }
+};
+
+TEST_F(FlyAllReduceTest, RepeatedOneShotWithVectorTail) {
+  RunRepeatedBf16AllReduce(/*elements=*/65537);
+}
+
+TEST_F(FlyAllReduceTest, RepeatedOneShotAlignedEightRanks) {
+  RunRepeatedBf16AllReduce(/*elements=*/65536, /*num_replicas=*/8);
+}
+
+TEST_F(FlyAllReduceTest, RepeatedTwoShotWithPrimeSize) {
+  RunRepeatedBf16AllReduce(/*elements=*/524309);
+}
+
+TEST_F(FlyAllReduceTest, RepeatedTwoShotWithPrimeSizeEightRanks) {
+  RunRepeatedBf16AllReduce(/*elements=*/524309, /*num_replicas=*/8);
+}
+
+TEST_F(FlyAllReduceTest, RepeatedTwoShotAlignedEightRanks) {
+  RunRepeatedBf16AllReduce(/*elements=*/524288, /*num_replicas=*/8);
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(
     AllReduceTest, AllReduceTest,

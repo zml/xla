@@ -32,11 +32,13 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_attention.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_gemm.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_paged_attention.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_scan.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
 #endif
@@ -81,6 +83,10 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
   const auto& analysis = fusion_info.analysis();
 #if TENSORFLOW_USE_ROCM
   if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
+    if (flydsl::GetFlyScanDescriptor(analysis).has_value()) {
+      return std::make_unique<MlirKernelFusion>(
+          flydsl::CreateFlyXTileScanEmitter(analysis));
+    }
     if (flydsl::GetFlyPagedAttentionDescriptor(analysis).has_value() ||
         flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
             .has_value() ||

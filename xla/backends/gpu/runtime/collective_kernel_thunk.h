@@ -74,7 +74,7 @@ class CollectiveKernelThunk : public TracedCommand {
       LaunchDimensions launch_dimensions,                  //
       int32_t shmem_bytes = 0,                             //
       std::optional<std::vector<uint8_t>> cubin = std::nullopt,
-      bool use_pdl = false)
+      bool use_pdl = false, bool skip_collective_clique = false)
       : TracedCommand{Thunk::kCollectiveKernel, info},
         collective_kernel_enabled_(is_collective_kernel_enabled),
         is_async_(is_async),
@@ -85,7 +85,8 @@ class CollectiveKernelThunk : public TracedCommand {
         cubin_(std::move(cubin)),
         shmem_bytes_(shmem_bytes),
         buffers_(std::move(buffers)),
-        use_pdl_(use_pdl) {
+        use_pdl_(use_pdl),
+        skip_collective_clique_(skip_collective_clique) {
     per_stream_state_.reserve(kMaxNumExecutors);
   }
 
@@ -194,6 +195,10 @@ class CollectiveKernelThunk : public TracedCommand {
 
   // Programmatic Dependent Launch.
   const bool use_pdl_;
+
+  // Whether this local peer-memory kernel can run without constructing a
+  // collective-library communicator for its clique.
+  const bool skip_collective_clique_;
 };
 }  // namespace xla::gpu
 

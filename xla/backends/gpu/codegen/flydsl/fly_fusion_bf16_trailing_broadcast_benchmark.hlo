@@ -1,0 +1,17 @@
+HloModule fly_fusion_bf16_trailing_broadcast_benchmark
+
+%fused_trailing_broadcast (p0: bf16[16384,8192], row: bf16[8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %row = bf16[8192]{0} parameter(1)
+  %absolute = bf16[8192]{0} abs(%row)
+  %rows = bf16[16384,8192]{1,0} broadcast(%absolute), dimensions={1}
+  ROOT %result = bf16[16384,8192]{1,0} add(%p0, %rows)
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8192], row: bf16[8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %row = bf16[8192]{0} parameter(1)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0, %row), kind=kCustom,
+    calls=%fused_trailing_broadcast,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

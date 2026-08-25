@@ -82,7 +82,7 @@ for shape in "$@"; do
     elif ((max_context == 131072)); then
       segment_tokens=1152
     elif ((max_context >= 65536)); then
-      segment_tokens=640
+      segment_tokens=576
     elif ((max_context > 8192)); then
       segment_tokens=512
     fi

@@ -249,7 +249,7 @@ TEST(DebugOptions, PjRtPluginFlyDslReplacementRemovesTritonBackends) {
   EXPECT_TRUE(options.xla_gpu_enable_flydsl_gemm());
   EXPECT_TRUE(options.xla_gpu_enable_flydsl_fusion());
   EXPECT_FALSE(options.xla_gpu_enable_triton_gemm());
-  EXPECT_FALSE(
+  EXPECT_TRUE(
       options.xla_gpu_unsupported_use_all_reduce_one_shot_kernel());
   EXPECT_EQ(options.xla_gpu_autotune_num_repetitions(), 7);
   EXPECT_THAT(options.xla_gpu_experimental_autotune_backends(),

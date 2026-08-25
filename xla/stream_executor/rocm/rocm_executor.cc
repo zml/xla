@@ -645,12 +645,7 @@ absl::Status RocmExecutor::Init() {
     peer_access_cache_[i] = CanEnablePeerAccess(device_, peer_device);
   }
 
-  // We initialize BLAS interfaces early here since otherwise it might create
-  // us problems during hipBlasLt initialization under graph capture.
-  // There is no real advantage of explicitly using 'lazy initialization' on
-  // ROCM platform because rocBLAS/hipBlasLt already use 'lazy initialization'
-  // internally
-  return InitBlas();
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::unique_ptr<Kernel>> RocmExecutor::LoadKernel(
@@ -924,18 +919,22 @@ void RocmExecutor::DeallocateStream(Stream* stream) {
   alive_gpu_streams_.erase(rocm_stream->stream_handle());
 }
 
-absl::Status RocmExecutor::InitBlas() {
-  absl::MutexLock lock(mu_);
-  PluginRegistry* registry = PluginRegistry::Instance();
-  ASSIGN_OR_RETURN(
-      auto factory,
-      registry->GetFactory<PluginRegistry::BlasFactory>(rocm::kROCmPlatformId));
-  blas_.reset(factory(this));
-  return absl::OkStatus();
-}
-
 blas::BlasSupport* RocmExecutor::AsBlas() {
   absl::MutexLock lock(mu_);
+  if (blas_ != nullptr) {
+    return blas_.get();
+  }
+
+  PluginRegistry* registry = PluginRegistry::Instance();
+  absl::StatusOr<PluginRegistry::BlasFactory> factory =
+      registry->GetFactory<PluginRegistry::BlasFactory>(
+          rocm::kROCmPlatformId);
+  if (!factory.ok()) {
+    LOG(ERROR) << "Unable to retrieve BLAS factory: "
+               << factory.status().message();
+    return nullptr;
+  }
+  blas_.reset((*factory)(this));
   return blas_.get();
 }
 

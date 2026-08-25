@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -193,6 +194,23 @@ class MlirKernelFusion final : public KernelFusionInterface {
 
   AsyncThunkSequence Emit(IrEmitterContext& ir_emitter_context,
                           const HloFusionInstruction& fusion) const final;
+
+  // A concrete emission result for callers that own a specialized runtime
+  // thunk. Collective kernels, for example, have scalar metadata and pointer
+  // tables that are not backed by XLA BufferAssignment slices.
+  struct EmitResult {
+    KernelReuseCache::Entry entry;
+    emitters::KernelArguments kernel_arguments;
+  };
+
+  // Emits an MLIR kernel with an alternate instruction for managed buffer
+  // assignment and additional unmanaged ABI arguments. This mirrors the
+  // specialized Triton entry point, but keeps compilation in XLA's common
+  // MLIR kernel path so non-Triton backends can share CollectiveKernelThunk.
+  xla::Future<EmitResult> Emit(
+      IrEmitterContext& ir_emitter_context, const HloFusionInstruction& fusion,
+      const HloInstruction* instr_override,
+      absl::Span<const Shape> unmanaged_arguments) const;
 
   // Visible for testing. `buffer_assignment` is optional for testing (assigns
   // a different buffer to each tensor).

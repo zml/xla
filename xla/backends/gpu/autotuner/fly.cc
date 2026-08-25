@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
@@ -2216,6 +2217,9 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   }
   HloFusionAnalysis analysis =
       HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (flydsl::GetFlyScanDescriptor(analysis).has_value()) {
+    return true;
+  }
   if (flydsl::GetFlyPagedAttentionDescriptor(analysis).has_value() ||
       flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
           .has_value() ||
@@ -2260,6 +2264,30 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
   HloFusionAnalysis analysis =
       HloFusionAnalysis::Create(instr, target_config().device_description);
+  if (std::optional<flydsl::FlyScanDescriptor> scan =
+          flydsl::GetFlyScanDescriptor(analysis)) {
+    // One Wave64 owns each contiguous row. Measure CTA packing and occupancy;
+    // both vary with the number of striped 64-element prefix tiles per row.
+    constexpr std::array<std::pair<int64_t, int64_t>, 8> kScanConfigs = {{
+        {8, 0}, {4, 0}, {16, 0}, {2, 0},
+        {8, 2}, {4, 2}, {1, 0},  {8, 4},
+    }};
+    for (auto [num_warps, waves_per_eu] : kScanConfigs) {
+      auto config = std::make_unique<BackendConfig>();
+      BlockLevelFusionConfig* block = config->mutable_block_level();
+      Tile* tile = block->add_output_tiles();
+      for (int64_t dimension = 0;
+           dimension < scan->input->shape().dimensions_size(); ++dimension) {
+        tile->add_sizes(1);
+      }
+      block->set_num_warps(num_warps);
+      block->set_num_ctas(1);
+      block->set_num_stages(1);
+      block->set_waves_per_eu(waves_per_eu);
+      configs.push_back(std::move(config));
+    }
+    return configs;
+  }
   if (std::optional<flydsl::FlyPagedAttentionDescriptor> attention =
           flydsl::GetFlyPagedAttentionDescriptor(analysis)) {
     // The two-phase specialization has a fixed four-wave MFMA16 layout.  The
@@ -2326,7 +2354,7 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       tile->add_sizes(1);
       tile->add_sizes(1);
       tile->add_sizes(reducer->head_dimension);
-      block->set_num_warps(2);
+      block->set_num_warps(1);
       block->set_num_ctas(1);
       block->set_num_stages(1);
       block->set_waves_per_eu(waves_per_eu);
@@ -2518,9 +2546,41 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const int64_t native_unroll = ComputeLoopFusionConfig(analysis);
   const bool is_native_elementwise =
       flydsl::IsFlyXTileElementwiseFusion(analysis);
+  const bool is_native_indexed = flydsl::IsFlyXTileIndexedFusion(analysis);
+  const bool is_native_slice =
+      is_native_indexed &&
+      (hlo_query::GetFirstInstructionWithOpcode(
+           *instr.fused_instructions_computation(), HloOpcode::kSlice) !=
+           nullptr ||
+       hlo_query::GetFirstInstructionWithOpcode(
+           *instr.fused_instructions_computation(),
+           HloOpcode::kDynamicSlice) != nullptr);
+  const bool is_native_dynamic_update =
+      is_native_indexed &&
+      hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(),
+          HloOpcode::kDynamicUpdateSlice) != nullptr;
+  const bool is_native_reverse =
+      is_native_indexed &&
+      hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(), HloOpcode::kReverse) !=
+          nullptr;
+  const bool is_native_pad =
+      is_native_indexed &&
+      hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(), HloOpcode::kPad) != nullptr;
+  const bool is_native_reduce_window =
+      is_native_indexed &&
+      hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(),
+          HloOpcode::kReduceWindow) != nullptr;
   int64_t max_external_element_bits =
       primitive_util::BitWidth(analysis.first_result_shape().element_type());
   for (const HloInstruction* operand : instr.operands()) {
+    if (ShapeUtil::IsScalar(operand->shape()) &&
+        primitive_util::IsIntegralType(operand->shape().element_type())) {
+      continue;
+    }
     max_external_element_bits = std::max<int64_t>(
         max_external_element_bits,
         primitive_util::BitWidth(operand->shape().element_type()));
@@ -2529,7 +2589,7 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       1, debug_options().xla_gpu_fusion_autotune_top_k_configs());
 
   auto add_config = [&](int64_t unroll, int64_t num_warps,
-                        int64_t vector_size_bits) {
+                        int64_t vector_size_bits, int64_t waves_per_eu = 0) {
     if (unroll <= 0 || unroll > elements) {
       return;
     }
@@ -2544,7 +2604,8 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     for (const auto& existing : configs) {
       if (existing->block_level().output_tiles(0).sizes(0) == unroll &&
           existing->block_level().num_warps() == num_warps &&
-          existing->block_level().vector_size_bits() == vector_size_bits) {
+          existing->block_level().vector_size_bits() == vector_size_bits &&
+          existing->block_level().waves_per_eu() == waves_per_eu) {
         return;
       }
     }
@@ -2556,8 +2617,121 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     block->set_num_ctas(1);
     block->set_num_stages(1);
     block->set_vector_size_bits(vector_size_bits);
+    block->set_waves_per_eu(waves_per_eu);
     configs.push_back(std::move(config));
   };
+
+  if (is_native_indexed) {
+    const int64_t scalar_bits = primitive_util::BitWidth(
+        analysis.first_result_shape().element_type());
+    if (is_native_reduce_window) {
+      // Sliding windows reuse overlapping input spans in registers. Put the
+      // 128-bit geometries that minimize global transactions ahead of the
+      // generic indexed-fusion order; otherwise XLA's default top-eight cap
+      // is exhausted entirely by 64-bit concatenate-oriented candidates.
+      constexpr std::array<std::array<int64_t, 3>, 8> kPreferredConfigs = {{
+          {2, 8, 128},
+          {2, 4, 128},
+          {4, 4, 128},
+          {1, 8, 128},
+          {4, 8, 128},
+          {1, 4, 128},
+          {4, 8, 64},
+          {8, 4, 64},
+      }};
+      for (const auto& [unroll, num_warps, vector_size_bits] :
+           kPreferredConfigs) {
+        add_config(unroll, num_warps, vector_size_bits);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
+    if (is_native_slice) {
+      // Contiguous slices have no boundary scalarization in the main vector
+      // loop. Start with the measured eight-wave/128-bit winner, including
+      // occupancy requests, then keep both copy widths and nearby unrolls in
+      // the ordinary top-eight search. The 64-bit alternatives also cover a
+      // slice combined with another indexed operation such as concatenate.
+      for (int64_t waves_per_eu : {0, 1, 2, 4}) {
+        add_config(/*unroll=*/1, /*num_warps=*/8,
+                   /*vector_size_bits=*/128, waves_per_eu);
+      }
+      add_config(/*unroll=*/2, /*num_warps=*/8,
+                 /*vector_size_bits=*/64);
+      add_config(/*unroll=*/1, /*num_warps=*/8,
+                 /*vector_size_bits=*/64);
+      add_config(/*unroll=*/2, /*num_warps=*/8,
+                 /*vector_size_bits=*/128);
+      add_config(/*unroll=*/4, /*num_warps=*/8,
+                 /*vector_size_bits=*/128);
+      if (configs.size() >= max_elementwise_configs) {
+        return configs;
+      }
+      for (int64_t num_warps : {8, 4, 2, 1}) {
+        for (int64_t unroll : {4, 2, 8, 1}) {
+          for (int64_t vector_bits : {128, 64}) {
+            add_config(unroll, num_warps, vector_bits);
+            if (configs.size() >= max_elementwise_configs) {
+              return configs;
+            }
+          }
+        }
+      }
+    }
+    if (is_native_dynamic_update) {
+      // Dynamic update retains full-width loads and stores except for the two
+      // transactions that intersect each row's update boundaries. Rank the
+      // measured MI300X 128-bit families first and retain the best scalar-copy
+      // geometry as protection for boundary-heavy small updates.
+      constexpr std::array<std::array<int64_t, 3>, 8> kPreferredConfigs = {{
+          {2, 4, 128},
+          {1, 8, 128},
+          {1, 1, 64},
+          {1, 4, 128},
+          {1, 1, 128},
+          {4, 8, 128},
+          {2, 2, 128},
+          {4, 4, 128},
+      }};
+      for (const auto& [unroll, num_warps, vector_size_bits] :
+           kPreferredConfigs) {
+        add_config(unroll, num_warps, vector_size_bits);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
+    if (is_native_reverse || is_native_pad) {
+      // A flat reversal or edge pad retains contiguous vector loads but adds
+      // indexing/control flow around them. Rank the stable
+      // 128-bit/single-vector and 64-bit/two-vector families across all Wave64
+      // workgroup sizes.
+      for (int64_t num_warps : {8, 4, 2, 1}) {
+        add_config(/*unroll=*/1, num_warps, /*vector_size_bits=*/128);
+        add_config(/*unroll=*/2, num_warps, /*vector_size_bits=*/64);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
+    // Full vectors remain legal everywhere except the single transaction that
+    // straddles each concatenation boundary; the emitter scalarizes that rare
+    // path. Rank vector copies first and keep a scalar candidate as a robust
+    // alternative for very short fragments.
+    for (int64_t vector_bits :
+         std::array<int64_t, 3>{64, 128, scalar_bits}) {
+      for (int64_t num_warps : {8, 4, 2, 1}) {
+        for (int64_t unroll : {4, 2, 8, 1}) {
+          add_config(unroll, num_warps, vector_bits);
+          if (configs.size() >= max_elementwise_configs) {
+            return configs;
+          }
+        }
+      }
+    }
+    return configs;
+  }
 
   if (is_native_elementwise) {
     // Rank the native MI300X configurations before applying XLA's top-k

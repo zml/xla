@@ -201,6 +201,69 @@ ENTRY entry {
 )"));
 }
 
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4DilatedReduceWindow) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_reduce_window
+
+maximum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] maximum(lhs, rhs)
+}
+
+elementwise {
+  p0 = bf16[2,5,7,11]{3,2,1,0} parameter(0)
+  negative_infinity = bf16[] constant(-inf)
+  window = bf16[2,3,3,11]{3,2,1,0} reduce-window(p0, negative_infinity),
+    window={size=1x3x3x1 stride=1x2x2x1
+      pad=0_0x1_1x2_1x0_0 rhs_dilate=1x1x2x1}, to_apply=maximum
+  ROOT result = bf16[2,3,3,11]{3,2,1,0} abs(window)
+}
+
+ENTRY entry {
+  p0 = bf16[2,5,7,11]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[2,3,3,11]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RejectsOversizedReduceWindow) {
+  EXPECT_FALSE(IsSupported(R"(
+HloModule elementwise_oversized_reduce_window
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+elementwise {
+  p0 = f32[1024]{0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[1024]{0} reduce-window(p0, zero),
+    window={size=129 pad=64_64}, to_apply=add
+}
+
+ENTRY entry {
+  p0 = f32[1024]{0} parameter(0)
+  ROOT fusion = f32[1024]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileElementwiseTest, RecognizesCompareSelectClampDag) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule elementwise_select
@@ -287,8 +350,44 @@ ENTRY entry {
 )"));
 }
 
-TEST_F(FlyXTileElementwiseTest, RejectsNonScalarBroadcast) {
-  EXPECT_FALSE(IsSupported(R"(
+TEST_F(FlyXTileElementwiseTest,
+       RecognizesUnalignedContiguousConcatenateDag) {
+  constexpr char kHlo[] = R"(
+HloModule indexed_concatenate
+
+concatenate {
+  p0 = bf16[33]{0} parameter(0)
+  p1 = bf16[31]{0} parameter(1)
+  absolute = bf16[33]{0} abs(p0)
+  negated = bf16[31]{0} negate(p1)
+  ROOT result = bf16[64]{0} concatenate(absolute, negated), dimensions={0}
+}
+
+ENTRY entry {
+  p0 = bf16[33]{0} parameter(0)
+  p1 = bf16[31]{0} parameter(1)
+  ROOT fusion = bf16[64]{0} fusion(p0, p1), kind=kCustom,
+    calls=concatenate,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesTrailingDimensionBroadcast) {
+  EXPECT_TRUE(IsSupported(R"(
 HloModule elementwise_broadcast
 
 elementwise {
@@ -308,6 +407,620 @@ ENTRY entry {
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["1"]}],
         "num_stages":"1", "num_warps":"1", "num_ctas":"1"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RejectsNonTrailingDimensionBroadcast) {
+  EXPECT_FALSE(IsSupported(R"(
+HloModule elementwise_non_trailing_broadcast
+
+elementwise {
+  p0 = f32[128,64]{1,0} parameter(0)
+  column = f32[128]{0} parameter(1)
+  column_broadcast = f32[128,64]{1,0} broadcast(column), dimensions={0}
+  ROOT result = f32[128,64]{1,0} add(p0, column_broadcast)
+}
+
+ENTRY entry {
+  p0 = f32[128,64]{1,0} parameter(0)
+  column = f32[128]{0} parameter(1)
+  ROOT fusion = f32[128,64]{1,0} fusion(p0, column), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesContiguousSlice) {
+  constexpr char kHlo[] = R"(
+HloModule elementwise_contiguous_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  absolute = bf16[19,67]{1,0} abs(p0)
+  ROOT result = bf16[15,67]{1,0} slice(absolute),
+    slice={[2:17], [0:67]}
+}
+
+ENTRY entry {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesGappedRectangularSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_gapped_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT result = bf16[15,65]{1,0} slice(p0),
+    slice={[2:17], [1:66]}
+}
+
+ENTRY entry {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4RectangularSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_slice
+
+elementwise {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  absolute = bf16[4,6,8,11]{3,2,1,0} abs(p0)
+  ROOT result = bf16[2,4,6,9]{3,2,1,0} slice(absolute),
+    slice={[1:3], [1:5], [1:7], [1:10]}
+}
+
+ENTRY entry {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[2,4,6,9]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RejectsStridedSlice) {
+  EXPECT_FALSE(IsSupported(R"(
+HloModule elementwise_strided_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT result = bf16[9,67]{1,0} slice(p0),
+    slice={[0:18:2], [0:67]}
+}
+
+ENTRY entry {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[9,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesDynamicRectangularSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_dynamic_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  row = s32[] parameter(1)
+  column = s32[] parameter(2)
+  ROOT result = bf16[15,65]{1,0} dynamic-slice(p0, row, column),
+    dynamic_slice_sizes={15,65}
+}
+
+ENTRY entry {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  row = s32[] parameter(1)
+  column = s32[] parameter(2)
+  ROOT fusion = bf16[15,65]{1,0} fusion(p0, row, column), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesS64DynamicRectangularSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_s64_dynamic_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  row = s64[] parameter(1)
+  column = s64[] parameter(2)
+  ROOT result = bf16[15,65]{1,0} dynamic-slice(p0, row, column),
+    dynamic_slice_sizes={15,65}
+}
+
+ENTRY entry {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  row = s64[] parameter(1)
+  column = s64[] parameter(2)
+  ROOT fusion = bf16[15,65]{1,0} fusion(p0, row, column), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4DynamicSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_dynamic_slice
+
+elementwise {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  start0 = s64[] parameter(1)
+  start1 = s64[] parameter(2)
+  start2 = s64[] parameter(3)
+  start3 = s64[] parameter(4)
+  absolute = bf16[4,6,8,11]{3,2,1,0} abs(p0)
+  ROOT result = bf16[2,4,6,9]{3,2,1,0} dynamic-slice(
+    absolute, start0, start1, start2, start3),
+    dynamic_slice_sizes={2,4,6,9}
+}
+
+ENTRY entry {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  start0 = s64[] parameter(1)
+  start1 = s64[] parameter(2)
+  start2 = s64[] parameter(3)
+  start3 = s64[] parameter(4)
+  ROOT fusion = bf16[2,4,6,9]{3,2,1,0} fusion(
+    p0, start0, start1, start2, start3), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesDynamicRectangularUpdate) {
+  constexpr char kHlo[] = R"(
+HloModule elementwise_dynamic_update_slice
+
+elementwise {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s32[] parameter(2)
+  column = s32[] parameter(3)
+  scale = bf16[] constant(1.25)
+  broadcast = bf16[15,65]{1,0} broadcast(scale), dimensions={}
+  scaled = bf16[15,65]{1,0} multiply(update, broadcast)
+  ROOT result = bf16[19,67]{1,0} dynamic-update-slice(
+    input, scaled, row, column)
+}
+
+ENTRY entry {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s32[] parameter(2)
+  column = s32[] parameter(3)
+  ROOT fusion = bf16[19,67]{1,0}
+    fusion(input, update, row, column), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesS64DynamicRectangularUpdate) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_s64_dynamic_update_slice
+
+elementwise {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s64[] parameter(2)
+  column = s64[] parameter(3)
+  ROOT result = bf16[19,67]{1,0} dynamic-update-slice(
+    input, update, row, column)
+}
+
+ENTRY entry {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s64[] parameter(2)
+  column = s64[] parameter(3)
+  ROOT fusion = bf16[19,67]{1,0}
+    fusion(input, update, row, column), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4DynamicUpdateSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_dynamic_update_slice
+
+elementwise {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  start0 = s64[] parameter(2)
+  start1 = s64[] parameter(3)
+  start2 = s64[] parameter(4)
+  start3 = s64[] parameter(5)
+  absolute = bf16[2,4,6,9]{3,2,1,0} abs(update)
+  ROOT result = bf16[4,6,8,11]{3,2,1,0} dynamic-update-slice(
+    input, absolute, start0, start1, start2, start3)
+}
+
+ENTRY entry {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  start0 = s64[] parameter(2)
+  start1 = s64[] parameter(3)
+  start2 = s64[] parameter(4)
+  start3 = s64[] parameter(5)
+  ROOT fusion = bf16[4,6,8,11]{3,2,1,0} fusion(
+    input, update, start0, start1, start2, start3), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank1DynamicUpdateSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank1_dynamic_update_slice
+
+elementwise {
+  input = bf16[67]{0} parameter(0)
+  update = bf16[65]{0} parameter(1)
+  start = s32[] parameter(2)
+  absolute = bf16[65]{0} abs(update)
+  ROOT result = bf16[67]{0} dynamic-update-slice(input, absolute, start)
+}
+
+ENTRY entry {
+  input = bf16[67]{0} parameter(0)
+  update = bf16[65]{0} parameter(1)
+  start = s32[] parameter(2)
+  ROOT fusion = bf16[67]{0} fusion(input, update, start), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesFlatReverse) {
+  constexpr char kHlo[] = R"(
+HloModule elementwise_flat_reverse
+
+elementwise {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  absolute = bf16[3,67]{1,0} abs(p0)
+  ROOT result = bf16[3,67]{1,0} reverse(absolute), dimensions={0,1}
+}
+
+ENTRY entry {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT fusion = bf16[3,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesMinorDimensionReverse) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_minor_reverse
+
+elementwise {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT result = bf16[3,67]{1,0} reverse(p0), dimensions={1}
+}
+
+ENTRY entry {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT fusion = bf16[3,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesMajorDimensionReverse) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_major_reverse
+
+elementwise {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT result = bf16[3,67]{1,0} reverse(p0), dimensions={0}
+}
+
+ENTRY entry {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT fusion = bf16[3,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4PartialReverse) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_partial_reverse
+
+elementwise {
+  p0 = bf16[3,5,7,11]{3,2,1,0} parameter(0)
+  absolute = bf16[3,5,7,11]{3,2,1,0} abs(p0)
+  ROOT result = bf16[3,5,7,11]{3,2,1,0} reverse(absolute),
+    dimensions={0,2}
+}
+
+ENTRY entry {
+  p0 = bf16[3,5,7,11]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[3,5,7,11]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesFlatEdgePad) {
+  constexpr char kHlo[] = R"(
+HloModule elementwise_flat_edge_pad
+
+elementwise {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  absolute = bf16[15,67]{1,0} abs(p0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[19,67]{1,0} pad(absolute, zero),
+    padding=2_2x0_0
+}
+
+ENTRY entry {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  ROOT fusion = bf16[19,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRectangularEdgePad) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_gapped_pad
+
+elementwise {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[15,71]{1,0} pad(p0, zero), padding=0_0x2_2
+}
+
+ENTRY entry {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,71]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank4InteriorAndNegativeEdgePad) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank4_pad
+
+elementwise {
+  p0 = bf16[4,5,6,7]{3,2,1,0} parameter(0)
+  absolute = bf16[4,5,6,7]{3,2,1,0} abs(p0)
+  padding_value = bf16[] constant(-0.5)
+  ROOT result = bf16[5,9,7,15]{3,2,1,0} pad(absolute, padding_value),
+    padding=-1_2x1_-1_1x0_1x2_0_1
+}
+
+ENTRY entry {
+  p0 = bf16[4,5,6,7]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[5,9,7,15]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank1InteriorAndNegativeEdgePad) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank1_pad
+
+elementwise {
+  p0 = bf16[7]{0} parameter(0)
+  padding_value = bf16[] constant(2)
+  ROOT result = bf16[14]{0} pad(p0, padding_value), padding=-1_2_1
+}
+
+ENTRY entry {
+  p0 = bf16[7]{0} parameter(0)
+  ROOT fusion = bf16[14]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRank1NegativeEdgePad) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_rank1_negative_edge_pad
+
+elementwise {
+  p0 = bf16[7]{0} parameter(0)
+  padding_value = bf16[] constant(2)
+  ROOT result = bf16[6]{0} pad(p0, padding_value), padding=-2_1
+}
+
+ENTRY entry {
+  p0 = bf16[7]{0} parameter(0)
+  ROOT fusion = bf16[6]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesInteriorPad) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_interior_pad
+
+elementwise {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[15,133]{1,0} pad(p0, zero), padding=0_0x0_0_1
+}
+
+ENTRY entry {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,133]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
 }
 )"));
 }

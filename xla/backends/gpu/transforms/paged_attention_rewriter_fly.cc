@@ -47,7 +47,7 @@ int64_t GetSegmentCount(
   // Follow FlyDSL's D128 decode dispatch.  The wide kernel uses four waves
   // with 32 tokens per wave through KV8192, then four waves with 128 tokens
   // per wave below KV65536. At KV65536 the source-swapped cooperative path
-  // takes over. Its tuned segment sizes keep roughly 102--114 producer CTAs
+  // takes over. Its tuned segment sizes keep 114 producer CTAs
   // per KV head while amortizing the segmented reducer. The descriptor rounds
   // the resulting extent to the producer's 16-token MFMA granularity.
   if (descriptor.max_context <= 256) {
@@ -59,7 +59,7 @@ int64_t GetSegmentCount(
   } else if (descriptor.max_context == 131072) {
     segment_tokens = 1152;
   } else if (descriptor.max_context >= 65536) {
-    segment_tokens = 640;
+    segment_tokens = 576;
   } else if (descriptor.max_context > 8192) {
     segment_tokens = 512;
   }

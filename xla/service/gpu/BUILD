@@ -621,7 +621,9 @@ cc_library(
         "@llvm-project//mlir:Support",
         "@triton//:TritonDialects",
         "@tsl//tsl/platform:human_readable_json",
-    ],
+    ] + if_rocm_is_configured([
+        "//xla/backends/gpu/codegen/flydsl:xtile_collective",
+    ]),
 )
 
 cc_library(

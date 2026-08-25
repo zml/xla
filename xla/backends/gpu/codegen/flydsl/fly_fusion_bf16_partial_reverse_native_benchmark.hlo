@@ -1,0 +1,13 @@
+HloModule fly_fusion_bf16_partial_reverse_native_benchmark
+
+%fused_partial_reverse (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %absolute = bf16[16384,8192]{1,0} abs(%p0)
+  ROOT %result = bf16[16384,8192]{1,0} reverse(%absolute), dimensions={1}
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kLoop,
+    calls=%fused_partial_reverse
+}

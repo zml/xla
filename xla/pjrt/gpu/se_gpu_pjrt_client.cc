@@ -208,7 +208,11 @@ static std::optional<se::GpuTargetConfigProto> GetTargetConfigForDevices(
         tensorflow::down_cast<const PjRtStreamExecutorDevice*>(device)
             ->local_device_state();
     if (local_device_state != nullptr) {
-      return xla::gpu::GpuTargetConfig(local_device_state->executor())
+      const bool query_dnn_version =
+          !xla::GetDebugOptionsFromFlags()
+               .xla_gpu_experimental_disable_binary_libraries();
+      return xla::gpu::GpuTargetConfig(local_device_state->executor(),
+                                       query_dnn_version)
           .ToProto();
     }
   }
@@ -1597,12 +1601,15 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
   }
 
   std::optional<gpu::GpuTargetConfig> gpu_target_config;
+  const bool query_dnn_version =
+      !xla::GetDebugOptionsFromFlags()
+           .xla_gpu_experimental_disable_binary_libraries();
 
   for (const auto& [ordinal, device] : local_device_states) {
     // We expect all devices on a host to have the same target config, so we
     // only need to get the target config for the first device.
     if (!gpu_target_config.has_value()) {
-      gpu_target_config.emplace(device->executor());
+      gpu_target_config.emplace(device->executor(), query_dnn_version);
     }
     const se::Platform* platform = device->executor()->GetPlatform();
     ASSIGN_OR_RETURN(

@@ -1,0 +1,26 @@
+HloModule fly_fusion_bf16_dynamic_update_slice_benchmark
+
+%fused_dynamic_update_slice (
+    input: bf16[16384,8192], update: bf16[16384,8190], row: s32[],
+    column: s32[]) -> bf16[16384,8192] {
+  %input = bf16[16384,8192]{1,0} parameter(0)
+  %update = bf16[16384,8190]{1,0} parameter(1)
+  %row = s32[] parameter(2)
+  %column = s32[] parameter(3)
+  %absolute = bf16[16384,8190]{1,0} abs(%update)
+  ROOT %result = bf16[16384,8192]{1,0} dynamic-update-slice(
+    %input, %absolute, %row, %column)
+}
+
+ENTRY %entry_computation (
+    input: bf16[16384,8192], update: bf16[16384,8190], row: s32[],
+    column: s32[]) -> bf16[16384,8192] {
+  %input = bf16[16384,8192]{1,0} parameter(0)
+  %update = bf16[16384,8190]{1,0} parameter(1)
+  %row = s32[] parameter(2)
+  %column = s32[] parameter(3)
+  ROOT %fusion = bf16[16384,8192]{1,0}
+    fusion(%input, %update, %row, %column), kind=kCustom,
+    calls=%fused_dynamic_update_slice,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

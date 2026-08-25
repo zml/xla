@@ -194,7 +194,9 @@ class CollectiveEmitterTest : public CollectiveBlockLevelConfigTest {
     ASSIGN_OR_RETURN(
         bool collective_fusion_config_set,
         TrySetGpuBackendConfigForCollective(
-            gpu_topology, module_with_fusion.MutableFusionInstr()));
+            gpu_topology, module_with_fusion.MutableFusionInstr(),
+            /*device_assignment=*/nullptr,
+            /*fusion_kind=*/kTritonCollectiveFusionKind));
     if (!collective_fusion_config_set) {
       return absl::InternalError(
           "Failed to set collective fusion config. "
@@ -307,6 +309,23 @@ TEST_F(CollectiveEmitterTest, AllReduceGetCollectiveUnmanagedKernelArguments) {
   ASSERT_EQ(unmanaged_arguments[3].dimensions().size(), 2);
   EXPECT_EQ(unmanaged_arguments[3].dimensions()[0], 2);      // num_devices
   EXPECT_EQ(unmanaged_arguments[3].dimensions()[1], 65536);  // input_shape[0]
+}
+
+TEST_F(CollectiveEmitterTest, SetsRequestedCollectiveFusionKind) {
+  ASSERT_OK_AND_ASSIGN(
+      auto module_with_fusion,
+      BuildModuleWithFusion(GetModuleStr(ShapeUtil::MakeShape(F32, {65536}))));
+  ASSERT_OK_AND_ASSIGN(
+      bool config_set,
+      TrySetGpuBackendConfigForCollective(
+          *gpu_topology_, module_with_fusion.MutableFusionInstr(),
+          /*device_assignment=*/nullptr,
+          /*fusion_kind=*/"__fly_collective"));
+  ASSERT_TRUE(config_set);
+  ASSERT_OK_AND_ASSIGN(
+      GpuBackendConfig config,
+      module_with_fusion.FusionInstr()->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(config.fusion_backend_config().kind(), "__fly_collective");
 }
 
 TEST_F(CollectiveEmitterTest, AllReduceWithTritonGetLaunchConfig) {

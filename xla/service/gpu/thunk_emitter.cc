@@ -57,10 +57,13 @@ limitations under the License.
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
+#include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
-#include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
+#if TENSORFLOW_USE_ROCM
+#include "xla/backends/gpu/codegen/flydsl/xtile_collective.h"
+#endif
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/codegen/llvm/llvm_emitter.h"
@@ -361,7 +364,7 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
        is_collective_kernel_enabled](
           absl::string_view kernel_name, int32_t shmem_bytes,
           LaunchDimensions launch_dimensions, const std::vector<uint8_t>& cubin,
-          bool use_pdl)
+          bool use_pdl, bool skip_collective_clique)
       -> absl::StatusOr<std::unique_ptr<CollectiveKernelThunk>> {
     ASSIGN_OR_RETURN(
         CollectiveKernelSpec kernel_spec,
@@ -370,7 +373,8 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
         thunk_info, config, std::move(kernel_spec), is_async,
         std::move(buffers), is_collective_kernel_enabled, kernel_name,
         launch_dimensions, shmem_bytes,
-        !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl);
+        !cubin.empty() ? std::make_optional(cubin) : std::nullopt, use_pdl,
+        skip_collective_clique);
   };
   const GpuTopology& gpu_topology = ir_emitter_context_->gpu_topology();
   const DeviceAssignment* device_assignment = nullptr;
@@ -380,20 +384,60 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
     device_assignment =
         &ir_emitter_context_->hlo_module().config().static_device_assignment();
   }
+  const bool replace_triton = ir_emitter_context_->debug_options()
+                                  .xla_gpu_flydsl_replace_triton();
+  bool use_fly_collective = false;
+#if TENSORFLOW_USE_ROCM
+  use_fly_collective = replace_triton;
+#else
+  if (replace_triton) {
+    return absl::FailedPreconditionError(
+        "FlyDSL Triton replacement is only supported on ROCm.");
+  }
+#endif
   ASSIGN_OR_RETURN(bool did_set_config,
                    TrySetGpuBackendConfigForCollective(
-                       gpu_topology, fusion_instr, device_assignment));
+                       gpu_topology, fusion_instr, device_assignment,
+                       use_fly_collective ? kFlyCollectiveFusionKind
+                                          : kTritonCollectiveFusionKind));
   if (!did_set_config) {
     return Internal("Failed to set GPU backend config for collective kernel.");
   }
   analysis_garbage_collector_.push_back(
       std::make_unique<HloFusionAnalysis>(HloFusionAnalysis::Create(
           *fusion_instr, ir_emitter_context_->gpu_device_info())));
-  auto emitter =
-      std::make_unique<TritonFusion>(*analysis_garbage_collector_.back());
-
   ASSIGN_OR_RETURN(std::vector<Shape> unmanaged_arguments,
                    GetCollectiveUnmanagedKernelArguments(fusion_instr));
+#if TENSORFLOW_USE_ROCM
+  if (use_fly_collective) {
+    auto emitter = std::make_unique<MlirKernelFusion>(
+        flydsl::CreateFlyXTileCollectiveEmitter(
+            *analysis_garbage_collector_.back()));
+    return emitter
+        ->Emit(*ir_emitter_context_, *fusion_instr,
+               /*instr_override=*/instr, unmanaged_arguments)
+        .Map([make_thunk = std::move(make_thunk),
+              fused_module = std::move(fused_module)](
+                 MlirKernelFusion::EmitResult result)
+                 -> absl::StatusOr<ThunkSequence> {
+          ASSIGN_OR_RETURN(
+              std::unique_ptr<CollectiveKernelThunk> thunk,
+              make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
+                         result.entry.launch_dimensions,
+                         std::move(result.entry.binary),
+                         result.entry.use_pdl,
+                         /*skip_collective_clique=*/true));
+          return ThunkSequence::Of(std::move(thunk));
+        });
+  }
+#endif
+  auto emitter =
+      std::make_unique<TritonFusion>(*analysis_garbage_collector_.back());
+#if TENSORFLOW_USE_ROCM
+  static constexpr bool kSkipCollectiveClique = true;
+#else
+  static constexpr bool kSkipCollectiveClique = false;
+#endif
   return emitter
       ->Emit(*ir_emitter_context_, *fusion_instr,
              /*instr_override=*/instr, unmanaged_arguments)
@@ -405,7 +449,8 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
             std::unique_ptr<CollectiveKernelThunk> thunk,
             make_thunk(result.entry.kernel_name, result.entry.shmem_bytes,
                        result.entry.launch_dimensions,
-                       std::move(result.entry.binary), result.entry.use_pdl));
+                       std::move(result.entry.binary), result.entry.use_pdl,
+                       /*skip_collective_clique=*/kSkipCollectiveClique));
         return ThunkSequence::Of(std::move(thunk));
       });
 }

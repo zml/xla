@@ -106,4 +106,9 @@ message CollectiveKernelThunkProto {
   // Used to find runtime requirements for an emitted kernel.
   // See collective_params.h for more details.
   CollectiveKernelSpecProto kernel_spec = 12;
+
+  // If true, the kernel uses only local peer memory and XLA rendezvous state,
+  // so execution does not need to acquire a collective communicator clique.
+  // This is false by default for backwards compatibility.
+  bool skip_collective_clique = 13;
 }

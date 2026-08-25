@@ -18,12 +18,16 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status_matchers.h"
+#include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/service/pattern_matcher.h"
+#include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 
 namespace xla::gpu {
 namespace {
@@ -60,6 +64,83 @@ ENTRY entry {
   EXPECT_THAT(
       module->entry_computation()->root_instruction(),
       ::xla::GmockMatch(m::GetTupleElement(m::CustomCall(m::Parameter(0)), 0)));
+}
+
+TEST_F(ScanRewriterTest, RoutesSupportedMinorScanToFlyFusion) {
+  const char* hlo_text = R"(
+HloModule module
+
+add {
+  p0 = bf16[37] parameter(0)
+  p1 = bf16[37] parameter(1)
+  sum = bf16[37] add(p0, p1)
+  ROOT tuple = (bf16[37], bf16[37]) tuple(sum, sum)
+}
+
+ENTRY entry {
+  p0 = bf16[37,129]{1,0} parameter(0)
+  zero = bf16[] constant(0)
+  p1 = bf16[37]{0} broadcast(zero), dimensions={}
+  scan = (bf16[37,129]{1,0}, bf16[37]{0}) scan(p0, p1),
+    dimensions={1}, num_carries=1, is_associative=true, is_reverse=true,
+    to_apply=add
+  ROOT root = bf16[37,129]{1,0} get-tuple-element(scan), index=0
+}
+)";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
+
+  ScanRewriter pass(/*enable_flydsl=*/true);
+  ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kGetTupleElement);
+  HloInstruction* result_tuple = root->mutable_operand(0);
+  ASSERT_EQ(result_tuple->opcode(), HloOpcode::kTuple);
+  HloInstruction* fusion = result_tuple->mutable_operand(0);
+  ASSERT_EQ(fusion->opcode(), HloOpcode::kFusion);
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), kFlyFusionKind);
+
+  HloInstruction* call = fusion->fused_expression_root();
+  EXPECT_EQ(call->custom_call_target(), flydsl::kFlyScanCallTarget);
+  ASSERT_OK_AND_ASSIGN(CubScanOptions options,
+                       call->backend_config<CubScanOptions>());
+  EXPECT_EQ(options.vector_length(), 1);
+  EXPECT_EQ(options.row_length(), 129);
+  EXPECT_EQ(options.column_length(), 37);
+  EXPECT_TRUE(options.is_reverse());
+}
+
+TEST_F(ScanRewriterTest, LeavesLongRowsOnCub) {
+  const char* hlo_text = R"(
+HloModule module
+
+add {
+  p0 = f32[] parameter(0)
+  p1 = f32[] parameter(1)
+  sum = f32[] add(p0, p1)
+  ROOT tuple = (f32[], f32[]) tuple(sum, sum)
+}
+
+ENTRY entry {
+  p0 = f32[1025] parameter(0)
+  p1 = f32[] constant(0)
+  scan = (f32[1025], f32[]) scan(p0, p1), dimensions={0}, num_carries=1,
+    is_associative=true, to_apply=add
+  ROOT root = f32[1025] get-tuple-element(scan), index=0
+}
+)";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
+
+  ScanRewriter pass(/*enable_flydsl=*/true);
+  ASSERT_OK(pass.Run(module.get()));
+  HloInstruction* call =
+      module->entry_computation()->root_instruction()->mutable_operand(0);
+  ASSERT_EQ(call->opcode(), HloOpcode::kCustomCall);
+  EXPECT_EQ(call->custom_call_target(),
+            kCubDeviceScanUnassignedScratchSizeTarget);
 }
 
 TEST_F(ScanRewriterTest, SingleElementZeroInit) {

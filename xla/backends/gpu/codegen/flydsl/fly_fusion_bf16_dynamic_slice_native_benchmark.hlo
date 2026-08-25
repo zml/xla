@@ -1,0 +1,20 @@
+HloModule fly_fusion_bf16_dynamic_slice_native_benchmark
+
+%fused_dynamic_slice (p0: bf16[16386,8194], row: s32[], column: s32[]) -> bf16[16384,8192] {
+  %p0 = bf16[16386,8194]{1,0} parameter(0)
+  %row = s32[] parameter(1)
+  %column = s32[] parameter(2)
+  %absolute = bf16[16386,8194]{1,0} abs(%p0)
+  ROOT %result = bf16[16384,8192]{1,0}
+    dynamic-slice(%absolute, %row, %column),
+    dynamic_slice_sizes={16384,8192}
+}
+
+ENTRY %entry_computation (p0: bf16[16386,8194], row: s32[], column: s32[]) -> bf16[16384,8192] {
+  %p0 = bf16[16386,8194]{1,0} parameter(0)
+  %row = s32[] parameter(1)
+  %column = s32[] parameter(2)
+  ROOT %fusion = bf16[16384,8192]{1,0}
+    fusion(%p0, %row, %column), kind=kLoop,
+    calls=%fused_dynamic_slice
+}

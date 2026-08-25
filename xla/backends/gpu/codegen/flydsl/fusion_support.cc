@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -25,13 +26,15 @@ namespace xla::gpu::flydsl {
 namespace {
 
 bool IsSupportedCustomCallRoot(const HloInstruction& root) {
-  return GetFlyPagedAttentionDescriptor(root).has_value() ||
+  return GetFlyScanDescriptor(root).has_value() ||
+         GetFlyPagedAttentionDescriptor(root).has_value() ||
          GetFlyPagedAttentionSegmentedProducerDescriptor(root).has_value() ||
          GetFlyPagedAttentionSegmentedReducerDescriptor(root).has_value();
 }
 
 bool IsSupportedCustomCallRoot(const HloFusionAnalysis& analysis) {
-  return GetFlyPagedAttentionDescriptor(analysis).has_value() ||
+  return GetFlyScanDescriptor(analysis).has_value() ||
+         GetFlyPagedAttentionDescriptor(analysis).has_value() ||
          GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
              .has_value() ||
          GetFlyPagedAttentionSegmentedReducerDescriptor(analysis).has_value();

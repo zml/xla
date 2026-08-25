@@ -609,8 +609,10 @@ static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
     debug_options->set_xla_gpu_enable_flydsl_gemm(true);
     debug_options->set_xla_gpu_enable_flydsl_fusion(true);
     debug_options->set_xla_gpu_enable_triton_gemm(false);
+    // Keep XLA's small-collective runtime enabled. The late collective fusion
+    // is emitted through native Fly in replacement mode.
     debug_options->set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(
-        false);
+        true);
     add_autotune_backend(autotuner::Backend::FLY);
     add_autotune_backend(autotuner::Backend::FLY_FISSION);
     add_autotune_backend(autotuner::Backend::FLY_FUSION);

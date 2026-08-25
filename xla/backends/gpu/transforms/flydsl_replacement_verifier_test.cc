@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
@@ -66,15 +67,19 @@ TEST_F(FlyDslReplacementVerifierTest, DisabledModeAllowsTriton) {
               IsOkAndHolds(false));
 }
 
-TEST_F(FlyDslReplacementVerifierTest, EnabledModeAllowsFly) {
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnVerifiedModule(
-                              FusionModule("__fly_gemm")));
-  module->mutable_config()
-      .mutable_debug_options()
-      .set_xla_gpu_flydsl_replace_triton(true);
-  EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
-              IsOkAndHolds(false));
+TEST_F(FlyDslReplacementVerifierTest, EnabledModeAllowsEveryFlyKind) {
+  constexpr std::array<absl::string_view, 4> kKinds = {
+      "__fly", "__fly_gemm", "__fly_gemv", "__fly_collective"};
+  for (absl::string_view kind : kKinds) {
+    SCOPED_TRACE(kind);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                         ParseAndReturnVerifiedModule(FusionModule(kind)));
+    module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_flydsl_replace_triton(true);
+    EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
+                IsOkAndHolds(false));
+  }
 }
 
 TEST_F(FlyDslReplacementVerifierTest, RejectsEveryTritonFusionKind) {

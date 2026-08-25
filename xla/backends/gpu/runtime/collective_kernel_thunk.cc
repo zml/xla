@@ -316,18 +316,20 @@ absl::Status CollectiveKernelThunk::Prepare(const PrepareParams& params) {
     }
   }
 
-  ASSIGN_OR_RETURN(
-      std::vector<std::vector<GlobalDeviceId>> device_groups,
-      GetParticipatingDevicesGroups(*params.collective_params->device_assn,
-                                    collective_config_.replica_groups,
-                                    collective_config_.group_mode));
+  if (!skip_collective_clique_) {
+    ASSIGN_OR_RETURN(
+        std::vector<std::vector<GlobalDeviceId>> device_groups,
+        GetParticipatingDevicesGroups(*params.collective_params->device_assn,
+                                      collective_config_.replica_groups,
+                                      collective_config_.group_mode));
 
-  // Sort device groups: RequestClique expects pre-sorted groups.
-  absl::c_for_each(device_groups, [](auto& group) { absl::c_sort(group); });
-  absl::c_sort(device_groups);
+    // Sort device groups: RequestClique expects pre-sorted groups.
+    absl::c_for_each(device_groups, [](auto& group) { absl::c_sort(group); });
+    absl::c_sort(device_groups);
 
-  RETURN_IF_ERROR(params.collective_clique_requests->RequestClique(
-      clique_key, device_groups));
+    RETURN_IF_ERROR(params.collective_clique_requests->RequestClique(
+        clique_key, device_groups));
+  }
 
   absl::MutexLock lock(mutex_);
   if (!per_stream_memory_.contains(params.executor)) {
@@ -686,7 +688,7 @@ CollectiveKernelThunk::FromProto(
       thunk_proto.is_async(), std::move(buffers),
       thunk_proto.collective_kernel_enabled(), thunk_proto.kernel_name(),
       launch_dimensions, thunk_proto.shmem_bytes(), std::move(cubin),
-      thunk_proto.use_pdl());
+      thunk_proto.use_pdl(), thunk_proto.skip_collective_clique());
 }
 
 absl::StatusOr<ThunkProto> CollectiveKernelThunk::ToProto() const {
@@ -753,6 +755,7 @@ absl::StatusOr<ThunkProto> CollectiveKernelThunk::ToProto() const {
   }
 
   thunk_proto->set_use_pdl(use_pdl_);
+  thunk_proto->set_skip_collective_clique(skip_collective_clique_);
 
   return proto;
 }

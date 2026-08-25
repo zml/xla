@@ -1,0 +1,15 @@
+HloModule fly_fusion_bf16_rectangular_edge_pad_native_benchmark
+
+%fused_rectangular_edge_pad (p0: bf16[16384,8190]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8190]{1,0} parameter(0)
+  %absolute = bf16[16384,8190]{1,0} abs(%p0)
+  %zero = bf16[] constant(0)
+  ROOT %result = bf16[16384,8192]{1,0} pad(%absolute, %zero),
+    padding=0_0x1_1
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8190]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8190]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kLoop,
+    calls=%fused_rectangular_edge_pad
+}

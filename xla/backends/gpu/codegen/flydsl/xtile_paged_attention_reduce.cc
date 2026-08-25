@@ -30,6 +30,7 @@ limitations under the License.
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -54,7 +55,8 @@ namespace {
 using mlir::Value;
 
 constexpr int64_t kWaveSize = 64;
-constexpr int64_t kBlockThreads = 128;
+constexpr int64_t kBlockThreads = kWaveSize;
+constexpr int64_t kOutputElementsPerThread = 2;
 
 Value IndexConstant(mlir::ImplicitLocOpBuilder& builder, int64_t value) {
   return mlir::arith::ConstantIndexOp::create(builder, value);
@@ -164,7 +166,8 @@ class FlyXTilePagedAttentionSegmentedReducerEmitter final
         << "reducer kernel arguments: " << entry_function.getNumArguments();
     TF_RET_CHECK(descriptor_.num_segments > 1 &&
                  descriptor_.num_segments <= 256 &&
-                 descriptor_.head_dimension == kBlockThreads);
+                 descriptor_.head_dimension ==
+                     kBlockThreads * kOutputElementsPerThread);
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
@@ -175,6 +178,10 @@ class FlyXTilePagedAttentionSegmentedReducerEmitter final
     mlir::Type element_type = descriptor_.element_type == BF16
                                   ? builder.getBF16Type()
                                   : builder.getF16Type();
+    auto f32_pair_type =
+        mlir::VectorType::get({kOutputElementsPerThread}, builder.getF32Type());
+    auto output_pair_type =
+        mlir::VectorType::get({kOutputElementsPerThread}, element_type);
     Value zero = F32Constant(builder, 0.0f);
     Value one = F32Constant(builder, 1.0f);
     Value minus_inf = NegativeInfinity(builder);
@@ -278,7 +285,15 @@ class FlyXTilePagedAttentionSegmentedReducerEmitter final
           builder, part_scale[lane_part], inverse_sum));
     }
 
-    Value result = zero;
+    // A single Wave64 owns all D=128 output elements. Each lane carries two
+    // adjacent columns, so the state reduction and weight broadcasts execute
+    // once instead of being duplicated by two identical waves. The paired
+    // F32 loads and BF16/F16 stores are naturally aligned because every
+    // partial row and output row is 128 elements wide.
+    Value output_column = Mul(
+        builder, thread, IndexConstant(builder, kOutputElementsPerThread));
+    Value result =
+        mlir::vector::BroadcastOp::create(builder, f32_pair_type, zero);
     for (int64_t part = 0; part < descriptor_.num_segments; ++part) {
       Value source_lane_byte = mlir::arith::ConstantIntOp::create(
           builder, builder.getI32Type(), (part % kWaveSize) * 4);
@@ -301,10 +316,12 @@ class FlyXTilePagedAttentionSegmentedReducerEmitter final
           IndexConstant(builder, descriptor_.head_dimension));
       Value partial = EmitBufferLoad(
           builder, entry_function.getLoc(), partial_output,
-          Add(builder, partial_base, thread), builder.getF32Type());
+          Add(builder, partial_base, output_column), f32_pair_type);
+      Value weight_pair = mlir::vector::BroadcastOp::create(
+          builder, f32_pair_type, weight);
       result = mlir::arith::AddFOp::create(
           builder, result,
-          mlir::arith::MulFOp::create(builder, partial, weight));
+          mlir::arith::MulFOp::create(builder, partial, weight_pair));
     }
     Value output_offset = Add(
         builder,
@@ -314,9 +331,9 @@ class FlyXTilePagedAttentionSegmentedReducerEmitter final
                     IndexConstant(builder, descriptor_.query_heads)),
                 query_head),
             IndexConstant(builder, descriptor_.head_dimension)),
-        thread);
+        output_column);
     Value output_value =
-        mlir::arith::TruncFOp::create(builder, element_type, result);
+        mlir::arith::TruncFOp::create(builder, output_pair_type, result);
     output = EmitBufferStore(builder, entry_function.getLoc(), output_value,
                              output, output_offset);
     mlir::func::ReturnOp::create(builder, output);

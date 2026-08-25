@@ -274,3 +274,93 @@ diff --git a/lib/Dialect/FlyROCDL/GFX1250/CopyAtom.cpp b/lib/Dialect/FlyROCDL/GF
    ArrayAttr noAliasScopes;
    if (isLoad)
      ROCDL::TensorLoadToLDSOp::create(builder, loc, dgroup0, dgroup1, dg2, dg3, dg4, cachePolicy,
+
+diff --git a/lib/Conversion/FlyToROCDL/FlyToROCDL.cpp b/lib/Conversion/FlyToROCDL/FlyToROCDL.cpp
+--- a/lib/Conversion/FlyToROCDL/FlyToROCDL.cpp
++++ b/lib/Conversion/FlyToROCDL/FlyToROCDL.cpp
+@@ -11,6 +11,7 @@
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+ #include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Transforms/DialectConversion.h"
+@@ -61,20 +62,20 @@ unsigned mapAttrToLLVMAddressSpace(Attribute attr) {
+ // Create a freshly named LDS global of `[nbytes x i8]` in `addrSpace`, inserted
+ // at the start of `moduleOp`. The symbol name is `prefix` followed by a counter
+ // chosen to avoid collisions with existing globals in the module. Shared by
+ // the static-LDS `make_ptr` and dynamic-LDS `get_dyn_shared` lowerings.
+ static LLVM::GlobalOp createLDSGlobal(ConversionPatternRewriter &rewriter,
+-                                      gpu::GPUModuleOp moduleOp, Location loc, StringRef prefix,
++                                      Block *moduleBody, Location loc, StringRef prefix,
+                                       int64_t nbytes, int64_t align, unsigned addrSpace) {
+   llvm::StringSet<> existingNames;
+-  for (auto globalOp : moduleOp.getBody()->getOps<LLVM::GlobalOp>())
++  for (auto globalOp : moduleBody->getOps<LLVM::GlobalOp>())
+     existingNames.insert(globalOp.getSymName());
+
+   unsigned counter = 0;
+   SmallString<128> symName = SymbolTable::generateSymbolName<128>(
+       prefix, [&](StringRef candidate) { return existingNames.contains(candidate); }, counter);
+
+   OpBuilder::InsertionGuard guard(rewriter);
+-  rewriter.setInsertionPointToStart(moduleOp.getBody());
++  rewriter.setInsertionPointToStart(moduleBody);
+
+   auto arrayTy = LLVM::LLVMArrayType::get(IntegerType::get(rewriter.getContext(), 8), nbytes);
+   auto globalOp = LLVM::GlobalOp::create(rewriter, loc, arrayTy,
+@@ -128,12 +129,18 @@ public:
+         return rewriter.notifyMatchFailure(
+             op, "shared make_ptr requires allocBytes, allocAlign in dictAttrs");
+
+-      auto moduleOp = op->getParentOfType<gpu::GPUModuleOp>();
+-      if (!moduleOp)
++      Block *moduleBody = nullptr;
++      if (auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>()) {
++        moduleBody = gpuModule.getBody();
++      } else if (auto builtinModule = op->getParentOfType<ModuleOp>()) {
++        moduleBody = builtinModule.getBody();
++      }
++      if (!moduleBody)
+         return op->emitError("shared make_ptr must be inside a gpu.module");
+
+       LLVM::GlobalOp global =
+-          createLDSGlobal(rewriter, moduleOp, loc, "__shared_alloc", allocBytesAttr.getInt(),
++          createLDSGlobal(rewriter, moduleBody, loc, "__shared_alloc", allocBytesAttr.getInt(),
+                           allocAlignAttr.getInt(), /*addrSpace=*/3);
+       rewriter.replaceOpWithNewOp<LLVM::AddressOfOp>(op, global);
+       return success();
+@@ -169,10 +176,15 @@ public:
+     auto flyPtrTy = cast<fly::PointerType>(op.getResult().getType());
+     unsigned addrSpace = mapAttrToLLVMAddressSpace(flyPtrTy.getAddressSpace());
+
+-    auto moduleOp = op->getParentOfType<gpu::GPUModuleOp>();
+-    if (!moduleOp)
++    Block *moduleBody = nullptr;
++    if (auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>()) {
++      moduleBody = gpuModule.getBody();
++    } else if (auto builtinModule = op->getParentOfType<ModuleOp>()) {
++      moduleBody = builtinModule.getBody();
++    }
++    if (!moduleBody)
+       return op->emitError("get_dyn_shared must be inside a gpu.module");
+
+     // Dynamic shared memory has a single logical region per kernel; reuse an
+@@ -180,14 +192,14 @@ public:
+     // `get_dyn_shared` ops resolve to the same base symbol.
+     LLVM::GlobalOp sharedGlobal;
+-    for (auto globalOp : moduleOp.getBody()->getOps<LLVM::GlobalOp>()) {
++    for (auto globalOp : moduleBody->getOps<LLVM::GlobalOp>()) {
+       if (auto arrayType = dyn_cast<LLVM::LLVMArrayType>(globalOp.getType())) {
+         if (globalOp.getAddrSpace() == addrSpace && arrayType.getNumElements() == 0 &&
+             globalOp.getAlignment().value_or(0) == 1024) {
+           sharedGlobal = globalOp;
+           break;
+         }
+       }
+     }
+     if (!sharedGlobal) {
+-      sharedGlobal = createLDSGlobal(rewriter, moduleOp, loc, "__dynamic_shared",
++      sharedGlobal = createLDSGlobal(rewriter, moduleBody, loc, "__dynamic_shared",
+                                      /*nbytes=*/0, /*align=*/1024, addrSpace);
+     }

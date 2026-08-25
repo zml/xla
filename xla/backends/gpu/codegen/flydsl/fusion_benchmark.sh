@@ -26,6 +26,38 @@ export HIPBLASLT_PRELOAD_KERNELS="${HIPBLASLT_PRELOAD_KERNELS:-0}"
 export HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL="${HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL:-1}"
 
 declare -A hlo_files=(
+  [concatenate]="fly_fusion_bf16_concatenate_benchmark.hlo"
+  [concatenate_native]="fly_fusion_bf16_concatenate_native_benchmark.hlo"
+  [contiguous_slice]="fly_fusion_bf16_contiguous_slice_benchmark.hlo"
+  [rectangular_slice]="fly_fusion_bf16_rectangular_slice_benchmark.hlo"
+  [rank4_rectangular_slice]="fly_fusion_bf16_rank4_rectangular_slice_benchmark.hlo"
+  [dynamic_slice]="fly_fusion_bf16_dynamic_slice_benchmark.hlo"
+  [rank4_dynamic_slice]="fly_fusion_bf16_rank4_dynamic_slice_benchmark.hlo"
+  [dynamic_slice_native]="fly_fusion_bf16_dynamic_slice_native_benchmark.hlo"
+  [dynamic_update_slice]="fly_fusion_bf16_dynamic_update_slice_benchmark.hlo"
+  [dynamic_update_slice_native]="fly_fusion_bf16_dynamic_update_slice_native_benchmark.hlo"
+  [rank4_dynamic_update_slice]="fly_fusion_bf16_rank4_dynamic_update_slice_benchmark.hlo"
+  [rank4_dynamic_update_slice_native]="fly_fusion_bf16_rank4_dynamic_update_slice_native_benchmark.hlo"
+  [flat_reverse]="fly_fusion_bf16_flat_reverse_benchmark.hlo"
+  [flat_reverse_native]="fly_fusion_bf16_flat_reverse_native_benchmark.hlo"
+  [partial_reverse]="fly_fusion_bf16_partial_reverse_benchmark.hlo"
+  [partial_reverse_native]="fly_fusion_bf16_partial_reverse_native_benchmark.hlo"
+  [rank4_partial_reverse]="fly_fusion_bf16_rank4_partial_reverse_benchmark.hlo"
+  [rank4_partial_reverse_native]="fly_fusion_bf16_rank4_partial_reverse_native_benchmark.hlo"
+  [flat_edge_pad]="fly_fusion_bf16_flat_edge_pad_benchmark.hlo"
+  [flat_edge_pad_native]="fly_fusion_bf16_flat_edge_pad_native_benchmark.hlo"
+  [rectangular_edge_pad]="fly_fusion_bf16_rectangular_edge_pad_benchmark.hlo"
+  [rectangular_edge_pad_native]="fly_fusion_bf16_rectangular_edge_pad_native_benchmark.hlo"
+  [interior_pad]="fly_fusion_bf16_interior_pad_benchmark.hlo"
+  [interior_pad_native]="fly_fusion_bf16_interior_pad_native_benchmark.hlo"
+  [rank4_interior_pad]="fly_fusion_bf16_rank4_interior_pad_benchmark.hlo"
+  [rank4_interior_pad_native]="fly_fusion_bf16_rank4_interior_pad_native_benchmark.hlo"
+  [reduce_window]="fly_fusion_bf16_reduce_window_benchmark.hlo"
+  [reduce_window_native]="fly_fusion_bf16_reduce_window_native_benchmark.hlo"
+  [reduce_window_15]="fly_fusion_bf16_reduce_window_15_benchmark.hlo"
+  [reduce_window_15_native]="fly_fusion_bf16_reduce_window_15_native_benchmark.hlo"
+  [scan]="fly_fusion_bf16_scan_256_preconfigured_benchmark.hlo"
+  [trailing_broadcast]="fly_fusion_bf16_trailing_broadcast_benchmark.hlo"
   [softmax]="fly_fusion_bf16_softmax_benchmark.hlo"
   [softmax_transformer]="fly_fusion_bf16_transformer_softmax_benchmark.hlo"
   [softmax_bf16_tail]="fly_fusion_bf16_softmax_tail_benchmark.hlo"
@@ -73,7 +105,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-  echo "Available benchmarks: softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce elementwise elementwise_f16 elementwise_f32 ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
+    echo "Available benchmarks: concatenate concatenate_native contiguous_slice rectangular_slice rank4_rectangular_slice dynamic_slice rank4_dynamic_slice dynamic_slice_native dynamic_update_slice dynamic_update_slice_native rank4_dynamic_update_slice rank4_dynamic_update_slice_native flat_edge_pad flat_edge_pad_native rectangular_edge_pad rectangular_edge_pad_native interior_pad interior_pad_native rank4_interior_pad rank4_interior_pad_native reduce_window reduce_window_native reduce_window_15 reduce_window_15_native scan flat_reverse flat_reverse_native partial_reverse partial_reverse_native rank4_partial_reverse rank4_partial_reverse_native trailing_broadcast softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce elementwise elementwise_f16 elementwise_f32 ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"

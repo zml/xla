@@ -573,7 +573,9 @@ absl::StatusOr<GpuTopology> InferGpuTopology(
 
   VLOG(1) << "Found stream executor, and not a target compilation environment. "
              "Performing JIT compilation.";
-  GpuTargetConfig local_target_config = GpuTargetConfig{stream_exec};
+  GpuTargetConfig local_target_config = GpuTargetConfig{
+      stream_exec,
+      !debug_opts.xla_gpu_experimental_disable_binary_libraries()};
 
   int64_t device_memory_size =
       local_target_config.device_description.device_memory_size();
@@ -663,6 +665,7 @@ void LogDebugOptions(HloModule* hlo_module) {
 }
 
 absl::Status RunPreSPMDPartitionerPasses(HloModule* hlo_module,
+                                         bool enable_flydsl_scan,
                                          CompilationStats* compilation_stats) {
   HloPassPipeline pre_spmd_pipeline("pre-spmd-partitioner", compilation_stats);
   // Run some IR cleanup passes before running the SPMD partitioning
@@ -670,7 +673,7 @@ absl::Status RunPreSPMDPartitionerPasses(HloModule* hlo_module,
   pre_spmd_pipeline.AddPass<CuDnnCustomCallConverter>();
   pre_spmd_pipeline.AddPass<CompositeRewriter>();
   pre_spmd_pipeline.AddPass<ConvertMemoryPlacementToInternalAnnotations>();
-  pre_spmd_pipeline.AddPass<ScanRewriter>();
+  pre_spmd_pipeline.AddPass<ScanRewriter>(enable_flydsl_scan);
   pre_spmd_pipeline.AddPass<FlattenCallGraph>();
   pre_spmd_pipeline.AddPass<CallInliner>(
       /*single_call_site=*/false, /*update_domain=*/false,
@@ -1766,7 +1769,11 @@ absl::Status GpuCompiler::OptimizeHloModule(
     RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
   }
 
-  RETURN_IF_ERROR(RunPreSPMDPartitionerPasses(hlo_module, compilation_stats));
+  const bool enable_flydsl_scan =
+      device_description.gpu_compute_capability().IsRocm() &&
+      hlo_module->config().debug_options().xla_gpu_enable_flydsl_fusion();
+  RETURN_IF_ERROR(RunPreSPMDPartitionerPasses(
+      hlo_module, enable_flydsl_scan, compilation_stats));
   // Set max_windowed_einsum_iteration to slice_size, as there will be
   // significant overhead when scaled beyond the maximum size of the
   // fast-interconnect domain.

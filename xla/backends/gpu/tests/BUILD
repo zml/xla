@@ -1685,6 +1685,7 @@ xla_test(
         "//xla/service/gpu:backend_configs_cc",
         "//xla/stream_executor/gpu:all_reduce_kernel",
         "//xla/tests:literal_test_util",
+        "//xla/tsl/platform:status_matchers",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/platform:test",
         "@com_google_absl//absl/log",

@@ -478,6 +478,74 @@ AsyncThunkSequence MlirKernelFusion::Emit(
   });
 }
 
+xla::Future<MlirKernelFusion::EmitResult> MlirKernelFusion::Emit(
+    IrEmitterContext& ir_emitter_context,
+    const HloFusionInstruction& fusion,
+    const HloInstruction* instr_override,
+    absl::Span<const Shape> unmanaged_arguments) const {
+  ASSIGN_OR_RETURN(
+      emitters::KernelArguments kernel_arguments,
+      emitters::KernelArguments::Create(
+          ir_emitter_context.buffer_assignment(), GetDefaultBufferAlignment(),
+          instr_override != nullptr ? instr_override : &fusion,
+          unmanaged_arguments));
+
+  const HloComputation* computation = fusion.fused_instructions_computation();
+  auto generate = [&]() -> xla::Future<KernelReuseCache::Entry> {
+    const std::string kernel_name =
+        ir_emitter_context.GetSanitizedUniqueName(std::string(fusion.name()));
+    return CreateLLVMModule(
+               ir_emitter_context.gpu_device_info(), fusion, kernel_name,
+               &ir_emitter_context.buffer_assignment(),
+               ir_emitter_context.kernel_compiler(),
+               ir_emitter_context.BorrowMlirContext())
+        .Map([kernel_compiler = ir_emitter_context.kernel_compiler(),
+              gpu_device_info = ir_emitter_context.gpu_device_info(),
+              target_triple = ir_emitter_context.target_triple(),
+              data_layout = ir_emitter_context.data_layout(), kernel_name,
+              launch_dims = launch_dimensions(),
+              kernel_arguments](LlvmKernelSource source)
+                 -> xla::Future<KernelReuseCache::Entry> {
+          llvm::orc::ThreadSafeModule module =
+              std::move(source).thread_safe_module();
+          llvm::Module* llvm_module = module.getModuleUnlocked();
+          llvm_module->setDataLayout(data_layout);
+          llvm_module->setTargetTriple(target_triple);
+
+          llvm::Function* kernel = llvm_module->getFunction(kernel_name);
+          TF_RET_CHECK(kernel != nullptr)
+              << "MLIR kernel module does not contain entry function "
+              << kernel_name;
+          AddRanges(kernel, launch_dims, llvm_module);
+          AnnotateAttrsIfUnset(kernel_arguments, *kernel);
+          llvm::IRBuilder<> builder(llvm_module->getContext());
+          AnnotateFunctionAsGpuKernel(llvm_module, kernel, &builder);
+          RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(
+              gpu_device_info, launch_dims, kernel, llvm_module));
+
+          return kernel_compiler
+              ->CompileToTargetBinary(
+                  LlvmKernelSource{std::move(module)})
+              .Map([kernel_name, launch_dims](
+                       const std::vector<uint8_t>& binary) {
+                return KernelReuseCache::Entry{
+                    kernel_name, launch_dims, /*cluster_dim=*/std::nullopt,
+                    /*shmem_bytes=*/0, binary};
+              });
+        });
+  };
+
+  auto [future_entry, cached] = ir_emitter_context.kernel_cache().GetWithStatus(
+      computation, kernel_arguments.args(),
+      /*discriminator=*/"MlirKernelFusionUnmanaged", generate);
+  return future_entry.Map(
+      [kernel_arguments = std::move(kernel_arguments)](
+          const KernelReuseCache::Entry* entry) mutable
+          -> absl::StatusOr<EmitResult> {
+        return EmitResult{*entry, std::move(kernel_arguments)};
+      });
+}
+
 xla::Future<LlvmKernelSource> MlirKernelFusion::CreateLLVMModule(
     const se::DeviceDescription& device, const HloFusionInstruction& fusion,
     const std::string& entry_function_name,
@@ -762,6 +830,14 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   const bool has_fly_operations = flydsl::HasOperations(module.get());
   const bool is_generic_fly_fusion = flydsl::IsGenericFusion(module.get());
   if (has_fly_operations) {
+    // Native Fly emitters build gpu.func bodies directly.  Lower their SCF
+    // before Fly's dialect conversion: unlike the ordinary XLA emitter path,
+    // these bodies do not pass through AddLoopTransformationPasses, and the
+    // Fly type converter must not be asked to legalize scf region terminators
+    // nested under a converted gpu.func signature.
+    if (has_native_gpu_entry) {
+      pm.addPass(mlir::createSCFToControlFlowPass());
+    }
     flydsl::AddLoweringPasses(pm);
   }
 #endif

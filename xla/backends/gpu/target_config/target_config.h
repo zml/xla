@@ -50,7 +50,8 @@ enum class GpuModel {
 
 // Description of a target device for compilation.
 struct GpuTargetConfig {
-  explicit GpuTargetConfig(stream_executor::StreamExecutor* s);
+  explicit GpuTargetConfig(stream_executor::StreamExecutor* s,
+                           bool query_dnn_version = true);
 
   static absl::StatusOr<GpuTargetConfig> FromProto(
       const stream_executor::GpuTargetConfigProto& proto);
