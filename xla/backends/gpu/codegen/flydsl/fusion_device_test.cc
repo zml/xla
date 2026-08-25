@@ -50,6 +50,8 @@ class FlyFusionPipelineDeviceTest
     DebugOptions debug_options = HloPjRtGpuTestBase::GetDebugOptionsForTest();
     debug_options.set_xla_gpu_enable_flydsl_gemm(true);
     debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+    debug_options.set_xla_gpu_flydsl_replace_triton(true);
+    debug_options.set_xla_gpu_enable_triton_gemm(false);
     debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(false);
     debug_options.set_xla_gpu_autotune_level(0);
     return debug_options;
@@ -62,6 +64,8 @@ class FlyFusionAutotuningPipelineDeviceTest
   DebugOptions GetDebugOptionsForTest() const override {
     DebugOptions debug_options = HloPjRtGpuTestBase::GetDebugOptionsForTest();
     debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+    debug_options.set_xla_gpu_flydsl_replace_triton(true);
+    debug_options.set_xla_gpu_enable_triton_gemm(false);
     debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(true);
     debug_options.set_xla_gpu_autotune_level(3);
     debug_options.clear_xla_gpu_experimental_autotune_backends();
@@ -909,6 +913,85 @@ ENTRY main {
 })";
 
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       ExecutesNativeFlyForwardAndReverseScans) {
+  constexpr absl::string_view kHloTemplate = R"(
+HloModule fly_native_scan
+
+add {
+  lhs = f32[257] parameter(0)
+  rhs = f32[257] parameter(1)
+  sum = f32[257] add(lhs, rhs)
+  ROOT result = (f32[257], f32[257]) tuple(sum, sum)
+}
+
+ENTRY main {
+  input = f32[257,129]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  init = f32[257]{0} broadcast(zero), dimensions={}
+  scan = (f32[257,129]{1,0}, f32[257]{0}) scan(input, init),
+    dimensions={1}, num_carries=1, is_associative=true,
+    is_reverse=__REVERSE__, to_apply=add
+  ROOT output = f32[257,129]{1,0} get-tuple-element(scan), index=0
+}
+)";
+  for (bool reverse : {false, true}) {
+    std::string hlo = absl::StrReplaceAll(
+        kHloTemplate, {{"__REVERSE__", reverse ? "true" : "false"}});
+    EXPECT_TRUE(
+        RunAndCompare(hlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+  }
+}
+
+TEST_F(FlyFusionPipelineDeviceTest, ExecutesNativeFlyS32ScanExactly) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_s32_scan
+
+add {
+  lhs = s32[19] parameter(0)
+  rhs = s32[19] parameter(1)
+  sum = s32[19] add(lhs, rhs)
+  ROOT result = (s32[19], s32[19]) tuple(sum, sum)
+}
+
+ENTRY main {
+  input = s32[19,193]{1,0} parameter(0)
+  zero = s32[] constant(0)
+  init = s32[19]{0} broadcast(zero), dimensions={}
+  scan = (s32[19,193]{1,0}, s32[19]{0}) scan(input, init),
+    dimensions={1}, num_carries=1, is_associative=true, to_apply=add
+  ROOT output = s32[19,193]{1,0} get-tuple-element(scan), index=0
+}
+)";
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest, ExecutesNativeFlyBf16AndF16Scans) {
+  constexpr absl::string_view kHloTemplate = R"(
+HloModule fly_native_low_precision_scan
+
+add {
+  lhs = __TYPE__[73] parameter(0)
+  rhs = __TYPE__[73] parameter(1)
+  sum = __TYPE__[73] add(lhs, rhs)
+  ROOT result = (__TYPE__[73], __TYPE__[73]) tuple(sum, sum)
+}
+
+ENTRY main {
+  input = __TYPE__[73,193]{1,0} parameter(0)
+  zero = __TYPE__[] constant(0)
+  init = __TYPE__[73]{0} broadcast(zero), dimensions={}
+  scan = (__TYPE__[73,193]{1,0}, __TYPE__[73]{0}) scan(input, init),
+    dimensions={1}, num_carries=1, is_associative=true, to_apply=add
+  ROOT output = __TYPE__[73,193]{1,0} get-tuple-element(scan), index=0
+}
+)";
+  for (absl::string_view type : {"bf16", "f16"}) {
+    std::string hlo = absl::StrReplaceAll(kHloTemplate, {{"__TYPE__", type}});
+    EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{/*aabs=*/0.5, /*arel=*/0.06}));
+  }
 }
 
 TEST_F(FlyFusionDeviceTest, Bf16Softmax64x4096) {
@@ -2013,7 +2096,7 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/2e-2, /*arel=*/2e-2}));
 }
 
-TEST_F(FlyFusionDeviceTest, GenericDynamicSliceBitcast) {
+TEST_F(FlyFusionDeviceTest, NativeDynamicSliceBitcast) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_generic_dynamic_slice_bitcast
 
@@ -2040,9 +2123,37 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
-TEST_F(FlyFusionDeviceTest, GenericInPlaceDynamicUpdateSlice) {
+TEST_F(FlyFusionDeviceTest, NativeS64DynamicSliceClampsConstants) {
   constexpr absl::string_view kHlo = R"(
-HloModule fly_generic_in_place_dynamic_update_slice
+HloModule fly_native_s64_dynamic_slice_constants
+
+slice {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  row = s64[] constant(-4294967297)
+  column = s64[] constant(4294967298)
+  ROOT result = bf16[15,65]{1,0} dynamic-slice(p0, row, column),
+    dynamic_slice_sizes={15,65}
+}
+
+ENTRY main {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,65]{1,0} fusion(p0), kind=kCustom, calls=slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeInPlaceDynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_in_place_dynamic_update_slice
 
 update_slice {
   input = f32[64,96]{1,0} parameter(0)
@@ -2074,35 +2185,579 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
-TEST_F(FlyFusionDeviceTest, GenericBf16Concatenate) {
+TEST_F(FlyFusionDeviceTest, NativeS64InPlaceDynamicUpdateSlice) {
   constexpr absl::string_view kHlo = R"(
-HloModule fly_generic_bf16_concatenate
+HloModule fly_native_s64_in_place_dynamic_update_slice
 
-concatenate {
-  p0 = bf16[33]{0} parameter(0)
-  p1 = bf16[31]{0} parameter(1)
-  abs = bf16[33]{0} abs(p0)
-  negate = bf16[31]{0} negate(p1)
-  ROOT result = bf16[64]{0} concatenate(abs, negate), dimensions={0}
+update_slice {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s64[] parameter(2)
+  column = s64[] parameter(3)
+  absolute = bf16[15,65]{1,0} abs(update)
+  ROOT result = bf16[19,67]{1,0} dynamic-update-slice(
+      input, absolute, row, column)
 }
 
 ENTRY main {
-  p0 = bf16[33]{0} parameter(0)
-  p1 = bf16[31]{0} parameter(1)
-  ROOT fusion = bf16[64]{0} fusion(p0, p1), kind=kCustom,
-    calls=concatenate,
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  row = s64[] parameter(2)
+  column = s64[] parameter(3)
+  ROOT fusion = bf16[19,67]{1,0}
+    fusion(input, update, row, column), kind=kCustom, calls=update_slice,
     backend_config={"fusion_backend_config":{
       "kind":"__fly",
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["4"]}],
-        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest,
+       NativeOutOfPlaceDynamicUpdateSliceClampsConstantStarts) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_out_of_place_dynamic_update_slice
+
+update_slice {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  absolute = bf16[15,65]{1,0} abs(update)
+  row = s32[] constant(-7)
+  column = s32[] constant(200)
+  result = bf16[19,67]{1,0} dynamic-update-slice(
+      input, absolute, row, column)
+  ROOT tuple = (bf16[19,67]{1,0}, bf16[19,67]{1,0})
+      tuple(result, input)
+}
+
+ENTRY main {
+  input = bf16[19,67]{1,0} parameter(0)
+  update = bf16[15,65]{1,0} parameter(1)
+  ROOT fusion = (bf16[19,67]{1,0}, bf16[19,67]{1,0})
+    fusion(input, update), kind=kCustom, calls=update_slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4S64InPlaceDynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_s64_in_place_dynamic_update_slice
+
+update_slice {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  start0 = s64[] parameter(2)
+  start1 = s64[] parameter(3)
+  start2 = s64[] parameter(4)
+  start3 = s64[] parameter(5)
+  absolute = bf16[2,4,6,9]{3,2,1,0} abs(update)
+  ROOT result = bf16[4,6,8,11]{3,2,1,0} dynamic-update-slice(
+    input, absolute, start0, start1, start2, start3)
+}
+
+ENTRY main {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  start0 = s64[] parameter(2)
+  start1 = s64[] parameter(3)
+  start2 = s64[] parameter(4)
+  start3 = s64[] parameter(5)
+  ROOT fusion = bf16[4,6,8,11]{3,2,1,0} fusion(
+    input, update, start0, start1, start2, start3), kind=kCustom,
+    calls=update_slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
 })";
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
-TEST_F(FlyFusionDeviceTest, GenericF32HighPadding) {
+TEST_F(FlyFusionDeviceTest,
+       NativeRank4OutOfPlaceDynamicUpdateSliceClampsConstants) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_out_of_place_dynamic_update_slice
+
+update_slice {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  absolute = bf16[2,4,6,9]{3,2,1,0} abs(update)
+  start0 = s64[] constant(-4294967297)
+  start1 = s64[] constant(4294967298)
+  start2 = s64[] constant(1)
+  start3 = s64[] constant(2)
+  result = bf16[4,6,8,11]{3,2,1,0} dynamic-update-slice(
+    input, absolute, start0, start1, start2, start3)
+  ROOT tuple = (bf16[4,6,8,11]{3,2,1,0}, bf16[4,6,8,11]{3,2,1,0})
+    tuple(result, input)
+}
+
+ENTRY main {
+  input = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  update = bf16[2,4,6,9]{3,2,1,0} parameter(1)
+  ROOT fusion = (bf16[4,6,8,11]{3,2,1,0},
+                 bf16[4,6,8,11]{3,2,1,0}) fusion(input, update),
+    kind=kCustom, calls=update_slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank1DynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank1_dynamic_update_slice
+
+update_slice {
+  input = bf16[67]{0} parameter(0)
+  update = bf16[65]{0} parameter(1)
+  start = s32[] parameter(2)
+  absolute = bf16[65]{0} abs(update)
+  ROOT result = bf16[67]{0} dynamic-update-slice(input, absolute, start)
+}
+
+ENTRY main {
+  input = bf16[67]{0} parameter(0)
+  update = bf16[65]{0} parameter(1)
+  start = s32[] parameter(2)
+  ROOT fusion = bf16[67]{0} fusion(input, update, start), kind=kCustom,
+    calls=update_slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16Concatenate) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_generic_bf16_concatenate
+
+concatenate {
+  p0 = bf16[17]{0} parameter(0)
+  p1 = bf16[16]{0} parameter(1)
+  p2 = bf16[31]{0} parameter(2)
+  abs0 = bf16[17]{0} abs(p0)
+  negate = bf16[16]{0} negate(p1)
+  abs2 = bf16[31]{0} abs(p2)
+  ROOT result = bf16[64]{0} concatenate(abs0, negate, abs2), dimensions={0}
+}
+
+ENTRY main {
+  p0 = bf16[17]{0} parameter(0)
+  p1 = bf16[16]{0} parameter(1)
+  p2 = bf16[31]{0} parameter(2)
+  ROOT fusion = bf16[64]{0} fusion(p0, p1, p2), kind=kCustom,
+    calls=concatenate,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedBf16TrailingBroadcast) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_ragged_bf16_broadcast
+
+elementwise {
+  p0 = bf16[17,65]{1,0} parameter(0)
+  row = bf16[65]{0} parameter(1)
+  absolute_row = bf16[65]{0} abs(row)
+  rows = bf16[17,65]{1,0} broadcast(absolute_row), dimensions={1}
+  ROOT result = bf16[17,65]{1,0} add(p0, rows)
+}
+
+ENTRY main {
+  p0 = bf16[17,65]{1,0} parameter(0)
+  row = bf16[65]{0} parameter(1)
+  ROOT fusion = bf16[17,65]{1,0} fusion(p0, row), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeUnalignedBf16ContiguousSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_unaligned_bf16_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  absolute = bf16[19,67]{1,0} abs(p0)
+  ROOT result = bf16[15,67]{1,0} slice(absolute),
+    slice={[2:17], [0:67]}
+}
+
+ENTRY main {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16GappedRectangularSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_gapped_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  absolute = bf16[19,67]{1,0} abs(p0)
+  ROOT result = bf16[15,65]{1,0} slice(absolute),
+    slice={[2:17], [1:66]}
+}
+
+ENTRY main {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[15,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4Bf16RectangularSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_bf16_slice
+
+elementwise {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  absolute = bf16[4,6,8,11]{3,2,1,0} abs(p0)
+  ROOT result = bf16[2,4,6,9]{3,2,1,0} slice(absolute),
+    slice={[1:3], [1:5], [1:7], [1:10]}
+}
+
+ENTRY main {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[2,4,6,9]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4S64DynamicSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_s64_dynamic_slice
+
+elementwise {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  start0 = s64[] parameter(1)
+  start1 = s64[] parameter(2)
+  start2 = s64[] parameter(3)
+  start3 = s64[] parameter(4)
+  absolute = bf16[4,6,8,11]{3,2,1,0} abs(p0)
+  ROOT result = bf16[2,4,6,9]{3,2,1,0} dynamic-slice(
+    absolute, start0, start1, start2, start3),
+    dynamic_slice_sizes={2,4,6,9}
+}
+
+ENTRY main {
+  p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
+  start0 = s64[] parameter(1)
+  start1 = s64[] parameter(2)
+  start2 = s64[] parameter(3)
+  start3 = s64[] parameter(4)
+  ROOT fusion = bf16[2,4,6,9]{3,2,1,0} fusion(
+    p0, start0, start1, start2, start3), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedBf16FlatReverse) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_ragged_bf16_reverse
+
+elementwise {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  absolute = bf16[3,67]{1,0} abs(p0)
+  ROOT result = bf16[3,67]{1,0} reverse(absolute), dimensions={0,1}
+}
+
+ENTRY main {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT fusion = bf16[3,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedBf16PartialDimensionReverse) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_ragged_bf16_partial_reverse
+
+elementwise {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  absolute = bf16[3,67]{1,0} abs(p0)
+  rows = bf16[3,67]{1,0} reverse(absolute), dimensions={0}
+  columns = bf16[3,67]{1,0} reverse(absolute), dimensions={1}
+  ROOT tuple = (bf16[3,67]{1,0}, bf16[3,67]{1,0}) tuple(rows, columns)
+}
+
+ENTRY main {
+  p0 = bf16[3,67]{1,0} parameter(0)
+  ROOT fusion = (bf16[3,67]{1,0}, bf16[3,67]{1,0})
+    fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4Bf16PartialDimensionReverse) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_bf16_partial_reverse
+
+elementwise {
+  p0 = bf16[3,5,7,11]{3,2,1,0} parameter(0)
+  absolute = bf16[3,5,7,11]{3,2,1,0} abs(p0)
+  outer = bf16[3,5,7,11]{3,2,1,0} reverse(absolute), dimensions={0,2}
+  minor = bf16[3,5,7,11]{3,2,1,0} reverse(absolute), dimensions={1,3}
+  ROOT tuple = (bf16[3,5,7,11]{3,2,1,0},
+                bf16[3,5,7,11]{3,2,1,0}) tuple(outer, minor)
+}
+
+ENTRY main {
+  p0 = bf16[3,5,7,11]{3,2,1,0} parameter(0)
+  ROOT fusion = (bf16[3,5,7,11]{3,2,1,0},
+                 bf16[3,5,7,11]{3,2,1,0}) fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeUnalignedBf16FlatEdgePad) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_unaligned_bf16_flat_pad
+
+elementwise {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  absolute = bf16[15,67]{1,0} abs(p0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[19,67]{1,0} pad(absolute, zero),
+    padding=2_2x0_0
+}
+
+ENTRY main {
+  p0 = bf16[15,67]{1,0} parameter(0)
+  ROOT fusion = bf16[19,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeUnalignedBf16RectangularEdgePad) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_unaligned_bf16_rectangular_pad
+
+elementwise {
+  p0 = bf16[15,65]{1,0} parameter(0)
+  absolute = bf16[15,65]{1,0} abs(p0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[17,69]{1,0} pad(absolute, zero), padding=1_1x2_2
+}
+
+ENTRY main {
+  p0 = bf16[15,65]{1,0} parameter(0)
+  ROOT fusion = bf16[17,69]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4InteriorAndNegativeEdgePad) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_interior_negative_edge_pad
+
+elementwise {
+  p0 = bf16[4,5,6,7]{3,2,1,0} parameter(0)
+  absolute = bf16[4,5,6,7]{3,2,1,0} abs(p0)
+  padding_value = bf16[] constant(-0.5)
+  ROOT result = bf16[5,9,7,15]{3,2,1,0} pad(absolute, padding_value),
+    padding=-1_2x1_-1_1x0_1x2_0_1
+}
+
+ENTRY main {
+  p0 = bf16[4,5,6,7]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[5,9,7,15]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank1InteriorAndNegativeEdgePad) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank1_interior_negative_edge_pad
+
+elementwise {
+  p0 = bf16[7]{0} parameter(0)
+  padding_value = bf16[] constant(2)
+  ROOT result = bf16[14]{0} pad(p0, padding_value), padding=-1_2_1
+}
+
+ENTRY main {
+  p0 = bf16[7]{0} parameter(0)
+  ROOT fusion = bf16[14]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank1NegativeEdgePadVectorPath) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank1_negative_edge_pad_vector
+
+elementwise {
+  p0 = bf16[7]{0} parameter(0)
+  absolute = bf16[7]{0} abs(p0)
+  padding_value = bf16[] constant(2)
+  ROOT result = bf16[6]{0} pad(absolute, padding_value), padding=-2_1
+}
+
+ENTRY main {
+  p0 = bf16[7]{0} parameter(0)
+  ROOT fusion = bf16[6]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeF32HighRectangularPadding) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_generic_f32_high_padding
 
@@ -2122,6 +2777,171 @@ ENTRY main {
         "output_tiles":[{"sizes":["4"]}],
         "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16PackedInteriorColumnPad) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_packed_interior_column_pad
+
+padding {
+  p0 = bf16[7,8]{1,0} parameter(0)
+  absolute = bf16[7,8]{1,0} abs(p0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[7,16]{1,0} pad(absolute, zero),
+    padding=0_0x0_1_1
+}
+
+ENTRY main {
+  p0 = bf16[7,8]{1,0} parameter(0)
+  ROOT fusion = bf16[7,16]{1,0} fusion(p0), kind=kCustom,
+    calls=padding,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16InteriorPadBothDimensions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_interior_pad_both_dimensions
+
+padding {
+  p0 = bf16[5,7]{1,0} parameter(0)
+  absolute = bf16[5,7]{1,0} abs(p0)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[12,24]{1,0} pad(absolute, zero),
+    padding=1_2_1x2_3_2
+}
+
+ENTRY main {
+  p0 = bf16[5,7]{1,0} parameter(0)
+  ROOT fusion = bf16[12,24]{1,0} fusion(p0), kind=kCustom,
+    calls=padding,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4Bf16DilatedReduceWindow) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_bf16_dilated_reduce_window
+
+maximum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] maximum(lhs, rhs)
+}
+
+elementwise {
+  p0 = bf16[2,5,7,11]{3,2,1,0} parameter(0)
+  negative_infinity = bf16[] constant(-inf)
+  window = bf16[2,3,3,11]{3,2,1,0} reduce-window(p0, negative_infinity),
+    window={size=1x3x3x1 stride=1x2x2x1
+      pad=0_0x1_1x2_1x0_0 rhs_dilate=1x1x2x1}, to_apply=maximum
+  ROOT result = bf16[2,3,3,11]{3,2,1,0} abs(window)
+}
+
+ENTRY main {
+  p0 = bf16[2,5,7,11]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[2,3,3,11]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16SlidingReduceWindowReusesInput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_sliding_reduce_window
+
+maximum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] maximum(lhs, rhs)
+}
+
+elementwise {
+  p0 = bf16[5,37]{1,0} parameter(0)
+  absolute = bf16[5,37]{1,0} abs(p0)
+  negative_infinity = bf16[] constant(-inf)
+  ROOT result = bf16[5,37]{1,0}
+    reduce-window(absolute, negative_infinity),
+    window={size=1x15 pad=0_0x7_7}, to_apply=maximum
+}
+
+ENTRY main {
+  p0 = bf16[5,37]{1,0} parameter(0)
+  ROOT fusion = bf16[5,37]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeF32BaseDilatedReduceWindow) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_f32_base_dilated_reduce_window
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+elementwise {
+  p0 = f32[7]{0} parameter(0)
+  zero = f32[] constant(0)
+  window = f32[6]{0} reduce-window(p0, zero),
+    window={size=3 stride=2 pad=2_1 lhs_dilate=2 rhs_dilate=2},
+    to_apply=add
+  ROOT result = f32[6]{0} negate(window)
+}
+
+ENTRY main {
+  p0 = f32[7]{0} parameter(0)
+  ROOT fusion = f32[6]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));

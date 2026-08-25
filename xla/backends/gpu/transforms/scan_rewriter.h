@@ -26,9 +26,13 @@ limitations under the License.
 
 namespace xla::gpu {
 
-// Rewrites Scan operations into CUB PrefixSum custom calls.
+// Rewrites scan operations to native Fly fusions when enabled and supported,
+// or to CUB/rocPRIM prefix-sum custom calls otherwise.
 class ScanRewriter : public HloModulePass {
  public:
+  explicit ScanRewriter(bool enable_flydsl = false)
+      : enable_flydsl_(enable_flydsl) {}
+
   absl::string_view name() const override { return "scan-rewriter"; }
 
  protected:
@@ -37,6 +41,9 @@ class ScanRewriter : public HloModulePass {
   absl::StatusOr<bool> RunImpl(
       HloModule* module,
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+
+ private:
+  bool enable_flydsl_;
 };
 
 }  // namespace xla::gpu

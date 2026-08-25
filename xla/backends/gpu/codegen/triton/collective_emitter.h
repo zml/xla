@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/base/nullability.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/PatternMatch.h"
@@ -83,7 +84,8 @@ GetCollectiveBlockLevelFusionConfig(
 // Returns an error in case of an internal error or invalid arguments.
 absl::StatusOr<bool> TrySetGpuBackendConfigForCollective(
     const GpuTopology& gpu_topology, HloFusionInstruction* fusion_instr,
-    const DeviceAssignment* device_assignment = nullptr);
+    const DeviceAssignment* device_assignment,
+    absl::string_view fusion_kind);
 
 // Adds the metadata arguments to the function's argument list.
 // For collective some extra metadata arguments are needed such as rank,

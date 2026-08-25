@@ -38,7 +38,7 @@ bool IsTritonFusionKind(absl::string_view kind) {
 
 bool IsFlyFusionKind(absl::string_view kind) {
   return kind == kFlyFusionKind || kind == kFlyGemmFusionKind ||
-         kind == kFlyGemvFusionKind;
+         kind == kFlyGemvFusionKind || kind == kFlyCollectiveFusionKind;
 }
 
 bool IsTritonCustomCall(const HloInstruction& instruction) {

@@ -1,0 +1,15 @@
+HloModule fly_fusion_bf16_contiguous_slice_benchmark
+
+%fused_contiguous_slice (p0: bf16[16386,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16386,8192]{1,0} parameter(0)
+  %absolute = bf16[16386,8192]{1,0} abs(%p0)
+  ROOT %result = bf16[16384,8192]{1,0} slice(%absolute),
+    slice={[1:16385], [0:8192]}
+}
+
+ENTRY %entry_computation (p0: bf16[16386,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16386,8192]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_contiguous_slice,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

@@ -16,6 +16,9 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/scan_rewriter.h"
 
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -24,6 +27,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -31,16 +35,90 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 
 namespace xla::gpu {
+namespace {
+
+bool IsStandardReverseAssociativeScan(const HloInstruction* instruction) {
+  const auto* scan = DynCast<HloScanInstruction>(instruction);
+  if (scan == nullptr || scan->IsRoot() ||
+      scan->is_associative() != TRI_STATE_TRUE || !scan->is_reverse() ||
+      scan->num_carries() != 1 || scan->operand_count() != 2 ||
+      !scan->shape().IsTuple() ||
+      scan->shape().tuple_shapes().size() != 2 ||
+      !scan->shape().tuple_shapes(0).IsArray()) {
+    return false;
+  }
+  for (const HloInstruction* user : scan->users()) {
+    if (user->user_count() == 0 && !user->IsRoot()) {
+      continue;
+    }
+    if (user->opcode() != HloOpcode::kGetTupleElement ||
+        user->tuple_index() != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+absl::Status SetFlyScanBackendConfig(HloInstruction* fusion,
+                                     const Shape& output_shape) {
+  GpuBackendConfig gpu_config;
+  FusionBackendConfig* fusion_config =
+      gpu_config.mutable_fusion_backend_config();
+  fusion_config->set_kind(kFlyFusionKind);
+  BlockLevelFusionConfig* block =
+      fusion_config->mutable_block_level_fusion_config();
+  Tile* tile = block->add_output_tiles();
+  for (int64_t dimension = 0;
+       dimension < output_shape.dimensions_size(); ++dimension) {
+    tile->add_sizes(1);
+  }
+  block->set_num_warps(2);
+  block->set_num_ctas(1);
+  block->set_num_stages(1);
+  block->set_waves_per_eu(0);
+  return fusion->set_backend_config(std::move(gpu_config));
+}
+
+absl::StatusOr<HloInstruction*> MakeFlyScanFusion(
+    HloComputation* computation, HloInstruction* input,
+    const CubScanOptions& options, const OpMetadata& metadata) {
+  HloComputation::Builder builder("fly_scan_computation");
+  HloInstruction* parameter =
+      builder.AddInstruction(HloInstruction::CreateParameter(
+          0, input->shape(), input->name()));
+  HloInstruction* call =
+      builder.AddInstruction(HloInstruction::CreateCustomCall(
+          input->shape(), {parameter}, flydsl::kFlyScanCallTarget));
+  TF_RETURN_IF_ERROR(call->set_backend_config(options));
+
+  HloModule* module = computation->parent();
+  HloComputation* fused_computation =
+      module->AddComputationAndUnifyNamesAndIds(builder.Build(call),
+                                                /*is_entry=*/false);
+  HloInstruction* fusion = computation->AddInstruction(
+      HloInstruction::CreateFusion(input->shape(),
+                                   HloInstruction::FusionKind::kCustom,
+                                   {input}, fused_computation),
+      /*new_name=*/"fly_scan");
+  fusion->set_metadata(metadata);
+  TF_RETURN_IF_ERROR(SetFlyScanBackendConfig(fusion, input->shape()));
+  return fusion;
+}
+
+}  // namespace
 
 absl::StatusOr<bool> ScanRewriter::RunOnComputation(
     HloComputation* computation) {
   std::vector<HloScanInstruction*> scans;
   for (HloInstruction* inst : computation->instructions()) {
-    if (hlo_query::IsStandardAssociativeScan(inst)) {
+    if (hlo_query::IsStandardAssociativeScan(inst) ||
+        (enable_flydsl_ && IsStandardReverseAssociativeScan(inst))) {
       scans.push_back(xla::Cast<HloScanInstruction>(inst));
     }
   }
@@ -97,7 +175,40 @@ absl::StatusOr<bool> ScanRewriter::RunOnComputation(
       continue;
     }
 
-    // Create the custom call.
+    CubScanOptions::Kind kind = [&]() {
+      switch (binary_op) {
+        case HloOpcode::kAdd:
+          return CubScanOptions::SUM;
+        default:
+          return CubScanOptions::KIND_INVALID;
+      }
+    }();
+
+    // Pass attributes via backend_config.
+    xla::CubScanOptions options;
+    options.set_vector_length(vector_length);
+    options.set_row_length(row_length);
+    options.set_column_length(column_length);
+    options.set_kind(kind);
+    options.set_is_reverse(scan->is_reverse());
+
+    if (enable_flydsl_ && flydsl::IsFlyScanSupported(shape, options)) {
+      TF_ASSIGN_OR_RETURN(HloInstruction * fusion,
+                          MakeFlyScanFusion(computation, input, options,
+                                            scan->metadata()));
+      // Standard associative scans expose a carry in tuple element one, but
+      // all of its users are dead. Preserve the original tuple ABI without
+      // inheriting rocPRIM's scratch result in the Fly kernel.
+      HloInstruction* replacement = computation->AddInstruction(
+          HloInstruction::CreateTuple({fusion, scan->mutable_operand(1)}),
+          /*new_name=*/"fly_scan_result");
+      replacement->set_metadata(scan->metadata());
+      RETURN_IF_ERROR(computation->ReplaceInstruction(scan, replacement));
+      changed = true;
+      continue;
+    }
+
+    // Create the rocPRIM/CUB custom call.
     Shape scratch_shape =
         ShapeUtil::MakeShape(U8, {0});  // Empty shape, assigned later.
     Shape result_shape = ShapeUtil::MakeTupleShape({shape, scratch_shape});
@@ -108,22 +219,6 @@ absl::StatusOr<bool> ScanRewriter::RunOnComputation(
             result_shape, {input}, kCubDeviceScanUnassignedScratchSizeTarget,
             {shape}));
 
-    CubScanOptions::Kind kind = [&]() {
-      switch (binary_op) {
-        case HloOpcode::kAdd:
-          return CubScanOptions::SUM;
-        default:
-          return CubScanOptions::KIND_INVALID;
-      }
-    }();
-
-    // Pass attributes via backend_config
-    xla::CubScanOptions options;
-    options.set_vector_length(vector_length);
-    options.set_row_length(row_length);
-    options.set_column_length(column_length);
-    options.set_kind(kind);
-    options.set_is_reverse(scan->is_reverse());
     RETURN_IF_ERROR(custom_call->set_backend_config(options));
 
     // The second tuple element is the scratch buffer instead of the final

@@ -2050,6 +2050,37 @@ xla_test(
     ],
 )
 
+xla_test(
+    name = "collective_kernel_thunk_prepare_test",
+    srcs = ["collective_kernel_thunk_prepare_test.cc"],
+    backends = ["gpu"],
+    deps = [
+        ":collective_clique_requests",
+        ":collective_kernel_thunk",
+        ":collective_memory_requests",
+        ":collective_params",
+        ":collective_thunk",
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/runtime:device_id",
+        "//xla/service:buffer_assignment",
+        "//xla/service:computation_placer_hdr",
+        "//xla/service:executable",
+        "//xla/service:shaped_slice",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/service/gpu:gpu_executable_run_options",
+        "//xla/service/gpu:launch_dimensions",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/stream_executor/gpu:gpu_init",
+        "//xla/tsl/platform:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "all_reduce_thunk",
     srcs = ["all_reduce_thunk.cc"],

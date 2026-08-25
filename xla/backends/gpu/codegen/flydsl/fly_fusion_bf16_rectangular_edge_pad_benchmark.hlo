@@ -1,0 +1,16 @@
+HloModule fly_fusion_bf16_rectangular_edge_pad_benchmark
+
+%fused_rectangular_edge_pad (p0: bf16[16384,8190]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8190]{1,0} parameter(0)
+  %absolute = bf16[16384,8190]{1,0} abs(%p0)
+  %zero = bf16[] constant(0)
+  ROOT %result = bf16[16384,8192]{1,0} pad(%absolute, %zero),
+    padding=0_0x1_1
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8190]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8190]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_rectangular_edge_pad,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

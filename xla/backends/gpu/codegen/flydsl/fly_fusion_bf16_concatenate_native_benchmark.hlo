@@ -1,0 +1,17 @@
+HloModule fly_fusion_bf16_concatenate_native_benchmark
+
+%fused_concatenate (p0: bf16[33554433], p1: bf16[33554431]) -> bf16[67108864] {
+  %p0 = bf16[33554433]{0} parameter(0)
+  %p1 = bf16[33554431]{0} parameter(1)
+  %absolute = bf16[33554433]{0} abs(%p0)
+  %negated = bf16[33554431]{0} negate(%p1)
+  ROOT %result = bf16[67108864]{0} concatenate(%absolute, %negated),
+    dimensions={0}
+}
+
+ENTRY %entry_computation (p0: bf16[33554433], p1: bf16[33554431]) -> bf16[67108864] {
+  %p0 = bf16[33554433]{0} parameter(0)
+  %p1 = bf16[33554431]{0} parameter(1)
+  ROOT %fusion = bf16[67108864]{0} fusion(%p0, %p1), kind=kLoop,
+    calls=%fused_concatenate
+}

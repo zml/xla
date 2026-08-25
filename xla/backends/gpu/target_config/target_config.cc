@@ -127,11 +127,15 @@ absl::StatusOr<stream_executor::GpuTargetConfigProto> GetGpuTargetConfig(
   return config;
 }
 
-GpuTargetConfig::GpuTargetConfig(se::StreamExecutor* s)
+GpuTargetConfig::GpuTargetConfig(se::StreamExecutor* s,
+                                 bool query_dnn_version)
     : device_description(
           s->GetDeviceDescription().DeviceSpecificFieldsCleared()),
       platform_name(s->GetPlatform()->Name()),
       device_description_str(s->GetDeviceDescription().name()) {
+  if (!query_dnn_version) {
+    return;
+  }
   se::dnn::DnnSupport* dnn = s->AsDnn();
   if (dnn != nullptr) {
     absl::StatusOr<se::dnn::VersionInfo> dnn_version = dnn->GetVersion();

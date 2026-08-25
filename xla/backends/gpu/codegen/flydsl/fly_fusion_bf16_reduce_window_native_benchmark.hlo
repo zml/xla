@@ -1,0 +1,24 @@
+HloModule fly_fusion_bf16_reduce_window_native_benchmark
+
+%maximum (lhs: bf16[], rhs: bf16[]) -> bf16[] {
+  %lhs = bf16[] parameter(0)
+  %rhs = bf16[] parameter(1)
+  ROOT %result = bf16[] maximum(%lhs, %rhs)
+}
+
+%fused_reduce_window (p0: bf16[2,4,2048,8192])
+    -> bf16[2,4,2048,8192] {
+  %p0 = bf16[2,4,2048,8192]{3,2,1,0} parameter(0)
+  %absolute = bf16[2,4,2048,8192]{3,2,1,0} abs(%p0)
+  %negative_infinity = bf16[] constant(-inf)
+  ROOT %result = bf16[2,4,2048,8192]{3,2,1,0}
+    reduce-window(%absolute, %negative_infinity),
+    window={size=1x1x1x3 pad=0_0x0_0x0_0x1_1}, to_apply=%maximum
+}
+
+ENTRY %entry_computation (p0: bf16[2,4,2048,8192])
+    -> bf16[2,4,2048,8192] {
+  %p0 = bf16[2,4,2048,8192]{3,2,1,0} parameter(0)
+  ROOT %fusion = bf16[2,4,2048,8192]{3,2,1,0} fusion(%p0),
+    kind=kLoop, calls=%fused_reduce_window
+}

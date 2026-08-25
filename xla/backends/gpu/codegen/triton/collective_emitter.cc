@@ -1015,20 +1015,20 @@ GetCollectiveBlockLevelFusionConfig(const GpuTopology& gpu_topology,
 
 absl::StatusOr<bool> TrySetGpuBackendConfigForCollective(
     const GpuTopology& gpu_topology, HloFusionInstruction* fusion_instr,
-    const DeviceAssignment* device_assignment) {
+    const DeviceAssignment* device_assignment, absl::string_view fusion_kind) {
   ASSIGN_OR_RETURN(const std::optional<BlockLevelFusionConfig> block_config,
                    GetCollectiveBlockLevelFusionConfig(
                        gpu_topology, fusion_instr, device_assignment));
   if (!block_config.has_value()) {
     VLOG(3) << "No block level fusion config calculated for collective: "
             << fusion_instr->ToString()
-            << ". Not using Triton collective fusion.";
+            << ". Not using a collective kernel fusion.";
     return false;
   }
   ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
                    fusion_instr->backend_config<GpuBackendConfig>());
   gpu_backend_config.mutable_fusion_backend_config()->set_kind(
-      kTritonCollectiveFusionKind);
+      fusion_kind);
   *gpu_backend_config.mutable_fusion_backend_config()
        ->mutable_block_level_fusion_config() = *std::move(block_config);
   RETURN_IF_ERROR(

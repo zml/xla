@@ -1538,6 +1538,7 @@ TEST(ThunkProtoDeserializationTest, CollectiveKernelThunk) {
           shmem_bytes: 1024
           cubin: "my_cubin"
           use_pdl: false
+          skip_collective_clique: true
         }
       )pb");
 

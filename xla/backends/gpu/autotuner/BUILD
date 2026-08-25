@@ -360,6 +360,7 @@ cc_library(
         "//xla/backends/gpu/codegen/flydsl:attention_support",
         "//xla/backends/gpu/codegen/flydsl:fusion_support",
         "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
+        "//xla/backends/gpu/codegen/flydsl:scan_support",
         "//xla/backends/gpu/codegen/flydsl:xtile_elementwise",
         "//xla/backends/gpu/codegen/flydsl:xtile_reduction",
         "//xla/backends/gpu/codegen/flydsl:xtile_softmax",
@@ -983,12 +984,6 @@ xla_cc_test(
 xla_cc_binary(
     name = "autotuner_main",
     srcs = ["autotuner_main.cc"],
-    linkopts = if_rocm_is_configured([
-        # The hermetic glibc 2.27 toolchain supplies C++17 filesystem through
-        # libstdc++fs.a. Keep its symbols local so that ROCm DSOs use the
-        # matching filesystem implementation from their own libstdc++.so.
-        "-Wl,--exclude-libs,libstdc++fs.a",
-    ]),
     tags = [
         "gpu",
     ],

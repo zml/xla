@@ -26,6 +26,11 @@ namespace xla::gpu::flydsl {
 // Returns whether a fusion can be emitted as a native Fly vector program.
 bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis);
 
+// Returns whether the native elementwise program has an indexed output domain
+// assembled from differently sized buffers. Full transactions remain
+// vectorized; the emitter scalarizes only vectors that cross a boundary.
+bool IsFlyXTileIndexedFusion(const HloFusionAnalysis& analysis);
+
 // Creates a native Fly emitter for a contiguous elementwise fusion.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileElementwiseEmitter(
     const HloFusionAnalysis& analysis);

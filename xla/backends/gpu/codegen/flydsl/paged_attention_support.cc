@@ -118,8 +118,10 @@ std::optional<FlyPagedAttentionDescriptor> GetFlyPagedAttentionDescriptor(
 
 std::optional<FlyPagedAttentionSegmentedProducerDescriptor>
 GetFlyPagedAttentionSegmentedProducerDescriptor(const HloInstruction& call) {
-  if (call.opcode() != HloOpcode::kCustomCall ||
-      call.custom_call_target() !=
+  if (call.opcode() != HloOpcode::kCustomCall) {
+    return std::nullopt;
+  }
+  if (call.custom_call_target() !=
           kFlyPagedAttentionSegmentedProducerCallTarget ||
       !call.shape().IsTuple() || call.shape().tuple_shapes_size() != 3 ||
       call.operand_count() != 6) {

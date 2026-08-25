@@ -102,6 +102,9 @@ inline constexpr absl::string_view kFlyFusionKind = "__fly";
 // Used for fusions that codegen a collective.
 inline constexpr absl::string_view kTritonCollectiveFusionKind =
     "__triton_collective";
+// Used for native Fly fusions that codegen a collective.
+inline constexpr absl::string_view kFlyCollectiveFusionKind =
+    "__fly_collective";
 
 // Fusions that use Triton have FusionBackendConfig.kind equal to this string.
 inline constexpr absl::string_view kTritonGemmFusionKind = "__triton_gemm";
