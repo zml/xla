@@ -54,6 +54,14 @@ TestVulkanStorage16WithoutShaderBFloat16ComputeCapability() {
           /*storage_buffer_16bit_access=*/true));
 }
 
+stream_executor::GpuComputeCapability
+TestVulkanShaderBFloat16ComputeCapability() {
+  return stream_executor::GpuComputeCapability(
+      stream_executor::VulkanComputeCapability(
+          1, 2, /*shader_bfloat16=*/true,
+          /*storage_buffer_16bit_access=*/true));
+}
+
 absl::StatusOr<std::unique_ptr<llvm::Module>> ParseLlvmIr(
     absl::string_view ir, llvm::LLVMContext& context) {
   llvm::SMDiagnostic diagnostic;
@@ -205,6 +213,30 @@ attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
 
   EXPECT_OK(CompileToVulkanSPIRV(
       module.get(), TestVulkanStorage16WithoutShaderBFloat16ComputeCapability(),
+      DebugOptions()));
+}
+
+TEST(SpirvBackendTest,
+     CompilesVulkanBFloat16ElementwiseMultiplyWithNativeType) {
+  llvm::LLVMContext context;
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<llvm::Module> module,
+                       ParseLlvmIr(R"(
+target triple = "spirv1.5-unknown-vulkan1.2-compute"
+
+define void @bf16_native_type_multiply(ptr %in, ptr %out) #0 {
+entry:
+  %value = load bfloat, ptr %in, align 2
+  %scaled = fmul bfloat %value, 0xR3E00
+  store bfloat %scaled, ptr %out, align 2
+  ret void
+}
+
+attributes #0 = { "hlsl.shader"="compute" "hlsl.numthreads"="1,1,1" }
+)",
+                                   context));
+
+  EXPECT_OK(CompileToVulkanSPIRV(
+      module.get(), TestVulkanShaderBFloat16ComputeCapability(),
       DebugOptions()));
 }
 

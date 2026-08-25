@@ -266,6 +266,82 @@ bool IsBFloat16StorageTypePair(llvm::Type* logical_type,
   return logical_storage_type != nullptr && logical_storage_type == storage_type;
 }
 
+llvm::Type* WidenBFloat16Type(llvm::Type* type) {
+  if (type->isBFloatTy()) {
+    return llvm::Type::getFloatTy(type->getContext());
+  }
+  if (auto* vector_type = llvm::dyn_cast<llvm::VectorType>(type);
+      vector_type != nullptr && vector_type->getElementType()->isBFloatTy()) {
+    return llvm::VectorType::get(
+        llvm::Type::getFloatTy(type->getContext()),
+        vector_type->getElementCount());
+  }
+  return nullptr;
+}
+
+// SPV_KHR_bfloat16 intentionally supports the bfloat16 type, conversions,
+// dot products, and cooperative matrices, but not ordinary arithmetic. Keep
+// Vulkan shaders portable by performing ordinary bfloat16 arithmetic in f32.
+// This runs after LLVM optimization so no later optimizer can recreate the
+// unsupported operations before SPIR-V module analysis.
+void LegalizeVulkanBFloat16Arithmetic(llvm::Module* module) {
+  llvm::SmallVector<llvm::Instruction*> operations;
+  for (llvm::Function& function : *module) {
+    for (llvm::BasicBlock& block : function) {
+      for (llvm::Instruction& instruction : block) {
+        switch (instruction.getOpcode()) {
+          case llvm::Instruction::FNeg:
+          case llvm::Instruction::FAdd:
+          case llvm::Instruction::FSub:
+          case llvm::Instruction::FMul:
+          case llvm::Instruction::FDiv:
+          case llvm::Instruction::FRem:
+            if (WidenBFloat16Type(instruction.getType()) != nullptr) {
+              operations.push_back(&instruction);
+            }
+            break;
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+  for (llvm::Instruction* operation : operations) {
+    llvm::IRBuilder<> builder(operation);
+    builder.SetCurrentDebugLocation(operation->getDebugLoc());
+    if (auto* floating_operation =
+            llvm::dyn_cast<llvm::FPMathOperator>(operation)) {
+      builder.setFastMathFlags(floating_operation->getFastMathFlags());
+    }
+    llvm::Type* widened_type = WidenBFloat16Type(operation->getType());
+    llvm::SmallVector<llvm::Value*, 2> widened_operands;
+    for (llvm::Value* operand : operation->operand_values()) {
+      widened_operands.push_back(builder.CreateFPExt(
+          operand, widened_type, operand->getName() + ".f32"));
+    }
+
+    llvm::Value* widened_result;
+    if (operation->getOpcode() == llvm::Instruction::FNeg) {
+      widened_result =
+          builder.CreateFNeg(widened_operands[0], operation->getName() + ".f32");
+    } else {
+      widened_result = builder.CreateBinOp(
+          static_cast<llvm::Instruction::BinaryOps>(operation->getOpcode()),
+          widened_operands[0], widened_operands[1],
+          operation->getName() + ".f32");
+    }
+    llvm::Value* replacement = builder.CreateFPTrunc(
+        widened_result, operation->getType(), operation->getName());
+    if (auto* replacement_instruction =
+            llvm::dyn_cast<llvm::Instruction>(replacement)) {
+      replacement_instruction->copyMetadata(*operation);
+    }
+    operation->replaceAllUsesWith(replacement);
+    operation->eraseFromParent();
+  }
+}
+
 // LLVM represents unordered floating-point predicates directly, but the
 // corresponding SPIR-V comparison instructions are not available in the
 // Vulkan Shader environment. General bfloat16 relational instructions also
@@ -1544,6 +1620,7 @@ absl::StatusOr<std::string> CompileToVulkanSPIRV(
   ABSL_RETURN_IF_ERROR(LinkAndOptimizeModule(
       module, gpu_version, debug_options, "", SPIRVTargetModuleLinker,
       target_triple, target_machine.get(), kDefaultInlineThreshold));
+  LegalizeVulkanBFloat16Arithmetic(module);
   LegalizeVulkanShaderComparisons(module);
   ExpandSubByteBitReverse(module);
   ABSL_RETURN_IF_ERROR(ValidateVulkanModule(*module));

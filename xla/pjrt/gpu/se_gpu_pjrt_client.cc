@@ -1967,9 +1967,13 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   const bool is_vulkan =
       xla_client->platform()->id() ==
       stream_executor::vulkan::kVulkanPlatformId;
-  if (is_vulkan && allocator_config.preallocate) {
-    LOG(INFO) << "Vulkan uses host-visible mapped memory; disabling BFC "
-                 "preallocation so the allocator grows with demand.";
+  if (is_vulkan &&
+      (allocator_config.kind == GpuAllocatorConfig::Kind::kDefault ||
+       allocator_config.kind == GpuAllocatorConfig::Kind::kBFC)) {
+    LOG(INFO) << "Vulkan uses the platform allocator instead of BFC so its "
+                 "executor can select among mapped memory heaps per "
+                 "allocation.";
+    allocator_config.kind = GpuAllocatorConfig::Kind::kPlatform;
     allocator_config.preallocate = false;
   }
   bool preallocate_device_memory = allocator_config.preallocate;

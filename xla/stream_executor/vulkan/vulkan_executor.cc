@@ -1268,6 +1268,8 @@ struct VulkanExecutor::Impl {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     VkDeviceSize size = 0;
+    uint32_t memory_type_index = 0;
+    uint32_t heap_index = 0;
   };
 
   struct AllocationView {
@@ -1746,8 +1748,10 @@ struct VulkanExecutor::Impl {
     vkDestroyDevice(device, nullptr);
   }
 
-  absl::StatusOr<uint32_t> FindMemoryType(uint32_t memory_type_bits) const {
-    std::optional<uint32_t> host_visible;
+  std::vector<uint32_t> FindMappedMemoryTypes(
+      uint32_t memory_type_bits) const {
+    std::vector<uint32_t> device_local;
+    std::vector<uint32_t> host;
     for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
       if ((memory_type_bits & (1u << i)) == 0) continue;
       VkMemoryPropertyFlags flags =
@@ -1756,13 +1760,14 @@ struct VulkanExecutor::Impl {
           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
       if ((flags & required) != required) continue;
-      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) return i;
-      if (!host_visible.has_value()) host_visible = i;
+      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        device_local.push_back(i);
+      } else {
+        host.push_back(i);
+      }
     }
-    if (host_visible.has_value()) return *host_visible;
-    return absl::NotFoundError(
-        "Vulkan buffer has no HOST_VISIBLE | HOST_COHERENT compatible "
-        "memory type");
+    device_local.insert(device_local.end(), host.begin(), host.end());
+    return device_local;
   }
 
   absl::StatusOr<AllocationView> FindAllocation(const void* address,
@@ -2502,21 +2507,49 @@ DeviceAddressBase VulkanExecutor::Allocate(uint64_t size,
   VkMemoryRequirements requirements = {};
   impl_->vkGetBufferMemoryRequirements(impl_->device, allocation->buffer,
                                        &requirements);
-  absl::StatusOr<uint32_t> memory_type =
-      impl_->FindMemoryType(requirements.memoryTypeBits);
-  if (!memory_type.ok()) {
-    LOG(ERROR) << memory_type.status();
+  std::vector<uint32_t> memory_types =
+      impl_->FindMappedMemoryTypes(requirements.memoryTypeBits);
+  if (memory_types.empty()) {
+    LOG(ERROR) << "Vulkan buffer has no HOST_VISIBLE | HOST_COHERENT "
+                  "compatible memory type";
     impl_->vkDestroyBuffer(impl_->device, allocation->buffer, nullptr);
     return DeviceAddressBase();
   }
   VkMemoryAllocateInfo allocate_info = {};
   allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   allocate_info.allocationSize = requirements.size;
-  allocate_info.memoryTypeIndex = *memory_type;
-  result = impl_->vkAllocateMemory(impl_->device, &allocate_info, nullptr,
-                                   &allocation->memory);
-  if (result != VK_SUCCESS) {
-    LOG(ERROR) << VulkanError("vkAllocateMemory", result);
+  VkResult last_allocation_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  for (uint32_t memory_type : memory_types) {
+    allocate_info.memoryTypeIndex = memory_type;
+    result = impl_->vkAllocateMemory(impl_->device, &allocate_info, nullptr,
+                                     &allocation->memory);
+    if (result != VK_SUCCESS) {
+      last_allocation_result = result;
+      VLOG(1) << "Vulkan allocation " << allocation->id << " (" << size
+              << " bytes) did not fit memory type " << memory_type
+              << " on heap "
+              << impl_->memory_properties.memoryTypes[memory_type].heapIndex
+              << ": " << VulkanError("vkAllocateMemory", result);
+      continue;
+    }
+    result = impl_->vkMapMemory(impl_->device, allocation->memory, 0, size, 0,
+                                &allocation->mapped);
+    if (result == VK_SUCCESS) {
+      allocation->memory_type_index = memory_type;
+      allocation->heap_index =
+          impl_->memory_properties.memoryTypes[memory_type].heapIndex;
+      break;
+    }
+    last_allocation_result = result;
+    impl_->vkFreeMemory(impl_->device, allocation->memory, nullptr);
+    allocation->memory = VK_NULL_HANDLE;
+    allocation->mapped = nullptr;
+  }
+  if (allocation->memory == VK_NULL_HANDLE) {
+    LOG(ERROR) << "Vulkan allocation " << allocation->id << " (" << size
+               << " bytes) exhausted all compatible mapped memory types: "
+               << VulkanError("vkAllocateMemory/vkMapMemory",
+                              last_allocation_result);
     impl_->vkDestroyBuffer(impl_->device, allocation->buffer, nullptr);
     return DeviceAddressBase();
   }
@@ -2526,16 +2559,22 @@ DeviceAddressBase VulkanExecutor::Allocate(uint64_t size,
                       allocate_info.allocationSize));
   result = impl_->vkBindBufferMemory(impl_->device, allocation->buffer,
                                      allocation->memory, 0);
-  if (result == VK_SUCCESS) {
-    result = impl_->vkMapMemory(impl_->device, allocation->memory, 0, size, 0,
-                                &allocation->mapped);
-  }
   if (result != VK_SUCCESS) {
-    LOG(ERROR) << VulkanError("Vulkan buffer bind/map", result);
+    LOG(ERROR) << VulkanError("vkBindBufferMemory", result);
+    impl_->vkUnmapMemory(impl_->device, allocation->memory);
     impl_->vkDestroyBuffer(impl_->device, allocation->buffer, nullptr);
     impl_->vkFreeMemory(impl_->device, allocation->memory, nullptr);
     return DeviceAddressBase();
   }
+  VLOG(1) << "Vulkan allocation " << allocation->id << " mapped " << size
+          << " bytes using memory type " << allocation->memory_type_index
+          << " on heap " << allocation->heap_index
+          << ((impl_->memory_properties
+                       .memoryTypes[allocation->memory_type_index]
+                       .propertyFlags &
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0
+                  ? " (device-local)"
+                  : " (host)");
   void* mapped = allocation->mapped;
   {
     absl::MutexLock lock(&impl_->allocations_mutex);
