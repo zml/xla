@@ -40,7 +40,7 @@ struct Fp8BlockGemvSpec {
   bool activation_batch_major;
 };
 
-inline constexpr int64_t kMaxFp8BlockGemvBatch = 16;
+inline constexpr int64_t kMaxFp8BlockGemvReduceRows = 1;
 
 inline constexpr absl::string_view kFp8BlockGemvComputationPrefix =
     "fp8_block_gemv_";
@@ -49,6 +49,7 @@ std::optional<Fp8BlockGemvSpec> MatchFp8BlockGemv(
     const HloFusionInstruction& fusion);
 
 struct Fp8BlockGemvConfig {
+  int64_t block_m;
   int64_t block_n;
   int64_t block_k;
   int num_warps;
