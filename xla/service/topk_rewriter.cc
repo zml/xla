@@ -220,7 +220,24 @@ static bool HasIota(HloSortInstruction* sort, HloInstruction* data) {
     return m::Iota().WithShape(m::Shape().WithElementType(S32).WithDims(dims));
   };
   return Match(sort->operand(1), match_iota(data->shape().dimensions())) ||
-         Match(sort->operand(1), m::Broadcast(match_iota(sort_dims)));
+         Match(sort->operand(1), m::Broadcast(match_iota(sort_dims))) ||
+         // A broadcast that only adds size-1 dimensions is canonicalised to a
+         // reshape, so a batch of one spells the index operand differently:
+         // the same graph that produces broadcast(iota[N]) -> [B, N] for B > 1
+         // produces reshape(iota[N]) -> [1, N] for B == 1. Matching only the
+         // broadcast form silently drops batch-1 decode off the TopK path and
+         // back onto a full sort -- on a 202048-wide vocabulary that is a
+         // 28-kernel bitonic sort at 156us a token against a single 16-22us
+         // custom call.
+         //
+         // No extra shape guard is needed, and one would be unreachable. A
+         // reshape preserves element count, and sort requires every operand to
+         // have the same dimensions as the data, so matching iota[N] here --
+         // where N is the size of the sort dimension -- already forces
+         // product(data dims) == data dims[sort_dim], i.e. every other
+         // dimension is 1. The reshape can only be inserting or removing unit
+         // dimensions, which leaves the iota aligned to the sort dimension.
+         Match(sort->operand(1), m::Reshape(match_iota(sort_dims)));
 }
 
 std::optional<int64_t> TopkRewriter::SortIsInTopK(HloInstruction* inst) {
