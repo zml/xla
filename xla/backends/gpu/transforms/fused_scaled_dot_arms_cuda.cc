@@ -18,7 +18,6 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -90,16 +89,11 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
                    fusion->backend_config<GpuBackendConfig>());
   FusionBackendConfig& backend_config =
       *gpu_config.mutable_fusion_backend_config();
-  static const bool prefer_tile_ir = [] {
-    const char* env = std::getenv("ZML_FP8_BLOCK_GEMV_TILEIR");
-    return env != nullptr && absl::string_view(env) == "1";
-  }();
-  backend_config.set_kind(std::string(
-      prefer_tile_ir ? kTileIrFusionKind : kTritonNestedGemmFusionKind));
+  backend_config.set_kind(std::string(kTritonNestedGemmFusionKind));
   xla::xtile::BlockLevelFusionConfig& block_config =
       *backend_config.mutable_block_level_fusion_config();
   xla::xtile::Tile& output_tile = *block_config.add_output_tiles();
-  output_tile.add_sizes(dot->shape().dimensions(0));
+  output_tile.add_sizes(config->block_m);
   output_tile.add_sizes(config->block_n);
   block_config.set_num_warps(config->num_warps);
   block_config.set_num_stages(config->num_stages);

@@ -124,7 +124,7 @@ std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
   const int64_t act_contracting = dims.lhs_contracting_dimensions(0);
   const bool batch_major = act_contracting == 1;
   const int64_t batch = activation->shape().dimensions(batch_major ? 0 : 1);
-  if (batch < 1 || batch > kMaxFp8BlockGemvBatch) return no("batch-range");
+  if (batch < 1 || batch > 16) return no("batch-range");
 
   if (weight->shape().element_type() != F8E4M3FN ||
       weight->shape().dimensions().size() != 2 ||
@@ -164,20 +164,8 @@ std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
 }  // namespace
 
 namespace {
-int TunedInt(const char* name, int fallback) {
-  const char* env = std::getenv(name);
-  if (env == nullptr) return fallback;
-  int value = 0;
-  if (!absl::SimpleAtoi(env, &value) || value <= 0) return fallback;
-  return value;
-}
-
 int64_t ChooseBlockK(int64_t block_n, int64_t k, int64_t max_block_k) {
-  int64_t budget = 32 * 1024;
-  if (const char* env = std::getenv("XLA_FP8_BUDGET_KB")) {
-    int parsed = 0;
-    if (absl::SimpleAtoi(env, &parsed) && parsed > 0) budget = parsed * 1024;
-  }
+  const int64_t budget = 32 * 1024;
   int64_t block_k = budget / (block_n * static_cast<int64_t>(sizeof(float)));
   block_k = std::min<int64_t>(block_k, max_block_k);
   block_k = std::max<int64_t>(block_k, kScaleBlock);
@@ -197,15 +185,12 @@ std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
   if (!spec.has_value()) return std::nullopt;
 
   const bool single_row = spec->batch == 1;
-  const int64_t block_n = single_row ? TunedInt("XLA_FP8_GEMV_BN", 16)
-                                     : TunedInt("XLA_FP8_GEMM_BN", 32);
+  const int64_t block_n = single_row ? 16 : 32;
+  int64_t block_m = std::min<int64_t>(spec->batch, 64);
+  while (block_m > 1 && spec->batch % block_m != 0) block_m /= 2;
   return Fp8BlockGemvConfig{
-      block_n,
-      ChooseBlockK(block_n, spec->k, TunedInt("XLA_FP8_MAXBK", kMaxBlockK)),
-      single_row ? TunedInt("XLA_FP8_GEMV_W", 8)
-                 : TunedInt("XLA_FP8_GEMM_W", 4),
-      single_row ? TunedInt("XLA_FP8_GEMV_STAGES", 3)
-                 : TunedInt("XLA_FP8_GEMM_STAGES", 4)};
+      block_m, block_n, ChooseBlockK(block_n, spec->k, kMaxBlockK),
+      single_row ? 8 : 4, single_row ? 3 : 4};
 }
 
 bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot) {
@@ -265,12 +250,22 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
     const xla::xtile::BlockLevelParameters& block_level_parameters,
     mlir::MLIRContext& mlir_context) {
   if (block_level_parameters.output_tile_sizes.size() != 1 ||
-      block_level_parameters.output_tile_sizes.front().size() != 2 ||
-      block_level_parameters.output_tile_sizes.front()[0] != spec.batch) {
+      block_level_parameters.output_tile_sizes.front().size() != 2) {
     return absl::InvalidArgumentError(
-        "fp8 block gemv needs a [batch, block_n] output tile");
+        "fp8 block gemv needs a [block_m, block_n] output tile");
   }
+  const int64_t block_m = block_level_parameters.output_tile_sizes.front()[0];
   const int64_t block_n = block_level_parameters.output_tile_sizes.front()[1];
+  if (block_m <= 0 || spec.batch % block_m != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("fp8 block gemv needs block_m dividing m, got ", block_m,
+                     " for m ", spec.batch));
+  }
+  if (spec.batch > 1 && block_m == 1) {
+    return absl::InvalidArgumentError(
+        "fp8 block gemv reduces a single row and mma's the rest; a one-row "
+        "tile of a taller output would take the reduction path per row");
+  }
 
   const HloComputation* computation = fusion.fused_instructions_computation();
 
@@ -331,14 +326,18 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
     return mlir::arith::MulIOp::create(b, v, index(c));
   };
 
-  Value n0 = mul_index(fn.getProgramId(), block_n);
+  const int64_t n_tiles = spec.n / block_n;
+  Value pid = fn.getProgramId();
+  Value m0 = mul_index(mlir::arith::DivUIOp::create(b, pid, index(n_tiles)),
+                       block_m);
+  Value n0 = mul_index(mlir::arith::RemUIOp::create(b, pid, index(n_tiles)),
+                       block_n);
   Value scale_row = mlir::arith::DivUIOp::create(b, n0, index(kScaleBlock));
-  Value zero_index = index(0);
 
   const bool is_single_row = spec.batch == 1;
   Value acc_init =
       is_single_row ? CreateConst(b, f32, 0.0f, {block_n, 1})
-                    : CreateConst(b, f32, 0.0f, {spec.batch, block_n});
+                    : CreateConst(b, f32, 0.0f, {block_m, block_n});
   auto loop = mlir::scf::ForOp::create(b, index(0), index(spec.k / block_k),
                                        index(1), mlir::ValueRange{acc_init});
   {
@@ -359,12 +358,12 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
 
     const llvm::SmallVector<int64_t, 2> act_shape =
         spec.activation_batch_major
-            ? llvm::SmallVector<int64_t, 2>{spec.batch, block_k}
-            : llvm::SmallVector<int64_t, 2>{block_k, spec.batch};
+            ? llvm::SmallVector<int64_t, 2>{block_m, block_k}
+            : llvm::SmallVector<int64_t, 2>{block_k, block_m};
     Value act_tile = xtile::ExtractTileOp::create(
         b, mlir::RankedTensorType::get(act_shape, b.getBF16Type()), activation,
-        spec.activation_batch_major ? mlir::ValueRange{zero_index, k0}
-                                    : mlir::ValueRange{k0, zero_index},
+        spec.activation_batch_major ? mlir::ValueRange{m0, k0}
+                                    : mlir::ValueRange{k0, m0},
         act_shape, llvm::SmallVector<int64_t>{1, 1});
 
     const int64_t scale_cols = block_k / kScaleBlock;
@@ -425,12 +424,12 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
               ? act_tile
               : mlir::stablehlo::TransposeOp::create(
                     b,
-                    mlir::RankedTensorType::get({spec.batch, block_k},
+                    mlir::RankedTensorType::get({block_m, block_k},
                                                 b.getBF16Type()),
                     act_tile, llvm::SmallVector<int64_t>{1, 0})
                     .getResult();
       Value scale_2d = mlir::stablehlo::BroadcastInDimOp::create(
-          b, mlir::RankedTensorType::get({spec.batch, block_k}, f32),
+          b, mlir::RankedTensorType::get({block_m, block_k}, f32),
           scale_wide, llvm::SmallVector<int64_t>{1});
       Value act_bf16 = xtile::Cast(
           b,
@@ -448,7 +447,7 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
           b.getContext(), {mlir::stablehlo::Precision::DEFAULT,
                            mlir::stablehlo::Precision::DEFAULT});
       Value dot_result = mlir::stablehlo::DotGeneralOp::create(
-          b, mlir::RankedTensorType::get({spec.batch, block_n}, f32), act_bf16,
+          b, mlir::RankedTensorType::get({block_m, block_n}, f32), act_bf16,
           weight_bf16, dims, precision_config, /*algorithm=*/nullptr);
       next = mlir::arith::AddFOp::create(b, acc, dot_result);
     }
@@ -460,12 +459,12 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
   Value result = xtile::Cast(b, loop.getResult(0), out_element);
   if (is_single_row) {
     result = mlir::stablehlo::TransposeOp::create(
-        b, mlir::RankedTensorType::get({spec.batch, block_n}, out_element),
+        b, mlir::RankedTensorType::get({block_m, block_n}, out_element),
         result, llvm::SmallVector<int64_t>{1, 0});
   }
   xtile::InsertTileOp::create(b, result, output,
-                              mlir::ValueRange{zero_index, n0},
-                              llvm::SmallVector<int64_t>{spec.batch, block_n},
+                              mlir::ValueRange{m0, n0},
+                              llvm::SmallVector<int64_t>{block_m, block_n},
                               llvm::SmallVector<int64_t>{1, 1});
 
   b.create<xtile::EntryFuncReturnOp>();

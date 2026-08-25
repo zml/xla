@@ -368,6 +368,7 @@ cc_library(
         "//xla/backends/autotuner:backend_config_proto_cc",
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/codegen/kernels:fp8_block_gemv_kernel",
         "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_query",
