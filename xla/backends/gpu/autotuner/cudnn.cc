@@ -180,7 +180,7 @@ bool IsSupportedCudnnFusion(const HloInstruction& instr,
         se::SemanticVersion(9, 24, 0);
     const bool is_sm120_with_fixed_cudnn =
         compute_capability.major == se::CudaComputeCapability::kBlackwell_12 &&
-        has_fixed_cudnn;
+        has_fixed_cudnn && !ScaledDotOutputIsThin(*hero);
     const bool is_sm103_with_enough_rows =
         compute_capability.major == se::CudaComputeCapability::kBlackwell &&
         compute_capability.minor == 3 && has_fixed_cudnn &&

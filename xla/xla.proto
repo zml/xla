@@ -1818,6 +1818,8 @@ message DebugOptions {
   // custom kernels (e.g. PTX) are not gated.
   repeated string xla_gpu_hlo_custom_call_allowlist = 537;
 
+  optional bool xla_gpu_experimental_claim_nvfp4_decode_dot = 902;
+
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
 

@@ -2985,6 +2985,30 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fused_scaled_dot_arms_cuda",
+    srcs = ["fused_scaled_dot_arms_cuda.cc"],
+    hdrs = ["fused_scaled_dot_arms_cuda.h"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":fused_scaled_dot_rewriter",
+        "//xla:shape_util",
+        "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:matmul_indexing_utils",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 xla_cc_test(
     name = "fused_scaled_dot_rewriter_test",
     srcs = ["fused_scaled_dot_rewriter_test.cc"],

@@ -35,5 +35,6 @@ message BackendConfig {
     xla.cpu.LlvmKernelOptions llvm_kernel = 5;
     xla.gpu.NativeEmitterBackendConfig native_emitter = 6;
     xla.gpu.TileIrFusionConfig tile_ir = 7;
+    xla.gpu.TileIrFusionConfig nvfp4_decode_dot = 11;
   }
 }
