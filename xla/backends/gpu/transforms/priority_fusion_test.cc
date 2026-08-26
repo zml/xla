@@ -1102,8 +1102,78 @@ ENTRY main {
   EXPECT_TRUE(contains_add);
 }
 
-TEST_F(PriorityFusionTest,
-       FormsFlyMultiOutputWithoutTritonMultiOutputFlag) {
+TEST_F(PriorityFusionTest, StrictFlyReplacementPreservesNativeSoftmaxBoundary) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_priority_softmax_boundary
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+producer_computation {
+  x = f32[128,256]{1,0} parameter(0)
+  y = f32[128,256]{1,0} parameter(1)
+  tanh = f32[128,256]{1,0} tanh(x)
+  sine = f32[128,256]{1,0} sine(y)
+  ROOT result = f32[128,256]{1,0} add(tanh, sine)
+}
+
+softmax_computation {
+  input = f32[128,256]{1,0} parameter(0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(input, minus_inf), dimensions={1},
+    to_apply=maximum
+  broadcast_max = f32[128,256]{1,0} broadcast(row_max), dimensions={0}
+  shifted = f32[128,256]{1,0} subtract(input, broadcast_max)
+  exponential = f32[128,256]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(exponential, zero), dimensions={1},
+    to_apply=add
+  broadcast_sum = f32[128,256]{1,0} broadcast(row_sum), dimensions={0}
+  ROOT result = f32[128,256]{1,0} divide(exponential, broadcast_sum)
+}
+
+ENTRY main {
+  x = f32[128,256]{1,0} parameter(0)
+  y = f32[128,256]{1,0} parameter(1)
+  producer = f32[128,256]{1,0} fusion(x, y), kind=kCustom,
+    calls=producer_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","256"]}],"num_warps":"1"}}}
+  ROOT softmax = f32[128,256]{1,0} fusion(producer), kind=kCustom,
+    calls=softmax_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","256"]}],"num_warps":"1"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  DebugOptions& debug_options =
+      module->mutable_config().mutable_debug_options();
+  debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+  debug_options.set_xla_gpu_flydsl_replace_triton(true);
+
+  se::DeviceDescription rocm_device = TestGpuDeviceInfo::AMDMI210DeviceInfo();
+  GpuHloCostAnalysis::Options options;
+  options.count_multiple_input_accesses = true;
+  PriorityFusion fly_priority_fusion(/*thread_pool=*/nullptr, rocm_device,
+                                     &alias_info_, options, &mlir_context_);
+  EXPECT_THAT(fly_priority_fusion.Run(module.get()),
+              absl_testing::IsOkAndHolds(false));
+
+  HloInstruction* softmax = module->entry_computation()->root_instruction();
+  ASSERT_TRUE(IsGenericFlyFusion(*softmax));
+  ASSERT_EQ(softmax->operand_count(), 1);
+  EXPECT_TRUE(IsGenericFlyFusion(*softmax->operand(0)));
+}
+
+TEST_F(PriorityFusionTest, FormsFlyMultiOutputWithoutTritonMultiOutputFlag) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_priority_multi_output
 
@@ -1135,8 +1205,7 @@ ENTRY main {
       .mutable_debug_options()
       .set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
 
-  se::DeviceDescription rocm_device =
-      TestGpuDeviceInfo::AMDMI210DeviceInfo();
+  se::DeviceDescription rocm_device = TestGpuDeviceInfo::AMDMI210DeviceInfo();
   ASSERT_TRUE(rocm_device.gpu_compute_capability().IsRocm());
   GpuHloCostAnalysis::Options options;
   options.count_multiple_input_accesses = true;
@@ -1148,10 +1217,9 @@ ENTRY main {
 
   HloInstruction* fusion0 = nullptr;
   HloInstruction* fusion1 = nullptr;
-  EXPECT_THAT(
-      module->entry_computation()->root_instruction(),
-      GmockMatch(m::Tuple(m::GetTupleElement(m::Fusion(&fusion0), 0),
-                          m::GetTupleElement(m::Fusion(&fusion1), 1))));
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              GmockMatch(m::Tuple(m::GetTupleElement(m::Fusion(&fusion0), 0),
+                                  m::GetTupleElement(m::Fusion(&fusion1), 1))));
   ASSERT_NE(fusion0, nullptr);
   EXPECT_EQ(fusion0, fusion1);
   EXPECT_TRUE(IsGenericFlyFusion(*fusion0));

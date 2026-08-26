@@ -15,12 +15,19 @@ limitations under the License.
 
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 
+#include "absl/strings/string_view.h"
+#include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/scan_support.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_transpose.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_traversal.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 
 namespace xla::gpu::flydsl {
 namespace {
@@ -41,6 +48,87 @@ bool IsSupportedCustomCallRoot(const HloFusionAnalysis& analysis) {
 }
 
 }  // namespace
+
+FlyFusionRoute ClassifyFlyFusion(const HloFusionAnalysis& analysis) {
+  const absl::string_view kind = analysis.fusion_backend_config().kind();
+  if (kind == kFlyGemmFusionKind) {
+    return FlyFusionRoute::kGemm;
+  }
+  if (kind == kFlyGemvFusionKind) {
+    return FlyFusionRoute::kGemv;
+  }
+  if (kind == kFlyCollectiveFusionKind) {
+    return FlyFusionRoute::kCollective;
+  }
+  if (kind != kFlyFusionKind) {
+    return FlyFusionRoute::kNotFly;
+  }
+  if (GetFlyScanDescriptor(analysis).has_value()) {
+    return FlyFusionRoute::kScan;
+  }
+  if (GetFlyPagedAttentionDescriptor(analysis).has_value() ||
+      GetFlyPagedAttentionSegmentedProducerDescriptor(analysis).has_value() ||
+      GetFlyPagedAttentionSegmentedReducerDescriptor(analysis).has_value()) {
+    return FlyFusionRoute::kPagedAttention;
+  }
+  if (GetFlyAttentionDescriptor(analysis).has_value()) {
+    return FlyFusionRoute::kAttention;
+  }
+  if (ContainsUnsupportedCustomCall(analysis)) {
+    return FlyFusionRoute::kUnsupportedCustomCall;
+  }
+  if (IsFlySoftmaxFusion(analysis)) {
+    return FlyFusionRoute::kSoftmax;
+  }
+  if (IsFlyXTileTransposeConfigSupported(analysis)) {
+    return FlyFusionRoute::kTranspose;
+  }
+  if (IsFlyXTileElementwiseFusion(analysis)) {
+    return FlyFusionRoute::kElementwise;
+  }
+  if (IsFlyXTileRowReductionFusion(analysis)) {
+    return FlyFusionRoute::kRowReduction;
+  }
+  return FlyFusionRoute::kGenericXla;
+}
+
+absl::string_view FlyFusionRouteName(FlyFusionRoute route) {
+  switch (route) {
+    case FlyFusionRoute::kNotFly:
+      return "not-fly";
+    case FlyFusionRoute::kGemm:
+      return "native-gemm";
+    case FlyFusionRoute::kGemv:
+      return "native-gemv";
+    case FlyFusionRoute::kCollective:
+      return "native-collective";
+    case FlyFusionRoute::kScan:
+      return "native-scan";
+    case FlyFusionRoute::kPagedAttention:
+      return "native-paged-attention";
+    case FlyFusionRoute::kAttention:
+      return "native-attention";
+    case FlyFusionRoute::kSoftmax:
+      return "native-softmax";
+    case FlyFusionRoute::kTranspose:
+      return "native-transpose";
+    case FlyFusionRoute::kElementwise:
+      return "native-elementwise";
+    case FlyFusionRoute::kRowReduction:
+      return "native-row-reduction";
+    case FlyFusionRoute::kGenericXla:
+      return "generic-xla-emitter";
+    case FlyFusionRoute::kUnsupportedCustomCall:
+      return "unsupported-custom-call";
+  }
+  return "unknown";
+}
+
+bool IsNativeFlyFusionRoute(FlyFusionRoute route) {
+  return route != FlyFusionRoute::kNotFly &&
+         route != FlyFusionRoute::kGenericXla &&
+         route != FlyFusionRoute::kUnsupportedCustomCall;
+}
 
 bool ContainsUnsupportedCustomCall(const HloInstruction& instruction) {
   if (instruction.opcode() != HloOpcode::kFusion) {

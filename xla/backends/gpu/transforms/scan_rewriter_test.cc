@@ -24,10 +24,10 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
-#include "xla/service/pattern_matcher.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/pattern_matcher.h"
 
 namespace xla::gpu {
 namespace {
@@ -113,7 +113,7 @@ ENTRY entry {
   EXPECT_TRUE(options.is_reverse());
 }
 
-TEST_F(ScanRewriterTest, LeavesLongRowsOnCub) {
+TEST_F(ScanRewriterTest, RoutesLongRowsToFlyFusion) {
   const char* hlo_text = R"(
 HloModule module
 
@@ -135,12 +135,21 @@ ENTRY entry {
   ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
 
   ScanRewriter pass(/*enable_flydsl=*/true);
-  ASSERT_OK(pass.Run(module.get()));
-  HloInstruction* call =
-      module->entry_computation()->root_instruction()->mutable_operand(0);
+  ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));
+  EXPECT_TRUE(changed);
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kGetTupleElement);
+  HloInstruction* result_tuple = root->mutable_operand(0);
+  ASSERT_EQ(result_tuple->opcode(), HloOpcode::kTuple);
+  HloInstruction* fusion = result_tuple->mutable_operand(0);
+  ASSERT_EQ(fusion->opcode(), HloOpcode::kFusion);
+  HloInstruction* call = fusion->fused_expression_root();
   ASSERT_EQ(call->opcode(), HloOpcode::kCustomCall);
-  EXPECT_EQ(call->custom_call_target(),
-            kCubDeviceScanUnassignedScratchSizeTarget);
+  EXPECT_EQ(call->custom_call_target(), flydsl::kFlyScanCallTarget);
+  ASSERT_OK_AND_ASSIGN(CubScanOptions options,
+                       call->backend_config<CubScanOptions>());
+  EXPECT_EQ(options.row_length(), 1025);
+  EXPECT_EQ(options.column_length(), 1);
 }
 
 TEST_F(ScanRewriterTest, SingleElementZeroInit) {

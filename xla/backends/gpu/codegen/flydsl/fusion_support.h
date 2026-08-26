@@ -16,10 +16,35 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_CODEGEN_FLYDSL_FUSION_SUPPORT_H_
 #define XLA_BACKENDS_GPU_CODEGEN_FLYDSL_FUSION_SUPPORT_H_
 
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
 namespace xla::gpu::flydsl {
+
+// The concrete code-generation route selected for a Fly-tagged fusion. Keep
+// this classification in lockstep with GetFusionEmitter: replacement audits
+// must distinguish native xTile/Fly algorithms from XLA's generic emitters
+// using Fly memory operations.
+enum class FlyFusionRoute {
+  kNotFly,
+  kGemm,
+  kGemv,
+  kCollective,
+  kScan,
+  kPagedAttention,
+  kAttention,
+  kSoftmax,
+  kTranspose,
+  kElementwise,
+  kRowReduction,
+  kGenericXla,
+  kUnsupportedCustomCall,
+};
+
+FlyFusionRoute ClassifyFlyFusion(const HloFusionAnalysis& analysis);
+absl::string_view FlyFusionRouteName(FlyFusionRoute route);
+bool IsNativeFlyFusionRoute(FlyFusionRoute route);
 
 // Returns true when a fusion contains a custom call that is not owned by one
 // of Fly's specialized emitters. Generic loop/reduction/transpose emitters do

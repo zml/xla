@@ -101,8 +101,8 @@ std::optional<double> UniformConstant(const HloInstruction* instruction) {
   }
 }
 
-std::optional<double> FindDotScale(const HloInstruction* instruction,
-                                   const HloInstruction* dot) {
+std::optional<double> MatchScaledDot(const HloInstruction* instruction,
+                                     const HloInstruction* dot) {
   if (instruction == dot) {
     return 1.0;
   }
@@ -114,16 +114,26 @@ std::optional<double> FindDotScale(const HloInstruction* instruction,
       }
       if (std::optional<double> scale =
               UniformConstant(instruction->operand(1 - operand))) {
-        return scale;
+        if (std::optional<double> nested =
+                MatchScaledDot(instruction->operand(operand), dot)) {
+          return *scale * *nested;
+        }
       }
     }
+    return std::nullopt;
   }
-  for (const HloInstruction* operand : instruction->operands()) {
-    if (ContainsInstruction(operand, dot)) {
-      return FindDotScale(operand, dot);
-    }
+  if (instruction->operand_count() != 1) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  switch (instruction->opcode()) {
+    case HloOpcode::kBitcast:
+    case HloOpcode::kConvert:
+    case HloOpcode::kCopy:
+    case HloOpcode::kReshape:
+      return MatchScaledDot(instruction->operand(0), dot);
+    default:
+      return std::nullopt;
+  }
 }
 
 bool IsQkDot(const HloInstruction& dot, int64_t batch_heads,
@@ -292,12 +302,18 @@ std::optional<FlyAttentionDescriptor> GetFlyAttentionDescriptor(
       !ContainsInstruction(softmax_input, qk_dot)) {
     return std::nullopt;
   }
-  const bool causal =
-      GetFlyCausalMaskScores(*softmax_input, sequence) != nullptr;
-  if (!causal && softmax_input->shape().element_type() != element_type) {
-    return std::nullopt;
+  const HloInstruction* scaled_scores =
+      GetFlyCausalMaskScores(*softmax_input, sequence);
+  const bool causal = scaled_scores != nullptr;
+  if (!causal) {
+    scaled_scores = softmax_input;
   }
-  std::optional<double> scale = FindDotScale(softmax_input, qk_dot);
+  // XLA can remove an intermediate BF16 round trip and leave the QK scale in
+  // F32. The native attention kernel already accumulates and scales scores in
+  // F32, so accept both forms, but only when the complete producer is a dot,
+  // unary view/conversion chain, and uniform multiplication. This excludes
+  // unsupported bias or arbitrary score epilogues.
+  std::optional<double> scale = MatchScaledDot(scaled_scores, qk_dot);
   if (!scale.has_value() || *scale <= 0.0) {
     return std::nullopt;
   }

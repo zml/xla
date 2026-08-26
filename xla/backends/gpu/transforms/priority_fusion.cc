@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
 #include "xla/debug_options_flags.h"
@@ -912,6 +913,26 @@ class PriorityFusionQueue {
 
     TiledRunTimeData tiled_run_time_data =
         std::get<TiledRunTimeData>(std::move(tiled_run_time_data_or_error));
+
+    if (use_fly_backend && producer->GetModule()
+                               ->config()
+                               .debug_options()
+                               .xla_gpu_flydsl_replace_triton()) {
+      GpuBackendConfig gpu_config = GetBlockLevelGpuBackendConfig(
+          tiled_run_time_data.block_level_parameters, kFlyFusionKind);
+      HloFusionAnalysis native_analysis = HloFusionAnalysis::Create(
+          gpu_config.fusion_backend_config(),
+          HloFusionAdaptor::ForProducerConsumer(producer, consumer,
+                                                use_multi_output_fusion),
+          device_info_);
+      const flydsl::FlyFusionRoute route =
+          flydsl::ClassifyFlyFusion(native_analysis);
+      if (!flydsl::IsNativeFlyFusionRoute(route)) {
+        return FusionDecision::Forbid(absl::StrCat(
+            "strict Fly replacement would create non-native route ",
+            flydsl::FlyFusionRouteName(route)));
+      }
+    }
 
     // This is our way to pass the runtime estimate to the CalculatePriorities()
     // function.

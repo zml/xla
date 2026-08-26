@@ -25,8 +25,6 @@ limitations under the License.
 namespace xla::gpu::flydsl {
 namespace {
 
-constexpr int64_t kMaxNativeRowLength = 1024;
-
 bool IsSupportedElementType(PrimitiveType type) {
   return type == F16 || type == BF16 || type == F32 || type == S32 ||
          type == U32;
@@ -42,9 +40,7 @@ bool IsFlyScanSupported(const Shape& shape, const CubScanOptions& options) {
   if (!shape.IsArray() || !shape.has_layout() ||
       !IsSupportedElementType(shape.element_type()) ||
       options.kind() != CubScanOptions::SUM || options.vector_length() != 1 ||
-      options.row_length() <= 0 ||
-      options.row_length() > kMaxNativeRowLength ||
-      options.column_length() <= 0 ||
+      options.row_length() <= 0 || options.column_length() <= 0 ||
       ShapeUtil::ElementsIn(shape) !=
           options.row_length() * options.column_length()) {
     return false;
@@ -66,9 +62,9 @@ std::optional<FlyScanDescriptor> GetFlyScanDescriptor(
   if (!options.ok() || !IsFlyScanSupported(call.shape(), *options)) {
     return std::nullopt;
   }
-  return FlyScanDescriptor{
-      options->row_length(), options->column_length(), options->is_reverse(),
-      call.shape().element_type(), call.operand(0), &call};
+  return FlyScanDescriptor{options->row_length(), options->column_length(),
+                           options->is_reverse(), call.shape().element_type(),
+                           call.operand(0),       &call};
 }
 
 std::optional<FlyScanDescriptor> GetFlyScanDescriptor(

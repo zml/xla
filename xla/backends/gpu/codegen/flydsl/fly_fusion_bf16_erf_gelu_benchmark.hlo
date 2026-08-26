@@ -1,0 +1,27 @@
+HloModule fly_fusion_bf16_erf_gelu_benchmark
+
+%fused_gelu (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  %p0_f32 = f32[16384,8192]{1,0} convert(%p0)
+  %inv_sqrt_two = f32[] constant(0.7071067811865476)
+  %inv_sqrt_two_broadcast = f32[16384,8192]{1,0}
+    broadcast(%inv_sqrt_two), dimensions={}
+  %scaled = f32[16384,8192]{1,0}
+    multiply(%p0_f32, %inv_sqrt_two_broadcast)
+  %erf = f32[16384,8192]{1,0} erf(%scaled)
+  %one = f32[] constant(1)
+  %ones = f32[16384,8192]{1,0} broadcast(%one), dimensions={}
+  %shifted = f32[16384,8192]{1,0} add(%erf, %ones)
+  %half = f32[] constant(0.5)
+  %halves = f32[16384,8192]{1,0} broadcast(%half), dimensions={}
+  %gated = f32[16384,8192]{1,0} multiply(%p0_f32, %shifted)
+  %result_f32 = f32[16384,8192]{1,0} multiply(%gated, %halves)
+  ROOT %result = bf16[16384,8192]{1,0} convert(%result_f32)
+}
+
+ENTRY %entry_computation (p0: bf16[16384,8192]) -> bf16[16384,8192] {
+  %p0 = bf16[16384,8192]{1,0} parameter(0)
+  ROOT %fusion = bf16[16384,8192]{1,0} fusion(%p0), kind=kCustom,
+    calls=%fused_gelu,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

@@ -104,6 +104,9 @@ std::optional<FlyPagedAttentionDescriptor> GetDescriptorForTarget(
 
 std::optional<FlyPagedAttentionDescriptor> GetFlyPagedAttentionDescriptor(
     const HloInstruction& call) {
+  if (call.opcode() != HloOpcode::kCustomCall) {
+    return std::nullopt;
+  }
   return GetDescriptorForTarget(call, kFlyPagedAttentionDecodeCallTarget,
                                 call.shape());
 }

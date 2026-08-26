@@ -49,6 +49,16 @@ inline autotuner::Backend GetFissionBackend(autotuner::Backend backend) {
   LOG(FATAL) << "Could not parse fission backend name: " << fission_name;
 }
 
+// Removes structurally duplicate Fly GEMM configurations and, when
+// `restrict_to_mi300_default_tiles` is true, bounds the generic Cartesian
+// search to a hardware-curated set of MI300 macro tiles. Fly-specific
+// pipelines (staged RHS, preloaded fragments, rolling refill, etc.) are always
+// retained. This is exposed for focused policy tests; production callers use
+// it through FissionBackend::GetSupportedConfigs.
+std::vector<std::unique_ptr<BackendConfig>> OptimizeFlyFissionConfigSet(
+    std::vector<std::unique_ptr<BackendConfig>> configs,
+    bool restrict_to_mi300_default_tiles);
+
 // A proxy backend that wraps an actual codegen backend. The `rewriter_pipeline`
 // is used to transform unfused instructions to retarget them for the underlying
 // codegen backend.

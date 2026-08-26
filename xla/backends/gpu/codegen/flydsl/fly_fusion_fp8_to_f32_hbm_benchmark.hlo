@@ -1,0 +1,17 @@
+HloModule fly_fusion_fp8_to_f32_hbm_benchmark
+
+%fused_conversion (p0: f8e4m3fnuz[67108864]) -> f32[67108864] {
+  %p0 = f8e4m3fnuz[67108864]{0} parameter(0)
+  %converted = f32[67108864]{0} convert(%p0)
+  %magnitude = f32[67108864]{0} abs(%converted)
+  %scale = f32[] constant(0.5)
+  %scales = f32[67108864]{0} broadcast(%scale), dimensions={}
+  ROOT %result = f32[67108864]{0} multiply(%magnitude, %scales)
+}
+
+ENTRY %entry_computation (p0: f8e4m3fnuz[67108864]) -> f32[67108864] {
+  %p0 = f8e4m3fnuz[67108864]{0} parameter(0)
+  ROOT %fusion = f32[67108864]{0} fusion(%p0), kind=kCustom,
+    calls=%fused_conversion,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

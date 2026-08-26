@@ -144,11 +144,12 @@ add {
 
 softmax {
   p0 = bf16[32,128,128]{2,1,0} parameter(0)
-  view = bf16[2,16,128,128]{3,2,1,0} bitcast(p0)
-  converted = f32[2,16,128,128]{3,2,1,0} convert(view)
+  converted_flat = f32[32,128,128]{2,1,0} convert(p0)
+  converted = f32[2,16,128,128]{3,2,1,0} bitcast(converted_flat)
   minus_inf = f32[] constant(-inf)
-  row_max.0 = f32[2,16,128]{2,1,0} reduce(converted, minus_inf),
-    dimensions={3}, to_apply=maximum
+  row_max_flat = f32[32,128]{1,0} reduce(converted_flat, minus_inf),
+    dimensions={2}, to_apply=maximum
+  row_max.0 = f32[2,16,128]{2,1,0} bitcast(row_max_flat)
   broadcast_max.0 = f32[2,16,128,128]{3,2,1,0}
     broadcast(row_max.0), dimensions={0,1,2}
   shifted.0 = f32[2,16,128,128]{3,2,1,0}

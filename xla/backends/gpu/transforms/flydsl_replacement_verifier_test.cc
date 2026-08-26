@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -37,8 +38,16 @@ using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
-class FlyDslReplacementVerifierTest
-    : public HloHardwareIndependentTestBase {};
+class FlyDslReplacementVerifierTest : public HloHardwareIndependentTestBase {
+ protected:
+  FlyDslReplacementVerifier Verifier() {
+    return FlyDslReplacementVerifier(device_);
+  }
+
+ private:
+  stream_executor::DeviceDescription device_ =
+      TestGpuDeviceInfo::AMDMI210DeviceInfo();
+};
 
 std::string FusionModule(absl::string_view kind) {
   return absl::StrCat(R"(
@@ -63,8 +72,7 @@ TEST_F(FlyDslReplacementVerifierTest, DisabledModeAllowsTriton) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnVerifiedModule(
                               FusionModule("__triton_gemm")));
-  EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
-              IsOkAndHolds(false));
+  EXPECT_THAT(Verifier().Run(module.get()), IsOkAndHolds(false));
 }
 
 TEST_F(FlyDslReplacementVerifierTest, EnabledModeAllowsEveryFlyKind) {
@@ -77,8 +85,7 @@ TEST_F(FlyDslReplacementVerifierTest, EnabledModeAllowsEveryFlyKind) {
     module->mutable_config()
         .mutable_debug_options()
         .set_xla_gpu_flydsl_replace_triton(true);
-    EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
-                IsOkAndHolds(false));
+    EXPECT_THAT(Verifier().Run(module.get()), IsOkAndHolds(false));
   }
 }
 
@@ -93,9 +100,9 @@ TEST_F(FlyDslReplacementVerifierTest, RejectsEveryTritonFusionKind) {
     module->mutable_config()
         .mutable_debug_options()
         .set_xla_gpu_flydsl_replace_triton(true);
-    EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
-                StatusIs(absl::StatusCode::kFailedPrecondition,
-                         HasSubstr(kind)));
+    EXPECT_THAT(
+        Verifier().Run(module.get()),
+        StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr(kind)));
   }
 }
 
@@ -119,9 +126,9 @@ ENTRY main {
     module->mutable_config()
         .mutable_debug_options()
         .set_xla_gpu_flydsl_replace_triton(true);
-    EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
-                StatusIs(absl::StatusCode::kFailedPrecondition,
-                         HasSubstr(target)));
+    EXPECT_THAT(
+        Verifier().Run(module.get()),
+        StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr(target)));
   }
 }
 
@@ -147,9 +154,42 @@ ENTRY main {
   module->mutable_config()
       .mutable_debug_options()
       .set_xla_gpu_flydsl_replace_triton(true);
-  EXPECT_THAT(FlyDslReplacementVerifier().Run(module.get()),
+  EXPECT_THAT(Verifier().Run(module.get()),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("unsupported custom call")));
+}
+
+TEST_F(FlyDslReplacementVerifierTest, RejectsGenericXlaEmitterRoute) {
+  constexpr absl::string_view kHlo = R"(
+HloModule replacement_verifier_generic_xla_route
+
+multiply {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT product = f32[] multiply(lhs, rhs)
+}
+
+body {
+  p0 = f32[17,11]{1,0} parameter(0)
+  one = f32[] constant(1)
+  ROOT result = f32[11]{0} reduce(p0, one), dimensions={0},
+      to_apply=multiply
+}
+
+ENTRY main {
+  p0 = f32[17,11]{1,0} parameter(0)
+  ROOT fusion = f32[11]{0} fusion(p0), kind=kCustom, calls=body,
+      backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_flydsl_replace_triton(true);
+  EXPECT_THAT(Verifier().Run(module.get()),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("generic-xla-emitter")));
 }
 
 }  // namespace

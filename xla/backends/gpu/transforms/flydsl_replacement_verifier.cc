@@ -18,14 +18,16 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
-#include "xla/tsl/platform/status_macros.h"
 
 namespace xla::gpu {
 namespace {
@@ -84,6 +86,21 @@ absl::StatusOr<bool> FlyDslReplacementVerifier::RunImpl(
             "FlyDSL replacement mode found an unsupported custom call inside "
             "Fly fusion ",
             instruction->name()));
+      }
+      if (kind == kFlyFusionKind) {
+        HloFusionAnalysis analysis =
+            HloFusionAnalysis::Create(*instruction, device_description_);
+        const flydsl::FlyFusionRoute route =
+            flydsl::ClassifyFlyFusion(analysis);
+        if (!flydsl::IsNativeFlyFusionRoute(route)) {
+          return absl::FailedPreconditionError(absl::StrCat(
+              "FlyDSL replacement mode found non-native Fly route '",
+              flydsl::FlyFusionRouteName(route), "' on instruction ",
+              instruction->name(), ":\n",
+              Cast<const HloFusionInstruction>(instruction)
+                  ->fused_instructions_computation()
+                  ->ToString()));
+        }
       }
     }
   }

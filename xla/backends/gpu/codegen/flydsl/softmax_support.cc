@@ -32,22 +32,32 @@ bool IsScalarConstant(const HloInstruction* instruction, double value) {
   return instruction->literal().GetAsDouble({}) == value;
 }
 
-bool IsRowReduction(const HloInstruction* reduction, HloOpcode reducer_opcode,
-                    const HloInstruction* input) {
+const HloInstruction* GetRowReduction(const HloInstruction* reduction,
+                                      HloOpcode reducer_opcode,
+                                      const HloInstruction* input) {
+  while (reduction->opcode() == HloOpcode::kBitcast &&
+         reduction->operand_count() == 1) {
+    reduction = reduction->operand(0);
+  }
+  while (input->opcode() == HloOpcode::kBitcast &&
+         input->operand_count() == 1) {
+    input = input->operand(0);
+  }
   const int64_t input_rank = input->shape().dimensions_size();
-  return reduction->opcode() == HloOpcode::kReduce &&
-         reduction->operand_count() == 2 && reduction->operand(0) == input &&
-         reduction->dimensions().size() == 1 &&
-         input_rank >= 2 && reduction->dimensions(0) == input_rank - 1 &&
-         reduction->shape().dimensions_size() == input_rank - 1 &&
-         ShapeUtil::SameDimensions(reduction->shape(),
-                                   ShapeUtil::DeleteDimension(
-                                       input_rank - 1, input->shape())) &&
-         reduction->called_computations().size() == 1 &&
-         reduction->called_computations()
-                 .front()
-                 ->root_instruction()
-                 ->opcode() == reducer_opcode;
+  if (reduction->opcode() != HloOpcode::kReduce ||
+      reduction->operand_count() != 2 || reduction->operand(0) != input ||
+      reduction->dimensions().size() != 1 || input_rank < 2 ||
+      reduction->dimensions(0) != input_rank - 1 ||
+      reduction->shape().dimensions_size() != input_rank - 1 ||
+      !ShapeUtil::SameDimensions(
+          reduction->shape(),
+          ShapeUtil::DeleteDimension(input_rank - 1, input->shape())) ||
+      reduction->called_computations().size() != 1 ||
+      reduction->called_computations().front()->root_instruction()->opcode() !=
+          reducer_opcode) {
+    return nullptr;
+  }
+  return reduction;
 }
 
 const HloInstruction* BroadcastOperand(const HloInstruction* instruction,
@@ -77,9 +87,11 @@ const HloInstruction* StableShiftInput(const HloInstruction* shifted) {
   const HloInstruction* input = shifted->operand(0);
   const HloInstruction* row_max =
       BroadcastOperand(shifted->operand(1), input->shape());
-  if (row_max == nullptr ||
-      !IsRowReduction(row_max, HloOpcode::kMaximum, input) ||
-      !IsScalarConstant(row_max->operand(1),
+  const HloInstruction* reduction =
+      row_max == nullptr ? nullptr
+                         : GetRowReduction(row_max, HloOpcode::kMaximum, input);
+  if (reduction == nullptr ||
+      !IsScalarConstant(reduction->operand(1),
                         -std::numeric_limits<double>::infinity())) {
     return nullptr;
   }
@@ -106,9 +118,13 @@ const HloInstruction* GetStableSoftmaxF32Input(const HloInstruction& root) {
   const HloInstruction* exponential = normalized->operand(0);
   const HloInstruction* row_sum =
       BroadcastOperand(normalized->operand(1), exponential->shape());
+  const HloInstruction* sum_reduction =
+      row_sum == nullptr
+          ? nullptr
+          : GetRowReduction(row_sum, HloOpcode::kAdd, exponential);
   if (exponential->opcode() != HloOpcode::kExp || row_sum == nullptr ||
-      !IsRowReduction(row_sum, HloOpcode::kAdd, exponential) ||
-      !IsScalarConstant(row_sum->operand(1), 0.0)) {
+      sum_reduction == nullptr ||
+      !IsScalarConstant(sum_reduction->operand(1), 0.0)) {
     return nullptr;
   }
   const HloInstruction* input = StableShiftInput(exponential->operand(0));
@@ -150,6 +166,15 @@ const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
   }
   const HloInstruction* input = converted;
   if (element_type != F32) {
+    // Layout normalization can legally commute a bitcast and a widening
+    // conversion: bitcast(convert(parameter)) is equivalent to
+    // convert(bitcast(parameter)) for this flat row-wise kernel. Peel the
+    // F32 bitcast so both normalized forms select the native emitter.
+    while (converted->opcode() == HloOpcode::kBitcast &&
+           converted->operand_count() == 1 &&
+           converted->shape().element_type() == F32) {
+      converted = converted->operand(0);
+    }
     if (converted->opcode() != HloOpcode::kConvert ||
         converted->operand_count() != 1 ||
         converted->shape().element_type() != F32) {

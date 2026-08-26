@@ -2239,6 +2239,19 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   if (flydsl::ContainsUnsupportedCustomCall(analysis)) {
     return false;
   }
+  if (flydsl::IsFlyXTileElementwiseFusion(analysis) ||
+      flydsl::IsFlyXTileRowReductionFusion(analysis)) {
+    return true;
+  }
+  // Strict replacement is a native-Fly contract.  Do not attach __fly to an
+  // otherwise valid XLA loop/reduction merely because the legacy generic
+  // emitter can compile it: doing so hides coverage gaps and can also hand a
+  // multi-output graph to a generic reduction emitter whose hero assumptions
+  // do not apply.  Leave such fusions on their ordinary XLA backend until a
+  // native Fly route owns their complete graph.
+  if (debug_options().xla_gpu_flydsl_replace_triton()) {
+    return false;
+  }
   // Generic block-level fusions have already been marked custom, so their HLO
   // fusion analysis reports the selected backend instead of the underlying
   // loop, reduction, or transpose emitter kind. Fly dispatches those
@@ -2487,6 +2500,8 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return configs;
   }
   const auto& heroes = analysis.fusion_heroes();
+  const bool is_native_elementwise =
+      flydsl::IsFlyXTileElementwiseFusion(analysis);
   const bool has_tiled_transpose_hero =
       std::any_of(heroes.begin(), heroes.end(), [](const auto& hero) {
         return GetDescriptionForTiledTransposeEmitter(hero.instruction())
@@ -2514,7 +2529,7 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       break;
     }
   }
-  if (reduction_hero != nullptr) {
+  if (reduction_hero != nullptr && !is_native_elementwise) {
     ReductionDimensions dimensions =
         GetReductionKindAndContiguousComponents(*reduction_hero);
     auto add_reduction_config = [&](int64_t elements_per_thread,
@@ -2544,9 +2559,44 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
   const int64_t elements = ShapeUtil::ElementsIn(analysis.first_result_shape());
   const int64_t native_unroll = ComputeLoopFusionConfig(analysis);
-  const bool is_native_elementwise =
-      flydsl::IsFlyXTileElementwiseFusion(analysis);
   const bool is_native_indexed = flydsl::IsFlyXTileIndexedFusion(analysis);
+  const bool has_type_changing_bitcast =
+      is_native_elementwise &&
+      absl::c_any_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* instruction) {
+            return (instruction->opcode() == HloOpcode::kBitcast ||
+                    instruction->opcode() == HloOpcode::kBitcastConvert) &&
+                   instruction->operand_count() == 1 &&
+                   instruction->shape().element_type() !=
+                       instruction->operand(0)->shape().element_type();
+          });
+  const bool has_shape_changing_physical_view =
+      is_native_elementwise &&
+      absl::c_any_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* instruction) {
+            switch (instruction->opcode()) {
+              case HloOpcode::kBitcast:
+              case HloOpcode::kBitcastConvert:
+              case HloOpcode::kReshape:
+              case HloOpcode::kTranspose:
+                return instruction->operand_count() == 1 &&
+                       !ShapeUtil::Equal(instruction->shape(),
+                                         instruction->operand(0)->shape());
+              default:
+                return false;
+            }
+          });
+  const bool has_native_leading_reduction =
+      is_native_elementwise &&
+      absl::c_any_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* instruction) {
+            return instruction->opcode() == HloOpcode::kReduce &&
+                   instruction->dimensions().size() == 1 &&
+                   instruction->dimensions(0) == 0;
+          });
   const bool is_native_slice =
       is_native_indexed &&
       (hlo_query::GetFirstInstructionWithOpcode(
@@ -2574,8 +2624,13 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       hlo_query::GetFirstInstructionWithOpcode(
           *instr.fused_instructions_computation(),
           HloOpcode::kReduceWindow) != nullptr;
+  auto storage_bit_width = [](PrimitiveType type) {
+    // XLA's device ABI stores PRED as one byte even though its logical value
+    // has one bit.
+    return type == PRED ? int64_t{8} : primitive_util::BitWidth(type);
+  };
   int64_t max_external_element_bits =
-      primitive_util::BitWidth(analysis.first_result_shape().element_type());
+      storage_bit_width(analysis.first_result_shape().element_type());
   for (const HloInstruction* operand : instr.operands()) {
     if (ShapeUtil::IsScalar(operand->shape()) &&
         primitive_util::IsIntegralType(operand->shape().element_type())) {
@@ -2583,7 +2638,7 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     }
     max_external_element_bits = std::max<int64_t>(
         max_external_element_bits,
-        primitive_util::BitWidth(operand->shape().element_type()));
+        storage_bit_width(operand->shape().element_type()));
   }
   const int64_t max_elementwise_configs = std::max<int64_t>(
       1, debug_options().xla_gpu_fusion_autotune_top_k_configs());
@@ -2593,12 +2648,17 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     if (unroll <= 0 || unroll > elements) {
       return;
     }
-    if (is_native_elementwise && vector_size_bits > 0 &&
+    const bool scalarized_wide_s4_output =
+        analysis.first_result_shape().element_type() == S4 &&
+        vector_size_bits == 16;
+    if (is_native_elementwise && !has_type_changing_bitcast &&
+        vector_size_bits > 0 &&
         vector_size_bits /
-                primitive_util::BitWidth(
+                storage_bit_width(
                     analysis.first_result_shape().element_type()) *
                 max_external_element_bits >
-            128) {
+            128 &&
+        !scalarized_wide_s4_output) {
       return;
     }
     for (const auto& existing : configs) {
@@ -2734,6 +2794,21 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   }
 
   if (is_native_elementwise) {
+    if (has_native_leading_reduction) {
+      // Leading reductions run one independent accumulator per output lane.
+      // A single Wave64 block with a 64-bit output vector reaches the MI300X
+      // HBM ceiling for the common split/leading dimensions. Tune occupancy
+      // explicitly; larger CTAs only reduce the number of schedulable blocks.
+      for (int64_t waves_per_eu : {0, 2, 4}) {
+        add_config(/*unroll=*/1, /*num_warps=*/1,
+                   /*vector_size_bits=*/64, waves_per_eu);
+      }
+      add_config(/*unroll=*/1, /*num_warps=*/1,
+                 /*vector_size_bits=*/128);
+      if (configs.size() >= max_elementwise_configs) {
+        return configs;
+      }
+    }
     // Rank the native MI300X configurations before applying XLA's top-k
     // fusion-autotuning limit. Two-wave, single-vector blocks are the stable
     // steady-state winner across F16, BF16, F32, aligned, and ragged HBM
@@ -2781,15 +2856,62 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
         {4, 4, 64},
         {1, 4, 128},
     }};
+    // Shape-changing physical views remain flat, coalesced memory operations,
+    // but the extra indexing context changes the best workgroup geometry on
+    // gfx942.  Keep the measured 128-bit winners inside XLA's ordinary
+    // top-eight budget instead of requiring an expanded diagnostic search.
+    constexpr std::array<std::array<int64_t, 3>, 8>
+        kPhysicalViewPreferredConfigs = {{{1, 2, 64},
+                                          {1, 8, 128},
+                                          {2, 1, 128},
+                                          {2, 4, 128},
+                                          {1, 2, 128},
+                                          {1, 4, 128},
+                                          {2, 2, 64},
+                                          {2, 2, 128}}};
     const PrimitiveType element_type =
         analysis.first_result_shape().element_type();
-    const int64_t element_bits = primitive_util::BitWidth(element_type);
+    const int64_t element_bits = storage_bit_width(element_type);
     const bool has_scalar_tail = elements % (64 / element_bits) != 0;
-    const auto& preferred_configs = element_type == F16   ? kF16PreferredConfigs
-                                    : element_type == F32 ? kF32PreferredConfigs
-                                    : has_scalar_tail
-                                        ? kTailPreferredConfigs
-                                        : kAlignedPreferredConfigs;
+    // Mixed-width conversions use the output lane count for every external
+    // buffer. When a narrow result reads a wider input, 64- and 128-bit output
+    // vectors can therefore exceed the copy atom's 128-bit transaction limit.
+    // Seed the search with the widest legal narrow vector instead of dropping
+    // every native Fly candidate (for example, S8 output fed by F64 input).
+    const int64_t maximum_safe_vector_bits =
+        128 * element_bits / max_external_element_bits;
+    if (!has_type_changing_bitcast && maximum_safe_vector_bits < 64) {
+      constexpr std::array<std::array<int64_t, 2>, 8>
+          kNarrowPreferredConfigs = {{{1, 2},
+                                      {1, 4},
+                                      {2, 2},
+                                      {2, 4},
+                                      {4, 2},
+                                      {4, 4},
+                                      {1, 1},
+                                      {1, 8}}};
+      for (int64_t vector_size_bits : {32, 16}) {
+        if ((vector_size_bits <= maximum_safe_vector_bits ||
+             (element_type == S4 && vector_size_bits == 16)) &&
+            vector_size_bits % element_bits == 0) {
+          for (const auto& [unroll, num_warps] :
+               kNarrowPreferredConfigs) {
+            add_config(unroll, num_warps, vector_size_bits);
+            if (configs.size() >= max_elementwise_configs) {
+              return configs;
+            }
+          }
+          break;
+        }
+      }
+    }
+    const auto& preferred_configs =
+        has_shape_changing_physical_view
+            ? kPhysicalViewPreferredConfigs
+        : element_type == F16   ? kF16PreferredConfigs
+        : element_type == F32   ? kF32PreferredConfigs
+        : has_scalar_tail       ? kTailPreferredConfigs
+                                : kAlignedPreferredConfigs;
     for (const auto& [unroll, num_warps, vector_size_bits] :
          preferred_configs) {
       add_config(unroll, num_warps, vector_size_bits);
