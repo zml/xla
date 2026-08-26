@@ -17,10 +17,12 @@ limitations under the License.
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -48,6 +50,55 @@ namespace xla {
 namespace gpu {
 
 namespace {
+
+std::string FlyTileKey(const FlyGemmConfig& config) {
+  return absl::StrCat(config.block_m(), ":", config.block_n(), ":",
+                      config.block_k(), ":", config.num_warps());
+}
+
+std::string FlyConfigKey(const BackendConfig& config) {
+  if (!config.has_fly()) {
+    return config.SerializeAsString();
+  }
+  const FlyGemmConfig& fly = config.fly();
+  return absl::StrCat(
+      fly.block_m(), ":", fly.block_n(), ":", fly.block_k(), ":",
+      fly.num_warps(), ":", static_cast<int>(fly.mfma_atom()), ":",
+      fly.prefetch_rhs(), ":", fly.stage_output(), ":", fly.waves_per_eu(), ":",
+      fly.schedule_instructions(), ":", fly.stage_rhs(), ":", fly.async_lhs(),
+      ":", fly.preload_lds_fragments(), ":", fly.single_buffer_lds(), ":",
+      fly.direct_to_vgpr(), ":", fly.rolling_refill(), ":", fly.local_split_k(),
+      ":", fly.workgroup_mapping_n(), ":", fly.gemv_outputs_per_wave(), ":",
+      fly.gemv_k_vector_width(), ":", fly.gemv_split_k(), ":",
+      fly.dequantize_block_scales());
+}
+
+bool IsFlySpecificPipeline(const FlyGemmConfig& config) {
+  return config.stage_rhs() || config.async_lhs() ||
+         config.preload_lds_fragments() || config.single_buffer_lds() ||
+         config.direct_to_vgpr() || config.rolling_refill() ||
+         config.local_split_k() || config.workgroup_mapping_n() != 0 ||
+         config.gemv_outputs_per_wave() != 0 ||
+         config.gemv_k_vector_width() != 0 || config.gemv_split_k() ||
+         config.dequantize_block_scales();
+}
+
+const absl::flat_hash_set<std::string>& Mi300DefaultFlyTileKeys() {
+  // These are macro-tile priors, not Triton configurations. They cover the
+  // useful MI300 workgroup geometries found by XLA's existing hardware search
+  // while leaving Fly's MFMA atom and software pipeline choices independent.
+  // Specialized Fly pipelines bypass this list entirely.
+  static const auto* keys = new absl::flat_hash_set<std::string>({
+      "16:16:256:4",  "16:128:32:4",  "32:8:16:2",    "32:16:128:2",
+      "32:16:128:4",  "32:16:256:2",  "32:32:32:2",   "32:32:256:4",
+      "32:64:64:4",   "64:8:128:2",   "64:32:16:2",   "64:32:32:2",
+      "64:32:32:4",   "64:32:128:2",  "128:8:16:2",   "128:16:128:8",
+      "128:32:16:4",  "128:32:32:4",  "128:64:128:8", "128:128:32:4",
+      "128:128:64:4", "128:256:32:4", "128:256:64:8", "256:8:16:2",
+      "256:8:32:2",   "256:128:32:4", "256:128:64:8", "256:256:32:8",
+  });
+  return *keys;
+}
 
 // Replaces the fusion instruction with the instructions from the fissioned
 // computation.
@@ -92,6 +143,70 @@ absl::Status InlineFissionedComputation(HloInstruction* fusion_instr,
 
 }  // namespace
 
+std::vector<std::unique_ptr<BackendConfig>> OptimizeFlyFissionConfigSet(
+    std::vector<std::unique_ptr<BackendConfig>> configs,
+    bool restrict_to_mi300_default_tiles) {
+  const size_t original_size = configs.size();
+  absl::flat_hash_set<std::string> seen;
+  std::vector<std::unique_ptr<BackendConfig>> unique_configs;
+  unique_configs.reserve(configs.size());
+  for (std::unique_ptr<BackendConfig>& config : configs) {
+    if (seen.insert(FlyConfigKey(*config)).second) {
+      unique_configs.push_back(std::move(config));
+    }
+  }
+  if (!restrict_to_mi300_default_tiles || unique_configs.empty()) {
+    VLOG(2) << "Deduplicated Fly fission configs from " << original_size
+            << " to " << unique_configs.size();
+    return unique_configs;
+  }
+
+  // Output-transpose fusions can make staging mandatory. Preserve hinted
+  // staged-output choices when no generic direct-output choice exists.
+  bool has_generic_config = false;
+  bool all_generic_configs_stage_output = true;
+  for (const std::unique_ptr<BackendConfig>& config : unique_configs) {
+    if (!config->has_fly() || IsFlySpecificPipeline(config->fly())) {
+      continue;
+    }
+    has_generic_config = true;
+    all_generic_configs_stage_output &= config->fly().stage_output();
+  }
+  all_generic_configs_stage_output &= has_generic_config;
+
+  // FlyBackend's default is the last generated configuration. Keep a copy so
+  // an unusual shape that misses every macro-tile prior remains supported.
+  auto fallback = std::make_unique<BackendConfig>(*unique_configs.back());
+  std::vector<std::unique_ptr<BackendConfig>> optimized_configs;
+  optimized_configs.reserve(unique_configs.size());
+  for (std::unique_ptr<BackendConfig>& config : unique_configs) {
+    if (!config->has_fly()) {
+      optimized_configs.push_back(std::move(config));
+      continue;
+    }
+    const FlyGemmConfig& fly = config->fly();
+    if (IsFlySpecificPipeline(fly)) {
+      optimized_configs.push_back(std::move(config));
+      continue;
+    }
+    const bool hinted_tile =
+        Mi300DefaultFlyTileKeys().contains(FlyTileKey(fly));
+    const bool useful_generic_variant =
+        fly.waves_per_eu() == 0 &&
+        (!fly.stage_output() || all_generic_configs_stage_output) &&
+        !(fly.prefetch_rhs() && fly.schedule_instructions());
+    if (hinted_tile && useful_generic_variant) {
+      optimized_configs.push_back(std::move(config));
+    }
+  }
+  if (optimized_configs.empty()) {
+    optimized_configs.push_back(std::move(fallback));
+  }
+  VLOG(1) << "Restricted MI300 Fly fission configs from " << original_size
+          << " to " << optimized_configs.size();
+  return optimized_configs;
+}
+
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
 FissionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   if (!IsSupported(instr)) {
@@ -109,7 +224,20 @@ FissionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return std::vector<std::unique_ptr<BackendConfig>>();
   }
   RETURN_IF_ERROR(supported_instrs.status());
-  return codegen_backend_->GetSupportedConfigs(*(*supported_instrs)[0]);
+  ASSIGN_OR_RETURN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      codegen_backend_->GetSupportedConfigs(*(*supported_instrs)[0]));
+  if (codegen_backend_->backend() != autotuner::Backend::FLY) {
+    return configs;
+  }
+  const auto& compute_capability =
+      target_config().device_description.gpu_compute_capability();
+  const bool use_mi300_default_tiles =
+      !debug_options().xla_gpu_exhaustive_tiling_search() &&
+      compute_capability.IsRocm() &&
+      compute_capability.rocm_compute_capability()->gfx9_mi300();
+  return OptimizeFlyFissionConfigSet(std::move(configs),
+                                     use_mi300_default_tiles);
 }
 
 absl::StatusOr<std::unique_ptr<BackendConfig>> FissionBackend::GetDefaultConfig(

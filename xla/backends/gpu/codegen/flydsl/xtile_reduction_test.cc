@@ -97,6 +97,264 @@ ENTRY main {
 )"));
 }
 
+TEST_F(FlyXTileReductionTest, RecognizesDirectLowPrecisionReductions) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_direct_f16_row_add
+
+add {
+  lhs = f16[] parameter(0)
+  rhs = f16[] parameter(1)
+  ROOT sum = f16[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f16[127,259]{1,0} parameter(0)
+  zero = f16[] constant(0)
+  ROOT result = f16[127]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f16[127,259]{1,0} parameter(0)
+  ROOT fusion = f16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_direct_f16_row_maximum
+
+maximum {
+  lhs = f16[] parameter(0)
+  rhs = f16[] parameter(1)
+  ROOT max = f16[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f16[127,259]{1,0} parameter(0)
+  minus_inf = f16[] constant(-inf)
+  ROOT result = f16[127]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = f16[127,259]{1,0} parameter(0)
+  ROOT fusion = f16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_direct_bf16_row_minimum
+
+minimum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT min = bf16[] minimum(lhs, rhs)
+}
+
+reduction {
+  p0 = bf16[127,259]{1,0} parameter(0)
+  plus_inf = bf16[] constant(inf)
+  ROOT result = bf16[127]{0} reduce(p0, plus_inf), dimensions={1},
+    to_apply=minimum
+}
+
+ENTRY main {
+  p0 = bf16[127,259]{1,0} parameter(0)
+  ROOT fusion = bf16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesDirectIntegerReductions) {
+  for (absl::string_view hlo : {
+           R"(
+HloModule native_direct_pred_row_maximum
+
+maximum {
+  lhs = pred[] parameter(0)
+  rhs = pred[] parameter(1)
+  ROOT max = pred[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = pred[127,259]{1,0} parameter(0)
+  init = pred[] constant(false)
+  ROOT result = pred[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = pred[127,259]{1,0} parameter(0)
+  ROOT fusion = pred[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_s8_row_add
+
+add {
+  lhs = s8[] parameter(0)
+  rhs = s8[] parameter(1)
+  ROOT sum = s8[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = s8[127,259]{1,0} parameter(0)
+  init = s8[] constant(0)
+  ROOT result = s8[127]{0} reduce(p0, init), dimensions={1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = s8[127,259]{1,0} parameter(0)
+  ROOT fusion = s8[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_s16_row_minimum
+
+minimum {
+  lhs = s16[] parameter(0)
+  rhs = s16[] parameter(1)
+  ROOT min = s16[] minimum(lhs, rhs)
+}
+
+reduction {
+  p0 = s16[127,259]{1,0} parameter(0)
+  init = s16[] constant(32767)
+  ROOT result = s16[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=minimum
+}
+
+ENTRY main {
+  p0 = s16[127,259]{1,0} parameter(0)
+  ROOT fusion = s16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_s32_row_maximum
+
+maximum {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT max = s32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = s32[127,259]{1,0} parameter(0)
+  init = s32[] constant(-2147483648)
+  ROOT result = s32[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = s32[127,259]{1,0} parameter(0)
+  ROOT fusion = s32[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_s32_row_xor
+
+xor {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT result = s32[] xor(lhs, rhs)
+}
+
+reduction {
+  p0 = s32[127,259]{1,0} parameter(0)
+  init = s32[] constant(0)
+  ROOT result = s32[127]{0} reduce(p0, init), dimensions={1}, to_apply=xor
+}
+
+ENTRY main {
+  p0 = s32[127,259]{1,0} parameter(0)
+  ROOT fusion = s32[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_s64_row_maximum
+
+maximum {
+  lhs = s64[] parameter(0)
+  rhs = s64[] parameter(1)
+  ROOT max = s64[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = s64[31,67]{1,0} parameter(0)
+  init = s64[] constant(-9223372036854775808)
+  ROOT result = s64[31]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = s64[31,67]{1,0} parameter(0)
+  ROOT fusion = s64[31]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)",
+           R"(
+HloModule native_direct_f64_row_maximum
+
+maximum {
+  lhs = f64[] parameter(0)
+  rhs = f64[] parameter(1)
+  ROOT max = f64[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f64[31,67]{1,0} parameter(0)
+  init = f64[] constant(-inf)
+  ROOT result = f64[31]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = f64[31,67]{1,0} parameter(0)
+  ROOT fusion = f64[31]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"}) {
+    EXPECT_TRUE(IsSupported(std::string(hlo)));
+  }
+}
+
 TEST_F(FlyXTileReductionTest, RecognizesFusedInputAndOutputGraphs) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_fused_row_reduction
@@ -125,6 +383,39 @@ ENTRY main {
   p0 = bf16[64,256]{1,0} parameter(0)
   p1 = bf16[64,256]{1,0} parameter(1)
   ROOT fusion = f32[64]{0} fusion(p0, p1), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesExternalRowScaleInOutputGraph) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_external_row_scale_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  input = bf16[65,256]{1,0} parameter(0)
+  row_scale = f32[65]{0} parameter(1)
+  converted = f32[65,256]{1,0} convert(input)
+  zero = f32[] constant(0)
+  row_sum = f32[65]{0} reduce(converted, zero), dimensions={1}, to_apply=add
+  scaled = f32[65]{0} multiply(row_sum, row_scale)
+  ROOT result = bf16[65]{0} convert(scaled)
+}
+
+ENTRY main {
+  input = bf16[65,256]{1,0} parameter(0)
+  row_scale = f32[65]{0} parameter(1)
+  ROOT fusion = bf16[65]{0} fusion(input, row_scale), kind=kCustom,
+    calls=reduction,
     backend_config={"fusion_backend_config":{"kind":"__fly",
       "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
       "num_warps":"4","num_ctas":1,"num_stages":1,
@@ -308,6 +599,49 @@ ENTRY main {
   partials = f32[2,34,259]{2,1,0} parameter(1)
   ROOT fusion = bf16[2,17,259]{2,1,0} fusion(residual, partials),
     kind=kCustom, calls=rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesBitcastResidualRmsStatistic) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_bitcast_residual_rms_statistic
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+statistic {
+  flat_residual = bf16[256,1024]{1,0} parameter(0)
+  input = bf16[2,128,1024]{2,1,0} parameter(1)
+  residual = bf16[2,128,1024]{2,1,0} bitcast(flat_residual)
+  input_f32 = f32[2,128,1024]{2,1,0} convert(input)
+  residual_f32 = f32[2,128,1024]{2,1,0} convert(residual)
+  added = f32[2,128,1024]{2,1,0} add(input_f32, residual_f32)
+  squared = f32[2,128,1024]{2,1,0} multiply(added, added)
+  zero = f32[] constant(0)
+  row_sum = f32[2,128]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,128]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,128]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,128]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,128]{1,0} add(mean_square, epsilons)
+  ROOT result = f32[2,128]{1,0} rsqrt(variance)
+}
+
+ENTRY main {
+  flat_residual = bf16[256,1024]{1,0} parameter(0)
+  input = bf16[2,128,1024]{2,1,0} parameter(1)
+  ROOT fusion = f32[2,128]{1,0} fusion(flat_residual, input),
+    kind=kCustom, calls=statistic,
     backend_config={"fusion_backend_config":{"kind":"__fly",
       "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
       "num_warps":"4","num_ctas":1,"num_stages":1,

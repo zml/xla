@@ -22,6 +22,7 @@ limitations under the License.
 #include <functional>
 #include <iterator>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/hlo_dfs_reachability.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -40,6 +42,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/gpu/alias_info.h"
 #include "xla/service/gpu/gpu_fusible.h"
+#include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/model/fusion_analysis_cache.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
 #include "xla/service/gpu/model/gpu_performance_model.h"
@@ -355,6 +359,25 @@ FusionDecision ProducerCandidateIsFusible(
 
   if (cost_analysis->ProducerConsumerMergedTooLarge(producer, consumer)) {
     return FusionDecision::Forbid("will generate too large IR");
+  }
+
+  if (producer.GetModule()
+          ->config()
+          .debug_options()
+          .xla_gpu_flydsl_replace_triton()) {
+    FusionBackendConfig backend_config;
+    backend_config.set_kind(kFlyFusionKind);
+    HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+        std::move(backend_config),
+        HloFusionAdaptor::ForProducerConsumer(&producer, &consumer,
+                                              /*use_multi_output_fusion=*/true),
+        &device_info);
+    const flydsl::FlyFusionRoute route = flydsl::ClassifyFlyFusion(analysis);
+    if (!flydsl::IsNativeFlyFusionRoute(route)) {
+      return FusionDecision::Forbid(absl::StrCat(
+          "strict Fly replacement would create non-native multi-output route ",
+          flydsl::FlyFusionRouteName(route)));
+    }
   }
 
   GpuPerformanceModel::RunTimes t =

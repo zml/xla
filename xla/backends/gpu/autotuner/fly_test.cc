@@ -986,10 +986,48 @@ ENTRY main {
 )";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(
-          *module->entry_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+  EXPECT_TRUE(configs.empty());
+}
+
+TEST_F(FlyFusionBackendTest,
+       StrictReplacementRejectsNonNativeMixedOutputReduction) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_non_native_mixed_output_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+body {
+  residual = bf16[2,17,259]{2,1,0} parameter(0)
+  partials = f32[2,34,259]{2,1,0} parameter(1)
+  residual_f32 = f32[2,17,259]{2,1,0} convert(residual)
+  zero = f32[] constant(0)
+  projected = f32[34,259]{1,0} reduce(partials, zero), dimensions={0},
+    to_apply=add
+  projected_bf16 = bf16[34,259]{1,0} convert(projected)
+  ROOT tuple = (f32[2,17,259]{2,1,0}, bf16[34,259]{1,0})
+    tuple(residual_f32, projected_bf16)
+}
+
+ENTRY main {
+  residual = bf16[2,17,259]{2,1,0} parameter(0)
+  partials = f32[2,34,259]{2,1,0} parameter(1)
+  ROOT fusion = (f32[2,17,259]{2,1,0}, bf16[34,259]{1,0})
+    fusion(residual, partials), kind=kLoop, calls=body
+}
+)";
+  debug_options_.set_xla_gpu_flydsl_replace_triton(true);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
   EXPECT_TRUE(configs.empty());
 }
 
@@ -1023,13 +1061,18 @@ ENTRY main {
 
   ASSERT_EQ(configs.size(), 8);
   constexpr std::array<std::pair<int64_t, int64_t>, 8> kExpected = {{
-      {8, 0}, {4, 0}, {16, 0}, {2, 0},
-      {8, 2}, {4, 2}, {1, 0},  {8, 4},
+      {8, 0},
+      {4, 0},
+      {16, 0},
+      {2, 0},
+      {8, 2},
+      {4, 2},
+      {1, 0},
+      {8, 4},
   }};
   for (int64_t i = 0; i < configs.size(); ++i) {
     EXPECT_EQ(configs[i]->block_level().num_warps(), kExpected[i].first);
-    EXPECT_EQ(configs[i]->block_level().waves_per_eu(),
-              kExpected[i].second);
+    EXPECT_EQ(configs[i]->block_level().waves_per_eu(), kExpected[i].second);
   }
 }
 
@@ -1595,8 +1638,7 @@ ENTRY main {
   constexpr std::array<int64_t, 4> kWavesPerEu = {0, 1, 2, 4};
   for (int64_t index = 0; index < 4; ++index) {
     EXPECT_EQ(configs[index]->block_level().vector_size_bits(), 128);
-    EXPECT_EQ(configs[index]->block_level().waves_per_eu(),
-              kWavesPerEu[index]);
+    EXPECT_EQ(configs[index]->block_level().waves_per_eu(), kWavesPerEu[index]);
   }
   EXPECT_EQ(configs[4]->block_level().vector_size_bits(), 64);
   EXPECT_EQ(configs[5]->block_level().vector_size_bits(), 64);
@@ -1634,8 +1676,7 @@ ENTRY main {
   constexpr std::array<int64_t, 4> kWavesPerEu = {0, 1, 2, 4};
   for (int64_t index = 0; index < 4; ++index) {
     EXPECT_EQ(configs[index]->block_level().vector_size_bits(), 128);
-    EXPECT_EQ(configs[index]->block_level().waves_per_eu(),
-              kWavesPerEu[index]);
+    EXPECT_EQ(configs[index]->block_level().waves_per_eu(), kWavesPerEu[index]);
   }
 }
 
@@ -1671,8 +1712,7 @@ ENTRY main {
   constexpr std::array<int64_t, 4> kWavesPerEu = {0, 1, 2, 4};
   for (int64_t index = 0; index < 4; ++index) {
     EXPECT_EQ(configs[index]->block_level().vector_size_bits(), 128);
-    EXPECT_EQ(configs[index]->block_level().waves_per_eu(),
-              kWavesPerEu[index]);
+    EXPECT_EQ(configs[index]->block_level().waves_per_eu(), kWavesPerEu[index]);
   }
 }
 
@@ -1807,13 +1847,9 @@ ENTRY main {
     EXPECT_EQ(configs[2 * pair]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair]->block_level().vector_size_bits(), 128);
     EXPECT_EQ(configs[2 * pair]->block_level().output_tiles(0).sizes(0), 1);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(),
-              kWarps[pair]);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair + 1]->block_level().vector_size_bits(), 64);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level()
-                  .output_tiles(0)
-                  .sizes(0),
-              2);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().output_tiles(0).sizes(0), 2);
   }
 }
 
@@ -1848,13 +1884,9 @@ ENTRY main {
     EXPECT_EQ(configs[2 * pair]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair]->block_level().vector_size_bits(), 128);
     EXPECT_EQ(configs[2 * pair]->block_level().output_tiles(0).sizes(0), 1);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(),
-              kWarps[pair]);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair + 1]->block_level().vector_size_bits(), 64);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level()
-                  .output_tiles(0)
-                  .sizes(0),
-              2);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().output_tiles(0).sizes(0), 2);
   }
 }
 
@@ -1889,13 +1921,9 @@ ENTRY main {
     EXPECT_EQ(configs[2 * pair]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair]->block_level().vector_size_bits(), 128);
     EXPECT_EQ(configs[2 * pair]->block_level().output_tiles(0).sizes(0), 1);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(),
-              kWarps[pair]);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().num_warps(), kWarps[pair]);
     EXPECT_EQ(configs[2 * pair + 1]->block_level().vector_size_bits(), 64);
-    EXPECT_EQ(configs[2 * pair + 1]->block_level()
-                  .output_tiles(0)
-                  .sizes(0),
-              2);
+    EXPECT_EQ(configs[2 * pair + 1]->block_level().output_tiles(0).sizes(0), 2);
   }
 }
 
@@ -1996,6 +2024,87 @@ ENTRY main {
   EXPECT_EQ(configs[2]->block_level().vector_size_bits(), 64);
 }
 
+TEST_F(FlyFusionBackendTest, RanksShapeChangingPhysicalViewConfigs) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_physical_view_top_k
+
+elementwise {
+  p0 = s32[4194304,16]{1,0} parameter(0)
+  view = s32[16,4194304]{0,1} bitcast(p0)
+  ROOT result = s32[16,4194304]{0,1} not(view)
+}
+
+ENTRY main {
+  p0 = s32[4194304,16]{1,0} parameter(0)
+  ROOT fusion = s32[16,4194304]{0,1} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"64"}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 8);
+  constexpr std::array<std::array<int64_t, 3>, 8> kExpected = {{
+      {1, 2, 64},
+      {1, 8, 128},
+      {2, 1, 128},
+      {2, 4, 128},
+      {1, 2, 128},
+      {1, 4, 128},
+      {2, 2, 64},
+      {2, 2, 128},
+  }};
+  for (int64_t index = 0; index < kExpected.size(); ++index) {
+    const auto& expected = kExpected[index];
+    EXPECT_EQ(configs[index]->block_level().output_tiles(0).sizes(0),
+              expected[0]);
+    EXPECT_EQ(configs[index]->block_level().num_warps(), expected[1]);
+    EXPECT_EQ(configs[index]->block_level().vector_size_bits(), expected[2]);
+  }
+}
+
+TEST_F(FlyFusionBackendTest, KeepsWideTypeChangingBitcastsVectorized) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_type_bitcast_top_k
+
+elementwise {
+  p0 = s32[4194304]{0} parameter(0)
+  bytes = s8[4194304,4]{1,0} bitcast-convert(p0)
+  ROOT result = s8[4194304,4]{1,0} not(bytes)
+}
+
+ENTRY main {
+  p0 = s32[4194304]{0} parameter(0)
+  ROOT fusion = s8[4194304,4]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"64"}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_EQ(configs[0]->block_level().vector_size_bits(), 64);
+  EXPECT_EQ(configs[1]->block_level().vector_size_bits(), 128);
+  EXPECT_EQ(configs[2]->block_level().vector_size_bits(), 128);
+  EXPECT_EQ(configs[3]->block_level().vector_size_bits(), 128);
+}
+
 TEST_F(FlyFusionBackendTest, RanksScalarTailElementwiseConfigFirst) {
   constexpr absl::string_view kHlo = R"(
 HloModule native_fly_elementwise_tail_top_k
@@ -2074,6 +2183,139 @@ ENTRY main {
     EXPECT_EQ(configs[0]->block_level().num_warps(), 2);
     EXPECT_EQ(configs[0]->block_level().vector_size_bits(), 64);
   }
+}
+
+TEST_F(FlyFusionBackendTest, OffersLegalNativeFp8ConversionConfigs) {
+  constexpr absl::string_view kF32ToFp8Hlo = R"(
+HloModule native_fly_f32_to_fp8_top_k
+
+elementwise {
+  p0 = f32[67108864]{0} parameter(0)
+  ROOT result = f8e5m2fnuz[67108864]{0} convert(p0)
+}
+
+ENTRY main {
+  p0 = f32[67108864]{0} parameter(0)
+  ROOT fusion = f8e5m2fnuz[67108864]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"32"}}}
+})";
+  constexpr absl::string_view kFp8ToF32Hlo = R"(
+HloModule native_fly_fp8_to_f32_top_k
+
+elementwise {
+  p0 = f8e5m2fnuz[67108864]{0} parameter(0)
+  ROOT result = f32[67108864]{0} convert(p0)
+}
+
+ENTRY main {
+  p0 = f8e5m2fnuz[67108864]{0} parameter(0)
+  ROOT fusion = f32[67108864]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"64"}}}
+})";
+
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> f32_to_fp8_module,
+                       ParseAndReturnVerifiedModule(kF32ToFp8Hlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> f32_to_fp8_configs,
+      backend_.GetSupportedConfigs(
+          *f32_to_fp8_module->entry_computation()->root_instruction()));
+
+  ASSERT_EQ(f32_to_fp8_configs.size(), 8);
+  EXPECT_TRUE(std::all_of(
+      f32_to_fp8_configs.begin(), f32_to_fp8_configs.end(),
+      [](const auto& c) { return c->block_level().vector_size_bits() == 32; }));
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> fp8_to_f32_module,
+                       ParseAndReturnVerifiedModule(kFp8ToF32Hlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> fp8_to_f32_configs,
+      backend_.GetSupportedConfigs(
+          *fp8_to_f32_module->entry_computation()->root_instruction()));
+  ASSERT_EQ(fp8_to_f32_configs.size(), 8);
+  EXPECT_TRUE(std::any_of(
+      fp8_to_f32_configs.begin(), fp8_to_f32_configs.end(),
+      [](const auto& c) { return c->block_level().vector_size_bits() == 64; }));
+  EXPECT_TRUE(std::any_of(fp8_to_f32_configs.begin(), fp8_to_f32_configs.end(),
+                          [](const auto& c) {
+                            return c->block_level().vector_size_bits() == 128;
+                          }));
+}
+
+TEST_F(FlyFusionBackendTest, OffersNativePackedS4ConversionConfigs) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_packed_s4_top_k
+
+elementwise {
+  p0 = s4[67108864]{0:E(4)} parameter(0)
+  widened = s8[67108864]{0} convert(p0)
+  ROOT result = bf16[67108864]{0} convert(widened)
+}
+
+ENTRY main {
+  p0 = s4[67108864]{0:E(4)} parameter(0)
+  ROOT fusion = bf16[67108864]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"64"}}}
+})";
+
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 64;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 128;
+  }));
+}
+
+TEST_F(FlyFusionBackendTest, OffersScalarizedWideInputPackedS4OutputConfigs) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_packed_s4_output_top_k
+
+elementwise {
+  p0 = s64[65]{0} parameter(0)
+  ROOT result = s4[65]{0:E(4)} convert(p0)
+}
+
+ENTRY main {
+  p0 = s64[65]{0} parameter(0)
+  ROOT fusion = s4[65]{0:E(4)} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"16"}}}
+})";
+
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 16;
+  }));
 }
 
 TEST_F(FlyFusionBackendTest, ReplacesMultiOutputTritonElementwiseFusion) {
@@ -3567,10 +3809,8 @@ ENTRY main {
     ASSERT_EQ(block.output_tiles_size(), 3);
     EXPECT_THAT(block.output_tiles(0).sizes(),
                 ::testing::ElementsAre(1, 1, 1, 128));
-    EXPECT_THAT(block.output_tiles(1).sizes(),
-                ::testing::ElementsAre(1, 1, 1));
-    EXPECT_THAT(block.output_tiles(2).sizes(),
-                ::testing::ElementsAre(1, 1, 1));
+    EXPECT_THAT(block.output_tiles(1).sizes(), ::testing::ElementsAre(1, 1, 1));
+    EXPECT_THAT(block.output_tiles(2).sizes(), ::testing::ElementsAre(1, 1, 1));
   }
 
   ASSERT_OK_AND_ASSIGN(
@@ -3662,11 +3902,9 @@ ENTRY main {
   ASSERT_EQ(configs.size(), 12);
   constexpr std::array<int64_t, 4> kOccupancies = {0, 1, 2, 4};
   for (int64_t stage = 1; stage <= 3; ++stage) {
-    for (int64_t occupancy = 0; occupancy < kOccupancies.size();
-         ++occupancy) {
+    for (int64_t occupancy = 0; occupancy < kOccupancies.size(); ++occupancy) {
       const BlockLevelFusionConfig& block =
-          configs[(stage - 1) * kOccupancies.size() + occupancy]
-              ->block_level();
+          configs[(stage - 1) * kOccupancies.size() + occupancy]->block_level();
       EXPECT_EQ(block.num_warps(), 2);
       EXPECT_EQ(block.num_stages(), stage);
       EXPECT_EQ(block.waves_per_eu(), kOccupancies[occupancy]);

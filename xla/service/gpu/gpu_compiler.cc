@@ -1894,7 +1894,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
   {
     HloPassPipeline pipeline("flydsl-replacement-verification",
                              compilation_stats);
-    pipeline.AddPass<FlyDslReplacementVerifier>();
+    pipeline.AddPass<FlyDslReplacementVerifier>(device_description);
     RETURN_IF_ERROR(pipeline.Run(hlo_module).status());
   }
 

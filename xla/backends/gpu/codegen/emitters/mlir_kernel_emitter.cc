@@ -837,6 +837,15 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
     // nested under a converted gpu.func signature.
     if (has_native_gpu_entry) {
       pm.addPass(mlir::createSCFToControlFlowPass());
+      // Preserve logical FP8 vectors until XLA's AMD conversion pass can
+      // combine adjacent lanes into gfx942 packed conversion intrinsics.
+      // Fly's type conversion deliberately byte-backs external FP8 storage;
+      // running it first would scalarize the logical vector and lose the
+      // pairing opportunity.
+      if (auto* cc = device.gpu_compute_capability().rocm_compute_capability();
+          cc != nullptr && cc->has_fp8_support()) {
+        pm.addPass(CreateConvertFloatAMDPass(*cc));
+      }
     }
     flydsl::AddLoweringPasses(pm);
   }

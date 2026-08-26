@@ -21,11 +21,14 @@ limitations under the License.
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/Passes.h"
 #include "flydsl/Conversion/FlyToROCDL/FlyToROCDL.h"
@@ -41,6 +44,62 @@ constexpr llvm::StringLiteral kOriginalInvariantAttr =
     "xla.fly.original_invariant";
 constexpr llvm::StringLiteral kOriginalAlignmentAttr =
     "xla.fly.original_alignment";
+
+// XLA's common MLIR pipeline expands math.erf into a rational polynomial.
+// That expansion is a good scalar default, but native Fly elementwise kernels
+// expose several independent vector lanes at once and the four parallel
+// divisions materially increase VGPR pressure on gfx942. Triton's ROCm path
+// instead uses OCML, whose inlined implementation has substantially lower
+// register pressure for the same HLO. Lower scalar Fly erf operations before
+// the common expansion pass so both backends use the optimized ROCm routine.
+class LowerErfToOcmlPass
+    : public mlir::PassWrapper<LowerErfToOcmlPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+ public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerErfToOcmlPass)
+
+  void runOnOperation() override {
+    mlir::ModuleOp module = getOperation();
+    llvm::SmallVector<mlir::math::ErfOp> erfs;
+    module.walk([&](mlir::math::ErfOp op) {
+      if (op.getType().isF32()) {
+        erfs.push_back(op);
+      }
+    });
+    if (erfs.empty()) {
+      return;
+    }
+
+    mlir::MLIRContext* context = module.getContext();
+    auto function_name = mlir::StringAttr::get(context, "__ocml_erf_f32");
+    auto function_type = mlir::LLVM::LLVMFunctionType::get(
+        mlir::Float32Type::get(context), {mlir::Float32Type::get(context)});
+    for (mlir::math::ErfOp erf : erfs) {
+      mlir::LLVM::LLVMFuncOp function =
+          mlir::SymbolTable::lookupNearestSymbolFrom<mlir::LLVM::LLVMFuncOp>(
+              erf, function_name);
+      if (!function) {
+        mlir::gpu::GPUModuleOp gpu_module =
+            erf->getParentOfType<mlir::gpu::GPUModuleOp>();
+        if (!gpu_module) {
+          erf.emitError("expected native Fly erf inside gpu.module");
+          signalPassFailure();
+          return;
+        }
+        mlir::OpBuilder declaration_builder(gpu_module.getBodyRegion());
+        function = mlir::LLVM::LLVMFuncOp::create(
+            declaration_builder, erf.getLoc(), function_name.getValue(),
+            function_type);
+      }
+
+      mlir::OpBuilder builder(erf);
+      mlir::LLVM::CallOp call = mlir::LLVM::CallOp::create(
+          builder, erf.getLoc(), function, mlir::ValueRange{erf.getOperand()});
+      erf.replaceAllUsesWith(call.getResult());
+      erf.erase();
+    }
+  }
+};
 
 std::optional<mlir::BlockArgument> GetKernelArgument(mlir::Value value) {
   if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
@@ -356,6 +415,7 @@ void AddGenericMemoryPasses(mlir::OpPassManager& pm) {
 
 void AddLoweringPasses(mlir::OpPassManager& pm,
                        bool restore_generic_memory_metadata) {
+  pm.addPass(std::make_unique<LowerErfToOcmlPass>());
   pm.addPass(mlir::fly::createFlyRewriteFuncSignaturePass());
   pm.addPass(mlir::fly::createFlyCanonicalizePass());
   pm.addPass(mlir::fly::createFlyLayoutLoweringPass());

@@ -40,9 +40,9 @@ struct FlyScanDescriptor {
   const HloInstruction* call;
 };
 
-// The first native implementation assigns one Wave64 to a row and unrolls a
-// bounded number of striped prefix tiles. Larger rows remain on rocPRIM until
-// the hierarchical multi-kernel implementation is available.
+// The native implementation assigns one Wave64 to each physically contiguous
+// row. Short scans unroll their striped prefix tiles; long rows use a
+// loop-carried Fly/SCF stripe traversal without a code-size-dependent limit.
 bool IsFlyScanSupported(const Shape& shape, const CubScanOptions& options);
 
 std::optional<FlyScanDescriptor> GetFlyScanDescriptor(

@@ -294,14 +294,13 @@ ENTRY main {
     argument_pointers.push_back(&argument);
   }
   ASSERT_OK(PreprocessModuleForTestRunner(module.get()));
+  ASSERT_OK_AND_ASSIGN(Literal actual, test_runner().Execute(
+                                           std::move(module), argument_pointers,
+                                           /*run_hlo_passes=*/true));
   ASSERT_OK_AND_ASSIGN(
-      Literal actual,
-      test_runner().Execute(std::move(module), argument_pointers,
-                            /*run_hlo_passes=*/true));
-  ASSERT_OK_AND_ASSIGN(Literal expected,
-                       reference_runner().Execute(std::move(reference_module),
-                                                  argument_pointers,
-                                                  /*run_hlo_passes=*/false));
+      Literal expected,
+      reference_runner().Execute(std::move(reference_module), argument_pointers,
+                                 /*run_hlo_passes=*/false));
   EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
       expected, actual, ErrorSpec{/*aabs=*/0.04, /*arel=*/0.04}));
 }
@@ -386,12 +385,11 @@ ENTRY main {
       {{4096, 65536, 65521}, {8192, 131072, 131057}}};
   for (const auto& [pages, tokens, used_tokens] : kCases) {
     SCOPED_TRACE(std::to_string(tokens));
-    const std::string paged_hlo = absl::StrReplaceAll(
-        kPagedHlo, {{"__PAGES__", std::to_string(pages)}});
+    const std::string paged_hlo =
+        absl::StrReplaceAll(kPagedHlo, {{"__PAGES__", std::to_string(pages)}});
     const std::string reference_hlo = absl::StrReplaceAll(
-        kReferenceHlo,
-        {{"__PAGES__", std::to_string(pages)},
-         {"__TOKENS__", std::to_string(tokens)}});
+        kReferenceHlo, {{"__PAGES__", std::to_string(pages)},
+                        {"__TOKENS__", std::to_string(tokens)}});
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                          ParseAndReturnVerifiedModule(paged_hlo));
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> reference_module,
@@ -420,11 +418,10 @@ ENTRY main {
         Literal actual,
         test_runner().Execute(std::move(module), argument_pointers,
                               /*run_hlo_passes=*/true));
-    ASSERT_OK_AND_ASSIGN(
-        Literal expected,
-        reference_runner().Execute(std::move(reference_module),
-                                   argument_pointers,
-                                   /*run_hlo_passes=*/false));
+    ASSERT_OK_AND_ASSIGN(Literal expected,
+                         reference_runner().Execute(std::move(reference_module),
+                                                    argument_pointers,
+                                                    /*run_hlo_passes=*/false));
     EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
         expected, actual, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
   }
@@ -678,6 +675,282 @@ ENTRY main {
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesRaggedSignedIntegerFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_ragged_signed_integer_pipeline
+
+ENTRY main {
+  p0 = s32[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  sum = s32[127,65]{1,0} add(p0, p1)
+  inverted = s32[127,65]{1,0} not(p0)
+  mixed = s32[127,65]{1,0} xor(sum, inverted)
+  less = pred[127,65]{1,0} compare(p0, p1), direction=LT
+  ROOT result = s32[127,65]{1,0} select(less, mixed, sum)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesExternalPredicateFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_external_predicate_pipeline
+
+ENTRY main {
+  p0 = pred[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  p0_s32 = s32[127,65]{1,0} convert(p0)
+  sum = s32[127,65]{1,0} add(p0_s32, p1)
+  sum_pred = pred[127,65]{1,0} convert(sum)
+  inverted = pred[127,65]{1,0} not(p0)
+  not_sum = pred[127,65]{1,0} not(sum_pred)
+  both = pred[127,65]{1,0} and(sum_pred, p0)
+  neither = pred[127,65]{1,0} and(not_sum, inverted)
+  ROOT result = pred[127,65]{1,0} or(both, neither)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesMultidimensionalIotaFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_multidimensional_iota_pipeline
+
+ENTRY main {
+  p0 = f32[5,7,65,3]{3,2,1,0} parameter(0)
+  iota = s32[5,7,65,3]{3,2,1,0} iota(), iota_dimension=1
+  converted = f32[5,7,65,3]{3,2,1,0} convert(iota)
+  ROOT result = f32[5,7,65,3]{3,2,1,0} add(p0, converted)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesShapeChangingViewWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_shape_changing_view_pipeline
+
+ENTRY main {
+  p0 = f32[65,67]{1,0} parameter(0)
+  negated = f32[65,67]{1,0} negate(p0)
+  view = f32[67,65]{1,0} reshape(negated)
+  ROOT result = f32[67,65]{1,0} abs(view)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kBitcast) << optimized->ToString();
+  root = root->operand(0);
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsWideF64ToNarrowS8FusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_wide_f64_to_narrow_s8_pipeline
+
+ENTRY main {
+  p0 = f64[65]{0} parameter(0)
+  offset = f64[] constant(37)
+  offsets = f64[65]{0} broadcast(offset), dimensions={}
+  shifted = f64[65]{0} add(p0, offsets)
+  lower = f64[] constant(-100)
+  lowers = f64[65]{0} broadcast(lower), dimensions={}
+  upper = f64[] constant(100)
+  uppers = f64[65]{0} broadcast(upper), dimensions={}
+  bounded = f64[65]{0} clamp(lowers, shifted, uppers)
+  ROOT result = s8[65]{0} convert(bounded)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  const FusionBackendConfig& fusion_config =
+      backend_config.fusion_backend_config();
+  EXPECT_EQ(fusion_config.kind(), kFlyFusionKind) << optimized->ToString();
+  EXPECT_LE(fusion_config.block_level_fusion_config().vector_size_bits(), 16)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesTypeChangingBitcastWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_type_changing_bitcast_pipeline
+
+ENTRY main {
+  p0 = s32[65]{0} parameter(0)
+  bytes = s8[65,4]{1,0} bitcast-convert(p0)
+  ROOT result = s8[65,4]{1,0} not(bytes)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesFp8ConversionFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_fp8_conversion_pipeline
+
+ENTRY main {
+  p0 = f8e4m3fnuz[127,65]{1,0} parameter(0)
+  converted = f32[127,65]{1,0} convert(p0)
+  magnitude = f32[127,65]{1,0} abs(converted)
+  scale = f32[] constant(0.5)
+  scales = f32[127,65]{1,0} broadcast(scale), dimensions={}
+  ROOT result = f32[127,65]{1,0} multiply(magnitude, scales)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesPackedS4ConversionFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_packed_s4_conversion_pipeline
+
+ENTRY main {
+  p0 = s4[127,65]{1,0:E(4)} parameter(0)
+  widened = s8[127,65]{1,0} convert(p0)
+  converted = bf16[127,65]{1,0} convert(widened)
+  magnitude = bf16[127,65]{1,0} abs(converted)
+  scale = bf16[] constant(0.5)
+  scales = bf16[127,65]{1,0} broadcast(scale), dimensions={}
+  ROOT result = bf16[127,65]{1,0} multiply(magnitude, scales)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesPackedS4OutputFusionWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_packed_s4_output_pipeline
+
+ENTRY main {
+  p0 = s8[127,65]{1,0} parameter(0)
+  bias = s8[] constant(9)
+  biases = s8[127,65]{1,0} broadcast(bias), dimensions={}
+  shifted = s8[127,65]{1,0} add(p0, biases)
+  ROOT result = s4[127,65]{1,0:E(4)} convert(shifted)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesBf16ErfGeluWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_erf_gelu_pipeline
+
+ENTRY main {
+  p0 = bf16[127,65]{1,0} parameter(0)
+  p0_f32 = f32[127,65]{1,0} convert(p0)
+  inv_sqrt_two = f32[] constant(0.7071067811865476)
+  inv_sqrt_two_broadcast = f32[127,65]{1,0}
+    broadcast(inv_sqrt_two), dimensions={}
+  scaled = f32[127,65]{1,0} multiply(p0_f32, inv_sqrt_two_broadcast)
+  erf = f32[127,65]{1,0} erf(scaled)
+  one = f32[] constant(1)
+  ones = f32[127,65]{1,0} broadcast(one), dimensions={}
+  shifted = f32[127,65]{1,0} add(erf, ones)
+  half = f32[] constant(0.5)
+  halves = f32[127,65]{1,0} broadcast(half), dimensions={}
+  gated = f32[127,65]{1,0} multiply(p0_f32, shifted)
+  result_f32 = f32[127,65]{1,0} multiply(gated, halves)
+  ROOT result = bf16[127,65]{1,0} convert(result_f32)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.015, /*arel=*/0.02}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
        FormsAndExecutesNarrowingBf16RowReduction) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_native_narrowing_row_reduction_pipeline
@@ -750,6 +1023,65 @@ ENTRY main {
   EXPECT_GE(fusion_config.block_level_fusion_config().vector_size_bits(), 64)
       << optimized->ToString();
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.01, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesTritonReductionTypes) {
+  constexpr absl::string_view kS32Hlo = R"(
+HloModule fly_native_s32_row_reduction_pipeline
+
+maximum {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT max = s32[] maximum(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = s32[127,259]{1,0} parameter(0)
+  init = s32[] constant(-2147483648)
+  ROOT result = s32[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> s32_optimized,
+                       GetOptimizedModule(kS32Hlo));
+  const HloInstruction* s32_root =
+      s32_optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(s32_root->opcode(), HloOpcode::kFusion)
+      << s32_optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig s32_backend_config,
+                       s32_root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(s32_backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << s32_optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kS32Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kF64Hlo = R"(
+HloModule fly_native_f64_row_reduction_pipeline
+
+maximum {
+  lhs = f64[] parameter(0)
+  rhs = f64[] parameter(1)
+  ROOT max = f64[] maximum(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = f64[31,67]{1,0} parameter(0)
+  init = f64[] constant(-inf)
+  ROOT result = f64[31]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> f64_optimized,
+                       GetOptimizedModule(kF64Hlo));
+  const HloInstruction* f64_root =
+      f64_optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(f64_root->opcode(), HloOpcode::kFusion)
+      << f64_optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig f64_backend_config,
+                       f64_root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(f64_backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << f64_optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kF64Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -857,6 +1189,37 @@ ENTRY main {
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.02, /*arel=*/0.02}));
 }
 
+TEST_F(FlyFusionDeviceTest, ExecutesGeneralLeadingReduction) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_general_leading_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+body {
+  p0 = f32[257,259]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[259]{0} reduce(p0, zero), dimensions={0}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f32[257,259]{1,0} parameter(0)
+  ROOT fusion = f32[259]{0} fusion(p0), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-5, /*arel=*/1e-5}));
+}
+
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
        FormsNativeMultiOutputWithoutTritonFlag) {
   constexpr absl::string_view kHlo = R"(
@@ -915,8 +1278,7 @@ ENTRY main {
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
 }
 
-TEST_F(FlyFusionPipelineDeviceTest,
-       ExecutesNativeFlyForwardAndReverseScans) {
+TEST_F(FlyFusionPipelineDeviceTest, ExecutesNativeFlyForwardAndReverseScans) {
   constexpr absl::string_view kHloTemplate = R"(
 HloModule fly_native_scan
 
@@ -940,8 +1302,7 @@ ENTRY main {
   for (bool reverse : {false, true}) {
     std::string hlo = absl::StrReplaceAll(
         kHloTemplate, {{"__REVERSE__", reverse ? "true" : "false"}});
-    EXPECT_TRUE(
-        RunAndCompare(hlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+    EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
   }
 }
 
@@ -966,6 +1327,34 @@ ENTRY main {
 }
 )";
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest, ExecutesNativeFlyLongS32ScanExactly) {
+  constexpr absl::string_view kHloTemplate = R"(
+HloModule fly_native_long_s32_scan
+
+add {
+  lhs = s32[3] parameter(0)
+  rhs = s32[3] parameter(1)
+  sum = s32[3] add(lhs, rhs)
+  ROOT result = (s32[3], s32[3]) tuple(sum, sum)
+}
+
+ENTRY main {
+  input = s32[3,4097]{1,0} parameter(0)
+  zero = s32[] constant(0)
+  init = s32[3]{0} broadcast(zero), dimensions={}
+  scan = (s32[3,4097]{1,0}, s32[3]{0}) scan(input, init),
+    dimensions={1}, num_carries=1, is_associative=true,
+    is_reverse=__REVERSE__, to_apply=add
+  ROOT output = s32[3,4097]{1,0} get-tuple-element(scan), index=0
+}
+)";
+  for (bool reverse : {false, true}) {
+    std::string hlo = absl::StrReplaceAll(
+        kHloTemplate, {{"__REVERSE__", reverse ? "true" : "false"}});
+    EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+  }
 }
 
 TEST_F(FlyFusionPipelineDeviceTest, ExecutesNativeFlyBf16AndF16Scans) {
@@ -1192,6 +1581,1001 @@ ENTRY main {
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedS32CompleteElementwiseSurface) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_ragged_s32_complete_elementwise
+
+elementwise {
+  p0 = s32[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  absolute = s32[127,65]{1,0} abs(p0)
+  negated = s32[127,65]{1,0} negate(p1)
+  inverted = s32[127,65]{1,0} not(p0)
+  sum = s32[127,65]{1,0} add(absolute, negated)
+  difference = s32[127,65]{1,0} subtract(sum, p1)
+  product = s32[127,65]{1,0} multiply(difference, p0)
+  one = s32[] constant(1)
+  ones = s32[127,65]{1,0} broadcast(one), dimensions={}
+  abs_denominator = s32[127,65]{1,0} abs(p1)
+  denominator = s32[127,65]{1,0} maximum(abs_denominator, ones)
+  quotient = s32[127,65]{1,0} divide(product, denominator)
+  remainder = s32[127,65]{1,0} remainder(product, denominator)
+  minimum = s32[127,65]{1,0} minimum(quotient, remainder)
+  anded = s32[127,65]{1,0} and(minimum, inverted)
+  ored = s32[127,65]{1,0} or(anded, p1)
+  xored = s32[127,65]{1,0} xor(ored, p0)
+  less = pred[127,65]{1,0} compare(sum, difference), direction=LT
+  equal = pred[127,65]{1,0} compare(quotient, remainder), direction=EQ
+  not_equal = pred[127,65]{1,0} not(equal)
+  both = pred[127,65]{1,0} and(less, not_equal)
+  either = pred[127,65]{1,0} or(less, equal)
+  decision = pred[127,65]{1,0} xor(both, either)
+  selected = s32[127,65]{1,0} select(decision, xored, product)
+  lower = s32[] constant(-1000)
+  lowers = s32[127,65]{1,0} broadcast(lower), dimensions={}
+  upper = s32[] constant(1000)
+  uppers = s32[127,65]{1,0} broadcast(upper), dimensions={}
+  ROOT result = s32[127,65]{1,0} clamp(lowers, selected, uppers)
+}
+
+ENTRY main {
+  p0 = s32[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  ROOT fusion = s32[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedS8AndS16ElementwiseVectors) {
+  constexpr absl::string_view kS8Hlo = R"(
+HloModule fly_ragged_s8_elementwise
+
+elementwise {
+  p0 = s8[127,65]{1,0} parameter(0)
+  p1 = s8[127,65]{1,0} parameter(1)
+  sum = s8[127,65]{1,0} add(p0, p1)
+  inverted = s8[127,65]{1,0} not(p0)
+  mixed = s8[127,65]{1,0} xor(sum, inverted)
+  less = pred[127,65]{1,0} compare(p0, p1), direction=LT
+  ROOT result = s8[127,65]{1,0} select(less, mixed, sum)
+}
+
+ENTRY main {
+  p0 = s8[127,65]{1,0} parameter(0)
+  p1 = s8[127,65]{1,0} parameter(1)
+  ROOT fusion = s8[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS8Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS16Hlo = R"(
+HloModule fly_ragged_s16_elementwise
+
+elementwise {
+  p0 = s16[127,65]{1,0} parameter(0)
+  p1 = s16[127,65]{1,0} parameter(1)
+  difference = s16[127,65]{1,0} subtract(p0, p1)
+  product = s16[127,65]{1,0} multiply(difference, p0)
+  maximum = s16[127,65]{1,0} maximum(product, p1)
+  ROOT result = s16[127,65]{1,0} minimum(maximum, p0)
+}
+
+ENTRY main {
+  p0 = s16[127,65]{1,0} parameter(0)
+  p1 = s16[127,65]{1,0} parameter(1)
+  ROOT fusion = s16[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS16Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeMixedS32F32Conversions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_mixed_s32_f32_conversions
+
+elementwise {
+  p0 = s32[127,65]{1,0} parameter(0)
+  p1 = f32[127,65]{1,0} parameter(1)
+  converted = f32[127,65]{1,0} convert(p0)
+  finite = pred[127,65]{1,0} compare(p1, p1), direction=EQ
+  zero = f32[] constant(0)
+  zeros = f32[127,65]{1,0} broadcast(zero), dimensions={}
+  sanitized = f32[127,65]{1,0} select(finite, p1, zeros)
+  sum = f32[127,65]{1,0} add(converted, sanitized)
+  lower = f32[] constant(-1000)
+  lowers = f32[127,65]{1,0} broadcast(lower), dimensions={}
+  upper = f32[] constant(1000)
+  uppers = f32[127,65]{1,0} broadcast(upper), dimensions={}
+  bounded = f32[127,65]{1,0} clamp(lowers, sum, uppers)
+  ROOT result = s32[127,65]{1,0} convert(bounded)
+}
+
+ENTRY main {
+  p0 = s32[127,65]{1,0} parameter(0)
+  p1 = f32[127,65]{1,0} parameter(1)
+  ROOT fusion = s32[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeFp8InputAndOutputConversions) {
+  constexpr absl::string_view kInputHlo = R"(
+HloModule fly_native_fp8_input_conversion
+
+elementwise {
+  p0 = f8e4m3fnuz[127,65]{1,0} parameter(0)
+  converted = f32[127,65]{1,0} convert(p0)
+  ROOT result = f32[127,65]{1,0} abs(converted)
+}
+
+ENTRY main {
+  p0 = f8e4m3fnuz[127,65]{1,0} parameter(0)
+  ROOT fusion = f32[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kInputHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kOutputHlo = R"(
+HloModule fly_native_fp8_output_conversion
+
+elementwise {
+  p0 = f32[127,65]{1,0} parameter(0)
+  converted = f8e5m2fnuz[127,65]{1,0} convert(p0)
+  ROOT result = f8e5m2fnuz[127,65]{1,0} abs(converted)
+}
+
+ENTRY main {
+  p0 = f32[127,65]{1,0} parameter(0)
+  ROOT fusion = f8e5m2fnuz[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kOutputHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kOcpHlo = R"(
+HloModule fly_native_ocp_fp8_conversions
+
+elementwise {
+  p0 = f8e4m3fn[127,65]{1,0} parameter(0)
+  converted = f32[127,65]{1,0} convert(p0)
+  ROOT result = f8e5m2[127,65]{1,0} convert(converted)
+}
+
+ENTRY main {
+  p0 = f8e4m3fn[127,65]{1,0} parameter(0)
+  ROOT fusion = f8e5m2[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kOcpHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeFp8ValueOperations) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_fp8_value_operations
+
+elementwise {
+  predicate = pred[127,65]{1,0} parameter(0)
+  p0 = f8e4m3fnuz[127,65]{1,0} parameter(1)
+  reduced = f8e4m3fnuz[127,65]{1,0} reduce-precision(p0),
+    exponent_bits=3, mantissa_bits=1
+  fallback = f8e4m3fnuz[] constant(-1.5)
+  fallbacks = f8e4m3fnuz[127,65]{1,0}
+    broadcast(fallback), dimensions={}
+  selected = f8e4m3fnuz[127,65]{1,0}
+    select(predicate, reduced, fallbacks)
+  ROOT result = f8e4m3fnuz[127,65]{1,0} abs(selected)
+}
+
+ENTRY main {
+  predicate = pred[127,65]{1,0} parameter(0)
+  p0 = f8e4m3fnuz[127,65]{1,0} parameter(1)
+  ROOT fusion = f8e4m3fnuz[127,65]{1,0}
+    fusion(predicate, p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4InputConversionWithOddTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_input_conversion
+
+elementwise {
+  p0 = s4[127,65]{1,0:E(4)} parameter(0)
+  widened = s8[127,65]{1,0} convert(p0)
+  converted = bf16[127,65]{1,0} convert(widened)
+  magnitude = bf16[127,65]{1,0} abs(converted)
+  scale = bf16[] constant(0.5)
+  scales = bf16[127,65]{1,0} broadcast(scale), dimensions={}
+  ROOT result = bf16[127,65]{1,0} multiply(magnitude, scales)
+}
+
+ENTRY main {
+  p0 = s4[127,65]{1,0:E(4)} parameter(0)
+  ROOT fusion = bf16[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4PhysicalViewsWithOddTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_physical_views
+
+elementwise {
+  p0 = s4[127,65]{1,0:E(4)} parameter(0)
+  flattened = s4[8255]{0:E(4)} bitcast(p0)
+  widened = s8[8255]{0} convert(flattened)
+  converted = bf16[8255]{0} convert(widened)
+  ROOT result = bf16[8255]{0} abs(converted)
+}
+
+ENTRY main {
+  p0 = s4[127,65]{1,0:E(4)} parameter(0)
+  ROOT fusion = bf16[8255]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OddOffsetRectangularSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_odd_offset_slice
+
+elementwise {
+  p0 = s4[127,66]{1,0:E(4)} parameter(0)
+  sliced = s4[127,65]{1,0:E(4)} slice(p0),
+    slice={[0:127], [1:66]}
+  widened = s8[127,65]{1,0} convert(sliced)
+  ROOT result = bf16[127,65]{1,0} convert(widened)
+}
+
+ENTRY main {
+  p0 = s4[127,66]{1,0:E(4)} parameter(0)
+  ROOT fusion = bf16[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OddOffsetDynamicSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_odd_offset_dynamic_slice
+
+elementwise {
+  p0 = s4[129,67]{1,0:E(4)} parameter(0)
+  row = s32[] constant(0)
+  column = s32[] constant(1)
+  sliced = s4[127,65]{1,0:E(4)} dynamic-slice(p0, row, column),
+    dynamic_slice_sizes={127,65}
+  widened = s8[127,65]{1,0} convert(sliced)
+  ROOT result = bf16[127,65]{1,0} convert(widened)
+}
+
+ENTRY main {
+  p0 = s4[129,67]{1,0:E(4)} parameter(0)
+  ROOT fusion = bf16[127,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4ReversePadAndConcatenate) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_reverse_pad_concatenate
+
+elementwise {
+  p0 = s4[8255]{0:E(4)} parameter(0)
+  reversed = s4[8255]{0:E(4)} reverse(p0), dimensions={0}
+  widened = s8[8255]{0} convert(reversed)
+  converted = bf16[8255]{0} convert(widened)
+  zero = bf16[] constant(0)
+  padded = bf16[8257]{0} pad(converted, zero), padding=1_1
+  ROOT result = bf16[16514]{0}
+    concatenate(padded, padded), dimensions={0}
+}
+
+ENTRY main {
+  p0 = s4[8255]{0:E(4)} parameter(0)
+  ROOT fusion = bf16[16514]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4DynamicUpdateSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_dynamic_update_slice
+
+elementwise {
+  base_s4 = s4[67]{0:E(4)} parameter(0)
+  update_s4 = s4[9]{0:E(4)} parameter(1)
+  base_s8 = s8[67]{0} convert(base_s4)
+  update_s8 = s8[9]{0} convert(update_s4)
+  base = bf16[67]{0} convert(base_s8)
+  update = bf16[9]{0} convert(update_s8)
+  start = s32[] constant(5)
+  ROOT result = bf16[67]{0}
+    dynamic-update-slice(base, update, start)
+}
+
+ENTRY main {
+  base = s4[67]{0:E(4)} parameter(0)
+  update = s4[9]{0:E(4)} parameter(1)
+  ROOT fusion = bf16[67]{0} fusion(base, update), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4BitcastConvert) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_bitcast_convert
+
+elementwise {
+  p0 = s4[65,4]{1,0:E(4)} parameter(0)
+  widened = s8[65,4]{1,0} convert(p0)
+  ROOT result = s32[65]{0} bitcast-convert(widened)
+}
+
+ENTRY main {
+  p0 = s4[65,4]{1,0:E(4)} parameter(0)
+  ROOT fusion = s32[65]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4ReduceWindow) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_reduce_window
+
+add {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] add(lhs, rhs)
+}
+
+elementwise {
+  p0 = s4[67]{0:E(4)} parameter(0)
+  widened = s8[67]{0} convert(p0)
+  converted = bf16[67]{0} convert(widened)
+  zero = bf16[] constant(0)
+  ROOT result = bf16[67]{0} reduce-window(converted, zero),
+    window={size=3 pad=1_1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = s4[67]{0:E(4)} parameter(0)
+  ROOT fusion = bf16[67]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OutputConversionWithOddTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_output_conversion
+
+elementwise {
+  p0 = s8[127,65]{1,0} parameter(0)
+  bias = s8[] constant(9)
+  biases = s8[127,65]{1,0} broadcast(bias), dimensions={}
+  shifted = s8[127,65]{1,0} add(p0, biases)
+  ROOT result = s4[127,65]{1,0:E(4)} convert(shifted)
+}
+
+ENTRY main {
+  p0 = s8[127,65]{1,0} parameter(0)
+  ROOT fusion = s4[127,65]{1,0:E(4)} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OutputFromS64) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_output_from_s64
+
+elementwise {
+  p0 = s64[65]{0} parameter(0)
+  ROOT result = s4[65]{0:E(4)} convert(p0)
+}
+
+ENTRY main {
+  p0 = s64[65]{0} parameter(0)
+  ROOT fusion = s4[65]{0:E(4)} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"16"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OutputAligned) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_output_aligned
+
+elementwise {
+  p0 = s8[128]{0} parameter(0)
+  bias = s8[] constant(9)
+  biases = s8[128]{0} broadcast(bias), dimensions={}
+  shifted = s8[128]{0} add(p0, biases)
+  ROOT result = s4[128]{0:E(4)} convert(shifted)
+}
+
+ENTRY main {
+  p0 = s8[128]{0} parameter(0)
+  ROOT fusion = s4[128]{0:E(4)} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativePackedS4OutputFromF32ClampsSpecialValues) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_packed_s4_output_from_f32
+
+elementwise {
+  p0 = f32[9]{0} parameter(0)
+  ROOT result = s4[9]{0:E(4)} convert(p0)
+}
+
+ENTRY main {
+  values = f32[9]{0} constant({-inf, -9, -8, -7.9, 0, nan, 6.9, 7, inf})
+  ROOT fusion = s4[9]{0:E(4)} fusion(values), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"16"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeExternalPredicateBuffersAndConversions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_external_predicate_buffers
+
+elementwise {
+  p0 = pred[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  p0_s32 = s32[127,65]{1,0} convert(p0)
+  sum = s32[127,65]{1,0} add(p0_s32, p1)
+  sum_pred = pred[127,65]{1,0} convert(sum)
+  inverted = pred[127,65]{1,0} not(p0)
+  not_sum = pred[127,65]{1,0} not(sum_pred)
+  both = pred[127,65]{1,0} and(sum_pred, p0)
+  neither = pred[127,65]{1,0} and(not_sum, inverted)
+  ROOT result = pred[127,65]{1,0} or(both, neither)
+}
+
+ENTRY main {
+  p0 = pred[127,65]{1,0} parameter(0)
+  p1 = s32[127,65]{1,0} parameter(1)
+  ROOT fusion = pred[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeTritonPredicateSurface) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_triton_predicate_surface
+
+elementwise {
+  p0 = pred[127,65]{1,0} parameter(0)
+  p1 = pred[127,65]{1,0} parameter(1)
+  sum = pred[127,65]{1,0} add(p0, p1)
+  product = pred[127,65]{1,0} multiply(p0, p1)
+  maximum = pred[127,65]{1,0} maximum(sum, product)
+  minimum = pred[127,65]{1,0} minimum(maximum, p0)
+  lower = pred[] constant(false)
+  lowers = pred[127,65]{1,0} broadcast(lower), dimensions={}
+  upper = pred[] constant(true)
+  uppers = pred[127,65]{1,0} broadcast(upper), dimensions={}
+  clamped = pred[127,65]{1,0} clamp(lowers, minimum, uppers)
+  equal = pred[127,65]{1,0} compare(p0, p1), direction=EQ
+  ROOT result = pred[127,65]{1,0} select(equal, clamped, sum)
+}
+
+ENTRY main {
+  p0 = pred[127,65]{1,0} parameter(0)
+  p1 = pred[127,65]{1,0} parameter(1)
+  ROOT fusion = pred[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeMultidimensionalIotaDag) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_multidimensional_iota
+
+elementwise {
+  iota = s16[5,7,65,3]{3,2,1,0} iota(), iota_dimension=1
+  converted = f64[5,7,65,3]{3,2,1,0} convert(iota)
+  half = f64[] constant(0.5)
+  half_broadcast = f64[5,7,65,3]{3,2,1,0} broadcast(half), dimensions={}
+  ROOT result = f64[5,7,65,3]{3,2,1,0}
+    multiply(converted, half_broadcast)
+}
+
+ENTRY main {
+  ROOT fusion = f64[5,7,65,3]{3,2,1,0} fusion(), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeShapeChangingReshapeView) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_shape_changing_reshape_view
+
+elementwise {
+  p0 = s32[65,17]{1,0} parameter(0)
+  view = s32[17,65]{1,0} reshape(p0)
+  ROOT result = s32[17,65]{1,0} negate(view)
+}
+
+ENTRY main {
+  p0 = s32[65,17]{1,0} parameter(0)
+  ROOT fusion = s32[17,65]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeEffectiveTransposeView) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_effective_transpose_view
+
+elementwise {
+  p0 = f32[13,67]{1,0} parameter(0)
+  view = f32[67,13]{0,1} transpose(p0), dimensions={1,0}
+  ROOT result = f32[67,13]{0,1} abs(view)
+}
+
+ENTRY main {
+  p0 = f32[13,67]{1,0} parameter(0)
+  ROOT fusion = f32[67,13]{0,1} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeSameWidthTypeChangingBitcast) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_same_width_type_bitcast
+
+elementwise {
+  p0 = f32[65]{0} parameter(0)
+  bits = s32[65]{0} bitcast(p0)
+  ROOT result = s32[65]{0} not(bits)
+}
+
+ENTRY main {
+  p0 = f32[65]{0} parameter(0)
+  ROOT fusion = s32[65]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeNarrowingBitcastConvertWithTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_narrowing_bitcast_convert
+
+elementwise {
+  p0 = s32[65]{0} parameter(0)
+  bytes = s8[65,4]{1,0} bitcast-convert(p0)
+  ROOT result = s8[65,4]{1,0} not(bytes)
+}
+
+ENTRY main {
+  p0 = s32[65]{0} parameter(0)
+  ROOT fusion = s8[65,4]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeWideningBitcastConvertWithTail) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_widening_bitcast_convert
+
+elementwise {
+  p0 = s8[65,4]{1,0} parameter(0)
+  words = s32[65]{0} bitcast-convert(p0)
+  ROOT result = s32[65]{0} not(words)
+}
+
+ENTRY main {
+  p0 = s8[65,4]{1,0} parameter(0)
+  ROOT fusion = s32[65]{0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedS64ElementwiseDag) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_ragged_s64_elementwise
+
+elementwise {
+  p0 = s64[127,65]{1,0} parameter(0)
+  p1 = s64[127,65]{1,0} parameter(1)
+  absolute = s64[127,65]{1,0} abs(p0)
+  negated = s64[127,65]{1,0} negate(p1)
+  sum = s64[127,65]{1,0} add(absolute, negated)
+  inverted = s64[127,65]{1,0} not(p1)
+  mixed = s64[127,65]{1,0} xor(sum, inverted)
+  less = pred[127,65]{1,0} compare(p0, p1), direction=LT
+  ROOT result = s64[127,65]{1,0} select(less, mixed, sum)
+}
+
+ENTRY main {
+  p0 = s64[127,65]{1,0} parameter(0)
+  p1 = s64[127,65]{1,0} parameter(1)
+  ROOT fusion = s64[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeWideF64ToNarrowS8Conversion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_wide_f64_to_narrow_s8
+
+elementwise {
+  p0 = f64[65]{0} parameter(0)
+  offset = f64[] constant(37)
+  offsets = f64[65]{0} broadcast(offset), dimensions={}
+  shifted = f64[65]{0} add(p0, offsets)
+  lower = f64[] constant(-100)
+  lowers = f64[65]{0} broadcast(lower), dimensions={}
+  upper = f64[] constant(100)
+  uppers = f64[65]{0} broadcast(upper), dimensions={}
+  bounded = f64[65]{0} clamp(lowers, shifted, uppers)
+  ROOT result = s8[65]{0} convert(bounded)
+}
+
+ENTRY main {
+  p0 = f64[65]{0} parameter(0)
+  ROOT fusion = s8[65]{0} fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"16"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRaggedF64ElementwiseDag) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_ragged_f64_elementwise
+
+elementwise {
+  p0 = f64[127,65]{1,0} parameter(0)
+  p1 = f64[127,65]{1,0} parameter(1)
+  absolute = f64[127,65]{1,0} abs(p0)
+  sum = f64[127,65]{1,0} add(absolute, p1)
+  sine = f64[127,65]{1,0} sine(sum)
+  zero = f64[] constant(0)
+  zeros = f64[127,65]{1,0} broadcast(zero), dimensions={}
+  positive = pred[127,65]{1,0} compare(sine, zeros), direction=GT
+  negated = f64[127,65]{1,0} negate(sine)
+  ROOT result = f64[127,65]{1,0} select(positive, sine, negated)
+}
+
+ENTRY main {
+  p0 = f64[127,65]{1,0} parameter(0)
+  p1 = f64[127,65]{1,0} parameter(1)
+  ROOT fusion = f64[127,65]{1,0} fusion(p0, p1), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["2"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-9, /*arel=*/1e-9}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16CompleteFloatingMathSurface) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_complete_floating_math
+
+elementwise {
+  p0 = bf16[65]{0} parameter(0)
+  lower = bf16[] constant(-0.75)
+  lowers = bf16[65]{0} broadcast(lower), dimensions={}
+  upper = bf16[] constant(0.75)
+  uppers = bf16[65]{0} broadcast(upper), dimensions={}
+  bounded = bf16[65]{0} clamp(lowers, p0, uppers)
+  absolute = bf16[65]{0} abs(p0)
+  offset = bf16[] constant(1.25)
+  offsets = bf16[65]{0} broadcast(offset), dimensions={}
+  positive = bf16[65]{0} add(absolute, offsets)
+  acos = bf16[65]{0} acos(bounded)
+  acosh = bf16[65]{0} acosh(positive)
+  asin = bf16[65]{0} asin(bounded)
+  asinh = bf16[65]{0} asinh(bounded)
+  atanh = bf16[65]{0} atanh(bounded)
+  cbrt = bf16[65]{0} cbrt(bounded)
+  ceil = bf16[65]{0} ceil(p0)
+  cosine = bf16[65]{0} cosine(bounded)
+  cosh = bf16[65]{0} cosh(bounded)
+  erf = bf16[65]{0} erf(bounded)
+  expm1 = bf16[65]{0} exponential-minus-one(bounded)
+  floor = bf16[65]{0} floor(p0)
+  log1p = bf16[65]{0} log-plus-one(bounded)
+  round = bf16[65]{0} round-nearest-even(p0)
+  sine = bf16[65]{0} sine(bounded)
+  sinh = bf16[65]{0} sinh(bounded)
+  tan = bf16[65]{0} tan(bounded)
+  reduced = bf16[65]{0} reduce-precision(p0),
+    exponent_bits=5, mantissa_bits=5
+  atan2 = bf16[65]{0} atan2(bounded, positive)
+  power = bf16[65]{0} power(positive, bounded)
+  remainder = bf16[65]{0} remainder(p0, positive)
+  ROOT tuple = (bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0})
+    tuple(acos, acosh, asin, asinh, atanh, cbrt, ceil, cosine, cosh, erf,
+      expm1, floor, log1p, round, sine, sinh, tan, reduced, atan2, power,
+      remainder)
+}
+
+ENTRY main {
+  p0 = bf16[65]{0} parameter(0)
+  ROOT fusion = (bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0}, bf16[65]{0},
+    bf16[65]{0}, bf16[65]{0}) fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.02, /*arel=*/0.03}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeTinyF32ElementwiseTail) {
@@ -1910,6 +3294,277 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
+TEST_F(FlyFusionDeviceTest, NativeDirectLowPrecisionRowReductions) {
+  constexpr absl::string_view kF16AddHlo = R"(
+HloModule fly_native_direct_f16_row_add
+
+add {
+  lhs = f16[] parameter(0)
+  rhs = f16[] parameter(1)
+  ROOT sum = f16[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f16[127,259]{1,0} parameter(0)
+  zero = f16[] constant(0)
+  ROOT result = f16[127]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f16[127,259]{1,0} parameter(0)
+  ROOT fusion = f16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(RunAndCompareNoHloPasses(kF16AddHlo,
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/0.06}));
+
+  constexpr absl::string_view kF16Hlo = R"(
+HloModule fly_native_direct_f16_row_maximum
+
+maximum {
+  lhs = f16[] parameter(0)
+  rhs = f16[] parameter(1)
+  ROOT max = f16[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f16[127,259]{1,0} parameter(0)
+  minus_inf = f16[] constant(-inf)
+  ROOT result = f16[127]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = f16[127,259]{1,0} parameter(0)
+  ROOT fusion = f16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kF16Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kBf16Hlo = R"(
+HloModule fly_native_direct_bf16_row_minimum
+
+minimum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT min = bf16[] minimum(lhs, rhs)
+}
+
+reduction {
+  p0 = bf16[127,259]{1,0} parameter(0)
+  plus_inf = bf16[] constant(inf)
+  ROOT result = bf16[127]{0} reduce(p0, plus_inf), dimensions={1},
+    to_apply=minimum
+}
+
+ENTRY main {
+  p0 = bf16[127,259]{1,0} parameter(0)
+  ROOT fusion = bf16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kBf16Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeDirectIntegerRowReductions) {
+  constexpr absl::string_view kPredHlo = R"(
+HloModule fly_native_direct_pred_row_maximum
+
+maximum {
+  lhs = pred[] parameter(0)
+  rhs = pred[] parameter(1)
+  ROOT max = pred[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = pred[127,259]{1,0} parameter(0)
+  init = pred[] constant(false)
+  ROOT result = pred[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = pred[127,259]{1,0} parameter(0)
+  ROOT fusion = pred[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kPredHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS8Hlo = R"(
+HloModule fly_native_direct_s8_row_add
+
+add {
+  lhs = s8[] parameter(0)
+  rhs = s8[] parameter(1)
+  ROOT sum = s8[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = s8[127,259]{1,0} parameter(0)
+  init = s8[] constant(0)
+  ROOT result = s8[127]{0} reduce(p0, init), dimensions={1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = s8[127,259]{1,0} parameter(0)
+  ROOT fusion = s8[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS8Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS16Hlo = R"(
+HloModule fly_native_direct_s16_row_minimum
+
+minimum {
+  lhs = s16[] parameter(0)
+  rhs = s16[] parameter(1)
+  ROOT min = s16[] minimum(lhs, rhs)
+}
+
+reduction {
+  p0 = s16[127,259]{1,0} parameter(0)
+  init = s16[] constant(32767)
+  ROOT result = s16[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=minimum
+}
+
+ENTRY main {
+  p0 = s16[127,259]{1,0} parameter(0)
+  ROOT fusion = s16[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS16Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS32Hlo = R"(
+HloModule fly_native_direct_s32_row_maximum
+
+maximum {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT max = s32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = s32[127,259]{1,0} parameter(0)
+  init = s32[] constant(-2147483648)
+  ROOT result = s32[127]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = s32[127,259]{1,0} parameter(0)
+  ROOT fusion = s32[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS32Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS32XorHlo = R"(
+HloModule fly_native_direct_s32_row_xor
+
+xor {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT result = s32[] xor(lhs, rhs)
+}
+
+reduction {
+  p0 = s32[127,259]{1,0} parameter(0)
+  init = s32[] constant(0)
+  ROOT result = s32[127]{0} reduce(p0, init), dimensions={1}, to_apply=xor
+}
+
+ENTRY main {
+  p0 = s32[127,259]{1,0} parameter(0)
+  ROOT fusion = s32[127]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS32XorHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kS64Hlo = R"(
+HloModule fly_native_direct_s64_row_maximum
+
+maximum {
+  lhs = s64[] parameter(0)
+  rhs = s64[] parameter(1)
+  ROOT max = s64[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = s64[31,67]{1,0} parameter(0)
+  init = s64[] constant(-9223372036854775808)
+  ROOT result = s64[31]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = s64[31,67]{1,0} parameter(0)
+  ROOT fusion = s64[31]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kS64Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+
+  constexpr absl::string_view kF64Hlo = R"(
+HloModule fly_native_direct_f64_row_maximum
+
+maximum {
+  lhs = f64[] parameter(0)
+  rhs = f64[] parameter(1)
+  ROOT max = f64[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f64[31,67]{1,0} parameter(0)
+  init = f64[] constant(-inf)
+  ROOT result = f64[31]{0} reduce(p0, init), dimensions={1},
+    to_apply=maximum
+}
+
+ENTRY main {
+  p0 = f64[31,67]{1,0} parameter(0)
+  ROOT fusion = f64[31]{0} fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+})";
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kF64Hlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
 TEST_F(FlyFusionDeviceTest, NativeFusedBf16SquaredDifferenceReduction) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_native_fused_bf16_squared_difference_reduction
@@ -2094,6 +3749,52 @@ ENTRY main {
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/2e-2, /*arel=*/2e-2}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBitcastResidualRmsStatistic) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bitcast_residual_rms_statistic
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+statistic {
+  flat_residual = bf16[256,1024]{1,0} parameter(0)
+  input = bf16[2,128,1024]{2,1,0} parameter(1)
+  residual = bf16[2,128,1024]{2,1,0} bitcast(flat_residual)
+  input_f32 = f32[2,128,1024]{2,1,0} convert(input)
+  residual_f32 = f32[2,128,1024]{2,1,0} convert(residual)
+  added = f32[2,128,1024]{2,1,0} add(input_f32, residual_f32)
+  squared = f32[2,128,1024]{2,1,0} multiply(added, added)
+  zero = f32[] constant(0)
+  row_sum = f32[2,128]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,128]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,128]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,128]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,128]{1,0} add(mean_square, epsilons)
+  ROOT result = f32[2,128]{1,0} rsqrt(variance)
+}
+
+ENTRY main {
+  flat_residual = bf16[256,1024]{1,0} parameter(0)
+  input = bf16[2,128,1024]{2,1,0} parameter(1)
+  ROOT fusion = f32[2,128]{1,0} fusion(flat_residual, input),
+    kind=kCustom, calls=statistic,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-2, /*arel=*/1e-2}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeDynamicSliceBitcast) {

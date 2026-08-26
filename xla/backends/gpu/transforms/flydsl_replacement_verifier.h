@@ -19,6 +19,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla::gpu {
 
@@ -27,6 +28,10 @@ namespace xla::gpu {
 // enabled and fails compilation if any Triton code-generation route remains.
 class FlyDslReplacementVerifier : public HloModulePass {
  public:
+  explicit FlyDslReplacementVerifier(
+      const stream_executor::DeviceDescription& device_description)
+      : device_description_(device_description) {}
+
   absl::string_view name() const override {
     return "flydsl-replacement-verifier";
   }
@@ -35,6 +40,9 @@ class FlyDslReplacementVerifier : public HloModulePass {
   absl::StatusOr<bool> RunImpl(
       HloModule* module,
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+
+ private:
+  const stream_executor::DeviceDescription& device_description_;
 };
 
 }  // namespace xla::gpu

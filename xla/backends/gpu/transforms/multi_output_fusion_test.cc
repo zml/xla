@@ -91,6 +91,55 @@ static int64_t CountMultiOutputFusions(const HloModule* module) {
   return multi_output_fusion_count;
 }
 
+TEST_F(MultiOutputFusionTest,
+       StrictFlyReplacementPreservesMixedOutputReductionBoundary) {
+  constexpr absl::string_view kHlo = R"(
+HloModule strict_fly_mixed_output_boundary
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+producer_body {
+  partials = f32[2,34,259]{2,1,0} parameter(0)
+  zero = f32[] constant(0)
+  projected = f32[34,259]{1,0} reduce(partials, zero), dimensions={0},
+    to_apply=add
+  ROOT projected_bf16 = bf16[34,259]{1,0} convert(projected)
+}
+
+consumer_body {
+  projected = bf16[34,259]{1,0} parameter(0)
+  residual = bf16[2,17,259]{2,1,0} parameter(1)
+  projected_view = bf16[2,17,259]{2,1,0} bitcast(projected)
+  projected_f32 = f32[2,17,259]{2,1,0} convert(projected_view)
+  residual_f32 = f32[2,17,259]{2,1,0} convert(residual)
+  added = f32[2,17,259]{2,1,0} add(projected_f32, residual_f32)
+  ROOT squared = f32[2,17,259]{2,1,0} multiply(added, added)
+}
+
+ENTRY main {
+  residual = bf16[2,17,259]{2,1,0} parameter(0)
+  partials = f32[2,34,259]{2,1,0} parameter(1)
+  producer = bf16[34,259]{1,0} fusion(partials), kind=kLoop,
+    calls=producer_body
+  consumer = f32[2,17,259]{2,1,0} fusion(producer, residual), kind=kLoop,
+    calls=consumer_body
+  ROOT tuple = (f32[2,17,259]{2,1,0}, bf16[34,259]{1,0})
+    tuple(consumer, producer)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_flydsl_replace_triton(true);
+  EXPECT_FALSE(mof_.Run(module.get()).value());
+  EXPECT_EQ(CountMultiOutputFusions(module.get()), 0);
+}
+
 TEST_F(MultiOutputFusionTest, MultiOutputFusionSiblingReduceAndReduceFusion) {
   // Fusion with reduce instruction root and a sibling reduce instruction
   // sharing the same input param.

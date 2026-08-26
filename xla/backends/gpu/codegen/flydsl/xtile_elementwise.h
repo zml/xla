@@ -23,6 +23,8 @@ limitations under the License.
 
 namespace xla::gpu::flydsl {
 
+enum class FlyXTileMemoryPolicy { kCached, kNonTemporal };
+
 // Returns whether a fusion can be emitted as a native Fly vector program.
 bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis);
 
@@ -30,6 +32,9 @@ bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis);
 // assembled from differently sized buffers. Full transactions remain
 // vectorized; the emitter scalarizes only vectors that cross a boundary.
 bool IsFlyXTileIndexedFusion(const HloFusionAnalysis& analysis);
+
+// Selects the cache policy for vectorized global-memory transactions.
+FlyXTileMemoryPolicy GetFlyXTileMemoryPolicy(const HloFusionAnalysis& analysis);
 
 // Creates a native Fly emitter for a contiguous elementwise fusion.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileElementwiseEmitter(

@@ -1,0 +1,14 @@
+HloModule fly_fusion_s32_physical_view_hbm_benchmark
+
+%fused_view (p0: s32[4194304,16]) -> s32[16,4194304] {
+  %p0 = s32[4194304,16]{1,0} parameter(0)
+  %view = s32[16,4194304]{0,1} bitcast(%p0)
+  ROOT %result = s32[16,4194304]{0,1} not(%view)
+}
+
+ENTRY %entry_computation (p0: s32[4194304,16]) -> s32[16,4194304] {
+  %p0 = s32[4194304,16]{1,0} parameter(0)
+  ROOT %fusion = s32[16,4194304]{0,1} fusion(%p0), kind=kCustom,
+    calls=%fused_view,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["16","32"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

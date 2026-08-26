@@ -63,6 +63,92 @@ using absl_testing::IsOk;
 using absl_testing::IsOkAndHolds;
 using ::testing::HasSubstr;
 
+std::unique_ptr<BackendConfig> MakeFlyConfig(int64_t block_m, int64_t block_n,
+                                             int64_t block_k, int64_t num_warps,
+                                             bool prefetch_rhs = false,
+                                             bool stage_output = false,
+                                             int32_t waves_per_eu = 0,
+                                             bool schedule_instructions = false,
+                                             bool stage_rhs = false) {
+  auto config = std::make_unique<BackendConfig>();
+  FlyGemmConfig* fly = config->mutable_fly();
+  fly->set_block_m(block_m);
+  fly->set_block_n(block_n);
+  fly->set_block_k(block_k);
+  fly->set_num_warps(num_warps);
+  fly->set_mfma_atom(FlyGemmConfig::FLY_MFMA_32X32X8);
+  fly->set_prefetch_rhs(prefetch_rhs);
+  fly->set_stage_output(stage_output);
+  fly->set_waves_per_eu(waves_per_eu);
+  fly->set_schedule_instructions(schedule_instructions);
+  fly->set_stage_rhs(stage_rhs);
+  return config;
+}
+
+TEST(FlyFissionConfigPolicyTest, BoundsGenericSearchAndKeepsFlyPipelines) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8));  // Duplicate.
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, false, false, 0, true));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, true));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, true, false, 0, true));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, false, true));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, false, false, 2));
+  configs.push_back(MakeFlyConfig(96, 96, 96, 3));
+  configs.push_back(MakeFlyConfig(96, 96, 96, 3, false, false, 0, false, true));
+
+  configs = OptimizeFlyFissionConfigSet(
+      std::move(configs), /*restrict_to_mi300_default_tiles=*/true);
+
+  ASSERT_EQ(configs.size(), 4);
+  EXPECT_FALSE(configs[0]->fly().prefetch_rhs());
+  EXPECT_FALSE(configs[0]->fly().schedule_instructions());
+  EXPECT_TRUE(configs[1]->fly().schedule_instructions());
+  EXPECT_TRUE(configs[2]->fly().prefetch_rhs());
+  EXPECT_TRUE(configs[3]->fly().stage_rhs());
+  EXPECT_EQ(configs[3]->fly().block_m(), 96);
+}
+
+TEST(FlyFissionConfigPolicyTest, PreservesMandatoryStagedOutputVariants) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, false, true));
+  configs.push_back(MakeFlyConfig(128, 64, 128, 8, false, true, 0, true));
+
+  configs = OptimizeFlyFissionConfigSet(
+      std::move(configs), /*restrict_to_mi300_default_tiles=*/true);
+
+  ASSERT_EQ(configs.size(), 2);
+  EXPECT_TRUE(configs[0]->fly().stage_output());
+  EXPECT_TRUE(configs[1]->fly().stage_output());
+}
+
+TEST(FlyFissionConfigPolicyTest, KeepsDefaultWhenNoTilePriorMatches) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(MakeFlyConfig(48, 48, 48, 3));
+  configs.push_back(MakeFlyConfig(96, 96, 96, 3, false, true));
+
+  configs = OptimizeFlyFissionConfigSet(
+      std::move(configs), /*restrict_to_mi300_default_tiles=*/true);
+
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_EQ(configs[0]->fly().block_m(), 96);
+  EXPECT_TRUE(configs[0]->fly().stage_output());
+}
+
+TEST(FlyFissionConfigPolicyTest, ExhaustiveModeOnlyDeduplicates) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(MakeFlyConfig(96, 96, 96, 3));
+  configs.push_back(MakeFlyConfig(96, 96, 96, 3));
+  configs.push_back(MakeFlyConfig(48, 48, 48, 3));
+
+  configs = OptimizeFlyFissionConfigSet(
+      std::move(configs), /*restrict_to_mi300_default_tiles=*/false);
+
+  ASSERT_EQ(configs.size(), 2);
+  EXPECT_EQ(configs[0]->fly().block_m(), 96);
+  EXPECT_EQ(configs[1]->fly().block_m(), 48);
+}
+
 const char kTritonFusionHlo[] = R"(
   HloModule module
 

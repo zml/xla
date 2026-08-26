@@ -83,27 +83,41 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
   const auto& analysis = fusion_info.analysis();
 #if TENSORFLOW_USE_ROCM
   if (analysis.fusion_backend_config().kind() == kFlyFusionKind) {
-    if (flydsl::GetFlyScanDescriptor(analysis).has_value()) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileScanEmitter(analysis));
-    }
-    if (flydsl::GetFlyPagedAttentionDescriptor(analysis).has_value() ||
-        flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(analysis)
-            .has_value() ||
-        flydsl::GetFlyPagedAttentionSegmentedReducerDescriptor(analysis)
-            .has_value()) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTilePagedAttentionEmitter(analysis));
-    }
-    if (flydsl::GetFlyAttentionDescriptor(analysis).has_value()) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileAttentionEmitter(analysis));
-    }
-    if (flydsl::ContainsUnsupportedCustomCall(analysis)) {
-      // A generic XLA loop emitter cannot lower an opaque custom call. Return
-      // an error-producing emitter rather than reaching indexing analysis and
-      // crashing while treating the call as an ordinary elementwise node.
-      return std::make_unique<CustomFusion>();
+    switch (flydsl::ClassifyFlyFusion(analysis)) {
+      case flydsl::FlyFusionRoute::kScan:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileScanEmitter(analysis));
+      case flydsl::FlyFusionRoute::kPagedAttention:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTilePagedAttentionEmitter(analysis));
+      case flydsl::FlyFusionRoute::kAttention:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileAttentionEmitter(analysis));
+      case flydsl::FlyFusionRoute::kUnsupportedCustomCall:
+        // A generic XLA loop emitter cannot lower an opaque custom call.
+        // Return an error-producing emitter rather than reaching indexing
+        // analysis and crashing while treating it as an ordinary node.
+        return std::make_unique<CustomFusion>();
+      case flydsl::FlyFusionRoute::kSoftmax:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
+      case flydsl::FlyFusionRoute::kTranspose:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileTransposeEmitter(analysis));
+      case flydsl::FlyFusionRoute::kElementwise:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileElementwiseEmitter(analysis));
+      case flydsl::FlyFusionRoute::kRowReduction:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileRowReductionEmitter(analysis));
+      case flydsl::FlyFusionRoute::kGenericXla:
+        break;
+      case flydsl::FlyFusionRoute::kNotFly:
+      case flydsl::FlyFusionRoute::kGemm:
+      case flydsl::FlyFusionRoute::kGemv:
+      case flydsl::FlyFusionRoute::kCollective:
+        // These routes cannot carry the generic __fly kind handled here.
+        return nullptr;
     }
     if (IsDynamicUpdateSliceFusion(analysis.fusion_spec()) &&
         fusion_info.CanEmitDynamicUpdateSliceInPlace()) {
@@ -111,22 +125,6 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
           std::make_unique<InPlaceDynamicUpdateSliceFusion>(analysis);
       emitter->EnableFlyMemory();
       return std::make_unique<MlirKernelFusion>(std::move(emitter));
-    }
-    if (flydsl::IsFlySoftmaxFusion(analysis)) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
-    }
-    if (flydsl::IsFlyXTileTransposeConfigSupported(analysis)) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileTransposeEmitter(analysis));
-    }
-    if (flydsl::IsFlyXTileElementwiseFusion(analysis)) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileElementwiseEmitter(analysis));
-    }
-    if (flydsl::IsFlyXTileRowReductionFusion(analysis)) {
-      return std::make_unique<MlirKernelFusion>(
-          flydsl::CreateFlyXTileRowReductionEmitter(analysis));
     }
     for (const HloInstructionAdaptor& hero : analysis.fusion_heroes()) {
       if (GetDescriptionForTiledTransposeEmitter(hero.instruction())

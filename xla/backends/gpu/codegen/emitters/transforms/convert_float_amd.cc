@@ -251,24 +251,19 @@ struct RewriteFp8TruncFPattern : public Fp8OpRewritePattern<arith::TruncFOp> {
     }
 
     if (num_elements == 2) {
-      return b
-          .create<mlir::UnrealizedConversionCastOp>(
-              to_ty,
-              mlir::ValueRange{LLVM::BitcastOp::create(
-                  b, mlir::VectorType::get(num_elements, i8_ty),
-                  LLVM::ExtractElementOp::create(
-                      b,
-                      LLVM::BitcastOp::create(
-                          b, mlir::VectorType::get(2, b.getI16Type()), chunks),
-                      LLVM::ConstantOp::create(b, i32_ty, 0)))})
-          .getResult(0);
+      mlir::Value bytes = LLVM::BitcastOp::create(
+          b, mlir::VectorType::get(num_elements, i8_ty),
+          LLVM::ExtractElementOp::create(
+              b,
+              LLVM::BitcastOp::create(
+                  b, mlir::VectorType::get(2, b.getI16Type()), chunks),
+              LLVM::ConstantOp::create(b, i32_ty, 0)));
+      return arith::BitcastOp::create(b, to_ty, bytes);
     }
 
-    return b
-        .create<mlir::UnrealizedConversionCastOp>(
-            to_ty, mlir::ValueRange{LLVM::BitcastOp::create(
-                       b, mlir::VectorType::get(num_elements, i8_ty), chunks)})
-        .getResult(0);
+    mlir::Value bytes = LLVM::BitcastOp::create(
+        b, mlir::VectorType::get(num_elements, i8_ty), chunks);
+    return arith::BitcastOp::create(b, to_ty, bytes);
   }
 
   mlir::Value EmitTruncToF8Intrinsic(mlir::Value value, mlir::FloatType to_ty,
@@ -294,9 +289,7 @@ struct RewriteFp8TruncFPattern : public Fp8OpRewritePattern<arith::TruncFOp> {
                          LLVM::ConstantOp::create(b, b.getI1Type(), 0)});
     mlir::Value res =
         LLVM::TruncOp::create(b, b.getI8Type(), cvtOp.getResults());
-    return b
-        .create<mlir::UnrealizedConversionCastOp>(to_ty, mlir::ValueRange{res})
-        .getResult(0);
+    return arith::BitcastOp::create(b, to_ty, res);
   }
 };
 
@@ -460,18 +453,14 @@ struct RewriteFp8ExtFPattern : public Fp8OpRewritePattern<arith::ExtFOp> {
               b, LLVM::UndefOp::create(b, mlir::VectorType::get(2, i16_ty)),
               LLVM::BitcastOp::create(
                   b, i16_ty,
-                  mlir::UnrealizedConversionCastOp::create(
-                      b, mlir::VectorType::get(num_elements, i8_ty),
-                      mlir::ValueRange{value})
-                      .getResult(0)),
+                  arith::BitcastOp::create(
+                      b, mlir::VectorType::get(num_elements, i8_ty), value)),
               zero_cst));
     } else {
       chunks = LLVM::BitcastOp::create(
           b, chunks_ty,
-          mlir::UnrealizedConversionCastOp::create(
-              b, mlir::VectorType::get(num_elements, i8_ty),
-              mlir::ValueRange{value})
-              .getResult(0));
+          arith::BitcastOp::create(
+              b, mlir::VectorType::get(num_elements, i8_ty), value));
     }
 
     llvm::SmallVector<mlir::Value, 4> results;
@@ -532,10 +521,7 @@ struct RewriteFp8ExtFPattern : public Fp8OpRewritePattern<arith::ExtFOp> {
         b, i32_ty,
         LLVM::InsertElementOp::create(
             b, LLVM::UndefOp::create(b, mlir::VectorType::get(4, i8_ty)),
-            mlir::UnrealizedConversionCastOp::create(b, i8_ty,
-                                                     mlir::ValueRange{value})
-                .getResult(0),
-            zero_cst));
+            arith::BitcastOp::create(b, i8_ty, value), zero_cst));
     mlir::StringAttr cvtIntr =
         b.getStringAttr(isFp8(value.getType()) ? "llvm.amdgcn.cvt.f32.fp8"
                                                : "llvm.amdgcn.cvt.f32.bf8");

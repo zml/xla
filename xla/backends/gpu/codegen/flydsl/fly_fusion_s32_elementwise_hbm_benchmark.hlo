@@ -1,0 +1,20 @@
+HloModule fly_fusion_s32_elementwise_hbm_benchmark
+
+%fused_elementwise (p0: s32[8192,8192], p1: s32[8192,8192]) -> s32[8192,8192] {
+  %p0 = s32[8192,8192]{1,0} parameter(0)
+  %p1 = s32[8192,8192]{1,0} parameter(1)
+  %sum = s32[8192,8192]{1,0} add(%p0, %p1)
+  %product = s32[8192,8192]{1,0} multiply(%sum, %p0)
+  %inverted = s32[8192,8192]{1,0} not(%p1)
+  %mixed = s32[8192,8192]{1,0} xor(%product, %inverted)
+  %less = pred[8192,8192]{1,0} compare(%p0, %p1), direction=LT
+  ROOT %selected = s32[8192,8192]{1,0} select(%less, %mixed, %sum)
+}
+
+ENTRY %entry_computation (p0: s32[8192,8192], p1: s32[8192,8192]) -> s32[8192,8192] {
+  %p0 = s32[8192,8192]{1,0} parameter(0)
+  %p1 = s32[8192,8192]{1,0} parameter(1)
+  ROOT %fusion = s32[8192,8192]{1,0} fusion(%p0, %p1), kind=kCustom,
+    calls=%fused_elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["1","512"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

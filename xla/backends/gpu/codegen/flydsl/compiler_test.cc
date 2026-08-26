@@ -20,6 +20,7 @@ limitations under the License.
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
@@ -106,6 +107,43 @@ TEST(FlyDslCompilerTest, LowersBf16MfmaToRocdl) {
   });
   EXPECT_TRUE(found_mfma);
   EXPECT_FALSE(HasOperations(*module));
+}
+
+TEST(FlyDslCompilerTest, LowersNativeF32ErfToOcmlBeforeExpansion) {
+  mlir::DialectRegistry registry;
+  RegisterDialects(registry);
+  registry.insert<mlir::arith::ArithDialect, mlir::gpu::GPUDialect,
+                  mlir::LLVM::LLVMDialect, mlir::math::MathDialect,
+                  mlir::ROCDL::ROCDLDialect, mlir::vector::VectorDialect>();
+  mlir::MLIRContext context(registry);
+  constexpr llvm::StringLiteral kModule = R"mlir(
+    module {
+      gpu.module @kernels {
+        gpu.func @kernel(%value: f32) kernel {
+          %result = math.erf %value : f32
+          gpu.return
+        }
+      }
+    }
+  )mlir";
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kModule, &context);
+  ASSERT_TRUE(module);
+
+  mlir::PassManager pm(&context);
+  AddLoweringPasses(pm);
+  ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
+
+  int erf_calls = 0;
+  int math_erfs = 0;
+  module->walk([&](mlir::LLVM::CallOp call) {
+    if (call.getCallee() == "__ocml_erf_f32") {
+      ++erf_calls;
+    }
+  });
+  module->walk([&](mlir::math::ErfOp) { ++math_erfs; });
+  EXPECT_EQ(erf_calls, 1);
+  EXPECT_EQ(math_erfs, 0);
 }
 
 TEST(FlyDslCompilerTest, WrapsKernelArgumentMemoryInFlyAndLowersBackToLlvm) {

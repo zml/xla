@@ -23,17 +23,18 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
-#include "flydsl/Dialect/Fly/IR/FlyDialect.h"
-#include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
+#include "flydsl/Dialect/Fly/IR/FlyDialect.h"
+#include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
 #include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/codegen/emitters/type_util.h"
 #include "xla/codegen/ir_emission_utils.h"
@@ -102,6 +103,7 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
     context.getOrLoadDialect<mlir::fly::FlyDialect>();
     context.getOrLoadDialect<mlir::fly_rocdl::FlyROCDLDialect>();
     context.getOrLoadDialect<mlir::gpu::GPUDialect>();
+    context.getOrLoadDialect<mlir::scf::SCFDialect>();
 
     mlir::OpBuilder module_builder(&context);
     mlir::Location location =
@@ -150,44 +152,39 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
   }
 
   Value Zero(mlir::ImplicitLocOpBuilder& builder) const {
-    if (descriptor_.element_type == S32 ||
-        descriptor_.element_type == U32) {
+    if (descriptor_.element_type == S32 || descriptor_.element_type == U32) {
       return mlir::arith::ConstantIntOp::create(builder, builder.getI32Type(),
                                                 0);
     }
-    return mlir::arith::ConstantFloatOp::create(
-        builder, builder.getF32Type(), llvm::APFloat(0.0f));
+    return mlir::arith::ConstantFloatOp::create(builder, builder.getF32Type(),
+                                                llvm::APFloat(0.0f));
   }
 
   Value Combine(mlir::ImplicitLocOpBuilder& builder, Value lhs,
                 Value rhs) const {
-    if (descriptor_.element_type == S32 ||
-        descriptor_.element_type == U32) {
+    if (descriptor_.element_type == S32 || descriptor_.element_type == U32) {
       return mlir::arith::AddIOp::create(builder, lhs, rhs);
     }
     Value result = mlir::arith::AddFOp::create(builder, lhs, rhs);
-    if (descriptor_.element_type == F16 ||
-        descriptor_.element_type == BF16) {
-      mlir::Type storage_type = emitters::PrimitiveTypeToMlirType(
-          descriptor_.element_type, builder);
+    if (descriptor_.element_type == F16 || descriptor_.element_type == BF16) {
+      mlir::Type storage_type =
+          emitters::PrimitiveTypeToMlirType(descriptor_.element_type, builder);
       result = mlir::arith::TruncFOp::create(builder, storage_type, result);
-      result = mlir::arith::ExtFOp::create(builder, builder.getF32Type(),
-                                           result);
+      result =
+          mlir::arith::ExtFOp::create(builder, builder.getF32Type(), result);
     }
     return result;
   }
 
   Value ToAccumulator(mlir::ImplicitLocOpBuilder& builder, Value value) const {
-    if (descriptor_.element_type == F16 ||
-        descriptor_.element_type == BF16) {
+    if (descriptor_.element_type == F16 || descriptor_.element_type == BF16) {
       return mlir::arith::ExtFOp::create(builder, builder.getF32Type(), value);
     }
     return value;
   }
 
   Value ToStorage(mlir::ImplicitLocOpBuilder& builder, Value value) const {
-    if (descriptor_.element_type == F16 ||
-        descriptor_.element_type == BF16) {
+    if (descriptor_.element_type == F16 || descriptor_.element_type == BF16) {
       return mlir::arith::TruncFOp::create(
           builder,
           emitters::PrimitiveTypeToMlirType(descriptor_.element_type, builder),
@@ -199,8 +196,8 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
   BufferState CreateBufferState(mlir::ImplicitLocOpBuilder& builder,
                                 Value argument) const {
     mlir::MLIRContext* context = builder.getContext();
-    mlir::Type element_type = emitters::PrimitiveTypeToMlirType(
-        descriptor_.element_type, builder);
+    mlir::Type element_type =
+        emitters::PrimitiveTypeToMlirType(descriptor_.element_type, builder);
     auto vector_type = mlir::VectorType::get({1}, element_type);
     auto shape_attr = mlir::fly::IntTupleAttr::getLeafStatic(context, 1);
     auto tuple_type = mlir::fly::IntTupleType::get(shape_attr);
@@ -208,8 +205,7 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
                                                     mlir::ValueRange{});
     Value stride = mlir::fly::MakeIntTupleOp::create(builder, tuple_type,
                                                      mlir::ValueRange{});
-    auto layout_type =
-        mlir::fly::LayoutType::get(shape_attr, shape_attr);
+    auto layout_type = mlir::fly::LayoutType::get(shape_attr, shape_attr);
     Value layout =
         mlir::fly::MakeLayoutOp::create(builder, layout_type, shape, stride);
     auto copy_atom_type = mlir::fly::CopyAtomType::get(
@@ -222,8 +218,8 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
 
     auto address = mlir::fly_rocdl::BufferDescAddressAttr::get(context);
     auto pointer_type = mlir::fly::PointerType::get(element_type, address);
-    Value descriptor_stride = mlir::arith::ConstantIntOp::create(
-        builder, builder.getI16Type(), 0);
+    Value descriptor_stride =
+        mlir::arith::ConstantIntOp::create(builder, builder.getI16Type(), 0);
     Value descriptor_extent = mlir::arith::ConstantIntOp::create(
         builder, builder.getI64Type(),
         descriptor_.rows * descriptor_.row_length *
@@ -245,8 +241,7 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
             ? static_cast<mlir::Attribute>(builder.getI32IntegerAttr(0))
             : builder.getFloatAttr(element_type, 0.0);
     Value zero_vector = mlir::arith::ConstantOp::create(
-        builder, vector_type,
-        mlir::DenseElementsAttr::get(vector_type, zero));
+        builder, vector_type, mlir::DenseElementsAttr::get(vector_type, zero));
     return BufferState{pointer_type, memref_type, offset_type, pointer,
                        layout,       copy_atom,   zero_vector};
   }
@@ -266,11 +261,10 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
   Value Load(mlir::ImplicitLocOpBuilder& builder, const BufferState& state,
              Value element_offset, Value predicate) const {
     Value view = OffsetView(builder, state, element_offset);
-    Value vector =
-        mlir::fly::CopyAtomCallSSA::create(
-            builder, mlir::TypeRange{state.zero_vector.getType()},
-            state.copy_atom, view, state.zero_vector, predicate)
-            .getResult(0);
+    Value vector = mlir::fly::CopyAtomCallSSA::create(
+                       builder, mlir::TypeRange{state.zero_vector.getType()},
+                       state.copy_atom, view, state.zero_vector, predicate)
+                       .getResult(0);
     return mlir::vector::ExtractOp::create(builder, vector, 0);
   }
 
@@ -279,8 +273,8 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
     Value vector = mlir::vector::FromElementsOp::create(
         builder, state.zero_vector.getType(), mlir::ValueRange{value});
     Value view = OffsetView(builder, state, element_offset);
-    mlir::fly::CopyAtomCallSSA::create(builder, mlir::TypeRange{},
-                                      state.copy_atom, vector, view, predicate);
+    mlir::fly::CopyAtomCallSSA::create(
+        builder, mlir::TypeRange{}, state.copy_atom, vector, view, predicate);
   }
 
   absl::Status EmitKernel(mlir::gpu::GPUFuncOp kernel) const {
@@ -296,17 +290,17 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
         builder, builder.getI64Type(), thread_id);
     Value block = mlir::arith::IndexCastOp::create(
         builder, builder.getI64Type(), block_id);
-    Value lane = mlir::arith::RemUIOp::create(builder, thread,
-                                              I64(builder, kWaveSize));
-    Value wave = mlir::arith::DivUIOp::create(builder, thread,
-                                              I64(builder, kWaveSize));
+    Value lane =
+        mlir::arith::RemUIOp::create(builder, thread, I64(builder, kWaveSize));
+    Value wave =
+        mlir::arith::DivUIOp::create(builder, thread, I64(builder, kWaveSize));
     Value row = mlir::arith::AddIOp::create(
         builder,
         mlir::arith::MulIOp::create(builder, block, I64(builder, num_warps_)),
         wave);
-    Value row_valid = mlir::arith::CmpIOp::create(
-        builder, mlir::arith::CmpIPredicate::ult, row,
-        I64(builder, descriptor_.rows));
+    Value row_valid =
+        mlir::arith::CmpIOp::create(builder, mlir::arith::CmpIPredicate::ult,
+                                    row, I64(builder, descriptor_.rows));
     Value row_base = mlir::arith::MulIOp::create(
         builder, row, I64(builder, descriptor_.row_length));
 
@@ -315,23 +309,24 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
     Value carry = Zero(builder);
     const int64_t stripes =
         (descriptor_.row_length + kWaveSize - 1) / kWaveSize;
-    for (int64_t stripe = 0; stripe < stripes; ++stripe) {
+    auto emit_stripe = [&](Value stripe, Value incoming_carry) {
       Value logical = mlir::arith::AddIOp::create(
-          builder, lane, I64(builder, stripe * kWaveSize));
+          builder, lane,
+          mlir::arith::MulIOp::create(builder, stripe,
+                                      I64(builder, kWaveSize)));
       Value lane_valid = mlir::arith::CmpIOp::create(
           builder, mlir::arith::CmpIPredicate::ult, logical,
           I64(builder, descriptor_.row_length));
-      Value valid =
-          mlir::arith::AndIOp::create(builder, row_valid, lane_valid);
+      Value valid = mlir::arith::AndIOp::create(builder, row_valid, lane_valid);
       Value physical_column = logical;
       if (descriptor_.is_reverse) {
         physical_column = mlir::arith::SubIOp::create(
             builder, I64(builder, descriptor_.row_length - 1), logical);
       }
-      Value element_offset = mlir::arith::AddIOp::create(
-          builder, row_base, physical_column);
-      Value value = ToAccumulator(builder, Load(builder, input, element_offset,
-                                                valid));
+      Value element_offset =
+          mlir::arith::AddIOp::create(builder, row_base, physical_column);
+      Value value =
+          ToAccumulator(builder, Load(builder, input, element_offset, valid));
 
       Value prefix = value;
       for (int64_t distance : {1, 2, 4, 8, 16, 32}) {
@@ -343,17 +338,34 @@ class FlyXTileScanEmitter final : public MlirKernelEmitter {
             builder, mlir::arith::CmpIPredicate::uge, lane,
             I64(builder, distance));
         Value combined = Combine(builder, prefix, shuffled);
-        prefix = mlir::arith::SelectOp::create(
-            builder, has_predecessor, combined, prefix);
+        prefix = mlir::arith::SelectOp::create(builder, has_predecessor,
+                                               combined, prefix);
       }
-      if (stripe != 0) {
-        prefix = Combine(builder, carry, prefix);
-      }
+      prefix = Combine(builder, incoming_carry, prefix);
       Store(builder, output, element_offset, valid, ToStorage(builder, prefix));
-      carry = mlir::gpu::ShuffleOp::create(
-                  builder, prefix, /*offset=*/63, /*width=*/kWaveSize,
-                  mlir::gpu::ShuffleMode::IDX)
-                  .getShuffleResult();
+      return mlir::gpu::ShuffleOp::create(builder, prefix, /*offset=*/63,
+                                          /*width=*/kWaveSize,
+                                          mlir::gpu::ShuffleMode::IDX)
+          .getShuffleResult();
+    };
+    constexpr int64_t kMaxUnrolledStripes = 16;
+    if (stripes <= kMaxUnrolledStripes) {
+      for (int64_t stripe = 0; stripe < stripes; ++stripe) {
+        carry = emit_stripe(I64(builder, stripe), carry);
+      }
+    } else {
+      mlir::scf::ForOp stripe_loop = mlir::scf::ForOp::create(
+          builder, I64(builder, 0), I64(builder, stripes), I64(builder, 1),
+          mlir::ValueRange{carry},
+          [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(stripe_loop.getBody());
+        Value next_carry = emit_stripe(stripe_loop.getInductionVar(),
+                                       stripe_loop.getRegionIterArg(0));
+        mlir::scf::YieldOp::create(builder, next_carry);
+      }
+      builder.setInsertionPointAfter(stripe_loop);
     }
     mlir::gpu::ReturnOp::create(builder);
     return absl::OkStatus();
