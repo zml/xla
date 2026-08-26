@@ -549,6 +549,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_unsupported_crash_on_hlo_pass_noop_change(false);
   opts.set_xla_gpu_experimental_enable_collective_multi_streaming(false);
   opts.set_xla_gpu_experimental_force_split_k(0);
+  opts.set_xla_gpu_experimental_claim_nvfp4_decode_dot(true);
   opts.set_xla_gpu_experimental_enable_triton_warp_specialization(false);
   opts.set_xla_detect_unstable_reductions(DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_detect_unstable_reductions_post_optimizations(
@@ -3492,6 +3493,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "If non empty will interpret this variable as a path for performance "
       "tables for matmuls. Expects `xla.gpu.DeviceHloInstructionProfiles` "
       "proto."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_claim_nvfp4_decode_dot",
+      bool_setter_for(
+          &DebugOptions::set_xla_gpu_experimental_claim_nvfp4_decode_dot),
+      debug_options->xla_gpu_experimental_claim_nvfp4_decode_dot(),
+      "Let FusedScaledDotRewriter claim NVFP4 decode projections, swapping "
+      "their operands and owning their block-level config, instead of leaving "
+      "them to GemmFusion and the generic Triton search."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_force_split_k",
       int32_setter_for(&DebugOptions::set_xla_gpu_experimental_force_split_k),
