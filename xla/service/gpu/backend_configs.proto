@@ -285,6 +285,11 @@ message FlyGemmConfig {
     FLY_MFMA_16X16X4_F32 = 4;
     FLY_MFMA_32X32X2_F32 = 5;
     FLY_MFMA_32X32X4_XF32 = 6;
+    // gfx942's narrow-M atom. CBSZ=4 with ABID=0..15 broadcasts one
+    // four-element LHS fragment across a native 4x64 output wave.
+    FLY_MFMA_4X4X4_BF16 = 7;
+    // CDNA3's signed-byte matrix product with signed-dword accumulation.
+    FLY_MFMA_16X16X32_I8 = 8;
   }
 
   int64 block_m = 1;

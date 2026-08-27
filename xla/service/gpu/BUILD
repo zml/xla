@@ -1808,6 +1808,7 @@ cc_library(
         "//xla/backends/gpu/transforms:estimate_cub_sort_scratch_size",
         "//xla/backends/gpu/transforms:explicit_collectives_group_async_wrapper",
         "//xla/backends/gpu/transforms:explicit_stream_annotation_async_wrapper",
+        "//xla/backends/gpu/transforms:fly_autotune_cleanup",
         "//xla/backends/gpu/transforms:flydsl_replacement_verifier",
         "//xla/backends/gpu/transforms:paged_attention_rewriter_fly",
         "//xla/backends/gpu/transforms:fusion_block_level_rewriter",

@@ -126,6 +126,8 @@ bool IsSupportedContractionConversion(PrimitiveType source,
 mlir::Type ContractionElementType(mlir::ImplicitLocOpBuilder& builder,
                                   PrimitiveType type) {
   switch (type) {
+    case S8:
+      return builder.getI8Type();
     case F32:
       return builder.getF32Type();
     case F16:
@@ -144,6 +146,8 @@ mlir::Type ContractionElementType(mlir::ImplicitLocOpBuilder& builder,
 
 std::string FlyTypeName(PrimitiveType type) {
   switch (type) {
+    case S8:
+      return "i8";
     case F32:
       return "f32";
     case F16:
@@ -161,7 +165,8 @@ std::string FlyTypeName(PrimitiveType type) {
 }
 
 int64_t ContractionElementBytes(PrimitiveType type) {
-  CHECK(type == F32 || IsHalfPrecisionFloat(type) || IsFnuzFp8(type));
+  CHECK(type == F32 || type == S8 || IsHalfPrecisionFloat(type) ||
+        IsFnuzFp8(type));
   return type == F32 ? 4 : (IsHalfPrecisionFloat(type) ? 2 : 1);
 }
 
@@ -286,6 +291,65 @@ bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
          transpose.dimensions() == std::vector<int64_t>({0, 2, 1});
 }
 
+struct ContractingScaleInput {
+  const HloInstruction* data;
+  const HloInstruction* scale;
+  int64_t broadcast_dimension;
+};
+
+std::optional<ContractingScaleInput> MatchContractingScaleInput(
+    const HloInstruction& input) {
+  if (!IsHalfPrecisionFloat(input.shape().element_type()) ||
+      input.opcode() != HloOpcode::kConvert || input.operand_count() != 1 ||
+      input.operand(0)->shape().element_type() != F32 ||
+      !ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape())) {
+    return std::nullopt;
+  }
+  const HloInstruction* multiply = input.operand(0);
+  if (multiply->opcode() != HloOpcode::kMultiply ||
+      multiply->operand_count() != 2 ||
+      multiply->shape().element_type() != F32) {
+    return std::nullopt;
+  }
+  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+    const HloInstruction* widened_data = multiply->operand(data_operand);
+    const HloInstruction* widened_broadcast =
+        multiply->operand(1 - data_operand);
+    if (widened_data->opcode() != HloOpcode::kConvert ||
+        widened_data->operand_count() != 1 ||
+        widened_data->shape().element_type() != F32 ||
+        widened_data->operand(0)->opcode() != HloOpcode::kParameter ||
+        widened_data->operand(0)->shape().element_type() !=
+            input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(widened_data->shape(), input.shape()) ||
+        widened_broadcast->opcode() != HloOpcode::kConvert ||
+        widened_broadcast->operand_count() != 1 ||
+        widened_broadcast->shape().element_type() != F32) {
+      continue;
+    }
+    const HloInstruction* broadcast = widened_broadcast->operand(0);
+    if (broadcast->opcode() != HloOpcode::kBroadcast ||
+        broadcast->operand_count() != 1 ||
+        broadcast->shape().element_type() != input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(broadcast->shape(), input.shape()) ||
+        broadcast->dimensions().size() != 1) {
+      continue;
+    }
+    const HloInstruction* scale = broadcast->operand(0);
+    const int64_t broadcast_dimension = broadcast->dimensions(0);
+    if (scale->opcode() != HloOpcode::kParameter ||
+        scale->shape().dimensions_size() != 1 ||
+        scale->shape().element_type() != input.shape().element_type() ||
+        scale->shape().dimensions(0) !=
+            input.shape().dimensions(broadcast_dimension)) {
+      continue;
+    }
+    return ContractingScaleInput{widened_data->operand(0), scale,
+                                 broadcast_dimension};
+  }
+  return std::nullopt;
+}
+
 struct ContractionInput {
   std::vector<int64_t> parameter_numbers;
   PrimitiveType parameter_type;
@@ -293,48 +357,96 @@ struct ContractionInput {
   int64_t physical_offset;
   std::vector<int64_t> physical_strides;
   int64_t concat_dimension;
-  int64_t concat_fragment_size;
+  std::vector<int64_t> concat_fragment_sizes;
+  std::vector<int64_t> concat_physical_offsets;
+  std::vector<std::vector<int64_t>> concat_physical_strides;
   std::vector<int64_t> dynamic_offset_parameter_numbers;
   std::vector<int64_t> dynamic_offset_constants;
   std::vector<int64_t> dynamic_offset_limits;
+  int64_t scale_parameter_number = -1;
+  PrimitiveType scale_parameter_type = PRIMITIVE_TYPE_INVALID;
+  int64_t scale_broadcast_dimension = -1;
 };
 
 ContractionInput FindContractionInput(const HloInstruction& input) {
   const PrimitiveType contraction_type = input.shape().element_type();
   CHECK(IsHalfPrecisionFloat(contraction_type) ||
-        IsFnuzFp8(contraction_type) || contraction_type == F32);
+        IsFnuzFp8(contraction_type) || contraction_type == F32 ||
+        contraction_type == S8);
+  const HloInstruction* concat = nullptr;
+  std::optional<std::vector<int64_t>> output_to_concat_dimensions;
   if (input.opcode() == HloOpcode::kConcatenate) {
-    CHECK_GE(input.operand_count(), 2);
+    concat = &input;
+  } else if (input.opcode() == HloOpcode::kTranspose &&
+             input.operand_count() == 1 &&
+             input.shape().dimensions_size() == 2 &&
+             input.dimensions() == std::vector<int64_t>({1, 0}) &&
+             input.operand(0)->opcode() == HloOpcode::kConcatenate) {
+    concat = input.operand(0);
+    output_to_concat_dimensions = std::vector<int64_t>(
+        input.dimensions().begin(), input.dimensions().end());
+  }
+  if (concat != nullptr) {
+    CHECK_GE(concat->operand_count(), 2);
     std::vector<int64_t> parameter_numbers;
+    std::vector<int64_t> fragment_sizes;
+    std::vector<int64_t> fragment_physical_offsets;
+    std::vector<std::vector<int64_t>> fragment_physical_strides;
     std::optional<ContractionInput> first_fragment;
-    for (const HloInstruction* operand : input.operands()) {
+    const int64_t concat_dimension = concat->concatenate_dimension();
+    int64_t logical_concat_dimension = concat_dimension;
+    if (output_to_concat_dimensions.has_value()) {
+      auto it = std::find(output_to_concat_dimensions->begin(),
+                          output_to_concat_dimensions->end(), concat_dimension);
+      CHECK(it != output_to_concat_dimensions->end());
+      logical_concat_dimension =
+          std::distance(output_to_concat_dimensions->begin(), it);
+    }
+    for (const HloInstruction* operand : concat->operands()) {
       ContractionInput fragment = FindContractionInput(*operand);
       CHECK_EQ(fragment.parameter_numbers.size(), 1);
       CHECK_EQ(fragment.concat_dimension, -1);
-      CHECK(!fragment.requires_linear_addressing);
       if (!first_fragment.has_value()) {
         first_fragment = fragment;
       } else {
         CHECK_EQ(fragment.parameter_type, first_fragment->parameter_type);
-        CHECK_EQ(fragment.physical_offset, first_fragment->physical_offset);
-        CHECK_EQ(fragment.physical_strides, first_fragment->physical_strides);
       }
       parameter_numbers.push_back(fragment.parameter_numbers.front());
+      fragment_sizes.push_back(
+          operand->shape().dimensions(concat_dimension));
+      fragment_physical_offsets.push_back(fragment.physical_offset);
+      if (output_to_concat_dimensions.has_value()) {
+        std::vector<int64_t> logical_strides(input.shape().dimensions_size());
+        for (int64_t dimension = 0; dimension < logical_strides.size();
+             ++dimension) {
+          logical_strides[dimension] =
+              fragment.physical_strides[(*output_to_concat_dimensions)[dimension]];
+        }
+        fragment_physical_strides.push_back(std::move(logical_strides));
+      } else {
+        fragment_physical_strides.push_back(fragment.physical_strides);
+      }
     }
     CHECK(first_fragment.has_value());
-    const int64_t concat_dimension = input.concatenate_dimension();
     return {std::move(parameter_numbers),
             first_fragment->parameter_type,
-            /*requires_linear_addressing=*/false,
-            first_fragment->physical_offset,
-            std::move(first_fragment->physical_strides),
-            concat_dimension,
-            input.operand(0)->shape().dimensions(concat_dimension),
+            /*requires_linear_addressing=*/
+                output_to_concat_dimensions.has_value() ||
+                    first_fragment->requires_linear_addressing,
+            fragment_physical_offsets.front(),
+            fragment_physical_strides.front(),
+            logical_concat_dimension,
+            std::move(fragment_sizes),
+            std::move(fragment_physical_offsets),
+            std::move(fragment_physical_strides),
             /*dynamic_offset_parameter_numbers=*/{},
             /*dynamic_offset_constants=*/{},
             /*dynamic_offset_limits=*/{}};
   }
-  const HloInstruction* value = &input;
+  const std::optional<ContractingScaleInput> contracting_scale =
+      MatchContractingScaleInput(input);
+  const HloInstruction* value =
+      contracting_scale.has_value() ? contracting_scale->data : &input;
   bool has_conversion = false;
   bool has_input_view = false;
   bool requires_linear_addressing = false;
@@ -462,16 +574,26 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
     dynamic_offset_constants.clear();
     dynamic_offset_limits.clear();
   }
-  return {{value->parameter_number()},
-          parameter_type,
-          requires_linear_addressing,
-          physical_offset,
-          std::move(physical_strides),
-          /*concat_dimension=*/-1,
-          /*concat_fragment_size=*/0,
-          std::move(dynamic_offset_parameter_numbers),
-          std::move(dynamic_offset_constants),
-          std::move(dynamic_offset_limits)};
+  return {
+      {value->parameter_number()},
+      parameter_type,
+      requires_linear_addressing,
+      physical_offset,
+      std::move(physical_strides),
+      /*concat_dimension=*/-1,
+      /*concat_fragment_sizes=*/{},
+      /*concat_physical_offsets=*/{},
+      /*concat_physical_strides=*/{},
+      std::move(dynamic_offset_parameter_numbers),
+      std::move(dynamic_offset_constants),
+      std::move(dynamic_offset_limits),
+      contracting_scale.has_value() ? contracting_scale->scale->parameter_number()
+                                    : -1,
+      contracting_scale.has_value()
+          ? contracting_scale->scale->shape().element_type()
+          : PRIMITIVE_TYPE_INVALID,
+      contracting_scale.has_value() ? contracting_scale->broadcast_dimension
+                                    : -1};
 }
 
 std::vector<int64_t> PhysicalStrides(const Shape& shape) {
@@ -653,10 +775,15 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     rhs_element_type_ = dot->operand(1)->shape().element_type();
     is_fp8_ = IsFnuzFp8(lhs_element_type_);
     CHECK_EQ(is_fp8_, IsFnuzFp8(rhs_element_type_));
+    is_int8_ = lhs_element_type_ == S8;
+    CHECK_EQ(is_int8_, rhs_element_type_ == S8);
     const bool native_fp8_atom =
         mfma_atom_ == FlyGemmConfig::FLY_MFMA_16X16X32_FP8 ||
         mfma_atom_ == FlyGemmConfig::FLY_MFMA_32X32X16_FP8;
     CHECK_EQ(is_fp8_ && !dequantize_block_scales_, native_fp8_atom);
+    const bool native_int8_atom =
+        mfma_atom_ == FlyGemmConfig::FLY_MFMA_16X16X32_I8;
+    CHECK_EQ(is_int8_, native_int8_atom);
     const bool native_f32_atom =
         mfma_atom_ == FlyGemmConfig::FLY_MFMA_16X16X4_F32 ||
         mfma_atom_ == FlyGemmConfig::FLY_MFMA_32X32X2_F32 ||
@@ -664,7 +791,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     CHECK_EQ(lhs_element_type_ == F32 && rhs_element_type_ == F32,
              native_f32_atom);
     CHECK(!dequantize_block_scales_ || is_fp8_);
-    atom_k_ = native_fp8_atom
+    atom_k_ = native_int8_atom
+                  ? 32
+              : native_fp8_atom
                   ? (use_mfma_32_ ? 16 : 32)
               : mfma_atom_ == FlyGemmConfig::FLY_MFMA_32X32X4_XF32
                   ? 4
@@ -680,7 +809,13 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         lhs_input.dynamic_offset_parameter_numbers;
     lhs_dynamic_offset_constants_ = lhs_input.dynamic_offset_constants;
     lhs_dynamic_offset_limits_ = lhs_input.dynamic_offset_limits;
-    lhs_concat_fragment_size_ = lhs_input.concat_fragment_size;
+    lhs_concat_fragment_sizes_ = lhs_input.concat_fragment_sizes;
+    lhs_concat_physical_offsets_ = lhs_input.concat_physical_offsets;
+    lhs_concat_physical_strides_ = lhs_input.concat_physical_strides;
+    lhs_input_scale_parameter_number_ = lhs_input.scale_parameter_number;
+    lhs_input_scale_parameter_type_ = lhs_input.scale_parameter_type;
+    lhs_input_scale_broadcast_dimension_ =
+        lhs_input.scale_broadcast_dimension;
     const ContractionInput rhs_input = FindContractionInput(*dot->operand(1));
     rhs_parameter_numbers_ = rhs_input.parameter_numbers;
     rhs_input_type_ = rhs_input.parameter_type;
@@ -691,7 +826,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         rhs_input.dynamic_offset_parameter_numbers;
     rhs_dynamic_offset_constants_ = rhs_input.dynamic_offset_constants;
     rhs_dynamic_offset_limits_ = rhs_input.dynamic_offset_limits;
-    rhs_concat_fragment_size_ = rhs_input.concat_fragment_size;
+    rhs_concat_fragment_sizes_ = rhs_input.concat_fragment_sizes;
+    rhs_concat_physical_offsets_ = rhs_input.concat_physical_offsets;
+    rhs_concat_physical_strides_ = rhs_input.concat_physical_strides;
     epilogue_steps_ = output_transpose_batch_inner_.has_value()
                           ? std::vector<EpilogueStep>{}
                           : FindEpilogueSteps(root, *dot);
@@ -754,7 +891,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         dot->dot_dimension_numbers().lhs_contracting_dimensions(0);
     rhs_contracting_dimension_ =
         dot->dot_dimension_numbers().rhs_contracting_dimensions(0);
-    if (global_split_k_) {
+    if (global_split_k_ || batched_gemm_) {
       lhs_batch_dimension_ = dot_dims.lhs_batch_dimensions(0);
       rhs_batch_dimension_ = dot_dims.rhs_batch_dimensions(0);
       for (int64_t dimension = 0; dimension < 3; ++dimension) {
@@ -769,7 +906,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
     }
     CHECK(lhs_parameter_numbers_.size() == 1 ||
-          lhs_input.concat_dimension == 0);
+          lhs_input.concat_dimension == 1 - lhs_contracting_dimension_);
     CHECK(rhs_parameter_numbers_.size() == 1 ||
           rhs_input.concat_dimension == 1 - rhs_contracting_dimension_);
     lhs_k_contiguous_ =
@@ -956,20 +1093,44 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
     };
     Value batch_id;
+    Value lhs_concat_fragment;
+    Value rhs_concat_fragment;
+    auto concat_local_index = [&](Value index, Value fragment,
+                                  llvm::ArrayRef<int64_t> fragment_sizes) {
+      CHECK_GE(fragment_sizes.size(), 2);
+      std::vector<int64_t> prefixes(fragment_sizes.size(), 0);
+      for (int64_t candidate = 1; candidate < fragment_sizes.size();
+           ++candidate) {
+        prefixes[candidate] =
+            prefixes[candidate - 1] + fragment_sizes[candidate - 1];
+      }
+      Value selected_prefix = IndexConstant(builder, prefixes.back());
+      for (int64_t candidate = fragment_sizes.size() - 2; candidate >= 0;
+           --candidate) {
+        Value is_candidate = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::eq, fragment,
+            IndexConstant(builder, candidate));
+        selected_prefix = mlir::arith::SelectOp::create(
+            builder, is_candidate, IndexConstant(builder, prefixes[candidate]),
+            selected_prefix);
+      }
+      return Sub(builder, index, selected_prefix);
+    };
     auto lhs_indices = [&](Value m, Value k) {
       llvm::SmallVector<Value, 3> indices;
       if (lhs_parameter_numbers_.size() > 1) {
-        m = Rem(builder, m, lhs_concat_fragment_size_);
+        m = concat_local_index(m, lhs_concat_fragment,
+                               lhs_concat_fragment_sizes_);
       }
-      if (global_split_k_) {
+      if (global_split_k_ || batched_gemm_) {
         indices.resize(3);
         indices[lhs_noncontracting_dimension_] = m;
         indices[lhs_batch_dimension_] = batch_id;
         indices[lhs_contracting_dimension_] = k;
-      } else if (batched_gemm_) {
-        indices.assign({batch_id, m, k});
       } else {
-        indices.assign({m, k});
+        indices.resize(2);
+        indices[1 - lhs_contracting_dimension_] = m;
+        indices[lhs_contracting_dimension_] = k;
       }
       add_dynamic_offsets(indices, lhs_dynamic_offsets);
       return indices;
@@ -977,7 +1138,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     auto rhs_indices = [&](Value k, Value n) {
       llvm::SmallVector<Value, 3> indices;
       if (rhs_parameter_numbers_.size() > 1) {
-        n = Rem(builder, n, rhs_concat_fragment_size_);
+        n = concat_local_index(n, rhs_concat_fragment,
+                               rhs_concat_fragment_sizes_);
       }
       if (global_split_k_) {
         indices.resize(3);
@@ -1010,15 +1172,51 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
       return linear;
     };
+    auto concat_physical_linear_index =
+        [&](mlir::ValueRange indices, Value fragment,
+            llvm::ArrayRef<int64_t> offsets,
+            const std::vector<std::vector<int64_t>>& strides) {
+          CHECK_GE(strides.size(), 2);
+          CHECK_EQ(offsets.size(), strides.size());
+          Value selected = physical_linear_index(
+              indices, strides.back(), offsets.back());
+          for (int64_t candidate = strides.size() - 2; candidate >= 0;
+               --candidate) {
+            Value is_candidate = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::eq, fragment,
+                IndexConstant(builder, candidate));
+            selected = mlir::arith::SelectOp::create(
+                builder, is_candidate,
+                physical_linear_index(indices, strides[candidate],
+                                      offsets[candidate]),
+                selected);
+          }
+          return selected;
+        };
+    auto input_physical_linear_index =
+        [&](Value source, mlir::ValueRange indices,
+            llvm::ArrayRef<int64_t> strides, int64_t offset) {
+          if (source == lhs && lhs_parameter_numbers_.size() > 1) {
+            return concat_physical_linear_index(
+                indices, lhs_concat_fragment, lhs_concat_physical_offsets_,
+                lhs_concat_physical_strides_);
+          }
+          if (source == rhs && rhs_parameter_numbers_.size() > 1) {
+            return concat_physical_linear_index(
+                indices, rhs_concat_fragment, rhs_concat_physical_offsets_,
+                rhs_concat_physical_strides_);
+          }
+          return physical_linear_index(indices, strides, offset);
+        };
     auto lhs_physical_linear_index = [&](Value m, Value k) {
       llvm::SmallVector<Value, 3> indices = lhs_indices(m, k);
-      return physical_linear_index(indices, lhs_physical_strides_,
-                                   lhs_physical_offset_);
+      return input_physical_linear_index(lhs, indices, lhs_physical_strides_,
+                                         lhs_physical_offset_);
     };
     auto rhs_physical_linear_index = [&](Value k, Value n) {
       llvm::SmallVector<Value, 3> indices = rhs_indices(k, n);
-      return physical_linear_index(indices, rhs_physical_strides_,
-                                   rhs_physical_offset_);
+      return input_physical_linear_index(rhs, indices, rhs_physical_strides_,
+                                         rhs_physical_offset_);
     };
     // A row-vector GEMV has only one 16x16 MFMA output atom. Two or four waves
     // can nevertheless cooperate on it by accumulating disjoint K partitions
@@ -1035,7 +1233,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         IsHalfPrecisionFloat(lhs_element_type_);
     if (stage_rhs_) {
       const int64_t copy_elements =
-          lhs_element_type_ == F32 ? 4 : (is_fp8_ ? 8 : 2);
+          lhs_element_type_ == F32 ? 4 : ((is_fp8_ || is_int8_) ? 8 : 2);
       const int64_t block_threads = num_warps_ * 64;
       const bool row_major_rhs_square_double_buffer =
           !single_buffer_lds_ && use_mfma_32_ && num_warps_ == 4 &&
@@ -1090,9 +1288,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           m_ >= block_m_ && n_ >= block_n_;
       const bool shifted_staged_edge_tile =
           !global_split_k_ && m_ >= block_m_ && n_ >= block_n_;
+      const bool small_m_staged_tail =
+          m_ >= 2 && m_ <= 8 && block_m_ == 16 && n_ % block_n_ == 0;
       TF_RET_CHECK((m_ % block_m_ == 0 && n_ % block_n_ == 0) ||
                    (global_split_k_ && m_ % block_m_ == 0 && n_ % 16 == 0) ||
                    tensile_edge_tile || shifted_staged_edge_tile ||
+                   small_m_staged_tail ||
                    (tiny_gemv_local_split && n_ % block_n_ == 0));
     }
     if (preload_lds_fragments_) {
@@ -1100,8 +1301,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           !single_buffer_lds_ && !use_mfma_32_ &&
           ((stage_k_ == 64 && block_m_ == block_n_ &&
             (block_m_ == 64 || block_m_ == 128)) ||
-           (is_fp8_ && stage_k_ == 128 && block_m_ == 128 &&
+           ((is_fp8_ || is_int8_) && stage_k_ == 128 && block_m_ == 128 &&
             block_n_ == 128));
+      const bool small_m_double_buffer =
+          !single_buffer_lds_ && !use_mfma_32_ && !is_fp8_ &&
+          m_ >= 2 && m_ <= 8 && block_m_ == 16 && block_n_ == 64 &&
+          stage_k_ == 128 && num_warps_ == 4 && n_ % block_n_ == 0;
       const bool triton_single_buffer =
           single_buffer_lds_ && use_mfma_32_ && num_warps_ == 4 &&
           ((stage_k_ == 32 && ((block_m_ == 128 && block_n_ == 256) ||
@@ -1128,9 +1333,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           stage_k_ == 128 && block_m_ == 128 &&
           (block_n_ == 64 || block_n_ == 96);
       const bool row_major_rhs_single_buffer =
-          single_buffer_lds_ && use_mfma_32_ && num_warps_ == 8 &&
-          stage_k_ == 128 && block_m_ == 128 && block_n_ == 64 &&
-          !rhs_k_contiguous_;
+          single_buffer_lds_ && use_mfma_32_ && stage_k_ == 128 &&
+          block_n_ == 64 && !rhs_k_contiguous_ &&
+          ((block_m_ == 128 && num_warps_ == 8) ||
+           (block_m_ == 32 && num_warps_ == 2));
       const bool row_major_rhs_square_double_buffer =
           !single_buffer_lds_ && use_mfma_32_ && num_warps_ == 4 &&
           block_m_ == 128 &&
@@ -1143,7 +1349,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                     tensile_single_buffer || tensile_double_buffer ||
                     small_grid_single_buffer || row_major_rhs_single_buffer ||
                     row_major_rhs_square_double_buffer ||
-                    tiny_gemv_local_split));
+                    tiny_gemv_local_split || small_m_double_buffer));
     }
     TF_RET_CHECK(!single_buffer_lds_ || preload_lds_fragments_);
     if (async_lhs_) {
@@ -1172,7 +1378,14 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                                 ContractionElementBytes(lhs_element_type_))));
     }
     const bool use_mfma_32 = use_mfma_32_;
-    const bool paired_mfma = stage_rhs_ || async_lhs_;
+    // FlyDSL's INT8 preshuffle pipeline groups two native K32 MFMAs into one
+    // K64 operand fragment.  Both the LDS A read and register B load are
+    // therefore 16 bytes, with the low/high eight-byte halves consumed by
+    // consecutive MFMAs.  This is independent of how A reached LDS.
+    const bool register_rhs_paired_mfma =
+        is_int8_ && prefetch_rhs_ && !stage_rhs_;
+    const bool paired_rhs_fragment = async_lhs_ || register_rhs_paired_mfma;
+    const bool paired_mfma = stage_rhs_ || paired_rhs_fragment;
     const bool triton_vec4_lds = single_buffer_lds_ && use_mfma_32 &&
                                  stage_k_ == 32 && block_m_ == 128 &&
                                  block_n_ == 256 && num_warps_ == 4;
@@ -1183,15 +1396,21 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                                     (block_m_ == 224 && block_n_ == 256)) &&
                                    num_warps_ == 4;
     const bool row_major_rhs_single_buffer =
-        single_buffer_lds_ && use_mfma_32 && num_warps_ == 8 &&
-        stage_k_ == 128 && block_m_ == 128 && block_n_ == 64 &&
-        !rhs_k_contiguous_;
+        single_buffer_lds_ && use_mfma_32 && stage_k_ == 128 &&
+        block_n_ == 64 && !rhs_k_contiguous_ &&
+        ((block_m_ == 128 && num_warps_ == 8) ||
+         (block_m_ == 32 && num_warps_ == 2));
     const bool row_major_rhs_square_double_buffer =
         stage_rhs_ && preload_lds_fragments_ && !single_buffer_lds_ &&
         use_mfma_32 && num_warps_ == 4 && block_m_ == 128 &&
         ((block_n_ == 128 && (stage_k_ == 32 || stage_k_ == 64)) ||
          (block_n_ == 256 && stage_k_ == 32)) &&
         !rhs_k_contiguous_;
+    const bool small_m_repository_register_refill =
+        stage_rhs_ && preload_lds_fragments_ && !single_buffer_lds_ &&
+        !use_mfma_32 && m_ >= 2 && m_ <= 8 && block_m_ == 16 &&
+        block_n_ == 64 && stage_k_ == 128 && num_warps_ == 4 &&
+        lhs_input_scale_parameter_number_ >= 0 && !rhs_k_contiguous_;
     const bool row_major_rhs_wide_source_swap =
         row_major_rhs_square_double_buffer && block_n_ == 256 &&
         !stage_output_;
@@ -1471,15 +1690,45 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                                       block_n_base, shifted_edge),
           block_n_base, shifted_edge);
     }
-    Value lhs_concat_fragment;
     if (lhs_parameter_numbers_.size() > 1) {
+      std::vector<int64_t> fragment_ends(lhs_concat_fragment_sizes_.size());
+      int64_t end = 0;
+      for (int64_t candidate = 0;
+           candidate < lhs_concat_fragment_sizes_.size(); ++candidate) {
+        end += lhs_concat_fragment_sizes_[candidate];
+        fragment_ends[candidate] = end;
+      }
       lhs_concat_fragment =
-          Div(builder, block_m_base, lhs_concat_fragment_size_);
+          IndexConstant(builder, lhs_concat_fragment_sizes_.size() - 1);
+      for (int64_t candidate = lhs_concat_fragment_sizes_.size() - 2;
+           candidate >= 0; --candidate) {
+        Value in_candidate = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ult, block_m_base,
+            IndexConstant(builder, fragment_ends[candidate]));
+        lhs_concat_fragment = mlir::arith::SelectOp::create(
+            builder, in_candidate, IndexConstant(builder, candidate),
+            lhs_concat_fragment);
+      }
     }
-    Value rhs_concat_fragment;
     if (rhs_parameter_numbers_.size() > 1) {
+      std::vector<int64_t> fragment_ends(rhs_concat_fragment_sizes_.size());
+      int64_t end = 0;
+      for (int64_t candidate = 0;
+           candidate < rhs_concat_fragment_sizes_.size(); ++candidate) {
+        end += rhs_concat_fragment_sizes_[candidate];
+        fragment_ends[candidate] = end;
+      }
       rhs_concat_fragment =
-          Div(builder, block_n_base, rhs_concat_fragment_size_);
+          IndexConstant(builder, rhs_concat_fragment_sizes_.size() - 1);
+      for (int64_t candidate = rhs_concat_fragment_sizes_.size() - 2;
+           candidate >= 0; --candidate) {
+        Value in_candidate = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ult, block_n_base,
+            IndexConstant(builder, fragment_ends[candidate]));
+        rhs_concat_fragment = mlir::arith::SelectOp::create(
+            builder, in_candidate, IndexConstant(builder, candidate),
+            rhs_concat_fragment);
+      }
     }
     auto output_indices = [&](Value row, Value column) {
       llvm::SmallVector<Value> indices;
@@ -1503,11 +1752,13 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         dequantize_block_scales_ ? BF16 : lhs_element_type_;
     const PrimitiveType mma_rhs_element_type =
         dequantize_block_scales_ ? BF16 : rhs_element_type_;
+    const std::string accumulator_type_name = is_int8_ ? "i32" : "f32";
     const std::string mma_atom_assembly =
         "!fly.mma_atom<!fly_rocdl.cdna3.mfma<" + std::to_string(atom_m) + "x" +
         std::to_string(atom_m) + "x" + std::to_string(atom_k) + ", (" +
         FlyTypeName(mma_lhs_element_type) + "," +
-        FlyTypeName(mma_rhs_element_type) + ")->f32>>";
+        FlyTypeName(mma_rhs_element_type) + ")->" + accumulator_type_name +
+        ">>";
     mlir::Type mma_atom_type =
         mlir::parseType(mma_atom_assembly, entry_function.getContext());
     TF_RET_CHECK(mma_atom_type != nullptr);
@@ -1527,8 +1778,11 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         mlir::VectorType::get({input_fragment_elements}, rhs_element_type);
     mlir::VectorType staged_input_vector_type =
         mlir::VectorType::get({2 * input_fragment_elements}, lhs_element_type);
-    mlir::VectorType accumulator_type =
-        mlir::VectorType::get({accumulator_elements}, builder.getF32Type());
+    mlir::Type accumulator_element_type =
+        is_int8_ ? mlir::Type(builder.getI32Type())
+                 : mlir::Type(builder.getF32Type());
+    mlir::VectorType accumulator_type = mlir::VectorType::get(
+        {accumulator_elements}, accumulator_element_type);
     auto apply_epilogue_step = [&](Value value, int64_t step_index,
                                    Value operand) -> Value {
       const EpilogueStep& step = epilogue_steps_[step_index];
@@ -1698,7 +1952,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         return mlir::arith::SIToFPOp::create(builder, contraction_type, widened)
             .getResult();
       }
-      CHECK(IsHalfPrecisionFloat(source_type) || IsFnuzFp8(source_type));
+      CHECK(IsHalfPrecisionFloat(source_type) || IsFnuzFp8(source_type) ||
+            source_type == S8);
       return value;
     };
     auto unpack_s4_vector = [&](Value packed,
@@ -1764,7 +2019,6 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       // is not supported by XLA's tensor-flattening pass.
       std::function<Value(int64_t)> emit_branch = [&](int64_t index) -> Value {
         Value candidate = entry_function.getArgument((*parameters)[index]);
-        CHECK_EQ(candidate.getType(), source.getType());
         if (index + 1 == parameters->size()) {
           return emit(candidate);
         }
@@ -1855,7 +2109,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                          llvm::ArrayRef<int64_t>{0, 1, 2, 3, 4, 5, 6, 7})
                   .getResult();
             }
-            if (IsFnuzFp8(source_type)) {
+            if (IsFnuzFp8(source_type) || source_type == S8) {
               // LLVM has no native FNUZ FP8 type. Keep the overloaded ROCm
               // raw-buffer intrinsic dword-typed and reinterpret its payload
               // only after the load. This is also required for 16-byte
@@ -1871,6 +2125,20 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                   selected_source, source_linear_index, packed_type);
               return mlir::arith::BitcastOp::create(builder, result_type,
                                                     packed)
+                  .getResult();
+            }
+            if (IsHalfPrecisionFloat(source_type) &&
+                result_type.getNumElements() == 1) {
+              // AMDGPU cannot scalarize a raw-buffer intrinsic returning
+              // vector<1xbf16/f16>. Load the storage scalar as i16, then
+              // reinterpret and repack it for the contraction fragment.
+              Value bits = emit_buffer_load(selected_source,
+                                            source_linear_index,
+                                            builder.getI16Type());
+              Value scalar = mlir::arith::BitcastOp::create(
+                  builder, result_type.getElementType(), bits);
+              return mlir::vector::BroadcastOp::create(builder, result_type,
+                                                       scalar)
                   .getResult();
             }
             Value loaded =
@@ -1915,7 +2183,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                          llvm::ArrayRef<int64_t>{0, 1, 2, 3, 4, 5, 6, 7})
                   .getResult();
             }
-            if (IsFnuzFp8(source_type)) {
+            if (IsFnuzFp8(source_type) || source_type == S8) {
               CHECK_EQ(result_type.getNumElements() % 4, 0);
               auto packed_type = mlir::VectorType::get(
                   {result_type.getNumElements() / 4}, builder.getI32Type());
@@ -1940,7 +2208,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       if (requires_linear_addressing || source_type == S4) {
         return emit_input_buffer_load(
             source, source_type,
-            physical_linear_index(indices, strides, physical_offset),
+            input_physical_linear_index(source, indices, strides,
+                                        physical_offset),
             result_type);
       }
       return emit_selected_input(
@@ -1960,7 +2229,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       if (requires_linear_addressing || source_type == S4) {
         return emit_input_buffer_load(
             source, source_type,
-            physical_linear_index(indices, strides, physical_offset),
+            input_physical_linear_index(source, indices, strides,
+                                        physical_offset),
             result_type);
       }
       return emit_selected_input(
@@ -1986,7 +2256,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         auto result_type = mlir::VectorType::get({1}, element_type);
         Value loaded = emit_input_buffer_load(
             source, source_type,
-            physical_linear_index(indices, strides, physical_offset),
+            input_physical_linear_index(source, indices, strides,
+                                        physical_offset),
             result_type);
         return mlir::vector::ExtractOp::create(builder, loaded,
                                                llvm::SmallVector<int64_t>{0})
@@ -2012,7 +2283,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                   .getResult();
             }
             CHECK(IsHalfPrecisionFloat(source_type) ||
-                  IsFnuzFp8(source_type));
+                  IsFnuzFp8(source_type) || source_type == S8);
             return element;
           });
     };
@@ -2038,8 +2309,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       wait_state.addAttribute("bitfield", builder.getI32IntegerAttr(bitfield));
       builder.create(wait_state);
     };
-    Value zero = mlir::arith::ConstantFloatOp::create(
-        builder, builder.getF32Type(), llvm::APFloat(0.0f));
+    Value zero =
+        is_int8_
+            ? mlir::arith::ConstantIntOp::create(builder, 0, 32).getResult()
+            : mlir::arith::ConstantFloatOp::create(
+                  builder, builder.getF32Type(), llvm::APFloat(0.0f))
+                  .getResult();
     Value zero_accumulator =
         mlir::vector::BroadcastOp::create(builder, accumulator_type, zero);
     const int64_t pipeline_stages =
@@ -2118,7 +2393,16 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         best_fragment_loads = fragment_loads;
       }
     }
-    if (row_major_rhs_square_double_buffer && block_n_ == 256) {
+    if (is_int8_ && prefetch_rhs_ && !stage_rhs_ && block_m_ == 128 &&
+        block_n_ == 128 && num_warps_ == 4) {
+      // FlyDSL's preshuffled INT8 GEMM maps all four waves along N.  A wave
+      // consequently owns an 128x32 output slice (8x2 MFMA atoms), retaining
+      // only two N fragments at each K step.  The generic minimum-total-read
+      // heuristic picks a 2x2 wave grid instead; that has the same sixteen
+      // accumulators but doubles the loop-resident B bank.
+      wave_grid_rows = 1;
+      wave_grid_columns = 4;
+    } else if (row_major_rhs_square_double_buffer && block_n_ == 256) {
       // Match Triton's winning transposed-MFMA layout. Four waves split N and
       // each cover a 128x64 output slice: four M atoms by two N atoms. This
       // retains eight independent accumulators per wave while sharing each B
@@ -2235,7 +2519,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                   IndexConstant(builder, tile_row * tile_row_stride + element_row)));
           elements.push_back(load_block_scale(
               lhs_scale_parameter_number_, lhs_scale_element_type_,
-              lhs_scale_dimensions_, /*contracting_dimension=*/1, output_row,
+              lhs_scale_dimensions_, lhs_contracting_dimension_, output_row,
               m_, k_base));
         }
         lhs_scales.push_back(mlir::vector::FromElementsOp::create(
@@ -2342,6 +2626,38 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     Value zero_rhs_input_element = mlir::arith::ConstantOp::create(
         builder, rhs_element_type, builder.getZeroAttr(rhs_element_type));
     const bool masked_k_tail = k_ % stage_k_ != 0;
+    Value lhs_input_scale;
+    if (lhs_input_scale_parameter_number_ >= 0) {
+      TF_RET_CHECK(lhs_input_scale_parameter_type_ == lhs_element_type_ &&
+                   lhs_input_scale_broadcast_dimension_ ==
+                       lhs_contracting_dimension_ &&
+                   IsHalfPrecisionFloat(lhs_element_type_));
+      lhs_input_scale = entry_function.getArgument(
+          lhs_input_scale_parameter_number_);
+    }
+    auto apply_lhs_input_scale = [&](Value loaded, Value first_k) -> Value {
+      if (!lhs_input_scale) {
+        return loaded;
+      }
+      // Preserve the HLO producer's exact arithmetic and rounding:
+      //   convert<T>(convert<f32>(data) * convert<f32>(scale)).
+      // Applying it while loading A into LDS lets every output-column wave
+      // reuse the scaled tile instead of repeating the VALU work per N tile.
+      CHECK(!masked_k_tail);
+      Value scale = mlir::vector::TransferReadOp::create(
+          builder, load_vector_type, lhs_input_scale,
+          mlir::ValueRange{first_k}, /*padding=*/std::nullopt,
+          llvm::ArrayRef<bool>{true});
+      auto f32_vector_type = mlir::VectorType::get(
+          {load_vector_width}, builder.getF32Type());
+      Value widened_data = mlir::arith::ExtFOp::create(
+          builder, f32_vector_type, loaded);
+      Value widened_scale = mlir::arith::ExtFOp::create(
+          builder, f32_vector_type, scale);
+      Value product =
+          mlir::arith::MulFOp::create(builder, widened_data, widened_scale);
+      return mlir::arith::TruncFOp::create(builder, load_vector_type, product);
+    };
     Value load_step = IndexConstant(builder, num_warps_ * 64);
     const int64_t lhs_vectors_per_row = stage_k_ / load_vector_width;
     auto emit_lhs_register_vector_with_mask =
@@ -2377,6 +2693,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
               : SwizzleXor16(builder, shared_row, shared_k, stage_k_,
                              ContractionElementBytes(lhs_element_type_));
       if (tensile_direct_rhs || local_split_k_) {
+        CHECK(!lhs_input_scale);
         Value vector_linear_index = lhs_physical_linear_index(
             Add(builder, block_m_base, logical_row), logical_k);
         Value scalar_linear_index =
@@ -2391,11 +2708,32 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       auto emit_unchecked_vector = [&]() -> Value {
         Value source_linear_index =
             lhs_physical_linear_index(global_row, first_k);
-        return emit_input_buffer_load(lhs, lhs_input_type_,
-                                      source_linear_index, load_vector_type);
+        Value loaded = emit_input_buffer_load(
+            lhs, lhs_input_type_, source_linear_index, load_vector_type);
+        return apply_lhs_input_scale(loaded, first_k);
+      };
+      auto emit_row_checked_vector = [&]() -> Value {
+        if (m_ % block_m_ == 0 || shift_m_edge) {
+          return emit_unchecked_vector();
+        }
+        Value row_in_bounds = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ult, global_row,
+            IndexConstant(builder, m_));
+        mlir::scf::IfOp load = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{load_vector_type}, row_in_bounds,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard if_guard(builder);
+          builder.setInsertionPointToStart(load.thenBlock());
+          mlir::scf::YieldOp::create(builder, emit_unchecked_vector());
+          builder.setInsertionPointToStart(load.elseBlock());
+          mlir::scf::YieldOp::create(builder, zero_load_vector);
+        }
+        builder.setInsertionPointAfter(load);
+        return load.getResult(0);
       };
       if (!mask_k_tail) {
-        return emit_unchecked_vector();
+        return emit_row_checked_vector();
       }
       Value complete_vector = mlir::arith::CmpIOp::create(
           builder, mlir::arith::CmpIPredicate::ule,
@@ -2407,7 +2745,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       {
         mlir::OpBuilder::InsertionGuard if_guard(builder);
         builder.setInsertionPointToStart(load.thenBlock());
-        mlir::scf::YieldOp::create(builder, emit_unchecked_vector());
+        mlir::scf::YieldOp::create(builder, emit_row_checked_vector());
 
         builder.setInsertionPointToStart(load.elseBlock());
         llvm::SmallVector<Value, 8> elements;
@@ -2908,6 +3246,29 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                              llvm::ArrayRef<bool>{true})
                              .getResult();
               }
+            }
+            return stored;
+          }
+          if (small_m_repository_register_refill) {
+            CHECK_GE(copy_begin, 0);
+            CHECK_LE(copy_end, vectors.size());
+            const int64_t block_threads = num_warps_ * 64;
+            Value stage_base = Mul(builder, shared_stage,
+                                   IndexConstant(builder, lhs_stage_elements));
+            Value stored = destination;
+            for (int64_t copy = copy_begin; copy < copy_end; ++copy) {
+              Value vector_index = Add(
+                  builder, thread_id,
+                  IndexConstant(builder, copy * block_threads));
+              Value physical_linear =
+                  Mul(builder, vector_index,
+                      IndexConstant(builder, load_vector_width));
+              stored = mlir::vector::TransferWriteOp::create(
+                           builder, vectors[copy], stored,
+                           mlir::ValueRange{
+                               Add(builder, stage_base, physical_linear)},
+                           llvm::ArrayRef<bool>{true})
+                           .getResult();
             }
             return stored;
           }
@@ -3524,7 +3885,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
               lhs_requires_linear_addressing_, lhs_physical_offset_,
               lhs_physical_strides_);
         };
-        auto emit_lhs_vector = [&]() -> Value {
+        auto emit_unscaled_lhs_vector = [&]() -> Value {
           if (!masked_k_tail) {
             return emit_unchecked_lhs_vector();
           }
@@ -3568,6 +3929,11 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           }
           builder.setInsertionPointAfter(load);
           return load.getResult(0);
+        };
+        auto emit_lhs_vector = [&]() -> Value {
+          return apply_lhs_input_scale(
+              emit_unscaled_lhs_vector(),
+              Add(builder, global_k, logical_k));
         };
         Value loaded;
         if (m_ % block_m_ == 0 || shift_m_edge) {
@@ -3667,6 +4033,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
       const bool can_copy_direct =
           (stage_rhs_ || async_lhs_) &&
+          lhs_input_scale_parameter_number_ < 0 &&
           lhs_k_contiguous_ &&
           (m_ % block_m_ == 0 || shift_m_edge) &&
           (IsHalfPrecisionFloat(lhs_input_type_) ||
@@ -3701,6 +4068,61 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       return emit_lhs_register_stage(destination, global_k, shared_stage);
     };
 
+    auto emit_small_m_repository_rhs_register_vector =
+        [&](Value global_k, int64_t copy) {
+      CHECK(small_m_repository_register_refill);
+      const int64_t block_threads = num_warps_ * 64;
+      const int64_t n_vectors = block_n_ / load_vector_width;
+      Value vector_index = Add(
+          builder, thread_id, IndexConstant(builder, copy * block_threads));
+      Value shared_k = Div(builder, vector_index, n_vectors);
+      Value shared_n = Mul(builder, Rem(builder, vector_index, n_vectors),
+                           IndexConstant(builder, load_vector_width));
+      mlir::AffineMap n_vector_map = mlir::AffineMap::get(
+          /*dimCount=*/2, /*symbolCount=*/0,
+          builder.getAffineDimExpr(1 - rhs_contracting_dimension_),
+          builder.getContext());
+      llvm::SmallVector<Value, 2> indices = rhs_indices(
+          Add(builder, global_k, shared_k),
+          Add(builder, block_n_base, shared_n));
+      return emit_input_mapped_transfer_read(
+          rhs, rhs_input_type_, load_vector_type, indices, n_vector_map,
+          rhs_requires_linear_addressing_, rhs_physical_offset_,
+          rhs_physical_strides_);
+    };
+    auto emit_small_m_repository_rhs_register_store =
+        [&](Value destination, Value vector, int64_t copy,
+            Value shared_stage) -> Value {
+      CHECK(small_m_repository_register_refill);
+      const int64_t block_threads = num_warps_ * 64;
+      const int64_t n_vectors = block_n_ / load_vector_width;
+      Value vector_index = Add(
+          builder, thread_id, IndexConstant(builder, copy * block_threads));
+      Value shared_k = Div(builder, vector_index, n_vectors);
+      Value shared_n = Mul(builder, Rem(builder, vector_index, n_vectors),
+                           IndexConstant(builder, load_vector_width));
+      Value stage_base = Mul(builder, shared_stage,
+                             IndexConstant(builder, rhs_stage_elements));
+      Value stored = destination;
+      for (int64_t element = 0; element < load_vector_width; ++element) {
+        Value element_n =
+            Add(builder, shared_n, IndexConstant(builder, element));
+        Value physical_k = SwizzleXor16(
+            builder, element_n, shared_k, stage_k_,
+            ContractionElementBytes(rhs_element_type_));
+        Value shared_index = Add(
+            builder, IndexConstant(builder, lhs_shared_elements),
+            Add(builder, stage_base,
+                Add(builder,
+                    Mul(builder, element_n, IndexConstant(builder, stage_k_)),
+                    physical_k)));
+        Value scalar = mlir::vector::ExtractOp::create(
+            builder, vector, llvm::SmallVector<int64_t>{element});
+        stored = mlir::tensor::InsertOp::create(builder, scalar, stored,
+                                                shared_index);
+      }
+      return stored;
+    };
     auto emit_rhs_lds_stage = [&](Value destination, Value global_k,
                                   Value shared_stage) {
       const int64_t rhs_shared_base = lhs_shared_elements;
@@ -4023,11 +4445,14 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       Value group_k = Add(
           builder,
           Mul(builder, lane_group,
-              IndexConstant(builder, async_lhs_ ? 2 * input_fragment_elements
-                                                : input_fragment_elements)),
+              IndexConstant(builder,
+                            paired_rhs_fragment
+                                ? 2 * input_fragment_elements
+                                : input_fragment_elements)),
           IndexConstant(builder, k_offset));
       mlir::VectorType rhs_vector_type =
-          async_lhs_ ? staged_input_vector_type : rhs_input_vector_type;
+          paired_rhs_fragment ? staged_input_vector_type
+                              : rhs_input_vector_type;
       for (int64_t tile_column = 0; tile_column < wave_tile_columns;
            ++tile_column) {
         Value column = Add(builder, wave_column_offset,
@@ -4044,7 +4469,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                 /*dimCount=*/2, /*symbolCount=*/0,
                 builder.getAffineDimExpr(rhs_contracting_dimension_),
                 builder.getContext());
-            if (async_lhs_) {
+            if (paired_rhs_fragment) {
               Value source_linear_index = rhs_physical_linear_index(
                   Add(builder, global_k, group_k), global_column);
               return emit_input_buffer_load(
@@ -4058,7 +4483,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                 rhs_physical_strides_);
           }
           llvm::SmallVector<Value, 8> elements;
-          const int64_t vector_elements = async_lhs_
+          const int64_t vector_elements = paired_rhs_fragment
                                               ? 2 * input_fragment_elements
                                               : input_fragment_elements;
           for (int64_t element = 0; element < vector_elements; ++element) {
@@ -4077,7 +4502,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           if (!masked_k_tail) {
             return emit_unchecked_rhs_vector();
           }
-          const int64_t vector_elements = async_lhs_
+          const int64_t vector_elements = paired_rhs_fragment
                                               ? 2 * input_fragment_elements
                                               : input_fragment_elements;
           Value first_k = Add(builder, global_k, group_k);
@@ -4136,9 +4561,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             Value loaded = emit_rhs_vector();
             mlir::scf::YieldOp::create(builder, loaded);
             builder.setInsertionPointToStart(load.elseBlock());
-            mlir::scf::YieldOp::create(builder, async_lhs_
-                                                    ? zero_staged_input_vector
-                                                    : zero_rhs_input_vector);
+            mlir::scf::YieldOp::create(
+                builder, paired_rhs_fragment ? zero_staged_input_vector
+                                             : zero_rhs_input_vector);
           }
           builder.setInsertionPointAfter(load);
           fragments.push_back(load.getResult(0));
@@ -4148,7 +4573,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     };
     auto emit_rhs_stage = [&](Value global_k) {
       llvm::SmallVector<Value> fragments;
-      const int64_t rhs_k_step = async_lhs_ ? 2 * atom_k : atom_k;
+      const int64_t rhs_k_step = paired_rhs_fragment ? 2 * atom_k : atom_k;
       fragments.reserve((stage_k_ / rhs_k_step) * wave_tile_columns);
       for (int64_t k_offset = 0; k_offset < stage_k_; k_offset += rhs_k_step) {
         llvm::SmallVector<Value> group = emit_rhs_group(global_k, k_offset);
@@ -5098,12 +5523,30 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             initial_shared, initial_lhs_registers, 0,
             initial_lhs_registers.size(), lower_bound);
       }
+    } else if (small_m_repository_register_refill) {
+      const int64_t rhs_copies =
+          block_n_ * stage_k_ / load_vector_width / (num_warps_ * 64);
+      llvm::SmallVector<Value> initial_rhs;
+      initial_rhs.reserve(rhs_copies);
+      for (int64_t copy = 0; copy < rhs_copies; ++copy) {
+        initial_rhs.push_back(
+            emit_small_m_repository_rhs_register_vector(lower_bound, copy));
+      }
+      llvm::SmallVector<Value> initial_lhs =
+          emit_lhs_register_vectors(lower_bound);
+      emit_wait_vmcnt(0);
+      for (int64_t copy = 0; copy < rhs_copies; ++copy) {
+        initial_shared = emit_small_m_repository_rhs_register_store(
+            initial_shared, initial_rhs[copy], copy, lower_bound);
+      }
+      initial_shared = emit_lhs_register_stores_at_stage(
+          initial_shared, initial_lhs, 0, initial_lhs.size(), lower_bound);
     } else if (stage_rhs_) {
       initial_shared =
           emit_rhs_lds_stage(initial_shared, lower_bound, lower_bound);
     }
     if (!single_buffer_lds_ && !tensile_double_buffer &&
-        !tensile_direct_lhs) {
+        !tensile_direct_lhs && !small_m_repository_register_refill) {
       initial_shared =
           async_lhs_ ? emit_lhs_register_stage(initial_shared, lower_bound,
                                                lower_bound)
@@ -5117,7 +5560,73 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     constexpr bool kCarryWideDirectAcrossLoop = true;
     constexpr bool kCarryWideStagedPayloadAcrossLoop = false;
     constexpr bool kCarryWidePreloadedGroupAcrossLoop = false;
-    llvm::SmallVector<Value> initial_loop_values = initial_accumulators;
+    // FlyDSL's preshuffled GEMM carries the complete accumulator fragment as
+    // one flat vector through the K-loop.  Keeping every MFMA result as an
+    // independent SCF iter_arg makes LLVM allocate disjoint live ranges for
+    // them: the 128x128 INT8 tile grows from 154 VGPRs in the repository
+    // kernel to 244 VGPRs here.  Preserve FlyDSL's packed loop state for the
+    // matching register-RHS pipeline and only materialize the vector<4xi32>
+    // slices at the MFMA boundary.
+    const bool pack_loop_accumulators =
+        is_int8_ && prefetch_rhs && !stage_rhs_ && !async_lhs_ &&
+        !preload_lds_fragments_ && !tensile_direct_operand &&
+        !local_split_k_;
+    const int64_t accumulator_loop_value_count =
+        pack_loop_accumulators ? 1 : accumulators_per_wave;
+    auto pack_accumulators = [&](llvm::ArrayRef<Value> accumulators) -> Value {
+      CHECK(!accumulators.empty());
+      llvm::SmallVector<Value> packed(accumulators);
+      while (packed.size() > 1) {
+        llvm::SmallVector<Value> combined;
+        combined.reserve((packed.size() + 1) / 2);
+        for (int64_t index = 0; index < packed.size(); index += 2) {
+          if (index + 1 == packed.size()) {
+            combined.push_back(packed[index]);
+            continue;
+          }
+          auto lhs_type =
+              mlir::cast<mlir::VectorType>(packed[index].getType());
+          auto rhs_type =
+              mlir::cast<mlir::VectorType>(packed[index + 1].getType());
+          const int64_t elements =
+              lhs_type.getNumElements() + rhs_type.getNumElements();
+          auto result_type = mlir::VectorType::get(
+              {elements}, lhs_type.getElementType());
+          llvm::SmallVector<int64_t> mask;
+          mask.reserve(elements);
+          for (int64_t element = 0; element < elements; ++element) {
+            mask.push_back(element);
+          }
+          combined.push_back(mlir::vector::ShuffleOp::create(
+              builder, result_type, packed[index], packed[index + 1], mask));
+        }
+        packed = std::move(combined);
+      }
+      return packed.front();
+    };
+    auto unpack_accumulators = [&](Value packed) {
+      llvm::SmallVector<Value> accumulators;
+      accumulators.reserve(accumulators_per_wave);
+      auto packed_type = mlir::cast<mlir::VectorType>(packed.getType());
+      auto fragment_type = mlir::VectorType::get(
+          {accumulator_elements}, packed_type.getElementType());
+      for (int64_t index = 0; index < accumulators_per_wave; ++index) {
+        llvm::SmallVector<int64_t> mask;
+        mask.reserve(accumulator_elements);
+        for (int64_t element = 0; element < accumulator_elements; ++element) {
+          mask.push_back(index * accumulator_elements + element);
+        }
+        accumulators.push_back(mlir::vector::ShuffleOp::create(
+            builder, fragment_type, packed, packed, mask));
+      }
+      return accumulators;
+    };
+    llvm::SmallVector<Value> initial_loop_values;
+    if (pack_loop_accumulators) {
+      initial_loop_values.push_back(pack_accumulators(initial_accumulators));
+    } else {
+      initial_loop_values.append(initial_accumulators);
+    }
     if (prefetch_rhs) {
       llvm::SmallVector<Value> initial_rhs = emit_rhs_stage(lower_bound);
       initial_loop_values.append(initial_rhs);
@@ -5230,7 +5739,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                   IndexConstant(builder, tile_row * tile_row_stride)));
           lhs_dequant_scales.push_back(load_block_scale(
               lhs_scale_parameter_number_, lhs_scale_element_type_,
-              lhs_scale_dimensions_, /*contracting_dimension=*/1, output_row,
+              lhs_scale_dimensions_, lhs_contracting_dimension_, output_row,
               m_, k_base));
         }
         rhs_dequant_scales.reserve(wave_tile_columns);
@@ -5921,7 +6430,59 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         // with the corresponding MFMA group.
         const int64_t k_groups =
             compute_stage_k / (paired_mfma ? 2 * atom_k : atom_k);
-        if (preload_lds_fragments_) {
+        if (register_rhs_paired_mfma) {
+          // Literal gfx942 schedule from FlyDSL's preshuffle_gemm.py.  Its
+          // scheduler intentionally names a few more DS/MFMA instructions
+          // than one source-level K64 group contains; the backend consumes
+          // the groups bottom-up across the surrounding ping-pong region.
+          const int64_t mfma_group = wave_tile_columns;
+          const int64_t mfma_total =
+              k_groups * 2 * wave_tile_rows * mfma_group;
+          const int64_t mfma_per_iteration = 2 * mfma_group;
+          const int64_t schedule_iterations =
+              mfma_per_iteration == 0 ? 0
+                                      : mfma_total / mfma_per_iteration;
+
+          ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::ds_read, 2);
+          ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma, 1);
+          ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma, 1);
+          if (mfma_group < 4) {
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::ds_read, 1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
+                          1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::ds_read, 1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
+                          1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
+                          1);
+          }
+
+          constexpr int64_t kRepositoryLoadBytes = 16;
+          const int64_t block_threads = num_warps_ * 64;
+          int64_t ds_write_tail =
+              block_m_ * stage_k_ /
+              (block_threads * kRepositoryLoadBytes);
+          ds_write_tail =
+              std::min(ds_write_tail, schedule_iterations);
+          const int64_t ds_write_start =
+              std::max(schedule_iterations - ds_write_tail - 2, int64_t{0});
+          for (int64_t iteration = 0; iteration < schedule_iterations;
+               ++iteration) {
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::vmem_read,
+                          1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
+                          mfma_group);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::ds_read, 1);
+            ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
+                          mfma_group);
+            if (iteration >= ds_write_start - 1) {
+              ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::ds_write,
+                            1);
+            }
+          }
+          mlir::ROCDL::SchedBarrier::create(
+              builder, mlir::ROCDL::SchedGroupMask::none);
+        } else if (preload_lds_fragments_) {
           if (triton_xf32_paired_lds && schedule_instructions_) {
             // The XF32 path emits Triton's four LDS/VMEM/MFMA regions and
             // their compiler barriers explicitly. Applying the generic
@@ -5958,12 +6519,30 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           // fragments are read before next-tile DMA, then each A/B direct copy
           // is paired with two independent MFMAs.
           const int64_t block_threads = num_warps_ * 64;
-          const int64_t copy_elements =
-              single_buffer_lds_ ? load_vector_width : 2;
+          // The dedicated FlyDSL small-M kernel models one 16-byte VMEM load
+          // for each register-staged vector. Our generic schedule historically
+          // counted those as four separate dword copies, even when both A and
+          // B take the vector-load path. Besides misrepresenting the region to
+          // LLVM, that prevents the intended VMEM/MFMA interleave.
+          const bool repository_small_m_vector_staging =
+              m_ >= 2 && m_ <= 8 && block_m_ == 16 && block_n_ == 64 &&
+              stage_k_ == 128 && num_warps_ == 4 &&
+              lhs_input_scale_parameter_number_ >= 0 &&
+              !rhs_k_contiguous_;
+          const int64_t lhs_copy_elements =
+              (single_buffer_lds_ || repository_small_m_vector_staging)
+                  ? load_vector_width
+                  : 2;
+          const int64_t rhs_copy_elements =
+              (single_buffer_lds_ || repository_small_m_vector_staging)
+                  ? load_vector_width
+                  : 2;
           const int64_t lhs_copies_per_thread =
-              block_m_ * stage_k_ / copy_elements / block_threads;
+              (block_m_ * stage_k_ / lhs_copy_elements + block_threads - 1) /
+              block_threads;
           const int64_t rhs_copies_per_thread =
-              block_n_ * stage_k_ / copy_elements / block_threads;
+              (block_n_ * stage_k_ / rhs_copy_elements + block_threads - 1) /
+              block_threads;
           const int64_t fragment_reads =
               k_groups *
               (wave_tile_rows + (load_rhs_on_demand ? wave_tile_columns : 0));
@@ -5992,12 +6571,22 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           mlir::ROCDL::SchedBarrier::create(builder,
                                             mlir::ROCDL::SchedGroupMask::none);
         } else if (stage_rhs_) {
-          constexpr int64_t kCopyElements = 2;
           const int64_t block_threads = num_warps_ * 64;
+          const bool repository_small_m_vector_staging =
+              m_ >= 2 && m_ <= 8 && block_m_ == 16 && block_n_ == 64 &&
+              stage_k_ == 128 && num_warps_ == 4 &&
+              lhs_input_scale_parameter_number_ >= 0 &&
+              !rhs_k_contiguous_;
+          const int64_t lhs_copy_elements =
+              repository_small_m_vector_staging ? load_vector_width : 2;
+          const int64_t rhs_copy_elements =
+              repository_small_m_vector_staging ? load_vector_width : 2;
           const int64_t rhs_copies_per_thread =
-              block_n_ * stage_k_ / kCopyElements / block_threads;
+              (block_n_ * stage_k_ / rhs_copy_elements + block_threads - 1) /
+              block_threads;
           const int64_t lhs_copies_per_thread =
-              block_m_ * stage_k_ / kCopyElements / block_threads;
+              (block_m_ * stage_k_ / lhs_copy_elements + block_threads - 1) /
+              block_threads;
           for (int64_t copy = 0; copy < rhs_copies_per_thread; ++copy) {
             ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::vmem_read, 1);
           }
@@ -6013,7 +6602,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             }
             for (int64_t row = 0; row < wave_tile_rows; ++row) {
               ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
-                            wave_tile_columns);
+                            2 * wave_tile_columns);
             }
           }
           mlir::ROCDL::SchedBarrier::create(builder,
@@ -6037,7 +6626,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             }
             for (int64_t row = 0; row < wave_tile_rows; ++row) {
               ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
-                            wave_tile_columns);
+                            2 * wave_tile_columns);
             }
           }
           mlir::ROCDL::SchedBarrier::create(builder,
@@ -6049,7 +6638,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::vmem_read,
                           wave_tile_columns);
             ScheduleGroup(builder, mlir::ROCDL::SchedGroupMask::mfma_wmma,
-                          wave_tile_rows * wave_tile_columns);
+                          wave_tile_rows * wave_tile_columns *
+                              (paired_mfma ? 2 : 1));
           }
         }
       }
@@ -6698,7 +7288,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         if (preload_lds_fragments_ && !row_major_rhs_single_buffer &&
             !row_major_rhs_square_double_buffer) {
           if (local_split_k_) {
-            const int64_t lhs_begin = accumulators_per_wave + wave_tile_columns;
+            const int64_t lhs_begin =
+                accumulator_loop_value_count + wave_tile_columns;
             for (int64_t index = 0; index < wave_tile_rows; ++index) {
               current_lhs.push_back(loop.getRegionIterArg(lhs_begin + index));
             }
@@ -6708,7 +7299,17 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         }
         llvm::SmallVector<Value> next_lhs_registers;
         llvm::SmallVector<Value> next_rhs_registers;
-        if (single_buffer_lds_ || row_major_rhs_square_double_buffer) {
+        if (small_m_repository_register_refill) {
+          const int64_t rhs_copies =
+              block_n_ * stage_k_ / load_vector_width / (num_warps_ * 64);
+          next_rhs_registers.reserve(rhs_copies);
+          for (int64_t copy = 0; copy < rhs_copies; ++copy) {
+            next_rhs_registers.push_back(
+                emit_small_m_repository_rhs_register_vector(prefetch_k,
+                                                            copy));
+          }
+          next_lhs_registers = emit_lhs_register_vectors(prefetch_k);
+        } else if (single_buffer_lds_ || row_major_rhs_square_double_buffer) {
           if (row_major_rhs_square_double_buffer) {
             // The MFMA32 compute path issues these payloads between its two
             // LDS read batches, matching Triton's stage-2 modulo pipeline.
@@ -6767,7 +7368,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           staged_shared =
               emit_rhs_lds_stage(staged_shared, prefetch_k, next_stage);
         }
-        if (!single_buffer_lds_ && !row_major_rhs_square_double_buffer) {
+        if (!single_buffer_lds_ && !row_major_rhs_square_double_buffer &&
+            !small_m_repository_register_refill) {
           staged_shared = emit_lhs_stage(staged_shared, prefetch_k, next_stage);
         }
         llvm::SmallVector<Value> next_rhs;
@@ -6775,23 +7377,29 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           next_rhs = emit_rhs_stage(prefetch_k);
         }
         llvm::SmallVector<Value> current_accumulators;
-        current_accumulators.reserve(accumulators_per_wave);
-        for (int64_t index = 0; index < accumulators_per_wave; ++index) {
-          current_accumulators.push_back(loop.getRegionIterArg(index));
+        if (pack_loop_accumulators) {
+          current_accumulators =
+              unpack_accumulators(loop.getRegionIterArg(0));
+        } else {
+          current_accumulators.reserve(accumulators_per_wave);
+          for (int64_t index = 0; index < accumulators_per_wave; ++index) {
+            current_accumulators.push_back(loop.getRegionIterArg(index));
+          }
         }
         llvm::SmallVector<Value> current_rhs;
         const int64_t fragment_state_end = preloaded_fragment_end;
         if (local_split_k_) {
           for (int64_t index = 0; index < wave_tile_columns; ++index) {
             current_rhs.push_back(
-                loop.getRegionIterArg(accumulators_per_wave + index));
+                loop.getRegionIterArg(accumulator_loop_value_count + index));
           }
         } else if (load_rhs_on_demand && !row_major_rhs_single_buffer &&
                    !row_major_rhs_square_double_buffer) {
           current_rhs = emit_rhs_lds_fragments(staged_shared, current_stage);
         } else {
-          current_rhs.reserve(fragment_state_end - accumulators_per_wave);
-          for (int64_t index = accumulators_per_wave;
+          current_rhs.reserve(fragment_state_end -
+                              accumulator_loop_value_count);
+          for (int64_t index = accumulator_loop_value_count;
                index < fragment_state_end; ++index) {
             current_rhs.push_back(loop.getRegionIterArg(index));
           }
@@ -6845,6 +7453,33 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         const int64_t small_grid_mfmas =
             compute_stage_k / atom_k * wave_tile_rows * wave_tile_columns;
         auto before_mfma = [&](int64_t mfma_index) {
+          if (small_m_repository_register_refill) {
+            // The dedicated FlyDSL small-M pipeline consumes one next-tile
+            // VMEM payload every two independent MFMAs.  End each RHS
+            // vector's live range as soon as its load can retire instead of
+            // carrying all four vectors through the complete K128 compute.
+            const int64_t rhs_copies = next_rhs_registers.size();
+            for (int64_t copy = 0; copy < rhs_copies; ++copy) {
+              // End each RHS vector's live range uniformly across the
+              // independent MFMAs.  The scaled LHS contributes two later
+              // VMEM requests (data and learned scale), so waiting at
+              // rhs_copies + 1 - copy retires exactly this RHS request.
+              const int64_t store_position =
+                  ((copy + 1) * small_grid_mfmas) / rhs_copies - 1;
+              if (mfma_index != store_position) {
+                continue;
+              }
+              mlir::ROCDL::SchedBarrier::create(
+                  builder, mlir::ROCDL::SchedGroupMask::none);
+              emit_wait_vmcnt(rhs_copies + 1 - copy);
+              staged_shared = emit_small_m_repository_rhs_register_store(
+                  staged_shared, next_rhs_registers[copy], copy, next_stage);
+              mlir::ROCDL::SchedBarrier::create(
+                  builder, mlir::ROCDL::SchedGroupMask::none);
+              return;
+            }
+            return;
+          }
           if (!tensile_wide_tile && !small_grid_single_buffer) {
             return;
           }
@@ -6912,18 +7547,38 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             return;
           }
           if (row_major_rhs_single_buffer) {
+            if (block_m_ == 32 && mfma_index >= 0 && mfma_index <= 7) {
+              // The two-wave tile has eight B payloads per thread, versus two
+              // for the repository's eight-wave tile.  Issuing all eight at
+              // MFMA 9 leaves no VMEM latency to hide before the refill wait.
+              // Distribute one payload under each first-half MFMA so the
+              // oldest loads get a full eight MFMAs of latency hiding.
+              CHECK_EQ(next_rhs_registers.size(), 8);
+              const int64_t copy = mfma_index;
+              mlir::ROCDL::SchedBarrier::create(
+                  builder, mlir::ROCDL::SchedGroupMask::none);
+              next_rhs_registers[copy] =
+                  emit_rhs_register_vector(prefetch_k, copy);
+              mlir::ROCDL::SchedBarrier::create(
+                  builder, mlir::ROCDL::SchedGroupMask::none);
+              return;
+            }
             if (mfma_index == 9) {
-              // Triton's winning modulo schedule issues the two adjacent-K B
-              // payloads after MFMA 8, then opens LDS and retires all four A
-              // payloads before MFMA 9.
-              mlir::ROCDL::SchedBarrier::create(
-                  builder, mlir::ROCDL::SchedGroupMask::none);
-              for (int64_t copy = 0; copy < next_rhs_registers.size(); ++copy) {
-                next_rhs_registers[copy] =
-                    emit_rhs_register_vector(prefetch_k, copy);
+              // The eight-wave tile has only two adjacent-K B payloads and
+              // retains the repository cadence.  The two-wave tile issued its
+              // eight payloads above; both variants now open LDS and retire
+              // all four A payloads before MFMA 9.
+              if (block_m_ == 128) {
+                mlir::ROCDL::SchedBarrier::create(
+                    builder, mlir::ROCDL::SchedGroupMask::none);
+                for (int64_t copy = 0; copy < next_rhs_registers.size();
+                     ++copy) {
+                  next_rhs_registers[copy] =
+                      emit_rhs_register_vector(prefetch_k, copy);
+                }
+                mlir::ROCDL::SchedBarrier::create(
+                    builder, mlir::ROCDL::SchedGroupMask::none);
               }
-              mlir::ROCDL::SchedBarrier::create(
-                  builder, mlir::ROCDL::SchedGroupMask::none);
               staged_shared =
                   SyncThreadsOp::create(
                       builder, mlir::TypeRange{lhs_shared_type}, staged_shared)
@@ -7281,7 +7936,16 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         }
         emit_hot_loop_schedule();
         Value synchronized_lhs = staged_shared;
-        if (row_major_rhs_square_double_buffer) {
+        if (small_m_repository_register_refill) {
+          emit_wait_vmcnt(0);
+          synchronized_lhs = emit_lhs_register_stores_at_stage(
+              synchronized_lhs, next_lhs_registers, 0,
+              next_lhs_registers.size(), next_stage);
+          synchronized_lhs =
+              SyncThreadsOp::create(builder, mlir::TypeRange{lhs_shared_type},
+                                    synchronized_lhs)
+                  .getResult(0);
+        } else if (row_major_rhs_square_double_buffer) {
           // The opening barrier retires every current-tile LDS read before the
           // one physical stage is overwritten. LLVM inserts progressive VMEM
           // waits for the dependent vector stores; the closing barrier
@@ -7351,6 +8015,11 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                                                   next_stage);
           mlir::ROCDL::SchedBarrier::create(builder,
                                             mlir::ROCDL::SchedGroupMask::none);
+        }
+        if (pack_loop_accumulators) {
+          Value packed = pack_accumulators(next_accumulators);
+          next_accumulators.clear();
+          next_accumulators.push_back(packed);
         }
         next_accumulators.append(next_rhs);
         if (local_split_k_) {
@@ -7602,8 +8271,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         }
       }
     } else {
-      for (int64_t index = 0; index < accumulators_per_wave; ++index) {
-        final_accumulators.push_back(loop.getResult(index));
+      if (pack_loop_accumulators) {
+        final_accumulators = unpack_accumulators(loop.getResult(0));
+      } else {
+        for (int64_t index = 0; index < accumulators_per_wave; ++index) {
+          final_accumulators.push_back(loop.getResult(index));
+        }
       }
     }
     // Source-swapped MFMAs keep their accumulators in AGPRs through the
@@ -8559,6 +9232,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   FlyGemmConfig::MfmaAtom mfma_atom_ = FlyGemmConfig::FLY_MFMA_16X16X16;
   bool use_mfma_32_ = false;
   bool is_fp8_ = false;
+  bool is_int8_ = false;
   bool prefetch_rhs_ = false;
   bool stage_output_ = false;
   bool schedule_instructions_ = false;
@@ -8588,6 +9262,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> rhs_parameter_numbers_ = {1};
   int64_t lhs_scale_parameter_number_ = 2;
   int64_t rhs_scale_parameter_number_ = 3;
+  int64_t lhs_input_scale_parameter_number_ = -1;
+  PrimitiveType lhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
+  int64_t lhs_input_scale_broadcast_dimension_ = -1;
   PrimitiveType lhs_scale_element_type_ = BF16;
   PrimitiveType rhs_scale_element_type_ = BF16;
   std::vector<int64_t> lhs_scale_dimensions_;
@@ -8610,8 +9287,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> rhs_dynamic_offset_limits_;
   std::vector<int64_t> output_physical_strides_;
   std::optional<int64_t> output_transpose_batch_inner_;
-  int64_t lhs_concat_fragment_size_ = 0;
-  int64_t rhs_concat_fragment_size_ = 0;
+  std::vector<int64_t> lhs_concat_fragment_sizes_;
+  std::vector<int64_t> rhs_concat_fragment_sizes_;
+  std::vector<int64_t> lhs_concat_physical_offsets_;
+  std::vector<int64_t> rhs_concat_physical_offsets_;
+  std::vector<std::vector<int64_t>> lhs_concat_physical_strides_;
+  std::vector<std::vector<int64_t>> rhs_concat_physical_strides_;
   std::vector<EpilogueStep> epilogue_steps_;
   int64_t split_k_batches_ = 1;
   int64_t batch_count_ = 1;
@@ -8645,6 +9326,8 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
     if (analysis.fusion_backend_config().has_fly_gemm_config()) {
       const FlyGemmConfig& fly_config =
           analysis.fusion_backend_config().fly_gemm_config();
+      block_k_ = fly_config.block_k();
+      mfma_atom_ = fly_config.mfma_atom();
       outputs_per_wave_ =
           std::clamp<int64_t>(fly_config.gemv_outputs_per_wave(), 1, 8);
       k_vector_width_ =
@@ -8678,6 +9361,10 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
         lhs_input.dynamic_offset_parameter_numbers;
     lhs_dynamic_offset_constants_ = lhs_input.dynamic_offset_constants;
     lhs_dynamic_offset_limits_ = lhs_input.dynamic_offset_limits;
+    lhs_input_scale_parameter_number_ = lhs_input.scale_parameter_number;
+    lhs_input_scale_parameter_type_ = lhs_input.scale_parameter_type;
+    lhs_input_scale_broadcast_dimension_ =
+        lhs_input.scale_broadcast_dimension;
     const ContractionInput rhs_input = FindContractionInput(*dot->operand(1));
     CHECK_EQ(rhs_input.parameter_numbers.size(), 1);
     rhs_parameter_number_ = rhs_input.parameter_numbers.front();
@@ -8689,29 +9376,56 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
         rhs_input.dynamic_offset_parameter_numbers;
     rhs_dynamic_offset_constants_ = rhs_input.dynamic_offset_constants;
     rhs_dynamic_offset_limits_ = rhs_input.dynamic_offset_limits;
+    rhs_input_scale_parameter_number_ = rhs_input.scale_parameter_number;
+    rhs_input_scale_parameter_type_ = rhs_input.scale_parameter_type;
+    rhs_input_scale_broadcast_dimension_ =
+        rhs_input.scale_broadcast_dimension;
     const DotDimensionNumbers& dot_dims = dot->dot_dimension_numbers();
     rank_three_ = dot->shape().dimensions_size() == 3;
+    CHECK_EQ(dot_dims.lhs_contracting_dimensions_size(), 1);
+    CHECK_EQ(dot_dims.rhs_contracting_dimensions_size(), 1);
+    CHECK_EQ(dot_dims.lhs_batch_dimensions_size(), rank_three_ ? 1 : 0);
+    CHECK_EQ(dot_dims.rhs_batch_dimensions_size(), rank_three_ ? 1 : 0);
+    lhs_contracting_dimension_ = dot_dims.lhs_contracting_dimensions(0);
+    rhs_contracting_dimension_ = dot_dims.rhs_contracting_dimensions(0);
+    lhs_batch_dimension_ =
+        rank_three_ ? dot_dims.lhs_batch_dimensions(0) : -1;
+    rhs_batch_dimension_ =
+        rank_three_ ? dot_dims.rhs_batch_dimensions(0) : -1;
+    auto find_noncontracting_dimension = [](int64_t rank,
+                                            int64_t contracting_dimension,
+                                            int64_t batch_dimension) {
+      for (int64_t dimension = 0; dimension < rank; ++dimension) {
+        if (dimension != contracting_dimension &&
+            dimension != batch_dimension) {
+          return dimension;
+        }
+      }
+      return int64_t{-1};
+    };
+    lhs_noncontracting_dimension_ = find_noncontracting_dimension(
+        dot->operand(0)->shape().dimensions_size(),
+        lhs_contracting_dimension_, lhs_batch_dimension_);
+    rhs_noncontracting_dimension_ = find_noncontracting_dimension(
+        dot->operand(1)->shape().dimensions_size(),
+        rhs_contracting_dimension_, rhs_batch_dimension_);
+    CHECK_GE(lhs_noncontracting_dimension_, 0);
+    CHECK_GE(rhs_noncontracting_dimension_, 0);
     global_split_k_ = rank_three_ &&
-                      dot_dims.lhs_batch_dimensions_size() == 1 &&
-                      dot_dims.lhs_batch_dimensions(0) == 1;
-    batched_gemv_ = rank_three_ && dot_dims.lhs_batch_dimensions_size() == 1 &&
-                    dot_dims.lhs_batch_dimensions(0) == 0;
-    CHECK(!rank_three_ || global_split_k_ || batched_gemv_);
+                      lhs_batch_dimension_ == 1;
+    batched_gemv_ = rank_three_ && !global_split_k_;
     batch_count_ = rank_three_ ? dot->shape().dimensions(0) : 1;
     m_ = dot->shape().dimensions(rank_three_ ? 1 : 0);
     n_ = dot->shape().dimensions(rank_three_ ? 2 : 1);
     k_ = dot->operand(0)->shape().dimensions(
         dot_dims.lhs_contracting_dimensions(0));
-    rhs_contracting_dimension_ = dot_dims.rhs_contracting_dimensions(0);
-    const int64_t rhs_column_dimension =
-        global_split_k_
-            ? 0
-            : (batched_gemv_ ? (rhs_contracting_dimension_ == 1 ? 2 : 1)
-                             : 1 - rhs_contracting_dimension_);
-    rhs_column_contiguous_ = rhs_physical_strides_[rhs_column_dimension] == 1;
+    rhs_column_contiguous_ =
+        rhs_physical_strides_[rhs_noncontracting_dimension_] == 1;
     rhs_k_contiguous_gemv_ =
         rhs_physical_strides_[rhs_contracting_dimension_] == 1;
-    blocks_per_batch_ = m_ == 1 ? (n_ + block_n_ - 1) / block_n_
+    const bool small_m_gemv = m_ >= 2 && m_ <= 8 && block_m_ == m_;
+    blocks_per_batch_ =
+        m_ == 1 || small_m_gemv ? (n_ + block_n_ - 1) / block_n_
                                 : (m_ + block_m_ - 1) / block_m_;
     launch_dimensions_ =
         LaunchDimensions(se::BlockDim(batch_count_ * blocks_per_batch_, 1, 1),
@@ -8763,7 +9477,9 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
   absl::Status EmitKernel(mlir::func::FuncOp entry_function) const {
     TF_RET_CHECK(entry_function.getNumArguments() ==
                  fusion_parameter_count_ + 1);
-    TF_RET_CHECK(m_ == 1 || n_ == 1);
+    TF_RET_CHECK(m_ == 1 || n_ == 1 ||
+                 (m_ >= 2 && m_ <= 8 && block_m_ == m_ &&
+                  rhs_column_contiguous_));
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
@@ -8894,30 +9610,30 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
     };
     auto lhs_indices = [&](Value row, Value k) {
       llvm::SmallVector<Value, 3> indices;
-      if (global_split_k_) {
-        indices.assign({row, batch_id, k});
-      } else if (batched_gemv_) {
-        indices.assign({batch_id, row, k});
+      if (rank_three_) {
+        indices.resize(3);
+        indices[lhs_batch_dimension_] = batch_id;
+        indices[lhs_contracting_dimension_] = k;
+        indices[lhs_noncontracting_dimension_] = row;
       } else {
-        indices.assign({row, k});
+        indices.resize(2);
+        indices[lhs_contracting_dimension_] = k;
+        indices[lhs_noncontracting_dimension_] = row;
       }
       add_dynamic_offsets(indices, lhs_dynamic_offsets);
       return indices;
     };
     auto rhs_indices = [&](Value k, Value column) {
       llvm::SmallVector<Value, 3> indices;
-      if (global_split_k_) {
-        indices.assign({column, batch_id, k});
-      } else if (batched_gemv_) {
-        if (rhs_contracting_dimension_ == 1) {
-          indices.assign({batch_id, k, column});
-        } else {
-          indices.assign({batch_id, column, k});
-        }
-      } else if (rhs_contracting_dimension_ == 0) {
-        indices.assign({k, column});
+      if (rank_three_) {
+        indices.resize(3);
+        indices[rhs_batch_dimension_] = batch_id;
+        indices[rhs_contracting_dimension_] = k;
+        indices[rhs_noncontracting_dimension_] = column;
       } else {
-        indices.assign({column, k});
+        indices.resize(2);
+        indices[rhs_contracting_dimension_] = k;
+        indices[rhs_noncontracting_dimension_] = column;
       }
       add_dynamic_offsets(indices, rhs_dynamic_offsets);
       return indices;
@@ -8931,7 +9647,7 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       }
       return indices;
     };
-    const bool has_column_output_tail = m_ == 1 && n_ % block_n_ != 0;
+    const bool has_column_output_tail = n_ > 1 && n_ % block_n_ != 0;
     const bool has_row_output_tail = n_ == 1 && m_ % block_m_ != 0;
     auto safe_output_column = [&](Value column) -> Value {
       if (!has_column_output_tail) {
@@ -9036,11 +9752,35 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       }
       return value;
     };
-    auto extract_input = [&](Value source, PrimitiveType source_type,
-                             bool requires_linear_addressing,
-                             int64_t physical_offset,
-                             llvm::ArrayRef<int64_t> strides,
-                             mlir::ValueRange indices) {
+    auto load_input_scale = [&](Value source,
+                                mlir::ValueRange indices) -> Value {
+      const bool is_lhs = source == lhs;
+      const int64_t parameter_number =
+          is_lhs ? lhs_input_scale_parameter_number_
+                 : rhs_input_scale_parameter_number_;
+      if (parameter_number < 0) {
+        return {};
+      }
+      const PrimitiveType parameter_type =
+          is_lhs ? lhs_input_scale_parameter_type_
+                 : rhs_input_scale_parameter_type_;
+      const int64_t broadcast_dimension =
+          is_lhs ? lhs_input_scale_broadcast_dimension_
+                 : rhs_input_scale_broadcast_dimension_;
+      CHECK(IsHalfPrecisionFloat(parameter_type));
+      CHECK_GE(broadcast_dimension, 0);
+      CHECK_LT(broadcast_dimension, indices.size());
+      Value scale = mlir::tensor::ExtractOp::create(
+          builder, entry_function.getArgument(parameter_number),
+          mlir::ValueRange{indices[broadcast_dimension]});
+      return mlir::arith::ExtFOp::create(builder, builder.getF32Type(), scale)
+          .getResult();
+    };
+    auto extract_input_with_scale =
+        [&](Value source, PrimitiveType source_type,
+            bool requires_linear_addressing, int64_t physical_offset,
+            llvm::ArrayRef<int64_t> strides, mlir::ValueRange indices,
+            Value preloaded_scale) {
       Value element;
       if (requires_linear_addressing) {
         mlir::Type element_type = source_type == F32
@@ -9068,14 +9808,43 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       } else {
         CHECK(IsHalfPrecisionFloat(source_type) || IsFnuzFp8(source_type));
       }
+      element = mlir::arith::ExtFOp::create(builder, builder.getF32Type(),
+                                            element)
+                    .getResult();
+      const bool is_lhs = source == lhs;
+      Value scale = preloaded_scale ? preloaded_scale
+                                    : load_input_scale(source, indices);
+      if (!scale) {
+        return element;
+      }
+      const PrimitiveType input_scale_parameter_type =
+          is_lhs ? lhs_input_scale_parameter_type_
+                 : rhs_input_scale_parameter_type_;
+      CHECK(IsHalfPrecisionFloat(input_scale_parameter_type));
+      element = mlir::arith::MulFOp::create(builder, element, scale);
+      mlir::Type rounded_type = input_scale_parameter_type == F16
+                                    ? builder.getF16Type()
+                                    : builder.getBF16Type();
+      element = mlir::arith::TruncFOp::create(builder, rounded_type, element);
       return mlir::arith::ExtFOp::create(builder, builder.getF32Type(), element)
           .getResult();
+    };
+    auto extract_input = [&](Value source, PrimitiveType source_type,
+                             bool requires_linear_addressing,
+                             int64_t physical_offset,
+                             llvm::ArrayRef<int64_t> strides,
+                             mlir::ValueRange indices) {
+      return extract_input_with_scale(
+          source, source_type, requires_linear_addressing, physical_offset,
+          strides, indices, /*preloaded_scale=*/{});
     };
     auto extract_input_vector = [&](Value source, PrimitiveType source_type,
                                     int64_t physical_offset,
                                     llvm::ArrayRef<int64_t> strides,
                                     mlir::ValueRange indices,
                                     int64_t element_count) -> Value {
+      CHECK((source == lhs ? lhs_input_scale_parameter_number_
+                           : rhs_input_scale_parameter_number_) < 0);
       mlir::Type source_element_type = source_type == F32
                                            ? builder.getF32Type()
                                            : ContractionElementType(builder,
@@ -9184,6 +9953,73 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       for (int64_t output_offset = 0; output_offset < output_count;
            ++output_offset) {
         sums.push_back(reduction.getResult(output_offset));
+      }
+      return sums;
+    };
+
+    auto emit_small_m_matrix_products = [&](Value column,
+                                            int64_t output_count,
+                                            Value k_start, int64_t k_step) {
+      llvm::SmallVector<Value> initial_values(m_ * output_count, zero);
+      mlir::scf::ForOp reduction = mlir::scf::ForOp::create(
+          builder, k_start, IndexConstant(builder, k_),
+          IndexConstant(builder, k_step), initial_values,
+          [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(reduction.getBody());
+        Value k_index = reduction.getInductionVar();
+        llvm::SmallVector<Value, 3> first_lhs_indices =
+            lhs_indices(IndexConstant(builder, 0), k_index);
+        Value lhs_scale = load_input_scale(lhs, first_lhs_indices);
+        llvm::SmallVector<Value> lhs_values;
+        lhs_values.reserve(m_);
+        for (int64_t row = 0; row < m_; ++row) {
+          lhs_values.push_back(extract_input_with_scale(
+              lhs, lhs_input_type_, lhs_requires_linear_addressing_,
+              lhs_physical_offset_, lhs_physical_strides_,
+              lhs_indices(IndexConstant(builder, row), k_index), lhs_scale));
+        }
+        Value rhs_values;
+        if (output_count > 1) {
+          rhs_values = extract_input_vector(
+              rhs, rhs_input_type_, rhs_physical_offset_,
+              rhs_physical_strides_, rhs_indices(k_index, column),
+              output_count);
+        }
+        llvm::SmallVector<Value> sums;
+        sums.reserve(m_ * output_count);
+        for (int64_t row = 0; row < m_; ++row) {
+          for (int64_t output_offset = 0; output_offset < output_count;
+               ++output_offset) {
+            Value output_column =
+                Add(builder, column, IndexConstant(builder, output_offset));
+            Value b =
+                output_count > 1
+                    ? mlir::vector::ExtractOp::create(
+                          builder, rhs_values,
+                          llvm::SmallVector<int64_t>{output_offset})
+                          .getResult()
+                    : extract_input(
+                          rhs, rhs_input_type_,
+                          rhs_requires_linear_addressing_,
+                          rhs_physical_offset_, rhs_physical_strides_,
+                          rhs_indices(k_index,
+                                      safe_output_column(output_column)));
+            const int64_t result_index = row * output_count + output_offset;
+            Value product = mlir::arith::MulFOp::create(builder,
+                                                        lhs_values[row], b);
+            sums.push_back(mlir::arith::AddFOp::create(
+                builder, reduction.getRegionIterArg(result_index), product));
+          }
+        }
+        mlir::scf::YieldOp::create(builder, sums);
+      }
+      builder.setInsertionPointAfter(reduction);
+      llvm::SmallVector<Value> sums;
+      sums.reserve(m_ * output_count);
+      for (int64_t result = 0; result < m_ * output_count; ++result) {
+        sums.push_back(reduction.getResult(result));
       }
       return sums;
     };
@@ -9398,6 +10234,735 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       builder.setInsertionPointAfter(store);
       return store.getResult(0);
     };
+
+    if (mfma_atom_ == FlyGemmConfig::FLY_MFMA_4X4X4_BF16) {
+      if (rank_three_) {
+        // Batched decoder projection: match Triton's M4/N64/K128 topology.
+        // Two waves cooperatively transpose a complete B tile into LDS, but
+        // only the one live M4 output wave consumes it with MFMA4. Unlike the
+        // rank-two projection below, the last K tile may be partial (for
+        // example K=1376 leaves a K96 tail).
+        TF_RET_CHECK(
+            m_ == 4 && block_m_ == 4 && block_n_ == 64 && block_k_ == 128 &&
+            num_warps_ == 2 && n_ % block_n_ == 0 && k_ >= block_k_ &&
+            lhs_input_type_ == BF16 && rhs_input_type_ == BF16 &&
+            lhs_physical_strides_[lhs_contracting_dimension_] == 1 &&
+            rhs_column_contiguous_ && lhs_input_scale_parameter_number_ < 0 &&
+            rhs_input_scale_parameter_number_ < 0);
+
+        constexpr int64_t kM = 4;
+        constexpr int64_t kN = 64;
+        constexpr int64_t kK = 128;
+        constexpr int64_t kLhsElements = kM * kK;
+        constexpr int64_t kRhsElements = kN * kK;
+        auto shared_type = mlir::RankedTensorType::get(
+            {kLhsElements + kRhsElements}, builder.getBF16Type());
+        auto rhs_load_type = mlir::VectorType::get({8}, builder.getBF16Type());
+        auto input_fragment_type =
+            mlir::VectorType::get({4}, builder.getBF16Type());
+        auto input_bits_type = mlir::VectorType::get({4}, builder.getI16Type());
+        auto accumulator_type =
+            mlir::VectorType::get({4}, builder.getF32Type());
+        Value zero_rhs = mlir::arith::ConstantOp::create(
+            builder, rhs_load_type, builder.getZeroAttr(rhs_load_type));
+        Value zero_lhs = mlir::arith::ConstantOp::create(
+            builder, input_fragment_type,
+            builder.getZeroAttr(input_fragment_type));
+        Value initial_accumulator = mlir::arith::ConstantOp::create(
+            builder, accumulator_type, builder.getZeroAttr(accumulator_type));
+        Value initial_shared = AllocateSharedOp::create(builder, shared_type);
+
+        Value column_base =
+            Mul(builder, output_block_id, IndexConstant(builder, kN));
+        // 128 threads each read eight contiguous N-vectors from eight K rows:
+        // 128 * 8 * vector<8xbf16> exactly covers the K128xN64 B tile.
+        Value n_base =
+            Mul(builder, Rem(builder, thread_id, 8), IndexConstant(builder, 8));
+        Value k_base =
+            Mul(builder, Div(builder, thread_id, 8), IndexConstant(builder, 8));
+        Value global_column_base = Add(builder, column_base, n_base);
+        auto load_rhs_rows = [&](Value global_k) {
+          llvm::SmallVector<Value, 8> rhs_rows;
+          rhs_rows.reserve(8);
+          for (int64_t row = 0; row < 8; ++row) {
+            Value row_k =
+                Add(builder, global_k,
+                    Add(builder, k_base, IndexConstant(builder, row)));
+            Value in_bounds = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::ult, row_k,
+                IndexConstant(builder, k_));
+            Value safe_k = mlir::arith::SelectOp::create(
+                builder, in_bounds, row_k, IndexConstant(builder, 0));
+            mlir::OperationState load_state(entry_function.getLoc(),
+                                            "xla_gpu.buffer_load");
+            load_state.addOperands(
+                {rhs, physical_linear_index(
+                          rhs_indices(safe_k, global_column_base),
+                          rhs_physical_strides_, rhs_physical_offset_)});
+            load_state.addTypes(rhs_load_type);
+            Value loaded = builder.create(load_state)->getResult(0);
+            rhs_rows.push_back(mlir::arith::SelectOp::create(builder, in_bounds,
+                                                             loaded, zero_rhs));
+          }
+          return rhs_rows;
+        };
+        auto store_rhs_rows = [&](Value shared,
+                                  llvm::ArrayRef<Value> rhs_rows) {
+          for (int64_t column = 0; column < 8; ++column) {
+            Value shared_column =
+                Add(builder, n_base, IndexConstant(builder, column));
+            // The Triton swizzle is four BF16 elements wide. Split each
+            // eight-row transpose into two vector<4> stores so an XOR phase
+            // boundary cannot reorder the two halves.
+            for (int64_t group = 0; group < 2; ++group) {
+              llvm::SmallVector<Value, 4> elements;
+              elements.reserve(4);
+              for (int64_t element = 0; element < 4; ++element) {
+                elements.push_back(mlir::vector::ExtractOp::create(
+                    builder, rhs_rows[group * 4 + element],
+                    llvm::SmallVector<int64_t>{column}));
+              }
+              Value fragment = mlir::vector::FromElementsOp::create(
+                  builder, input_fragment_type, elements);
+              Value logical_k =
+                  Add(builder, k_base, IndexConstant(builder, group * 4));
+              Value physical_k = SwizzleTritonMfma32TransposedRhs(
+                  builder, shared_column, logical_k, /*stage_k=*/64);
+              Value shared_index = Add(
+                  builder, IndexConstant(builder, kLhsElements),
+                  Add(builder,
+                      Mul(builder, shared_column, IndexConstant(builder, kK)),
+                      physical_k));
+              shared =
+                  mlir::vector::TransferWriteOp::create(
+                      builder, fragment, shared, mlir::ValueRange{shared_index},
+                      llvm::ArrayRef<bool>{true})
+                      .getResult();
+            }
+          }
+          return shared;
+        };
+
+        // Each thread owns one contiguous four-BF16 fragment of the 4xK128 A
+        // tile. A K-tail is vector-aligned for the supported BF16 contraction;
+        // out-of-range fragments are explicitly zeroed before entering LDS.
+        Value lhs_row = Div(builder, thread_id, 32);
+        Value lhs_k = Mul(builder, Rem(builder, thread_id, 32),
+                          IndexConstant(builder, 4));
+        Value lhs_shared_index = Add(
+            builder, Mul(builder, lhs_row, IndexConstant(builder, kK)), lhs_k);
+        auto load_lhs_fragment = [&](Value global_k) {
+          Value first_k = Add(builder, global_k, lhs_k);
+          Value in_bounds = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ule,
+              Add(builder, first_k, IndexConstant(builder, 4)),
+              IndexConstant(builder, k_));
+          Value safe_k = mlir::arith::SelectOp::create(
+              builder, in_bounds, first_k, IndexConstant(builder, 0));
+          mlir::OperationState load_state(entry_function.getLoc(),
+                                          "xla_gpu.buffer_load");
+          load_state.addOperands(
+              {lhs, physical_linear_index(lhs_indices(lhs_row, safe_k),
+                                          lhs_physical_strides_,
+                                          lhs_physical_offset_)});
+          load_state.addTypes(input_fragment_type);
+          Value loaded = builder.create(load_state)->getResult(0);
+          return mlir::arith::SelectOp::create(builder, in_bounds, loaded,
+                                               zero_lhs)
+              .getResult();
+        };
+        auto store_lhs_fragment = [&](Value shared, Value lhs_fragment) {
+          return mlir::vector::TransferWriteOp::create(
+                     builder, lhs_fragment, shared,
+                     mlir::ValueRange{lhs_shared_index},
+                     llvm::ArrayRef<bool>{true})
+              .getResult();
+        };
+
+        Value fragment_row = Rem(builder, lane_id, kM);
+        Value fragment_k =
+            Mul(builder, Div(builder, lane_id, kM), IndexConstant(builder, 4));
+        Value wave_column = lane_id;
+        Value rhs_column_base =
+            Add(builder, IndexConstant(builder, kLhsElements),
+                Mul(builder, wave_column, IndexConstant(builder, kK)));
+        auto read_fragment = [&](Value shared, Value index) {
+          return mlir::vector::TransferReadOp::create(
+                     builder, input_fragment_type, shared,
+                     mlir::ValueRange{index},
+                     /*padding=*/std::nullopt, llvm::ArrayRef<bool>{true})
+              .getResult();
+        };
+        struct BatchedMfma4Fragments {
+          Value lhs_low;
+          Value lhs_high;
+          llvm::SmallVector<Value, 16> rhs_low;
+          llvm::SmallVector<Value, 16> rhs_high;
+        };
+        auto read_fragments = [&](Value shared) {
+          Value lhs_low = read_fragment(
+              shared,
+              Add(builder,
+                  Mul(builder, fragment_row, IndexConstant(builder, kK)),
+                  fragment_k));
+          Value lhs_high = read_fragment(
+              shared,
+              Add(builder,
+                  Add(builder,
+                      Mul(builder, fragment_row, IndexConstant(builder, kK)),
+                      fragment_k),
+                  IndexConstant(builder, 64)));
+          llvm::SmallVector<Value, 16> rhs_low;
+          llvm::SmallVector<Value, 16> rhs_high;
+          rhs_low.reserve(16);
+          rhs_high.reserve(16);
+          for (int64_t abid = 0; abid < 16; ++abid) {
+            Value physical_k = SwizzleTritonMfma32TransposedRhs(
+                builder, wave_column, IndexConstant(builder, abid * 4),
+                /*stage_k=*/64);
+            Value rhs_index = Add(builder, rhs_column_base, physical_k);
+            rhs_low.push_back(read_fragment(shared, rhs_index));
+            rhs_high.push_back(read_fragment(
+                shared, Add(builder, rhs_index, IndexConstant(builder, 64))));
+          }
+          return BatchedMfma4Fragments{lhs_low, lhs_high, std::move(rhs_low),
+                                       std::move(rhs_high)};
+        };
+        auto emit_mfmas = [&](Value accumulator,
+                              const BatchedMfma4Fragments& fragments) {
+          auto emit_mfma = [&](Value lhs_fragment, Value rhs_fragment,
+                               int64_t abid) {
+            Value lhs_bits = mlir::vector::BitCastOp::create(
+                builder, input_bits_type, lhs_fragment);
+            Value rhs_bits = mlir::vector::BitCastOp::create(
+                builder, input_bits_type, rhs_fragment);
+            accumulator =
+                mlir::ROCDL::mfma_f32_4x4x4bf16_1k::create(
+                    builder, accumulator_type, lhs_bits, rhs_bits, accumulator,
+                    /*cbsz=*/4, abid, mlir::ROCDL::MFMAPermB::none)
+                    .getRes();
+          };
+          for (int64_t abid = 0; abid < 16; ++abid) {
+            emit_mfma(fragments.lhs_low, fragments.rhs_low[abid], abid);
+          }
+          for (int64_t abid = 0; abid < 16; ++abid) {
+            emit_mfma(fragments.lhs_high, fragments.rhs_high[abid], abid);
+          }
+          return accumulator;
+        };
+
+        Value is_live_wave = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ult, wave_id,
+            IndexConstant(builder, 1));
+        auto compute_tile = [&](Value accumulator, Value shared) {
+          mlir::scf::IfOp compute = mlir::scf::IfOp::create(
+              builder, mlir::TypeRange{accumulator_type}, is_live_wave,
+              /*withElseRegion=*/true);
+          {
+            mlir::OpBuilder::InsertionGuard compute_guard(builder);
+            builder.setInsertionPointToStart(compute.thenBlock());
+            mlir::scf::YieldOp::create(
+                builder, emit_mfmas(accumulator, read_fragments(shared)));
+            builder.setInsertionPointToStart(compute.elseBlock());
+            mlir::scf::YieldOp::create(builder, accumulator);
+          }
+          builder.setInsertionPointAfter(compute);
+          return compute.getResult(0);
+        };
+
+        Value shared = store_rhs_rows(initial_shared,
+                                      load_rhs_rows(IndexConstant(builder, 0)));
+        shared = store_lhs_fragment(
+            shared, load_lhs_fragment(IndexConstant(builder, 0)));
+        shared =
+            SyncThreadsOp::create(builder, mlir::TypeRange{shared_type}, shared)
+                .getResult(0);
+
+        mlir::scf::ForOp reduction = mlir::scf::ForOp::create(
+            builder, IndexConstant(builder, 0), IndexConstant(builder, k_ - kK),
+            IndexConstant(builder, kK),
+            mlir::ValueRange{initial_accumulator, shared},
+            [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+        {
+          mlir::OpBuilder::InsertionGuard reduction_guard(builder);
+          builder.setInsertionPointToStart(reduction.getBody());
+          Value global_k = reduction.getInductionVar();
+          Value accumulator = reduction.getRegionIterArg(0);
+          Value loop_shared = reduction.getRegionIterArg(1);
+          Value next_k = Add(builder, global_k, IndexConstant(builder, kK));
+          llvm::SmallVector<Value, 8> next_rhs_rows = load_rhs_rows(next_k);
+          Value next_lhs_fragment = load_lhs_fragment(next_k);
+          accumulator = compute_tile(accumulator, loop_shared);
+          loop_shared = SyncThreadsOp::create(
+                            builder, mlir::TypeRange{shared_type}, loop_shared)
+                            .getResult(0);
+          loop_shared = store_rhs_rows(loop_shared, next_rhs_rows);
+          loop_shared = store_lhs_fragment(loop_shared, next_lhs_fragment);
+          loop_shared = SyncThreadsOp::create(
+                            builder, mlir::TypeRange{shared_type}, loop_shared)
+                            .getResult(0);
+          mlir::scf::YieldOp::create(
+              builder, mlir::ValueRange{accumulator, loop_shared});
+        }
+        builder.setInsertionPointAfter(reduction);
+        Value final_accumulator =
+            compute_tile(reduction.getResult(0), reduction.getResult(1));
+
+        mlir::scf::IfOp store = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{output.getType()}, is_live_wave,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard store_guard(builder);
+          builder.setInsertionPointToStart(store.thenBlock());
+          Value updated = output;
+          Value output_column = Add(builder, column_base, lane_id);
+          for (int64_t row = 0; row < kM; ++row) {
+            Value output_row = IndexConstant(builder, row);
+            Value value = mlir::vector::ExtractOp::create(
+                builder, final_accumulator, llvm::SmallVector<int64_t>{row});
+            updated = insert_output(
+                updated, convert_output(value, output_row, output_column),
+                output_row, output_column);
+          }
+          mlir::scf::YieldOp::create(builder, updated);
+          builder.setInsertionPointToStart(store.elseBlock());
+          mlir::scf::YieldOp::create(builder, output);
+        }
+        builder.setInsertionPointAfter(store);
+        mlir::func::ReturnOp::create(builder, store.getResult(0));
+        return absl::OkStatus();
+      }
+
+      // Match Triton's gfx942 narrow-M schedule instead of issuing strided
+      // scalar B loads. All eight waves cooperatively read a K128xN128 tile as
+      // contiguous vector<8xbf16> transactions and transpose it to [N,K] in
+      // LDS. A Wave64 then consumes one column per lane with the native
+      // 4x64x4 CBSZ/ABID form of v_mfma_f32_4x4x4bf16_1k.
+      TF_RET_CHECK(!rank_three_ && m_ == 4 && block_m_ == 4 &&
+                   block_n_ == 128 && block_k_ == 128 && num_warps_ == 8 &&
+                   n_ % block_n_ == 0 && k_ % block_k_ == 0 &&
+                   lhs_input_type_ == BF16 && rhs_input_type_ == BF16 &&
+                   rhs_column_contiguous_ &&
+                   rhs_input_scale_parameter_number_ < 0);
+
+      constexpr int64_t kM = 4;
+      constexpr int64_t kN = 128;
+      constexpr int64_t kK = 128;
+      constexpr int64_t kLhsElements = kM * kK;
+      constexpr int64_t kRhsElements = kN * kK;
+      auto shared_type = mlir::RankedTensorType::get(
+          {kLhsElements + kRhsElements}, builder.getBF16Type());
+      auto rhs_load_type =
+          mlir::VectorType::get({8}, builder.getBF16Type());
+      auto input_fragment_type =
+          mlir::VectorType::get({4}, builder.getBF16Type());
+      auto input_bits_type =
+          mlir::VectorType::get({4}, builder.getI16Type());
+      auto accumulator_type =
+          mlir::VectorType::get({4}, builder.getF32Type());
+      Value initial_accumulator = mlir::arith::ConstantOp::create(
+          builder, accumulator_type, builder.getZeroAttr(accumulator_type));
+      Value initial_shared = AllocateSharedOp::create(builder, shared_type);
+
+      Value column_base =
+          Mul(builder, output_block_id, IndexConstant(builder, block_n_));
+      // 512 threads cover 32 K elements each. Keeping N as the vector
+      // dimension gives four naturally aligned 16-byte global reads per
+      // thread, exactly covering the 32 KiB RHS tile.
+      Value n_base = Mul(builder, Rem(builder, thread_id, 16),
+                         IndexConstant(builder, 8));
+      Value k_base = Mul(builder, Div(builder, thread_id, 16),
+                         IndexConstant(builder, 4));
+      Value global_column_base = Add(builder, column_base, n_base);
+      auto load_rhs_rows = [&](Value global_k) {
+        llvm::SmallVector<Value, 4> rhs_rows;
+        rhs_rows.reserve(4);
+        for (int64_t row = 0; row < 4; ++row) {
+          Value row_k = Add(builder, global_k,
+                            Add(builder, k_base,
+                                IndexConstant(builder, row)));
+          mlir::OperationState load_state(entry_function.getLoc(),
+                                          "xla_gpu.buffer_load");
+          load_state.addOperands(
+              {rhs,
+               physical_linear_index(rhs_indices(row_k, global_column_base),
+                                     rhs_physical_strides_,
+                                     rhs_physical_offset_)});
+          load_state.addTypes(rhs_load_type);
+          rhs_rows.push_back(builder.create(load_state)->getResult(0));
+        }
+        return rhs_rows;
+      };
+      auto store_rhs_rows = [&](Value shared,
+                                llvm::ArrayRef<Value> rhs_rows) {
+        for (int64_t column = 0; column < 8; ++column) {
+          llvm::SmallVector<Value, 4> elements;
+          elements.reserve(4);
+          for (Value row : rhs_rows) {
+            elements.push_back(mlir::vector::ExtractOp::create(
+                builder, row, llvm::SmallVector<int64_t>{column}));
+          }
+          Value fragment = mlir::vector::FromElementsOp::create(
+              builder, input_fragment_type, elements);
+          Value shared_column =
+              Add(builder, n_base, IndexConstant(builder, column));
+          // Triton's K128 narrow-M kernel retains the K64 16-phase RHS
+          // swizzle.  The high K64 half is selected by bit 6, while the
+          // low six K bits are XORed with an N-dependent four-element
+          // phase.  This avoids every Wave64 lane addressing the same LDS
+          // bank when a column is consumed by the MFMA4 atom.
+          Value physical_k = SwizzleTritonMfma32TransposedRhs(
+              builder, shared_column, k_base, /*stage_k=*/64);
+          Value shared_index =
+              Add(builder, IndexConstant(builder, kLhsElements),
+                  Add(builder,
+                      Mul(builder, shared_column, IndexConstant(builder, kK)),
+                      physical_k));
+          shared = mlir::vector::TransferWriteOp::create(
+                       builder, fragment, shared,
+                       mlir::ValueRange{shared_index},
+                       llvm::ArrayRef<bool>{true})
+                       .getResult();
+        }
+        return shared;
+      };
+
+      // The same 512 threads load the complete 4xK128 LHS tile. Scalar loads
+      // preserve the fused per-K BF16 scale/rounding semantics; each wave
+      // accesses one contiguous half-row.
+      Value lhs_row = Div(builder, thread_id, kK);
+      Value lhs_k = Rem(builder, thread_id, kK);
+      Value lhs_shared_index =
+          Add(builder, Mul(builder, lhs_row, IndexConstant(builder, kK)),
+              lhs_k);
+      auto load_lhs_element = [&](Value global_k) {
+        Value lhs_global_k = Add(builder, global_k, lhs_k);
+        Value lhs_element = extract_input(
+            lhs, lhs_input_type_, lhs_requires_linear_addressing_,
+            lhs_physical_offset_, lhs_physical_strides_,
+            lhs_indices(lhs_row, lhs_global_k));
+        return mlir::arith::TruncFOp::create(
+                   builder, builder.getBF16Type(), lhs_element)
+            .getResult();
+      };
+      auto store_lhs_element = [&](Value shared, Value lhs_element) {
+        return mlir::tensor::InsertOp::create(
+            builder, lhs_element, shared,
+            mlir::ValueRange{lhs_shared_index})
+            .getResult();
+      };
+
+      Value fragment_row = Rem(builder, lane_id, kM);
+      Value fragment_k = Mul(builder, Div(builder, lane_id, kM),
+                             IndexConstant(builder, 4));
+      Value wave_column =
+          Add(builder,
+              Mul(builder, Rem(builder, wave_id, 2),
+                  IndexConstant(builder, 64)),
+              lane_id);
+      Value rhs_column_base =
+          Add(builder, IndexConstant(builder, kLhsElements),
+              Mul(builder, wave_column, IndexConstant(builder, kK)));
+      auto read_fragment = [&](Value shared, Value index) {
+        return mlir::vector::TransferReadOp::create(
+            builder, input_fragment_type, shared, mlir::ValueRange{index},
+            /*padding=*/std::nullopt, llvm::ArrayRef<bool>{true})
+            .getResult();
+      };
+      struct Mfma4Fragments {
+        Value lhs_low;
+        Value lhs_high;
+        llvm::SmallVector<Value, 16> rhs_low;
+        llvm::SmallVector<Value, 16> rhs_high;
+      };
+      auto read_fragments = [&](Value shared) {
+        Value lhs_low = read_fragment(shared, Add(
+            builder, Mul(builder, fragment_row, IndexConstant(builder, kK)),
+            fragment_k));
+        Value lhs_high = read_fragment(shared, Add(
+            builder,
+            Add(builder,
+                Mul(builder, fragment_row, IndexConstant(builder, kK)),
+                fragment_k),
+            IndexConstant(builder, 64)));
+
+        llvm::SmallVector<Value, 16> rhs_low;
+        llvm::SmallVector<Value, 16> rhs_high;
+        rhs_low.reserve(16);
+        rhs_high.reserve(16);
+        for (int64_t abid = 0; abid < 16; ++abid) {
+          Value physical_k = SwizzleTritonMfma32TransposedRhs(
+              builder, wave_column, IndexConstant(builder, abid * 4),
+              /*stage_k=*/64);
+          Value rhs_index = Add(builder, rhs_column_base, physical_k);
+          rhs_low.push_back(read_fragment(shared, rhs_index));
+          rhs_high.push_back(read_fragment(
+              shared,
+              Add(builder, rhs_index, IndexConstant(builder, 64))));
+        }
+        return Mfma4Fragments{lhs_low, lhs_high, std::move(rhs_low),
+                              std::move(rhs_high)};
+      };
+
+      auto emit_mfmas = [&](Value accumulator,
+                            const Mfma4Fragments& fragments) {
+        auto emit_mfma = [&](Value lhs_fragment, Value rhs_fragment,
+                             int64_t abid) {
+          Value lhs_bits = mlir::vector::BitCastOp::create(
+              builder, input_bits_type, lhs_fragment);
+          Value rhs_bits = mlir::vector::BitCastOp::create(
+              builder, input_bits_type, rhs_fragment);
+          accumulator =
+              mlir::ROCDL::mfma_f32_4x4x4bf16_1k::create(
+                  builder, accumulator_type, lhs_bits, rhs_bits, accumulator,
+                  /*cbsz=*/4, abid, mlir::ROCDL::MFMAPermB::none)
+                  .getRes();
+        };
+        for (int64_t abid = 0; abid < 16; ++abid) {
+          emit_mfma(fragments.lhs_low, fragments.rhs_low[abid], abid);
+        }
+        for (int64_t abid = 0; abid < 16; ++abid) {
+          emit_mfma(fragments.lhs_high, fragments.rhs_high[abid], abid);
+        }
+        return accumulator;
+      };
+
+      // Eight waves cooperatively fill the K128 LDS tile, but only the two
+      // waves that own the N64 output halves need to execute MFMA4.  The
+      // previous schedule executed the same two column groups on all eight
+      // waves and discarded six waves' results below.
+      Value is_compute_wave = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, wave_id,
+          IndexConstant(builder, 2));
+      auto compute_tile = [&](Value accumulator, Value shared) {
+        mlir::scf::IfOp compute = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{accumulator_type}, is_compute_wave,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard compute_guard(builder);
+          builder.setInsertionPointToStart(compute.thenBlock());
+          mlir::scf::YieldOp::create(
+              builder, emit_mfmas(accumulator, read_fragments(shared)));
+          builder.setInsertionPointToStart(compute.elseBlock());
+          mlir::scf::YieldOp::create(builder, accumulator);
+        }
+        builder.setInsertionPointAfter(compute);
+        return compute.getResult(0);
+      };
+
+      // Prologue: make K0 available in LDS. The steady-state loop below
+      // prefetches K+128 into registers while K is consumed by MFMA, then
+      // refills this same buffer after the protection barrier.
+      Value shared = store_rhs_rows(
+          initial_shared, load_rhs_rows(IndexConstant(builder, 0)));
+      shared = store_lhs_element(
+          shared, load_lhs_element(IndexConstant(builder, 0)));
+      shared = SyncThreadsOp::create(builder, mlir::TypeRange{shared_type},
+                                     shared)
+                   .getResult(0);
+
+      mlir::scf::ForOp reduction = mlir::scf::ForOp::create(
+          builder, IndexConstant(builder, 0),
+          IndexConstant(builder, k_ - kK), IndexConstant(builder, kK),
+          mlir::ValueRange{initial_accumulator, shared},
+          [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+      {
+        mlir::OpBuilder::InsertionGuard reduction_guard(builder);
+        builder.setInsertionPointToStart(reduction.getBody());
+        Value global_k = reduction.getInductionVar();
+        Value accumulator = reduction.getRegionIterArg(0);
+        Value loop_shared = reduction.getRegionIterArg(1);
+
+        Value next_k = Add(builder, global_k, IndexConstant(builder, kK));
+        llvm::SmallVector<Value, 4> next_rhs_rows = load_rhs_rows(next_k);
+        Value next_lhs_element = load_lhs_element(next_k);
+        accumulator = compute_tile(accumulator, loop_shared);
+
+        // Protect the fragments just consumed from the next iteration's
+        // single-buffer refill. The independent VMEM operations above can be
+        // hidden under the current MFMA dependency chain.
+        loop_shared =
+            SyncThreadsOp::create(builder, mlir::TypeRange{shared_type},
+                                  loop_shared)
+                .getResult(0);
+        loop_shared = store_rhs_rows(loop_shared, next_rhs_rows);
+        loop_shared =
+            store_lhs_element(loop_shared, next_lhs_element);
+        loop_shared =
+            SyncThreadsOp::create(builder, mlir::TypeRange{shared_type},
+                                  loop_shared)
+                .getResult(0);
+        mlir::scf::YieldOp::create(builder,
+                                   mlir::ValueRange{accumulator, loop_shared});
+      }
+      builder.setInsertionPointAfter(reduction);
+
+      // Epilogue: the loop leaves the final K128 tile in LDS.
+      Value final_accumulator = compute_tile(reduction.getResult(0),
+                                             reduction.getResult(1));
+
+      Value is_live_wave = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, wave_id,
+          IndexConstant(builder, 2));
+      mlir::scf::IfOp store = mlir::scf::IfOp::create(
+          builder, mlir::TypeRange{output.getType()}, is_live_wave,
+          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard store_guard(builder);
+        builder.setInsertionPointToStart(store.thenBlock());
+        Value updated = output;
+        Value output_column =
+            Add(builder, column_base,
+                Add(builder, Mul(builder, wave_id,
+                                 IndexConstant(builder, 64)),
+                    lane_id));
+        for (int64_t row = 0; row < kM; ++row) {
+          Value output_row = IndexConstant(builder, row);
+          Value value = mlir::vector::ExtractOp::create(
+              builder, final_accumulator,
+              llvm::SmallVector<int64_t>{row});
+          updated = insert_output(
+              updated, convert_output(value, output_row, output_column),
+              output_row, output_column);
+        }
+        mlir::scf::YieldOp::create(builder, updated);
+        builder.setInsertionPointToStart(store.elseBlock());
+        mlir::scf::YieldOp::create(builder, output);
+      }
+      builder.setInsertionPointAfter(store);
+      mlir::func::ReturnOp::create(builder, store.getResult(0));
+      return absl::OkStatus();
+    }
+
+    if (m_ >= 2 && m_ <= 8 && block_m_ == m_) {
+      TF_RET_CHECK(rhs_column_contiguous_ && block_n_ % 64 == 0);
+      const int64_t threads = num_warps_ * 64;
+      const int64_t outputs_per_thread =
+          std::max<int64_t>(1, block_n_ / threads);
+      const int64_t active_threads = block_n_ / outputs_per_thread;
+      Value column_base =
+          Mul(builder, output_block_id, IndexConstant(builder, block_n_));
+
+      if (split_k_) {
+        const int64_t outputs_per_lane = block_n_ / 64;
+        auto partials_type = mlir::RankedTensorType::get(
+            {num_warps_ * m_ * block_n_}, builder.getF32Type());
+        Value partials = AllocateSharedOp::create(builder, partials_type);
+        Value lane_column =
+            Add(builder, column_base,
+                Mul(builder, lane_id,
+                    IndexConstant(builder, outputs_per_lane)));
+        llvm::SmallVector<Value> sums = emit_small_m_matrix_products(
+            lane_column, outputs_per_lane, wave_id, num_warps_);
+        for (int64_t row = 0; row < m_; ++row) {
+          Value partial_base = Add(
+              builder, IndexConstant(builder, row * block_n_),
+              Add(builder,
+                  Mul(builder, wave_id,
+                      IndexConstant(builder, m_ * block_n_)),
+                  Mul(builder, lane_id,
+                      IndexConstant(builder, outputs_per_lane))));
+          for (int64_t output_offset = 0;
+               output_offset < outputs_per_lane; ++output_offset) {
+            partials = mlir::tensor::InsertOp::create(
+                builder,
+                sums[row * outputs_per_lane + output_offset], partials,
+                mlir::ValueRange{Add(
+                    builder, partial_base,
+                    IndexConstant(builder, output_offset))});
+          }
+        }
+        partials =
+            SyncThreadsOp::create(builder, mlir::TypeRange{partials_type},
+                                  partials)
+                .getResult(0);
+
+        Value is_wave_zero = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::eq, wave_id,
+            IndexConstant(builder, 0));
+        mlir::scf::IfOp reduce = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{output.getType()}, is_wave_zero,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard reduce_guard(builder);
+          builder.setInsertionPointToStart(reduce.thenBlock());
+          Value updated = output;
+          Value lane_offset =
+              Mul(builder, lane_id,
+                  IndexConstant(builder, outputs_per_lane));
+          for (int64_t row = 0; row < m_; ++row) {
+            for (int64_t output_offset = 0;
+                 output_offset < outputs_per_lane; ++output_offset) {
+              Value local_column =
+                  Add(builder, lane_offset,
+                      IndexConstant(builder, output_offset));
+              Value partial_index =
+                  Add(builder, local_column,
+                      IndexConstant(builder, row * block_n_));
+              Value sum = mlir::tensor::ExtractOp::create(
+                  builder, partials, mlir::ValueRange{partial_index});
+              for (int64_t source_wave = 1; source_wave < num_warps_;
+                   ++source_wave) {
+                Value source_index = Add(
+                    builder, partial_index,
+                    IndexConstant(builder,
+                                  source_wave * m_ * block_n_));
+                Value next = mlir::tensor::ExtractOp::create(
+                    builder, partials, mlir::ValueRange{source_index});
+                sum = mlir::arith::AddFOp::create(builder, sum, next);
+              }
+              Value output_row = IndexConstant(builder, row);
+              Value output_column = Add(builder, column_base, local_column);
+              updated = insert_output(
+                  updated,
+                  convert_output(sum, output_row, output_column), output_row,
+                  output_column);
+            }
+          }
+          mlir::scf::YieldOp::create(builder, updated);
+          builder.setInsertionPointToStart(reduce.elseBlock());
+          mlir::scf::YieldOp::create(builder, output);
+        }
+        builder.setInsertionPointAfter(reduce);
+        mlir::func::ReturnOp::create(builder, reduce.getResult(0));
+        return absl::OkStatus();
+      }
+
+      mlir::scf::ForOp columns = mlir::scf::ForOp::create(
+          builder, thread_id, IndexConstant(builder, active_threads),
+          IndexConstant(builder, threads), mlir::ValueRange{output},
+          [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(columns.getBody());
+        Value column =
+            Add(builder, column_base,
+                Mul(builder, columns.getInductionVar(),
+                    IndexConstant(builder, outputs_per_thread)));
+        llvm::SmallVector<Value> sums = emit_small_m_matrix_products(
+            column, outputs_per_thread, IndexConstant(builder, 0),
+            /*k_step=*/1);
+        Value updated = columns.getRegionIterArg(0);
+        for (int64_t row = 0; row < m_; ++row) {
+          for (int64_t output_offset = 0;
+               output_offset < outputs_per_thread; ++output_offset) {
+            Value output_row = IndexConstant(builder, row);
+            Value output_column =
+                Add(builder, column, IndexConstant(builder, output_offset));
+            updated = insert_output(
+                updated,
+                convert_output(
+                    sums[row * outputs_per_thread + output_offset], output_row,
+                    output_column),
+                output_row, output_column);
+          }
+        }
+        mlir::scf::YieldOp::create(builder, updated);
+      }
+      builder.setInsertionPointAfter(columns);
+      mlir::func::ReturnOp::create(builder, columns.getResult(0));
+      return absl::OkStatus();
+    }
 
     if (m_ == 1 && rhs_k_contiguous_gemv_) {
       Value column_base =
@@ -9624,7 +11189,9 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
 
   int64_t block_m_ = 0;
   int64_t block_n_ = 0;
+  int64_t block_k_ = 0;
   int64_t num_warps_ = 0;
+  FlyGemmConfig::MfmaAtom mfma_atom_ = FlyGemmConfig::FLY_MFMA_16X16X16;
   int64_t m_;
   int64_t n_;
   int64_t k_;
@@ -9644,6 +11211,12 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
   bool is_scaled_dot_ = false;
   int64_t lhs_scale_parameter_number_ = 2;
   int64_t rhs_scale_parameter_number_ = 3;
+  int64_t lhs_input_scale_parameter_number_ = -1;
+  int64_t rhs_input_scale_parameter_number_ = -1;
+  PrimitiveType lhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
+  PrimitiveType rhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
+  int64_t lhs_input_scale_broadcast_dimension_ = -1;
+  int64_t rhs_input_scale_broadcast_dimension_ = -1;
   int64_t epilogue_row_dimension_ = 0;
   int64_t epilogue_column_dimension_ = 1;
   std::vector<EpilogueStep> epilogue_steps_;
@@ -9661,7 +11234,12 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> rhs_dynamic_offset_parameter_numbers_;
   std::vector<int64_t> rhs_dynamic_offset_constants_;
   std::vector<int64_t> rhs_dynamic_offset_limits_;
+  int64_t lhs_batch_dimension_ = -1;
+  int64_t rhs_batch_dimension_ = -1;
+  int64_t lhs_contracting_dimension_ = 0;
   int64_t rhs_contracting_dimension_ = 0;
+  int64_t lhs_noncontracting_dimension_ = 0;
+  int64_t rhs_noncontracting_dimension_ = 0;
   LaunchDimensions launch_dimensions_;
 };
 

@@ -117,6 +117,41 @@ TEST_F(FlyXTileSoftmaxTest, RecognizesF32SoftmaxWithTail) {
   EXPECT_TRUE(IsSupported("-inf", "f32", 125));
 }
 
+TEST_F(FlyXTileSoftmaxTest, RecognizesExternalRowOffsetSoftmax) {
+  constexpr char kSoftmaxHlo[] = R"(
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax {
+  input = f32[64,4096]{1,0} parameter(0)
+  row_offset = f32[64]{0} parameter(1)
+  row_offsets = f32[64,4096]{1,0} broadcast(row_offset), dimensions={0}
+  shifted = f32[64,4096]{1,0} subtract(input, row_offsets)
+  exponential = f32[64,4096]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[64]{0} reduce(exponential, zero), dimensions={1}, to_apply=add
+  broadcast_sum = f32[64,4096]{1,0} broadcast(row_sum), dimensions={0}
+  ROOT result = f32[64,4096]{1,0} divide(exponential, broadcast_sum)
+}
+
+ENTRY entry {
+  input = f32[64,4096]{1,0} parameter(0)
+  row_offset = f32[64]{0} parameter(1)
+  ROOT fusion = f32[64,4096]{1,0} fusion(input, row_offset), kind=kInput,
+    calls=softmax
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kSoftmaxHlo).value();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlySoftmaxFusion(analysis));
+}
+
 TEST_F(FlyXTileSoftmaxTest, RejectsIncorrectMaximumIdentity) {
   EXPECT_FALSE(IsSupported("0"));
 }

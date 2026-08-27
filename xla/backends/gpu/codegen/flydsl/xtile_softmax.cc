@@ -21,6 +21,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "llvm/ADT/APFloat.h"
@@ -104,6 +105,19 @@ mlir::func::FuncOp CreateReducer(mlir::ModuleOp module, mlir::StringRef name,
 class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
  public:
   explicit FlyXTileSoftmaxEmitter(const HloFusionAnalysis& analysis) {
+    const HloInstruction& root = analysis.fusion_root(0).instruction();
+    const HloInstruction* input = GetFlySoftmaxInput(root);
+    CHECK(input != nullptr);
+    while (input->opcode() == HloOpcode::kBitcast &&
+           input->operand_count() == 1) {
+      input = input->operand(0);
+    }
+    CHECK_EQ(input->opcode(), HloOpcode::kParameter);
+    input_parameter_number_ = input->parameter_number();
+    if (const HloInstruction* row_offset =
+            GetFlySoftmaxExternalRowOffset(root)) {
+      external_row_parameter_number_ = row_offset->parameter_number();
+    }
     const Shape& shape = analysis.first_result_shape();
     dimensions_.assign(shape.dimensions().begin(), shape.dimensions().end());
     columns_ = dimensions_.back();
@@ -174,15 +188,27 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
   absl::Status EmitKernel(mlir::func::FuncOp entry_function,
                           mlir::func::FuncOp maximum,
                           mlir::func::FuncOp add_reducer) const {
-    TF_RET_CHECK(entry_function.getNumArguments() == 2);
+    const bool has_external_row = external_row_parameter_number_ >= 0;
+    TF_RET_CHECK(entry_function.getNumArguments() ==
+                 (has_external_row ? 3 : 2));
+    TF_RET_CHECK(input_parameter_number_ >= 0 &&
+                 input_parameter_number_ <
+                     entry_function.getNumArguments() - 1);
+    TF_RET_CHECK(!has_external_row || external_row_parameter_number_ <
+                                          entry_function.getNumArguments() - 1);
     const int64_t threads = independent_rows_ ? 64 : num_warps_ * 64;
     TF_RET_CHECK(num_warps_ > 0 && num_warps_ <= 16 && columns_ > 0 &&
                  (columns_ + threads - 1) / threads <= 64);
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
-    Value input = entry_function.getArgument(0);
-    Value output = entry_function.getArgument(1);
+    Value input = entry_function.getArgument(input_parameter_number_);
+    Value external_row =
+        has_external_row
+            ? entry_function.getArgument(external_row_parameter_number_)
+            : Value();
+    Value output =
+        entry_function.getArgument(entry_function.getNumArguments() - 1);
     Value thread_id = EmitThreadId(builder, 0);
     Value block_id = EmitBlockId(builder, 0);
     Value wave_id = Div(builder, thread_id, 64);
@@ -404,8 +430,31 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
           builder, shared, mlir::ValueRange{IndexConstant(builder, 0)});
     };
 
-    Value block_max = block_reduce(local_max, maximum, minus_inf,
-                                   /*is_maximum=*/true);
+    Value block_max;
+    if (has_external_row) {
+      if (all_rows_in_bounds) {
+        block_max = mlir::tensor::ExtractOp::create(
+            builder, external_row, mlir::ValueRange(input_row_indices));
+      } else {
+        mlir::scf::IfOp load = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{builder.getF32Type()}, row_in_bounds,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(load.thenBlock());
+          Value value = mlir::tensor::ExtractOp::create(
+              builder, external_row, mlir::ValueRange(input_row_indices));
+          mlir::scf::YieldOp::create(builder, value);
+          builder.setInsertionPointToStart(load.elseBlock());
+          mlir::scf::YieldOp::create(builder, zero);
+        }
+        builder.setInsertionPointAfter(load);
+        block_max = load.getResult(0);
+      }
+    } else {
+      block_max = block_reduce(local_max, maximum, minus_inf,
+                               /*is_maximum=*/true);
+    }
     std::vector<Value> exponentials;
     exponentials.reserve(values.size());
     Value local_sum = zero;
@@ -488,6 +537,8 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
   PrimitiveType element_type_;
   std::vector<int64_t> dimensions_;
   bool independent_rows_ = false;
+  int64_t input_parameter_number_ = 0;
+  int64_t external_row_parameter_number_ = -1;
   int64_t num_warps_ = 4;
   LaunchDimensions launch_dimensions_;
 };

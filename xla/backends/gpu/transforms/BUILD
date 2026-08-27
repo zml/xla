@@ -2812,6 +2812,40 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fly_autotune_cleanup",
+    srcs = ["fly_autotune_cleanup.cc"],
+    hdrs = ["fly_autotune_cleanup.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/evaluator:hlo_evaluator",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "fly_autotune_cleanup_test",
+    srcs = ["fly_autotune_cleanup_test.cc"],
+    deps = [
+        ":fly_autotune_cleanup",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 xla_cc_test(
     name = "fly_gemm_fission_rewriter_test",
     srcs = ["fly_gemm_fission_rewriter_test.cc"],

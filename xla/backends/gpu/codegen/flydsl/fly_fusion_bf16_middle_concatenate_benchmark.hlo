@@ -1,0 +1,17 @@
+HloModule fly_fusion_bf16_middle_concatenate_benchmark
+
+%fused_middle_concatenate (p0: bf16[256,64,256], p1: bf16[256,64,256]) -> bf16[256,128,256] {
+  %p0 = bf16[256,64,256]{2,1,0} parameter(0)
+  %p1 = bf16[256,64,256]{2,1,0} parameter(1)
+  %absolute = bf16[256,64,256]{2,1,0} abs(%p0)
+  %negated = bf16[256,64,256]{2,1,0} negate(%p1)
+  ROOT %result = bf16[256,128,256]{2,1,0} concatenate(%absolute, %negated), dimensions={1}
+}
+
+ENTRY %entry_computation (p0: bf16[256,64,256], p1: bf16[256,64,256]) -> bf16[256,128,256] {
+  %p0 = bf16[256,64,256]{2,1,0} parameter(0)
+  %p1 = bf16[256,64,256]{2,1,0} parameter(1)
+  ROOT %fusion = bf16[256,128,256]{2,1,0} fusion(%p0, %p1), kind=kCustom,
+    calls=%fused_middle_concatenate,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}

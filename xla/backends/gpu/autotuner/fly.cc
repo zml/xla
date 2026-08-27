@@ -166,14 +166,82 @@ bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
          transpose.dimensions() == std::vector<int64_t>({0, 2, 1});
 }
 
+struct ContractingScaleInput {
+  const HloInstruction* data;
+  const HloInstruction* scale;
+  int64_t broadcast_dimension;
+};
+
+// Matches the BF16/F16 rounding boundary used by RMSNorm's learned weight:
+//
+//   convert<T>(convert<f32>(data) * convert<f32>(broadcast(scale)))
+//
+// Keeping this producer inside a decoder projection avoids materializing the
+// scaled activation while preserving the multiply-before-rounding semantics.
+std::optional<ContractingScaleInput> MatchContractingScaleInput(
+    const HloInstruction& input) {
+  if (!IsHalfPrecisionFloat(input.shape().element_type()) ||
+      input.opcode() != HloOpcode::kConvert || input.operand_count() != 1 ||
+      input.operand(0)->shape().element_type() != F32 ||
+      !ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape())) {
+    return std::nullopt;
+  }
+  const HloInstruction* multiply = input.operand(0);
+  if (multiply->opcode() != HloOpcode::kMultiply ||
+      multiply->operand_count() != 2 ||
+      multiply->shape().element_type() != F32) {
+    return std::nullopt;
+  }
+  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+    const HloInstruction* widened_data = multiply->operand(data_operand);
+    const HloInstruction* widened_broadcast =
+        multiply->operand(1 - data_operand);
+    if (widened_data->opcode() != HloOpcode::kConvert ||
+        widened_data->operand_count() != 1 ||
+        widened_data->shape().element_type() != F32 ||
+        widened_data->operand(0)->opcode() != HloOpcode::kParameter ||
+        widened_data->operand(0)->shape().element_type() !=
+            input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(widened_data->shape(), input.shape()) ||
+        widened_broadcast->opcode() != HloOpcode::kConvert ||
+        widened_broadcast->operand_count() != 1 ||
+        widened_broadcast->shape().element_type() != F32) {
+      continue;
+    }
+    const HloInstruction* broadcast = widened_broadcast->operand(0);
+    if (broadcast->opcode() != HloOpcode::kBroadcast ||
+        broadcast->operand_count() != 1 ||
+        broadcast->shape().element_type() != input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(broadcast->shape(), input.shape()) ||
+        broadcast->dimensions().size() != 1) {
+      continue;
+    }
+    const HloInstruction* scale = broadcast->operand(0);
+    const int64_t broadcast_dimension = broadcast->dimensions(0);
+    if (scale->opcode() != HloOpcode::kParameter ||
+        scale->shape().dimensions_size() != 1 ||
+        scale->shape().element_type() != input.shape().element_type() ||
+        scale->shape().dimensions(0) !=
+            input.shape().dimensions(broadcast_dimension)) {
+      continue;
+    }
+    return ContractingScaleInput{widened_data->operand(0), scale,
+                                 broadcast_dimension};
+  }
+  return std::nullopt;
+}
+
 const HloInstruction* FindContractionInputParameter(
     const HloInstruction& input) {
   const PrimitiveType contraction_type = input.shape().element_type();
   if (!IsHalfPrecisionFloat(contraction_type) && !IsFnuzFp8(contraction_type) &&
-      contraction_type != F32) {
+      contraction_type != F32 && contraction_type != S8) {
     return nullptr;
   }
-  const HloInstruction* value = &input;
+  const std::optional<ContractingScaleInput> contracting_scale =
+      MatchContractingScaleInput(input);
+  const HloInstruction* value =
+      contracting_scale.has_value() ? contracting_scale->data : &input;
   bool has_conversion = false;
   bool has_input_view = false;
   bool physical_mapping_fixed = false;
@@ -264,6 +332,25 @@ const HloInstruction* FindContractionInputParameter(
                                                                : nullptr;
 }
 
+bool IsDimensionContiguous(const HloInstruction& input, int64_t dimension) {
+  if (!input.shape().has_layout()) {
+    return false;
+  }
+  // Singleton dimensions do not contribute to the physical stride. XLA's
+  // token-one canonicalization commonly presents a contiguous [K] buffer as
+  // [K,1] with the unit dimension listed first in minor-to-major order.
+  for (int64_t physical_dimension :
+       input.shape().layout().minor_to_major()) {
+    if (physical_dimension == dimension) {
+      return true;
+    }
+    if (input.shape().dimensions(physical_dimension) != 1) {
+      return false;
+    }
+  }
+  return false;
+}
+
 bool IsContractingDimensionContiguous(const HloInstruction& input,
                                       int64_t contracting_dimension) {
   if (IsSupportedBatchInnerTranspose(input)) {
@@ -272,8 +359,7 @@ bool IsContractingDimensionContiguous(const HloInstruction& input,
            operand->shape().layout().minor_to_major(0) ==
                input.dimensions(contracting_dimension);
   }
-  return input.shape().has_layout() &&
-         input.shape().layout().minor_to_major(0) == contracting_dimension;
+  return IsDimensionContiguous(input, contracting_dimension);
 }
 
 bool IsS4DequantizedInput(const HloInstruction& input) {
@@ -283,43 +369,50 @@ bool IsS4DequantizedInput(const HloInstruction& input) {
 
 struct ConcatInputInfo {
   int64_t dimension;
-  int64_t fragment_size;
+  std::vector<int64_t> fragment_sizes;
 };
 
 std::optional<ConcatInputInfo> FindSupportedConcatInput(
     const HloInstruction& input) {
-  if (input.opcode() != HloOpcode::kConcatenate || input.operand_count() < 2 ||
-      input.shape().element_type() != BF16) {
+  const HloInstruction* concat = &input;
+  std::optional<std::vector<int64_t>> output_to_concat_dimensions;
+  if (input.opcode() == HloOpcode::kTranspose && input.operand_count() == 1 &&
+      input.shape().dimensions_size() == 2 &&
+      input.dimensions() == std::vector<int64_t>({1, 0}) &&
+      input.operand(0)->opcode() == HloOpcode::kConcatenate) {
+    concat = input.operand(0);
+    output_to_concat_dimensions = std::vector<int64_t>(
+        input.dimensions().begin(), input.dimensions().end());
+  }
+  if (concat->opcode() != HloOpcode::kConcatenate ||
+      concat->operand_count() < 2 || input.shape().element_type() != BF16 ||
+      concat->shape().element_type() != BF16) {
     return std::nullopt;
   }
-  const int64_t dimension = input.concatenate_dimension();
-  const Shape& first_shape = input.operand(0)->shape();
-  PrimitiveType parameter_type = PRIMITIVE_TYPE_INVALID;
-  for (const HloInstruction* operand : input.operands()) {
-    if (!ShapeUtil::Equal(operand->shape(), first_shape)) {
+  const int64_t concat_dimension = concat->concatenate_dimension();
+  int64_t dimension = concat_dimension;
+  if (output_to_concat_dimensions.has_value()) {
+    auto it = std::find(output_to_concat_dimensions->begin(),
+                        output_to_concat_dimensions->end(), concat_dimension);
+    if (it == output_to_concat_dimensions->end()) {
       return std::nullopt;
     }
-    const HloInstruction* parameter = nullptr;
-    if (operand->opcode() == HloOpcode::kParameter &&
-        operand->shape().element_type() == BF16) {
-      parameter = operand;
-    } else if (operand->opcode() == HloOpcode::kConvert &&
-               operand->operand_count() == 1 &&
-               operand->shape().element_type() == BF16 &&
-               operand->operand(0)->opcode() == HloOpcode::kParameter &&
-               operand->operand(0)->shape().element_type() == F32 &&
-               ShapeUtil::SameDimensions(operand->shape(),
-                                         operand->operand(0)->shape())) {
-      parameter = operand->operand(0);
-    }
+    dimension = std::distance(output_to_concat_dimensions->begin(), it);
+  }
+  PrimitiveType parameter_type = PRIMITIVE_TYPE_INVALID;
+  std::vector<int64_t> fragment_sizes;
+  fragment_sizes.reserve(concat->operand_count());
+  for (const HloInstruction* operand : concat->operands()) {
+    const HloInstruction* parameter = FindContractionInputParameter(*operand);
     if (parameter == nullptr ||
         (parameter_type != PRIMITIVE_TYPE_INVALID &&
          parameter->shape().element_type() != parameter_type)) {
       return std::nullopt;
     }
     parameter_type = parameter->shape().element_type();
+    fragment_sizes.push_back(operand->shape().dimensions(concat_dimension));
   }
-  return ConcatInputInfo{dimension, first_shape.dimensions(dimension)};
+  return ConcatInputInfo{dimension, std::move(fragment_sizes)};
 }
 
 bool IsSupportedContractionInput(const HloInstruction& input) {
@@ -363,7 +456,8 @@ bool IsBatchedContraction(const HloInstruction& dot) {
          dims.rhs_batch_dimensions(0) == 0 &&
          dims.lhs_contracting_dimensions_size() == 1 &&
          dims.rhs_contracting_dimensions_size() == 1 &&
-         dims.lhs_contracting_dimensions(0) == 2 &&
+         (dims.lhs_contracting_dimensions(0) == 1 ||
+          dims.lhs_contracting_dimensions(0) == 2) &&
          (dims.rhs_contracting_dimensions(0) == 1 ||
           dims.rhs_contracting_dimensions(0) == 2);
 }
@@ -381,12 +475,13 @@ bool IsSupportedContraction(const HloInstruction& dot) {
   const bool is_f16 = lhs_type == F16 && rhs_type == F16;
   const bool is_f32 = lhs_type == F32 && rhs_type == F32;
   const bool is_fp8 = IsFnuzFp8(lhs_type) && IsFnuzFp8(rhs_type);
+  const bool is_int8 = lhs_type == S8 && rhs_type == S8;
   const bool is_int4 = IsS4DequantizedInput(*dot.operand(0)) ||
                        IsS4DequantizedInput(*dot.operand(1));
   if ((rank != 2 && rank != 3) ||
       dot.operand(0)->shape().dimensions_size() != rank ||
       dot.operand(1)->shape().dimensions_size() != rank ||
-      (!is_bf16 && !is_f16 && !is_f32 && !is_fp8) ||
+      (!is_bf16 && !is_f16 && !is_f32 && !is_fp8 && !is_int8) ||
       (is_int4 &&
        (rank != 2 || is_scaled_dot || dot.shape().dimensions(0) == 1 ||
         dot.shape().dimensions(1) == 1)) ||
@@ -395,7 +490,8 @@ bool IsSupportedContraction(const HloInstruction& dot) {
       (dot.shape().element_type() != F32 &&
        !(is_bf16 && dot.shape().element_type() == BF16) &&
        !(is_f16 && dot.shape().element_type() == F16) &&
-       !(is_fp8 && dot.shape().element_type() == BF16))) {
+       !(is_fp8 && dot.shape().element_type() == BF16) &&
+       !(is_int8 && dot.shape().element_type() == S32))) {
     return false;
   }
   const DotDimensionNumbers& dims = dot.dot_dimension_numbers();
@@ -403,12 +499,24 @@ bool IsSupportedContraction(const HloInstruction& dot) {
       dims.rhs_contracting_dimensions_size() != 1) {
     return false;
   }
+  const std::optional<ContractingScaleInput> lhs_contracting_scale =
+      MatchContractingScaleInput(*dot.operand(0));
+  const std::optional<ContractingScaleInput> rhs_contracting_scale =
+      MatchContractingScaleInput(*dot.operand(1));
+  if (rhs_contracting_scale.has_value() ||
+      (lhs_contracting_scale.has_value() &&
+       (dot.shape().dimensions(rank - 2) > 8 ||
+        dot.shape().dimensions(rank - 1) <= 1 ||
+        lhs_contracting_scale->broadcast_dimension !=
+            dims.lhs_contracting_dimensions(0)))) {
+    return false;
+  }
   if (is_scaled_dot) {
     const int64_t m = dot.shape().dimensions(rank - 2);
     const int64_t n = dot.shape().dimensions(rank - 1);
     const bool uniform_scale =
         IsUniformScale(*dot.operand(2)) && IsUniformScale(*dot.operand(3));
-    if (is_f32 || (rank == 3 && !IsBatchedContraction(dot)) ||
+    if (is_f32 || is_int8 || (rank == 3 && !IsBatchedContraction(dot)) ||
         ((m == 1 || n == 1) && !uniform_scale) ||
         !ScaledDotKBlockSize(dot).has_value()) {
       return false;
@@ -429,7 +537,8 @@ bool IsSupportedContraction(const HloInstruction& dot) {
   if ((lhs_concat.has_value() || rhs_concat.has_value()) &&
       (is_scaled_dot || rank != 2 || dot.shape().dimensions(0) == 1 ||
        dot.shape().dimensions(1) == 1 ||
-       (lhs_concat.has_value() && lhs_concat->dimension != 0) ||
+       (lhs_concat.has_value() &&
+        lhs_concat->dimension != 1 - dims.lhs_contracting_dimensions(0)) ||
        (rhs_concat.has_value() &&
         rhs_concat->dimension != 1 - dims.rhs_contracting_dimensions(0)))) {
     return false;
@@ -437,7 +546,8 @@ bool IsSupportedContraction(const HloInstruction& dot) {
   if (rank == 2) {
     return dims.lhs_batch_dimensions().empty() &&
            dims.rhs_batch_dimensions().empty() &&
-           dims.lhs_contracting_dimensions(0) == 1 &&
+           (dims.lhs_contracting_dimensions(0) == 0 ||
+            dims.lhs_contracting_dimensions(0) == 1) &&
            (dims.rhs_contracting_dimensions(0) == 0 ||
             dims.rhs_contracting_dimensions(0) == 1);
   }
@@ -679,8 +789,8 @@ std::unique_ptr<BackendConfig> MakeGemvConfig(
     int64_t block_m, int64_t block_n, int64_t num_warps,
     int32_t outputs_per_wave = 0, int32_t k_vector_width = 0,
     FlyGemmConfig::MfmaAtom mfma_atom = FlyGemmConfig::FLY_MFMA_16X16X16,
-    bool split_k = false) {
-  return MakeConfig(block_m, block_n, /*block_k=*/32, num_warps, mfma_atom,
+    bool split_k = false, int64_t block_k = 32) {
+  return MakeConfig(block_m, block_n, block_k, num_warps, mfma_atom,
                     /*prefetch_rhs=*/false, /*stage_output=*/false,
                     /*waves_per_eu=*/0, /*schedule_instructions=*/false,
                     /*stage_rhs=*/false, /*async_lhs=*/false,
@@ -722,6 +832,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const bool is_f32 = dot->operand(0)->shape().element_type() == F32 &&
                       dot->operand(1)->shape().element_type() == F32;
   const bool is_fp8 = IsFnuzFp8(dot->operand(0)->shape().element_type());
+  const bool is_int8 = dot->operand(0)->shape().element_type() == S8 &&
+                       dot->operand(1)->shape().element_type() == S8;
   const bool is_int4 = IsS4DequantizedInput(*dot->operand(0)) ||
                        IsS4DequantizedInput(*dot->operand(1));
   const bool rank_three = dot->shape().dimensions_size() == 3;
@@ -734,6 +846,17 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       dot->dot_dimension_numbers().lhs_contracting_dimensions(0);
   const int64_t rhs_contracting_dimension =
       dot->dot_dimension_numbers().rhs_contracting_dimensions(0);
+  int64_t rhs_noncontracting_dimension = -1;
+  for (int64_t dimension = 0;
+       dimension < dot->operand(1)->shape().dimensions_size(); ++dimension) {
+    if (dimension == rhs_contracting_dimension ||
+        absl::c_linear_search(
+            dot->dot_dimension_numbers().rhs_batch_dimensions(), dimension)) {
+      continue;
+    }
+    rhs_noncontracting_dimension = dimension;
+    break;
+  }
   const bool is_scaled_dot = dot->opcode() == HloOpcode::kScaledDot;
   const bool is_block_scaled_dot =
       is_scaled_dot &&
@@ -746,18 +869,25 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       *dot->operand(0), lhs_contracting_dimension);
   const bool rhs_k_contiguous = IsContractingDimensionContiguous(
       *dot->operand(1), rhs_contracting_dimension);
+  const bool rhs_column_contiguous =
+      rhs_noncontracting_dimension >= 0 &&
+      IsDimensionContiguous(*dot->operand(1), rhs_noncontracting_dimension);
+  const bool has_lhs_contracting_scale =
+      MatchContractingScaleInput(*dot->operand(0)).has_value();
   const std::optional<ConcatInputInfo> lhs_concat =
       FindSupportedConcatInput(*dot->operand(0));
   const std::optional<ConcatInputInfo> rhs_concat =
       FindSupportedConcatInput(*dot->operand(1));
-  const bool supports_masked_k_tail =
-      !is_fp8 && !is_int4 && !is_block_scaled_dot && !global_split_k;
-  if (k % (is_fp8 ? 32 : 16) != 0 && !supports_masked_k_tail) {
+  const int64_t contraction_atom_k = (is_fp8 || is_int8) ? 32 : 16;
+  const bool supports_masked_k_tail = !is_fp8 && !is_int8 && !is_int4 &&
+                                      !is_block_scaled_dot &&
+                                      !global_split_k;
+  if (k % contraction_atom_k != 0 && !supports_masked_k_tail) {
     return configs;
   }
 
   constexpr std::array<int64_t, 5> kBlockSizes = {16, 32, 64, 128, 256};
-  const bool masked_k_tail = k % 16 != 0;
+  const bool masked_k_tail = k % contraction_atom_k != 0;
   auto supports_gemm_k_tile = [&](int64_t block_k) {
     if (!masked_k_tail) {
       return block_k <= k && k % block_k == 0;
@@ -767,6 +897,117 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     // also offering successively larger mostly-zero stages.
     return block_k == 16 || block_k <= k || block_k / 2 < k;
   };
+  if (is_int8) {
+    // Follow FlyDSL's CDNA3 preshuffle GEMM geometry: a 16x16x32 signed-byte
+    // MFMA, four-wave macro-tiles, and K stages made from whole K32 atoms.
+    // XLA owns ordinary (not preshuffled) buffers, so start with the generic
+    // LHS-LDS/RHS-register transport that accepts either logical RHS layout.
+    // Dedicated two-operand LDS candidates can be layered on after this broad
+    // correctness path is established.
+    if (m == 1 || n == 1 || k % 32 != 0) {
+      return configs;
+    }
+    constexpr std::array<int64_t, 5> kInt8BlockSizes = {16, 32, 64, 128, 256};
+    for (int64_t block_m : kInt8BlockSizes) {
+      if (block_m > m || m % block_m != 0) {
+        continue;
+      }
+      for (int64_t block_n : kInt8BlockSizes) {
+        if (block_n > n || n % block_n != 0) {
+          continue;
+        }
+        const int64_t wave_tiles = (block_m / 16) * (block_n / 16);
+        for (int64_t block_k : {32, 64, 128, 256}) {
+          if (block_k > k || k % block_k != 0 ||
+              2 * block_m * block_k > 64 * 1024) {
+            continue;
+          }
+          for (int64_t num_warps : {1, 2, 4, 8}) {
+            if (num_warps > wave_tiles || wave_tiles % num_warps != 0) {
+              continue;
+            }
+            configs.push_back(MakeConfig(
+                block_m, block_n, block_k, num_warps,
+                FlyGemmConfig::FLY_MFMA_16X16X32_I8));
+            // FlyDSL's preshuffle GEMM keeps A in a two-stage LDS pipeline and
+            // B in a two-stage VGPR pipeline.  This is the corresponding XLA
+            // transport: `prefetch_rhs` carries the next complete B fragment
+            // bank while the current bank feeds the MFMAs.  Keep the ordinary
+            // streaming variant because N-contiguous XLA weights do not have
+            // FlyDSL's K-contiguous/preshuffled B representation.
+            const bool flydsl_register_rhs_pipeline =
+                num_warps == 4 && block_m >= 64 && block_n >= 64 &&
+                block_k >= 64 && block_k <= 128 && k >= 2 * block_k;
+            if (flydsl_register_rhs_pipeline) {
+              configs.push_back(MakeConfig(
+                  block_m, block_n, block_k, num_warps,
+                  FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                  /*prefetch_rhs=*/true));
+            }
+            const int64_t two_operand_lds_bytes =
+                2 * block_k * (block_m + block_n);
+            const bool flydsl_two_operand_pipeline =
+                block_m >= 64 && block_n >= 64 && block_k >= 64 &&
+                num_warps >= 4 && two_operand_lds_bytes <= 64 * 1024;
+            const bool native_preloaded_shape =
+                num_warps == 4 &&
+                ((block_k == 64 && block_m == block_n &&
+                  (block_m == 64 || block_m == 128)) ||
+                 (block_k == 128 && block_m == 128 && block_n == 128));
+            if (flydsl_two_operand_pipeline) {
+              configs.push_back(MakeConfig(
+                  block_m, block_n, block_k, num_warps,
+                  FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                  /*prefetch_rhs=*/false, /*stage_output=*/false,
+                  /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+                  /*stage_rhs=*/true));
+              if (native_preloaded_shape) {
+                configs.push_back(MakeConfig(
+                    block_m, block_n, block_k, num_warps,
+                    FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                    /*prefetch_rhs=*/false, /*stage_output=*/false,
+                    /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+                    /*stage_rhs=*/true, /*async_lhs=*/false,
+                    /*preload_lds_fragments=*/true));
+              }
+            }
+            if (k >= 1024) {
+              configs.push_back(MakeConfig(
+                  block_m, block_n, block_k, num_warps,
+                  FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                  /*prefetch_rhs=*/false, /*stage_output=*/false,
+                  /*waves_per_eu=*/0, /*schedule_instructions=*/true));
+              if (flydsl_register_rhs_pipeline) {
+                configs.push_back(MakeConfig(
+                    block_m, block_n, block_k, num_warps,
+                    FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                    /*prefetch_rhs=*/true, /*stage_output=*/false,
+                    /*waves_per_eu=*/0, /*schedule_instructions=*/true));
+              }
+              if (flydsl_two_operand_pipeline) {
+                configs.push_back(MakeConfig(
+                    block_m, block_n, block_k, num_warps,
+                    FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                    /*prefetch_rhs=*/false, /*stage_output=*/false,
+                    /*waves_per_eu=*/0, /*schedule_instructions=*/true,
+                    /*stage_rhs=*/true));
+                if (native_preloaded_shape) {
+                  configs.push_back(MakeConfig(
+                      block_m, block_n, block_k, num_warps,
+                      FlyGemmConfig::FLY_MFMA_16X16X32_I8,
+                      /*prefetch_rhs=*/false, /*stage_output=*/false,
+                      /*waves_per_eu=*/0, /*schedule_instructions=*/true,
+                      /*stage_rhs=*/true, /*async_lhs=*/false,
+                      /*preload_lds_fragments=*/true));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return configs;
+  }
   if (m == 1) {
     if (is_f32) {
       return configs;
@@ -1245,7 +1486,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       // power-of-two tile larger than an odd dimension so small tails do not
       // force an extra workgroup, while avoiding successively larger tiles
       // whose wasted MFMA work cannot be competitive.
-      if (block_m > m && block_m / 2 >= m) {
+      if (block_m > m && block_m / 2 >= m && block_m != 16) {
         continue;
       }
       for (int64_t block_n : kBlockSizes) {
@@ -1478,6 +1719,116 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return configs;
   }
 
+  if (m >= 2 && m <= 8 && n > 1 && !is_f32 && !is_fp8 && !is_int4 &&
+      !is_scaled_dot && !has_output_transpose && lhs_k_contiguous &&
+      rhs_column_contiguous) {
+    // Decoder projections are matrices mathematically, but padding M=2..8 to
+    // the minimum 16-row MFMA atom performs up to 8x unnecessary work. Offer
+    // a GEMV-family kernel that assigns output columns to lanes, computes only
+    // the live rows, and optionally partitions a long K reduction across all
+    // waves in the workgroup.
+    for (int64_t block_n : {64, 128, 256}) {
+      if (block_n > n && block_n / 2 >= n) {
+        continue;
+      }
+      for (int64_t num_warps : {1, 2, 4}) {
+        if (num_warps * 64 <= block_n) {
+          configs.push_back(MakeGemvConfig(
+              /*block_m=*/m, block_n, num_warps,
+              /*outputs_per_wave=*/m, /*k_vector_width=*/0));
+        }
+      }
+      if (k >= 512) {
+        for (int64_t num_warps : {2, 4, 8}) {
+          configs.push_back(MakeGemvConfig(
+              /*block_m=*/m, block_n, num_warps,
+              /*outputs_per_wave=*/m, /*k_vector_width=*/0,
+              FlyGemmConfig::FLY_MFMA_16X16X16,
+              /*split_k=*/true));
+        }
+      }
+    }
+    // Also let the MFMA path compete with explicit A+B LDS staging. It still
+    // computes the padded 16-row atom, but unlike the generic direct-load
+    // path it reuses every K stage across the output-column waves. These
+    // geometries mirror Triton's successful small-M tiles on gfx942.
+    for (const auto& [block_n, block_k, num_warps] :
+         std::array<std::array<int64_t, 3>, 2>{{
+             // Fused decoder projections can source the lhs through an f32
+             // producer. Keep every row-stage copy divisible by the complete
+             // workgroup even in that four-byte input case.
+             {64, 64, 4},
+             {128, 64, 4},
+         }}) {
+      if ((block_n > n && block_n / 2 >= n) || n % block_n != 0) {
+        continue;
+      }
+      if (has_lhs_contracting_scale && block_n > 64) {
+        continue;
+      }
+      if (has_lhs_contracting_scale && k % block_k != 0) {
+        continue;
+      }
+      configs.insert(
+          configs.begin(),
+          MakeConfig(/*block_m=*/16, block_n, block_k, num_warps,
+                     FlyGemmConfig::FLY_MFMA_16X16X16,
+                     /*prefetch_rhs=*/false, /*stage_output=*/false,
+                     /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+                     /*stage_rhs=*/true));
+    }
+    if (k >= 128 && k % 128 == 0) {
+      // Increase K reuse without exceeding gfx942's LDS limit. A double
+      // buffered M16/N64/K128 tile occupies 40 KiB; the corresponding N128
+      // tile would require 72 KiB and needs a dedicated live-row refill
+      // schedule before it can safely mirror Triton's wider tile.
+      for (bool schedule : {false, true}) {
+        configs.insert(
+            configs.begin(),
+            MakeConfig(/*block_m=*/16, /*block_n=*/64, /*block_k=*/128,
+                       /*num_warps=*/4,
+                       FlyGemmConfig::FLY_MFMA_16X16X16,
+                       /*prefetch_rhs=*/false, /*stage_output=*/false,
+                       /*waves_per_eu=*/0, schedule,
+                       /*stage_rhs=*/true));
+      }
+      // FlyDSL's dedicated small-M B_TO_LDS kernel preloads the complete
+      // current A/B fragment bank before issuing the next tile's vector loads.
+      // Keep this as a separate candidate: it changes the machine schedule,
+      // not just the macro-tile geometry.
+      configs.insert(
+          configs.begin(),
+          MakeConfig(/*block_m=*/16, /*block_n=*/64, /*block_k=*/128,
+                     /*num_warps=*/4,
+                     FlyGemmConfig::FLY_MFMA_16X16X16,
+                     /*prefetch_rhs=*/false, /*stage_output=*/false,
+                     /*waves_per_eu=*/0, /*schedule_instructions=*/true,
+                     /*stage_rhs=*/true, /*async_lhs=*/false,
+                     /*preload_lds_fragments=*/true));
+    }
+  }
+  if (has_lhs_contracting_scale) {
+    if (dot->shape().dimensions_size() == 2 && m == 4 && n % 128 == 0 &&
+        k % 128 == 0 && rhs_column_contiguous &&
+        dot->operand(0)->shape().element_type() == BF16 &&
+        dot->operand(1)->shape().element_type() == BF16) {
+      // Keep the learned per-K scale inside the MFMA4 decoder projection.
+      // Returning before this candidate forces Fly fission to materialize a
+      // 4xK temporary, while Triton folds the same multiply/rounding producer
+      // into its GEMM. The xTile GEMV emitter accepts this exact producer and
+      // applies the scale as the live LHS tile is loaded.
+      configs.insert(
+          configs.begin(),
+          MakeGemvConfig(/*block_m=*/4, /*block_n=*/128, /*num_warps=*/8,
+                         /*outputs_per_wave=*/1, /*k_vector_width=*/1,
+                         FlyGemmConfig::FLY_MFMA_4X4X4_BF16,
+                         /*split_k=*/false, /*block_k=*/128));
+    }
+    // Only the dedicated decoder GEMV family and its staged M16 variants
+    // lower this exact learned-scale producer grammar.
+    return configs;
+  }
+
   if (is_f16) {
     add_generic_gemm_configs();
     // The ordinary two-operand LDS paths use the same 16-bit fragment layout
@@ -1548,10 +1899,35 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   }
 
   if (global_split_k) {
+    // A rank-three BF16 contraction with an FP32 output is structurally
+    // indistinguishable from XLA split-K when the LHS stores its batch between
+    // M and K. Decoder attention and MLP projections use exactly that layout
+    // for small M. Keep the ordinary predicated MFMA tile in the search: the
+    // emitter derives all batch/contracting dimensions from the dot and the
+    // minimal M16 tile safely masks the unused rows.
+    if (m < 16) {
+      add_generic_gemm_configs();
+    }
+    if (m == 4 && n % 64 == 0 && k >= 128 && rhs_column_contiguous && !is_f32 &&
+        !is_fp8 && !is_int4 && !is_block_scaled_dot &&
+        !has_lhs_contracting_scale &&
+        dot->operand(0)->shape().element_type() == BF16 &&
+        dot->operand(1)->shape().element_type() == BF16) {
+      // Decoder MLP-down dots put their real batch dimension between M and K,
+      // which is structurally identical to an XLA global split-K partial.
+      // Triton's selected kernel still treats it as a batched M4/N64/K128
+      // projection: both waves stage B and one live wave executes MFMA4.
+      configs.insert(
+          configs.begin(),
+          MakeGemvConfig(/*block_m=*/4, /*block_n=*/64, /*num_warps=*/2,
+                         /*outputs_per_wave=*/1, /*k_vector_width=*/1,
+                         FlyGemmConfig::FLY_MFMA_4X4X4_BF16,
+                         /*split_k=*/false, /*block_k=*/128));
+    }
     // Global split-K partials are FP32 and XLA owns the final reduction. Only
     // offer the A+B LDS pipelines whose global accesses are explicitly
     // batch-aware; generic rank-2 tensor-indexing candidates remain excluded.
-    if (k >= 512) {
+    if (k >= 512 && m >= 16) {
       add_staged_rhs_configs(/*block_m=*/64, /*block_n=*/32,
                              /*block_k=*/128,
                              /*num_warps_values=*/{2, 4});
@@ -1828,10 +2204,26 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       }
     }
   }
-  // Row-major RHS needs a K/N register transpose before LDS. Pair adjacent K
-  // rows, then overlap the single-buffer refill with the second half of the
-  // MFMA tile. Four K128 stages are already sufficient to amortize this
-  // pipeline in batched K512 GEMMs.
+  // Row-major RHS needs a K/N register transpose before LDS. For shallow M,
+  // keep one MFMA32 output atom per wave: the 32x64 tile exposes four times as
+  // many workgroups as the repository's 128x64 geometry while preserving the
+  // same four coalesced A vectors per thread. This is important for projection
+  // GEMMs whose concatenated N dimension is large but M cannot fill gfx942.
+  if (k >= 256 && !rhs_k_contiguous && m % 32 == 0 && n % 64 == 0 &&
+      k % 128 == 0) {
+    configs.push_back(MakeConfig(
+        /*block_m=*/32, /*block_n=*/64, /*block_k=*/128,
+        /*num_warps=*/2, FlyGemmConfig::FLY_MFMA_32X32X8,
+        /*prefetch_rhs=*/false, /*stage_output=*/false,
+        /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+        /*stage_rhs=*/true, /*async_lhs=*/false,
+        /*preload_lds_fragments=*/true,
+        /*single_buffer_lds=*/true, /*direct_to_vgpr=*/false,
+        /*rolling_refill=*/true));
+  }
+  // Pair adjacent K rows, then overlap the single-buffer refill with the
+  // second half of the MFMA tile. Four K128 stages are already sufficient to
+  // amortize this pipeline in batched K512 GEMMs.
   if (k >= 256 && !rhs_k_contiguous && m % 128 == 0 && n % 64 == 0 &&
       k % 128 == 0) {
     configs.push_back(MakeConfig(
@@ -2088,6 +2480,22 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   }
 
   add_generic_gemm_configs();
+  if (dot->shape().dimensions_size() == 2 && m == 4 && n % 128 == 0 &&
+      k % 128 == 0 && rhs_column_contiguous &&
+      !is_f32 && !is_fp8 && !is_int4 && !is_block_scaled_dot &&
+      dot->operand(0)->shape().element_type() == BF16 &&
+      dot->operand(1)->shape().element_type() == BF16) {
+    // Triton's successful decoder projection maps one Wave64 to a native
+    // 4x64 output atom. Eight waves cooperatively transpose a K128xN128 RHS
+    // tile into LDS; the two live N waves use CBSZ/ABID MFMA4 while the
+    // padded-M waves provide the copy bandwidth and latency hiding.
+    configs.insert(
+        configs.begin(),
+        MakeGemvConfig(/*block_m=*/4, /*block_n=*/128, /*num_warps=*/8,
+                       /*outputs_per_wave=*/1, /*k_vector_width=*/1,
+                       FlyGemmConfig::FLY_MFMA_4X4X4_BF16,
+                       /*split_k=*/false, /*block_k=*/128));
+  }
   if (has_output_transpose && rhs_k_contiguous && m % 64 == 0 && n % 64 == 0 &&
       k % 32 == 0) {
     // The context-layout epilogue stores four contiguous M values directly
@@ -2120,9 +2528,17 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
             [&](const std::unique_ptr<BackendConfig>& config) {
               const FlyGemmConfig& fly = config->fly();
               return (lhs_concat.has_value() &&
-                      lhs_concat->fragment_size % fly.block_m() != 0) ||
+                      !absl::c_all_of(
+                          lhs_concat->fragment_sizes,
+                          [&](int64_t size) {
+                            return size % fly.block_m() == 0;
+                          })) ||
                      (rhs_concat.has_value() &&
-                      rhs_concat->fragment_size % fly.block_n() != 0);
+                      !absl::c_all_of(
+                          rhs_concat->fragment_sizes,
+                          [&](int64_t size) {
+                            return size % fly.block_n() == 0;
+                          }));
             }),
         configs.end());
   }
@@ -2132,6 +2548,50 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                        [](const std::unique_ptr<BackendConfig>& config) {
                          return !config->fly().stage_output();
                        }),
+        configs.end());
+  }
+  if (m >= 2 && m <= 8) {
+    // Generic configuration families were designed around complete MFMA
+    // macro-tiles. Once the emitter admits a masked M tail, discard shapes
+    // that cannot assign at least one output atom per compute wave. For an
+    // LDS-staged tail, also retain only the dedicated M16 family and require
+    // both cooperative copies to divide evenly across the workgroup.
+    const int64_t copy_elements = is_f32 ? 4 : (is_fp8 ? 8 : 2);
+    configs.erase(
+        std::remove_if(
+            configs.begin(), configs.end(),
+            [&](const std::unique_ptr<BackendConfig>& config) {
+              const FlyGemmConfig& fly = config->fly();
+              if (fly.gemv_outputs_per_wave() != 0) {
+                return false;
+              }
+              const bool atom_32 =
+                  fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X8 ||
+                  fly.mfma_atom() ==
+                      FlyGemmConfig::FLY_MFMA_32X32X16_FP8 ||
+                  fly.mfma_atom() ==
+                      FlyGemmConfig::FLY_MFMA_32X32X2_F32 ||
+                  fly.mfma_atom() ==
+                      FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
+              const int64_t atom_m = atom_32 ? 32 : 16;
+              const int64_t output_waves =
+                  fly.num_warps() / (fly.local_split_k() ? 2 : 1);
+              if ((fly.block_m() / atom_m) * (fly.block_n() / atom_m) <
+                  output_waves) {
+                return true;
+              }
+              if (!fly.stage_rhs()) {
+                return false;
+              }
+              const int64_t threads = fly.num_warps() * 64;
+              return fly.block_m() != 16 ||
+                     (fly.block_m() * fly.block_k() / copy_elements) %
+                             threads !=
+                         0 ||
+                     (fly.block_n() * fly.block_k() / copy_elements) %
+                             threads !=
+                         0;
+            }),
         configs.end());
   }
   return configs;
@@ -2167,10 +2627,18 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
   const int64_t output_rank = dot->shape().dimensions_size();
   const bool is_gemv = dot->shape().dimensions(output_rank - 2) == 1 ||
                        dot->shape().dimensions(output_rank - 1) == 1;
+  const bool is_small_m_gemv =
+      dot->shape().dimensions(output_rank - 2) >= 2 &&
+      dot->shape().dimensions(output_rank - 2) <= 8 &&
+      dot->shape().dimensions(output_rank - 1) > 1 &&
+      fly_config.block_m() ==
+          dot->shape().dimensions(output_rank - 2) &&
+      fly_config.gemv_outputs_per_wave() != 0;
   // Scalar/vector GEMV configs use the dedicated Fly GEMV emitter.  The
   // cooperative MFMA candidate is structurally a tiled GEMM with a masked
   // M-tail and must therefore use the xTile GEMM emitter.
-  fusion_config->set_kind(is_gemv && !fly_config.local_split_k()
+  fusion_config->set_kind((is_gemv || is_small_m_gemv) &&
+                              !fly_config.local_split_k()
                               ? kFlyGemvFusionKind
                               : kFlyGemmFusionKind);
   *fusion_config->mutable_fly_gemm_config() = fly_config;
@@ -2203,6 +2671,12 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
     return false;
   }
   const auto* fusion = Cast<const HloFusionInstruction>(&instr);
+  // A parameter-free scalar fusion is compile-time constant materialization.
+  // Leave it out of autotuning; FlyAutotuneCleanup evaluates it after backend
+  // selection so it cannot become a standalone GPU launch.
+  if (fusion->operand_count() == 0 && ShapeUtil::IsScalar(fusion->shape())) {
+    return false;
+  }
   bool is_generic_block_fusion = false;
   if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
     auto gpu_config = instr.backend_config<GpuBackendConfig>();
@@ -2590,21 +3064,76 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
           });
   const bool has_native_leading_reduction =
       is_native_elementwise &&
+      absl::c_any_of(instr.fused_instructions_computation()->instructions(),
+                     [](const HloInstruction* instruction) {
+                       return instruction->opcode() == HloOpcode::kReduce &&
+                              instruction->dimensions().size() == 1 &&
+                              instruction->dimensions(0) == 0;
+                     });
+  const bool has_native_cooperative_strided_reduction =
+      is_native_elementwise &&
       absl::c_any_of(
           instr.fused_instructions_computation()->instructions(),
           [](const HloInstruction* instruction) {
-            return instruction->opcode() == HloOpcode::kReduce &&
-                   instruction->dimensions().size() == 1 &&
-                   instruction->dimensions(0) == 0;
+            if (instruction->opcode() != HloOpcode::kReduce ||
+                instruction->dimensions().size() != 1 ||
+                instruction->operand_count() != 2 ||
+                instruction->shape().element_type() != F32 ||
+                instruction->operand(0)->shape().element_type() != F32) {
+              return false;
+            }
+            const Shape& input = instruction->operand(0)->shape();
+            const int64_t reduction_dimension = instruction->dimensions(0);
+            if (reduction_dimension <= 0 ||
+                reduction_dimension >= input.dimensions_size() - 1 ||
+                input.dimensions(reduction_dimension) % 4 != 0) {
+              return false;
+            }
+            int64_t inner_elements = 1;
+            for (int64_t dimension = reduction_dimension + 1;
+                 dimension < input.dimensions_size(); ++dimension) {
+              inner_elements *= input.dimensions(dimension);
+            }
+            return inner_elements % 256 == 0;
           });
-  const bool is_native_slice =
+  const bool has_native_arbitrary_broadcast =
       is_native_indexed &&
-      (hlo_query::GetFirstInstructionWithOpcode(
-           *instr.fused_instructions_computation(), HloOpcode::kSlice) !=
-           nullptr ||
-       hlo_query::GetFirstInstructionWithOpcode(
-           *instr.fused_instructions_computation(),
-           HloOpcode::kDynamicSlice) != nullptr);
+      absl::c_any_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* instruction) {
+            if (instruction->opcode() != HloOpcode::kBroadcast ||
+                instruction->operand_count() != 1 ||
+                ShapeUtil::IsScalar(instruction->operand(0)->shape())) {
+              return false;
+            }
+            const int64_t input_rank =
+                instruction->operand(0)->shape().dimensions_size();
+            const int64_t output_rank = instruction->shape().dimensions_size();
+            bool leading = instruction->dimensions().size() == input_rank;
+            bool trailing = leading;
+            for (int64_t dimension = 0; dimension < input_rank; ++dimension) {
+              leading &= instruction->dimensions(dimension) == dimension;
+              trailing &= instruction->dimensions(dimension) ==
+                          output_rank - input_rank + dimension;
+            }
+            return !leading && !trailing;
+          });
+  const bool has_native_nonleading_concatenate =
+      is_native_indexed &&
+      absl::c_any_of(instr.fused_instructions_computation()->instructions(),
+                     [](const HloInstruction* instruction) {
+                       return instruction->opcode() ==
+                                  HloOpcode::kConcatenate &&
+                              instruction->dimensions().size() == 1 &&
+                              instruction->dimensions(0) != 0;
+                     });
+  const bool is_native_slice =
+      is_native_indexed && (hlo_query::GetFirstInstructionWithOpcode(
+                                *instr.fused_instructions_computation(),
+                                HloOpcode::kSlice) != nullptr ||
+                            hlo_query::GetFirstInstructionWithOpcode(
+                                *instr.fused_instructions_computation(),
+                                HloOpcode::kDynamicSlice) != nullptr);
   const bool is_native_dynamic_update =
       is_native_indexed &&
       hlo_query::GetFirstInstructionWithOpcode(
@@ -2648,6 +3177,10 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     if (unroll <= 0 || unroll > elements) {
       return;
     }
+    if (has_native_cooperative_strided_reduction && num_warps == 4 &&
+        vector_size_bits == 128 && unroll != 1) {
+      return;
+    }
     const bool scalarized_wide_s4_output =
         analysis.first_result_shape().element_type() == S4 &&
         vector_size_bits == 16;
@@ -2682,8 +3215,53 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   };
 
   if (is_native_indexed) {
-    const int64_t scalar_bits = primitive_util::BitWidth(
-        analysis.first_result_shape().element_type());
+    const int64_t scalar_bits =
+        primitive_util::BitWidth(analysis.first_result_shape().element_type());
+    if (has_native_arbitrary_broadcast) {
+      // A wide vector amortizes the row-major dimension-map calculation. The
+      // emitter carries middle-dimension broadcast values across striped
+      // output vectors, so rank the measured gfx942 reuse schedules before
+      // the generic indexed-fusion search consumes the top-k budget.
+      constexpr std::array<std::array<int64_t, 4>, 8> kBroadcastConfigs = {{
+          {8, 8, 64, 0},
+          {8, 8, 64, 2},
+          {8, 8, 64, 4},
+          {1, 8, 128, 0},
+          {1, 8, 128, 2},
+          {1, 8, 128, 4},
+          {4, 4, 128, 0},
+          {4, 4, 128, 4},
+      }};
+      for (const auto& [unroll, num_warps, vector_size_bits, waves_per_eu] :
+           kBroadcastConfigs) {
+        add_config(unroll, num_warps, vector_size_bits, waves_per_eu);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
+    if (has_native_nonleading_concatenate) {
+      // A middle/minor concatenate repeats each operand segment for every
+      // outer coordinate. Rank the measured gfx942 128-bit schedules that
+      // amortize the segment remapping and keep full-vector copies on the
+      // ordinary path; only vectors crossing a segment edge scalarize.
+      constexpr std::array<std::array<int64_t, 3>, 8> kConcatConfigs = {{
+          {4, 4, 128},
+          {4, 2, 128},
+          {2, 4, 128},
+          {4, 8, 128},
+          {2, 2, 128},
+          {8, 4, 128},
+          {4, 4, 64},
+          {8, 4, 64},
+      }};
+      for (const auto& [unroll, num_warps, vector_size_bits] : kConcatConfigs) {
+        add_config(unroll, num_warps, vector_size_bits);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
     if (is_native_reduce_window) {
       // Sliding windows reuse overlapping input spans in registers. Put the
       // 128-bit geometries that minimize global transactions ahead of the
@@ -2794,6 +3372,16 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
   }
 
   if (is_native_elementwise) {
+    if (has_native_cooperative_strided_reduction) {
+      // Split a non-minor reduction across four Wave64s while each lane loads
+      // four contiguous output columns. This is the native Fly equivalent of
+      // Triton's cooperative [1, 256] reduction tile on gfx942.
+      add_config(/*unroll=*/1, /*num_warps=*/4,
+                 /*vector_size_bits=*/128);
+      if (configs.size() >= max_elementwise_configs) {
+        return configs;
+      }
+    }
     if (has_native_leading_reduction) {
       // Leading reductions run one independent accumulator per output lane.
       // A single Wave64 block with a 64-bit output vector reaches the MI300X

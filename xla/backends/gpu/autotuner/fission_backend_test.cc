@@ -122,6 +122,22 @@ TEST(FlyFissionConfigPolicyTest, PreservesMandatoryStagedOutputVariants) {
   EXPECT_TRUE(configs[1]->fly().stage_output());
 }
 
+TEST(FlyFissionConfigPolicyTest, KeepsWideSmallMDecoderTile) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(MakeFlyConfig(16, 128, 64, 8, true));
+  configs.push_back(MakeFlyConfig(16, 128, 64, 4));
+
+  configs = OptimizeFlyFissionConfigSet(
+      std::move(configs), /*restrict_to_mi300_default_tiles=*/true);
+
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_EQ(configs[0]->fly().block_m(), 16);
+  EXPECT_EQ(configs[0]->fly().block_n(), 128);
+  EXPECT_EQ(configs[0]->fly().block_k(), 64);
+  EXPECT_EQ(configs[0]->fly().num_warps(), 8);
+  EXPECT_TRUE(configs[0]->fly().prefetch_rhs());
+}
+
 TEST(FlyFissionConfigPolicyTest, KeepsDefaultWhenNoTilePriorMatches) {
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.push_back(MakeFlyConfig(48, 48, 48, 3));

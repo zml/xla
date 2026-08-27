@@ -16,6 +16,8 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/softmax_support.h"
 
 #include <limits>
+#include <optional>
+#include <utility>
 
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/shape_util.h"
@@ -139,6 +141,55 @@ const HloInstruction* GetStableSoftmaxF32Input(const HloInstruction& root) {
   return input;
 }
 
+std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
+GetExternalRowSoftmaxF32Inputs(const HloInstruction& root) {
+  const PrimitiveType element_type = root.shape().element_type();
+  if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
+      root.shape().dimensions_size() < 2) {
+    return std::nullopt;
+  }
+  const HloInstruction* normalized = &root;
+  if (element_type != F32) {
+    if (root.opcode() != HloOpcode::kConvert || root.operand_count() != 1 ||
+        root.operand(0)->shape().element_type() != F32) {
+      return std::nullopt;
+    }
+    normalized = root.operand(0);
+  }
+  if (normalized->opcode() != HloOpcode::kDivide ||
+      normalized->operand_count() != 2) {
+    return std::nullopt;
+  }
+  const HloInstruction* exponential = normalized->operand(0);
+  const HloInstruction* row_sum =
+      BroadcastOperand(normalized->operand(1), exponential->shape());
+  const HloInstruction* sum_reduction =
+      row_sum == nullptr
+          ? nullptr
+          : GetRowReduction(row_sum, HloOpcode::kAdd, exponential);
+  if (exponential->opcode() != HloOpcode::kExp || sum_reduction == nullptr ||
+      !IsScalarConstant(sum_reduction->operand(1), 0.0)) {
+    return std::nullopt;
+  }
+  const HloInstruction* shifted = exponential->operand(0);
+  if (shifted->opcode() != HloOpcode::kSubtract ||
+      shifted->operand_count() != 2) {
+    return std::nullopt;
+  }
+  const HloInstruction* input = shifted->operand(0);
+  const HloInstruction* row_offset =
+      BroadcastOperand(shifted->operand(1), input->shape());
+  const int64_t input_rank = input->shape().dimensions_size();
+  if (row_offset == nullptr || row_offset->opcode() != HloOpcode::kParameter ||
+      row_offset->shape().element_type() != F32 || input_rank < 2 ||
+      !ShapeUtil::SameDimensions(
+          row_offset->shape(),
+          ShapeUtil::DeleteDimension(input_rank - 1, input->shape()))) {
+    return std::nullopt;
+  }
+  return std::pair(input, row_offset);
+}
+
 bool HasCompatibleSoftmaxShape(const HloInstruction& root,
                                const HloInstruction& input) {
   if (ShapeUtil::ElementsIn(root.shape()) !=
@@ -161,6 +212,11 @@ bool HasCompatibleSoftmaxShape(const HloInstruction& root,
 const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
   const HloInstruction* converted = GetStableSoftmaxF32Input(root);
+  if (converted == nullptr) {
+    std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
+        external = GetExternalRowSoftmaxF32Inputs(root);
+    converted = external.has_value() ? external->first : nullptr;
+  }
   if (converted == nullptr) {
     return nullptr;
   }
@@ -187,6 +243,13 @@ const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
     return nullptr;
   }
   return input;
+}
+
+const HloInstruction* GetFlySoftmaxExternalRowOffset(
+    const HloInstruction& root) {
+  std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
+      external = GetExternalRowSoftmaxF32Inputs(root);
+  return external.has_value() ? external->second : nullptr;
 }
 
 const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root) {
@@ -217,6 +280,14 @@ bool IsFlySoftmaxRoot(const HloInstruction& root) {
           ShapeUtil::ElementsIn(parameter->shape())) {
     return false;
   }
+  const HloInstruction* external_row_offset =
+      GetFlySoftmaxExternalRowOffset(root);
+  if (external_row_offset != nullptr &&
+      (external_row_offset->parent() != root.parent() ||
+       external_row_offset->parameter_number() ==
+           parameter->parameter_number())) {
+    return false;
+  }
   const int64_t columns =
       root.shape().dimensions(root.shape().dimensions_size() - 1);
   if (parameter->shape().dimensions_size() < 2 ||
@@ -228,8 +299,13 @@ bool IsFlySoftmaxRoot(const HloInstruction& root) {
 }
 
 bool IsFlySoftmaxFusion(const HloFusionAnalysis& analysis) {
-  return analysis.fusion_root_count() == 1 &&
-         IsFlySoftmaxRoot(analysis.fusion_root(0).instruction());
+  if (analysis.fusion_root_count() != 1 ||
+      !IsFlySoftmaxRoot(analysis.fusion_root(0).instruction())) {
+    return false;
+  }
+  const HloInstruction& root = analysis.fusion_root(0).instruction();
+  return root.parent()->num_parameters() ==
+         (GetFlySoftmaxExternalRowOffset(root) == nullptr ? 1 : 2);
 }
 
 }  // namespace xla::gpu::flydsl
