@@ -69,7 +69,7 @@ struct DotDimensions {
   int64_t flops_per_element;
 };
 
-int64_t GetAlgoritmFlopsPerElement(const HloDotInstruction* dot) {
+int64_t GetAlgoritmFlopsPerElement(const HloInstruction* dot) {
   switch (dot->precision_config().algorithm()) {
     case PrecisionConfig::ALG_DOT_BF16_BF16_F32_X3:
     case PrecisionConfig::ALG_DOT_TF32_TF32_F32_X3:
@@ -83,8 +83,14 @@ int64_t GetAlgoritmFlopsPerElement(const HloDotInstruction* dot) {
   }
 }
 
-DotDimensions GetDotDimensions(const HloInstruction* instr) {
-  const HloDotInstruction* dot = Cast<HloDotInstruction>(instr);
+PrimitiveType GetAccumulatorType(const HloInstruction* instr) {
+  if (instr->opcode() == HloOpcode::kScaledDot) {
+    return F32;
+  }
+  return GetGemmAccumulatorType(Cast<HloDotInstruction>(instr));
+}
+
+DotDimensions GetDotDimensions(const HloInstruction* dot) {
   const Shape& lhs_shape = dot->operand(0)->shape();
   const Shape& rhs_shape = dot->operand(1)->shape();
   DotDimensionNumbers dnums = dot->dot_dimension_numbers();
@@ -121,8 +127,7 @@ DotDimensions GetDotDimensions(const HloInstruction* instr) {
       /* .lhs_el_size_in_bits = */ get_side_size(dot->operand(0)),
       /* .rhs_el_size_in_bits = */ get_side_size(dot->operand(1)),
       /* .acc_el_size_in_bits = */
-      ShapeUtil::ByteSizeOfPrimitiveType(GetGemmAccumulatorType(dot)) *
-          CHAR_BIT,
+      ShapeUtil::ByteSizeOfPrimitiveType(GetAccumulatorType(dot)) * CHAR_BIT,
       /* .result_el_size_in_bits = */
       ShapeUtil::ElementSizeInBits(dot->shape()),
       /* .flops_per_element = */ GetAlgoritmFlopsPerElement(dot),
@@ -130,6 +135,8 @@ DotDimensions GetDotDimensions(const HloInstruction* instr) {
 }
 
 namespace {
+
+constexpr double kSplitKTargetWaves = 2.0;
 
 constexpr int64_t kMTileSize = 128;
 constexpr int64_t kNTileSize = 128;
@@ -209,6 +216,29 @@ double EstimateGemmCostAfterSplitK(const DotDimensions& gemm, int64_t splitk,
                           weights.reduction_memory_cost_weight;
 
   return total_dot_cost + weights.reduction_launch_overhead + reduction_cost;
+}
+
+size_t SplitKForOccupancy(const DotDimensions& dims,
+                          const se::DeviceDescription& device_description,
+                          double target_waves) {
+  if (target_waves <= 0.0) {
+    return 1;
+  }
+  const int64_t tiles = CeilOfRatio(dims.m, kMTileSize) *
+                        CeilOfRatio(dims.n, kNTileSize) * std::max<int64_t>(dims.b, 1);
+  const int64_t cores = device_description.core_count();
+  if (tiles <= 0 || tiles >= cores) {
+    return 1;
+  }
+  const int64_t want = static_cast<int64_t>(target_waves * cores);
+  if (tiles >= want) {
+    return 1;
+  }
+  size_t split = 1;
+  while (split < 64 && tiles * static_cast<int64_t>(split) < want) {
+    split *= 2;
+  }
+  return split;
 }
 
 size_t ChooseSplitK(const DotDimensions& dims,
@@ -368,6 +398,57 @@ absl::StatusOr<HloInstruction*> SplitKDimensionOfDot(HloDotInstruction* src_dot,
   return splitk_root;
 }
 
+using ScaledDotOperandDims = std::array<DotOperandDims, 4>;
+
+absl::StatusOr<HloInstruction*> SplitKDimensionOfScaledDot(
+    HloInstruction* src_dot, int64_t split_k) {
+  const PrimitiveType output_type = src_dot->shape().element_type();
+  const PrimitiveType accumulator_type = GetAccumulatorType(src_dot);
+
+  ABSL_ASSIGN_OR_RETURN(ScaledDotOperandDims dims,
+                   DotOperandDims::FromScaledDot(src_dot));
+  std::array<HloInstruction*, 4> operands;
+  std::array<int64_t, 4> k_indices;
+  for (int i = 0; i < 4; ++i) {
+    k_indices[i] = dims[i].Indices(DotOperandDims::kContracting)[0];
+    HloInstruction* operand = src_dot->mutable_operand(i);
+    operands[i] = SplitKOperand(operand, k_indices[i], split_k,
+                                operand->shape().dimensions(k_indices[i]));
+  }
+
+  std::optional<int64_t> insertion_idx = std::nullopt;
+  for (int i : {0, 1}) {
+    ABSL_ASSIGN_OR_RETURN(insertion_idx,
+                     dims[i].InsertDimension(DotOperandDims::kBatch,
+                                             k_indices[i], split_k,
+                                             insertion_idx));
+    ABSL_RETURN_IF_ERROR(dims[i].SetShape(operands[i]->shape()));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(DotDimensionNumbers new_dnums,
+                   DotOperandDims::CreateDotDimensionNumbers(dims[0], dims[1]));
+  ABSL_ASSIGN_OR_RETURN(
+      Shape new_shape,
+      DotOperandDims::ComputeOutputShape(accumulator_type, dims[0], dims[1]));
+
+  HloInstruction* new_dot = src_dot->parent()->AddInstruction(
+      HloInstruction::CreateScaledDot(new_shape, operands[0], operands[1],
+                                      operands[2], operands[3], new_dnums,
+                                      src_dot->precision_config()),
+      &src_dot->metadata());
+
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t splitk_dim_idx,
+      dims[0].IndexWithinCategory(DotOperandDims::kBatch, k_indices[0]));
+  ABSL_ASSIGN_OR_RETURN(HloInstruction * splitk_root,
+                   ReduceDimension(new_dot, splitk_dim_idx));
+  *splitk_root->mutable_shape()->mutable_layout() = src_dot->shape().layout();
+  if (output_type != accumulator_type) {
+    splitk_root = MakeConvertToHlo(splitk_root, output_type);
+  }
+  return splitk_root;
+}
+
 bool FeedsFromBlockScaledDequantize(const HloInstruction* operand) {
   constexpr int kMaxVisited = 32;
   std::vector<const HloInstruction*> worklist = {operand};
@@ -434,6 +515,40 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
     }
     ABSL_ASSIGN_OR_RETURN(HloInstruction * new_dot,
                      SplitKDimensionOfDot(dot, split_k));
+    ABSL_RETURN_IF_ERROR(ReplaceInstruction(instr, new_dot));
+    return absl::OkStatus();
+  }
+
+  absl::Status HandleScaledDot(HloInstruction* instr) override {
+    const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
+    if (dnums.lhs_contracting_dimensions_size() != 1 ||
+        dnums.rhs_contracting_dimensions_size() != 1) {
+      return absl::OkStatus();
+    }
+    size_t split_k = 0;
+    {
+      split_k = ChooseSplitK(GetDotDimensions(instr), device_description_);
+      split_k = std::max<size_t>(
+          split_k, SplitKForOccupancy(GetDotDimensions(instr),
+                                      device_description_,
+                                      kSplitKTargetWaves));
+    }
+    if (split_k == 1) {
+      return absl::OkStatus();
+    }
+    ABSL_ASSIGN_OR_RETURN(ScaledDotOperandDims dims,
+                     DotOperandDims::FromScaledDot(instr));
+    for (int i = 0; i < 4; ++i) {
+      absl::Span<const int64_t> contracting =
+          dims[i].Indices(DotOperandDims::kContracting);
+      if (contracting.size() != 1 ||
+          instr->operand(i)->shape().dimensions(contracting[0]) % split_k !=
+              0) {
+        return absl::OkStatus();
+      }
+    }
+    ABSL_ASSIGN_OR_RETURN(HloInstruction * new_dot,
+                     SplitKDimensionOfScaledDot(instr, split_k));
     ABSL_RETURN_IF_ERROR(ReplaceInstruction(instr, new_dot));
     return absl::OkStatus();
   }
