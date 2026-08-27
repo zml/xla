@@ -26,8 +26,10 @@ limitations under the License.
 
 #include "absl/algorithm/container.h"
 #include "absl/functional/function_ref.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -57,11 +59,17 @@ using tsl::profiler::TraceMeEncode;
 // CommandBufferThunk
 //===----------------------------------------------------------------------===//
 
-CommandBufferThunk::ExecutorCommandBuffer::ExecutorCommandBuffer(
+CommandBufferThunk::CommandBufferEntry::CommandBufferEntry(
     std::unique_ptr<se::CommandBuffer> command_buffer)
     : command_buffer(std::move(command_buffer)) {}
 
-bool CommandBufferThunk::ExecutorCommandBuffer::HasDynamicAllocations(
+CommandBufferThunk::ExecutorCommandBufferCache::ExecutorCommandBufferCache(
+    int64_t capacity)
+    : capacity(capacity) {
+  CHECK_GT(capacity, 0);
+}
+
+bool CommandBufferThunk::ExecutorCommandBufferCache::HasDynamicAllocations(
     const CommandExecutor& commands,
     std::optional<absl::Span<const BufferAllocation::Index>>
         persistent_alloc_indices) {
@@ -75,16 +83,160 @@ bool CommandBufferThunk::ExecutorCommandBuffer::HasDynamicAllocations(
                            commands.allocs_indices());
 }
 
+absl::StatusOr<CommandBufferThunk::CommandBufferSelection>
+CommandBufferThunk::ExecutorCommandBufferCache::Select(
+    se::StreamExecutor* executor, const CommandExecutor& commands,
+    const Thunk::ExecuteParams& params) {
+  std::vector<BufferAllocation::Index> dynamic_alloc_indices;
+  absl::Span<const BufferAllocation::Index> allocs_to_check =
+      commands.allocs_indices();
+  if (const auto& persistent_alloc_indices = params.persistent_alloc_indices) {
+    DCHECK(absl::c_is_sorted(commands.allocs_indices()));
+    DCHECK(absl::c_is_sorted(*persistent_alloc_indices));
+    absl::c_set_difference(commands.allocs_indices(), *persistent_alloc_indices,
+                           std::back_inserter(dynamic_alloc_indices));
+    allocs_to_check = dynamic_alloc_indices;
+  }
+
+  std::vector<se::DeviceAddressBase> current_allocs;
+  for (BufferAllocation::Index index : allocs_to_check) {
+    if (current_allocs.size() <= index) {
+      current_allocs.resize(index + 1);
+    }
+    current_allocs[index] = params.buffer_allocations->GetDeviceAddress(index);
+  }
+
+  auto move_to_front = [&](size_t index) -> CommandBufferEntry* {
+    mutex.AssertHeld();
+    if (index != 0) {
+      std::unique_ptr<CommandBufferEntry> entry = std::move(entries[index]);
+      do {
+        entries[index] = std::move(entries[index - 1]);
+      } while (--index > 0);
+      entries[0] = std::move(entry);
+    }
+    return entries[0].get();
+  };
+
+  bool persistent_allocs_info_is_valid =
+      params.persistent_alloc_indices.has_value();
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i]->persistent_allocs_info_was_valid ==
+            persistent_allocs_info_is_valid &&
+        absl::c_equal(entries[i]->recorded_allocs, current_allocs)) {
+      ++cache_hits;
+      CommandBufferEntry* entry = move_to_front(i);
+      XLA_VLOG_DEVICE(3, executor->device_ordinal())
+          << "Command buffer cache hit"
+          << "; cache=" << this << "; entry=" << entry
+          << "; entries=" << entries.size() << "; capacity=" << capacity
+          << "; hits=" << cache_hits << "; misses=" << cache_misses
+          << "; evictions=" << cache_evictions;
+      TraceMe trace([&] {
+        mutex.AssertHeld();
+        return TraceMeEncode(
+            "command_buffer::cache_hit",
+            {{"device", executor->device_ordinal()},
+             {"entries", entries.size()},
+             {"capacity", capacity}});
+      });
+      return CommandBufferSelection{entry, CacheLookup::kHit,
+                                    std::move(current_allocs), {}, false};
+    }
+  }
+
+  ++cache_misses;
+  CacheLookup lookup = CacheLookup::kMiss;
+  CommandBufferEntry* entry;
+  if (static_cast<int64_t>(entries.size()) < capacity) {
+    ASSIGN_OR_RETURN(
+        std::unique_ptr<se::CommandBuffer> command_buffer,
+        executor->CreateCommandBuffer(se::CommandBuffer::Mode::kPrimary));
+    entries.insert(entries.begin(), std::make_unique<CommandBufferEntry>(
+                                        std::move(command_buffer)));
+    entry = entries.front().get();
+  } else {
+    lookup = CacheLookup::kEviction;
+    ++cache_evictions;
+    entry = move_to_front(entries.size() - 1);
+  }
+
+  bool persistent_allocs_info_is_changed =
+      entry->command_buffer->state() != se::CommandBuffer::State::kCreate &&
+      entry->persistent_allocs_info_was_valid !=
+          persistent_allocs_info_is_valid;
+  std::vector<BufferAllocation::Index> updated_allocs;
+  for (BufferAllocation::Index index : allocs_to_check) {
+    if (entry->recorded_allocs.size() <= index ||
+        !entry->recorded_allocs[index].IsSameAs(current_allocs[index])) {
+      updated_allocs.push_back(index);
+    }
+  }
+
+  const char* event_name = lookup == CacheLookup::kEviction
+                               ? "command_buffer::cache_evict"
+                               : "command_buffer::cache_miss";
+  XLA_VLOG_DEVICE(3, executor->device_ordinal())
+      << (lookup == CacheLookup::kEviction
+              ? "Command buffer cache miss (LRU replacement)"
+              : "Command buffer cache miss (empty slot)")
+      << "; cache=" << this << "; entry=" << entry
+      << "; entries=" << entries.size() << "; capacity=" << capacity
+      << "; hits=" << cache_hits << "; misses=" << cache_misses
+      << "; evictions=" << cache_evictions
+      << "; updated_allocs=" << updated_allocs.size()
+      << "; updated_alloc_indices=[" << absl::StrJoin(updated_allocs, ",")
+      << "]";
+  TraceMe trace([&] {
+    mutex.AssertHeld();
+    return TraceMeEncode(event_name,
+                         {{"device", executor->device_ordinal()},
+                          {"entries", entries.size()},
+                          {"capacity", capacity},
+                          {"updated_allocs", updated_allocs.size()}});
+  });
+
+  return CommandBufferSelection{entry, lookup, std::move(current_allocs),
+                                std::move(updated_allocs),
+                                persistent_allocs_info_is_changed};
+}
+
+void CommandBufferThunk::ExecutorCommandBufferCache::Discard(
+    CommandBufferEntry* entry) {
+  auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& item) {
+    return item.get() == entry;
+  });
+  if (it != entries.end()) {
+    entries.erase(it);
+  }
+}
+
 CommandBufferThunk::CommandBufferThunk(
     CommandExecutor commands, ThunkInfo thunk_info,
     std::unique_ptr<SequentialThunk> thunks,
-    bool enable_command_buffers_during_profiling)
+    bool enable_command_buffers_during_profiling,
+    int64_t command_buffer_cache_size)
     : Thunk(Thunk::kCommandBuffer, std::move(thunk_info)),
       commands_(std::move(commands)),
       thunks_(std::move(thunks)),
       enable_command_buffers_during_profiling_(
           enable_command_buffers_during_profiling),
+      command_buffer_cache_size_(command_buffer_cache_size),
       state_(std::make_shared<State>()) {
+  CHECK_GT(command_buffer_cache_size_, 0);
+  bool contains_collective = false;
+  commands_
+      .Walk([&](const Command* command) {
+        contains_collective |= command->IsCollective();
+        return absl::OkStatus();
+      })
+      .IgnoreError();
+  if (contains_collective && command_buffer_cache_size_ > 1) {
+    VLOG(1) << "Command buffer cache capacity is limited to 1 for a command "
+               "buffer containing collectives; requested capacity="
+            << command_buffer_cache_size_;
+    command_buffer_cache_size_ = 1;
+  }
   if (VLOG_IS_ON(5)) {
     absl::StatusOr<std::string> graph = commands_.RenderExecutionGraph();
     if (graph.ok()) {
@@ -109,42 +261,6 @@ CommandBufferThunk::CommandBufferThunk(
   // all have a pretty large LRU cache for keeping O(1000) XLA executables.
   EvictCommandBuffers();
   TrackCommandBuffers(state_);
-}
-
-std::vector<BufferAllocation::Index>
-CommandBufferThunk::ExecutorCommandBuffer::UpdateBufferAllocations(
-    const CommandExecutor& commands, const Thunk::ExecuteParams& params) {
-  std::vector<BufferAllocation::Index> updated_allocs;
-  const BufferAllocations* allocs = params.buffer_allocations;
-  absl::Span<const BufferAllocation::Index> allocs_to_check =
-      commands.allocs_indices();
-  std::vector<BufferAllocation::Index> dynamic_alloc_indices;
-
-  if (const auto& persistent_alloc_indices = params.persistent_alloc_indices) {
-    DCHECK(absl::c_is_sorted(commands.allocs_indices()));
-    DCHECK(absl::c_is_sorted(*persistent_alloc_indices));
-    absl::c_set_difference(commands.allocs_indices(), *persistent_alloc_indices,
-                           std::back_inserter(dynamic_alloc_indices));
-    allocs_to_check = dynamic_alloc_indices;
-  }
-
-  // We check only allocations referenced by commands in a cmd sequence, and
-  // leave every other entry default initialized (nullptr device memory).
-  for (BufferAllocation::Index index : allocs_to_check) {
-    se::DeviceAddressBase alloc = allocs->GetDeviceAddress(index);
-
-    if (recorded_allocs.size() <= index) {
-      recorded_allocs.resize(index + 1);
-      updated_allocs.push_back(index);
-    }
-
-    if (!recorded_allocs[index].IsSameAs(alloc)) {
-      recorded_allocs[index] = alloc;
-      updated_allocs.push_back(index);
-    }
-  }
-
-  return updated_allocs;
 }
 
 absl::Status CommandBufferThunk::Prepare(const PrepareParams& params) {
@@ -201,14 +317,14 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
     return absl::OkStatus();
   }
 
-  ASSIGN_OR_RETURN(std::shared_ptr<ExecutorCommandBuffer> cmd_buffer,
-                   GetOrCreateCommandBuffer(params.executor));
-  absl::MutexLock lock(cmd_buffer->mutex);
+  std::shared_ptr<ExecutorCommandBufferCache> cache =
+      GetOrCreateCommandBufferCache(params.executor);
+  absl::MutexLock lock(cache->mutex);
 
   // If there are no thunks, or command buffer does not require warmup,
   // we can mark warm up as done immediately.
   if (!thunks_ || !commands_.requires_warmup()) {
-    cmd_buffer->warmup_done = true;
+    cache->warmup_done = true;
   }
 
   // Construct ExecuteParams with empty fields for everything that is not needed
@@ -225,9 +341,13 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
       /*mock_collectives=*/false, /*execution_id=*/0,
       /*rng_seed=*/0, params.persistent_alloc_indices);
 
-  if (!cmd_buffer->warmup_done) {
+  if (!cache->warmup_done) {
     return absl::OkStatus();
   }
+
+  ASSIGN_OR_RETURN(CommandBufferSelection selection,
+                   cache->Select(params.executor, commands_, execute_params));
+  CommandBufferEntry* cmd_buffer = selection.entry;
 
   // If command buffer is in `kCreate` state it means that command buffer
   // sequence was never recorded into it. We initialize all command buffers
@@ -241,59 +361,70 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
   // participating ranks to avoid deadlocks. We also update an existing command
   // buffer when persistent allocation indices become available, because that
   // changes which commands can safely retain their recorded addresses.
-  bool has_dynamic_allocations = cmd_buffer->HasDynamicAllocations(
-      commands_, params.persistent_alloc_indices);
+  bool has_dynamic_allocations =
+      ExecutorCommandBufferCache::HasDynamicAllocations(
+          commands_, params.persistent_alloc_indices);
   bool is_first_record =
       cmd_buffer->command_buffer->state() == se::CommandBuffer::State::kCreate;
   bool persistent_allocs_info_is_valid =
       params.persistent_alloc_indices.has_value();
-  DCHECK(!cmd_buffer->persistent_allocs_info_was_valid ||
-         persistent_allocs_info_is_valid)
-      << "Persistent allocation information must remain valid once set";
-  if (is_first_record ||
-      (!cmd_buffer->persistent_allocs_info_was_valid &&
-       persistent_allocs_info_is_valid) ||
+  if (is_first_record || selection.lookup == CacheLookup::kEviction ||
+      selection.persistent_allocs_info_is_changed ||
       (has_dynamic_allocations && commands_.requires_update_on_initialize())) {
+    const char* initialization_reason =
+        is_first_record
+            ? "new_cache_entry"
+            : selection.persistent_allocs_info_is_changed
+                  ? "persistent_allocation_policy"
+                  : selection.lookup == CacheLookup::kEviction
+                        ? "cache_eviction"
+                        : "requires_update_on_initialize";
     VLOG(3) << "Initialize command buffer on device #"
             << params.executor->device_ordinal()
             << " by recoding command buffer cmd sequence"
             << "; num_commands=" << commands_.size()
             << "; persistent_allocs_info_is_valid="
-            << persistent_allocs_info_is_valid;
+            << persistent_allocs_info_is_valid
+            << "; reason=" << initialization_reason;
 
     TraceMe trace([&] {
       return TraceMeEncode("command_buffer::initialize",
                            {{"device", params.executor->device_ordinal()},
-                            {"num_commands", commands_.size()}});
+                            {"num_commands", commands_.size()},
+                            {"reason", initialization_reason}});
     });
 
     uint64_t start_micros = tsl::Env::Default()->NowMicros();
 
-    // Update recorded buffer allocations.
     std::optional<std::vector<BufferAllocation::Index>> updated_allocs =
-        cmd_buffer->UpdateBufferAllocations(commands_, execute_params);
+        std::move(selection.updated_allocs);
 
-    // Allocations can become persistent before their new addresses are
-    // observed by UpdateBufferAllocations. Force all commands to update so
-    // none retain addresses recorded before the policy became available.
-    if (!is_first_record && !cmd_buffer->persistent_allocs_info_was_valid &&
-        persistent_allocs_info_is_valid) {
+    // Force all commands to update when the persistent-allocation policy
+    // changes so none retain addresses recorded under the previous policy.
+    if (selection.persistent_allocs_info_is_changed) {
       updated_allocs.reset();
     }
 
     Command::RecordParams record_params = {cmd_buffer->state,
                                            std::move(updated_allocs),
                                            /*is_initialization=*/true};
-    RETURN_IF_ERROR(commands_.Record(execute_params, record_params,
-                                     cmd_buffer->command_buffer.get()));
+    absl::Status record_status = commands_.Record(
+        execute_params, record_params, cmd_buffer->command_buffer.get());
+    if (!record_status.ok()) {
+      cache->Discard(cmd_buffer);
+      return record_status;
+    }
+    cmd_buffer->recorded_allocs = std::move(selection.recorded_allocs);
     cmd_buffer->persistent_allocs_info_was_valid =
         persistent_allocs_info_is_valid;
 
     uint64_t end_micros = tsl::Env::Default()->NowMicros();
-    VLOG(3) << "Initialized command buffer on device #"
+    VLOG(3) << (is_first_record ? "Recorded" : "Updated")
+            << " command buffer during initialization on device #"
             << params.executor->device_ordinal() << " in "
             << (end_micros - start_micros)
-            << " μs; num_commands=" << commands_.size();
+            << " μs; num_commands=" << commands_.size()
+            << "; reason=" << initialization_reason;
     cmd_buffer->num_executions = 0;
   }
   return absl::OkStatus();
@@ -318,18 +449,22 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
   }
 
   se::StreamExecutor* executor = params.stream->parent();
-  ASSIGN_OR_RETURN(std::shared_ptr<ExecutorCommandBuffer> cmd_buffer,
-                   GetOrCreateCommandBuffer(executor));
+  std::shared_ptr<ExecutorCommandBufferCache> cache =
+      GetOrCreateCommandBufferCache(executor);
 
-  absl::MutexLock lock(cmd_buffer->mutex);
+  absl::MutexLock lock(cache->mutex);
 
   // warm up iteration, run through thunks if they are present.
-  if (!cmd_buffer->warmup_done && thunks_) {
+  if (!cache->warmup_done && thunks_) {
     VLOG(2) << "Executing warm up iteration of command buffer thunk";
     RETURN_IF_ERROR(thunks_->ExecuteOnStream(params));
-    cmd_buffer->warmup_done = true;
+    cache->warmup_done = true;
     return absl::OkStatus();
   }
+
+  ASSIGN_OR_RETURN(CommandBufferSelection selection,
+                   cache->Select(executor, commands_, params));
+  CommandBufferEntry* cmd_buffer = selection.entry;
 
   bool is_first_record =
       cmd_buffer->command_buffer->state() == se::CommandBuffer::State::kCreate;
@@ -339,13 +474,14 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
   bool persistent_allocs_info_is_valid =
       params.persistent_alloc_indices.has_value();
   bool persistent_allocs_info_is_changed =
-      !is_first_record && cmd_buffer->persistent_allocs_info_was_valid !=
-                              persistent_allocs_info_is_valid;
+      selection.persistent_allocs_info_is_changed;
 
-  auto updated_allocs = cmd_buffer->UpdateBufferAllocations(commands_, params);
+  std::vector<BufferAllocation::Index> updated_allocs =
+      std::move(selection.updated_allocs);
 
-  bool has_dynamic_allocations = cmd_buffer->HasDynamicAllocations(
-      commands_, params.persistent_alloc_indices);
+  bool has_dynamic_allocations =
+      ExecutorCommandBufferCache::HasDynamicAllocations(
+          commands_, params.persistent_alloc_indices);
   bool needs_update = persistent_allocs_info_is_changed ||
                       commands_.requires_update_on_execute() ||
                       (has_dynamic_allocations && !updated_allocs.empty());
@@ -362,12 +498,23 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
         << persistent_allocs_info_is_changed
         << "; needs_update=" << needs_update;
 
+    const char* update_reason =
+        is_first_record
+            ? "new_cache_entry"
+            : persistent_allocs_info_is_changed
+                  ? "persistent_allocation_policy"
+                  : selection.lookup == CacheLookup::kEviction
+                        ? "cache_eviction"
+                        : commands_.requires_update_on_execute()
+                              ? "requires_update_on_execute"
+                              : "allocation_addresses";
     TraceMe trace([&] {
-      cmd_buffer->mutex.AssertHeld();
+      cache->mutex.AssertHeld();
       return TraceMeEncode(
           is_first_record ? "command_buffer::record" : "command_buffer::update",
           {{"device", executor->device_ordinal()},
-           {"num_commands", commands_.size()}});
+           {"num_commands", commands_.size()},
+           {"reason", update_reason}});
     });
 
     uint64_t start_micros = tsl::Env::Default()->NowMicros();
@@ -384,16 +531,23 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
     Command::RecordParams record_params = {
         cmd_buffer->state, std::move(allocs_to_update),
         /*is_initialization=*/is_first_record && !has_dynamic_allocations};
-    RETURN_IF_ERROR(commands_.Record(params, record_params,
-                                     cmd_buffer->command_buffer.get()));
+    absl::Status record_status = commands_.Record(
+        params, record_params, cmd_buffer->command_buffer.get());
+    if (!record_status.ok()) {
+      cache->Discard(cmd_buffer);
+      return record_status;
+    }
+    cmd_buffer->recorded_allocs = std::move(selection.recorded_allocs);
     cmd_buffer->persistent_allocs_info_was_valid =
         persistent_allocs_info_is_valid;
 
     uint64_t end_micros = tsl::Env::Default()->NowMicros();
     XLA_VLOG_DEVICE(3, executor->device_ordinal())
-        << (needs_update ? "Updated" : "Recorded") << " command buffer in "
+        << (is_first_record ? "Recorded" : "Updated")
+        << " command buffer in "
         << (end_micros - start_micros)
-        << " μs; num_commands=" << commands_.size();
+        << " μs; num_commands=" << commands_.size()
+        << "; reason=" << update_reason;
     cmd_buffer->num_executions = 0;
   }
 
@@ -404,31 +558,30 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
       << "; num_executions=" << cmd_buffer->num_executions;
 
   TraceMe trace([&] {
-    cmd_buffer->mutex.AssertHeld();
+    cache->mutex.AssertHeld();
     return TraceMeEncode("command_buffer::execute",
                          {{"device", executor->device_ordinal()},
                           {"num_commands", commands_.size()},
-                          {"num_executions", cmd_buffer->num_executions}});
+                          {"num_executions", cmd_buffer->num_executions},
+                          {"cache_entries", cache->entries.size()},
+                          {"cache_capacity", cache->capacity}});
   });
 
   return cmd_buffer->command_buffer->Submit(params.stream);
 }
 
-absl::StatusOr<std::shared_ptr<CommandBufferThunk::ExecutorCommandBuffer>>
-CommandBufferThunk::GetOrCreateCommandBuffer(se::StreamExecutor* executor) {
+std::shared_ptr<CommandBufferThunk::ExecutorCommandBufferCache>
+CommandBufferThunk::GetOrCreateCommandBufferCache(
+    se::StreamExecutor* executor) {
   absl::MutexLock lock(state_->mutex);
-  // Check if command buffer already exists
-  if (auto it = state_->command_buffers.find(executor);
-      it != state_->command_buffers.end()) {
+  if (auto it = state_->command_buffer_caches.find(executor);
+      it != state_->command_buffer_caches.end()) {
     return it->second;
   }
 
-  // Create a new empty command buffer.
-  ASSIGN_OR_RETURN(auto command_buffer, executor->CreateCommandBuffer(
-                                            se::CommandBuffer::Mode::kPrimary));
-  auto emplaced = state_->command_buffers.emplace(
-      executor,
-      std::make_shared<ExecutorCommandBuffer>(std::move(command_buffer)));
+  auto emplaced = state_->command_buffer_caches.emplace(
+      executor, std::make_shared<ExecutorCommandBufferCache>(
+                    command_buffer_cache_size_));
   return emplaced.first->second;
 }
 
@@ -476,10 +629,14 @@ void CommandBufferThunk::EvictCommandBuffers() {
       continue;
     }
 
-    // Evict all command buffers.
+    // Evict all command buffer caches and count their graph entries.
     absl::MutexLock state_lock(ptr->mutex);
-    num_evicted += ptr->command_buffers.size();
-    ptr->command_buffers.clear();
+    for (const auto& item : ptr->command_buffer_caches) {
+      const std::shared_ptr<ExecutorCommandBufferCache>& cache = item.second;
+      absl::MutexLock cache_lock(cache->mutex);
+      num_evicted += cache->entries.size();
+    }
+    ptr->command_buffer_caches.clear();
   }
 
   if (num_evicted > 0) {

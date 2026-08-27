@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -189,6 +190,14 @@ class CountingDeviceToDeviceCopyThunk : public DeviceToDeviceCopyThunk {
   int* record_count_;
 };
 
+class RequiresWarmupCountingDeviceToDeviceCopyThunk
+    : public CountingDeviceToDeviceCopyThunk {
+ public:
+  using CountingDeviceToDeviceCopyThunk::CountingDeviceToDeviceCopyThunk;
+
+  bool requires_warmup() const override { return true; }
+};
+
 }  // namespace
 
 TEST(CommandBufferThunkTest, DeviceToDeviceCopy) {
@@ -257,6 +266,185 @@ TEST(CommandBufferThunkTest, DeviceToDeviceCopy) {
   TF_ASSERT_OK(stream->Memcpy(dst.data(), b, byte_length));
 
   ASSERT_EQ(dst, std::vector<int32_t>(4, 42));
+}
+
+TEST(CommandBufferThunkTest, AddressSpecializationsUseLruCache) {
+  se::StreamExecutor* stream_executor = GpuExecutor();
+  ASSERT_OK_AND_ASSIGN(auto stream, stream_executor->CreateStream());
+
+  constexpr int64_t kLength = 4;
+  constexpr int64_t kByteLength = sizeof(int32_t) * kLength;
+  Shape shape = ShapeUtil::MakeShape(S32, {kLength});
+
+  std::vector<se::DeviceAddress<int32_t>> sources;
+  std::vector<se::DeviceAddress<int32_t>> destinations;
+  for (int32_t value : {11, 22, 33}) {
+    sources.push_back(stream_executor->AllocateArray<int32_t>(kLength, 0));
+    destinations.push_back(
+        stream_executor->AllocateArray<int32_t>(kLength, 0));
+    ASSERT_OK(stream->Memset32(&sources.back(), value, kByteLength));
+    ASSERT_OK(stream->MemZero(&destinations.back(), kByteLength));
+  }
+
+  BufferAllocation source(/*index=*/0, kByteLength, /*color=*/0);
+  BufferAllocation destination(/*index=*/1, kByteLength, /*color=*/0);
+  BufferAllocation::Slice source_slice(&source, 0, kByteLength);
+  BufferAllocation::Slice destination_slice(&destination, 0, kByteLength);
+
+  stream_executor::StreamExecutorAddressAllocator allocator(stream_executor);
+  ServiceExecutableRunOptions run_options;
+
+  auto run_scenario = [&](int64_t capacity, absl::Span<const int> sequence,
+                          absl::Span<const int> expected_record_counts) {
+    int record_count = 0;
+    CommandSequence commands;
+    commands.Emplace<CountingDeviceToDeviceCopyThunk>(
+        Thunk::ThunkInfo(), ShapedSlice{source_slice, shape},
+        ShapedSlice{destination_slice, shape}, kByteLength, &record_count);
+    ASSERT_OK_AND_ASSIGN(
+        CommandExecutor executor,
+        CommandExecutor::Create(std::move(commands), serialize));
+    CommandBufferThunk thunk(std::move(executor), Thunk::ThunkInfo(), nullptr,
+                             /*enable_command_buffers_during_profiling=*/false,
+                             capacity);
+
+    for (size_t i = 0; i < sequence.size(); ++i) {
+      int address_set = sequence[i];
+      ASSERT_OK(stream->MemZero(&destinations[address_set], kByteLength));
+      BufferAllocations allocations(
+          {sources[address_set], destinations[address_set]},
+          /*device_ordinal=*/0, &allocator);
+      Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+          run_options, allocations, stream.get(), stream.get(), nullptr,
+          nullptr, nullptr);
+      ASSERT_OK(thunk.ExecuteOnStream(params));
+      ASSERT_OK(stream->BlockHostUntilDone());
+
+      std::vector<int32_t> result(kLength, 0);
+      ASSERT_OK(stream->Memcpy(result.data(), destinations[address_set],
+                               kByteLength));
+      EXPECT_EQ(result,
+                std::vector<int32_t>(kLength, (address_set + 1) * 11));
+      EXPECT_EQ(record_count, expected_record_counts[i]);
+    }
+  };
+
+  // A, B, A, C, A, B: C replaces B, then the final B replaces C.
+  run_scenario(/*capacity=*/2, std::vector<int>{0, 1, 0, 2, 0, 1},
+               std::vector<int>{1, 2, 2, 3, 3, 4});
+
+  // Capacity one preserves the old update-in-place behavior.
+  run_scenario(/*capacity=*/1, std::vector<int>{0, 1, 0},
+               std::vector<int>{1, 2, 3});
+
+  // Once all three address sets are cached, a second cycle performs no record
+  // or update calls.
+  run_scenario(/*capacity=*/3, std::vector<int>{0, 1, 2, 0, 1, 2},
+               std::vector<int>{1, 2, 3, 3, 3, 3});
+
+  // Allocation size is part of the signature even when the pointer is the
+  // same. Both address ranges cover the fixed-size copy performed by the
+  // command.
+  int record_count = 0;
+  CommandSequence commands;
+  commands.Emplace<CountingDeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{source_slice, shape},
+      ShapedSlice{destination_slice, shape}, kByteLength, &record_count);
+  ASSERT_OK_AND_ASSIGN(CommandExecutor executor,
+                       CommandExecutor::Create(std::move(commands), serialize));
+  CommandBufferThunk thunk(std::move(executor), Thunk::ThunkInfo(), nullptr,
+                           /*enable_command_buffers_during_profiling=*/false,
+                           /*command_buffer_cache_size=*/2);
+
+  se::DeviceAddressBase source_short(sources[0].opaque(), kByteLength);
+  se::DeviceAddressBase source_long(sources[0].opaque(), 2 * kByteLength);
+  auto execute_with_source = [&](se::DeviceAddressBase source_address) {
+    ASSERT_OK(stream->MemZero(&destinations[0], kByteLength));
+    std::vector<se::DeviceAddressBase> buffers = {source_address,
+                                                   destinations[0]};
+    BufferAllocations allocations(buffers, /*device_ordinal=*/0, &allocator);
+    Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+        run_options, allocations, stream.get(), stream.get(), nullptr, nullptr,
+        nullptr);
+    ASSERT_OK(thunk.ExecuteOnStream(params));
+    ASSERT_OK(stream->BlockHostUntilDone());
+
+    std::vector<int32_t> result(kLength, 0);
+    ASSERT_OK(stream->Memcpy(result.data(), destinations[0], kByteLength));
+    EXPECT_EQ(result, std::vector<int32_t>(kLength, 11));
+  };
+
+  execute_with_source(source_short);
+  EXPECT_EQ(record_count, 1);
+  execute_with_source(source_long);
+  EXPECT_EQ(record_count, 2);
+  execute_with_source(source_short);
+  EXPECT_EQ(record_count, 2);
+}
+
+TEST(CommandBufferThunkTest, AddressSpecializationCacheWarmsUpOnce) {
+  se::StreamExecutor* stream_executor = GpuExecutor();
+  ASSERT_OK_AND_ASSIGN(auto stream, stream_executor->CreateStream());
+
+  constexpr int64_t kLength = 4;
+  constexpr int64_t kByteLength = sizeof(int32_t) * kLength;
+  Shape shape = ShapeUtil::MakeShape(S32, {kLength});
+  se::DeviceAddress<int32_t> source_a =
+      stream_executor->AllocateArray<int32_t>(kLength, 0);
+  se::DeviceAddress<int32_t> destination_a =
+      stream_executor->AllocateArray<int32_t>(kLength, 0);
+  se::DeviceAddress<int32_t> source_b =
+      stream_executor->AllocateArray<int32_t>(kLength, 0);
+  se::DeviceAddress<int32_t> destination_b =
+      stream_executor->AllocateArray<int32_t>(kLength, 0);
+  ASSERT_OK(stream->Memset32(&source_a, 11, kByteLength));
+  ASSERT_OK(stream->Memset32(&source_b, 22, kByteLength));
+  ASSERT_OK(stream->MemZero(&destination_a, kByteLength));
+  ASSERT_OK(stream->MemZero(&destination_b, kByteLength));
+
+  BufferAllocation source(/*index=*/0, kByteLength, /*color=*/0);
+  BufferAllocation destination(/*index=*/1, kByteLength, /*color=*/0);
+  BufferAllocation::Slice source_slice(&source, 0, kByteLength);
+  BufferAllocation::Slice destination_slice(&destination, 0, kByteLength);
+
+  int record_count = 0;
+  CommandSequence commands;
+  commands.Emplace<RequiresWarmupCountingDeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{source_slice, shape},
+      ShapedSlice{destination_slice, shape}, kByteLength, &record_count);
+  ASSERT_OK_AND_ASSIGN(CommandExecutor executor,
+                       CommandExecutor::Create(std::move(commands), serialize));
+
+  ThunkSequence fallback_thunks;
+  fallback_thunks.push_back(std::make_unique<DeviceToDeviceCopyThunk>(
+      Thunk::ThunkInfo(), ShapedSlice{source_slice, shape},
+      ShapedSlice{destination_slice, shape}, kByteLength));
+  CommandBufferThunk thunk(
+      std::move(executor), Thunk::ThunkInfo(),
+      std::make_unique<SequentialThunk>(Thunk::ThunkInfo(),
+                                        std::move(fallback_thunks)),
+      /*enable_command_buffers_during_profiling=*/false,
+      /*command_buffer_cache_size=*/2);
+
+  stream_executor::StreamExecutorAddressAllocator allocator(stream_executor);
+  ServiceExecutableRunOptions run_options;
+  auto execute = [&](se::DeviceAddress<int32_t> source_address,
+                     se::DeviceAddress<int32_t> destination_address) {
+    BufferAllocations allocations({source_address, destination_address},
+                                  /*device_ordinal=*/0, &allocator);
+    Thunk::ExecuteParams params = Thunk::ExecuteParams::Create(
+        run_options, allocations, stream.get(), stream.get(), nullptr, nullptr,
+        nullptr);
+    ASSERT_OK(thunk.ExecuteOnStream(params));
+    ASSERT_OK(stream->BlockHostUntilDone());
+  };
+
+  execute(source_a, destination_a);
+  EXPECT_EQ(record_count, 0);
+  execute(source_b, destination_b);
+  EXPECT_EQ(record_count, 1);
+  execute(source_a, destination_a);
+  EXPECT_EQ(record_count, 2);
 }
 
 TEST(CommandBufferThunkTest, UpdatePolicyIgnoresVaRemappedAllocations) {
@@ -500,7 +688,9 @@ TEST(CommandBufferThunkTest,
       Thunk::ThunkInfo(), /*value=*/42, slice, &record_count);
   ASSERT_OK_AND_ASSIGN(CommandExecutor executor,
                        CommandExecutor::Create(std::move(commands), serialize));
-  CommandBufferThunk thunk(std::move(executor), Thunk::ThunkInfo());
+  CommandBufferThunk thunk(std::move(executor), Thunk::ThunkInfo(), nullptr,
+                           /*enable_command_buffers_during_profiling=*/false,
+                           /*command_buffer_cache_size=*/2);
 
   std::vector<BufferAllocation::Index> persistent_alloc_indices = {0};
   stream_executor::StreamExecutorAddressAllocator allocator(stream_executor);

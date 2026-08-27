@@ -269,6 +269,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_command_buffer_scheduling_mode(DebugOptions::LHS);
   opts.set_xla_gpu_command_buffer_unroll_loops(false);
   opts.set_xla_cmd_buffer_trace_cache_size(16);
+  opts.set_xla_gpu_command_buffer_cache_size(1);
 
   // Despite the name, fast min/max on GPUs does not seem to be any faster, and
   // adds very counter-intuitive "NaN-swallowing" behavior.
@@ -2099,6 +2100,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "Set the command buffer trace cache size, increasing the cache size may "
       "sometimes reduces the chances of doing command buffer tracing for "
       "updating command buffer instance."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_command_buffer_cache_size",
+      int64_setter_for(&DebugOptions::set_xla_gpu_command_buffer_cache_size),
+      debug_options->xla_gpu_command_buffer_cache_size(),
+      "Maximum number of primary command buffers cached for distinct device "
+      "allocation address sets, per command buffer thunk and GPU executor. "
+      "The value must be at least 1."));
   flag_list->push_back(
       tsl::Flag("xla_dump_disable_metadata",
                 bool_setter_for(&DebugOptions::set_xla_dump_disable_metadata),

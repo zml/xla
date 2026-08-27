@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/framework/allocator.h"
 
 namespace xla {
 class DeviceAssignment;
@@ -178,6 +179,13 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
       int device_ordinal, uint64_t size, bool retry_on_failure,
       int64_t memory_space) override;
 
+  // Delegates allocations in `memory_space` to `allocator`. This is used for
+  // spaces such as pinned host memory that cannot be backed by device VMM.
+  // Must be called during allocator construction, before concurrent use.
+  void SetAllocatorForMemorySpace(
+      int64_t memory_space,
+      std::unique_ptr<DeviceAddressAllocator> allocator);
+
   // Allocates raw physical memory and maps it into a caller-owned
   // MemoryReservation range.
   // `allocation_size` and `mapping_size` must be equal.
@@ -270,6 +278,15 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
 
   // Returns the stream for the given device ordinal.
   absl::StatusOr<Stream*> GetStream(int device_ordinal) override;
+
+  // Returns physical-memory accounting for the given device. VMM virtual
+  // reservations are not charged; bytes in use and reserved describe physical
+  // allocations retained until their stream-ordered deallocation completes.
+  absl::StatusOr<tsl::AllocatorStats> GetAllocatorStats(
+      int device_ordinal) const;
+
+  // Clears cumulative allocation statistics while preserving current usage.
+  bool ClearAllocatorStats(int device_ordinal) override;
 
   // Waits for all pending stream-ordered deallocations and unmaps on the given
   // device to complete, then drops the corresponding deferred bookkeeping.
@@ -439,6 +456,9 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
 
     mutable absl::Mutex mu;
     uint64_t pa_allocated ABSL_GUARDED_BY(mu) = 0;
+    uint64_t peak_pa_allocated ABSL_GUARDED_BY(mu) = 0;
+    uint64_t num_allocs ABSL_GUARDED_BY(mu) = 0;
+    uint64_t largest_alloc_size ABSL_GUARDED_BY(mu) = 0;
     // Monotonically increasing counter for timeline sequence numbers.
     uint64_t next_seqno ABSL_GUARDED_BY(mu) = 1;
     std::deque<PendingDeallocation> pending_deallocations ABSL_GUARDED_BY(mu);
@@ -499,6 +519,12 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
 
   // True iff the calling thread is inside a multi-device DeviceAssignmentScope.
   static bool CurrentMultiDevice();
+
+  absl::flat_hash_map<int64_t, std::unique_ptr<DeviceAddressAllocator>>
+      memory_space_allocators_;
+  absl::Mutex delegated_allocations_mu_;
+  absl::flat_hash_map<std::pair<int, void*>, DeviceAddressAllocator*>
+      delegated_allocations_ ABSL_GUARDED_BY(delegated_allocations_mu_);
 
   // Allocate helpers.
 

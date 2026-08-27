@@ -46,7 +46,8 @@ class CommandBufferThunk : public Thunk {
  public:
   CommandBufferThunk(CommandExecutor commands, ThunkInfo thunk_info,
                      std::unique_ptr<SequentialThunk> thunks = nullptr,
-                     bool enable_command_buffers_during_profiling = false);
+                     bool enable_command_buffers_during_profiling = false,
+                     int64_t command_buffer_cache_size = 1);
 
   const std::unique_ptr<SequentialThunk>& thunks() const { return thunks_; }
 
@@ -86,37 +87,21 @@ class CommandBufferThunk : public Thunk {
     return enable_command_buffers_during_profiling_;
   }
 
+  int64_t command_buffer_cache_size() const {
+    return command_buffer_cache_size_;
+  }
+
  private:
-  // Command buffer instantiated on a `se::StreamExecutor` instance, and
-  // auxiliary state required for efficient command buffer updates.
-  struct ExecutorCommandBuffer {
-    explicit ExecutorCommandBuffer(
+  // Command buffer specialized for one set of device allocation addresses.
+  struct CommandBufferEntry {
+    explicit CommandBufferEntry(
         std::unique_ptr<se::CommandBuffer> command_buffer);
 
-    // Updates recorded buffer allocation for the given `commands` using the
-    // buffer allocations passed in `params`. Returns buffer allocations that
-    // changed since the last update. Returned buffer allocations are sorted by
-    // the buffer allocation index.
-    std::vector<BufferAllocation::Index> UpdateBufferAllocations(
-        const CommandExecutor& commands, const Thunk::ExecuteParams& params)
-        ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
-
-    // Returns true if `commands` references any allocation whose address is not
-    // persistent under the current allocation address policy. If the policy is
-    // absent, conservatively returns true.
-    bool HasDynamicAllocations(
-        const CommandExecutor& commands,
-        std::optional<absl::Span<const BufferAllocation::Index>>
-            persistent_alloc_indices) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
-
-    // se::CommandBuffer is not thread safe, and we guard it with a mutex to
-    // guarantee that we do not mutate it concurrently.
-    absl::Mutex mutex;
-    std::unique_ptr<se::CommandBuffer> command_buffer ABSL_GUARDED_BY(mutex);
+    std::unique_ptr<se::CommandBuffer> command_buffer;
 
     // A manager for an external state attached by commands in a command
     // sequence to a command buffer.
-    CommandStateManager state ABSL_GUARDED_BY(mutex);
+    CommandStateManager state;
 
     // Mapping from buffer allocation index to the device memory passed at
     // that index to the last call of `commands_.Record(...)` for
@@ -129,16 +114,59 @@ class CommandBufferThunk : public Thunk {
     // execution on a stream. All other pieces of information (like thread
     // and block sizes) captured by commands at construction time and do not
     // change.
-    std::vector<se::DeviceAddressBase> recorded_allocs ABSL_GUARDED_BY(mutex);
+    std::vector<se::DeviceAddressBase> recorded_allocs;
 
     // True if persistent allocation information was valid when the command
     // buffer was recorded. We track only validity because the execution
     // parameter contract guarantees that the indices remain unchanged once
     // present.
-    bool persistent_allocs_info_was_valid ABSL_GUARDED_BY(mutex) = false;
+    bool persistent_allocs_info_was_valid = false;
 
     // Number of command buffer executions since last update.
-    int64_t num_executions ABSL_GUARDED_BY(mutex) = 0;
+    int64_t num_executions = 0;
+  };
+
+  enum class CacheLookup {
+    kHit,
+    kMiss,
+    kEviction,
+  };
+
+  struct CommandBufferSelection {
+    CommandBufferEntry* entry;
+    CacheLookup lookup;
+    std::vector<se::DeviceAddressBase> recorded_allocs;
+    std::vector<BufferAllocation::Index> updated_allocs;
+    bool persistent_allocs_info_is_changed;
+  };
+
+  // MRU cache of command buffers instantiated on one StreamExecutor.
+  struct ExecutorCommandBufferCache {
+    explicit ExecutorCommandBufferCache(int64_t capacity);
+
+    absl::StatusOr<CommandBufferSelection> Select(
+        se::StreamExecutor* executor, const CommandExecutor& commands,
+        const Thunk::ExecuteParams& params)
+        ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
+
+    void Discard(CommandBufferEntry* entry)
+        ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex);
+
+    static bool HasDynamicAllocations(
+        const CommandExecutor& commands,
+        std::optional<absl::Span<const BufferAllocation::Index>>
+            persistent_alloc_indices);
+
+    // se::CommandBuffer is not thread safe. This mutex guards all cache entries
+    // so lookup, graph mutation and submission are serialized.
+    absl::Mutex mutex;
+    const int64_t capacity;
+    std::vector<std::unique_ptr<CommandBufferEntry>> entries
+        ABSL_GUARDED_BY(mutex);
+
+    int64_t cache_hits ABSL_GUARDED_BY(mutex) = 0;
+    int64_t cache_misses ABSL_GUARDED_BY(mutex) = 0;
+    int64_t cache_evictions ABSL_GUARDED_BY(mutex) = 0;
 
     // For GPU backend, NCCL may call cuda-graph un-supported host side API
     // during graph capturing (e.g. cuCtxEnablePeerAccess), this will break XLA
@@ -150,17 +178,17 @@ class CommandBufferThunk : public Thunk {
     bool warmup_done ABSL_GUARDED_BY(mutex) = false;
   };
 
-  // Command buffer thunk owns one command buffer for each executor it runs on.
+  // Command buffer thunk owns one command buffer cache for each executor.
   struct State {
     absl::Mutex mutex;
     absl::flat_hash_map<se::StreamExecutor*,
-                        std::shared_ptr<ExecutorCommandBuffer>>
-        command_buffers ABSL_GUARDED_BY(mutex);
+                        std::shared_ptr<ExecutorCommandBufferCache>>
+        command_buffer_caches ABSL_GUARDED_BY(mutex);
   };
 
-  // Returns a command buffer for `executor` or creates a new one.
-  absl::StatusOr<std::shared_ptr<ExecutorCommandBuffer>>
-  GetOrCreateCommandBuffer(se::StreamExecutor* executor);
+  // Returns a command buffer cache for `executor` or creates a new one.
+  std::shared_ptr<ExecutorCommandBufferCache> GetOrCreateCommandBufferCache(
+      se::StreamExecutor* executor);
 
   // Each individual command buffer allocates state on device (CUDA graph) and
   // it adds up pretty quickly. To prevent OOM errors we proactively evict
@@ -189,6 +217,10 @@ class CommandBufferThunk : public Thunk {
   // When true, allows command buffers to be used while profiling active.
   // TODO(b/355487968): Remove this option when validation complete.
   bool enable_command_buffers_during_profiling_;
+
+  // Maximum number of address-specialized command buffers retained per
+  // StreamExecutor. Collective command buffers use an effective capacity of 1.
+  int64_t command_buffer_cache_size_;
 
   // Command buffer thunk state allocated in heap to allow global (per-process)
   // management of instantiated command buffers.

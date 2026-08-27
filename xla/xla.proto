@@ -1256,6 +1256,9 @@ message DebugOptions {
   // ragged-all-to-all operations.
   optional bool xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel = 375;
 
+  // Deprecated compatibility option. ROCm always uses lld in-process.
+  optional bool xla_gpu_use_inprocess_lld = 389 [deprecated = true];
+
   // This instructs the runtime whether to use memcpy for p2p communication when
   // source and target are located within a node(nvlink).
   optional bool xla_gpu_use_memcpy_local_p2p = 287;
@@ -1576,6 +1579,11 @@ message DebugOptions {
   // updating command buffer instance.
   optional int64 xla_cmd_buffer_trace_cache_size = 311;
 
+  // Maximum number of primary command buffers cached for distinct device
+  // allocation address sets. The cache is per command buffer thunk and GPU
+  // executor. A value of 1 preserves update-in-place behavior.
+  optional int64 xla_gpu_command_buffer_cache_size = 525;
+
   // This flag is used for controlling HLO dumping and NVTX marker. If turned
   // on, both HLO dumping and NVTX marker will use syntactic sugar wrappers
   // as op names, while the actual op names will be shown if turned off.
@@ -1783,7 +1791,6 @@ message DebugOptions {
   reserved "xla_gpu_use_cudnn_batchnorm";
   reserved "xla_gpu_use_embeded_device_lib";
   reserved "xla_gpu_use_horizontal_fusion";
-  reserved "xla_gpu_use_inprocess_lld";
   reserved "xla_gpu_use_random_streams";
   reserved "xla_hlo_dump_as_graphdef";
   reserved "xla_hlo_tfgraph_device_scopes";
@@ -1798,7 +1805,7 @@ message DebugOptions {
       206, 207, 211, 214, 218, 220, 221, 226, 229, 230, 233, 234, 238, 241, 242,
       243, 249, 263, 264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 298,
       299, 302, 303, 309, 313, 314, 319, 320, 325, 326, 332, 346, 352, 354, 355,
-      358, 361, 367, 369, 371, 385, 388, 389, 394, 396, 398, 402, 420, 423, 430,
+      358, 361, 367, 369, 371, 385, 388, 394, 396, 398, 402, 420, 423, 430,
       443, 446, 458, 464, 477;
 }
 

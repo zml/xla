@@ -115,6 +115,7 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
   src.env_option_overrides = {
       {"xla_gpu_use_runtime_fusion", std::string("True")},
       {"xla_gpu_graph_min_graph_size", std::string("2")},
+      {"xla_gpu_use_inprocess_lld", true},
       {"xla_gpu_auto_spmd_partitioning_memory_budget_ratio", 0.9},
       {"xla_gpu_pgle_profile_file_or_directory_path", std::string("abc")},
       // Repeated fields.
@@ -131,6 +132,7 @@ TEST(ExecuteOptionsTest, ApplyOptionsCanParseStringsAndEnums) {
   auto& debug_options = src.executable_build_options.debug_options();
   EXPECT_EQ(debug_options.xla_gpu_use_runtime_fusion(), true);
   EXPECT_EQ(debug_options.xla_gpu_graph_min_graph_size(), 2);
+  EXPECT_TRUE(debug_options.xla_gpu_use_inprocess_lld());
   EXPECT_FLOAT_EQ(
       debug_options.xla_gpu_auto_spmd_partitioning_memory_budget_ratio(), 0.9);
   EXPECT_EQ(debug_options.xla_gpu_pgle_profile_file_or_directory_path(), "abc");

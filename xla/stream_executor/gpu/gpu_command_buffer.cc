@@ -589,7 +589,8 @@ absl::Status GpuCommandBuffer::Finalize() {
           "Underlying backend ran out of memory trying to instantiate command "
           "buffer with %d (total of %d alive graphs in the process). You can "
           "try to (a) Give more memory to the driver by reducing "
-          "XLA_CLIENT_MEM_FRACTION (b) Disable command buffers with "
+          "XLA_CLIENT_MEM_FRACTION (b) Reduce "
+          "--xla_gpu_command_buffer_cache_size (c) Disable command buffers with "
           "'XLA_FLAGS=--xla_gpu_enable_command_buffer=' (empty set). Original "
           "error: %s",
           num_commands, AliveExecs(), instantiated.message()));
