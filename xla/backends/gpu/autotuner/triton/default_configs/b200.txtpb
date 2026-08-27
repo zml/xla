@@ -16,6 +16,17 @@ config { block_m: 16 block_n: 16 block_k: 128 num_stages: 1 num_warps: 2 num_cta
 config { block_m: 32 block_n: 16 block_k: 64 num_stages: 3 num_warps: 2 num_ctas: 1 }
 config { block_m: 32 block_n: 16 block_k: 256 num_stages: 3 num_warps: 2 num_ctas: 1 }
 config { block_m: 32 block_n: 32 block_k: 32 num_stages: 4 num_warps: 2 num_ctas: 1 }
+# TMA twins of the four small-block_m hints above. Config equality includes
+# is_tma_allowed, and OptimizeConfigSet keeps a generated config only if some
+# hint matches it exactly, so without these a thin-M dot never gets its TMA
+# candidate measured -- it is dropped before profiling, not refused by a
+# legality check. Every other TMA hint in this file has block_m >= 64, which is
+# why decode-shaped dots were the ones losing it: Qwen3.8-27B's fp8 out_proj
+# lands on the 32x16 hint and ran at ~60% of its streaming-read roofline.
+config { block_m: 16 block_n: 16 block_k: 128 num_stages: 1 num_warps: 2 num_ctas: 1 is_tma_allowed: true }
+config { block_m: 32 block_n: 16 block_k: 64 num_stages: 3 num_warps: 2 num_ctas: 1 is_tma_allowed: true }
+config { block_m: 32 block_n: 16 block_k: 256 num_stages: 3 num_warps: 2 num_ctas: 1 is_tma_allowed: true }
+config { block_m: 32 block_n: 32 block_k: 32 num_stages: 4 num_warps: 2 num_ctas: 1 is_tma_allowed: true }
 config { block_m: 64 block_n: 16 block_k: 128 num_stages: 3 num_warps: 2 num_ctas: 1 is_tma_allowed: true }
 config { block_m: 64 block_n: 16 block_k: 128 num_stages: 3 num_warps: 4 num_ctas: 1 }
 config { block_m: 64 block_n: 16 block_k: 256 num_stages: 3 num_warps: 4 num_ctas: 1 is_tma_allowed: true }
