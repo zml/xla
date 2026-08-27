@@ -69,6 +69,12 @@ namespace {
 
 using CommandBufferConfig = CommandBufferConversionPass::CommandBufferConfig;
 
+int64_t CommandBufferCacheSize(const DebugOptions& debug_options) {
+  return debug_options.has_xla_gpu_command_buffer_cache_size()
+             ? debug_options.xla_gpu_command_buffer_cache_size()
+             : 1;
+}
+
 std::optional<DebugOptions::CollectiveOpType> GetCollectiveOpType(
     Thunk::Kind kind) {
   switch (kind) {
@@ -579,7 +585,8 @@ ConvertThunksToCommandBuffer(
       std::move(cmd_executor), std::move(thunk_info),
       std::make_unique<SequentialThunk>(Thunk::ThunkInfo(),
                                         std::move(thunks_to_convert)),
-      debug_options.xla_enable_command_buffers_during_profiling());
+      debug_options.xla_enable_command_buffers_during_profiling(),
+      CommandBufferCacheSize(debug_options));
 }
 
 absl::Status FlushCommandBuffer(
@@ -654,6 +661,12 @@ absl::StatusOr<bool> CommandBufferConversionPass::Run(
     const se::DeviceDescription& device_info,
     ThunkPassBufferAllocator& allocator) {
   tsl::profiler::TraceMe traceme("CommandBufferConversionPass");
+
+  if (CommandBufferCacheSize(debug_options) < 1) {
+    return InvalidArgument("xla_gpu_command_buffer_cache_size must be at "
+                           "least 1; got %d",
+                           CommandBufferCacheSize(debug_options));
+  }
 
   CommandBufferConfig config =
       GetCommandBufferConfig(debug_options, device_info, hlo_module);

@@ -2528,6 +2528,64 @@ TEST_F(VmmTest, VmmAllocatorCanBeSet) {
 #endif
 }
 
+TEST_F(VmmTest, VmmAllocatorReportsMemoryStats) {
+  GpuClientOptions options;
+  options.allocator_config.kind = GpuAllocatorConfig::Kind::kVmm;
+  options.allowed_devices = {0};
+
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetStreamExecutorGpuClient(options));
+  ASSERT_EQ(client->addressable_devices().size(), 1);
+
+  PjRtDevice* device = client->addressable_devices()[0];
+  TF_ASSERT_OK_AND_ASSIGN(tsl::AllocatorStats stats,
+                          device->GetAllocatorStats());
+  ASSERT_TRUE(stats.bytes_limit.has_value());
+  EXPECT_GT(*stats.bytes_limit, 0);
+  EXPECT_GE(stats.peak_bytes_in_use, stats.bytes_in_use);
+  EXPECT_OK(device->ClearMemoryStats());
+}
+
+TEST_F(VmmTest, VmmAllocatorDelegatesPinnedHostMemory) {
+  GpuClientOptions options;
+  options.allocator_config.kind = GpuAllocatorConfig::Kind::kVmm;
+  options.allowed_devices = {0};
+
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetStreamExecutorGpuClient(options));
+  PjRtDevice* device = client->addressable_devices()[0];
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto* pinned_memory_space,
+      device->memory_space_by_kind(PinnedHostMemorySpace::kKind));
+
+  auto* se_client = tensorflow::down_cast<PjRtStreamExecutorClient*>(
+      client.get());
+  auto* vmm_allocator = dynamic_cast<se::DeviceAddressVmmAllocator*>(
+      se_client->allocator());
+  ASSERT_NE(vmm_allocator, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto host_allocation,
+      vmm_allocator->Allocate(
+          /*device_ordinal=*/0, /*size=*/4096, /*retry_on_failure=*/true,
+          static_cast<int64_t>(se::MemorySpace::kHost)));
+  EXPECT_EQ(host_allocation.allocator(), vmm_allocator);
+  EXPECT_OK(host_allocation.Free());
+
+  std::vector<int32_t> data{1, 2, 3, 4};
+  Shape shape = ShapeUtil::MakeShape(S32, {4});
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto buffer,
+      client->BufferFromHostBuffer(
+          data.data(), shape.element_type(), shape.dimensions(),
+          /*byte_strides=*/std::nullopt,
+          PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall, nullptr,
+          pinned_memory_space, /*device_layout=*/nullptr));
+
+  EXPECT_TRUE(buffer->IsOnCpu());
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteral().Await());
+  EXPECT_TRUE(LiteralTestUtil::Equal(LiteralUtil::CreateR1<int32_t>(data),
+                                     *literal));
+  buffer.reset();
+}
+
 TEST_F(VmmTest, VmmAllocatorE2ETest) {
   GpuClientOptions options;
   options.allocator_config.kind = GpuAllocatorConfig::Kind::kVmm;

@@ -365,6 +365,7 @@ cc_library(
         ":stream",
         ":stream_executor_h",
         "//xla/service:computation_placer_hdr",
+        "//xla/tsl/framework:allocator",
         "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",

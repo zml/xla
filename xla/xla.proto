@@ -1631,6 +1631,11 @@ message DebugOptions {
   // updating command buffer instance.
   optional int64 xla_cmd_buffer_trace_cache_size = 311;
 
+  // Maximum number of primary command buffers cached for distinct device
+  // allocation address sets. The cache is per command buffer thunk and GPU
+  // executor. A value of 1 preserves update-in-place behavior.
+  optional int64 xla_gpu_command_buffer_cache_size = 525;
+
   // This flag is used for controlling HLO dumping and NVTX marker. If turned
   // on, both HLO dumping and NVTX marker will use syntactic sugar wrappers
   // as op names, while the actual op names will be shown if turned off.

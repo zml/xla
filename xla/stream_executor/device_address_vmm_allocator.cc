@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/framework/allocator.h"
 
 namespace stream_executor {
 
@@ -238,6 +239,15 @@ DeviceAddressVmmAllocator::~DeviceAddressVmmAllocator() {
   }
 }
 
+void DeviceAddressVmmAllocator::SetAllocatorForMemorySpace(
+    int64_t memory_space, std::unique_ptr<DeviceAddressAllocator> allocator) {
+  CHECK(allocator != nullptr);
+  auto [it, inserted] = memory_space_allocators_.emplace(
+      memory_space, std::move(allocator));
+  CHECK(inserted) << "Allocator already registered for memory space "
+                  << memory_space;
+}
+
 absl::Status DeviceAddressVmmAllocator::SynchronizeAllPendingOperations() {
   for (auto& device : per_device_) {
     RETURN_IF_ERROR(SynchronizePendingOperations(device.first));
@@ -359,6 +369,49 @@ uint64_t DeviceAddressVmmAllocator::GetAllocationGranularity(
   return state->allocation_granularity;
 }
 
+absl::StatusOr<tsl::AllocatorStats>
+DeviceAddressVmmAllocator::GetAllocatorStats(int device_ordinal) const {
+  ASSIGN_OR_RETURN(auto state, GetPerDeviceState(device_ordinal));
+  absl::MutexLock lock(state->mu);
+
+  auto as_int64 = [](uint64_t value) {
+    return static_cast<int64_t>(std::min<uint64_t>(
+        value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+  };
+
+  tsl::AllocatorStats stats;
+  stats.num_allocs = as_int64(state->num_allocs);
+  stats.bytes_in_use = as_int64(state->pa_allocated);
+  stats.peak_bytes_in_use = as_int64(state->peak_pa_allocated);
+  stats.largest_alloc_size = as_int64(state->largest_alloc_size);
+  stats.bytes_limit = as_int64(state->pa_budget);
+  stats.bytes_reserved = stats.bytes_in_use;
+  stats.peak_bytes_reserved = stats.peak_bytes_in_use;
+  stats.peak_allocated_bytes = stats.peak_bytes_in_use;
+  stats.bytes_reservable_limit = stats.bytes_limit;
+  stats.largest_free_block_bytes =
+      as_int64(state->pa_allocated < state->pa_budget
+                   ? state->pa_budget - state->pa_allocated
+                   : 0);
+  stats.pool_bytes = stats.bytes_in_use;
+  stats.peak_pool_bytes = stats.peak_bytes_in_use;
+  return stats;
+}
+
+bool DeviceAddressVmmAllocator::ClearAllocatorStats(int device_ordinal) {
+  absl::StatusOr<PerDeviceState*> state_or =
+      GetPerDeviceState(device_ordinal);
+  if (!state_or.ok()) {
+    return false;
+  }
+  PerDeviceState* state = *state_or;
+  absl::MutexLock lock(state->mu);
+  state->num_allocs = 0;
+  state->peak_pa_allocated = state->pa_allocated;
+  state->largest_alloc_size = 0;
+  return true;
+}
+
 // Allocate helpers.
 
 absl::StatusOr<std::unique_ptr<MemoryAllocation>>
@@ -411,6 +464,8 @@ DeviceAddressVmmAllocator::TrackAllocatorAddressMappedAllocation(
       state.records_by_allocator_address.emplace(va_ptr, std::move(record));
   CHECK(insert_result.second);
   state.pa_allocated += physical_size;
+  state.peak_pa_allocated =
+      std::max(state.peak_pa_allocated, state.pa_allocated);
   return *record_ptr;
 }
 
@@ -609,8 +664,33 @@ DeviceAddressVmmAllocator::TryWithPendingReclaim(PerDeviceState& state,
 // tries a fresh allocator-address mapping.
 absl::StatusOr<ScopedDeviceAddress<uint8_t>>
 DeviceAddressVmmAllocator::Allocate(int device_ordinal, uint64_t size,
-                                    bool /*retry_on_failure*/,
+                                    bool retry_on_failure,
                                     int64_t memory_space) {
+  if (auto it = memory_space_allocators_.find(memory_space);
+      it != memory_space_allocators_.end()) {
+    DeviceAddressAllocator* allocator = it->second.get();
+    ASSIGN_OR_RETURN(
+        auto result,
+        allocator->Allocate(device_ordinal, size, retry_on_failure,
+                            memory_space));
+    if (result.is_null()) {
+      return result;
+    }
+
+    DeviceAddressBase address = result.Release();
+    {
+      absl::MutexLock lock(delegated_allocations_mu_);
+      auto [it, inserted] = delegated_allocations_.emplace(
+          std::make_pair(device_ordinal, address.opaque()), allocator);
+      CHECK(inserted) << "Delegated allocation returned an address that is "
+                         "already active: "
+                      << address.opaque();
+    }
+    // PJRT releases the scoped address and later deallocates it through the
+    // client allocator, so keep this allocator as the owner and route the
+    // eventual Deallocate call using delegated_allocations_.
+    return ScopedDeviceAddress<uint8_t>(address, device_ordinal, this);
+  }
   if (size == 0) {
     return ScopedDeviceAddress<uint8_t>(DeviceAddressBase(), device_ordinal,
                                         this);
@@ -687,6 +767,9 @@ DeviceAddressVmmAllocator::Allocate(int device_ordinal, uint64_t size,
   ASSIGN_OR_RETURN(DeviceAddressBase result,
                    TryWithPendingReclaim(*state, size, try_reuse, try_fresh));
 
+  ++state->num_allocs;
+  state->largest_alloc_size = std::max(state->largest_alloc_size, size);
+
   VLOG(3) << absl::StreamFormat(
       "Allocated virtual address %p (%uB) on device ordinal %d",
       result.opaque(), size, device_ordinal);
@@ -747,6 +830,10 @@ DeviceAddressVmmAllocator::Allocate(
       DeviceAddressBase result,
       TryWithPendingReclaim(*state, allocation_size, try_reuse, try_fresh));
 
+  ++state->num_allocs;
+  state->largest_alloc_size =
+      std::max(state->largest_alloc_size, allocation_size);
+
   // `result` is the reservation slice, which acts as the allocator address for
   // this allocation.
   return ScopedDeviceAddress<uint8_t>(result, device_ordinal, this);
@@ -756,6 +843,18 @@ absl::Status DeviceAddressVmmAllocator::Deallocate(int device_ordinal,
                                                    DeviceAddressBase mem) {
   if (mem.is_null()) {
     return absl::OkStatus();
+  }
+
+  {
+    absl::MutexLock lock(delegated_allocations_mu_);
+    auto it = delegated_allocations_.find(
+        std::make_pair(device_ordinal, mem.opaque()));
+    if (it != delegated_allocations_.end()) {
+      DeviceAddressAllocator* allocator = it->second;
+      RETURN_IF_ERROR(allocator->Deallocate(device_ordinal, mem));
+      delegated_allocations_.erase(it);
+      return absl::OkStatus();
+    }
   }
 
   ASSIGN_OR_RETURN(auto state, GetPerDeviceState(device_ordinal));

@@ -80,7 +80,9 @@ namespace gpu {
 namespace {
 
 using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 using ::testing::Pointee;
 
 MATCHER_P(ThunkKindIs, kind, "") { return arg.kind() == kind; }
@@ -363,6 +365,7 @@ TEST(CommandBufferConversionPassTest, ConvertsToCommandBufferThunk) {
 
   DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
   debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.set_xla_gpu_command_buffer_cache_size(7);
   debug_options.clear_xla_gpu_enable_command_buffer();
   debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);
 
@@ -384,10 +387,32 @@ TEST(CommandBufferConversionPassTest, ConvertsToCommandBufferThunk) {
 
   const auto* command_buffer_thunk =
       static_cast<const CommandBufferThunk*>(thunks[0].get());
+  EXPECT_EQ(command_buffer_thunk->command_buffer_cache_size(), 7);
 
   const auto& thunks_in_command_buffer =
       command_buffer_thunk->thunks()->thunks();
   EXPECT_THAT(thunks_in_command_buffer, ThunkKindsAre(Thunk::kCopy));
+}
+
+TEST(CommandBufferConversionPassTest, RejectsInvalidCommandBufferCacheSize) {
+  ThunkSequence thunks;
+  BufferAllocation allocation(/*index=*/0, /*size=*/1024, /*color=*/0);
+  thunks.push_back(CreateCopyThunk(allocation));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.set_xla_gpu_command_buffer_cache_size(0);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);
+
+  se::DeviceDescription device_info;
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+
+  EXPECT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("xla_gpu_command_buffer_cache_size")));
 }
 
 TEST(CommandBufferConversionPassTest,
@@ -584,6 +609,7 @@ TEST(CommandBufferConversionPassTest, ConvertsAsyncPairToCommandBuffer) {
 
   DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
   debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.set_xla_gpu_command_buffer_cache_size(7);
   debug_options.clear_xla_gpu_enable_command_buffer();
   debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
 
@@ -602,6 +628,7 @@ TEST(CommandBufferConversionPassTest, ConvertsAsyncPairToCommandBuffer) {
 
   const auto* command_buffer_thunk =
       static_cast<const CommandBufferThunk*>(thunks[0].get());
+  EXPECT_EQ(command_buffer_thunk->command_buffer_cache_size(), 1);
   const auto& thunks_in_command_buffer =
       command_buffer_thunk->thunks()->thunks();
   EXPECT_THAT(thunks_in_command_buffer,

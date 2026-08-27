@@ -1311,34 +1311,49 @@ GetStreamExecutorGpuDeviceAllocator(
     }
 
     case GpuAllocatorConfig::Kind::kVmm: {
+      std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
+      executor_streams.reserve(addressable_devices.size());
+      for (const auto& [ordinal, device] : addressable_devices) {
+        executor_streams.push_back(
+            {device->executor(), device->compute_stream()});
+      }
+
+      std::unique_ptr<se::DeviceAddressVmmAllocator> vmm_allocator;
 #if GOOGLE_CUDA
-      std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
-      executor_streams.reserve(addressable_devices.size());
-      for (const auto& [ordinal, device] : addressable_devices) {
-        executor_streams.push_back(
-            {device->executor(), device->compute_stream()});
-      }
-      return se::gpu::CudaDeviceAddressVmmAllocator::Create(
-          platform, allocator_config.memory_fraction,
-          allocator_config.gpu_system_memory_size, executor_streams,
-          /*reclaim_exempt_memory_space=*/
-          static_cast<int64_t>(gpu::MemorySpaceColor::kCollective));
+      ASSIGN_OR_RETURN(
+          vmm_allocator,
+          se::gpu::CudaDeviceAddressVmmAllocator::Create(
+              platform, allocator_config.memory_fraction,
+              allocator_config.gpu_system_memory_size, executor_streams,
+              /*reclaim_exempt_memory_space=*/
+              static_cast<int64_t>(gpu::MemorySpaceColor::kCollective)));
 #elif TENSORFLOW_USE_ROCM
-      std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
-      executor_streams.reserve(addressable_devices.size());
-      for (const auto& [ordinal, device] : addressable_devices) {
-        executor_streams.push_back(
-            {device->executor(), device->compute_stream()});
-      }
-      return se::gpu::RocmDeviceAddressVmmAllocator::Create(
-          platform, allocator_config.memory_fraction,
-          allocator_config.gpu_system_memory_size, executor_streams,
-          /*reclaim_exempt_memory_space=*/
-          static_cast<int64_t>(gpu::MemorySpaceColor::kCollective));
+      ASSIGN_OR_RETURN(
+          vmm_allocator,
+          se::gpu::RocmDeviceAddressVmmAllocator::Create(
+              platform, allocator_config.memory_fraction,
+              allocator_config.gpu_system_memory_size, executor_streams,
+              /*reclaim_exempt_memory_space=*/
+              static_cast<int64_t>(gpu::MemorySpaceColor::kCollective)));
 #else
       return absl::UnimplementedError(
           "VMM allocator is only supported with CUDA or ROCm.");
 #endif  // GOOGLE_CUDA
+
+      std::vector<se::MultiDeviceAdapter::AllocatorInfo> host_allocators;
+      host_allocators.reserve(addressable_devices.size());
+      for (const auto& [ordinal, device] : addressable_devices) {
+        ASSIGN_OR_RETURN(auto host_allocator,
+                         GetGpuHostAllocator(device->executor()));
+        host_allocators.push_back(
+            {std::move(host_allocator), device->compute_stream(),
+             /*memory_space=*/static_cast<int>(se::MemorySpace::kHost)});
+      }
+      vmm_allocator->SetAllocatorForMemorySpace(
+          static_cast<int64_t>(se::MemorySpace::kHost),
+          std::make_unique<se::MultiDeviceAdapter>(
+              platform, std::move(host_allocators)));
+      return vmm_allocator;
     }
   }
 
@@ -1718,8 +1733,15 @@ absl::StatusOr<tsl::AllocatorStats> StreamExecutorGpuDevice::GetAllocatorStats()
         "GetAllocatorStats() is allowed only for addressable devices");
   }
 
-  auto* allocator_adapter = dynamic_cast<se::MultiDeviceAdapter*>(
-      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator());
+  se::DeviceAddressAllocator* device_allocator =
+      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator();
+  if (auto* vmm_allocator =
+          dynamic_cast<se::DeviceAddressVmmAllocator*>(device_allocator)) {
+    return vmm_allocator->GetAllocatorStats(local_device_id().value());
+  }
+
+  auto* allocator_adapter =
+      dynamic_cast<se::MultiDeviceAdapter*>(device_allocator);
   if (!allocator_adapter) {
     return Unimplemented(
         "GetAllocatorStats() is only implemented with MultiDeviceAdapter "
@@ -1743,8 +1765,19 @@ absl::Status StreamExecutorGpuDevice::ClearMemoryStats() {
         "ClearMemoryStats() is allowed only for addressable devices");
   }
 
-  auto* allocator_adapter = dynamic_cast<se::MultiDeviceAdapter*>(
-      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator());
+  se::DeviceAddressAllocator* device_allocator =
+      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator();
+  if (auto* vmm_allocator =
+          dynamic_cast<se::DeviceAddressVmmAllocator*>(device_allocator)) {
+    if (vmm_allocator->ClearAllocatorStats(local_device_id().value())) {
+      return absl::OkStatus();
+    }
+    return absl::UnavailableError(
+        "ClearStats not supported by the VMM allocator");
+  }
+
+  auto* allocator_adapter =
+      dynamic_cast<se::MultiDeviceAdapter*>(device_allocator);
   if (!allocator_adapter) {
     return absl::UnimplementedError(
         "ClearMemoryStats() is only implemented with MultiDeviceAdapter "
