@@ -247,11 +247,19 @@ size_t SplitKForOccupancy(const DotDimensions& dims,
   }
   const bool tile_applies = preferred_contracting_elements > 0 &&
                             dims.k % preferred_contracting_elements == 0;
+  const auto utilization = [cores](int64_t t) {
+    return static_cast<double>(t) / (CeilOfRatio(t, cores) * cores);
+  };
+  const double unsplit_utilization = utilization(tiles);
   size_t split = 1;
   while (split < 64 && tiles * static_cast<int64_t>(split) < want) {
     const size_t next = split * 2;
     if (static_cast<int64_t>(next) * intermediate_bytes_per_split >
         operand_bytes) {
+      break;
+    }
+    if (utilization(tiles * static_cast<int64_t>(next)) <=
+        unsplit_utilization * 1.05) {
       break;
     }
     if (dims.k / static_cast<int64_t>(next) < kMinKPerSplit) {
