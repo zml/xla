@@ -52,7 +52,6 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor::metal {

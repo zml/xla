@@ -973,9 +973,9 @@ GpuExecutable::ResolveConstantGlobals(se::Stream* stream) {
       }
       owned_allocations.push_back(global);
       if (content_size == 0) {
-        RETURN_IF_ERROR(stream->MemZero(&global, size));
+        ABSL_RETURN_IF_ERROR(stream->MemZero(&global, size));
       } else {
-        RETURN_IF_ERROR(
+        ABSL_RETURN_IF_ERROR(
             stream->Memcpy(&global, info.content.span().data(), content_size));
       }
       submitted_mem_copies = true;

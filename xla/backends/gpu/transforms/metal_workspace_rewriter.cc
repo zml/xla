@@ -21,10 +21,10 @@ limitations under the License.
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/runtime/metal_workspace.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/xla_data.pb.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
 namespace {
@@ -63,9 +64,9 @@ absl::StatusOr<std::optional<int64_t>> DenseNvfp4WorkspaceBytes(
 
   const Shape& x = call.operand(0)->shape();
   const Shape& w = call.operand(1)->shape();
-  RETURN_IF_ERROR(CheckRank(x, 2, "NVFP4 x"));
-  RETURN_IF_ERROR(CheckRank(w, 2, "NVFP4 weight"));
-  RETURN_IF_ERROR(CheckRank(call.shape(), 2, "NVFP4 output"));
+  ABSL_RETURN_IF_ERROR(CheckRank(x, 2, "NVFP4 x"));
+  ABSL_RETURN_IF_ERROR(CheckRank(w, 2, "NVFP4 weight"));
+  ABSL_RETURN_IF_ERROR(CheckRank(call.shape(), 2, "NVFP4 output"));
   const int64_t m = x.dimensions(0);
   const int64_t k = x.dimensions(1);
   const int64_t n = w.dimensions(0);
@@ -91,9 +92,9 @@ absl::StatusOr<std::optional<int64_t>> MoeWorkspaceBytes(
 
   const Shape& x = call.operand(0)->shape();
   const Shape& w = call.operand(1)->shape();
-  RETURN_IF_ERROR(CheckRank(x, 2, "Metal MoE x"));
-  RETURN_IF_ERROR(CheckRank(w, 3, "Metal MoE weight"));
-  RETURN_IF_ERROR(CheckRank(call.shape(), 2, "Metal MoE output"));
+  ABSL_RETURN_IF_ERROR(CheckRank(x, 2, "Metal MoE x"));
+  ABSL_RETURN_IF_ERROR(CheckRank(w, 3, "Metal MoE weight"));
+  ABSL_RETURN_IF_ERROR(CheckRank(call.shape(), 2, "Metal MoE output"));
   const int64_t r = x.dimensions(0);
   const int64_t k = x.dimensions(1);
   const int64_t e = w.dimensions(0);
@@ -144,7 +145,7 @@ absl::StatusOr<bool> RunOnComputation(HloComputation* computation,
     TF_ASSIGN_OR_RETURN(std::optional<int64_t> workspace_bytes,
                         WorkspaceBytes(*call, arch_size, arch_gen));
     if (workspace_bytes.has_value() && *workspace_bytes > 0) {
-      RETURN_IF_ERROR(RewriteWithWorkspace(call, *workspace_bytes));
+      ABSL_RETURN_IF_ERROR(RewriteWithWorkspace(call, *workspace_bytes));
       changed = true;
       continue;
     }

@@ -47,8 +47,8 @@ cc_library(
         "-Wl,-framework,MetalPerformanceShaders",
     ]),
     deps = [
+        "//xla/tsl/platform:statusor",
         "//xla/stream_executor:launch_dim",
-        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -173,7 +173,6 @@ cc_library(
         "//xla/stream_executor:platform",
         "//xla/stream_executor:semantic_version",
         "//xla/stream_executor:stream",
-        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",

@@ -41,7 +41,7 @@ limitations under the License.
 #include "absl/time/clock.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/launch_dim.h"
-#include "xla/tsl/platform/status_macros.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor::metal {
 namespace {

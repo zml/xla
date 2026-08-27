@@ -19,10 +19,11 @@ limitations under the License.
 #include <limits>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/gpu/runtime/metal_nvfp4_dispatch.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
 namespace {
@@ -89,7 +90,7 @@ absl::Status ValidateMetalInt32Dimension(int64_t value,
 
 absl::StatusOr<MetalNvfp4WorkspaceLayout> GetMetalNvfp4SplitKWorkspaceLayout(
     int64_t split_k, int64_t m, int64_t n) {
-  RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       ValidatePositiveDimensions(split_k, m, n, "NVFP4 split-K workspace"));
   TF_ASSIGN_OR_RETURN(const int64_t plane_elements,
                       CheckedMultiply(m, n, "NVFP4 split-K M*N stride"));
@@ -111,9 +112,9 @@ absl::StatusOr<MetalNvfp4WorkspaceLayout> GetMetalNvfp4SplitKWorkspaceLayout(
 
 absl::StatusOr<MetalNvfp4WorkspaceLayout> GetMetalNvfp4WorkspaceLayout(
     int64_t m, int64_t k, int64_t n, char arch_size, int arch_gen) {
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(m, "NVFP4 M"));
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(k, "NVFP4 K"));
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(n, "NVFP4 N"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(m, "NVFP4 M"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(k, "NVFP4 K"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(n, "NVFP4 N"));
 
   if (SelectNvfp4DensePath(m, k, n, arch_size, arch_gen) !=
       Nvfp4DensePath::kQmmSplitK) {
@@ -127,7 +128,7 @@ absl::StatusOr<MetalNvfp4WorkspaceLayout> GetMetalNvfp4WorkspaceLayout(
 
 absl::StatusOr<MetalMoeWorkspaceLayout> GetMetalMoeWorkspaceLayout(
     int64_t rows, int64_t k, int64_t n) {
-  RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       ValidatePositiveDimensions(rows, k, n, "Metal MoE workspace"));
 
   TF_ASSIGN_OR_RETURN(
@@ -170,10 +171,10 @@ absl::StatusOr<int64_t> GetMetalNvfp4WorkspaceBytes(int64_t m, int64_t k,
 absl::StatusOr<int64_t> GetMetalMoeWorkspaceBytes(int64_t r, int64_t e,
                                                   int64_t k, int64_t n,
                                                   bool is_nvfp4) {
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(r, "Metal MoE R"));
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(e, "Metal MoE E"));
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(k, "Metal MoE K"));
-  RETURN_IF_ERROR(ValidateMetalInt32Dimension(n, "Metal MoE N"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(r, "Metal MoE R"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(e, "Metal MoE E"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(k, "Metal MoE K"));
+  ABSL_RETURN_IF_ERROR(ValidateMetalInt32Dimension(n, "Metal MoE N"));
   if (!ShouldUseMetalMoeSortedPath(r, e, k, n, is_nvfp4)) return 0;
   TF_ASSIGN_OR_RETURN(MetalMoeWorkspaceLayout layout,
                       GetMetalMoeWorkspaceLayout(r, k, n));

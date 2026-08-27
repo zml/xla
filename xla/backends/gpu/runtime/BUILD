@@ -5747,9 +5747,10 @@ cc_library(
     srcs = ["metal_workspace.cc"],
     hdrs = ["metal_workspace.h"],
     deps = [
+        "//xla/tsl/platform:statusor",
         ":metal_nvfp4_dispatch",
-        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
     ],

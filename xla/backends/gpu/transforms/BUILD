@@ -2294,6 +2294,7 @@ cc_library(
     srcs = ["metal_workspace_rewriter.cc"],
     hdrs = ["metal_workspace_rewriter.h"],
     deps = [
+        "//xla/tsl/platform:statusor",
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/backends/gpu/runtime:metal_nvfp4_dispatch",
@@ -2301,9 +2302,9 @@ cc_library(
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/service/gpu:metal_custom_calls",
-        "//xla/tsl/platform:status_macros",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
     ],

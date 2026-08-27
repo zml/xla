@@ -530,11 +530,11 @@ absl::Status GpuLayoutAssignment::AddBackendConstraints(
       for (int64_t i = 0; i < instruction->operand_count(); ++i) {
         Shape operand_shape = instruction->operand(i)->shape();
         LayoutUtil::SetToDefaultLayout(&operand_shape);
-        RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction, i));
+        ABSL_RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction, i));
       }
       Shape output_shape = instruction->shape();
       LayoutUtil::SetToDefaultLayout(&output_shape);
-      RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction));
+      ABSL_RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction));
     }
 
     CHECK(!IsCublasLtGemm(*instruction))
