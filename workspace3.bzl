@@ -78,6 +78,7 @@ def workspace():
         name = "rules_ml_toolchain",
         patch_file = [
             "@xla//third_party/rules_ml_toolchain:cudnn_9_24.patch",
+            "@xla//third_party/rules_ml_toolchain:nvcc_wrapper_no_log.patch",
         ],
         sha256 = "75ccb7c4dc699343f02d02f0b5baa6dac09c013d46b92b60f18563448ea59e77",
         strip_prefix = "rules_ml_toolchain-73cb731fed3ccf7551beac710bf1c5dbeb8be298",
