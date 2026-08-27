@@ -301,6 +301,24 @@ TEST_F(SplitkRewriterTest, TargetWavesLeavesAWellOccupiedDotAlone) {
   EXPECT_EQ(with_floor->ToString(), without_floor->ToString());
 }
 
+TEST_F(SplitkRewriterTest, TargetWavesLeavesADotJustUnderOneWaveAlone) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      x = bf16[16,5120]{1,0} parameter(0)
+      w = f8e4m3fn[5120,16384]{1,0} parameter(1)
+      cw = bf16[5120,16384]{1,0} convert(w)
+      ROOT d = bf16[16,16384]{1,0} dot(x, cw),
+                             lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          rewriter_.HloModulePass::Run(module.get()));
+  EXPECT_FALSE(changed);
+}
+
 constexpr absl::string_view kNvfp4DownProjection = R"(
     HloModule module
 
