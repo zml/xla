@@ -246,6 +246,12 @@ bool IsGuaranteedDivisible(mlir::Value value, int64_t divisor) {
     }
     return symbolic_map.GetResult(0).IsMultipleOf(divisor);
   }
+  if (auto div_op = value.getDefiningOp<arith::DivSIOp>()) {
+    if (auto c = div_op.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+        c && c.value() > 0) {
+      return IsGuaranteedDivisible(div_op.getLhs(), divisor * c.value());
+    }
+  }
   return false;
 }
 
