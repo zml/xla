@@ -360,15 +360,17 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
     // A single short kernel launch does not bring ROCm devices to a stable
     // performance state. That systematically penalizes the first autotuning
     // candidate relative to later backends. Warm the device once per profiler,
-    // then retain the existing per-candidate warmup for cache-local effects.
+    // then use a shorter ramp for every candidate: compiling and installing a
+    // new executable can leave an MI300 idle long enough to drop its clocks.
     constexpr int kInitialRocmWarmupRuns = 32;
-    const bool needs_initial_rocm_warmup =
-        !initial_device_warmup_done_ &&
-        stream_executor_->GetDeviceDescription()
-            .gpu_compute_capability()
-            .IsRocm();
+    constexpr int kPerCandidateRocmWarmupRuns = 8;
+    const bool is_rocm = stream_executor_->GetDeviceDescription()
+                             .gpu_compute_capability()
+                             .IsRocm();
     const int warmup_runs =
-        needs_initial_rocm_warmup ? kInitialRocmWarmupRuns : 1;
+        is_rocm ? (initial_device_warmup_done_ ? kPerCandidateRocmWarmupRuns
+                                               : kInitialRocmWarmupRuns)
+                : 1;
     for (int warmup = 0; warmup < warmup_runs; ++warmup) {
       std::vector<ExecutionInput> execution_inputs =
           CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),

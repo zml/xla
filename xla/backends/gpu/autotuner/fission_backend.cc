@@ -89,7 +89,7 @@ const absl::flat_hash_set<std::string>& Mi300DefaultFlyTileKeys() {
   // while leaving Fly's MFMA atom and software pipeline choices independent.
   // Specialized Fly pipelines bypass this list entirely.
   static const auto* keys = new absl::flat_hash_set<std::string>({
-      "16:16:256:4",  "16:128:32:4",  "32:8:16:2",    "32:16:128:2",
+      "16:16:256:4",  "16:128:32:4",  "16:128:64:8",   "32:8:16:2",
       "32:16:128:4",  "32:16:256:2",  "32:32:32:2",   "32:32:256:4",
       "32:64:64:4",   "64:8:128:2",   "64:32:16:2",   "64:32:32:2",
       "64:32:32:4",   "64:32:128:2",  "128:8:16:2",   "128:16:128:8",

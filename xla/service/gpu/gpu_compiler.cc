@@ -114,6 +114,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/estimate_cub_sort_scratch_size.h"
 #include "xla/backends/gpu/transforms/explicit_collectives_group_async_wrapper.h"
 #include "xla/backends/gpu/transforms/explicit_stream_annotation_async_wrapper.h"
+#include "xla/backends/gpu/transforms/fly_autotune_cleanup.h"
 #include "xla/backends/gpu/transforms/flydsl_replacement_verifier.h"
 #include "xla/backends/gpu/transforms/paged_attention_rewriter_fly.h"
 #include "xla/backends/gpu/transforms/fusion_wrapper.h"
@@ -3573,6 +3574,7 @@ absl::Status GpuCompiler::AddAutotunerPass(
   // Post autotuning transformations needed after autotuning happens.
   pipeline->AddPass<ConvertTritonGemmConfig>(target_config->device_description,
                                              mlir_context);
+  pipeline->AddPass<FlyAutotuneCleanup>();
   return absl::OkStatus();
 }
 

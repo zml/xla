@@ -76,6 +76,7 @@ struct RowReductionSpec {
   std::vector<std::pair<int64_t, PrimitiveType>> input_parameters;
   int64_t max_vector_element_bits;
   HloOpcode reducer_opcode;
+  std::optional<int64_t> init_parameter_number;
   double init_value;
   int64_t integer_init_value;
 };
@@ -163,13 +164,19 @@ int64_t ScalarIntegerLiteral(const Literal& literal, PrimitiveType type) {
 }
 
 bool HasSamePhysicalDimensions(const Shape& lhs, const Shape& rhs) {
-  return ShapeUtil::EqualIgnoringElementType(lhs, rhs) &&
-         LayoutUtil::Equal(lhs.layout(), rhs.layout());
+  // Native row reduction addresses every input and output as a flat physical
+  // buffer.  Logical singleton dimensions therefore do not change its index
+  // map: [K], [1,K], and [1,1,K] are the same emitter shape when their layouts
+  // make the reshape a bitcast.
+  return lhs.has_layout() && rhs.has_layout() &&
+         ShapeUtil::ElementsIn(lhs) == ShapeUtil::ElementsIn(rhs) &&
+         ShapeUtil::ReshapeIsBitcast(lhs, rhs,
+                                     /*ignore_element_type=*/true);
 }
 
 bool HasCompatibleRowShape(const Shape& input, const Shape& rows) {
   const int64_t input_rank = input.dimensions_size();
-  if (input_rank < 2 || rows.dimensions_size() != input_rank - 1 ||
+  if (input_rank < 1 || rows.dimensions_size() != input_rank - 1 ||
       !input.has_layout() || !rows.has_layout() ||
       input.layout().minor_to_major(0) != input_rank - 1) {
     return false;
@@ -189,9 +196,68 @@ bool HasCompatibleRowShape(const Shape& input, const Shape& rows) {
   return true;
 }
 
+bool HasCompatibleColumnShape(const Shape& input, const Shape& columns) {
+  const int64_t input_rank = input.dimensions_size();
+  return input_rank >= 1 && columns.dimensions_size() == 1 &&
+         input.has_layout() && columns.has_layout() &&
+         input.layout().minor_to_major(0) == input_rank - 1 &&
+         columns.layout().minor_to_major(0) == 0 &&
+         columns.dimensions(0) == input.dimensions(input_rank - 1);
+}
+
+bool IsColumnBroadcast(const HloInstruction& instruction,
+                       const Shape& input_shape) {
+  return instruction.opcode() == HloOpcode::kBroadcast &&
+         instruction.operand_count() == 1 &&
+         HasSamePhysicalDimensions(instruction.shape(), input_shape) &&
+         HasCompatibleColumnShape(input_shape,
+                                  instruction.operand(0)->shape()) &&
+         instruction.dimensions().size() == 1 &&
+         instruction.dimensions(0) ==
+             instruction.shape().layout().minor_to_major(0);
+}
+
+bool IsRowBroadcast(const HloInstruction& instruction,
+                    const Shape& input_shape) {
+  if (instruction.opcode() != HloOpcode::kBroadcast ||
+      instruction.operand_count() != 1 ||
+      !HasSamePhysicalDimensions(instruction.shape(), input_shape) ||
+      !HasCompatibleRowShape(input_shape, instruction.operand(0)->shape()) ||
+      instruction.dimensions().size() !=
+          instruction.operand(0)->shape().dimensions_size()) {
+    return false;
+  }
+  for (int64_t dimension = 0; dimension < instruction.dimensions().size();
+       ++dimension) {
+    if (instruction.dimensions(dimension) != dimension) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool DependsOnInstruction(const HloInstruction* root,
+                          const HloInstruction* target) {
+  llvm::DenseSet<const HloInstruction*> visited;
+  llvm::SmallVector<const HloInstruction*> worklist = {root};
+  while (!worklist.empty()) {
+    const HloInstruction* instruction = worklist.pop_back_val();
+    if (instruction == target) {
+      return true;
+    }
+    if (!visited.insert(instruction).second) {
+      continue;
+    }
+    worklist.append(instruction->operands().begin(),
+                    instruction->operands().end());
+  }
+  return false;
+}
+
 bool IsSupportedF32Unary(HloOpcode opcode) {
   return opcode == HloOpcode::kAbs || opcode == HloOpcode::kCopy ||
-         opcode == HloOpcode::kNegate || opcode == HloOpcode::kRsqrt;
+         opcode == HloOpcode::kExp || opcode == HloOpcode::kNegate ||
+         opcode == HloOpcode::kRsqrt;
 }
 
 bool IsSupportedF32Binary(HloOpcode opcode) {
@@ -216,6 +282,33 @@ bool HasDescendingLayout(const Shape& shape) {
     }
   }
   return true;
+}
+
+bool IsSupportedReductionSlice(const HloInstruction& instruction,
+                               const Shape& input_shape) {
+  if (instruction.opcode() != HloOpcode::kSlice ||
+      instruction.operand_count() != 1 ||
+      !HasSamePhysicalDimensions(instruction.shape(), input_shape)) {
+    return false;
+  }
+  const Shape& result = instruction.shape();
+  const Shape& source = instruction.operand(0)->shape();
+  if (result.element_type() != source.element_type() ||
+      result.dimensions_size() != source.dimensions_size() ||
+      !HasDescendingLayout(result) || !HasDescendingLayout(source) ||
+      !LayoutUtil::Equal(result.layout(), source.layout()) ||
+      !std::all_of(instruction.slice_strides().begin(),
+                   instruction.slice_strides().end(),
+                   [](int64_t stride) { return stride == 1; })) {
+    return false;
+  }
+  // Vector loads must remain contiguous. Slicing outer dimensions is safe,
+  // but a partial innermost physical dimension could make one load cross a
+  // source-row boundary.
+  const int64_t minor_dimension = result.layout().minor_to_major(0);
+  return instruction.slice_starts()[minor_dimension] == 0 &&
+         instruction.slice_limits()[minor_dimension] ==
+             source.dimensions(minor_dimension);
 }
 
 bool IsAddReducer(const HloInstruction& reduction) {
@@ -330,13 +423,21 @@ bool IsSupportedReductionInputGraph(
     case HloOpcode::kConstant:
       return ShapeUtil::IsScalar(instruction->shape()) &&
              instruction->shape().element_type() == F32;
-    case HloOpcode::kBroadcast:
-      return instruction->operand_count() == 1 &&
-             instruction->shape().element_type() == F32 &&
-             HasSamePhysicalDimensions(instruction->shape(), input_shape) &&
-             IsSupportedReductionInputGraph(instruction->operand(0),
-                                            input_shape, visited,
+    case HloOpcode::kBroadcast: {
+      if (instruction->operand_count() != 1 ||
+          instruction->shape().element_type() != F32 ||
+          !HasSamePhysicalDimensions(instruction->shape(), input_shape)) {
+        return false;
+      }
+      const HloInstruction* operand = instruction->operand(0);
+      if (!ShapeUtil::IsEffectiveScalar(operand->shape()) &&
+          !IsRowBroadcast(*instruction, input_shape) &&
+          !IsColumnBroadcast(*instruction, input_shape)) {
+        return false;
+      }
+      return IsSupportedReductionInputGraph(operand, operand->shape(), visited,
                                             input_parameters);
+    }
     case HloOpcode::kBitcast: {
       if (!HasSamePhysicalDimensions(instruction->shape(), input_shape) ||
           instruction->operand_count() != 1 ||
@@ -370,6 +471,11 @@ bool IsSupportedReductionInputGraph(
       return IsSupportedReductionInputGraph(operand, operand->shape(), visited,
                                             input_parameters);
     }
+    case HloOpcode::kSlice:
+      return IsSupportedReductionSlice(*instruction, input_shape) &&
+             IsSupportedReductionInputGraph(instruction->operand(0),
+                                            instruction->operand(0)->shape(),
+                                            visited, input_parameters);
     case HloOpcode::kReduce:
       return IsSupportedAuxiliaryMajorReduction(*instruction, input_shape,
                                                 input_parameters);
@@ -428,16 +534,31 @@ bool IsSupportedReductionOutputGraph(
                                              output_shape, visited,
                                              input_parameters);
     }
-    case HloOpcode::kConstant:
-      return ShapeUtil::IsScalar(instruction->shape()) &&
-             instruction->shape().element_type() == F32;
-    case HloOpcode::kBroadcast:
+    case HloOpcode::kBitcast:
       return instruction->operand_count() == 1 &&
-             instruction->shape().element_type() == F32 &&
+             instruction->shape().element_type() ==
+                 instruction->operand(0)->shape().element_type() &&
              HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
+             ShapeUtil::ReshapeIsBitcast(instruction->operand(0)->shape(),
+                                         instruction->shape()) &&
              IsSupportedReductionOutputGraph(instruction->operand(0), reduction,
                                              output_shape, visited,
                                              input_parameters);
+    case HloOpcode::kConstant:
+      return ShapeUtil::IsEffectiveScalar(instruction->shape()) &&
+             instruction->shape().element_type() == F32;
+    case HloOpcode::kBroadcast:
+      if (instruction->operand_count() != 1 ||
+          instruction->shape().element_type() != F32 ||
+          !HasSamePhysicalDimensions(instruction->shape(), output_shape)) {
+        return false;
+      }
+      return IsSupportedReductionOutputGraph(
+          instruction->operand(0), reduction,
+          ShapeUtil::IsEffectiveScalar(instruction->operand(0)->shape())
+              ? instruction->operand(0)->shape()
+              : output_shape,
+          visited, input_parameters);
     default:
       break;
   }
@@ -475,10 +596,12 @@ bool IsSupportedRowwiseOutputGraph(
       HasSamePhysicalDimensions(instruction->shape(), input_shape);
   const bool has_row_shape =
       HasSamePhysicalDimensions(instruction->shape(), row_shape);
+  const bool has_column_shape =
+      HasCompatibleColumnShape(input_shape, instruction->shape());
   switch (instruction->opcode()) {
     case HloOpcode::kParameter: {
       const PrimitiveType type = instruction->shape().element_type();
-      if ((!has_input_shape && !has_row_shape) ||
+      if ((!has_input_shape && !has_row_shape && !has_column_shape) ||
           (type != F32 && type != F16 && type != BF16)) {
         return false;
       }
@@ -487,7 +610,7 @@ bool IsSupportedRowwiseOutputGraph(
     }
     case HloOpcode::kConvert: {
       if (instruction->operand_count() != 1 ||
-          (!has_input_shape && !has_row_shape)) {
+          (!has_input_shape && !has_row_shape && !has_column_shape)) {
         return false;
       }
       const PrimitiveType source_type =
@@ -505,22 +628,47 @@ bool IsSupportedRowwiseOutputGraph(
                                            input_parameters);
     }
     case HloOpcode::kConstant:
-      return ShapeUtil::IsScalar(instruction->shape()) &&
+      return ShapeUtil::IsEffectiveScalar(instruction->shape()) &&
              instruction->shape().element_type() == F32;
-    case HloOpcode::kBroadcast:
+    case HloOpcode::kBroadcast: {
+      const bool is_column_broadcast =
+          IsColumnBroadcast(*instruction, input_shape);
+      const PrimitiveType type = instruction->shape().element_type();
       return instruction->operand_count() == 1 &&
-             instruction->shape().element_type() == F32 &&
+             (type == F32 ||
+              (is_column_broadcast && (type == F16 || type == BF16))) &&
              (has_input_shape || has_row_shape) &&
+             (ShapeUtil::IsEffectiveScalar(
+                  instruction->operand(0)->shape()) ||
+              HasSamePhysicalDimensions(instruction->operand(0)->shape(),
+                                        row_shape) ||
+              is_column_broadcast) &&
              IsSupportedRowwiseOutputGraph(instruction->operand(0), reduction,
                                            input_shape, row_shape, visited,
                                            input_parameters);
+    }
     case HloOpcode::kBitcast: {
-      if (!has_input_shape) {
+      if ((!has_input_shape && !has_row_shape) ||
+          instruction->operand_count() != 1 ||
+          instruction->shape().element_type() !=
+              instruction->operand(0)->shape().element_type() ||
+          !ShapeUtil::ReshapeIsBitcast(instruction->operand(0)->shape(),
+                                       instruction->shape())) {
         return false;
       }
-      llvm::DenseSet<const HloInstruction*> input_visited;
-      return IsSupportedReductionInputGraph(instruction, input_shape,
-                                            input_visited, input_parameters);
+      if (has_input_shape) {
+        if (DependsOnInstruction(instruction->operand(0), reduction)) {
+          return IsSupportedRowwiseOutputGraph(
+              instruction->operand(0), reduction, input_shape, row_shape,
+              visited, input_parameters);
+        }
+        llvm::DenseSet<const HloInstruction*> input_visited;
+        return IsSupportedReductionInputGraph(instruction, input_shape,
+                                              input_visited, input_parameters);
+      }
+      return IsSupportedRowwiseOutputGraph(instruction->operand(0), reduction,
+                                           input_shape, row_shape, visited,
+                                           input_parameters);
     }
     case HloOpcode::kReduce:
       return has_input_shape && instruction != reduction &&
@@ -532,7 +680,7 @@ bool IsSupportedRowwiseOutputGraph(
   if (IsSupportedF32Unary(instruction->opcode())) {
     return instruction->operand_count() == 1 &&
            instruction->shape().element_type() == F32 &&
-           (has_input_shape || has_row_shape) &&
+           (has_input_shape || has_row_shape || has_column_shape) &&
            IsSupportedRowwiseOutputGraph(instruction->operand(0), reduction,
                                          input_shape, row_shape, visited,
                                          input_parameters);
@@ -540,7 +688,7 @@ bool IsSupportedRowwiseOutputGraph(
   if (IsSupportedF32Binary(instruction->opcode())) {
     return instruction->operand_count() == 2 &&
            instruction->shape().element_type() == F32 &&
-           (has_input_shape || has_row_shape) &&
+           (has_input_shape || has_row_shape || has_column_shape) &&
            IsSupportedRowwiseOutputGraph(instruction->operand(0), reduction,
                                          input_shape, row_shape, visited,
                                          input_parameters) &&
@@ -579,7 +727,7 @@ std::optional<RowReductionSpec> MatchRowReduction(const HloInstruction& root) {
     const HloInstruction* candidate_input = candidate->operand(0);
     if (candidate_input->shape().element_type() !=
             candidate->shape().element_type() ||
-        candidate_input->shape().dimensions_size() < 2 ||
+        candidate_input->shape().dimensions_size() < 1 ||
         candidate->dimensions(0) !=
             candidate_input->shape().dimensions_size() - 1 ||
         !HasCompatibleRowShape(candidate_input->shape(), candidate->shape())) {
@@ -637,26 +785,36 @@ std::optional<RowReductionSpec> MatchRowReduction(const HloInstruction& root) {
       return std::nullopt;
     }
   }
+  const HloInstruction* init = reduction->operand(1);
+  if (!ShapeUtil::IsScalar(init->shape()) ||
+      init->shape().element_type() != reduction_type) {
+    return std::nullopt;
+  }
+  std::optional<int64_t> init_parameter_number;
+  double init_value = 0.0;
+  int64_t integer_init_value = 0;
+  if (init->opcode() == HloOpcode::kConstant) {
+    std::optional<double> literal_value =
+        ScalarLiteralAsDouble(init->literal(), reduction_type);
+    if (!literal_value.has_value()) {
+      return std::nullopt;
+    }
+    init_value = *literal_value;
+    if (IsSupportedIntegerReductionType(reduction_type)) {
+      integer_init_value =
+          ScalarIntegerLiteral(init->literal(), reduction_type);
+    }
+  } else if (init->opcode() == HloOpcode::kParameter) {
+    init_parameter_number = init->parameter_number();
+    input_parameters.push_back({*init_parameter_number, reduction_type});
+  } else {
+    return std::nullopt;
+  }
+
   std::sort(input_parameters.begin(), input_parameters.end());
   input_parameters.erase(
       std::unique(input_parameters.begin(), input_parameters.end()),
       input_parameters.end());
-
-  const HloInstruction* init = reduction->operand(1);
-  if (init->opcode() != HloOpcode::kConstant ||
-      !ShapeUtil::IsScalar(init->shape()) ||
-      init->shape().element_type() != reduction_type) {
-    return std::nullopt;
-  }
-  std::optional<double> init_value =
-      ScalarLiteralAsDouble(init->literal(), reduction_type);
-  if (!init_value.has_value()) {
-    return std::nullopt;
-  }
-  const int64_t integer_init_value =
-      IsSupportedIntegerReductionType(reduction_type)
-          ? ScalarIntegerLiteral(init->literal(), reduction_type)
-          : 0;
 
   const HloComputation* reducer = reduction->called_computations().front();
   const HloInstruction* reducer_root = reducer->root_instruction();
@@ -707,7 +865,8 @@ std::optional<RowReductionSpec> MatchRowReduction(const HloInstruction& root) {
                           std::move(input_parameters),
                           max_vector_element_bits,
                           reducer_root->opcode(),
-                          *init_value,
+                          init_parameter_number,
+                          init_value,
                           integer_init_value};
 }
 
@@ -724,6 +883,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
     has_rowwise_output_ = spec->has_rowwise_output;
     max_vector_element_bits_ = spec->max_vector_element_bits;
     reducer_opcode_ = spec->reducer_opcode;
+    init_parameter_number_ = spec->init_parameter_number;
     init_value_ = spec->init_value;
     integer_init_value_ = spec->integer_init_value;
 
@@ -919,6 +1079,9 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
   }
 
   bool HasNeutralInit() const {
+    if (init_parameter_number_.has_value()) {
+      return false;
+    }
     if (UsesIntegerCompute()) {
       return integer_init_value_ == IntegerNeutralValue();
     }
@@ -1002,6 +1165,35 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
       default:
         LOG(FATAL) << "Unexpected Fly F32 binary opcode.";
     }
+  }
+
+  Value EmitF32Unary(mlir::ImplicitLocOpBuilder& builder, HloOpcode opcode,
+                     Value operand) const {
+    auto emit_scalar = [&](Value scalar) -> Value {
+      switch (opcode) {
+        case HloOpcode::kAbs:
+          return mlir::math::AbsFOp::create(builder, scalar);
+        case HloOpcode::kExp:
+          return mlir::math::ExpOp::create(builder, scalar);
+        case HloOpcode::kNegate:
+          return mlir::arith::NegFOp::create(builder, scalar);
+        case HloOpcode::kRsqrt:
+          return mlir::math::RsqrtOp::create(builder, scalar);
+        default:
+          LOG(FATAL) << "Unexpected Fly F32 unary opcode.";
+      }
+    };
+    auto vector_type = mlir::dyn_cast<mlir::VectorType>(operand.getType());
+    if (!vector_type) {
+      return emit_scalar(operand);
+    }
+    llvm::SmallVector<Value> elements;
+    elements.reserve(vector_type.getNumElements());
+    for (int64_t lane = 0; lane < vector_type.getNumElements(); ++lane) {
+      Value scalar = mlir::vector::ExtractOp::create(builder, operand, lane);
+      elements.push_back(emit_scalar(scalar));
+    }
+    return mlir::vector::FromElementsOp::create(builder, vector_type, elements);
   }
 
   mlir::vector::CombiningKind CombiningKind() const {
@@ -1247,10 +1439,57 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         .getResult(0);
   }
 
+  Value EmitSliceOperandOffset(mlir::ImplicitLocOpBuilder& builder,
+                               const HloInstruction& slice,
+                               Value element_offset) const {
+    const Shape& result = slice.shape();
+    const Shape& source = slice.operand(0)->shape();
+    const int64_t rank = result.dimensions_size();
+    std::vector<int64_t> result_strides(rank);
+    std::vector<int64_t> source_strides(rank);
+    int64_t stride = 1;
+    for (int64_t dimension : result.layout().minor_to_major()) {
+      result_strides[dimension] = stride;
+      stride *= result.dimensions(dimension);
+    }
+    stride = 1;
+    for (int64_t dimension : source.layout().minor_to_major()) {
+      source_strides[dimension] = stride;
+      stride *= source.dimensions(dimension);
+    }
+
+    Value source_offset = I64(builder, 0);
+    for (int64_t dimension = 0; dimension < rank; ++dimension) {
+      Value coordinate = element_offset;
+      if (result_strides[dimension] != 1) {
+        coordinate = mlir::arith::DivUIOp::create(
+            builder, coordinate, I64(builder, result_strides[dimension]));
+      }
+      if (result.dimensions(dimension) != 1) {
+        coordinate = mlir::arith::RemUIOp::create(
+            builder, coordinate, I64(builder, result.dimensions(dimension)));
+      } else {
+        coordinate = I64(builder, 0);
+      }
+      if (slice.slice_starts()[dimension] != 0) {
+        coordinate = mlir::arith::AddIOp::create(
+            builder, coordinate, I64(builder, slice.slice_starts()[dimension]));
+      }
+      if (source_strides[dimension] != 1) {
+        coordinate = mlir::arith::MulIOp::create(
+            builder, coordinate, I64(builder, source_strides[dimension]));
+      }
+      source_offset =
+          mlir::arith::AddIOp::create(builder, source_offset, coordinate);
+    }
+    return source_offset;
+  }
+
   absl::StatusOr<Value> EmitReductionInputGraph(
       mlir::ImplicitLocOpBuilder& builder, const HloInstruction* instruction,
       Value element_offset, Value predicate,
       const std::vector<std::optional<InputState>>& input_states,
+      const std::vector<std::optional<InputState>>& scalar_input_states,
       int64_t vector_width,
       llvm::DenseMap<const HloInstruction*, Value>& cache) const {
     if (auto it = cache.find(instruction); it != cache.end()) {
@@ -1292,27 +1531,64 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kConstant: {
-        std::optional<double> value = instruction->literal().GetAsDouble({});
-        TF_RET_CHECK(value.has_value());
-        result = FloatComputeConstant(builder, *value);
+        result = FloatComputeConstant(
+            builder, instruction->literal().GetFirstElement<float>());
         break;
       }
       case HloOpcode::kBroadcast: {
+        const HloInstruction* operand = instruction->operand(0);
+        const bool is_scalar = ShapeUtil::IsEffectiveScalar(operand->shape());
+        const bool is_row = IsRowBroadcast(*instruction, instruction->shape());
+        const bool is_column =
+            IsColumnBroadcast(*instruction, instruction->shape());
+        TF_RET_CHECK(is_scalar || is_row || is_column);
+        Value source_offset = element_offset;
+        const std::vector<std::optional<InputState>>* source_states =
+            &input_states;
+        int64_t source_vector_width = vector_width;
+        if (is_scalar) {
+          source_offset = I64(builder, 0);
+          source_states = &scalar_input_states;
+          source_vector_width = 1;
+        } else if (is_row) {
+          source_offset = mlir::arith::DivUIOp::create(builder, element_offset,
+                                                       I64(builder, columns_));
+          source_states = &scalar_input_states;
+          source_vector_width = 1;
+        } else {
+          source_offset = mlir::arith::RemUIOp::create(builder, element_offset,
+                                                       I64(builder, columns_));
+        }
+        // A broadcasted operand has a different address map and, for scalar
+        // or row broadcasts, a different vector width from the surrounding
+        // reduction DAG. Keep its memo table local so a shared producer is
+        // never reused with an incompatible offset or type.
+        llvm::DenseMap<const HloInstruction*, Value> broadcast_cache;
         TF_ASSIGN_OR_RETURN(
-            Value scalar, EmitReductionInputGraph(
-                              builder, instruction->operand(0), element_offset,
-                              predicate, input_states, vector_width, cache));
-        auto vector_type =
-            mlir::VectorType::get({vector_width}, builder.getF32Type());
-        result =
-            mlir::vector::BroadcastOp::create(builder, vector_type, scalar);
+            Value operand_value,
+            EmitReductionInputGraph(builder, operand, source_offset, predicate,
+                                    *source_states, scalar_input_states,
+                                    source_vector_width, broadcast_cache));
+        if (is_scalar || is_row) {
+          if (mlir::isa<mlir::VectorType>(operand_value.getType())) {
+            operand_value =
+                mlir::vector::ExtractOp::create(builder, operand_value, 0);
+          }
+          auto vector_type =
+              mlir::VectorType::get({vector_width}, builder.getF32Type());
+          result = mlir::vector::BroadcastOp::create(builder, vector_type,
+                                                     operand_value);
+        } else {
+          result = operand_value;
+        }
         break;
       }
       case HloOpcode::kConvert: {
         TF_ASSIGN_OR_RETURN(
-            Value operand, EmitReductionInputGraph(
-                               builder, instruction->operand(0), element_offset,
-                               predicate, input_states, vector_width, cache));
+            Value operand,
+            EmitReductionInputGraph(builder, instruction->operand(0),
+                                    element_offset, predicate, input_states,
+                                    scalar_input_states, vector_width, cache));
         const PrimitiveType source_type =
             instruction->operand(0)->shape().element_type();
         const PrimitiveType destination_type =
@@ -1343,9 +1619,24 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
       case HloOpcode::kBitcast:
       case HloOpcode::kCopy: {
         TF_ASSIGN_OR_RETURN(
+            result,
+            EmitReductionInputGraph(builder, instruction->operand(0),
+                                    element_offset, predicate, input_states,
+                                    scalar_input_states, vector_width, cache));
+        break;
+      }
+      case HloOpcode::kSlice: {
+        Value source_offset =
+            EmitSliceOperandOffset(builder, *instruction, element_offset);
+        // Distinct slices may reach the same packed parameter with different
+        // source offsets (Q and K are the common case). Do not reuse a value
+        // memoized while walking another slice path.
+        llvm::DenseMap<const HloInstruction*, Value> slice_cache;
+        TF_ASSIGN_OR_RETURN(
             result, EmitReductionInputGraph(builder, instruction->operand(0),
-                                            element_offset, predicate,
-                                            input_states, vector_width, cache));
+                                            source_offset, predicate,
+                                            input_states, scalar_input_states,
+                                            vector_width, slice_cache));
         break;
       }
       case HloOpcode::kReduce: {
@@ -1376,25 +1667,15 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kAbs:
+      case HloOpcode::kExp:
       case HloOpcode::kNegate:
       case HloOpcode::kRsqrt: {
         TF_ASSIGN_OR_RETURN(
-            Value operand, EmitReductionInputGraph(
-                               builder, instruction->operand(0), element_offset,
-                               predicate, input_states, vector_width, cache));
-        switch (instruction->opcode()) {
-          case HloOpcode::kAbs:
-            result = mlir::math::AbsFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kNegate:
-            result = mlir::arith::NegFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kRsqrt:
-            result = mlir::math::RsqrtOp::create(builder, operand).getResult();
-            break;
-          default:
-            LOG(FATAL) << "Unexpected Fly F32 unary opcode.";
-        }
+            Value operand,
+            EmitReductionInputGraph(builder, instruction->operand(0),
+                                    element_offset, predicate, input_states,
+                                    scalar_input_states, vector_width, cache));
+        result = EmitF32Unary(builder, instruction->opcode(), operand);
         break;
       }
       case HloOpcode::kAdd:
@@ -1404,13 +1685,15 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
       case HloOpcode::kMaximum:
       case HloOpcode::kMinimum: {
         TF_ASSIGN_OR_RETURN(
-            Value lhs, EmitReductionInputGraph(
-                           builder, instruction->operand(0), element_offset,
-                           predicate, input_states, vector_width, cache));
+            Value lhs,
+            EmitReductionInputGraph(builder, instruction->operand(0),
+                                    element_offset, predicate, input_states,
+                                    scalar_input_states, vector_width, cache));
         TF_ASSIGN_OR_RETURN(
-            Value rhs, EmitReductionInputGraph(
-                           builder, instruction->operand(1), element_offset,
-                           predicate, input_states, vector_width, cache));
+            Value rhs,
+            EmitReductionInputGraph(builder, instruction->operand(1),
+                                    element_offset, predicate, input_states,
+                                    scalar_input_states, vector_width, cache));
         result = EmitF32Binary(builder, instruction->opcode(), lhs, rhs);
         break;
       }
@@ -1469,9 +1752,8 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kConstant: {
-        std::optional<double> value = instruction->literal().GetAsDouble({});
-        TF_RET_CHECK(value.has_value());
-        result = FloatComputeConstant(builder, *value);
+        result = FloatComputeConstant(
+            builder, instruction->literal().GetFirstElement<float>());
         break;
       }
       case HloOpcode::kConvert: {
@@ -1489,7 +1771,18 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                       .getResult();
         break;
       }
-      case HloOpcode::kBroadcast:
+      case HloOpcode::kBroadcast: {
+        Value operand_row =
+            ShapeUtil::IsEffectiveScalar(instruction->operand(0)->shape())
+                ? I64(builder, 0)
+                : row;
+        TF_ASSIGN_OR_RETURN(
+            result, EmitReductionOutputGraph(builder, instruction->operand(0),
+                                             reduction, reduced, operand_row,
+                                             predicate, input_states, cache));
+        break;
+      }
+      case HloOpcode::kBitcast:
       case HloOpcode::kCopy: {
         TF_ASSIGN_OR_RETURN(
             result, EmitReductionOutputGraph(builder, instruction->operand(0),
@@ -1498,25 +1791,14 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kAbs:
+      case HloOpcode::kExp:
       case HloOpcode::kNegate:
       case HloOpcode::kRsqrt: {
         TF_ASSIGN_OR_RETURN(Value operand,
                             EmitReductionOutputGraph(
                                 builder, instruction->operand(0), reduction,
                                 reduced, row, predicate, input_states, cache));
-        switch (instruction->opcode()) {
-          case HloOpcode::kAbs:
-            result = mlir::math::AbsFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kNegate:
-            result = mlir::arith::NegFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kRsqrt:
-            result = mlir::math::RsqrtOp::create(builder, operand).getResult();
-            break;
-          default:
-            LOG(FATAL) << "Unexpected Fly F32 unary opcode.";
-        }
+        result = EmitF32Unary(builder, instruction->opcode(), operand);
         break;
       }
       case HloOpcode::kAdd:
@@ -1556,8 +1838,10 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
       llvm::DenseMap<const HloInstruction*, Value>& row_cache) const {
     const bool is_vector =
         HasSamePhysicalDimensions(instruction->shape(), input_shape);
+    const bool is_column =
+        HasCompatibleColumnShape(input_shape, instruction->shape());
     llvm::DenseMap<const HloInstruction*, Value>& cache =
-        is_vector ? vector_cache : row_cache;
+        (is_vector || is_column) ? vector_cache : row_cache;
     if (auto it = cache.find(instruction); it != cache.end()) {
       return it->second;
     }
@@ -1573,6 +1857,12 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           TF_ASSIGN_OR_RETURN(
               result, EmitInputLoad(builder, instruction->parameter_number(),
                                     element_offset, predicate, input_states));
+        } else if (is_column) {
+          Value column_offset = mlir::arith::RemUIOp::create(
+              builder, element_offset, I64(builder, columns_));
+          TF_ASSIGN_OR_RETURN(
+              result, EmitInputLoad(builder, instruction->parameter_number(),
+                                    column_offset, predicate, input_states));
         } else {
           Value row_offset = mlir::arith::DivUIOp::create(
               builder, element_offset, I64(builder, columns_));
@@ -1585,9 +1875,8 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kConstant: {
-        std::optional<double> value = instruction->literal().GetAsDouble({});
-        TF_RET_CHECK(value.has_value());
-        result = FloatComputeConstant(builder, *value);
+        result = FloatComputeConstant(
+            builder, instruction->literal().GetFirstElement<float>());
         break;
       }
       case HloOpcode::kBroadcast: {
@@ -1597,8 +1886,11 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                 builder, instruction->operand(0), reduction, input_shape,
                 row_shape, reduced, element_offset, predicate, input_states,
                 row_input_states, vector_width, vector_cache, row_cache));
-        if (is_vector && !HasSamePhysicalDimensions(
-                             instruction->operand(0)->shape(), input_shape)) {
+        if (is_vector &&
+            !HasSamePhysicalDimensions(instruction->operand(0)->shape(),
+                                       input_shape) &&
+            !HasCompatibleColumnShape(input_shape,
+                                      instruction->operand(0)->shape())) {
           auto vector_type =
               mlir::VectorType::get({vector_width}, builder.getF32Type());
           result =
@@ -1619,14 +1911,19 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
             instruction->operand(0)->shape().element_type();
         const PrimitiveType destination_type =
             instruction->shape().element_type();
+        const bool is_lane_vector = is_vector || is_column;
         if (destination_type == F32) {
-          auto vector_type =
-              mlir::VectorType::get({vector_width}, builder.getF32Type());
+          mlir::Type destination_mlir_type = builder.getF32Type();
+          if (is_lane_vector) {
+            destination_mlir_type =
+                mlir::VectorType::get({vector_width}, builder.getF32Type());
+          }
           if (source_type == BF16) {
             result = Bf16ToF32(builder, operand);
           } else {
             TF_RET_CHECK(source_type == F16);
-            result = mlir::arith::ExtFOp::create(builder, vector_type, operand);
+            result = mlir::arith::ExtFOp::create(builder, destination_mlir_type,
+                                                 operand);
           }
         } else {
           TF_RET_CHECK(source_type == F32 &&
@@ -1634,11 +1931,11 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           mlir::Type destination_element_type =
               emitters::PrimitiveTypeToMlirType(destination_type, builder);
           mlir::Type destination_mlir_type = destination_element_type;
-          if (is_vector) {
+          if (is_lane_vector) {
             destination_mlir_type =
                 mlir::VectorType::get({vector_width}, destination_element_type);
           }
-          if (destination_type == BF16 && is_vector) {
+          if (destination_type == BF16 && is_lane_vector) {
             result = RoundF32ToBf16(builder, operand);
           } else {
             result = mlir::arith::TruncFOp::create(
@@ -1662,13 +1959,25 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         // bitcast. The full-row path finds this value in the reduction-input
         // cache; partitioned output deliberately reloads its slice, so emit
         // that same supported input subgraph on demand.
-        TF_ASSIGN_OR_RETURN(result,
-                            EmitReductionInputGraph(
-                                builder, instruction, element_offset, predicate,
-                                input_states, vector_width, vector_cache));
+        if (is_vector &&
+            !DependsOnInstruction(instruction->operand(0), reduction)) {
+          TF_ASSIGN_OR_RETURN(
+              result,
+              EmitReductionInputGraph(builder, instruction, element_offset,
+                                      predicate, input_states, row_input_states,
+                                      vector_width, vector_cache));
+        } else {
+          TF_ASSIGN_OR_RETURN(
+              result,
+              EmitRowwiseOutputGraph(
+                  builder, instruction->operand(0), reduction, input_shape,
+                  row_shape, reduced, element_offset, predicate, input_states,
+                  row_input_states, vector_width, vector_cache, row_cache));
+        }
         break;
       }
       case HloOpcode::kAbs:
+      case HloOpcode::kExp:
       case HloOpcode::kNegate:
       case HloOpcode::kRsqrt: {
         TF_ASSIGN_OR_RETURN(
@@ -1677,19 +1986,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                 builder, instruction->operand(0), reduction, input_shape,
                 row_shape, reduced, element_offset, predicate, input_states,
                 row_input_states, vector_width, vector_cache, row_cache));
-        switch (instruction->opcode()) {
-          case HloOpcode::kAbs:
-            result = mlir::math::AbsFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kNegate:
-            result = mlir::arith::NegFOp::create(builder, operand).getResult();
-            break;
-          case HloOpcode::kRsqrt:
-            result = mlir::math::RsqrtOp::create(builder, operand).getResult();
-            break;
-          default:
-            LOG(FATAL) << "Unexpected Fly F32 unary opcode.";
-        }
+        result = EmitF32Unary(builder, instruction->opcode(), operand);
         break;
       }
       case HloOpcode::kAdd:
@@ -1835,9 +2132,11 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                    parameter_number < fusion.operand_count());
       const int64_t input_elements =
           ShapeUtil::ElementsIn(fusion.operand(parameter_number)->shape());
+      const int64_t input_vector_width =
+          init_parameter_number_ == parameter_number ? 1 : vector_width_;
       input_states[parameter_number] =
           CreateInputState(builder, kernel, parameter_number, input_type,
-                           input_elements, vector_width_);
+                           input_elements, input_vector_width);
       output_input_states[parameter_number] =
           CreateInputState(builder, kernel, parameter_number, input_type,
                            input_elements, /*vector_width=*/1);
@@ -1892,8 +2191,8 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
       TF_ASSIGN_OR_RETURN(
           Value values,
           EmitReductionInputGraph(builder, spec->reduction->operand(0), offset,
-                                  load_valid, input_states, vector_width_,
-                                  input_cache));
+                                  load_valid, input_states, output_input_states,
+                                  vector_width_, input_cache));
       values = mlir::arith::SelectOp::create(builder, load_valid, values,
                                              neutral_vector);
       // Keep one independent accumulator chain per vector lane and perform a
@@ -1921,7 +2220,8 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           Value tail_values,
           EmitReductionInputGraph(builder, spec->reduction->operand(0),
                                   tail_offset, tail_valid, tail_input_states,
-                                  /*vector_width=*/1, tail_input_cache));
+                                  output_input_states, /*vector_width=*/1,
+                                  tail_input_cache));
       auto scalar_vector_type =
           mlir::VectorType::get({1}, compute_element_type);
       Value scalar_neutral = mlir::arith::ConstantOp::create(
@@ -1980,7 +2280,18 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                                            mlir::gpu::ShuffleMode::IDX)
                   .getShuffleResult();
     }
-    if (!HasNeutralInit()) {
+    if (init_parameter_number_.has_value()) {
+      llvm::DenseMap<const HloInstruction*, Value> init_cache;
+      TF_ASSIGN_OR_RETURN(
+          Value init_vector,
+          EmitReductionInputGraph(builder, spec->reduction->operand(1),
+                                  I64(builder, 0), row_valid,
+                                  output_input_states, output_input_states,
+                                  /*vector_width=*/1, init_cache));
+      Value init_scalar =
+          mlir::vector::ExtractOp::create(builder, init_vector, 0);
+      local = Combine(builder, local, init_scalar);
+    } else if (!HasNeutralInit()) {
       local = Combine(builder, local,
                       UsesIntegerCompute()
                           ? IntegerComputeConstant(builder, integer_init_value_)
@@ -2101,6 +2412,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
   bool has_rowwise_output_ = false;
   int64_t max_vector_element_bits_ = 0;
   HloOpcode reducer_opcode_ = HloOpcode::kAdd;
+  std::optional<int64_t> init_parameter_number_;
   double init_value_ = 0.0;
   int64_t integer_init_value_ = 0;
   int64_t num_warps_ = 0;

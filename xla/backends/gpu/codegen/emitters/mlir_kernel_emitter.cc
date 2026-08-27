@@ -884,6 +884,15 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
         mlir::ModuleOp::create(gpu_module.getLoc(), gpu_module.getName());
     mlir::OpBuilder builder(module->getContext());
     builder.setInsertionPointToStart(flattened_gpu_module->getBody());
+    // Shared-memory allocations in a native gpu.module lower to LLVM globals
+    // in the enclosing builtin module. Preserve those globals when flattening
+    // the device module, otherwise llvm.addressof inside the cloned kernel
+    // refers to a symbol that is absent from the translation unit.
+    for (mlir::Operation& op : module->getBody()->without_terminator()) {
+      if (mlir::isa<mlir::LLVM::GlobalOp>(op)) {
+        builder.clone(op);
+      }
+    }
     for (mlir::Operation& op :
          gpu_module->getRegion(0).front().without_terminator()) {
       builder.clone(op);

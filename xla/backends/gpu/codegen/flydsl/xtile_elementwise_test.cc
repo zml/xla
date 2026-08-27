@@ -1127,6 +1127,36 @@ ENTRY entry {
 )"));
 }
 
+TEST_F(FlyXTileElementwiseTest, RecognizesMiddleDimensionReduction) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule middle_dimension_reduction
+
+add_reduce {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+body {
+  p0 = f32[64,128,256]{2,1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[64,256]{1,0} reduce(p0, zero), dimensions={1},
+      to_apply=add_reduce
+}
+
+ENTRY entry {
+  p0 = f32[64,128,256]{2,1,0} parameter(0)
+  ROOT fusion = f32[64,256]{1,0} fusion(p0), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileElementwiseTest, RecognizesRank4DilatedReduceWindow) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule elementwise_rank4_reduce_window
@@ -1310,6 +1340,34 @@ ENTRY entry {
   EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
 }
 
+TEST_F(FlyXTileElementwiseTest, RecognizesMiddleDimensionConcatenateDag) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule indexed_middle_dimension_concatenate
+
+concatenate {
+  p0 = bf16[3,5,17]{2,1,0} parameter(0)
+  p1 = bf16[3,7,17]{2,1,0} parameter(1)
+  absolute = bf16[3,5,17]{2,1,0} abs(p0)
+  negated = bf16[3,7,17]{2,1,0} negate(p1)
+  ROOT result = bf16[3,12,17]{2,1,0} concatenate(absolute, negated),
+    dimensions={1}
+}
+
+ENTRY entry {
+  p0 = bf16[3,5,17]{2,1,0} parameter(0)
+  p1 = bf16[3,7,17]{2,1,0} parameter(1)
+  ROOT fusion = bf16[3,12,17]{2,1,0} fusion(p0, p1), kind=kCustom,
+    calls=concatenate,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileElementwiseTest, RecognizesTrailingDimensionBroadcast) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule elementwise_broadcast
@@ -1356,6 +1414,33 @@ ENTRY entry {
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["1"]}],
         "num_stages":"1", "num_warps":"1", "num_ctas":"1"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesArbitraryDimensionBroadcast) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule elementwise_arbitrary_dimension_broadcast
+
+elementwise {
+  p0 = f32[17,7,65]{2,1,0} parameter(0)
+  plane = f32[17,65]{1,0} parameter(1)
+  plane_broadcast = f32[17,7,65]{2,1,0} broadcast(plane),
+    dimensions={0,2}
+  ROOT result = f32[17,7,65]{2,1,0} add(p0, plane_broadcast)
+}
+
+ENTRY entry {
+  p0 = f32[17,7,65]{2,1,0} parameter(0)
+  plane = f32[17,65]{1,0} parameter(1)
+  ROOT fusion = f32[17,7,65]{2,1,0} fusion(p0, plane), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
 }
 )"));
 }

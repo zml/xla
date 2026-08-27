@@ -27,6 +27,12 @@ namespace xla::gpu::flydsl {
 // compound kernels such as attention use it to keep that producer on chip.
 const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root);
 
+// Returns a runtime row offset used by `exp(input - row_offset)` when the
+// normalized result is otherwise a canonical softmax. The offset is optional:
+// the usual stable-softmax form computes it with a row maximum internally.
+const HloInstruction* GetFlySoftmaxExternalRowOffset(
+    const HloInstruction& root);
+
 // Like GetFlySoftmaxInput, but retains a mixed-precision F32 producer when the
 // softmax result is narrowed to F16/BF16. Compound attention uses this to see
 // canonical select(-inf) masks instead of treating them as external inputs.

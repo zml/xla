@@ -68,6 +68,34 @@ ENTRY main {
 )"));
 }
 
+TEST_F(FlyXTileReductionTest, RecognizesDynamicInitRowReduction) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_f32_dynamic_init_row_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[64,256]{1,0} parameter(0)
+  init = f32[] parameter(1)
+  ROOT result = f32[64]{0} reduce(p0, init), dimensions={1}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f32[64,256]{1,0} parameter(0)
+  init = f32[] parameter(1)
+  ROOT fusion = f32[64]{0} fusion(p0, init), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileReductionTest, RecognizesConvertedBf16MaximumReduction) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_bf16_row_maximum
@@ -391,6 +419,42 @@ ENTRY main {
 )"));
 }
 
+TEST_F(FlyXTileReductionTest, RecognizesExternalRowBroadcastInInputGraph) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_external_row_broadcast_input_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  input = f32[64,256]{1,0} parameter(0)
+  row_offset = f32[64]{0} parameter(1)
+  row_offsets = f32[64,256]{1,0} broadcast(row_offset), dimensions={0}
+  shifted = f32[64,256]{1,0} subtract(input, row_offsets)
+  exponentials = f32[64,256]{1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[64]{0} reduce(exponentials, zero), dimensions={1},
+    to_apply=add
+  row_sums = f32[64,256]{1,0} broadcast(row_sum), dimensions={0}
+  ROOT result = f32[64,256]{1,0} divide(exponentials, row_sums)
+}
+
+ENTRY main {
+  input = f32[64,256]{1,0} parameter(0)
+  row_offset = f32[64]{0} parameter(1)
+  ROOT fusion = f32[64,256]{1,0} fusion(input, row_offset), kind=kCustom,
+    calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileReductionTest, RecognizesExternalRowScaleInOutputGraph) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_external_row_scale_reduction
@@ -548,6 +612,152 @@ rms_norm {
 ENTRY main {
   p0 = bf16[2,17,259]{2,1,0} parameter(0)
   ROOT fusion = bf16[2,17,259]{2,1,0} fusion(p0), kind=kCustom,
+    calls=rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesBf16ColumnScaleRmsNorm) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_bf16_column_scale_rms_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  p0 = bf16[4,259]{1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  converted = f32[4,259]{1,0} convert(p0)
+  squared = f32[4,259]{1,0} multiply(converted, converted)
+  zero = f32[] constant(0)
+  row_sum = f32[4]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  reciprocal_width = f32[] constant(0.003861003861003861)
+  widths = f32[4]{0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[4]{0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[4]{0} broadcast(epsilon), dimensions={}
+  variance = f32[4]{0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[4]{0} rsqrt(variance)
+  scales = f32[4,259]{1,0} broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[4,259]{1,0} multiply(converted, scales)
+  weights = bf16[4,259]{1,0} broadcast(weight), dimensions={1}
+  weights_f32 = f32[4,259]{1,0} convert(weights)
+  weighted = f32[4,259]{1,0} multiply(normalized, weights_f32)
+  ROOT result = bf16[4,259]{1,0} convert(weighted)
+}
+
+ENTRY main {
+  p0 = bf16[4,259]{1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  ROOT fusion = bf16[4,259]{1,0} fusion(p0, weight), kind=kCustom,
+    calls=rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesBitcastBf16ColumnScaleRmsNorm) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_bitcast_bf16_column_scale_rms_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  p0 = bf16[4,1,259]{2,1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  converted = f32[4,1,259]{2,1,0} convert(p0)
+  squared = f32[4,1,259]{2,1,0} multiply(converted, converted)
+  flat_square = f32[4,259]{1,0} bitcast(squared)
+  zero = f32[] constant(0)
+  row_sum = f32[4]{0} reduce(flat_square, zero), dimensions={1}, to_apply=add
+  reciprocal_width = f32[] constant(0.003861003861003861)
+  widths = f32[4]{0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[4]{0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[4]{0} broadcast(epsilon), dimensions={}
+  variance = f32[4]{0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[4]{0} rsqrt(variance)
+  scales = f32[4,1,259]{2,1,0} broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[4,1,259]{2,1,0} multiply(converted, scales)
+  narrowed = bf16[4,1,259]{2,1,0} convert(normalized)
+  normalized_view = bf16[4,259]{1,0} bitcast(narrowed)
+  normalized_f32 = f32[4,259]{1,0} convert(normalized_view)
+  weights = bf16[4,259]{1,0} broadcast(weight), dimensions={1}
+  weights_f32 = f32[4,259]{1,0} convert(weights)
+  weighted = f32[4,259]{1,0} multiply(normalized_f32, weights_f32)
+  ROOT result = bf16[4,259]{1,0} convert(weighted)
+}
+
+ENTRY main {
+  p0 = bf16[4,1,259]{2,1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  ROOT fusion = bf16[4,259]{1,0} fusion(p0, weight), kind=kCustom,
+    calls=rms_norm,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesFlattenedRank3Bf16ColumnScaleRmsNorm) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_flattened_rank3_bf16_column_scale_rms_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+rms_norm {
+  p0 = bf16[2,3,259]{2,1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  converted = f32[2,3,259]{2,1,0} convert(p0)
+  squared = f32[2,3,259]{2,1,0} multiply(converted, converted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,3]{1,0} reduce(squared, zero), dimensions={2},
+    to_apply=add
+  reciprocal_width = f32[] constant(0.003861003861003861)
+  widths = f32[2,3]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,3]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,3]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,3]{1,0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[2,3]{1,0} rsqrt(variance)
+  scales = f32[2,3,259]{2,1,0} broadcast(reciprocal_stddev),
+    dimensions={0,1}
+  normalized = f32[2,3,259]{2,1,0} multiply(converted, scales)
+  narrowed = bf16[2,3,259]{2,1,0} convert(normalized)
+  normalized_view = bf16[6,259]{1,0} bitcast(narrowed)
+  normalized_f32 = f32[6,259]{1,0} convert(normalized_view)
+  weights = bf16[6,259]{1,0} broadcast(weight), dimensions={1}
+  weights_f32 = f32[6,259]{1,0} convert(weights)
+  weighted = f32[6,259]{1,0} multiply(normalized_f32, weights_f32)
+  ROOT result = bf16[6,259]{1,0} convert(weighted)
+}
+
+ENTRY main {
+  p0 = bf16[2,3,259]{2,1,0} parameter(0)
+  weight = bf16[259]{0} parameter(1)
+  ROOT fusion = bf16[6,259]{1,0} fusion(p0, weight), kind=kCustom,
     calls=rms_norm,
     backend_config={"fusion_backend_config":{"kind":"__fly",
       "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],

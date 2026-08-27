@@ -37,6 +37,7 @@ limitations under the License.
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -47,6 +48,7 @@ limitations under the License.
 #include "mlir/IR/Value.h"
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 #include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/codegen/emitters/type_util.h"
 #include "xla/codegen/ir_emission_utils.h"
 #include "xla/comparison_util.h"
@@ -712,39 +714,113 @@ std::optional<ReduceWindowDescriptor> GetReduceWindowDescriptor(
   return descriptor;
 }
 
-bool IsSupportedLeadingReduction(const HloInstruction* instruction,
-                                 const Shape& output_shape) {
+struct StridedReductionDescriptor {
+  int64_t reduction_size;
+  int64_t inner_elements;
+  int64_t input_parameter_number;
+};
+
+std::optional<StridedReductionDescriptor> GetStridedReductionDescriptor(
+    const HloInstruction* instruction, const Shape& output_shape) {
   if (instruction->opcode() != HloOpcode::kReduce ||
       instruction->operand_count() != 2 ||
       instruction->shape().element_type() != F32 ||
       !HasSameFlatElements(instruction->shape(), output_shape) ||
-      instruction->dimensions() != std::vector<int64_t>({0})) {
-    return false;
+      instruction->dimensions().size() != 1) {
+    return std::nullopt;
   }
   const HloInstruction* input = instruction->operand(0);
   const HloInstruction* init = instruction->operand(1);
+  const int64_t input_rank = input->shape().dimensions_size();
+  const int64_t reduction_dimension = instruction->dimensions(0);
   if (input->opcode() != HloOpcode::kParameter ||
       input->shape().element_type() != F32 ||
-      input->shape().dimensions_size() !=
-          instruction->shape().dimensions_size() + 1 ||
-      input->shape().dimensions(0) < 1 || !ShapeUtil::IsScalar(init->shape()) ||
+      input_rank != instruction->shape().dimensions_size() + 1 ||
+      reduction_dimension < 0 || reduction_dimension >= input_rank - 1 ||
+      input->shape().dimensions(reduction_dimension) < 1 ||
+      !input->shape().has_layout() || !instruction->shape().has_layout() ||
+      !LayoutUtil::IsMonotonicWithDim0Major(input->shape().layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(instruction->shape().layout()) ||
+      !ShapeUtil::IsScalar(init->shape()) ||
       init->opcode() != HloOpcode::kConstant ||
       init->shape().element_type() != F32 ||
       init->literal().GetFirstElement<float>() != 0.0f) {
-    return false;
+    return std::nullopt;
   }
-  for (int64_t dimension = 0;
-       dimension < instruction->shape().dimensions_size(); ++dimension) {
-    if (input->shape().dimensions(dimension + 1) !=
-        instruction->shape().dimensions(dimension)) {
-      return false;
+  for (int64_t input_dimension = 0, output_dimension = 0;
+       input_dimension < input_rank; ++input_dimension) {
+    if (input_dimension == reduction_dimension) {
+      continue;
+    }
+    if (input->shape().dimensions(input_dimension) !=
+        instruction->shape().dimensions(output_dimension++)) {
+      return std::nullopt;
     }
   }
   const HloComputation* reducer = instruction->to_apply();
-  return reducer != nullptr && reducer->num_parameters() == 2 &&
-         reducer->root_instruction()->opcode() == HloOpcode::kAdd &&
-         reducer->root_instruction()->operand_count() == 2 &&
-         reducer->root_instruction()->shape().element_type() == F32;
+  if (reducer == nullptr || reducer->num_parameters() != 2 ||
+      reducer->root_instruction()->opcode() != HloOpcode::kAdd ||
+      reducer->root_instruction()->operand_count() != 2 ||
+      reducer->root_instruction()->shape().element_type() != F32) {
+    return std::nullopt;
+  }
+  int64_t inner_elements = 1;
+  for (int64_t dimension = reduction_dimension + 1; dimension < input_rank;
+       ++dimension) {
+    inner_elements *= input->shape().dimensions(dimension);
+  }
+  return StridedReductionDescriptor{
+      input->shape().dimensions(reduction_dimension), inner_elements,
+      input->parameter_number()};
+}
+
+bool IsStripedLoopInvariantBroadcast(const HloInstruction* instruction,
+                                     int64_t thread_stride,
+                                     int64_t vectors_per_thread) {
+  if (instruction->opcode() != HloOpcode::kBroadcast ||
+      instruction->operand_count() != 1 ||
+      ShapeUtil::IsScalar(instruction->operand(0)->shape()) ||
+      vectors_per_thread <= 1) {
+    return false;
+  }
+  const Shape& input = instruction->operand(0)->shape();
+  const Shape& output = instruction->shape();
+  const int64_t input_rank = input.dimensions_size();
+  const int64_t output_rank = output.dimensions_size();
+  if (output_rank != input_rank + 1 ||
+      instruction->dimensions().size() != input_rank) {
+    return false;
+  }
+
+  int64_t omitted_dimension = -1;
+  for (int64_t output_dimension = 0, input_dimension = 0;
+       output_dimension < output_rank; ++output_dimension) {
+    if (input_dimension < input_rank &&
+        instruction->dimensions(input_dimension) == output_dimension) {
+      ++input_dimension;
+      continue;
+    }
+    if (omitted_dimension != -1) {
+      return false;
+    }
+    omitted_dimension = output_dimension;
+  }
+  if (omitted_dimension == -1) {
+    return false;
+  }
+
+  int64_t inner_elements = 1;
+  for (int64_t dimension = omitted_dimension + 1; dimension < output_rank;
+       ++dimension) {
+    inner_elements *= output.dimensions(dimension);
+  }
+  if (thread_stride % inner_elements != 0) {
+    return false;
+  }
+  const int64_t omitted_step = thread_stride / inner_elements;
+  const int64_t striped_span = omitted_step * vectors_per_thread;
+  return omitted_step > 0 &&
+         output.dimensions(omitted_dimension) % striped_span == 0;
 }
 
 bool IsSupportedElementwiseGraph(
@@ -795,25 +871,21 @@ bool IsSupportedElementwiseGraph(
       {
         const int64_t input_rank =
             instruction->operand(0)->shape().dimensions_size();
-        const int64_t output_rank = instruction->shape().dimensions_size();
         if (instruction->dimensions().size() != input_rank) {
           return false;
         }
-        bool is_leading_broadcast = true;
-        bool is_trailing_broadcast = true;
-        for (int64_t dimension = 0; dimension < input_rank; ++dimension) {
-          const int64_t output_dimension = output_rank - input_rank + dimension;
-          is_leading_broadcast &=
-              instruction->dimensions(dimension) == dimension &&
-              instruction->operand(0)->shape().dimensions(dimension) ==
-                  instruction->shape().dimensions(dimension);
-          is_trailing_broadcast &=
-              instruction->dimensions(dimension) == output_dimension &&
-              instruction->operand(0)->shape().dimensions(dimension) ==
-                  instruction->shape().dimensions(output_dimension);
-          if (!is_leading_broadcast && !is_trailing_broadcast) {
+        int64_t previous_output_dimension = -1;
+        for (int64_t input_dimension = 0; input_dimension < input_rank;
+             ++input_dimension) {
+          const int64_t output_dimension =
+              instruction->dimensions(input_dimension);
+          if (output_dimension <= previous_output_dimension ||
+              output_dimension >= instruction->shape().dimensions_size() ||
+              instruction->operand(0)->shape().dimensions(input_dimension) !=
+                  instruction->shape().dimensions(output_dimension)) {
             return false;
           }
+          previous_output_dimension = output_dimension;
         }
       }
       return IsSupportedElementwiseGraph(
@@ -882,16 +954,19 @@ bool IsSupportedElementwiseGraph(
              IsSupportedElementwiseGraph(instruction->operand(1), output_shape,
                                          visited);
     case HloOpcode::kConcatenate: {
-      if (instruction->shape().dimensions_size() != 1 ||
-          instruction->dimensions() != std::vector<int64_t>({0}) ||
+      const int64_t rank = instruction->shape().dimensions_size();
+      if (rank == 0 || instruction->dimensions().size() != 1 ||
+          instruction->dimensions(0) < 0 ||
+          instruction->dimensions(0) >= rank ||
           !IsSupportedValueType(instruction->shape().element_type()) ||
           !HasSamePhysicalDimensions(instruction->shape(), output_shape) ||
           instruction->operand_count() < 2) {
         return false;
       }
-      int64_t concatenated_elements = 0;
+      const int64_t concatenate_dimension = instruction->dimensions(0);
+      int64_t concatenated_extent = 0;
       for (const HloInstruction* operand : instruction->operands()) {
-        if (operand->shape().dimensions_size() != 1 ||
+        if (operand->shape().dimensions_size() != rank ||
             operand->shape().element_type() !=
                 instruction->shape().element_type() ||
             !operand->shape().has_layout() ||
@@ -899,13 +974,22 @@ bool IsSupportedElementwiseGraph(
             !IsSupportedElementwiseGraph(operand, operand->shape(), visited)) {
           return false;
         }
-        concatenated_elements += ShapeUtil::ElementsIn(operand->shape());
+        for (int64_t dimension = 0; dimension < rank; ++dimension) {
+          if (dimension != concatenate_dimension &&
+              operand->shape().dimensions(dimension) !=
+                  instruction->shape().dimensions(dimension)) {
+            return false;
+          }
+        }
+        concatenated_extent +=
+            operand->shape().dimensions(concatenate_dimension);
       }
-      return concatenated_elements ==
-             ShapeUtil::ElementsIn(instruction->shape());
+      return concatenated_extent ==
+             instruction->shape().dimensions(concatenate_dimension);
     }
     case HloOpcode::kReduce:
-      return IsSupportedLeadingReduction(instruction, output_shape);
+      return GetStridedReductionDescriptor(instruction, output_shape)
+          .has_value();
     case HloOpcode::kReduceWindow:
       return HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
              GetReduceWindowDescriptor(instruction).has_value() &&
@@ -1226,6 +1310,23 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     CHECK_GT(threads_, 0);
     const int64_t elements_per_block =
         threads_ * vectors_per_thread_ * vector_width_;
+    if (output_count_ == 1) {
+      cooperative_strided_reduction_ =
+          GetStridedReductionDescriptor(&analysis.fusion_root(0).instruction(),
+                                        analysis.fusion_root(0).shape());
+    }
+    if (cooperative_strided_reduction_.has_value() && config.num_warps() == 4 &&
+        vector_width_ == 4 && vectors_per_thread_ == 1 &&
+        cooperative_strided_reduction_->reduction_size % 4 == 0 &&
+        cooperative_strided_reduction_->inner_elements % (64 * vector_width_) ==
+            0) {
+      const int64_t output_elements_per_block = 64 * vector_width_;
+      launch_dimensions_ = LaunchDimensions(
+          se::BlockDim(elements_ / output_elements_per_block, 1, 1),
+          se::ThreadDim(threads_, 1, 1));
+      return;
+    }
+    cooperative_strided_reduction_.reset();
     launch_dimensions_ = LaunchDimensions(
         se::BlockDim((elements_ + elements_per_block - 1) / elements_per_block,
                      1, 1),
@@ -2532,10 +2633,14 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         if (!ShapeUtil::IsScalar(instruction->operand(0)->shape())) {
           const int64_t input_rank =
               instruction->operand(0)->shape().dimensions_size();
+          const int64_t output_rank = instruction->shape().dimensions_size();
           bool is_leading_broadcast = true;
+          bool is_trailing_broadcast = true;
           for (int64_t dimension = 0; dimension < input_rank; ++dimension) {
             is_leading_broadcast &=
                 instruction->dimensions(dimension) == dimension;
+            is_trailing_broadcast &= instruction->dimensions(dimension) ==
+                                     output_rank - input_rank + dimension;
           }
           if (is_leading_broadcast) {
             const int64_t repeat =
@@ -2602,6 +2707,132 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                                instruction->operand(0), scalar_input_offset,
                                predicate, boundary_copies.copy_atoms,
                                boundary_copies.layout, /*vector_width=*/1,
+                               operand_cache));
+                lanes.push_back(
+                    mlir::vector::ExtractOp::create(builder, scalar, 0));
+              }
+              Value boundary = mlir::vector::FromElementsOp::create(
+                  builder, vector_type, lanes);
+              mlir::scf::YieldOp::create(builder, boundary);
+            }
+            builder.setInsertionPointAfter(select);
+            result = select.getResult(0);
+            break;
+          }
+          if (!is_trailing_broadcast) {
+            auto input_offset = [&](Value output_offset) {
+              Value mapped = mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(), 0);
+              int64_t input_stride = 1;
+              for (int64_t input_dimension = input_rank - 1;
+                   input_dimension >= 0; --input_dimension) {
+                const int64_t output_dimension =
+                    instruction->dimensions(input_dimension);
+                int64_t output_stride = 1;
+                for (int64_t dimension = output_dimension + 1;
+                     dimension < output_rank; ++dimension) {
+                  output_stride *= instruction->shape().dimensions(dimension);
+                }
+                Value coordinate = output_offset;
+                if (output_stride != 1) {
+                  coordinate = mlir::arith::DivUIOp::create(
+                      builder, coordinate,
+                      mlir::arith::ConstantIntOp::create(
+                          builder, builder.getI64Type(), output_stride));
+                }
+                const int64_t output_extent =
+                    instruction->shape().dimensions(output_dimension);
+                if (output_extent != 1) {
+                  coordinate = mlir::arith::RemUIOp::create(
+                      builder, coordinate,
+                      mlir::arith::ConstantIntOp::create(
+                          builder, builder.getI64Type(), output_extent));
+                } else {
+                  coordinate = mlir::arith::ConstantIntOp::create(
+                      builder, builder.getI64Type(), 0);
+                }
+                if (input_stride != 1) {
+                  coordinate = mlir::arith::MulIOp::create(
+                      builder, coordinate,
+                      mlir::arith::ConstantIntOp::create(
+                          builder, builder.getI64Type(), input_stride));
+                }
+                mapped =
+                    mlir::arith::AddIOp::create(builder, mapped, coordinate);
+                input_stride *= instruction->operand(0)->shape().dimensions(
+                    input_dimension);
+              }
+              return mapped;
+            };
+
+            const int64_t output_minor_extent =
+                instruction->shape().dimensions(output_rank - 1);
+            Value minor_offset = mlir::arith::RemUIOp::create(
+                builder, element_offset,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), output_minor_extent));
+            Value minor_end = mlir::arith::AddIOp::create(
+                builder, minor_offset,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), vector_width));
+            Value fits_in_minor = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::ule, minor_end,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), output_minor_extent));
+            mlir::scf::IfOp select = mlir::scf::IfOp::create(
+                builder, mlir::TypeRange{vector_type}, fits_in_minor,
+                /*withElseRegion=*/true);
+            {
+              mlir::OpBuilder::InsertionGuard guard(builder);
+              builder.setInsertionPointToStart(select.thenBlock());
+              Value first_input_offset = input_offset(element_offset);
+              absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+              if (instruction->dimensions(input_rank - 1) == output_rank - 1) {
+                TF_ASSIGN_OR_RETURN(
+                    Value vector,
+                    EmitVector(builder, argument_pointers,
+                               instruction->operand(0), first_input_offset,
+                               predicate, copy_atoms, vector_layout,
+                               vector_width, operand_cache));
+                mlir::scf::YieldOp::create(builder, vector);
+              } else {
+                ScalarCopyContext scalar_copies =
+                    CreateScalarCopyContext(builder, copy_atoms);
+                TF_ASSIGN_OR_RETURN(
+                    Value scalar_vector,
+                    EmitVector(builder, argument_pointers,
+                               instruction->operand(0), first_input_offset,
+                               predicate, scalar_copies.copy_atoms,
+                               scalar_copies.layout, /*vector_width=*/1,
+                               operand_cache));
+                Value scalar =
+                    mlir::vector::ExtractOp::create(builder, scalar_vector, 0);
+                Value vector = mlir::vector::BroadcastOp::create(
+                    builder, vector_type, scalar);
+                mlir::scf::YieldOp::create(builder, vector);
+              }
+
+              builder.setInsertionPointToStart(select.elseBlock());
+              ScalarCopyContext scalar_copies =
+                  CreateScalarCopyContext(builder, copy_atoms);
+              llvm::SmallVector<Value> lanes;
+              lanes.reserve(vector_width);
+              for (int64_t lane = 0; lane < vector_width; ++lane) {
+                Value lane_offset = element_offset;
+                if (lane != 0) {
+                  lane_offset = mlir::arith::AddIOp::create(
+                      builder, element_offset,
+                      mlir::arith::ConstantIntOp::create(
+                          builder, builder.getI64Type(), lane));
+                }
+                Value scalar_input_offset = input_offset(lane_offset);
+                absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+                TF_ASSIGN_OR_RETURN(
+                    Value scalar,
+                    EmitVector(builder, argument_pointers,
+                               instruction->operand(0), scalar_input_offset,
+                               predicate, scalar_copies.copy_atoms,
+                               scalar_copies.layout, /*vector_width=*/1,
                                operand_cache));
                 lanes.push_back(
                     mlir::vector::ExtractOp::create(builder, scalar, 0));
@@ -3749,6 +3980,206 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         break;
       }
       case HloOpcode::kConcatenate: {
+        const auto* concatenate = Cast<HloConcatenateInstruction>(instruction);
+        const int64_t concatenate_dimension =
+            concatenate->concatenate_dimension();
+        if (concatenate_dimension != 0) {
+          int64_t inner_elements = 1;
+          for (int64_t dimension = concatenate_dimension + 1;
+               dimension < instruction->shape().dimensions_size();
+               ++dimension) {
+            inner_elements *= instruction->shape().dimensions(dimension);
+          }
+          const int64_t output_outer_elements =
+              instruction->shape().dimensions(concatenate_dimension) *
+              inner_elements;
+
+          ScalarCopyContext scalar_copies =
+              CreateScalarCopyContext(builder, copy_atoms);
+          auto scalar_vector_type = mlir::VectorType::get(
+              {1},
+              emitters::PrimitiveTypeToMlirType(instruction_type, builder));
+          auto output_coordinates = [&](Value output_offset) {
+            Value outer_index = mlir::arith::DivUIOp::create(
+                builder, output_offset,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), output_outer_elements));
+            Value within_outer = mlir::arith::RemUIOp::create(
+                builder, output_offset,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), output_outer_elements));
+            return std::pair<Value, Value>{outer_index, within_outer};
+          };
+          auto operand_offset = [&](int64_t operand_index,
+                                    int64_t operand_start, Value outer_index,
+                                    Value within_outer) {
+            const int64_t operand_outer_elements =
+                instruction->operand(operand_index)
+                    ->shape()
+                    .dimensions(concatenate_dimension) *
+                inner_elements;
+            Value outer_base = mlir::arith::MulIOp::create(
+                builder, outer_index,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), operand_outer_elements));
+            Value within_operand = within_outer;
+            if (operand_start != 0) {
+              within_operand = mlir::arith::SubIOp::create(
+                  builder, within_outer,
+                  mlir::arith::ConstantIntOp::create(
+                      builder, builder.getI64Type(), operand_start));
+            }
+            return mlir::arith::AddIOp::create(builder, outer_base,
+                                               within_operand)
+                .getResult();
+          };
+
+          std::function<absl::StatusOr<Value>(int64_t, int64_t, Value, Value)>
+              emit_scalar_operand =
+                  [&](int64_t operand_index, int64_t operand_start,
+                      Value outer_index,
+                      Value within_outer) -> absl::StatusOr<Value> {
+            const HloInstruction* operand = instruction->operand(operand_index);
+            Value selected_offset = operand_offset(operand_index, operand_start,
+                                                   outer_index, within_outer);
+            if (operand_index + 1 == instruction->operand_count()) {
+              absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+              return EmitVector(builder, argument_pointers, operand,
+                                selected_offset, predicate,
+                                scalar_copies.copy_atoms, scalar_copies.layout,
+                                /*vector_width=*/1, operand_cache);
+            }
+            const int64_t operand_end =
+                operand_start +
+                operand->shape().dimensions(concatenate_dimension) *
+                    inner_elements;
+            Value belongs_to_operand = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::ult, within_outer,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), operand_end));
+            mlir::scf::IfOp select = mlir::scf::IfOp::create(
+                builder, mlir::TypeRange{scalar_vector_type},
+                belongs_to_operand, /*withElseRegion=*/true);
+            {
+              mlir::OpBuilder::InsertionGuard guard(builder);
+              builder.setInsertionPointToStart(select.thenBlock());
+              absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+              TF_ASSIGN_OR_RETURN(
+                  Value selected,
+                  EmitVector(builder, argument_pointers, operand,
+                             selected_offset, predicate,
+                             scalar_copies.copy_atoms, scalar_copies.layout,
+                             /*vector_width=*/1, operand_cache));
+              mlir::scf::YieldOp::create(builder, selected);
+              builder.setInsertionPointToStart(select.elseBlock());
+              TF_ASSIGN_OR_RETURN(
+                  Value remaining,
+                  emit_scalar_operand(operand_index + 1, operand_end,
+                                      outer_index, within_outer));
+              mlir::scf::YieldOp::create(builder, remaining);
+            }
+            builder.setInsertionPointAfter(select);
+            return select.getResult(0);
+          };
+
+          auto emit_boundary = [&]() -> absl::StatusOr<Value> {
+            llvm::SmallVector<Value> lanes;
+            lanes.reserve(vector_width);
+            for (int64_t lane = 0; lane < vector_width; ++lane) {
+              Value lane_offset = element_offset;
+              if (lane != 0) {
+                lane_offset = mlir::arith::AddIOp::create(
+                    builder, element_offset,
+                    mlir::arith::ConstantIntOp::create(
+                        builder, builder.getI64Type(), lane));
+              }
+              auto [lane_outer_index, lane_within_outer] =
+                  output_coordinates(lane_offset);
+              TF_ASSIGN_OR_RETURN(
+                  Value scalar,
+                  emit_scalar_operand(/*operand_index=*/0,
+                                      /*operand_start=*/0, lane_outer_index,
+                                      lane_within_outer));
+              lanes.push_back(
+                  mlir::vector::ExtractOp::create(builder, scalar, 0));
+            }
+            return mlir::vector::FromElementsOp::create(builder, vector_type,
+                                                        lanes)
+                .getResult();
+          };
+
+          std::pair<Value, Value> coordinates =
+              output_coordinates(element_offset);
+          Value outer_index = coordinates.first;
+          Value within_outer = coordinates.second;
+          std::function<absl::StatusOr<Value>(int64_t, int64_t)> emit_operand =
+              [&](int64_t operand_index,
+                  int64_t operand_start) -> absl::StatusOr<Value> {
+            const HloInstruction* operand = instruction->operand(operand_index);
+            const int64_t operand_end =
+                operand_start +
+                operand->shape().dimensions(concatenate_dimension) *
+                    inner_elements;
+            Value selected_offset = operand_offset(operand_index, operand_start,
+                                                   outer_index, within_outer);
+            Value vector_end = mlir::arith::AddIOp::create(
+                builder, within_outer,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), vector_width));
+            Value fits_in_operand = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::ule, vector_end,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), operand_end));
+            auto emit_selected = [&]() -> absl::StatusOr<Value> {
+              mlir::scf::IfOp select = mlir::scf::IfOp::create(
+                  builder, mlir::TypeRange{vector_type}, fits_in_operand,
+                  /*withElseRegion=*/true);
+              {
+                mlir::OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPointToStart(select.thenBlock());
+                absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+                TF_ASSIGN_OR_RETURN(
+                    Value selected,
+                    EmitVector(builder, argument_pointers, operand,
+                               selected_offset, predicate, copy_atoms,
+                               vector_layout, vector_width, operand_cache));
+                mlir::scf::YieldOp::create(builder, selected);
+                builder.setInsertionPointToStart(select.elseBlock());
+                TF_ASSIGN_OR_RETURN(Value boundary, emit_boundary());
+                mlir::scf::YieldOp::create(builder, boundary);
+              }
+              builder.setInsertionPointAfter(select);
+              return select.getResult(0);
+            };
+            if (operand_index + 1 == instruction->operand_count()) {
+              return emit_selected();
+            }
+
+            Value belongs_to_operand = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::ult, within_outer,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(), operand_end));
+            mlir::scf::IfOp select = mlir::scf::IfOp::create(
+                builder, mlir::TypeRange{vector_type}, belongs_to_operand,
+                /*withElseRegion=*/true);
+            {
+              mlir::OpBuilder::InsertionGuard guard(builder);
+              builder.setInsertionPointToStart(select.thenBlock());
+              TF_ASSIGN_OR_RETURN(Value selected, emit_selected());
+              mlir::scf::YieldOp::create(builder, selected);
+              builder.setInsertionPointToStart(select.elseBlock());
+              TF_ASSIGN_OR_RETURN(Value remaining,
+                                  emit_operand(operand_index + 1, operand_end));
+              mlir::scf::YieldOp::create(builder, remaining);
+            }
+            builder.setInsertionPointAfter(select);
+            return select.getResult(0);
+          };
+          TF_ASSIGN_OR_RETURN(result, emit_operand(/*operand_index=*/0,
+                                                   /*operand_start=*/0));
+          break;
+        }
+
         ScalarCopyContext scalar_copies =
             CreateScalarCopyContext(builder, copy_atoms);
 
@@ -4209,26 +4640,76 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       }
       case HloOpcode::kReduce: {
         const HloInstruction* input = instruction->operand(0);
-        const int64_t reduction_size = input->shape().dimensions(0);
+        std::optional<StridedReductionDescriptor> descriptor =
+            GetStridedReductionDescriptor(instruction, instruction->shape());
+        TF_RET_CHECK(descriptor.has_value());
+        const int64_t reduction_size = descriptor->reduction_size;
+        const int64_t inner_elements = descriptor->inner_elements;
+        Value inner = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(), inner_elements);
+        Value input_outer_stride = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(), reduction_size * inner_elements);
+        auto source_base = [&](Value output_offset) {
+          Value outer =
+              mlir::arith::DivUIOp::create(builder, output_offset, inner);
+          Value inner_offset =
+              mlir::arith::RemUIOp::create(builder, output_offset, inner);
+          Value outer_base =
+              mlir::arith::MulIOp::create(builder, outer, input_outer_stride);
+          return mlir::arith::AddIOp::create(builder, outer_base, inner_offset)
+              .getResult();
+        };
+        auto source_offset = [&](Value base, Value part) {
+          Value part_base = mlir::arith::MulIOp::create(builder, part, inner);
+          return mlir::arith::AddIOp::create(builder, base, part_base)
+              .getResult();
+        };
+        Value vector_source_base = source_base(element_offset);
+        auto emit_partial = [&](Value part) -> absl::StatusOr<Value> {
+          if (inner_elements % vector_width == 0) {
+            Value part_offset = source_offset(vector_source_base, part);
+            absl::flat_hash_map<const HloInstruction*, Value> part_cache;
+            return EmitVector(builder, argument_pointers, input, part_offset,
+                              predicate, copy_atoms, vector_layout,
+                              vector_width, part_cache);
+          }
+          ScalarCopyContext scalar_copies =
+              CreateScalarCopyContext(builder, copy_atoms);
+          llvm::SmallVector<Value> lanes;
+          lanes.reserve(vector_width);
+          for (int64_t lane = 0; lane < vector_width; ++lane) {
+            Value lane_output_offset = element_offset;
+            if (lane != 0) {
+              lane_output_offset = mlir::arith::AddIOp::create(
+                  builder, element_offset,
+                  mlir::arith::ConstantIntOp::create(
+                      builder, builder.getI64Type(), lane));
+            }
+            Value lane_input_offset =
+                source_offset(source_base(lane_output_offset), part);
+            absl::flat_hash_map<const HloInstruction*, Value> lane_cache;
+            TF_ASSIGN_OR_RETURN(
+                Value scalar,
+                EmitVector(builder, argument_pointers, input, lane_input_offset,
+                           predicate, scalar_copies.copy_atoms,
+                           scalar_copies.layout,
+                           /*vector_width=*/1, lane_cache));
+            lanes.push_back(
+                mlir::vector::ExtractOp::create(builder, scalar, 0));
+          }
+          return mlir::vector::FromElementsOp::create(builder, vector_type,
+                                                      lanes)
+              .getResult();
+        };
         // Small split/leading dimensions benefit from straight-line loads:
         // LLVM can overlap their independent VMEM operations and there is no
         // loop-control dependency in the hot path. Keep a real loop for large
         // extents so general leading reductions do not grow code linearly.
         if (reduction_size <= 32) {
           for (int64_t part = 0; part < reduction_size; ++part) {
-            Value part_offset = element_offset;
-            if (part != 0) {
-              part_offset = mlir::arith::AddIOp::create(
-                  builder, element_offset,
-                  mlir::arith::ConstantIntOp::create(
-                      builder, builder.getI64Type(), part * elements_));
-            }
-            absl::flat_hash_map<const HloInstruction*, Value> part_cache;
-            TF_ASSIGN_OR_RETURN(
-                Value partial,
-                EmitVector(builder, argument_pointers, input, part_offset,
-                           predicate, copy_atoms, vector_layout, vector_width,
-                           part_cache));
+            Value part_value = mlir::arith::ConstantIntOp::create(
+                builder, builder.getI64Type(), part);
+            TF_ASSIGN_OR_RETURN(Value partial, emit_partial(part_value));
             result = part == 0
                          ? partial
                          : mlir::arith::AddFOp::create(builder, result, partial)
@@ -4236,39 +4717,54 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
           }
           break;
         }
+        constexpr int64_t kLoopUnroll = 8;
+        const int64_t loop_end = reduction_size - reduction_size % kLoopUnroll;
         Value zero = mlir::arith::ConstantOp::create(
             builder, vector_type, builder.getZeroAttr(vector_type));
+        llvm::SmallVector<Value> initial_accumulators(kLoopUnroll, zero);
         mlir::scf::ForOp reduction = mlir::scf::ForOp::create(
             builder,
             mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
                                                0),
             mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
-                                               reduction_size),
+                                               loop_end),
             mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
-                                               1),
-            mlir::ValueRange{zero},
+                                               kLoopUnroll),
+            initial_accumulators,
             [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
         {
           mlir::OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointToStart(reduction.getBody());
-          Value part_offset = mlir::arith::AddIOp::create(
-              builder, element_offset,
-              mlir::arith::MulIOp::create(
-                  builder, reduction.getInductionVar(),
+          llvm::SmallVector<Value> accumulators;
+          accumulators.reserve(kLoopUnroll);
+          for (int64_t part = 0; part < kLoopUnroll; ++part) {
+            Value part_value = reduction.getInductionVar();
+            if (part != 0) {
+              part_value = mlir::arith::AddIOp::create(
+                  builder, part_value,
                   mlir::arith::ConstantIntOp::create(
-                      builder, builder.getI64Type(), elements_)));
-          absl::flat_hash_map<const HloInstruction*, Value> part_cache;
-          TF_ASSIGN_OR_RETURN(
-              Value partial,
-              EmitVector(builder, argument_pointers, input, part_offset,
-                         predicate, copy_atoms, vector_layout, vector_width,
-                         part_cache));
-          Value sum = mlir::arith::AddFOp::create(
-              builder, reduction.getRegionIterArg(0), partial);
-          mlir::scf::YieldOp::create(builder, sum);
+                      builder, builder.getI64Type(), part));
+            }
+            TF_ASSIGN_OR_RETURN(Value partial, emit_partial(part_value));
+            accumulators.push_back(mlir::arith::AddFOp::create(
+                builder, reduction.getRegionIterArg(part), partial));
+          }
+          mlir::scf::YieldOp::create(builder, accumulators);
         }
         builder.setInsertionPointAfter(reduction);
         result = reduction.getResult(0);
+        for (int64_t accumulator = 1; accumulator < kLoopUnroll;
+             ++accumulator) {
+          result = mlir::arith::AddFOp::create(
+              builder, result, reduction.getResult(accumulator));
+        }
+        for (int64_t part = loop_end; part < reduction_size; ++part) {
+          Value part_value = mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(), part);
+          TF_ASSIGN_OR_RETURN(Value partial, emit_partial(part_value));
+          result =
+              mlir::arith::AddFOp::create(builder, result, partial).getResult();
+        }
         break;
       }
       case HloOpcode::kConvert: {
@@ -4771,8 +5267,208 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     return result;
   }
 
+  absl::Status EmitCooperativeStridedReductionKernel(
+      mlir::gpu::GPUFuncOp kernel, const HloFusionInstruction& fusion,
+      const StridedReductionDescriptor& descriptor) const {
+    TF_RET_CHECK(output_count_ == 1 && vector_width_ == 4 &&
+                 vectors_per_thread_ == 1 && threads_ == 256 &&
+                 descriptor.reduction_size % 4 == 0 &&
+                 descriptor.inner_elements % (64 * vector_width_) == 0 &&
+                 descriptor.input_parameter_number >= 0 &&
+                 descriptor.input_parameter_number < fusion.operand_count());
+    const HloInstruction* root = fusion.fused_expression_root();
+    TF_RET_CHECK(root != nullptr && root->opcode() == HloOpcode::kReduce &&
+                 root->shape().element_type() == F32 &&
+                 root->operand(0)->shape().element_type() == F32);
+
+    mlir::ImplicitLocOpBuilder builder(kernel.getLoc(), kernel);
+    builder.setInsertionPointToStart(&kernel.getBody().front());
+    mlir::MLIRContext* context = builder.getContext();
+    Value thread_id =
+        mlir::gpu::ThreadIdOp::create(builder, mlir::gpu::Dimension::x);
+    Value block_id =
+        mlir::gpu::BlockIdOp::create(builder, mlir::gpu::Dimension::x);
+    Value thread_i64 = mlir::arith::IndexCastOp::create(
+        builder, builder.getI64Type(), thread_id);
+    Value block_i64 = mlir::arith::IndexCastOp::create(
+        builder, builder.getI64Type(), block_id);
+    auto i64_constant = [&](int64_t value) -> Value {
+      return mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
+                                                value);
+    };
+    Value wave_id =
+        mlir::arith::DivUIOp::create(builder, thread_i64, i64_constant(64));
+    Value lane_id =
+        mlir::arith::RemUIOp::create(builder, thread_i64, i64_constant(64));
+
+    constexpr int64_t kOutputElementsPerBlock = 64 * 4;
+    Value output_block_offset = mlir::arith::MulIOp::create(
+        builder, block_i64, i64_constant(kOutputElementsPerBlock));
+    Value outer = mlir::arith::DivUIOp::create(
+        builder, output_block_offset, i64_constant(descriptor.inner_elements));
+    Value inner_block_offset = mlir::arith::RemUIOp::create(
+        builder, output_block_offset, i64_constant(descriptor.inner_elements));
+    Value lane_offset = mlir::arith::MulIOp::create(
+        builder, lane_id, i64_constant(vector_width_));
+    Value output_offset =
+        mlir::arith::AddIOp::create(builder, output_block_offset, lane_offset);
+    Value input_outer_offset = mlir::arith::MulIOp::create(
+        builder, outer,
+        i64_constant(descriptor.reduction_size * descriptor.inner_elements));
+    Value input_inner_offset =
+        mlir::arith::AddIOp::create(builder, inner_block_offset, lane_offset);
+    Value input_base = mlir::arith::AddIOp::create(builder, input_outer_offset,
+                                                   input_inner_offset);
+
+    auto buffer_address = mlir::fly_rocdl::BufferDescAddressAttr::get(context);
+    Value descriptor_stride =
+        mlir::arith::ConstantIntOp::create(builder, builder.getI16Type(), 0);
+    Value descriptor_flags = mlir::arith::ConstantIntOp::create(
+        builder, builder.getI32Type(), 0x27000);
+    auto make_buffer_pointer = [&](Value pointer,
+                                   int64_t byte_extent) -> Value {
+      auto buffer_pointer_type =
+          mlir::fly::PointerType::get(builder.getF32Type(), buffer_address);
+      Value descriptor_extent = mlir::arith::ConstantIntOp::create(
+          builder, builder.getI64Type(), byte_extent);
+      return mlir::fly::MakePtrOp::create(
+          builder, buffer_pointer_type,
+          mlir::ValueRange{pointer, descriptor_stride, descriptor_extent,
+                           descriptor_flags},
+          /*dictAttrs=*/nullptr);
+    };
+    Value input_pointer = make_buffer_pointer(
+        kernel.getArgument(descriptor.input_parameter_number),
+        ShapeUtil::ByteSizeOfElements(root->operand(0)->shape()));
+    Value output_pointer =
+        make_buffer_pointer(kernel.getArgument(fusion.operand_count()),
+                            ShapeUtil::ByteSizeOfElements(root->shape()));
+
+    auto shape_attr =
+        mlir::fly::IntTupleAttr::getLeafStatic(context, vector_width_);
+    auto stride_attr = mlir::fly::IntTupleAttr::getLeafStatic(context, 1);
+    auto shape_type = mlir::fly::IntTupleType::get(shape_attr);
+    auto stride_type = mlir::fly::IntTupleType::get(stride_attr);
+    Value shape = mlir::fly::MakeIntTupleOp::create(builder, shape_type,
+                                                    mlir::ValueRange{});
+    Value stride = mlir::fly::MakeIntTupleOp::create(builder, stride_type,
+                                                     mlir::ValueRange{});
+    auto layout_type = mlir::fly::LayoutType::get(shape_attr, stride_attr);
+    Value layout =
+        mlir::fly::MakeLayoutOp::create(builder, layout_type, shape, stride);
+    auto offset_attr = mlir::fly::IntTupleAttr::getLeafDynamic(
+        context, /*width=*/32, /*divisibility=*/vector_width_);
+    auto offset_type = mlir::fly::IntTupleType::get(offset_attr);
+    auto copy_atom_type = mlir::fly::CopyAtomType::get(
+        mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(context, /*bits=*/128,
+                                                        cache_modifier_),
+        /*elementBits=*/32);
+    Value copy_atom = mlir::fly::MakeCopyAtomOp::create(builder, copy_atom_type,
+                                                        /*elementBits=*/32);
+    auto vector_type =
+        mlir::VectorType::get({vector_width_}, builder.getF32Type());
+    auto make_view = [&](Value pointer, Value element_offset) -> Value {
+      Value offset_i32 = mlir::arith::TruncIOp::create(
+          builder, builder.getI32Type(), element_offset);
+      Value offset_tuple = mlir::fly::MakeIntTupleOp::create(
+          builder, offset_type, mlir::ValueRange{offset_i32});
+      Value advanced = mlir::fly::AddOffsetOp::create(
+          builder, pointer.getType(), pointer, offset_tuple);
+      auto memref_type = mlir::fly::MemRefType::get(
+          builder.getF32Type(),
+          mlir::cast<mlir::fly::PointerType>(pointer.getType())
+              .getAddressSpace(),
+          layout_type.getAttr());
+      return mlir::fly::MakeViewOp::create(builder, memref_type, advanced,
+                                           layout);
+    };
+
+    Value accumulator = mlir::arith::ConstantOp::create(
+        builder, vector_type, builder.getZeroAttr(vector_type));
+    Value true_predicate =
+        mlir::arith::ConstantIntOp::create(builder, builder.getI1Type(), 1);
+    for (int64_t iteration = 0; iteration < descriptor.reduction_size / 4;
+         ++iteration) {
+      Value reduction_part = wave_id;
+      if (iteration != 0) {
+        reduction_part = mlir::arith::AddIOp::create(
+            builder, wave_id, i64_constant(iteration * 4));
+      }
+      Value input_offset = mlir::arith::AddIOp::create(
+          builder, input_base,
+          mlir::arith::MulIOp::create(builder, reduction_part,
+                                      i64_constant(descriptor.inner_elements)));
+      Value input_view = make_view(input_pointer, input_offset);
+      Value poison = mlir::ub::PoisonOp::create(builder, vector_type);
+      Value loaded = mlir::fly::CopyAtomCallSSA::create(
+                         builder, mlir::TypeRange{vector_type}, copy_atom,
+                         input_view, poison, true_predicate)
+                         .getResult(0);
+      accumulator = mlir::arith::AddFOp::create(builder, accumulator, loaded);
+    }
+
+    auto partials_type = mlir::RankedTensorType::get(
+        {4 * kOutputElementsPerBlock}, builder.getF32Type());
+    Value partials = AllocateSharedOp::create(builder, partials_type);
+    Value partial_base = mlir::arith::AddIOp::create(
+        builder,
+        mlir::arith::MulIOp::create(builder, wave_id,
+                                    i64_constant(kOutputElementsPerBlock)),
+        lane_offset);
+    for (int64_t lane = 0; lane < vector_width_; ++lane) {
+      Value scalar =
+          mlir::vector::ExtractOp::create(builder, accumulator, lane);
+      partials = mlir::tensor::InsertOp::create(
+          builder, scalar, partials,
+          mlir::ValueRange{mlir::arith::AddIOp::create(builder, partial_base,
+                                                       i64_constant(lane))});
+    }
+    partials =
+        SyncThreadsOp::create(builder, mlir::TypeRange{partials_type}, partials)
+            .getResult(0);
+
+    Value is_wave_zero = mlir::arith::CmpIOp::create(
+        builder, mlir::arith::CmpIPredicate::eq, wave_id, i64_constant(0));
+    mlir::scf::IfOp store =
+        mlir::scf::IfOp::create(builder, mlir::TypeRange{}, is_wave_zero,
+                                /*withElseRegion=*/false);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(store.thenBlock());
+      llvm::SmallVector<Value> results;
+      results.reserve(vector_width_);
+      for (int64_t lane = 0; lane < vector_width_; ++lane) {
+        Value local_index = mlir::arith::AddIOp::create(builder, lane_offset,
+                                                        i64_constant(lane));
+        Value sum = mlir::tensor::ExtractOp::create(
+            builder, partials, mlir::ValueRange{local_index});
+        for (int64_t source_wave = 1; source_wave < 4; ++source_wave) {
+          Value source_index = mlir::arith::AddIOp::create(
+              builder, local_index,
+              i64_constant(source_wave * kOutputElementsPerBlock));
+          Value next = mlir::tensor::ExtractOp::create(
+              builder, partials, mlir::ValueRange{source_index});
+          sum = mlir::arith::AddFOp::create(builder, sum, next);
+        }
+        results.push_back(sum);
+      }
+      Value result =
+          mlir::vector::FromElementsOp::create(builder, vector_type, results);
+      Value output_view = make_view(output_pointer, output_offset);
+      mlir::fly::CopyAtomCallSSA::create(builder, mlir::TypeRange{}, copy_atom,
+                                         result, output_view, true_predicate);
+    }
+    builder.setInsertionPointAfter(store);
+    mlir::gpu::ReturnOp::create(builder);
+    return absl::OkStatus();
+  }
+
   absl::Status EmitKernel(mlir::gpu::GPUFuncOp kernel,
                           const HloFusionInstruction& fusion) const {
+    if (cooperative_strided_reduction_.has_value()) {
+      return EmitCooperativeStridedReductionKernel(
+          kernel, fusion, *cooperative_strided_reduction_);
+    }
     TF_RET_CHECK(kernel.getNumArguments() ==
                  fusion.operand_count() + output_count_);
     const HloInstruction* fusion_root = fusion.fused_expression_root();
@@ -4926,6 +5622,18 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         context, /*width=*/32, /*divisibility=*/vector_width_);
     auto offset_type = mlir::fly::IntTupleType::get(offset_attr);
 
+    llvm::SmallVector<const HloInstruction*> striped_invariant_broadcasts;
+    if (vectors_per_thread_ > 1) {
+      for (const HloInstruction* instruction :
+           fusion.fused_instructions_computation()->instructions()) {
+        if (IsStripedLoopInvariantBroadcast(
+                instruction, threads_ * vector_width_, vectors_per_thread_)) {
+          striped_invariant_broadcasts.push_back(instruction);
+        }
+      }
+    }
+    absl::flat_hash_map<const HloInstruction*, Value> striped_invariant_cache;
+
     for (int64_t vector = 0; full_elements != 0 && vector < vectors_per_thread_;
          ++vector) {
       Value vector_offset = base;
@@ -4939,7 +5647,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       Value in_bounds =
           mlir::arith::CmpIOp::create(builder, mlir::arith::CmpIPredicate::ult,
                                       vector_offset, element_count);
-      absl::flat_hash_map<const HloInstruction*, Value> cache;
+      absl::flat_hash_map<const HloInstruction*, Value> cache =
+          striped_invariant_cache;
       llvm::SmallVector<Value> results;
       results.reserve(output_count_);
       for (const HloInstruction* root : roots) {
@@ -4948,6 +5657,13 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                                        vector_offset, in_bounds, copy_atoms,
                                        vector_layout, vector_width_, cache));
         results.push_back(result);
+      }
+      if (vector == 0) {
+        for (const HloInstruction* broadcast : striped_invariant_broadcasts) {
+          if (auto it = cache.find(broadcast); it != cache.end()) {
+            striped_invariant_cache.insert(*it);
+          }
+        }
       }
 
       Value vector_offset_i32 = mlir::arith::TruncIOp::create(
@@ -5239,6 +5955,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
   int64_t vector_width_ = 0;
   int64_t vectors_per_thread_ = 1;
   int64_t threads_ = 0;
+  std::optional<StridedReductionDescriptor> cooperative_strided_reduction_;
   bool s4_may_start_odd_ = false;
   int32_t cache_modifier_ = 0;
   LaunchDimensions launch_dimensions_;

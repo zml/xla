@@ -25,6 +25,7 @@ for mode in FLY_GEMM_BENCHMARK_SCALED FLY_GEMM_BENCHMARK_SCALED_FP8 \
             FLY_GEMM_BENCHMARK_BATCHED_FP8 \
             FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8 \
             FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K \
+            FLY_GEMM_BENCHMARK_INT8 \
             FLY_GEMM_BENCHMARK_INT4 \
             FLY_GEMM_BENCHMARK_SCALAR FLY_GEMM_BENCHMARK_VECTOR \
             FLY_GEMM_BENCHMARK_CHAIN FLY_GEMM_BENCHMARK_CONVERTED_INPUTS \
@@ -79,6 +80,9 @@ elif [[ "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
 elif [[ "${FLY_GEMM_BENCHMARK_FP8:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/fp8_gemm_benchmark.hlo.tpl"
   benchmark_name="fnuz_fp8_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_INT8:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/int8_gemm_benchmark.hlo.tpl"
+  benchmark_name="s8_s32_gemm"
 elif [[ "${FLY_GEMM_BENCHMARK_INT4:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/int4_gemm_benchmark.hlo.tpl"
   benchmark_name="s4_dequantized_gemm"

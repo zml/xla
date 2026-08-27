@@ -1,0 +1,17 @@
+HloModule fly_fusion_bf16_arbitrary_broadcast_benchmark
+
+%fused_arbitrary_broadcast (p0: bf16[256,128,256], plane: bf16[256,256]) -> bf16[256,128,256] {
+  %p0 = bf16[256,128,256]{2,1,0} parameter(0)
+  %plane = bf16[256,256]{1,0} parameter(1)
+  %absolute = bf16[256,256]{1,0} abs(%plane)
+  %planes = bf16[256,128,256]{2,1,0} broadcast(%absolute), dimensions={0,2}
+  ROOT %result = bf16[256,128,256]{2,1,0} add(%p0, %planes)
+}
+
+ENTRY %entry_computation (p0: bf16[256,128,256], plane: bf16[256,256]) -> bf16[256,128,256] {
+  %p0 = bf16[256,128,256]{2,1,0} parameter(0)
+  %plane = bf16[256,256]{1,0} parameter(1)
+  ROOT %fusion = bf16[256,128,256]{2,1,0} fusion(%p0, %plane), kind=kCustom,
+    calls=%fused_arbitrary_broadcast,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
