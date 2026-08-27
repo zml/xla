@@ -138,6 +138,8 @@ namespace {
 
 constexpr double kSplitKTargetWaves = 2.0;
 
+constexpr int64_t kMinKPerSplit = 512;
+
 constexpr int64_t kMTileSize = 128;
 constexpr int64_t kNTileSize = 128;
 
@@ -220,7 +222,8 @@ double EstimateGemmCostAfterSplitK(const DotDimensions& gemm, int64_t splitk,
 
 size_t SplitKForOccupancy(const DotDimensions& dims,
                           const se::DeviceDescription& device_description,
-                          double target_waves) {
+                          double target_waves,
+                          int64_t preferred_contracting_elements = 0) {
   if (target_waves <= 0.0) {
     return 1;
   }
@@ -234,9 +237,32 @@ size_t SplitKForOccupancy(const DotDimensions& dims,
   if (tiles >= want) {
     return 1;
   }
+  const int64_t operand_bytes = (dims.m * dims.k * dims.lhs_element_bits +
+                                 dims.n * dims.k * dims.rhs_element_bits) /
+                                8;
+  const int64_t intermediate_bytes_per_split =
+      2 * dims.m * dims.n * dims.acc_element_bits / 8;
+  if (operand_bytes <= 0 || intermediate_bytes_per_split <= 0) {
+    return 1;
+  }
+  const bool tile_applies = preferred_contracting_elements > 0 &&
+                            dims.k % preferred_contracting_elements == 0;
   size_t split = 1;
   while (split < 64 && tiles * static_cast<int64_t>(split) < want) {
-    split *= 2;
+    const size_t next = split * 2;
+    if (static_cast<int64_t>(next) * intermediate_bytes_per_split >
+        operand_bytes) {
+      break;
+    }
+    if (dims.k / static_cast<int64_t>(next) < kMinKPerSplit) {
+      break;
+    }
+    if (tile_applies &&
+        dims.k % (static_cast<int64_t>(next) * preferred_contracting_elements) !=
+            0) {
+      break;
+    }
+    split = next;
   }
   return split;
 }
@@ -509,6 +535,10 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
                          .xla_gpu_experimental_force_split_k();
     if (split_k == 0) {
       split_k = ChooseSplitK(GetDotDimensions(dot), device_description_);
+      split_k = std::max<size_t>(
+          split_k, SplitKForOccupancy(GetDotDimensions(dot),
+                                      device_description_,
+                                      kSplitKTargetWaves));
     }
     if (split_k == 1) {
       return absl::OkStatus();
@@ -532,6 +562,16 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
           split_k, SplitKForOccupancy(GetDotDimensions(instr),
                                       device_description_,
                                       kSplitKTargetWaves));
+      const int64_t operand_bits =
+          ShapeUtil::ElementSizeInBits(instr->operand(0)->shape());
+      const int64_t row_elements = operand_bits > 0 ? 1024 / operand_bits : 0;
+      const int64_t k = GetDotDimensions(instr).k;
+      if (row_elements > 0 && k % row_elements == 0) {
+        while (split_k > 1 &&
+               k % (static_cast<int64_t>(split_k) * row_elements) != 0) {
+          split_k /= 2;
+        }
+      }
     }
     if (split_k == 1) {
       return absl::OkStatus();
