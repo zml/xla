@@ -884,6 +884,7 @@ cc_library(
         "gpu",
         "metal-only",
     ],
+    visibility = ["//xla/pjrt/c:__pkg__"],
     deps = [
         ":se_gpu_pjrt_compiler_impl",
         "//xla/pjrt:pjrt_compiler",

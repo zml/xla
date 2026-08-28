@@ -712,7 +712,9 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_protobuf//:protobuf",
-    ] + if_macos([], [
+    ] + if_macos([
+        "//xla/pjrt/gpu:se_gpu_pjrt_compiler_metal_registration",
+    ], [
         ":pjrt_c_api_gpu_internal_non_metal_deps",
     ]),
 )
