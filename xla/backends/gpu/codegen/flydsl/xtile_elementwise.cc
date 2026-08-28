@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -357,6 +358,544 @@ struct DynamicSlice {
   std::vector<int64_t> output_dimensions;
   std::vector<int64_t> start_limits;
 };
+
+struct RowGather {
+  std::vector<int64_t> indexed_dimension_sizes;
+  int64_t index_components = 0;
+  int64_t input_row_elements = 0;
+  int64_t row_elements = 0;
+};
+
+struct StridedAxisGather {
+  int64_t prefix_elements = 0;
+  int64_t index_rows = 0;
+  int64_t indexed_dimension_size = 0;
+  int64_t suffix_elements = 0;
+};
+
+enum class ScatterUpdateKind { kOverwrite, kAdd, kMaximum, kMinimum };
+
+struct OverwriteRowScatter {
+  const HloScatterInstruction* scatter = nullptr;
+  std::vector<int64_t> indexed_dimension_sizes;
+  int64_t index_components = 0;
+  int64_t update_rows = 0;
+  int64_t row_elements = 0;
+  ScatterUpdateKind update_kind = ScatterUpdateKind::kOverwrite;
+  bool requires_atomic_operation = false;
+};
+
+std::optional<RowGather> GetRowGather(const HloInstruction* instruction) {
+  if (instruction->opcode() != HloOpcode::kGather ||
+      instruction->operand_count() != 2) {
+    return std::nullopt;
+  }
+  const Shape& input = instruction->operand(0)->shape();
+  const Shape& indices = instruction->operand(1)->shape();
+  const Shape& output = instruction->shape();
+  const int64_t input_rank = input.dimensions_size();
+  if (!input.IsArray() || !indices.IsArray() || !output.IsArray() ||
+      !input.has_layout() || !indices.has_layout() || !output.has_layout() ||
+      input_rank == 0 ||
+      input.element_type() != output.element_type() ||
+      input.element_type() == S4 ||
+      !IsSupportedValueType(input.element_type()) ||
+      (indices.element_type() != S32 && indices.element_type() != S64) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(input.layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(indices.layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(output.layout()) ||
+      ShapeUtil::ElementsIn(input) <= 0 ||
+      ShapeUtil::ElementsIn(indices) <= 0 ||
+      ShapeUtil::ElementsIn(output) <= 0 ||
+      ShapeUtil::ByteSizeOfElements(input) >
+          std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+
+  const HloGatherInstruction* gather =
+      Cast<const HloGatherInstruction>(instruction);
+  const GatherDimensionNumbers& dimensions =
+      gather->gather_dimension_numbers();
+  const int64_t index_components = dimensions.start_index_map_size();
+  if (index_components <= 0 || index_components > input_rank ||
+      dimensions.operand_batching_dims_size() != 0 ||
+      dimensions.start_indices_batching_dims_size() != 0 ||
+      gather->gather_slice_sizes().size() != input_rank) {
+    return std::nullopt;
+  }
+  for (int64_t dimension = 0; dimension < input_rank; ++dimension) {
+    if (input.dimensions(dimension) <= 0 ||
+        gather->gather_slice_sizes()[dimension] <= 0 ||
+        gather->gather_slice_sizes()[dimension] >
+            input.dimensions(dimension) ||
+        (dimension < index_components &&
+         gather->gather_slice_sizes()[dimension] != 1) ||
+        (dimension >= index_components && dimension != input_rank - 1 &&
+         gather->gather_slice_sizes()[dimension] !=
+             input.dimensions(dimension)) ||
+        (dimension < index_components &&
+         dimensions.start_index_map(dimension) != dimension)) {
+      return std::nullopt;
+    }
+  }
+  if (index_components < input_rank - 1 &&
+      gather->gather_slice_sizes().back() != input.dimensions(input_rank - 1)) {
+    // A partial minor dimension is contiguous only when it is the entire
+    // trailing payload. With additional trailing dimensions, each logical row
+    // would require a separate input stride.
+    return std::nullopt;
+  }
+
+  const int64_t indices_rank = indices.dimensions_size();
+  int64_t batch_rank = 0;
+  if (dimensions.index_vector_dim() == indices_rank) {
+    if (index_components != 1) {
+      return std::nullopt;
+    }
+    batch_rank = indices_rank;
+  } else if (indices_rank > 0 &&
+             dimensions.index_vector_dim() == indices_rank - 1 &&
+             indices.dimensions(indices_rank - 1) == index_components) {
+    batch_rank = indices_rank - 1;
+  } else {
+    return std::nullopt;
+  }
+
+  const int64_t trailing_rank = input_rank - index_components;
+  const bool collapsed_form =
+      dimensions.collapsed_slice_dims_size() == index_components &&
+      dimensions.offset_dims_size() == trailing_rank &&
+      output.dimensions_size() == batch_rank + trailing_rank;
+  const bool explicit_unit_form =
+      dimensions.collapsed_slice_dims_size() == 0 &&
+      dimensions.offset_dims_size() == input_rank &&
+      output.dimensions_size() == batch_rank + input_rank;
+  if (!collapsed_form && !explicit_unit_form) {
+    return std::nullopt;
+  }
+  for (int64_t dimension = 0; dimension < dimensions.offset_dims_size();
+       ++dimension) {
+    if (dimensions.offset_dims(dimension) != batch_rank + dimension) {
+      return std::nullopt;
+    }
+  }
+  if (collapsed_form) {
+    for (int64_t dimension = 0; dimension < index_components; ++dimension) {
+      if (dimensions.collapsed_slice_dims(dimension) != dimension) {
+        return std::nullopt;
+      }
+    }
+  }
+  for (int64_t dimension = 0; dimension < batch_rank; ++dimension) {
+    if (indices.dimensions(dimension) <= 0 ||
+        output.dimensions(dimension) != indices.dimensions(dimension)) {
+      return std::nullopt;
+    }
+  }
+  const int64_t output_slice_rank =
+      explicit_unit_form ? input_rank : trailing_rank;
+  for (int64_t dimension = 0; dimension < output_slice_rank; ++dimension) {
+    const int64_t input_dimension =
+        explicit_unit_form ? dimension : index_components + dimension;
+    const int64_t expected = gather->gather_slice_sizes()[input_dimension];
+    if (output.dimensions(batch_rank + dimension) != expected) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t output_rows = 1;
+  for (int64_t dimension = 0; dimension < batch_rank; ++dimension) {
+    output_rows *= indices.dimensions(dimension);
+  }
+  int64_t input_row_elements = 1;
+  int64_t row_elements = 1;
+  for (int64_t dimension = index_components; dimension < input_rank;
+       ++dimension) {
+    input_row_elements *= input.dimensions(dimension);
+    row_elements *= gather->gather_slice_sizes()[dimension];
+  }
+  if (ShapeUtil::ElementsIn(indices) != output_rows * index_components ||
+      ShapeUtil::ElementsIn(output) != output_rows * row_elements) {
+    return std::nullopt;
+  }
+
+  return RowGather{
+      /*indexed_dimension_sizes=*/std::vector<int64_t>(
+          input.dimensions().begin(),
+          input.dimensions().begin() + index_components),
+      /*index_components=*/index_components,
+      /*input_row_elements=*/input_row_elements,
+      /*row_elements=*/row_elements};
+}
+
+std::optional<StridedAxisGather> GetStridedAxisGather(
+    const HloInstruction* instruction) {
+  if (instruction->opcode() != HloOpcode::kGather ||
+      instruction->operand_count() != 2) {
+    return std::nullopt;
+  }
+  const Shape& input = instruction->operand(0)->shape();
+  const Shape& indices = instruction->operand(1)->shape();
+  const Shape& output = instruction->shape();
+  const int64_t input_rank = input.dimensions_size();
+  if (!input.IsArray() || !indices.IsArray() || !output.IsArray() ||
+      !input.has_layout() || !indices.has_layout() || !output.has_layout() ||
+      input_rank < 2 || input.element_type() != output.element_type() ||
+      input.element_type() == S4 ||
+      !IsSupportedValueType(input.element_type()) ||
+      (indices.element_type() != S32 && indices.element_type() != S64) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(input.layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(indices.layout()) ||
+      ShapeUtil::ElementsIn(input) <= 0 ||
+      ShapeUtil::ElementsIn(indices) <= 0 ||
+      ShapeUtil::ElementsIn(output) <= 0 ||
+      ShapeUtil::ByteSizeOfElements(input) >
+          std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+
+  const HloGatherInstruction* gather =
+      Cast<const HloGatherInstruction>(instruction);
+  const GatherDimensionNumbers& dimensions =
+      gather->gather_dimension_numbers();
+  if (dimensions.start_index_map_size() != 1 ||
+      dimensions.operand_batching_dims_size() != 0 ||
+      dimensions.start_indices_batching_dims_size() != 0 ||
+      gather->gather_slice_sizes().size() != input_rank) {
+    return std::nullopt;
+  }
+  const int64_t axis = dimensions.start_index_map(0);
+  if (axis <= 0 || axis >= input_rank || input.dimensions(axis) <= 0) {
+    return std::nullopt;
+  }
+  for (int64_t dimension = 0; dimension < input_rank; ++dimension) {
+    if (input.dimensions(dimension) <= 0 ||
+        gather->gather_slice_sizes()[dimension] !=
+            (dimension == axis ? 1 : input.dimensions(dimension))) {
+      return std::nullopt;
+    }
+  }
+
+  const int64_t indices_rank = indices.dimensions_size();
+  int64_t batch_rank = 0;
+  if (dimensions.index_vector_dim() == indices_rank) {
+    batch_rank = indices_rank;
+  } else if (indices_rank > 0 &&
+             dimensions.index_vector_dim() == indices_rank - 1 &&
+             indices.dimensions(indices_rank - 1) == 1) {
+    batch_rank = indices_rank - 1;
+  } else {
+    return std::nullopt;
+  }
+
+  const bool collapsed_form =
+      dimensions.collapsed_slice_dims_size() == 1 &&
+      dimensions.collapsed_slice_dims(0) == axis &&
+      dimensions.offset_dims_size() == input_rank - 1 &&
+      output.dimensions_size() == input_rank - 1 + batch_rank;
+  const bool explicit_unit_form =
+      dimensions.collapsed_slice_dims_size() == 0 &&
+      dimensions.offset_dims_size() == input_rank &&
+      output.dimensions_size() == input_rank + batch_rank;
+  if (!collapsed_form && !explicit_unit_form) {
+    return std::nullopt;
+  }
+
+  const auto has_inserted_batch_order = [&] {
+    if (!LayoutUtil::IsMonotonicWithDim0Major(output.layout())) {
+      return false;
+    }
+    int64_t offset_index = 0;
+    for (int64_t output_dimension = 0;
+         output_dimension < output.dimensions_size(); ++output_dimension) {
+      const bool is_batch_dimension =
+          output_dimension >= axis && output_dimension < axis + batch_rank;
+      if (is_batch_dimension) {
+        if (output.dimensions(output_dimension) !=
+            indices.dimensions(output_dimension - axis)) {
+          return false;
+        }
+        continue;
+      }
+      if (offset_index >= dimensions.offset_dims_size() ||
+          dimensions.offset_dims(offset_index) != output_dimension) {
+        return false;
+      }
+      const int64_t input_dimension =
+          output_dimension < axis
+              ? output_dimension
+              : output_dimension - batch_rank +
+                    (collapsed_form ? 1 : 0);
+      const int64_t expected =
+          input_dimension == axis ? 1 : input.dimensions(input_dimension);
+      if (output.dimensions(output_dimension) != expected) {
+        return false;
+      }
+      ++offset_index;
+    }
+    return offset_index == dimensions.offset_dims_size();
+  };
+  const auto has_canonical_batch_first_order = [&] {
+    for (int64_t offset = 0; offset < dimensions.offset_dims_size();
+         ++offset) {
+      if (dimensions.offset_dims(offset) != batch_rank + offset) {
+        return false;
+      }
+    }
+    for (int64_t batch = 0; batch < batch_rank; ++batch) {
+      if (output.dimensions(batch) != indices.dimensions(batch)) {
+        return false;
+      }
+    }
+    auto output_dimension_for_input = [&](int64_t input_dimension) {
+      return batch_rank + input_dimension -
+             (collapsed_form && input_dimension > axis ? 1 : 0);
+    };
+    for (int64_t input_dimension = 0; input_dimension < input_rank;
+         ++input_dimension) {
+      if (collapsed_form && input_dimension == axis) {
+        continue;
+      }
+      const int64_t output_dimension =
+          output_dimension_for_input(input_dimension);
+      const int64_t expected =
+          input_dimension == axis ? 1 : input.dimensions(input_dimension);
+      if (output.dimensions(output_dimension) != expected) {
+        return false;
+      }
+    }
+
+    llvm::SmallVector<int64_t> expected_minor_to_major;
+    for (int64_t input_dimension = input_rank - 1;
+         input_dimension > axis; --input_dimension) {
+      expected_minor_to_major.push_back(
+          output_dimension_for_input(input_dimension));
+    }
+    if (explicit_unit_form) {
+      expected_minor_to_major.push_back(
+          output_dimension_for_input(axis));
+    }
+    for (int64_t batch = batch_rank - 1; batch >= 0; --batch) {
+      expected_minor_to_major.push_back(batch);
+    }
+    for (int64_t input_dimension = axis - 1; input_dimension >= 0;
+         --input_dimension) {
+      expected_minor_to_major.push_back(
+          output_dimension_for_input(input_dimension));
+    }
+    if (output.layout().minor_to_major_size() !=
+        expected_minor_to_major.size()) {
+      return false;
+    }
+    for (auto [position, dimension] :
+         llvm::enumerate(expected_minor_to_major)) {
+      if (output.layout().minor_to_major(position) != dimension) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!has_inserted_batch_order() && !has_canonical_batch_first_order()) {
+    return std::nullopt;
+  }
+
+  int64_t prefix_elements = 1;
+  for (int64_t dimension = 0; dimension < axis; ++dimension) {
+    prefix_elements *= input.dimensions(dimension);
+  }
+  int64_t index_rows = 1;
+  for (int64_t dimension = 0; dimension < batch_rank; ++dimension) {
+    if (indices.dimensions(dimension) <= 0) {
+      return std::nullopt;
+    }
+    index_rows *= indices.dimensions(dimension);
+  }
+  int64_t suffix_elements = 1;
+  for (int64_t dimension = axis + 1; dimension < input_rank; ++dimension) {
+    suffix_elements *= input.dimensions(dimension);
+  }
+  if (ShapeUtil::ElementsIn(indices) != index_rows ||
+      ShapeUtil::ElementsIn(output) !=
+          prefix_elements * index_rows * suffix_elements) {
+    return std::nullopt;
+  }
+  return StridedAxisGather{
+      /*prefix_elements=*/prefix_elements,
+      /*index_rows=*/index_rows,
+      /*indexed_dimension_size=*/input.dimensions(axis),
+      /*suffix_elements=*/suffix_elements};
+}
+
+std::optional<OverwriteRowScatter> GetOverwriteRowScatter(
+    const HloInstruction* instruction) {
+  if (instruction->opcode() != HloOpcode::kScatter ||
+      instruction->operand_count() != 3) {
+    return std::nullopt;
+  }
+  const HloScatterInstruction* scatter =
+      Cast<const HloScatterInstruction>(instruction);
+  if (scatter->scatter_operand_count() != 1 ||
+      scatter->operand(0)->opcode() != HloOpcode::kParameter) {
+    return std::nullopt;
+  }
+
+  const HloComputation* update_computation = scatter->to_apply();
+  const HloInstruction* update_root =
+      update_computation == nullptr ? nullptr
+                                    : update_computation->root_instruction();
+  if (update_root == nullptr || update_computation->num_parameters() != 2) {
+    return std::nullopt;
+  }
+  ScatterUpdateKind update_kind;
+  if (update_root->opcode() == HloOpcode::kParameter &&
+      update_root->parameter_number() == 1) {
+    update_kind = ScatterUpdateKind::kOverwrite;
+  } else {
+    const HloInstruction* combiner = update_root;
+    while (combiner->opcode() == HloOpcode::kConvert &&
+           combiner->operand_count() == 1) {
+      combiner = combiner->operand(0);
+    }
+    auto parameter_number_through_converts =
+        [](const HloInstruction* value) -> std::optional<int64_t> {
+      while (value->opcode() == HloOpcode::kConvert &&
+             value->operand_count() == 1) {
+        value = value->operand(0);
+      }
+      if (value->opcode() != HloOpcode::kParameter) {
+        return std::nullopt;
+      }
+      return value->parameter_number();
+    };
+    std::optional<int64_t> lhs_parameter;
+    std::optional<int64_t> rhs_parameter;
+    if ((combiner->opcode() == HloOpcode::kAdd ||
+         combiner->opcode() == HloOpcode::kMaximum ||
+         combiner->opcode() == HloOpcode::kMinimum) &&
+        combiner->operand_count() == 2) {
+      lhs_parameter =
+          parameter_number_through_converts(combiner->operand(0));
+      rhs_parameter =
+          parameter_number_through_converts(combiner->operand(1));
+    }
+    if (!lhs_parameter.has_value() || !rhs_parameter.has_value() ||
+        *lhs_parameter == *rhs_parameter) {
+      return std::nullopt;
+    }
+    switch (combiner->opcode()) {
+      case HloOpcode::kAdd:
+        update_kind = ScatterUpdateKind::kAdd;
+        break;
+      case HloOpcode::kMaximum:
+        update_kind = ScatterUpdateKind::kMaximum;
+        break;
+      case HloOpcode::kMinimum:
+        update_kind = ScatterUpdateKind::kMinimum;
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+
+  const Shape& output = scatter->shape();
+  const Shape& base = scatter->operand(0)->shape();
+  const Shape& indices = scatter->operand(1)->shape();
+  const Shape& updates = scatter->operand(2)->shape();
+  const int64_t output_rank = output.dimensions_size();
+  const int64_t index_components =
+      indices.dimensions_size() == 2 ? indices.dimensions(1) : 0;
+  if (!output.IsArray() || !base.IsArray() || !indices.IsArray() ||
+      !updates.IsArray() || !output.has_layout() || !base.has_layout() ||
+      !indices.has_layout() || !updates.has_layout() || output_rank < 1 ||
+      base.element_type() != output.element_type() ||
+      updates.element_type() != output.element_type() ||
+      output.element_type() == S4 || output.element_type() == PRED ||
+      !IsSupportedValueType(output.element_type()) ||
+      (indices.element_type() != S32 && indices.element_type() != S64) ||
+      !ShapeUtil::Equal(base, output) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(output.layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(indices.layout()) ||
+      !LayoutUtil::IsMonotonicWithDim0Major(updates.layout()) ||
+      indices.dimensions_size() != 2 || indices.dimensions(0) <= 0 ||
+      index_components <= 0 || index_components > output_rank ||
+      updates.dimensions_size() != output_rank + 1 ||
+      updates.dimensions(0) != indices.dimensions(0) ||
+      ShapeUtil::ElementsIn(output) <= 0 ||
+      ShapeUtil::ElementsIn(updates) <= 0 ||
+      ShapeUtil::ByteSizeOfElements(output) >
+          std::numeric_limits<uint32_t>::max() ||
+      ShapeUtil::ByteSizeOfElements(updates) >
+          std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  // The universal atomic lowering maps these directly to signed LLVM
+  // atomicrmw max/min. Keep the initial contract deliberately narrow until
+  // floating NaN/signed-zero semantics and additional integer widths are
+  // proven equivalent to HLO on every supported AMD target.
+  if ((update_kind == ScatterUpdateKind::kMaximum ||
+       update_kind == ScatterUpdateKind::kMinimum) &&
+      output.element_type() != S32) {
+    return std::nullopt;
+  }
+  for (int64_t dimension = 0; dimension < output_rank; ++dimension) {
+    const int64_t expected_update_size =
+        dimension < index_components ? 1 : output.dimensions(dimension);
+    if (output.dimensions(dimension) <= 0 ||
+        updates.dimensions(dimension + 1) != expected_update_size) {
+      return std::nullopt;
+    }
+  }
+
+  const ScatterDimensionNumbers& dimensions =
+      scatter->scatter_dimension_numbers();
+  if (dimensions.index_vector_dim() != 1 ||
+      dimensions.update_window_dims_size() != output_rank ||
+      dimensions.inserted_window_dims_size() != 0 ||
+      dimensions.scatter_dims_to_operand_dims_size() != index_components ||
+      dimensions.input_batching_dims_size() != 0 ||
+      dimensions.scatter_indices_batching_dims_size() != 0) {
+    return std::nullopt;
+  }
+  for (int64_t dimension = 0; dimension < output_rank; ++dimension) {
+    if (dimensions.update_window_dims(dimension) != dimension + 1) {
+      return std::nullopt;
+    }
+  }
+  for (int64_t component = 0; component < index_components; ++component) {
+    if (dimensions.scatter_dims_to_operand_dims(component) != component) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<int64_t> indexed_dimension_sizes;
+  indexed_dimension_sizes.reserve(index_components);
+  int64_t output_rows = 1;
+  for (int64_t component = 0; component < index_components; ++component) {
+    indexed_dimension_sizes.push_back(output.dimensions(component));
+    output_rows *= output.dimensions(component);
+  }
+  const int64_t row_elements = ShapeUtil::ElementsIn(output) / output_rows;
+  if (row_elements <= 0 ||
+      ShapeUtil::ElementsIn(updates) !=
+          indices.dimensions(0) * row_elements) {
+    return std::nullopt;
+  }
+  return OverwriteRowScatter{
+      /*scatter=*/scatter,
+      /*indexed_dimension_sizes=*/std::move(indexed_dimension_sizes),
+      /*index_components=*/index_components,
+      /*update_rows=*/indices.dimensions(0),
+      /*row_elements=*/row_elements,
+      /*update_kind=*/update_kind,
+      /*requires_atomic_operation=*/
+          update_kind != ScatterUpdateKind::kOverwrite ||
+              !scatter->unique_indices()};
+}
+
+bool IsSupportedGather(const HloInstruction* instruction) {
+  return GetRowGather(instruction).has_value() ||
+         GetStridedAxisGather(instruction).has_value();
+}
 
 std::optional<DynamicSlice> GetDynamicSlice(const HloInstruction* instruction) {
   if (instruction->opcode() != HloOpcode::kDynamicSlice) {
@@ -922,6 +1461,15 @@ bool IsSupportedElementwiseGraph(
              IsSupportedElementwiseGraph(instruction->operand(0),
                                          instruction->operand(0)->shape(),
                                          visited);
+    case HloOpcode::kGather:
+      return HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
+             IsSupportedGather(instruction) &&
+             IsSupportedElementwiseGraph(instruction->operand(0),
+                                         instruction->operand(0)->shape(),
+                                         visited) &&
+             IsSupportedElementwiseGraph(instruction->operand(1),
+                                         instruction->operand(1)->shape(),
+                                         visited);
     case HloOpcode::kDynamicUpdateSlice:
       return IsSupportedType(instruction->shape().element_type()) &&
              HasSameFlatElements(instruction->shape(), output_shape) &&
@@ -1273,17 +1821,91 @@ bool HasPotentiallyOddS4Offset(const HloFusionAnalysis& analysis) {
   return false;
 }
 
+std::vector<int64_t> ScalarIndexParameterNumbers(
+    const HloFusionAdaptor& fusion) {
+  absl::flat_hash_set<const HloInstruction*> index_nodes;
+  std::function<void(const HloInstruction*)> collect =
+      [&](const HloInstruction* instruction) {
+        if (!index_nodes.insert(instruction).second) {
+          return;
+        }
+        for (const HloInstruction* operand : instruction->operands()) {
+          collect(operand);
+        }
+      };
+  fusion.ForEach([&](HloInstructionAdaptor adaptor) {
+    const HloInstruction* instruction = &adaptor.instruction();
+    if (instruction->opcode() == HloOpcode::kGather &&
+        instruction->operand_count() == 2 &&
+        IsSupportedGather(instruction)) {
+      collect(instruction->operand(1));
+    } else if (GetOverwriteRowScatter(instruction).has_value()) {
+      collect(instruction->operand(1));
+    }
+  });
+
+  auto is_index_only = [&](const HloInstruction* parameter) {
+    absl::flat_hash_set<const HloInstruction*> visited;
+    std::function<bool(const HloInstruction*)> visit_users =
+        [&](const HloInstruction* instruction) {
+          if (!visited.insert(instruction).second) {
+            return true;
+          }
+          for (const HloInstruction* user : instruction->users()) {
+            if (user->opcode() == HloOpcode::kGather) {
+              if (user->operand_count() != 2 || user->operand(1) != instruction ||
+                  !IsSupportedGather(user)) {
+                return false;
+              }
+              continue;
+            }
+            if (user->opcode() == HloOpcode::kScatter) {
+              if (user->operand_count() != 3 || user->operand(1) != instruction ||
+                  !GetOverwriteRowScatter(user).has_value()) {
+                return false;
+              }
+              continue;
+            }
+            if (!index_nodes.contains(user) || !visit_users(user)) {
+              return false;
+            }
+          }
+          return !instruction->users().empty();
+        };
+    return index_nodes.contains(parameter) && visit_users(parameter);
+  };
+
+  std::vector<int64_t> parameter_numbers;
+  // HloFusionAdaptor intentionally hides fusion parameters from ForEach().
+  // They are still present in the original gather-index expression, so find
+  // them in the index DAG collected above.
+  for (const HloInstruction* parameter : index_nodes) {
+    if (parameter->opcode() == HloOpcode::kParameter &&
+        is_index_only(parameter)) {
+      parameter_numbers.push_back(parameter->parameter_number());
+    }
+  }
+  std::sort(parameter_numbers.begin(), parameter_numbers.end());
+  return parameter_numbers;
+}
+
 class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
  public:
   explicit FlyXTileElementwiseEmitter(const HloFusionAnalysis& analysis)
-      : elements_(ShapeUtil::ElementsIn(analysis.first_result_shape())),
+      : elements_(GetFlyXTileElementwiseElementCount(analysis)),
         element_type_(analysis.first_result_shape().element_type()),
         output_count_(analysis.fusion_root_count()),
+        scalar_index_parameter_numbers_(
+            GetFlyXTileScalarIndexParameterNumbers(analysis)),
         s4_may_start_odd_(HasPotentiallyOddS4Offset(analysis)),
         cache_modifier_(GetFlyXTileMemoryPolicy(analysis) ==
                                 FlyXTileMemoryPolicy::kNonTemporal
                             ? 2
                             : 0) {
+    if (analysis.fusion_root_count() == 1) {
+      overwrite_row_scatter_ = GetOverwriteRowScatter(
+          &analysis.fusion_root(0).instruction());
+    }
     const BlockLevelFusionConfig& config =
         analysis.fusion_backend_config().block_level_fusion_config();
     // Fly's elementwise emitter uses one shared flat output domain for every
@@ -1310,7 +1932,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     CHECK_GT(threads_, 0);
     const int64_t elements_per_block =
         threads_ * vectors_per_thread_ * vector_width_;
-    if (output_count_ == 1) {
+    if (output_count_ == 1 && !overwrite_row_scatter_.has_value()) {
       cooperative_strided_reduction_ =
           GetStridedReductionDescriptor(&analysis.fusion_root(0).instruction(),
                                         analysis.fusion_root(0).shape());
@@ -3196,6 +3818,196 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                 Value scalar,
                 EmitVector(builder, argument_pointers, instruction->operand(0),
                            scalar_input_offset, predicate,
+                           scalar_copies.copy_atoms, scalar_copies.layout,
+                           /*vector_width=*/1, operand_cache));
+            lanes.push_back(
+                mlir::vector::ExtractOp::create(builder, scalar, 0));
+          }
+          Value boundary =
+              mlir::vector::FromElementsOp::create(builder, vector_type, lanes);
+          mlir::scf::YieldOp::create(builder, boundary);
+        }
+        builder.setInsertionPointAfter(select);
+        result = select.getResult(0);
+        break;
+      }
+      case HloOpcode::kGather: {
+        std::optional<RowGather> row_gather = GetRowGather(instruction);
+        std::optional<StridedAxisGather> axis_gather =
+            GetStridedAxisGather(instruction);
+        TF_RET_CHECK(row_gather.has_value() || axis_gather.has_value());
+        ScalarCopyContext scalar_copies =
+            CreateScalarCopyContext(builder, copy_atoms);
+        const int64_t contiguous_elements =
+            row_gather ? row_gather->row_elements
+                       : axis_gather->suffix_elements;
+        Value row_elements = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(), contiguous_elements);
+        Value input_row_elements = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(),
+            row_gather ? row_gather->input_row_elements
+                       : axis_gather->suffix_elements);
+        auto map_input_offset =
+            [&](Value output_offset) -> absl::StatusOr<Value> {
+          Value output_row = mlir::arith::DivUIOp::create(
+              builder, output_offset, row_elements);
+          Value output_column = mlir::arith::RemUIOp::create(
+              builder, output_offset, row_elements);
+          Value zero = mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(), 0);
+          if (axis_gather) {
+            Value index_offset = zero;
+            Value prefix = output_row;
+            if (axis_gather->index_rows != 1) {
+              Value index_rows = mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(), axis_gather->index_rows);
+              index_offset = mlir::arith::RemUIOp::create(
+                  builder, output_row, index_rows);
+              prefix = mlir::arith::DivUIOp::create(builder, output_row,
+                                                    index_rows);
+            }
+            absl::flat_hash_map<const HloInstruction*, Value> index_cache;
+            TF_ASSIGN_OR_RETURN(
+                Value index_vector,
+                EmitVector(builder, argument_pointers,
+                           instruction->operand(1), index_offset, predicate,
+                           scalar_copies.copy_atoms, scalar_copies.layout,
+                           /*vector_width=*/1, index_cache));
+            Value index =
+                mlir::vector::ExtractOp::create(builder, index_vector, 0);
+            if (instruction->operand(1)->shape().element_type() == S32) {
+              index = mlir::arith::ExtSIOp::create(
+                  builder, builder.getI64Type(), index);
+            }
+            Value upper = mlir::arith::ConstantIntOp::create(
+                builder, builder.getI64Type(),
+                axis_gather->indexed_dimension_size - 1);
+            Value below_zero = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::slt, index, zero);
+            index = mlir::arith::SelectOp::create(builder, below_zero, zero,
+                                                  index);
+            Value above_upper = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::sgt, index, upper);
+            index = mlir::arith::SelectOp::create(builder, above_upper, upper,
+                                                  index);
+            Value input_row = mlir::arith::AddIOp::create(
+                builder,
+                mlir::arith::MulIOp::create(
+                    builder, prefix,
+                    mlir::arith::ConstantIntOp::create(
+                        builder, builder.getI64Type(),
+                        axis_gather->indexed_dimension_size)),
+                index);
+            Value input_offset = mlir::arith::MulIOp::create(
+                builder, input_row, input_row_elements);
+            return mlir::arith::AddIOp::create(builder, input_offset,
+                                               output_column)
+                .getResult();
+          }
+
+          Value index_base = output_row;
+          if (row_gather->index_components != 1) {
+            index_base = mlir::arith::MulIOp::create(
+                builder, output_row,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(),
+                    row_gather->index_components));
+          }
+          Value input_row = zero;
+          for (int64_t component = 0;
+               component < row_gather->index_components;
+               ++component) {
+            Value index_offset = index_base;
+            if (component != 0) {
+              index_offset = mlir::arith::AddIOp::create(
+                  builder, index_base,
+                  mlir::arith::ConstantIntOp::create(
+                      builder, builder.getI64Type(), component));
+            }
+            absl::flat_hash_map<const HloInstruction*, Value> index_cache;
+            TF_ASSIGN_OR_RETURN(
+                Value index_vector,
+                EmitVector(builder, argument_pointers,
+                           instruction->operand(1), index_offset, predicate,
+                           scalar_copies.copy_atoms, scalar_copies.layout,
+                           /*vector_width=*/1, index_cache));
+            Value index =
+                mlir::vector::ExtractOp::create(builder, index_vector, 0);
+            if (instruction->operand(1)->shape().element_type() == S32) {
+              index = mlir::arith::ExtSIOp::create(
+                  builder, builder.getI64Type(), index);
+            }
+            Value dimension_size = mlir::arith::ConstantIntOp::create(
+                builder, builder.getI64Type(),
+                row_gather->indexed_dimension_sizes[component]);
+            Value upper = mlir::arith::ConstantIntOp::create(
+                builder, builder.getI64Type(),
+                row_gather->indexed_dimension_sizes[component] - 1);
+            Value below_zero = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::slt, index, zero);
+            index = mlir::arith::SelectOp::create(builder, below_zero, zero,
+                                                  index);
+            Value above_upper = mlir::arith::CmpIOp::create(
+                builder, mlir::arith::CmpIPredicate::sgt, index, upper);
+            index = mlir::arith::SelectOp::create(builder, above_upper, upper,
+                                                  index);
+            input_row = mlir::arith::AddIOp::create(
+                builder,
+                mlir::arith::MulIOp::create(builder, input_row,
+                                            dimension_size),
+                index);
+          }
+          Value input_offset =
+              mlir::arith::MulIOp::create(builder, input_row,
+                                          input_row_elements);
+          return mlir::arith::AddIOp::create(builder, input_offset,
+                                             output_column)
+              .getResult();
+        };
+
+        Value output_column = mlir::arith::RemUIOp::create(
+            builder, element_offset, row_elements);
+        Value vector_column_end = mlir::arith::AddIOp::create(
+            builder, output_column,
+            mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
+                                               vector_width));
+        Value fits_in_row = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ule, vector_column_end,
+            row_elements);
+        mlir::scf::IfOp select = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{vector_type}, fits_in_row,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(select.thenBlock());
+          TF_ASSIGN_OR_RETURN(Value input_offset,
+                              map_input_offset(element_offset));
+          absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+          TF_ASSIGN_OR_RETURN(
+              Value vector,
+              EmitVector(builder, argument_pointers, instruction->operand(0),
+                         input_offset, predicate, copy_atoms, vector_layout,
+                         vector_width, operand_cache));
+          mlir::scf::YieldOp::create(builder, vector);
+
+          builder.setInsertionPointToStart(select.elseBlock());
+          llvm::SmallVector<Value> lanes;
+          lanes.reserve(vector_width);
+          for (int64_t lane = 0; lane < vector_width; ++lane) {
+            Value lane_offset = element_offset;
+            if (lane != 0) {
+              lane_offset = mlir::arith::AddIOp::create(
+                  builder, element_offset,
+                  mlir::arith::ConstantIntOp::create(
+                      builder, builder.getI64Type(), lane));
+            }
+            TF_ASSIGN_OR_RETURN(Value input_offset,
+                                map_input_offset(lane_offset));
+            absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
+            TF_ASSIGN_OR_RETURN(
+                Value scalar,
+                EmitVector(builder, argument_pointers,
+                           instruction->operand(0), input_offset, predicate,
                            scalar_copies.copy_atoms, scalar_copies.layout,
                            /*vector_width=*/1, operand_cache));
             lanes.push_back(
@@ -5552,13 +6364,16 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     }
     absl::flat_hash_set<PrimitiveType> external_types;
     absl::flat_hash_set<PrimitiveType> vector_external_types;
-    for (const HloInstruction* operand : fusion.operands()) {
+    for (auto [operand_index, operand] : llvm::enumerate(fusion.operands())) {
       const PrimitiveType type = operand->shape().element_type();
       external_types.insert(type);
       // Scalar integral operands are dynamic slice/update indices. They are
       // loaded once per wave through a scalar copy context, so they must not
       // inflate the transaction width used for the vectorized data path.
-      if (!ShapeUtil::IsScalar(operand->shape())) {
+      if (!ShapeUtil::IsScalar(operand->shape()) &&
+          !std::binary_search(scalar_index_parameter_numbers_.begin(),
+                              scalar_index_parameter_numbers_.end(),
+                              operand_index)) {
         vector_external_types.insert(type);
       }
     }
@@ -5621,9 +6436,260 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
     auto offset_attr = mlir::fly::IntTupleAttr::getLeafDynamic(
         context, /*width=*/32, /*divisibility=*/vector_width_);
     auto offset_type = mlir::fly::IntTupleType::get(offset_attr);
+    auto scatter_offset_attr = mlir::fly::IntTupleAttr::getLeafDynamic(
+        context, /*width=*/32, /*divisibility=*/1);
+    auto scatter_offset_type =
+        mlir::fly::IntTupleType::get(scatter_offset_attr);
+    std::optional<ScalarCopyContext> scatter_scalar_copies;
+    Value scatter_atomic_copy_atom;
+    Value scatter_packed_atomic_copy_atom;
+    const bool has_packed_bf16_scatter_add =
+        overwrite_row_scatter_.has_value() &&
+        overwrite_row_scatter_->update_kind == ScatterUpdateKind::kAdd &&
+        element_type_ == BF16 && vector_width_ == 2;
+    const bool use_paired_bf16_scatter_add =
+        has_packed_bf16_scatter_add &&
+        overwrite_row_scatter_->row_elements % 2 == 0;
+    if (overwrite_row_scatter_.has_value()) {
+      scatter_scalar_copies.emplace(
+          CreateScalarCopyContext(builder, copy_atoms));
+      if (overwrite_row_scatter_->requires_atomic_operation) {
+        const int64_t element_bits = ElementBits(element_type_);
+        mlir::fly::AtomicOp atomic_operation;
+        switch (overwrite_row_scatter_->update_kind) {
+          case ScatterUpdateKind::kOverwrite:
+            atomic_operation = mlir::fly::AtomicOp::Exchange;
+            break;
+          case ScatterUpdateKind::kAdd:
+            atomic_operation = mlir::fly::AtomicOp::Add;
+            break;
+          case ScatterUpdateKind::kMaximum:
+            atomic_operation = mlir::fly::AtomicOp::Max;
+            break;
+          case ScatterUpdateKind::kMinimum:
+            atomic_operation = mlir::fly::AtomicOp::Min;
+            break;
+        }
+        auto atomic_op =
+            mlir::fly::AtomicOpAttr::get(context, atomic_operation);
+        auto atomic_type = mlir::fly::CopyOpUniversalAtomicType::get(
+            atomic_op, StorageElementType(element_type_, builder),
+            "agent-one-as");
+        auto copy_atom_type =
+            mlir::fly::CopyAtomType::get(atomic_type, element_bits);
+        scatter_atomic_copy_atom = mlir::fly::MakeCopyAtomOp::create(
+            builder, copy_atom_type, element_bits);
+        if (has_packed_bf16_scatter_add) {
+          auto packed_type = mlir::VectorType::get(
+              {2}, StorageElementType(element_type_, builder));
+          auto packed_atomic_type = mlir::fly::CopyOpUniversalAtomicType::get(
+              atomic_op, packed_type, "agent-one-as");
+          auto packed_copy_atom_type = mlir::fly::CopyAtomType::get(
+              packed_atomic_type, element_bits);
+          scatter_packed_atomic_copy_atom =
+              mlir::fly::MakeCopyAtomOp::create(
+                  builder, packed_copy_atom_type, element_bits);
+        }
+      }
+    }
+
+    auto emit_scatter_indices =
+        [&](Value update_offset, Value predicate)
+        -> absl::StatusOr<llvm::SmallVector<Value>> {
+      TF_RET_CHECK(overwrite_row_scatter_.has_value() &&
+                   scatter_scalar_copies.has_value());
+      Value update_row = mlir::arith::DivUIOp::create(
+          builder, update_offset,
+          mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(),
+              overwrite_row_scatter_->row_elements));
+      Value first_index_offset = mlir::arith::MulIOp::create(
+          builder, update_row,
+          mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(),
+              overwrite_row_scatter_->index_components));
+      llvm::SmallVector<Value> indices;
+      indices.reserve(overwrite_row_scatter_->index_components);
+      for (int64_t component = 0;
+           component < overwrite_row_scatter_->index_components;
+           ++component) {
+        Value index_offset = first_index_offset;
+        if (component != 0) {
+          index_offset = mlir::arith::AddIOp::create(
+              builder, first_index_offset,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(), component));
+        }
+        absl::flat_hash_map<const HloInstruction*, Value> index_cache;
+        TF_ASSIGN_OR_RETURN(
+            Value index_vector,
+            EmitVector(builder, argument_pointers,
+                       overwrite_row_scatter_->scatter->operand(1),
+                       index_offset, predicate,
+                       scatter_scalar_copies->copy_atoms,
+                       scatter_scalar_copies->layout, /*vector_width=*/1,
+                       index_cache));
+        Value index =
+            mlir::vector::ExtractOp::create(builder, index_vector, 0);
+        if (overwrite_row_scatter_->scatter->operand(1)
+                ->shape()
+                .element_type() == S32) {
+          index = mlir::arith::ExtSIOp::create(builder, builder.getI64Type(),
+                                               index);
+        }
+        Value zero = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(), 0);
+        indices.push_back(
+            mlir::arith::SelectOp::create(builder, predicate, index, zero));
+      }
+      return indices;
+    };
+    auto scatter_indices_are_valid =
+        [&](llvm::ArrayRef<Value> indices) -> Value {
+      Value valid = mlir::arith::ConstantIntOp::create(
+          builder, builder.getI1Type(), 1);
+      Value zero = mlir::arith::ConstantIntOp::create(
+          builder, builder.getI64Type(), 0);
+      for (int64_t component = 0;
+           component < overwrite_row_scatter_->index_components;
+           ++component) {
+        Value lower = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::sge, indices[component],
+            zero);
+        Value upper = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::slt, indices[component],
+            mlir::arith::ConstantIntOp::create(
+                builder, builder.getI64Type(),
+                overwrite_row_scatter_->indexed_dimension_sizes[component]));
+        valid = mlir::arith::AndIOp::create(
+            builder, valid,
+            mlir::arith::AndIOp::create(builder, lower, upper));
+      }
+      return valid;
+    };
+    auto scatter_output_offset = [&](Value update_offset,
+                                     llvm::ArrayRef<Value> indices) -> Value {
+      Value column = mlir::arith::RemUIOp::create(
+          builder, update_offset,
+          mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(),
+              overwrite_row_scatter_->row_elements));
+      Value output_row = indices.front();
+      for (int64_t component = 1;
+           component < overwrite_row_scatter_->index_components;
+           ++component) {
+        output_row = mlir::arith::AddIOp::create(
+            builder,
+            mlir::arith::MulIOp::create(
+                builder, output_row,
+                mlir::arith::ConstantIntOp::create(
+                    builder, builder.getI64Type(),
+                    overwrite_row_scatter_
+                        ->indexed_dimension_sizes[component])),
+            indices[component]);
+      }
+      return mlir::arith::AddIOp::create(
+          builder,
+          mlir::arith::MulIOp::create(
+              builder, output_row,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(),
+                  overwrite_row_scatter_->row_elements)),
+          column);
+    };
+    auto emit_scalar_scatter_store =
+        [&](Value scalar, Value update_offset,
+            Value predicate) -> absl::Status {
+      TF_RET_CHECK(overwrite_row_scatter_.has_value() &&
+                   scatter_scalar_copies.has_value());
+      TF_ASSIGN_OR_RETURN(llvm::SmallVector<Value> indices,
+                          emit_scatter_indices(update_offset, predicate));
+      Value store_predicate = mlir::arith::AndIOp::create(
+          builder, predicate, scatter_indices_are_valid(indices));
+      Value output_offset = scatter_output_offset(update_offset, indices);
+      if (has_packed_bf16_scatter_add) {
+        Value one = mlir::arith::ConstantIntOp::create(
+            builder, builder.getI64Type(), 1);
+        Value pair_offset = mlir::arith::AndIOp::create(
+            builder, output_offset,
+            mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
+                                               -2));
+        Value high_lane = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ne,
+            mlir::arith::AndIOp::create(builder, output_offset, one),
+            mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
+                                               0));
+        Value pair_offset_i32 = mlir::arith::TruncIOp::create(
+            builder, builder.getI32Type(), pair_offset);
+        Value pair_offset_tuple = mlir::fly::MakeIntTupleOp::create(
+            builder, scatter_offset_type,
+            mlir::ValueRange{pair_offset_i32});
+        Value output_pointer =
+            kernel.getArgument(fusion.operand_count());
+        auto output_pointer_type = mlir::cast<mlir::fly::PointerType>(
+            output_pointer.getType());
+        auto output_memref_type = mlir::fly::MemRefType::get(
+            output_pointer_type.getElemTy(),
+            output_pointer_type.getAddressSpace(), layout_type.getAttr());
+        Value advanced_output = mlir::fly::AddOffsetOp::create(
+            builder, output_pointer_type, output_pointer, pair_offset_tuple);
+        Value output_view = mlir::fly::MakeViewOp::create(
+            builder, output_memref_type, advanced_output, vector_layout);
+        Value zero = mlir::arith::ConstantFloatOp::create(
+            builder, builder.getBF16Type(),
+            llvm::APFloat::getZero(llvm::APFloat::BFloat()));
+        auto pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
+        Value low_pair = mlir::vector::FromElementsOp::create(
+            builder, pair_type, mlir::ValueRange{scalar, zero});
+        Value high_pair = mlir::vector::FromElementsOp::create(
+            builder, pair_type, mlir::ValueRange{zero, scalar});
+        Value packed_value = mlir::arith::SelectOp::create(
+            builder, high_lane, high_pair, low_pair);
+        mlir::fly::CopyAtomCallSSA::create(
+            builder, mlir::TypeRange{}, scatter_packed_atomic_copy_atom,
+            packed_value, output_view, store_predicate);
+        return absl::OkStatus();
+      }
+      Value output_offset_i32 = mlir::arith::TruncIOp::create(
+          builder, builder.getI32Type(), output_offset);
+      Value output_offset_tuple = mlir::fly::MakeIntTupleOp::create(
+          builder, scatter_offset_type,
+          mlir::ValueRange{output_offset_i32});
+      Value output_pointer =
+          overwrite_row_scatter_->requires_atomic_operation
+              ? kernel.getArgument(fusion.operand_count())
+              : argument_pointers[fusion.operand_count()];
+      auto output_pointer_type =
+          mlir::cast<mlir::fly::PointerType>(output_pointer.getType());
+      auto scalar_layout_type = mlir::cast<mlir::fly::LayoutType>(
+          scatter_scalar_copies->layout.getType());
+      auto output_memref_type = mlir::fly::MemRefType::get(
+          output_pointer_type.getElemTy(), output_pointer_type.getAddressSpace(),
+          scalar_layout_type.getAttr());
+      Value advanced_output = mlir::fly::AddOffsetOp::create(
+          builder, output_pointer_type, output_pointer, output_offset_tuple);
+      Value output_view = mlir::fly::MakeViewOp::create(
+          builder, output_memref_type, advanced_output,
+          scatter_scalar_copies->layout);
+      auto scalar_vector_type = mlir::VectorType::get(
+          {1}, StorageElementType(element_type_, builder));
+      Value scalar_vector = mlir::vector::FromElementsOp::create(
+          builder, scalar_vector_type, mlir::ValueRange{scalar});
+      Value store_value =
+          overwrite_row_scatter_->requires_atomic_operation ? scalar
+                                                            : scalar_vector;
+      mlir::fly::CopyAtomCallSSA::create(
+          builder, mlir::TypeRange{},
+          overwrite_row_scatter_->requires_atomic_operation
+              ? scatter_atomic_copy_atom
+              : scatter_scalar_copies->copy_atoms.at(element_type_),
+          store_value,
+          output_view, store_predicate);
+      return absl::OkStatus();
+    };
 
     llvm::SmallVector<const HloInstruction*> striped_invariant_broadcasts;
-    if (vectors_per_thread_ > 1) {
+    if (vectors_per_thread_ > 1 && !overwrite_row_scatter_.has_value()) {
       for (const HloInstruction* instruction :
            fusion.fused_instructions_computation()->instructions()) {
         if (IsStripedLoopInvariantBroadcast(
@@ -5652,8 +6718,10 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       llvm::SmallVector<Value> results;
       results.reserve(output_count_);
       for (const HloInstruction* root : roots) {
+        const HloInstruction* expression =
+            overwrite_row_scatter_.has_value() ? root->operand(2) : root;
         TF_ASSIGN_OR_RETURN(Value result,
-                            EmitVector(builder, argument_pointers, root,
+                            EmitVector(builder, argument_pointers, expression,
                                        vector_offset, in_bounds, copy_atoms,
                                        vector_layout, vector_width_, cache));
         results.push_back(result);
@@ -5673,6 +6741,132 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
       for (auto [output_index, result] : llvm::enumerate(results)) {
         const PrimitiveType output_type =
             roots[output_index]->shape().element_type();
+        if (overwrite_row_scatter_.has_value()) {
+          TF_RET_CHECK(output_index == 0 && output_type == element_type_);
+          if (overwrite_row_scatter_->requires_atomic_operation) {
+            if (use_paired_bf16_scatter_add) {
+              TF_ASSIGN_OR_RETURN(
+                  llvm::SmallVector<Value> indices,
+                  emit_scatter_indices(vector_offset, in_bounds));
+              Value store_predicate = mlir::arith::AndIOp::create(
+                  builder, in_bounds, scatter_indices_are_valid(indices));
+              Value output_offset =
+                  scatter_output_offset(vector_offset, indices);
+              Value output_offset_i32 = mlir::arith::TruncIOp::create(
+                  builder, builder.getI32Type(), output_offset);
+              Value output_offset_tuple = mlir::fly::MakeIntTupleOp::create(
+                  builder, scatter_offset_type,
+                  mlir::ValueRange{output_offset_i32});
+              Value output_pointer =
+                  kernel.getArgument(fusion.operand_count());
+              auto output_pointer_type =
+                  mlir::cast<mlir::fly::PointerType>(
+                      output_pointer.getType());
+              auto output_memref_type = mlir::fly::MemRefType::get(
+                  output_pointer_type.getElemTy(),
+                  output_pointer_type.getAddressSpace(),
+                  layout_type.getAttr());
+              Value advanced_output = mlir::fly::AddOffsetOp::create(
+                  builder, output_pointer_type, output_pointer,
+                  output_offset_tuple);
+              Value output_view = mlir::fly::MakeViewOp::create(
+                  builder, output_memref_type, advanced_output,
+                  vector_layout);
+              mlir::fly::CopyAtomCallSSA::create(
+                  builder, mlir::TypeRange{},
+                  scatter_packed_atomic_copy_atom, result, output_view,
+                  store_predicate);
+              continue;
+            }
+            for (int64_t lane = 0; lane < vector_width_; ++lane) {
+              Value lane_offset = vector_offset;
+              if (lane != 0) {
+                lane_offset = mlir::arith::AddIOp::create(
+                    builder, vector_offset,
+                    mlir::arith::ConstantIntOp::create(
+                        builder, builder.getI64Type(), lane));
+              }
+              Value lane_value =
+                  mlir::vector::ExtractOp::create(builder, result, lane);
+              RETURN_IF_ERROR(emit_scalar_scatter_store(
+                  lane_value, lane_offset, in_bounds));
+            }
+            continue;
+          }
+          Value column = mlir::arith::RemUIOp::create(
+              builder, vector_offset,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(),
+                  overwrite_row_scatter_->row_elements));
+          Value vector_end = mlir::arith::AddIOp::create(
+              builder, column,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(), vector_width_));
+          Value fits_in_row = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ule, vector_end,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI64Type(),
+                  overwrite_row_scatter_->row_elements));
+          TF_ASSIGN_OR_RETURN(llvm::SmallVector<Value> indices,
+                              emit_scatter_indices(vector_offset, in_bounds));
+          Value vector_store_predicate = mlir::arith::AndIOp::create(
+              builder, in_bounds,
+              mlir::arith::AndIOp::create(
+                  builder, fits_in_row,
+                  scatter_indices_are_valid(indices)));
+          Value output_offset = scatter_output_offset(vector_offset, indices);
+          Value output_offset_i32 = mlir::arith::TruncIOp::create(
+              builder, builder.getI32Type(), output_offset);
+          Value output_offset_tuple = mlir::fly::MakeIntTupleOp::create(
+              builder, scatter_offset_type,
+              mlir::ValueRange{output_offset_i32});
+          Value output_pointer =
+              argument_pointers[fusion.operand_count()];
+          auto output_pointer_type =
+              mlir::cast<mlir::fly::PointerType>(output_pointer.getType());
+          auto output_memref_type = mlir::fly::MemRefType::get(
+              output_pointer_type.getElemTy(),
+              output_pointer_type.getAddressSpace(), layout_type.getAttr());
+          Value advanced_output = mlir::fly::AddOffsetOp::create(
+              builder, output_pointer_type, output_pointer,
+              output_offset_tuple);
+          Value output_view = mlir::fly::MakeViewOp::create(
+              builder, output_memref_type, advanced_output, vector_layout);
+          mlir::fly::CopyAtomCallSSA::create(
+              builder, mlir::TypeRange{}, copy_atoms.at(output_type), result,
+              output_view, vector_store_predicate);
+
+          Value crosses_row = mlir::arith::XOrIOp::create(
+              builder, fits_in_row,
+              mlir::arith::ConstantIntOp::create(
+                  builder, builder.getI1Type(), 1));
+          Value needs_scalar_store = mlir::arith::AndIOp::create(
+              builder, in_bounds, crosses_row);
+          mlir::scf::IfOp boundary = mlir::scf::IfOp::create(
+              builder, mlir::TypeRange{}, needs_scalar_store,
+              /*withElseRegion=*/false);
+          {
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(boundary.thenBlock());
+            Value true_predicate = mlir::arith::ConstantIntOp::create(
+                builder, builder.getI1Type(), 1);
+            for (int64_t lane = 0; lane < vector_width_; ++lane) {
+              Value lane_offset = vector_offset;
+              if (lane != 0) {
+                lane_offset = mlir::arith::AddIOp::create(
+                    builder, vector_offset,
+                    mlir::arith::ConstantIntOp::create(
+                        builder, builder.getI64Type(), lane));
+              }
+              Value lane_value =
+                  mlir::vector::ExtractOp::create(builder, result, lane);
+              RETURN_IF_ERROR(emit_scalar_scatter_store(
+                  lane_value, lane_offset, true_predicate));
+            }
+          }
+          builder.setInsertionPointAfter(boundary);
+          continue;
+        }
         if (output_type == S4) {
           result = PackS4Values(builder, result);
           Value one = mlir::arith::ConstantIntOp::create(
@@ -5898,9 +7092,11 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         llvm::SmallVector<Value> results;
         results.reserve(output_count_);
         for (const HloInstruction* root : roots) {
+          const HloInstruction* expression =
+              overwrite_row_scatter_.has_value() ? root->operand(2) : root;
           TF_ASSIGN_OR_RETURN(
               Value result,
-              EmitVector(builder, argument_pointers, root, tail_offset,
+              EmitVector(builder, argument_pointers, expression, tail_offset,
                          true_predicate, scalar_copy_atoms, scalar_layout,
                          /*vector_width=*/1, cache));
           results.push_back(result);
@@ -5917,6 +7113,14 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         for (auto [output_index, result] : llvm::enumerate(results)) {
           const PrimitiveType output_type =
               roots[output_index]->shape().element_type();
+          if (overwrite_row_scatter_.has_value()) {
+            TF_RET_CHECK(output_index == 0 && output_type == element_type_);
+            Value scalar =
+                mlir::vector::ExtractOp::create(builder, result, 0);
+            RETURN_IF_ERROR(emit_scalar_scatter_store(
+                scalar, tail_offset, true_predicate));
+            continue;
+          }
           if (output_type == PRED) {
             auto predicate_type =
                 mlir::cast<mlir::VectorType>(result.getType());
@@ -5951,11 +7155,13 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
   int64_t elements_ = 0;
   PrimitiveType element_type_ = PRIMITIVE_TYPE_INVALID;
   int64_t output_count_ = 0;
+  std::vector<int64_t> scalar_index_parameter_numbers_;
   int64_t vector_size_bits_ = 0;
   int64_t vector_width_ = 0;
   int64_t vectors_per_thread_ = 1;
   int64_t threads_ = 0;
   std::optional<StridedReductionDescriptor> cooperative_strided_reduction_;
+  std::optional<OverwriteRowScatter> overwrite_row_scatter_;
   bool s4_may_start_odd_ = false;
   int32_t cache_modifier_ = 0;
   LaunchDimensions launch_dimensions_;
@@ -5967,6 +7173,20 @@ bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis) {
   if (analysis.fusion_root_count() == 0) {
     return false;
   }
+  if (analysis.fusion_root_count() == 1) {
+    const HloInstruction* root =
+        &analysis.fusion_root(0).instruction();
+    if (GetOverwriteRowScatter(root).has_value()) {
+      absl::flat_hash_set<const HloInstruction*> visited;
+      if (!IsSupportedElementwiseGraph(root->operand(1),
+                                       root->operand(1)->shape(), visited)) {
+        return false;
+      }
+      visited.clear();
+      return IsSupportedElementwiseGraph(root->operand(2),
+                                         root->operand(2)->shape(), visited);
+    }
+  }
   const Shape& output_shape = analysis.fusion_root(0).shape();
   if (!output_shape.IsArray() || !output_shape.has_layout() ||
       !IsSupportedValueType(output_shape.element_type())) {
@@ -5977,22 +7197,62 @@ bool IsFlyXTileElementwiseFusion(const HloFusionAnalysis& analysis) {
                            std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-  absl::flat_hash_set<const HloInstruction*> visited;
   for (int64_t root_index = 0; root_index < analysis.fusion_root_count();
        ++root_index) {
     const HloInstruction& root = analysis.fusion_root(root_index).instruction();
-    if (root.shape().element_type() != output_shape.element_type() ||
-        !HasSamePhysicalDimensions(root.shape(), output_shape) ||
-        !IsSupportedElementwiseGraph(&root, output_shape, visited)) {
+    if (!root.shape().IsArray() || !root.shape().has_layout() ||
+        !IsSupportedValueType(root.shape().element_type()) ||
+        ((root.shape().element_type() == S4) !=
+         (output_shape.element_type() == S4)) ||
+        ShapeUtil::ElementsIn(root.shape()) != elements) {
+      return false;
+    }
+    // Every output traverses the same physical flat launch domain, but it may
+    // expose that storage through a different logical bitcast view. Validate
+    // each graph against its own root shape: carrying one visited set across
+    // roots would incorrectly reuse a proof made under another logical view.
+    absl::flat_hash_set<const HloInstruction*> visited;
+    if (!IsSupportedElementwiseGraph(&root, root.shape(), visited)) {
       return false;
     }
   }
   return HasSupportedS4InputGraph(analysis);
 }
 
+bool IsFlyXTileOverwriteRowScatterFusion(
+    const HloFusionAnalysis& analysis) {
+  return analysis.fusion_root_count() == 1 &&
+         GetOverwriteRowScatter(&analysis.fusion_root(0).instruction())
+             .has_value();
+}
+
+bool IsFlyXTileAtomicOverwriteRowScatterFusion(
+    const HloFusionAnalysis& analysis) {
+  if (analysis.fusion_root_count() != 1) {
+    return false;
+  }
+  std::optional<OverwriteRowScatter> scatter = GetOverwriteRowScatter(
+      &analysis.fusion_root(0).instruction());
+  return scatter.has_value() && scatter->requires_atomic_operation;
+}
+
+int64_t GetFlyXTileElementwiseElementCount(
+    const HloFusionAnalysis& analysis) {
+  if (analysis.fusion_root_count() == 1) {
+    if (std::optional<OverwriteRowScatter> scatter = GetOverwriteRowScatter(
+            &analysis.fusion_root(0).instruction())) {
+      return scatter->update_rows * scatter->row_elements;
+    }
+  }
+  return ShapeUtil::ElementsIn(analysis.first_result_shape());
+}
+
 bool IsFlyXTileIndexedFusion(const HloFusionAnalysis& analysis) {
   if (!IsFlyXTileElementwiseFusion(analysis)) {
     return false;
+  }
+  if (IsFlyXTileOverwriteRowScatterFusion(analysis)) {
+    return true;
   }
   absl::flat_hash_set<const HloInstruction*> visited;
   std::function<bool(const HloInstruction*)> contains_indexed_op =
@@ -6004,6 +7264,7 @@ bool IsFlyXTileIndexedFusion(const HloFusionAnalysis& analysis) {
             instruction->opcode() == HloOpcode::kSlice ||
             instruction->opcode() == HloOpcode::kDynamicSlice ||
             instruction->opcode() == HloOpcode::kDynamicUpdateSlice ||
+            instruction->opcode() == HloOpcode::kGather ||
             instruction->opcode() == HloOpcode::kReverse ||
             instruction->opcode() == HloOpcode::kPad ||
             instruction->opcode() == HloOpcode::kReduceWindow ||
@@ -6025,6 +7286,11 @@ bool IsFlyXTileIndexedFusion(const HloFusionAnalysis& analysis) {
     }
   }
   return false;
+}
+
+std::vector<int64_t> GetFlyXTileScalarIndexParameterNumbers(
+    const HloFusionAnalysis& analysis) {
+  return ScalarIndexParameterNumbers(analysis.fusion());
 }
 
 FlyXTileMemoryPolicy GetFlyXTileMemoryPolicy(

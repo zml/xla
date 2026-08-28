@@ -68,6 +68,147 @@ ENTRY main {
 )"));
 }
 
+TEST_F(FlyXTileReductionTest, RecognizesRowReductionWithExtraOutput) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule native_f32_row_reduction_extra_output
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  absolute = f32[128,512]{1,0} abs(p0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(absolute, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128,512]{1,0})
+    tuple(row_max, absolute)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128,512]{1,0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesReductionWithDependentRowwiseOutput) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule reduction_dependent_rowwise_output
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  squared = f32[128,512]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  epsilon = f32[] constant(1e-6)
+  epsilons = f32[128]{0} broadcast(epsilon), dimensions={}
+  variance = f32[128]{0} add(row_sum, epsilons)
+  scale = f32[128]{0} rsqrt(variance)
+  scales = f32[128,512]{1,0} broadcast(scale), dimensions={0}
+  normalized = f32[128,512]{1,0} multiply(p0, scales)
+  negative_sum = f32[128]{0} negate(row_sum)
+  ROOT result = (f32[128,512]{1,0}, f32[128]{0})
+    tuple(normalized, negative_sum)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128,512]{1,0}, f32[128]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesTwoIndependentRowReductions) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule two_independent_row_reductions
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128]{0}) tuple(row_sum, row_max)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesMultipleRowReductionsWithExtraOutput) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule multiple_row_reductions_extra_output
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  absolute = f32[128,512]{1,0} abs(p0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(absolute, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    tuple(row_sum, row_max, absolute)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+}
+
 TEST_F(FlyXTileReductionTest, RecognizesDynamicInitRowReduction) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_f32_dynamic_init_row_reduction

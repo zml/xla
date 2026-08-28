@@ -79,6 +79,7 @@ std::unique_ptr<HloPassPipeline> GetGemmRewriterPipeline(
 std::unique_ptr<HloPassPipeline> GetFlyFissionPipeline() {
   auto pipeline =
       std::make_unique<HloPassPipeline>("fly_fission_rewriter_pipeline");
+  pipeline->AddPass(std::make_unique<DotAlgorithmRewriter>());
   pipeline->AddPass(std::make_unique<ScaledDotRewriter>());
   pipeline->AddPass(std::make_unique<FlyGemmFissionRewriter>());
   return pipeline;

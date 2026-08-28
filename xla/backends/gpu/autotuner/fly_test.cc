@@ -1017,7 +1017,7 @@ ENTRY main {
 }
 
 TEST_F(FlyFusionBackendTest,
-       StrictReplacementRejectsNonNativeMixedOutputReduction) {
+       StrictReplacementAcceptsNativeMixedOutputLeadingReduction) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_non_native_mixed_output_reduction
 
@@ -1052,7 +1052,12 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(
                            *module->entry_computation()->root_instruction()));
-  EXPECT_TRUE(configs.empty());
+  ASSERT_FALSE(configs.empty());
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
 }
 
 TEST_F(FlyFusionBackendTest, TunesNativeScanWavePackingAndOccupancy) {
@@ -1913,6 +1918,148 @@ ENTRY main {
   }));
   EXPECT_EQ(configs.front()->block_level().num_warps(), 8);
   EXPECT_EQ(configs.front()->block_level().output_tiles(0).sizes(0), 4);
+}
+
+TEST_F(FlyFusionBackendTest, TunesNativeRowGather) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_row_gather
+
+elementwise {
+  values = bf16[127,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  gathered = bf16[191,1,259]{2,1,0} gather(values, indices),
+    offset_dims={1,2}, collapsed_slice_dims={}, start_index_map={0},
+    index_vector_dim=1, slice_sizes={1,259}
+  ROOT result = bf16[191,1,259]{2,1,0} negate(gathered)
+}
+
+ENTRY main {
+  values = bf16[127,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  ROOT fusion = bf16[191,1,259]{2,1,0} fusion(values, indices),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 64;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 128;
+  }));
+  EXPECT_EQ(configs.front()->block_level().num_warps(), 8);
+  EXPECT_EQ(configs.front()->block_level().output_tiles(0).sizes(0), 8);
+  EXPECT_EQ(configs.front()->block_level().vector_size_bits(), 128);
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+}
+
+TEST_F(FlyFusionBackendTest, TunesNativeOverwriteRowScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = bf16[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 64;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 128;
+  }));
+  EXPECT_EQ(configs.front()->block_level().num_warps(), 8);
+  EXPECT_EQ(configs.front()->block_level().output_tiles(0).sizes(0), 1);
+  EXPECT_EQ(configs.front()->block_level().vector_size_bits(), 128);
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+}
+
+TEST_F(FlyFusionBackendTest, TunesNativeAtomicOverwriteRowScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule native_fly_atomic_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = bf16[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 32;
+  }));
+  EXPECT_EQ(configs.front()->block_level().num_warps(), 8);
+  EXPECT_EQ(configs.front()->block_level().output_tiles(0).sizes(0), 8);
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
 }
 
 TEST_F(FlyFusionBackendTest, TunesNativeTrailingBroadcast) {
@@ -2797,6 +2944,41 @@ ENTRY main {
   EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
 }
 
+TEST_F(FlyFusionBackendTest, LimitsVectorWidthForMixedTypeMultiOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule mixed_type_multi_output_vector_width
+
+elementwise {
+  p0 = bf16[128,192]{1,0} parameter(0)
+  widened = f64[128,192]{1,0} convert(p0)
+  ROOT tuple = (bf16[128,192]{1,0}, f64[128,192]{1,0})
+    tuple(p0, widened)
+}
+
+ENTRY main {
+  p0 = bf16[128,192]{1,0} parameter(0)
+  ROOT fusion = (bf16[128,192]{1,0}, f64[128,192]{1,0})
+    fusion(p0), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"2","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"32"}}}
+})";
+
+  debug_options_.set_xla_gpu_fusion_autotune_top_k_configs(8);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+
+  ASSERT_EQ(configs.size(), 8);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().vector_size_bits() == 32;
+  }));
+}
+
 TEST_F(FlyFusionBackendTest, RetilesGenericTritonReductionFusion) {
   constexpr absl::string_view kHlo = R"(
 HloModule generic_triton_reduction
@@ -2870,6 +3052,216 @@ ENTRY main {
                        backend_.GetSupportedConfigs(*fusion));
 
   EXPECT_EQ(configs.size(), 10);
+}
+
+TEST_F(FlyFusionBackendTest, TunesRowReductionWithExtraOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule row_reduction_extra_output_autotune
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  absolute = f32[128,512]{1,0} abs(p0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(absolute, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128,512]{1,0})
+    tuple(row_max, absolute)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128,512]{1,0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64"]},{"sizes":["64","512"]}],
+        "num_warps":"2","num_ctas":1,"num_stages":1}}}
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 10);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().output_tiles_size() == 1 &&
+           c->block_level().output_tiles(0).sizes(0) == 1;
+  }));
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+}
+
+TEST_F(FlyFusionBackendTest, TunesReductionWithDependentRowwiseOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule reduction_dependent_rowwise_output_autotune
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  squared = f32[128,512]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  epsilon = f32[] constant(1e-6)
+  epsilons = f32[128]{0} broadcast(epsilon), dimensions={}
+  variance = f32[128]{0} add(row_sum, epsilons)
+  scale = f32[128]{0} rsqrt(variance)
+  scales = f32[128,512]{1,0} broadcast(scale), dimensions={0}
+  normalized = f32[128,512]{1,0} multiply(p0, scales)
+  negative_sum = f32[128]{0} negate(row_sum)
+  ROOT result = (f32[128,512]{1,0}, f32[128]{0})
+    tuple(normalized, negative_sum)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128,512]{1,0}, f32[128]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64","512"]},{"sizes":["64"]}],
+        "num_warps":"2","num_ctas":1,"num_stages":1}}}
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 10);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().output_tiles_size() == 1 &&
+           c->block_level().output_tiles(0).sizes(0) == 1;
+  }));
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+}
+
+TEST_F(FlyFusionBackendTest, TunesMultipleRowReductions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule multiple_row_reductions_autotune
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+  squared = f32[128,512]{1,0} multiply(p0, p0)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(squared, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128]{0}) tuple(row_sum, row_max)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64"]},{"sizes":["64"]}],
+        "num_warps":"2","num_ctas":1,"num_stages":1}}}
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 10);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().output_tiles_size() == 1 &&
+           c->block_level().output_tiles(0).sizes(0) == 1;
+  }));
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
+}
+
+TEST_F(FlyFusionBackendTest, TunesMultipleRowReductionsWithExtraOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule multiple_row_reductions_extra_output_autotune
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  absolute = f32[128,512]{1,0} abs(p0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(absolute, minus_inf), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    tuple(row_sum, row_max, absolute)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64"]},{"sizes":["64"]},
+                        {"sizes":["64","512"]}],
+        "num_warps":"2","num_ctas":1,"num_stages":1}}}
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 10);
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->block_level().output_tiles_size() == 1 &&
+           c->block_level().output_tiles(0).sizes(0) == 1;
+  }));
+  ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly");
 }
 
 TEST_F(FlyFusionBackendTest, UsesWideCopiesWithTailForRaggedBf16Reduction) {
@@ -3432,6 +3824,116 @@ ENTRY main {
       }));
 }
 
+TEST_F(FlyBackendTest, RejectsDotAlgorithmsThatRequireFission) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_x3_algorithm
+
+gemm {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT dot = f32[128,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      algorithm=dot_bf16_bf16_f32_x3
+}
+
+ENTRY main {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT fusion = f32[128,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+
+  EXPECT_TRUE(configs.empty());
+}
+
+TEST_F(FlyBackendTest, ExplicitTf32AlgorithmOnlyOffersXf32Mfma) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_tf32_algorithm
+
+gemm {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT dot = f32[128,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      algorithm=dot_tf32_tf32_f32
+}
+
+ENTRY main {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT fusion = f32[128,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->fly().mfma_atom() ==
+           FlyGemmConfig::FLY_MFMA_32X32X4_XF32;
+  }));
+}
+
+TEST_F(FlyBackendTest, Tf32X3UsesNativeFullPrecisionF32MfmaOnRocm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_tf32_x3_algorithm
+
+gemm {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT dot = f32[128,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0},
+      algorithm=dot_tf32_tf32_f32_x3
+}
+
+ENTRY main {
+  lhs = f32[128,128]{1,0} parameter(0)
+  rhs = f32[128,128]{0,1} parameter(1)
+  ROOT fusion = f32[128,128]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X4_F32 ||
+           c->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X2_F32;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const FlyGemmConfig& fly = c->fly();
+    return fly.block_m() == 128 && fly.block_n() == 128 &&
+           fly.block_k() == 32 && fly.num_warps() == 8 && fly.stage_rhs() &&
+           !fly.schedule_instructions() && fly.preload_lds_fragments() &&
+           fly.single_buffer_lds() &&
+           fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X2_F32;
+  }));
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const FlyGemmConfig& fly = c->fly();
+    return fly.block_m() == 128 && fly.block_n() == 128 &&
+           fly.block_k() == 64 && fly.num_warps() == 4 && fly.stage_rhs() &&
+           fly.preload_lds_fragments() && fly.single_buffer_lds() &&
+           fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X2_F32;
+  }));
+}
+
 TEST_F(FlyBackendTest, SupportsF16GemmWithOptimizedXTilePipelines) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnVerifiedModule(kF16DotHlo));
@@ -3802,6 +4304,45 @@ ENTRY main {
   TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                           fusion->backend_config<GpuBackendConfig>());
   EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+}
+
+TEST_F(FlyBackendTest, SupportsPackedAttentionScoreSlices) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_packed_attention_score_slices
+
+gemm {
+  packed = bf16[3,4,32,1,64]{4,3,2,1,0} parameter(0)
+  q_slice = bf16[1,4,32,1,64]{4,3,2,1,0} slice(packed),
+      slice={[0:1], [0:4], [0:32], [0:1], [0:64]}
+  q = bf16[4,32,64]{2,1,0} bitcast(q_slice)
+  k_slice = bf16[1,4,32,1,64]{4,3,2,1,0} slice(packed),
+      slice={[1:2], [0:4], [0:32], [0:1], [0:64]}
+  k = bf16[4,32,64]{2,1,0} bitcast(k_slice)
+  dot = bf16[4,64,64]{2,1,0} dot(q, k),
+      lhs_batch_dims={0}, lhs_contracting_dims={1},
+      rhs_batch_dims={0}, rhs_contracting_dims={1}
+  converted = f32[4,64,64]{2,1,0} convert(dot)
+  scale = bf16[] constant(0.125)
+  broadcast = bf16[4,64,64]{2,1,0} broadcast(scale), dimensions={}
+  widened_scale = f32[4,64,64]{2,1,0} convert(broadcast)
+  scaled = f32[4,64,64]{2,1,0} multiply(converted, widened_scale)
+  ROOT narrowed = bf16[4,64,64]{2,1,0} convert(scaled)
+}
+
+ENTRY main {
+  packed = bf16[3,4,32,1,64]{4,3,2,1,0} parameter(0)
+  ROOT fusion = bf16[4,64,64]{2,1,0} fusion(packed), kind=kCustom,
+      calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  EXPECT_FALSE(configs.empty());
 }
 
 TEST_F(FlyBackendTest, TunesShortKWorkgroupMapping) {
@@ -4351,6 +4892,38 @@ ENTRY main {
                fly.stage_rhs() && fly.preload_lds_fragments() &&
                fly.single_buffer_lds();
       }));
+}
+
+TEST_F(FlyBackendTest, SupportsShortKMiddleBatchDimension) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_short_k_middle_batch
+
+gemm {
+  lhs = bf16[256,4,128]{2,1,0} parameter(0)
+  rhs = bf16[4,128,384]{2,1,0} parameter(1)
+  ROOT dot = f32[4,256,384]{2,1,0} dot(lhs, rhs),
+      lhs_batch_dims={1}, rhs_batch_dims={0},
+      lhs_contracting_dims={2}, rhs_contracting_dims={1}
+}
+
+ENTRY main {
+  lhs = bf16[256,4,128]{2,1,0} parameter(0)
+  rhs = bf16[4,128,384]{2,1,0} parameter(1)
+  ROOT fusion = f32[4,256,384]{2,1,0} fusion(lhs, rhs), kind=kCustom,
+      calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+
+  EXPECT_FALSE(configs.empty());
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->fly().block_k() <= 128 && !c->fly().stage_rhs();
+  }));
 }
 
 TEST_F(FlyBackendTest, SupportsBatchedBf16Gemv) {

@@ -141,7 +141,13 @@ const HloInstruction* GetStableSoftmaxF32Input(const HloInstruction& root) {
   return input;
 }
 
-std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
+struct ExternalRowSoftmaxInputs {
+  const HloInstruction* input;
+  const HloInstruction* row_offset;
+  bool recompute_maximum;
+};
+
+std::optional<ExternalRowSoftmaxInputs>
 GetExternalRowSoftmaxF32Inputs(const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
   if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
@@ -171,14 +177,19 @@ GetExternalRowSoftmaxF32Inputs(const HloInstruction& root) {
       !IsScalarConstant(sum_reduction->operand(1), 0.0)) {
     return std::nullopt;
   }
-  const HloInstruction* shifted = exponential->operand(0);
-  if (shifted->opcode() != HloOpcode::kSubtract ||
-      shifted->operand_count() != 2) {
+  const HloInstruction* pre_shift = exponential->operand(0);
+  bool recompute_maximum = false;
+  if (const HloInstruction* stabilized_input = StableShiftInput(pre_shift)) {
+    pre_shift = stabilized_input;
+    recompute_maximum = true;
+  }
+  if (pre_shift->opcode() != HloOpcode::kSubtract ||
+      pre_shift->operand_count() != 2) {
     return std::nullopt;
   }
-  const HloInstruction* input = shifted->operand(0);
+  const HloInstruction* input = pre_shift->operand(0);
   const HloInstruction* row_offset =
-      BroadcastOperand(shifted->operand(1), input->shape());
+      BroadcastOperand(pre_shift->operand(1), input->shape());
   const int64_t input_rank = input->shape().dimensions_size();
   if (row_offset == nullptr || row_offset->opcode() != HloOpcode::kParameter ||
       row_offset->shape().element_type() != F32 || input_rank < 2 ||
@@ -187,7 +198,7 @@ GetExternalRowSoftmaxF32Inputs(const HloInstruction& root) {
           ShapeUtil::DeleteDimension(input_rank - 1, input->shape()))) {
     return std::nullopt;
   }
-  return std::pair(input, row_offset);
+  return ExternalRowSoftmaxInputs{input, row_offset, recompute_maximum};
 }
 
 bool HasCompatibleSoftmaxShape(const HloInstruction& root,
@@ -211,12 +222,11 @@ bool HasCompatibleSoftmaxShape(const HloInstruction& root,
 
 const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
-  const HloInstruction* converted = GetStableSoftmaxF32Input(root);
-  if (converted == nullptr) {
-    std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
-        external = GetExternalRowSoftmaxF32Inputs(root);
-    converted = external.has_value() ? external->first : nullptr;
-  }
+  std::optional<ExternalRowSoftmaxInputs> external =
+      GetExternalRowSoftmaxF32Inputs(root);
+  const HloInstruction* converted = external.has_value()
+                                        ? external->input
+                                        : GetStableSoftmaxF32Input(root);
   if (converted == nullptr) {
     return nullptr;
   }
@@ -247,9 +257,16 @@ const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
 
 const HloInstruction* GetFlySoftmaxExternalRowOffset(
     const HloInstruction& root) {
-  std::optional<std::pair<const HloInstruction*, const HloInstruction*>>
+  std::optional<ExternalRowSoftmaxInputs>
       external = GetExternalRowSoftmaxF32Inputs(root);
-  return external.has_value() ? external->second : nullptr;
+  return external.has_value() ? external->row_offset : nullptr;
+}
+
+bool FlySoftmaxRecomputesMaximumAfterExternalRowOffset(
+    const HloInstruction& root) {
+  std::optional<ExternalRowSoftmaxInputs> external =
+      GetExternalRowSoftmaxF32Inputs(root);
+  return external.has_value() && external->recompute_maximum;
 }
 
 const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root) {

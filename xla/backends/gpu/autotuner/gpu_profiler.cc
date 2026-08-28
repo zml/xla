@@ -18,8 +18,10 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -40,7 +42,9 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/executable_run_options.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/buffer_assignment.h"
@@ -140,6 +144,33 @@ static absl::Status InitializeInputBuffer(GpuInputBuffers& gpu_buffers,
   return absl::OkStatus();
 }
 
+bool IsAddScatterCombiner(const HloInstruction* root) {
+  while (root != nullptr && root->opcode() == HloOpcode::kConvert &&
+         root->operand_count() == 1) {
+    root = root->operand(0);
+  }
+  if (root == nullptr || root->opcode() != HloOpcode::kAdd ||
+      root->operand_count() != 2) {
+    return false;
+  }
+  auto parameter_number_through_converts =
+      [](const HloInstruction* value) -> std::optional<int64_t> {
+    while (value->opcode() == HloOpcode::kConvert &&
+           value->operand_count() == 1) {
+      value = value->operand(0);
+    }
+    if (value->opcode() != HloOpcode::kParameter) {
+      return std::nullopt;
+    }
+    return value->parameter_number();
+  };
+  std::optional<int64_t> lhs =
+      parameter_number_through_converts(root->operand(0));
+  std::optional<int64_t> rhs =
+      parameter_number_through_converts(root->operand(1));
+  return lhs.has_value() && rhs.has_value() && *lhs != *rhs;
+}
+
 // Initialize input buffers based on the operation type.
 // This function examines the HLO instruction and initializes
 // specific input buffers based on the operation's requirements.
@@ -148,6 +179,69 @@ static absl::Status InitializeBuffersIfRequiredByOpcode(
     se::Stream* stream) {
   if (instr == nullptr) {
     return absl::OkStatus();
+  }
+
+  // A non-unique overwrite scatter can legally choose any colliding update,
+  // while an additive scatter mutates its aliased base on every repetition.
+  // Zero every fusion parameter feeding update expressions that the autotune
+  // eligibility gate has proved uniform (overwrite) or zero-preserving (add).
+  // The atomic operations still execute with the original index distribution
+  // and contention, but candidate outputs and repetitions become idempotent.
+  if (instr->opcode() == HloOpcode::kFusion) {
+    const HloInstruction* root = instr->fused_expression_root();
+    if (root != nullptr && root->opcode() == HloOpcode::kScatter &&
+        root->operand_count() == 3) {
+      const HloScatterInstruction* scatter =
+          Cast<const HloScatterInstruction>(root);
+      const HloComputation* update = scatter->to_apply();
+      const HloInstruction* update_root =
+          update == nullptr ? nullptr : update->root_instruction();
+      const bool is_overwrite =
+          update_root != nullptr &&
+          update_root->opcode() == HloOpcode::kParameter &&
+          update_root->parameter_number() == 1;
+      const bool is_add = IsAddScatterCombiner(update_root);
+      const bool requires_zero_updates =
+          scatter->scatter_operand_count() == 1 && update != nullptr &&
+          update->num_parameters() == 2 &&
+          ((is_overwrite && !scatter->unique_indices()) || is_add);
+      if (requires_zero_updates) {
+        absl::flat_hash_set<const HloInstruction*> visited;
+        absl::flat_hash_set<int64_t> update_parameters;
+        std::function<void(const HloInstruction*)> collect_parameters =
+            [&](const HloInstruction* instruction) {
+              if (!visited.insert(instruction).second) {
+                return;
+              }
+              if (instruction->opcode() == HloOpcode::kParameter) {
+                update_parameters.insert(instruction->parameter_number());
+                return;
+              }
+              for (const HloInstruction* operand : instruction->operands()) {
+                collect_parameters(operand);
+              }
+            };
+        collect_parameters(root->operand(2));
+        for (int64_t parameter_number : update_parameters) {
+          if (parameter_number < 0 ||
+              parameter_number >=
+                  gpu_buffers.redzone_buffers.input_buffers().size()) {
+            return absl::InvalidArgumentError(absl::StrFormat(
+                "Invalid atomic scatter update parameter %d.",
+                parameter_number));
+          }
+          se::DeviceAddressBase buffer =
+              gpu_buffers.redzone_buffers.input_buffers()[parameter_number];
+          RETURN_IF_ERROR(stream->MemZero(
+              &buffer, ShapeUtil::ByteSizeOfElements(
+                           instr->operand(parameter_number)->shape())));
+        }
+        RETURN_IF_ERROR(stream->BlockHostUntilDone());
+        VLOG(3) << "Zeroed " << update_parameters.size()
+                << " atomic-scatter update inputs for deterministic, "
+                   "idempotent autotuning.";
+      }
+    }
   }
 
   // Handle group-gemm operations

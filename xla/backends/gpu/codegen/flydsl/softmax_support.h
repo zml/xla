@@ -33,6 +33,13 @@ const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root);
 const HloInstruction* GetFlySoftmaxExternalRowOffset(
     const HloInstruction& root);
 
+// Returns true when the external row value is subtracted before a second,
+// internal row-maximum reduction. This is the form XLA emits for an explicitly
+// stabilized tensor passed to softmax; unlike the direct external-maximum form,
+// the native kernel must retain both subtractions.
+bool FlySoftmaxRecomputesMaximumAfterExternalRowOffset(
+    const HloInstruction& root);
+
 // Like GetFlySoftmaxInput, but retains a mixed-precision F32 producer when the
 // softmax result is narrowed to F16/BF16. Compound attention uses this to see
 // canonical select(-inf) masks instead of treating them as external inputs.

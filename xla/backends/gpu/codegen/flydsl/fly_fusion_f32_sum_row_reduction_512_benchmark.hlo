@@ -1,0 +1,21 @@
+HloModule fly_fusion_f32_sum_row_reduction_512_benchmark
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[262144,512]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT row_sum = f32[262144]{0} reduce(p0, zero), dimensions={1},
+    to_apply=add
+}
+
+ENTRY main {
+  p0 = f32[262144,512]{1,0} parameter(0)
+  ROOT fusion = f32[262144]{0}
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["64"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}

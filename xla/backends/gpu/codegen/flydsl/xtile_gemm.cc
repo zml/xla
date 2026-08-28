@@ -62,6 +62,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
@@ -451,6 +452,8 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
   bool has_input_view = false;
   bool requires_linear_addressing = false;
   bool physical_mapping_fixed = false;
+  bool physical_mapping_from_bitcast = false;
+  bool has_static_slice = false;
   bool has_dynamic_slice = false;
   int64_t physical_offset = 0;
   std::vector<int64_t> logical_offsets(input.shape().dimensions_size(), 0);
@@ -483,6 +486,7 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
             logical_offsets[dimension] * physical_strides[dimension];
       }
       physical_mapping_fixed = true;
+      physical_mapping_from_bitcast = false;
       has_input_view = true;
       requires_linear_addressing = true;
     } else if (value->opcode() == HloOpcode::kBitcast) {
@@ -495,6 +499,7 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
               logical_offsets[dimension] * physical_strides[dimension];
         }
         physical_mapping_fixed = true;
+        physical_mapping_from_bitcast = true;
       }
       has_input_view = true;
       requires_linear_addressing = true;
@@ -504,15 +509,32 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
       CHECK(ShapeUtil::SameDimensions(value->shape(), operand->shape()));
       has_conversion = true;
     } else if (value->opcode() == HloOpcode::kSlice) {
-      CHECK(!physical_mapping_fixed);
       CHECK_EQ(value->shape().dimensions_size(),
                operand->shape().dimensions_size());
-      for (int64_t dimension = 0; dimension < logical_offsets.size();
-           ++dimension) {
-        CHECK_EQ(value->slice_strides(dimension), 1);
-        logical_offsets[dimension] += value->slice_starts(dimension);
+      CHECK(std::all_of(value->slice_strides().begin(),
+                        value->slice_strides().end(),
+                        [](int64_t stride) { return stride == 1; }));
+      if (physical_mapping_fixed) {
+        CHECK(physical_mapping_from_bitcast);
+        CHECK(!has_static_slice);
+        CHECK(IsContiguousSlice(*value));
+        CHECK_EQ(ShapeUtil::ElementsIn(value->shape()),
+                 ShapeUtil::ElementsIn(input.shape()));
+        std::vector<int64_t> operand_strides =
+            PhysicalStrides(operand->shape());
+        for (int64_t dimension = 0;
+             dimension < value->shape().dimensions_size(); ++dimension) {
+          physical_offset +=
+              value->slice_starts(dimension) * operand_strides[dimension];
+        }
+      } else {
+        for (int64_t dimension = 0; dimension < logical_offsets.size();
+             ++dimension) {
+          logical_offsets[dimension] += value->slice_starts(dimension);
+        }
       }
       has_input_view = true;
+      has_static_slice = true;
       requires_linear_addressing = true;
     } else {
       CHECK(!physical_mapping_fixed);
@@ -763,6 +785,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           fusion_config.fly_gemm_config().workgroup_mapping_n();
     }
     const HloInstruction& root = analysis.fusion_root(0).instruction();
+    output_element_type_ = root.shape().element_type();
     output_physical_strides_ = PhysicalStrides(root.shape());
     direct_accumulator_store_offsets_fit_ =
         ShapeUtil::ByteSizeOf(root.shape()) <=
@@ -1309,14 +1332,21 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           stage_k_ == 128 && num_warps_ == 4 && n_ % block_n_ == 0;
       const bool triton_single_buffer =
           single_buffer_lds_ && use_mfma_32_ && num_warps_ == 4 &&
-          ((stage_k_ == 32 && ((block_m_ == 128 && block_n_ == 256) ||
-                               (block_m_ == 256 && block_n_ == 128))) ||
+          ((stage_k_ == 32 &&
+            ((block_m_ == 128 && block_n_ == 128) ||
+             (block_m_ == 128 && block_n_ == 256) ||
+             (block_m_ == 256 && block_n_ == 128))) ||
            (stage_k_ == 64 && block_m_ == 128 && block_n_ == 128));
       const bool triton_eight_wave_single_buffer =
-          single_buffer_lds_ && use_mfma_32_ && num_warps_ == 8 &&
-          block_m_ == 256 && block_n_ == 128 &&
-          (stage_k_ == 64 ||
-           (lhs_element_type_ == F32 && stage_k_ == 32));
+          single_buffer_lds_ && use_mfma_32_ &&
+          ((block_m_ == 256 && block_n_ == 128 &&
+            num_warps_ == 8 &&
+            (stage_k_ == 64 ||
+             (lhs_element_type_ == F32 && stage_k_ == 32))) ||
+           (lhs_element_type_ == F32 && block_m_ == 128 &&
+            ((block_n_ == 128 && num_warps_ == 8) ||
+             (block_n_ == 256 && num_warps_ == 8)) &&
+            stage_k_ == 32));
       const int64_t tensile_stage_k = is_fp8_ ? 128 : 64;
       const bool tensile_single_buffer =
           single_buffer_lds_ && !use_mfma_32_ && num_warps_ == 4 &&
@@ -1413,7 +1443,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         lhs_input_scale_parameter_number_ >= 0 && !rhs_k_contiguous_;
     const bool row_major_rhs_wide_source_swap =
         row_major_rhs_square_double_buffer && block_n_ == 256 &&
-        !stage_output_;
+        !stage_output_ && output_element_type_ == BF16 &&
+        m_ % block_m_ == 0 && n_ % block_n_ == 0 &&
+        output_physical_strides_.back() == 1 && !is_scaled_dot_ &&
+        epilogue_steps_.empty();
     const bool small_grid_single_buffer =
         (single_buffer_lds_ && !use_mfma_32 && num_warps_ == 4 &&
          stage_k_ == 128 && block_m_ == 128 &&
@@ -1478,8 +1511,13 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         single_buffer_lds_ && use_mfma_32 &&
         mfma_atom_ == FlyGemmConfig::FLY_MFMA_32X32X4_XF32 &&
         lhs_element_type_ == F32 && rhs_element_type_ == F32;
-    const bool xf32_wide_single_buffer =
-        xf32_single_buffer && block_m_ == 256 && block_n_ == 128 &&
+    const bool native_f32_single_buffer =
+        single_buffer_lds_ && use_mfma_32 && lhs_element_type_ == F32 &&
+        rhs_element_type_ == F32 &&
+        mfma_atom_ == FlyGemmConfig::FLY_MFMA_32X32X2_F32;
+    const bool f32_wide_single_buffer =
+        single_buffer_lds_ && use_mfma_32 && lhs_element_type_ == F32 &&
+        rhs_element_type_ == F32 && block_m_ == 256 && block_n_ == 128 &&
         stage_k_ == 32 && num_warps_ == 8;
     const bool triton_xf32_paired_lds = false;
     const int64_t accumulator_elements = use_mfma_32 ? 16 : 4;
@@ -5501,7 +5539,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     const bool load_rhs_on_demand =
         (single_buffer_lds_ && block_m_ == 128 && block_n_ == 128) ||
         row_major_rhs_single_buffer || row_major_rhs_square_double_buffer ||
-        (xf32_wide_single_buffer && schedule_instructions_);
+        (f32_wide_single_buffer && schedule_instructions_);
     Value initial_shared = lhs_shared;
     if (single_buffer_lds_ || tensile_double_buffer) {
       llvm::SmallVector<Value> initial_rhs_registers;
@@ -7934,6 +7972,15 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           }
           next_lhs_registers = std::move(future_lhs_registers);
         }
+        if (native_f32_single_buffer && preload_lds_fragments_ &&
+            !schedule_instructions_) {
+          // Keep the refill barrier below the complete native-F32 MFMA block.
+          // Without this compiler boundary LLVM hoists the barrier after only
+          // a few MFMAs, so almost none of the next-tile VMEM latency is hidden
+          // by the current tile's arithmetic.
+          mlir::ROCDL::SchedBarrier::create(
+              builder, mlir::ROCDL::SchedGroupMask::none);
+        }
         emit_hot_loop_schedule();
         Value synchronized_lhs = staged_shared;
         if (small_m_repository_register_refill) {
@@ -9271,6 +9318,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> rhs_scale_dimensions_;
   PrimitiveType lhs_element_type_ = BF16;
   PrimitiveType rhs_element_type_ = BF16;
+  PrimitiveType output_element_type_ = BF16;
   PrimitiveType lhs_input_type_ = BF16;
   PrimitiveType rhs_input_type_ = BF16;
   bool lhs_requires_linear_addressing_ = false;

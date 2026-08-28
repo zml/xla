@@ -1,0 +1,20 @@
+HloModule fly_fusion_bf16_gather_nd_benchmark
+
+elementwise {
+  values = bf16[256,256,1024]{2,1,0} parameter(0)
+  indices = s32[65536,2]{1,0} parameter(1)
+  mask_value = s32[] constant(255)
+  mask = s32[65536,2]{1,0} broadcast(mask_value), dimensions={}
+  bounded_indices = s32[65536,2]{1,0} and(indices, mask)
+  gathered = bf16[65536,1024]{1,0} gather(values, bounded_indices),
+    offset_dims={1}, collapsed_slice_dims={0,1}, start_index_map={0,1},
+    index_vector_dim=1, slice_sizes={1,1,1024}
+  ROOT result = bf16[65536,1024]{1,0} abs(gathered)
+}
+
+ENTRY main {
+  values = bf16[256,256,1024]{2,1,0} parameter(0)
+  indices = s32[65536,2]{1,0} parameter(1)
+  ROOT fusion = bf16[65536,1024]{1,0} fusion(values, indices), kind=kLoop,
+    calls=elementwise
+}

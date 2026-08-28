@@ -35,6 +35,16 @@ declare -A hlo_files=(
   [dynamic_slice]="fly_fusion_bf16_dynamic_slice_benchmark.hlo"
   [rank4_dynamic_slice]="fly_fusion_bf16_rank4_dynamic_slice_benchmark.hlo"
   [dynamic_slice_native]="fly_fusion_bf16_dynamic_slice_native_benchmark.hlo"
+  [row_gather]="fly_fusion_bf16_row_gather_benchmark.hlo"
+  [gather_nd]="fly_fusion_bf16_gather_nd_benchmark.hlo"
+  [partial_row_gather]="fly_fusion_bf16_partial_row_gather_benchmark.hlo"
+  [strided_axis_gather]="fly_fusion_bf16_strided_axis_gather_benchmark.hlo"
+  [overwrite_row_scatter]="fly_fusion_bf16_overwrite_row_scatter_benchmark.hlo"
+  [non_unique_overwrite_scatter]="fly_fusion_bf16_non_unique_overwrite_scatter_benchmark.hlo"
+  [non_unique_additive_scatter]="fly_fusion_bf16_non_unique_additive_scatter_benchmark.hlo"
+  [scalar_additive_scatter]="fly_fusion_bf16_scalar_additive_scatter_benchmark.hlo"
+  [s32_maximum_scatter]="fly_fusion_s32_non_unique_maximum_scatter_benchmark.hlo"
+  [multi_component_overwrite_scatter]="fly_fusion_bf16_multi_component_overwrite_scatter_benchmark.hlo"
   [dynamic_update_slice]="fly_fusion_bf16_dynamic_update_slice_benchmark.hlo"
   [dynamic_update_slice_native]="fly_fusion_bf16_dynamic_update_slice_native_benchmark.hlo"
   [rank4_dynamic_update_slice]="fly_fusion_bf16_rank4_dynamic_update_slice_benchmark.hlo"
@@ -66,6 +76,14 @@ declare -A hlo_files=(
   [softmax_f16_tail]="fly_fusion_f16_softmax_tail_benchmark.hlo"
   [softmax_f32_tail]="fly_fusion_f32_softmax_tail_benchmark.hlo"
   [bf16_reduce]="fly_fusion_bf16_row_reduction_benchmark.hlo"
+  [f32_reduce_extra_output]="fly_fusion_f32_row_reduction_extra_output_benchmark.hlo"
+  [f32_dependent_rowwise_output]="fly_fusion_f32_dependent_rowwise_output_benchmark.hlo"
+  [f32_normalized_rowwise_512]="fly_fusion_f32_normalized_rowwise_512_benchmark.hlo"
+  [f32_negative_squared_sum_reduce_512]="fly_fusion_f32_negative_squared_sum_row_reduction_512_benchmark.hlo"
+  [f32_multiple_reductions]="fly_fusion_f32_multiple_row_reductions_benchmark.hlo"
+  [f32_multiple_reductions_extra_output]="fly_fusion_f32_multiple_row_reductions_extra_output_benchmark.hlo"
+  [f32_sum_reduce_512]="fly_fusion_f32_sum_row_reduction_512_benchmark.hlo"
+  [f32_squared_max_reduce_512]="fly_fusion_f32_squared_max_row_reduction_512_benchmark.hlo"
   [f16_direct_reduce]="fly_fusion_f16_direct_row_reduction_benchmark.hlo"
   [bf16_narrowing_reduce]="fly_fusion_bf16_narrowing_row_reduction_benchmark.hlo"
   [bf16_ragged_narrowing_reduce]="fly_fusion_bf16_ragged_narrowing_row_reduction_benchmark.hlo"
@@ -91,6 +109,8 @@ declare -A hlo_files=(
   [erf_gelu]="fly_fusion_bf16_erf_gelu_benchmark.hlo"
   [ragged_elementwise]="fly_fusion_ragged_elementwise_hbm_benchmark.hlo"
   [multi_output_elementwise]="fly_fusion_multi_output_elementwise_hbm_benchmark.hlo"
+  [multi_output_physical_view]="fly_fusion_multi_output_physical_view_hbm_benchmark.hlo"
+  [mixed_type_multi_output]="fly_fusion_mixed_type_multi_output_hbm_benchmark.hlo"
   [sigmoid]="fly_fusion_bf16_sigmoid_benchmark.hlo"
   [transpose]="fly_fusion_bf16_transpose_benchmark.hlo"
   [transpose_1024]="fly_fusion_bf16_transpose_1024_benchmark.hlo"
@@ -121,7 +141,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-    echo "Available benchmarks: concatenate concatenate_native middle_concatenate contiguous_slice rectangular_slice rank4_rectangular_slice dynamic_slice rank4_dynamic_slice dynamic_slice_native dynamic_update_slice dynamic_update_slice_native rank4_dynamic_update_slice rank4_dynamic_update_slice_native flat_edge_pad flat_edge_pad_native rectangular_edge_pad rectangular_edge_pad_native interior_pad interior_pad_native rank4_interior_pad rank4_interior_pad_native reduce_window reduce_window_native reduce_window_15 reduce_window_15_native scan flat_reverse flat_reverse_native partial_reverse partial_reverse_native rank4_partial_reverse rank4_partial_reverse_native trailing_broadcast arbitrary_broadcast softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f16_direct_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce f32_leading_reduce elementwise elementwise_f16 elementwise_f32 elementwise_pred elementwise_s32 fp8_to_f32 f32_to_fp8 s4_to_bf16 s4_rectangular_slice s8_to_s4 iota physical_view type_bitcast bitcast_convert erf_gelu ragged_elementwise multi_output_elementwise sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
+    echo "Available benchmarks: concatenate concatenate_native middle_concatenate contiguous_slice rectangular_slice rank4_rectangular_slice dynamic_slice rank4_dynamic_slice dynamic_slice_native row_gather gather_nd partial_row_gather strided_axis_gather overwrite_row_scatter non_unique_overwrite_scatter non_unique_additive_scatter scalar_additive_scatter s32_maximum_scatter multi_component_overwrite_scatter dynamic_update_slice dynamic_update_slice_native rank4_dynamic_update_slice rank4_dynamic_update_slice_native flat_edge_pad flat_edge_pad_native rectangular_edge_pad rectangular_edge_pad_native interior_pad interior_pad_native rank4_interior_pad rank4_interior_pad_native reduce_window reduce_window_native reduce_window_15 reduce_window_15_native scan flat_reverse flat_reverse_native partial_reverse partial_reverse_native rank4_partial_reverse rank4_partial_reverse_native trailing_broadcast arbitrary_broadcast softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f32_reduce_extra_output f32_dependent_rowwise_output f32_normalized_rowwise_512 f32_negative_squared_sum_reduce_512 f32_multiple_reductions f32_multiple_reductions_extra_output f32_sum_reduce_512 f32_squared_max_reduce_512 f16_direct_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce f32_leading_reduce elementwise elementwise_f16 elementwise_f32 elementwise_pred elementwise_s32 fp8_to_f32 f32_to_fp8 s4_to_bf16 s4_rectangular_slice s8_to_s4 iota physical_view type_bitcast bitcast_convert erf_gelu ragged_elementwise multi_output_elementwise multi_output_physical_view mixed_type_multi_output sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"

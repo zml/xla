@@ -1,0 +1,30 @@
+HloModule fly_fusion_f32_dependent_rowwise_output_benchmark
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[262144,512]{1,0} parameter(0)
+  squared = f32[262144,512]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[262144]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  epsilon = f32[] constant(1e-6)
+  epsilons = f32[262144]{0} broadcast(epsilon), dimensions={}
+  variance = f32[262144]{0} add(row_sum, epsilons)
+  scale = f32[262144]{0} rsqrt(variance)
+  scales = f32[262144,512]{1,0} broadcast(scale), dimensions={0}
+  normalized = f32[262144,512]{1,0} multiply(p0, scales)
+  negative_sum = f32[262144]{0} negate(row_sum)
+  ROOT result = (f32[262144,512]{1,0}, f32[262144]{0})
+    tuple(normalized, negative_sum)
+}
+
+ENTRY main {
+  p0 = f32[262144,512]{1,0} parameter(0)
+  ROOT fusion = (f32[262144,512]{1,0}, f32[262144]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__triton","block_level_fusion_config":{"output_tiles":[{"sizes":["64","512"]},{"sizes":["64"]}],"num_warps":"2","num_ctas":1,"num_stages":1}}}
+}
