@@ -18,8 +18,6 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -31,7 +29,6 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
@@ -292,37 +289,14 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
     result.scratch_bytes = GetScratchBytes(*gpu_executable);
   }
   {
-    // Warm-up run: route every buffer the executable allocates on-demand
-    // (result/output buffers and workspace/scratch buffers alike) through a
-    // RedzoneDeviceAddressAllocator, so that any out-of-bounds write lands in
-    // a mapped post-redzone rather than causing a GPU VM fault.
-    std::optional<se::RedzoneDeviceAddressAllocator> warmup_rz;
-    se::DeviceAddressAllocator* warmup_alloc = allocator_;
-    if (options_.redzone_padding_bytes > 0) {
-      warmup_rz.emplace(stream_, allocator_, options_.redzone_padding_bytes);
-      warmup_alloc = &warmup_rz.value();
-    }
     std::vector<ExecutionInput> execution_inputs =
         CreateExecutionInputsFromBuffers(rz_buffers.input_buffers(),
                                          rz_buffers.input_shapes());
     ABSL_RETURN_IF_ERROR(Execute(executable, std::move(execution_inputs),
-                            /*profile=*/nullptr, warmup_alloc)
-                        .status());
+                                 /*profile=*/nullptr)
+                             .status());
+
     ABSL_RETURN_IF_ERROR(stream_->BlockHostUntilDone());
-    if (warmup_rz.has_value()) {
-      ABSL_ASSIGN_OR_RETURN(se::RedzoneAllocator::RedzoneCheckStatus rz_check,
-                       warmup_rz->CheckRedzones());
-      if (!rz_check.ok()) {
-        std::string redzone_failure_msg = rz_check.RedzoneFailureMsg();
-        VLOG(1) << "Autotuning candidate discarded: out-of-bounds write "
-                   "detected past an allocated buffer. "
-                << redzone_failure_msg;
-        return absl::InternalError(absl::StrCat(
-            "Autotuning candidate rejected: kernel wrote past its allocated "
-            "buffer. ",
-            redzone_failure_msg));
-      }
-    }
   }
 
   ExecutionProfile profile;
@@ -333,7 +307,7 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
 
   ABSL_ASSIGN_OR_RETURN(
       ExecutionOutput execution_output,
-      Execute(executable, std::move(execution_inputs), &profile, allocator_));
+      Execute(executable, std::move(execution_inputs), &profile));
 
   result.duration = absl::Nanoseconds(profile.compute_time_ns());
   result.output_buffer = execution_output.Commit().ConsumeResult();
@@ -342,7 +316,7 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
 
 absl::StatusOr<ExecutionOutput> GpuProfiler::Execute(
     Executable* executable, std::vector<ExecutionInput> inputs,
-    ExecutionProfile* profile, se::DeviceAddressAllocator* allocator) {
+    ExecutionProfile* profile) {
   // Require exclusive GPU lock to prevent other runs during autotuning.
   GpuExecutableRunOptions gpu_opts;
   gpu_opts.set_requires_exclusive_lock_on_gpu();
@@ -350,7 +324,7 @@ absl::StatusOr<ExecutionOutput> GpuProfiler::Execute(
   ExecutableRunOptions run_options;
   run_options.set_device_ordinal(stream_executor_->device_ordinal());
   run_options.set_stream(stream_);
-  run_options.set_allocator(allocator);
+  run_options.set_allocator(allocator_);
   run_options.set_gpu_executable_run_options(&gpu_opts);
   run_options.set_execution_profile(profile);
   ServiceExecutableRunOptions service_run_options(run_options);
