@@ -104,7 +104,8 @@ bool IsFlySegmentedPagedAttentionFusion(const HloInstruction& instruction) {
     }
     const absl::string_view target = fused->custom_call_target();
     if (target == flydsl::kFlyPagedAttentionSegmentedProducerCallTarget ||
-        target == flydsl::kFlyPagedAttentionSegmentedReducerCallTarget) {
+        target == flydsl::kFlyPagedAttentionSegmentedReducerCallTarget ||
+        target == flydsl::kFlyPagedAttentionSegmentedFusedCallTarget) {
       return true;
     }
   }

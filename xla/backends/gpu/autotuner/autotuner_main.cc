@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/backends/autotuner/local_cache.h"
 #include "xla/backends/autotuner/profiler.h"
 #include "xla/backends/autotuner/tiered_cache.h"
+#include "xla/backends/gpu/autotuner/autotuner_main_util.h"
 #include "xla/backends/gpu/autotuner/gpu_profiler.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/symbolic_expr.h"
@@ -73,7 +74,7 @@ This tool autotunes a list of HLO modules and prints the results to stdout.
 Usage:
 
   bazel run autotuner_main -- --hlo_files=path/to/*.hlo,path/to/hlo_module2.hlo \
-    [--cache_dir=path/to/cache]
+    [--cache_dir=path/to/cache] [--retune_preexisting_block_level_configs]
 )";
 }  // namespace
 
@@ -246,7 +247,8 @@ absl::StatusOr<AutotunerEnvironment> CreateAutotunerEnvironment(
 
 absl::Status RunAutotuning(const std::vector<std::string>& hlo_files,
                            const DebugOptions& debug_options,
-                           absl::string_view cache_dir) {
+                           absl::string_view cache_dir,
+                           bool retune_preexisting_block_level_configs) {
   ASSIGN_OR_RETURN(AutotunerEnvironment env,
                    CreateAutotunerEnvironment(debug_options));
 
@@ -279,6 +281,9 @@ absl::Status RunAutotuning(const std::vector<std::string>& hlo_files,
     LOG(INFO) << "Autotuning " << hlo_file;
     ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
                      LoadModuleFromFile(hlo_file));
+    if (retune_preexisting_block_level_configs) {
+      RETURN_IF_ERROR(ClearPreexistingBlockLevelConfigs(*module));
+    }
     ASSIGN_OR_RETURN(
         std::vector<Autotuner::TuningResult> results,
         env.autotuner->TuneConfigs(*module, should_autotune,
@@ -300,11 +305,16 @@ absl::Status RunAutotuning(const std::vector<std::string>& hlo_files,
 int main(int argc, char* argv[]) {
   std::string hlo_files_str;
   std::string cache_dir;
+  bool retune_preexisting_block_level_configs = false;
   std::vector<tsl::Flag> flag_list = {
       tsl::Flag("hlo_files", &hlo_files_str,
                 "Comma-separated list of paths to the HLO files to autotune."),
       tsl::Flag("cache_dir", &cache_dir,
                 "Directory path for the autotuner directory cache."),
+      tsl::Flag("retune_preexisting_block_level_configs",
+                &retune_preexisting_block_level_configs,
+                "Ignore block-level configs embedded in __triton fusions so "
+                "the cost model generates a fresh autotuning search space."),
   };
 
   const std::string usage_string =
@@ -328,8 +338,9 @@ int main(int argc, char* argv[]) {
   }
 
   xla::DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
-  absl::Status status =
-      xla::gpu::RunAutotuning(hlo_files, debug_options, cache_dir);
+  absl::Status status = xla::gpu::RunAutotuning(
+      hlo_files, debug_options, cache_dir,
+      retune_preexisting_block_level_configs);
   if (!status.ok()) {
     std::cerr << "Failed to autotune: " << status.ToString() << std::endl;
     return 1;

@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
+#include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
 #include "xla/backends/gpu/codegen/flydsl/softmax_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -146,23 +147,72 @@ TEST_F(SoftmaxRewriterFlyTest, FormsCanonicalF32Softmax) {
 }
 
 TEST_F(SoftmaxRewriterFlyTest, IncreasesOccupancyForMaximumSupportedRow) {
-  ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<HloModule> module,
-      ParseAndReturnVerifiedModule(SoftmaxHlo("bf16", 65536)));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(SoftmaxHlo("bf16", 65536)));
 
   EXPECT_THAT(SoftmaxRewriterFly().Run(module.get()), IsOkAndHolds(true));
-  ASSERT_OK_AND_ASSIGN(
-      GpuBackendConfig gpu_config,
-      module->entry_computation()->root_instruction()->backend_config<
-          GpuBackendConfig>());
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       module->entry_computation()
+                           ->root_instruction()
+                           ->backend_config<GpuBackendConfig>());
   EXPECT_EQ(gpu_config.fusion_backend_config()
                 .block_level_fusion_config()
                 .num_warps(),
             16);
 }
 
-TEST_F(SoftmaxRewriterFlyTest,
-       FormsRank4DoubleStabilizedTransformerSoftmax) {
+TEST_F(SoftmaxRewriterFlyTest, FormsDependentLayerNormAsOneNativeFlyFusion) {
+  constexpr absl::string_view kLayerNormHlo = R"(
+HloModule fly_layer_norm_rewriter
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = bf16[256,4096]{1,0} parameter(0)
+  converted = f32[256,4096]{1,0} convert(p0)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(converted, zero), dimensions={1}, to_apply=add
+  reciprocal = f32[] constant(0.000244140625)
+  reciprocals = f32[256]{0} broadcast(reciprocal), dimensions={}
+  mean = f32[256]{0} multiply(sum, reciprocals)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(converted, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} multiply(square_sum, reciprocals)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  scales = f32[256,4096]{1,0} broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0} multiply(centered, scales)
+  ROOT result = bf16[256,4096]{1,0} convert(normalized)
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kLayerNormHlo));
+
+  EXPECT_THAT(SoftmaxRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  EXPECT_THAT(fusion->name(), HasSubstr("fly_layer_norm"));
+  EXPECT_TRUE(flydsl::IsFlyLayerNormRoot(
+      *fusion->fused_instructions_computation()->root_instruction()));
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  const FusionBackendConfig& fusion_config = gpu_config.fusion_backend_config();
+  EXPECT_EQ(fusion_config.kind(), kFlyFusionKind);
+  EXPECT_THAT(fusion_config.block_level_fusion_config().output_tiles(0).sizes(),
+              ::testing::ElementsAre(1, 4096));
+  EXPECT_EQ(fusion_config.block_level_fusion_config().num_warps(), 4);
+}
+
+TEST_F(SoftmaxRewriterFlyTest, FormsRank4DoubleStabilizedTransformerSoftmax) {
   constexpr absl::string_view kTransformerSoftmaxHlo = R"(
 HloModule fly_rank4_double_stabilized_softmax
 

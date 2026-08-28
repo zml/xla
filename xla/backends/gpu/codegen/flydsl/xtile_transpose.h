@@ -29,7 +29,8 @@ namespace xla::gpu::flydsl {
 // Returns the logical input matrix shape (rows, columns) for a native BF16
 // transpose. Besides a direct rank-2 transpose, this recognizes the batched
 // bitcast/transpose and bitcast/slice/transpose views used by transformer
-// attention. All matrix dimensions must be exact multiples of the LDS tile.
+// attention. Partial edge tiles are supported for matrix extents of at least
+// 32 elements.
 std::optional<std::pair<int64_t, int64_t>> GetFlyXTileTransposeMatrixShape(
     const HloFusionAnalysis& analysis);
 
@@ -40,9 +41,10 @@ bool IsFlyXTileTransposeFusion(const HloFusionAnalysis& analysis);
 // autotuner can replace an existing rank-preserving Triton/legacy config.
 bool IsFlyXTileTransposeConfigSupported(const HloFusionAnalysis& analysis);
 
-// Emits one rectangular matrix tile per workgroup. Every thread transfers 32
-// bytes in each direction. Adjacent BF16 input rows are packed into LDS dwords
-// so the transposed output is recovered with two 128-bit LDS reads per thread.
+// Emits one rectangular matrix tile per workgroup. Every thread transfers two
+// or four 128-bit vectors in each direction. Adjacent BF16 input rows are
+// packed into LDS dwords; partial edge workgroups overlap the preceding tile
+// to retain the same branch-free vectorized memory path.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(
     const HloFusionAnalysis& analysis);
 

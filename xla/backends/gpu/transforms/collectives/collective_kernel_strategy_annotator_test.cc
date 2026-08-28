@@ -60,6 +60,16 @@ constexpr absl::string_view kAllReduceHloTemplate = R"(
   }
 )";
 
+constexpr absl::string_view kAllGatherHloTemplate = R"(
+  HloModule all_gather_test
+
+  ENTRY e {
+    p0 = bf16[%1$d] parameter(0)
+    ROOT all-gather = bf16[%2$d] all-gather(p0),
+        dimensions={0}, replica_groups={{0,1,2,3,4,5,6,7}}
+  }
+)";
+
 class CollectiveKernelStrategyAnnotatorTest
     : public HloHardwareIndependentTestBase {
  protected:
@@ -80,10 +90,11 @@ class CollectiveKernelStrategyAnnotatorTest
   }
 
   absl::StatusOr<CollectiveBackendConfig::CollectiveKernelStrategy>
-  GetKernelStrategy(HloModule* module) {
+  GetKernelStrategy(HloModule* module,
+                    HloOpcode opcode = HloOpcode::kAllReduce) {
     for (HloComputation* comp : module->computations()) {
       for (HloInstruction* instr : comp->instructions()) {
-        if (instr->opcode() == HloOpcode::kAllReduce) {
+        if (instr->opcode() == opcode) {
           ASSIGN_OR_RETURN(GpuBackendConfig cfg,
                            instr->backend_config<GpuBackendConfig>());
           return cfg.collective_backend_config().kernel_strategy();
@@ -148,6 +159,69 @@ TEST_F(CollectiveKernelStrategyAnnotatorTest,
 
   ASSERT_OK_AND_ASSIGN(auto strategy_default, GetKernelStrategy(module.get()));
   EXPECT_EQ(strategy_default, CollectiveBackendConfig::KERNEL_STRATEGY_DEFAULT);
+}
+
+TEST_F(CollectiveKernelStrategyAnnotatorTest,
+       EnabledAllGatherIsAnnotatedOneShot) {
+  constexpr int64_t kNumElements = 65536;
+  std::string hlo = absl::StrFormat(kAllGatherHloTemplate, kNumElements,
+                                    8 * kNumElements);
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo, /*replica_count=*/8));
+  module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_gpu_experimental_use_collective_kernels(
+          DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER);
+
+  CollectiveKernelStrategyAnnotator annotator(*gpu_topology_,
+                                              /*is_multimem_enabled=*/false);
+  EXPECT_TRUE(annotator.Run(module.get()).value());
+
+  ASSERT_OK_AND_ASSIGN(
+      auto strategy,
+      GetKernelStrategy(module.get(), HloOpcode::kAllGather));
+  EXPECT_EQ(strategy,
+            CollectiveBackendConfig::KERNEL_STRATEGY_TRITON_ONE_SHOT);
+}
+
+TEST_F(CollectiveKernelStrategyAnnotatorTest,
+       DisabledAllGatherKeepsDefaultStrategy) {
+  constexpr int64_t kNumElements = 65536;
+  std::string hlo = absl::StrFormat(kAllGatherHloTemplate, kNumElements,
+                                    8 * kNumElements);
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo, /*replica_count=*/8));
+
+  CollectiveKernelStrategyAnnotator annotator(*gpu_topology_,
+                                              /*is_multimem_enabled=*/false);
+  EXPECT_FALSE(annotator.Run(module.get()).value());
+
+  ASSERT_OK_AND_ASSIGN(
+      auto strategy,
+      GetKernelStrategy(module.get(), HloOpcode::kAllGather));
+  EXPECT_EQ(strategy, CollectiveBackendConfig::KERNEL_STRATEGY_DEFAULT);
+}
+
+TEST_F(CollectiveKernelStrategyAnnotatorTest,
+       UnalignedAllGatherKeepsDefaultStrategy) {
+  constexpr int64_t kNumElements = 7;
+  std::string hlo = absl::StrFormat(kAllGatherHloTemplate, kNumElements,
+                                    8 * kNumElements);
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(hlo, /*replica_count=*/8));
+  module->mutable_config()
+      .mutable_debug_options()
+      .add_xla_gpu_experimental_use_collective_kernels(
+          DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER);
+
+  CollectiveKernelStrategyAnnotator annotator(*gpu_topology_,
+                                              /*is_multimem_enabled=*/false);
+  EXPECT_FALSE(annotator.Run(module.get()).value());
+
+  ASSERT_OK_AND_ASSIGN(
+      auto strategy,
+      GetKernelStrategy(module.get(), HloOpcode::kAllGather));
+  EXPECT_EQ(strategy, CollectiveBackendConfig::KERNEL_STRATEGY_DEFAULT);
 }
 
 }  // namespace

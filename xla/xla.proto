@@ -77,6 +77,16 @@ message DebugOptions {
     ALLCOLLECTIVES = 8;
   }
 
+  // Collective operations for which XLA should use a device-side collective
+  // kernel instead of a binary collective library.  The kernel implementation
+  // is selected by the active code-generation backend (Triton normally, Fly
+  // in strict Fly replacement mode).
+  enum CollectiveKernelType {
+    COLLECTIVE_KERNEL_INVALID = 0;
+    COLLECTIVE_KERNEL_ALL_REDUCE = 1;
+    COLLECTIVE_KERNEL_ALL_GATHER = 2;
+  }
+
   // Commands are categorized into 5 types:
   // FUSION represents regular fusion kernels.
   // CUBLAS/CUBLASLT, CUDNN/CONVOLUTION, and COLLECTIVES represent library
@@ -816,6 +826,12 @@ message DebugOptions {
   // disables Triton collective kernels. Native XLA emitters and binary
   // libraries remain eligible.
   optional bool xla_gpu_flydsl_replace_triton = 518;
+
+  // Experimental filter selecting collectives implemented by device-side
+  // kernels rather than NCCL/RCCL. Accepted values are ALL_REDUCE and
+  // ALL_GATHER. The legacy all-reduce one-shot flag remains supported.
+  repeated CollectiveKernelType xla_gpu_experimental_use_collective_kernels =
+      519;
 
   // Enable double buffering for loops.
   optional bool xla_gpu_enable_while_loop_double_buffering = 248;
@@ -1695,7 +1711,7 @@ message DebugOptions {
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
 
-  // Next id: 515
+  // Next id: 520
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.

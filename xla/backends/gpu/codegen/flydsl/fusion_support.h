@@ -35,6 +35,7 @@ enum class FlyFusionRoute {
   kPagedAttention,
   kAttention,
   kSoftmax,
+  kLayerNorm,
   kTranspose,
   kElementwise,
   kRowReduction,

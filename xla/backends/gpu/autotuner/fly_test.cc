@@ -786,6 +786,95 @@ ENTRY main {
         "kind":"__triton_gemm"}}
 })";
 
+constexpr char kS4ChannelScaledBatchedLhsHlo[] = R"(
+HloModule fly_s4_channel_scaled_batched_lhs
+
+gemm {
+  weights.s4 = s4[4,64,64]{1,2,0:E(4)} parameter(0)
+  weights.s8 = s8[4,64,64]{1,2,0} convert(weights.s4)
+  weights.bf16 = bf16[4,64,64]{1,2,0} convert(weights.s8)
+  weights.transpose = bf16[4,64,64]{1,2,0}
+      transpose(weights.bf16), dimensions={0,2,1}
+  scales = bf16[4,64]{1,0} parameter(1)
+  scales.broadcast = bf16[4,64,64]{1,2,0}
+      broadcast(scales), dimensions={0,2}
+  weights.scaled = bf16[4,64,64]{1,2,0}
+      multiply(weights.transpose, scales.broadcast)
+  activations = bf16[4,64,128]{2,1,0} parameter(2)
+  ROOT dot = f32[4,64,128]{2,1,0} dot(weights.scaled, activations),
+      lhs_batch_dims={0}, rhs_batch_dims={0},
+      lhs_contracting_dims={1}, rhs_contracting_dims={1}
+}
+
+ENTRY main {
+  weights = s4[4,64,64]{1,2,0:E(4)} parameter(0)
+  scales = bf16[4,64]{1,0} parameter(1)
+  activations = bf16[4,64,128]{2,1,0} parameter(2)
+  ROOT fusion = f32[4,64,128]{2,1,0}
+      fusion(weights, scales, activations), kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+
+constexpr char kS4SubchannelScaledBatchedLhsHlo[] = R"(
+HloModule fly_s4_subchannel_scaled_batched_lhs
+
+gemm {
+  weights.s4 = s4[2,2048,32]{2,1,0:E(4)} parameter(0)
+  weights.s8 = s8[2,2048,32]{2,1,0} convert(weights.s4)
+  weights.groups.s8 = s8[2,8,256,32]{3,2,1,0} bitcast(weights.s8)
+  weights.groups = bf16[2,8,256,32]{3,2,1,0}
+      convert(weights.groups.s8)
+  scales = bf16[2,8,1,32]{3,2,1,0} parameter(1)
+  scales.view = bf16[2,8,32]{2,1,0} bitcast(scales)
+  scales.broadcast = bf16[2,8,256,32]{3,2,1,0}
+      broadcast(scales.view), dimensions={0,1,3}
+  weights.scaled.groups = bf16[2,8,256,32]{3,2,1,0}
+      multiply(weights.groups, scales.broadcast)
+  weights.scaled = bf16[2,2048,32]{2,1,0}
+      bitcast(weights.scaled.groups)
+  activations = bf16[2,2,1,2048]{3,2,1,0} parameter(2)
+  activations.view = bf16[2,2,2048]{2,1,0} bitcast(activations)
+  ROOT dot = f32[2,32,2]{2,1,0} dot(weights.scaled, activations.view),
+      lhs_batch_dims={0}, lhs_contracting_dims={1},
+      rhs_batch_dims={1}, rhs_contracting_dims={2}
+}
+
+ENTRY main {
+  weights = s4[2,2048,32]{2,1,0:E(4)} parameter(0)
+  scales = bf16[2,8,1,32]{3,2,1,0} parameter(1)
+  activations = bf16[2,2,1,2048]{3,2,1,0} parameter(2)
+  ROOT fusion = f32[2,32,2]{2,1,0}
+      fusion(weights, scales, activations), kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+
+constexpr char kS4ChannelScaledMultiBatchLhsHlo[] = R"(
+HloModule fly_s4_channel_scaled_multi_batch_lhs
+
+gemm {
+  weights.s4 = s4[3,2,32,16]{3,2,1,0:E(4)} parameter(0)
+  weights.s8 = s8[3,2,32,16]{3,2,1,0} convert(weights.s4)
+  weights.bf16 = bf16[3,2,32,16]{3,2,1,0} convert(weights.s8)
+  scales = bf16[3,16]{1,0} parameter(1)
+  scales.broadcast = bf16[3,2,32,16]{3,2,1,0}
+      broadcast(scales), dimensions={0,3}
+  weights.scaled = bf16[3,2,32,16]{3,2,1,0}
+      multiply(weights.bf16, scales.broadcast)
+  activations = bf16[3,2,32,16]{3,2,1,0} parameter(2)
+  ROOT dot = f32[2,3,16,16]{3,2,1,0} dot(weights.scaled, activations),
+      lhs_batch_dims={1,0}, lhs_contracting_dims={2},
+      rhs_batch_dims={1,0}, rhs_contracting_dims={2}
+}
+
+ENTRY main {
+  weights = s4[3,2,32,16]{3,2,1,0:E(4)} parameter(0)
+  scales = bf16[3,16]{1,0} parameter(1)
+  activations = bf16[3,2,32,16]{3,2,1,0} parameter(2)
+  ROOT fusion = f32[2,3,16,16]{3,2,1,0}
+      fusion(weights, scales, activations), kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+
 constexpr char kConvertedConcatInputsHlo[] = R"(
 HloModule fly_converted_concat_inputs
 
@@ -1839,6 +1928,60 @@ ENTRY main {
       std::vector<std::unique_ptr<BackendConfig>> retuned_configs,
       backend_.GetSupportedConfigs(*fusion));
   EXPECT_FALSE(retuned_configs.empty());
+}
+
+TEST_F(FlyFusionBackendTest, TunesNativeDependentLayerNorm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_dependent_layer_norm
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+layer_norm {
+  p0 = bf16[256,4096]{1,0} parameter(0)
+  converted = f32[256,4096]{1,0} convert(p0)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(converted, zero), dimensions={1}, to_apply=add
+  reciprocal = f32[] constant(0.000244140625)
+  reciprocals = f32[256]{0} broadcast(reciprocal), dimensions={}
+  mean = f32[256]{0} multiply(sum, reciprocals)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(converted, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} multiply(square_sum, reciprocals)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  scales = f32[256,4096]{1,0} broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0} multiply(centered, scales)
+  ROOT result = bf16[256,4096]{1,0} convert(normalized)
+}
+
+ENTRY main {
+  p0 = bf16[256,4096]{1,0} parameter(0)
+  ROOT fusion = bf16[256,4096]{1,0} fusion(p0), kind=kCustom,
+    calls=layer_norm,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","4096"]}],"num_warps":"4","num_ctas":"1","num_stages":"1"}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 5);
+  std::vector<int64_t> num_warps;
+  for (const std::unique_ptr<BackendConfig>& config : configs) {
+    num_warps.push_back(config->block_level().num_warps());
+    EXPECT_THAT(config->block_level().output_tiles(0).sizes(),
+                ::testing::ElementsAre(1, 4096));
+  }
+  EXPECT_THAT(num_warps, ::testing::ElementsAre(1, 2, 4, 8, 16));
 }
 
 TEST_F(FlyFusionBackendTest, ReplacesGenericTritonElementwiseFusion) {
@@ -4767,6 +4910,85 @@ TEST_F(FlyBackendTest, SupportsS4DequantizedKContiguousRhs) {
   EXPECT_THAT(executable->module_stats(), IsEmpty());
 }
 
+TEST_F(FlyBackendTest, SupportsS4ChannelScaledBatchedLhs) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kS4ChannelScaledBatchedLhsHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
+        const FlyGemmConfig& fly = config->fly();
+        return fly.block_m() == 16 && fly.block_n() == 64 &&
+               fly.block_k() == 64 && fly.num_warps() == 2 &&
+               fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X16 &&
+               !fly.stage_rhs();
+      }));
+  EXPECT_FALSE(
+      std::any_of(configs.begin(), configs.end(), [](const auto& config) {
+        const FlyGemmConfig& fly = config->fly();
+        return fly.block_m() == 128 && fly.block_n() == 128 &&
+               fly.block_k() == 64 && fly.num_warps() == 4 &&
+               fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X8 &&
+               fly.stage_rhs() && fly.preload_lds_fragments() &&
+               !fly.single_buffer_lds();
+      }));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                          backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+}
+
+TEST_F(FlyBackendTest, SupportsS4SubchannelScaledBatchedLhs) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kS4SubchannelScaledBatchedLhsHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                          backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+}
+
+TEST_F(FlyBackendTest, SupportsS4ChannelScaledMultiBatchLhs) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kS4ChannelScaledMultiBatchLhsHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                          backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+  ASSERT_EQ(gpu_config.fusion_backend_config()
+                .block_level_fusion_config()
+                .output_tiles_size(),
+            1);
+  EXPECT_THAT(gpu_config.fusion_backend_config()
+                  .block_level_fusion_config()
+                  .output_tiles(0)
+                  .sizes(),
+              testing::ElementsAre(1, 1, config->fly().block_m(),
+                                   config->fly().block_n()));
+}
+
 TEST_F(FlyBackendTest, SupportsTileAlignedConvertedConcatInputs) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<HloModule> module,
@@ -5159,6 +5381,60 @@ ENTRY main {
       EXPECT_EQ(block.num_warps(), 2);
       EXPECT_EQ(block.num_stages(), stage);
       EXPECT_EQ(block.waves_per_eu(), kOccupancies[occupancy]);
+    }
+  }
+}
+
+TEST_F(FlyFusionBackendTest, TunesFusedCooperativePagedAttentionReducer) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_fused_cooperative_paged_attention_autotune
+
+fused_computation {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,4096]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT result = (bf16[1,16,128]{2,1,0}, f32[1,16,114,128]{3,2,1,0}, f32[1,16,114]{2,1,0}, f32[1,16,114]{2,1,0}, u32[1,4,2]{2,1,0})
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode_segmented_fused"
+}
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,4096]{1,0} parameter(4)
+  ROOT fusion = (bf16[1,16,128]{2,1,0}, f32[1,16,114,128]{3,2,1,0}, f32[1,16,114]{2,1,0}, f32[1,16,114]{2,1,0}, u32[1,4,2]{2,1,0})
+    fusion(q, k, v, used_k, table), kind=kCustom,
+    calls=fused_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly","block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","128"]},{"sizes":["1","1","1","128"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]},{"sizes":["1","1","1"]}],"num_warps":"2","num_ctas":"1","num_stages":"1","waves_per_eu":"2"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 12);
+  constexpr std::array<int64_t, 4> kOccupancies = {0, 1, 2, 4};
+  for (int64_t stage = 1; stage <= 3; ++stage) {
+    for (int64_t occupancy = 0; occupancy < kOccupancies.size(); ++occupancy) {
+      const BlockLevelFusionConfig& block =
+          configs[(stage - 1) * kOccupancies.size() + occupancy]->block_level();
+      EXPECT_EQ(block.num_warps(), 2);
+      EXPECT_EQ(block.num_stages(), stage);
+      EXPECT_EQ(block.waves_per_eu(), kOccupancies[occupancy]);
+      ASSERT_EQ(block.output_tiles_size(), 5);
+      EXPECT_THAT(block.output_tiles(0).sizes(),
+                  ::testing::ElementsAre(1, 1, 128));
+      EXPECT_THAT(block.output_tiles(1).sizes(),
+                  ::testing::ElementsAre(1, 1, 1, 128));
+      EXPECT_THAT(block.output_tiles(4).sizes(),
+                  ::testing::ElementsAre(1, 1, 1));
     }
   }
 }

@@ -149,6 +149,41 @@ class CollectiveBlockLevelConfigTest : public HloHardwareIndependentTestBase {
     return ModuleWithFusion{std::move(module_with_fusion)};
   }
 
+  absl::StatusOr<ModuleWithFusion> BuildAllGatherModuleWithFusion(
+      int64_t num_elements = 65536) const {
+    const std::string module_str = absl::StrFormat(R"(
+      HloModule all_gather_test
+
+      ENTRY main {
+        input = bf16[%1$d] parameter(0)
+        ROOT all-gather = bf16[%2$d] all-gather(input), dimensions={0},
+            replica_groups={{0,1,2,3,4,5,6,7}}
+      }
+    )",
+                                                   num_elements,
+                                                   8 * num_elements);
+    ASSIGN_OR_RETURN(
+        std::unique_ptr<HloModule> module,
+        ParseAndReturnVerifiedModule(module_str, /*replica_count=*/8,
+                                     /*num_partitions=*/1));
+    module->mutable_config()
+        .mutable_debug_options()
+        .add_xla_gpu_experimental_use_collective_kernels(
+            DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER);
+    module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_enable_tiling_propagation(true);
+    CollectiveKernelStrategyAnnotator annotator(*gpu_topology_,
+                                                /*is_multimem_enabled=*/false);
+    RETURN_IF_ERROR(annotator.Run(module.get()).status());
+    const HloInstruction* all_gather = hlo_query::GetFirstInstructionWithOpcode(
+        *module->entry_computation(), HloOpcode::kAllGather);
+    TF_RET_CHECK(all_gather != nullptr)
+        << "Could not find all-gather instruction";
+    return ModuleWithFusion{NewModuleWithFusion(
+        all_gather, HloInstruction::FusionKind::kLoop)};
+  }
+
  protected:
   static std::string GetModuleStr(const Shape& shape,
                                   absl::string_view replica_groups = "{0,1}") {
@@ -200,6 +235,37 @@ class CollectiveEmitterTest : public CollectiveBlockLevelConfigTest {
     if (!collective_fusion_config_set) {
       return absl::InternalError(
           "Failed to set collective fusion config. "
+          "TrySetGpuBackendConfigForCollective returned false.");
+    }
+    auto result = std::make_unique<ModuleWithEmitter>(
+        std::move(module_with_fusion.module));
+    const se::DeviceDescription& device_info =
+        gpu_topology.gpu_target_config().device_description;
+    result->analysis =
+        HloFusionAnalysis::Create(*result->FusionInstr(), device_info);
+    std::unique_ptr<FusionInterface> fusion_emitter =
+        GetFusionEmitter(PreBufferAssignmentFusionInfo{*result->analysis});
+    TritonFusion* triton_emitter =
+        dynamic_cast<TritonFusion*>(fusion_emitter.get());
+    TF_RET_CHECK(triton_emitter != nullptr);
+    fusion_emitter.release();
+    result->emitter = absl::WrapUnique(triton_emitter);
+    return result;
+  }
+
+  absl::StatusOr<std::unique_ptr<ModuleWithEmitter>>
+  BuildAllGatherModuleWithEmitter(const GpuTopology& gpu_topology) const {
+    ASSIGN_OR_RETURN(ModuleWithFusion module_with_fusion,
+                     BuildAllGatherModuleWithFusion());
+    ASSIGN_OR_RETURN(
+        bool collective_fusion_config_set,
+        TrySetGpuBackendConfigForCollective(
+            gpu_topology, module_with_fusion.MutableFusionInstr(),
+            /*device_assignment=*/nullptr,
+            /*fusion_kind=*/kTritonCollectiveFusionKind));
+    if (!collective_fusion_config_set) {
+      return absl::InternalError(
+          "Failed to set all-gather fusion config. "
           "TrySetGpuBackendConfigForCollective returned false.");
     }
     auto result = std::make_unique<ModuleWithEmitter>(
@@ -311,6 +377,52 @@ TEST_F(CollectiveEmitterTest, AllReduceGetCollectiveUnmanagedKernelArguments) {
   EXPECT_EQ(unmanaged_arguments[3].dimensions()[1], 65536);  // input_shape[0]
 }
 
+TEST_F(CollectiveEmitterTest, AllGatherBlockLevelConfig) {
+  ASSERT_OK_AND_ASSIGN(const auto module_with_fusion,
+                       BuildAllGatherModuleWithFusion());
+  ASSERT_OK_AND_ASSIGN(const auto block_level_config,
+                       GetCollectiveBlockLevelFusionConfig(
+                           *gpu_topology_, module_with_fusion.FusionInstr()));
+  EXPECT_THAT(block_level_config, Optional(EqualsProto(R"pb(
+                num_warps: 16
+                num_ctas: 1
+                num_stages: 1
+                output_tiles { sizes: 2048 }
+              )pb")));
+}
+
+TEST_F(CollectiveEmitterTest, AllGatherUnmanagedKernelArguments) {
+  ASSERT_OK_AND_ASSIGN(const auto module_with_fusion,
+                       BuildAllGatherModuleWithFusion());
+  ASSERT_OK_AND_ASSIGN(
+      const auto arguments,
+      GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
+  ASSERT_EQ(arguments.size(), 4);
+  EXPECT_TRUE(ShapeUtil::IsScalar(arguments[0]));
+  EXPECT_TRUE(ShapeUtil::IsScalar(arguments[1]));
+  EXPECT_EQ(arguments[2], ShapeUtil::MakeShape(S32, {8, 32}));
+  EXPECT_EQ(arguments[3], ShapeUtil::MakeShape(BF16, {8, 65536}));
+}
+
+TEST_F(CollectiveEmitterTest, AllGatherKernelSpec) {
+  ASSERT_OK_AND_ASSIGN(const auto module_with_fusion,
+                       BuildAllGatherModuleWithFusion());
+  ASSERT_OK_AND_ASSIGN(
+      const CollectiveKernelSpec spec,
+      CreateCollectiveKernelSpec(module_with_fusion.FusionInstr(),
+                                 LaunchDimensions(/*block_count=*/32,
+                                                  /*threads_per_block=*/512)));
+  ASSERT_EQ(spec.input_buffer_specs.size(), 1);
+  ASSERT_EQ(spec.output_buffer_specs.size(), 1);
+  ASSERT_EQ(spec.scratch_buffers.size(), 2);
+  EXPECT_EQ(spec.scratch_buffers[0].size_bytes, 1024);
+  EXPECT_EQ(spec.scratch_buffers[1].size_bytes, 131072);
+  EXPECT_TRUE(spec.scratch_buffers[0].should_double_buffer);
+  EXPECT_TRUE(spec.scratch_buffers[1].should_double_buffer);
+  EXPECT_EQ(spec.argument_descriptors.size(), 6);
+  EXPECT_EQ(spec.sync_count_increment, 1);
+}
+
 TEST_F(CollectiveEmitterTest, SetsRequestedCollectiveFusionKind) {
   ASSERT_OK_AND_ASSIGN(
       auto module_with_fusion,
@@ -340,6 +452,36 @@ TEST_F(CollectiveEmitterTest, AllReduceWithTritonGetLaunchConfig) {
   ASSERT_NE(launch_config, std::nullopt);
   EXPECT_EQ(launch_config->launch_dimensions.num_blocks(), 32);
   EXPECT_EQ(launch_config->launch_dimensions.num_threads_per_block(), 512);
+}
+
+TEST_F(CollectiveEmitterTest, AllGatherWithTritonGenerateKernelSanity) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<ModuleWithEmitter> result,
+                       BuildAllGatherModuleWithEmitter(*gpu_topology_));
+  const TritonFusion* triton_fusion = result->emitter.get();
+  ASSERT_NE(triton_fusion, nullptr);
+
+  auto llvm_compiler =
+      [&](llvm::Module& llvm_module, const se::DeviceDescription& descr,
+          const DebugOptions& opts) -> absl::StatusOr<std::vector<uint8_t>> {
+    return std::vector<uint8_t>{1};
+  };
+  DebugOptions debug_options;
+  CubinCustomKernelCompiler kernel_compiler(llvm_compiler, device_info_,
+                                            debug_options);
+
+  ObjectPool<std::unique_ptr<mlir::MLIRContext>> mlir_context_pool(
+      []() { return CreateMlirContext(); });
+  ASSERT_OK_AND_ASSIGN(BorrowedMlirContext borrowed_context,
+                       mlir_context_pool.GetOrCreate());
+
+  ASSERT_OK_AND_ASSIGN(
+      TritonWrapperResult triton_kernel,
+      triton_fusion
+          ->GenerateTritonKernelAndWrapper(
+              *result->FusionInstr(), "test-all-gather", device_info_,
+              result->target_triple, result->data_layout,
+              std::move(borrowed_context), &kernel_compiler)
+          .Await());
 }
 
 class CollectiveEmitterParameterizedTest

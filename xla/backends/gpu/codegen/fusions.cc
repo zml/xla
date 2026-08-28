@@ -101,6 +101,9 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       case flydsl::FlyFusionRoute::kSoftmax:
         return std::make_unique<MlirKernelFusion>(
             flydsl::CreateFlyXTileSoftmaxEmitter(analysis));
+      case flydsl::FlyFusionRoute::kLayerNorm:
+        return std::make_unique<MlirKernelFusion>(
+            flydsl::CreateFlyXTileLayerNormEmitter(analysis));
       case flydsl::FlyFusionRoute::kTranspose:
         return std::make_unique<MlirKernelFusion>(
             flydsl::CreateFlyXTileTransposeEmitter(analysis));

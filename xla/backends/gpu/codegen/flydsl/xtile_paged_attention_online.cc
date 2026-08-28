@@ -133,6 +133,15 @@ Value EmitBufferStore(mlir::ImplicitLocOpBuilder& builder,
   return builder.create(state)->getResult(0);
 }
 
+Value EmitBufferCompletionTicket(mlir::ImplicitLocOpBuilder& builder,
+                                 mlir::Location location, Value tickets,
+                                 Value ticket_index) {
+  mlir::OperationState state(location, "xla_gpu.buffer_completion_ticket");
+  state.addOperands({tickets, ticket_index});
+  state.addTypes(builder.getI32Type());
+  return builder.create(state)->getResult(0);
+}
+
 Value MakeFlyIndex(mlir::ImplicitLocOpBuilder& builder, Value index) {
   if (index.getType().isIndex()) {
     index = mlir::arith::IndexCastOp::create(builder, builder.getI32Type(),
@@ -259,6 +268,12 @@ void EmitLdsWait(mlir::ImplicitLocOpBuilder& builder) {
   // consume its private probability and V slots without a workgroup barrier.
   mlir::OperationState state(builder.getLoc(), "rocdl.s.waitcnt");
   state.addAttribute("bitfield", builder.getI32IntegerAttr(0xC07F));
+  builder.create(state);
+}
+
+void EmitWaitAll(mlir::ImplicitLocOpBuilder& builder) {
+  mlir::OperationState state(builder.getLoc(), "rocdl.s.waitcnt");
+  state.addAttribute("bitfield", builder.getI32IntegerAttr(0));
   builder.create(state);
 }
 
@@ -1227,9 +1242,272 @@ class FlyXTilePagedAttentionCooperativeEmitter final
         "Fly cooperative paged attention builds its module directly.");
   }
 
+  absl::Status EmitFusedReducer(
+      mlir::ImplicitLocOpBuilder& builder,
+      mlir::func::FuncOp entry_function, Value thread_id, Value sequence,
+      Value kv_head, Value output, Value partial_output,
+      Value partial_maximum, Value partial_sum,
+      Value completion_tickets) const {
+    constexpr int64_t kReducerWidth = 32;
+    constexpr int64_t kOutputElementsPerThread =
+        kHeadSize / kReducerWidth;
+    constexpr int64_t kMaxPartsPerLane = 4;
+    TF_RET_CHECK(producer_descriptor_.fused_reducer &&
+                 producer_descriptor_.num_segments <=
+                     kReducerWidth * kMaxPartsPerLane);
+
+    mlir::Type element_type = descriptor_.element_type == BF16
+                                  ? builder.getBF16Type()
+                                  : builder.getF16Type();
+    auto f32_output_type = mlir::VectorType::get(
+        {kOutputElementsPerThread}, builder.getF32Type());
+    auto stored_output_type = mlir::VectorType::get(
+        {kOutputElementsPerThread}, element_type);
+    Value zero = F32Constant(builder, 0.0f);
+    Value one = F32Constant(builder, 1.0f);
+    Value minus_inf = NegativeInfinity(builder);
+    // Every producer lane publishes its partial output before thread zero
+    // releases the completion ticket. The last acq_rel atomic observes the
+    // complete release sequence; an LDS broadcast then lets all four 32-lane
+    // reducers consume the published partials.
+    EmitWaitAll(builder);
+    mlir::LLVM::FenceOp::create(builder,
+                                mlir::LLVM::AtomicOrdering::release,
+                                "agent-one-as");
+    mlir::gpu::BarrierOp::create(builder);
+    Value shared_previous = CreateSharedPointer(
+        builder, builder.getI32Type(), kBlockThreads);
+    Value thread_zero = mlir::arith::CmpIOp::create(
+        builder, mlir::arith::CmpIPredicate::eq, thread_id,
+        IndexConstant(builder, 0));
+    mlir::scf::IfOp increment = mlir::scf::IfOp::create(
+        builder, mlir::TypeRange{builder.getI32Type()}, thread_zero,
+        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(increment.thenBlock());
+      Value ticket_base = Mul(
+          builder,
+          Add(builder,
+              Mul(builder, sequence,
+                  IndexConstant(builder, descriptor_.kv_heads)),
+              kv_head),
+          IndexConstant(builder, 2));
+      Value previous_count = EmitBufferCompletionTicket(
+          builder, entry_function.getLoc(), completion_tickets, ticket_base);
+      mlir::scf::YieldOp::create(builder, previous_count);
+      builder.setInsertionPointToStart(increment.elseBlock());
+      Value not_last = mlir::arith::ConstantIntOp::create(
+          builder, builder.getI32Type(), -1);
+      mlir::scf::YieldOp::create(builder, mlir::ValueRange{not_last});
+    }
+    builder.setInsertionPointAfter(increment);
+    StoreSharedPointer(builder, increment.getResult(0), shared_previous,
+                       thread_id);
+    mlir::gpu::BarrierOp::create(builder);
+    mlir::LLVM::FenceOp::create(builder,
+                                mlir::LLVM::AtomicOrdering::acquire,
+                                "agent-one-as");
+    Value previous = LoadSharedPointer(builder, shared_previous,
+                                       IndexConstant(builder, 0),
+                                       builder.getI32Type());
+    Value is_last = mlir::arith::CmpIOp::create(
+        builder, mlir::arith::CmpIPredicate::eq, previous,
+        mlir::arith::ConstantIntOp::create(
+            builder, builder.getI32Type(),
+            producer_descriptor_.num_segments - 1));
+
+    mlir::scf::IfOp reduce = mlir::scf::IfOp::create(
+        builder, mlir::TypeRange{output.getType()}, is_last,
+        /*withElseRegion=*/true);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(reduce.thenBlock());
+      Value subgroup = Div(builder, thread_id, kReducerWidth);
+      Value lane = Rem(builder, thread_id, kReducerWidth);
+      Value query_head = Add(
+          builder,
+          Mul(builder, kv_head,
+              IndexConstant(builder, descriptor_.gqa_group)),
+          subgroup);
+      auto subgroup_reduce = [&](Value value, bool maximum) {
+        for (int64_t distance : {16, 8, 4, 2, 1}) {
+          Value peer = mlir::gpu::ShuffleOp::create(
+                           builder, value, distance, kReducerWidth,
+                           mlir::gpu::ShuffleMode::XOR)
+                           .getShuffleResult();
+          value = maximum
+                      ? mlir::arith::MaxNumFOp::create(builder, value, peer)
+                            .getResult()
+                      : mlir::arith::AddFOp::create(builder, value, peer)
+                            .getResult();
+        }
+        return value;
+      };
+
+      const int64_t parts_per_lane =
+          (producer_descriptor_.num_segments + kReducerWidth - 1) /
+          kReducerWidth;
+      struct PartState {
+        Value valid;
+        Value sum;
+        Value maximum;
+      };
+      auto load_part_state = [&](int64_t lane_part, int64_t cache_policy) {
+        Value part = Add(
+            builder, lane,
+            IndexConstant(builder, lane_part * kReducerWidth));
+        Value valid_index = mlir::arith::CmpIOp::create(
+            builder, mlir::arith::CmpIPredicate::ult, part,
+            IndexConstant(builder, producer_descriptor_.num_segments));
+        Value safe_part = mlir::arith::SelectOp::create(
+            builder, valid_index, part, IndexConstant(builder, 0));
+        Value partial_state_index = Add(
+            builder,
+            Mul(builder,
+                Add(builder,
+                    Mul(builder, sequence,
+                        IndexConstant(builder, descriptor_.query_heads)),
+                    query_head),
+                IndexConstant(builder, producer_descriptor_.num_segments)),
+            safe_part);
+        Value sum = EmitBufferLoad(builder, entry_function.getLoc(),
+                                   partial_sum, partial_state_index,
+                                   builder.getF32Type(), /*is_scalar=*/false,
+                                   cache_policy);
+        Value maximum = EmitBufferLoad(
+            builder, entry_function.getLoc(), partial_maximum,
+            partial_state_index, builder.getF32Type(), /*is_scalar=*/false,
+            cache_policy);
+        Value has_mass = mlir::arith::CmpFOp::create(
+            builder, mlir::arith::CmpFPredicate::OGT, sum, zero);
+        Value valid =
+            mlir::arith::AndIOp::create(builder, valid_index, has_mass);
+        return PartState{
+            valid,
+            mlir::arith::SelectOp::create(builder, valid, sum, zero),
+            mlir::arith::SelectOp::create(builder, valid, maximum,
+                                          minus_inf)};
+      };
+
+      std::vector<Value> part_valid;
+      std::vector<Value> part_sum;
+      std::vector<Value> part_maximum;
+      part_valid.reserve(parts_per_lane);
+      part_sum.reserve(parts_per_lane);
+      part_maximum.reserve(parts_per_lane);
+      Value local_max = minus_inf;
+      for (int64_t lane_part = 0; lane_part < parts_per_lane; ++lane_part) {
+        PartState state = load_part_state(lane_part, /*cache_policy=*/0);
+        part_valid.push_back(state.valid);
+        part_sum.push_back(state.sum);
+        part_maximum.push_back(state.maximum);
+        local_max = mlir::arith::MaxNumFOp::create(
+            builder, local_max, state.maximum);
+      }
+      Value global_max = subgroup_reduce(local_max, /*maximum=*/true);
+
+      std::vector<Value> part_weight;
+      part_weight.reserve(parts_per_lane);
+      Value local_sum = zero;
+      for (int64_t lane_part = 0; lane_part < parts_per_lane; ++lane_part) {
+        Value exponent = mlir::arith::SubFOp::create(
+            builder, part_maximum[lane_part], global_max);
+        Value candidate = mlir::ROCDL::ROCDLExp2::create(
+            builder, builder.getF32Type(), exponent);
+        Value scale = mlir::arith::SelectOp::create(
+            builder, part_valid[lane_part], candidate, zero);
+        part_weight.push_back(scale);
+        local_sum = mlir::arith::AddFOp::create(
+            builder, local_sum,
+            mlir::arith::MulFOp::create(builder, part_sum[lane_part], scale));
+      }
+      Value global_sum = subgroup_reduce(local_sum, /*maximum=*/false);
+      Value positive_sum = mlir::arith::CmpFOp::create(
+          builder, mlir::arith::CmpFPredicate::OGT, global_sum, zero);
+      Value safe_sum = mlir::arith::SelectOp::create(
+          builder, positive_sum, global_sum, one);
+      Value inverse_sum = mlir::ROCDL::ROCDLRcp::create(
+          builder, builder.getF32Type(), safe_sum);
+      for (Value& weight : part_weight) {
+        weight = mlir::arith::MulFOp::create(builder, weight, inverse_sum);
+      }
+
+      Value output_column = Mul(
+          builder, lane,
+          IndexConstant(builder, kOutputElementsPerThread));
+      Value result = mlir::vector::BroadcastOp::create(
+          builder, f32_output_type, zero);
+      Value subgroup_in_wave = Rem(builder, subgroup, 2);
+      for (int64_t part = 0; part < producer_descriptor_.num_segments;
+           ++part) {
+        Value source_lane = Add(
+            builder,
+            Mul(builder, subgroup_in_wave,
+                IndexConstant(builder, kReducerWidth)),
+            IndexConstant(builder, part % kReducerWidth));
+        Value source_lane_byte = mlir::arith::IndexCastOp::create(
+            builder, builder.getI32Type(),
+            Mul(builder, source_lane, IndexConstant(builder, 4)));
+        Value weight_bits = mlir::arith::BitcastOp::create(
+            builder, builder.getI32Type(),
+            part_weight[part / kReducerWidth]);
+        weight_bits = mlir::ROCDL::DsBpermuteOp::create(
+            builder, builder.getI32Type(), source_lane_byte, weight_bits);
+        Value weight = mlir::arith::BitcastOp::create(
+            builder, builder.getF32Type(), weight_bits);
+        Value partial_base = Mul(
+            builder,
+            Add(builder,
+                Mul(builder,
+                    Add(builder,
+                        Mul(builder, sequence,
+                            IndexConstant(builder, descriptor_.query_heads)),
+                        query_head),
+                    IndexConstant(builder,
+                                  producer_descriptor_.num_segments)),
+                IndexConstant(builder, part)),
+            IndexConstant(builder, kHeadSize));
+        Value partial = EmitBufferLoad(
+            builder, entry_function.getLoc(), partial_output,
+            Add(builder, partial_base, output_column), f32_output_type);
+        Value weight_vector = mlir::vector::BroadcastOp::create(
+            builder, f32_output_type, weight);
+        result = mlir::arith::AddFOp::create(
+            builder, result,
+            mlir::arith::MulFOp::create(builder, partial, weight_vector));
+      }
+      Value output_offset = Add(
+          builder,
+          Mul(builder,
+              Add(builder,
+                  Mul(builder, sequence,
+                      IndexConstant(builder, descriptor_.query_heads)),
+                  query_head),
+              IndexConstant(builder, kHeadSize)),
+          output_column);
+      Value output_value = mlir::arith::TruncFOp::create(
+          builder, stored_output_type, result);
+      Value updated_output = EmitBufferStore(
+          builder, entry_function.getLoc(), output_value, output,
+          output_offset);
+      mlir::scf::YieldOp::create(builder, updated_output);
+      builder.setInsertionPointToStart(reduce.elseBlock());
+      mlir::scf::YieldOp::create(builder, output);
+    }
+    builder.setInsertionPointAfter(reduce);
+    mlir::func::ReturnOp::create(
+        builder,
+        mlir::ValueRange{reduce.getResult(0), partial_output, partial_maximum,
+                         partial_sum, completion_tickets});
+    return absl::OkStatus();
+  }
+
   absl::Status EmitKernel(mlir::func::FuncOp entry_function) const {
     const int64_t parameter_count = descriptor_.call->parent()->num_parameters();
-    TF_RET_CHECK(entry_function.getNumArguments() == parameter_count + 3);
+    TF_RET_CHECK(entry_function.getNumArguments() ==
+                 parameter_count +
+                     (producer_descriptor_.fused_reducer ? 5 : 3));
     TF_RET_CHECK(descriptor_.query->opcode() == HloOpcode::kParameter);
     TF_RET_CHECK(descriptor_.key_cache->opcode() == HloOpcode::kParameter);
     TF_RET_CHECK(descriptor_.value_cache->opcode() == HloOpcode::kParameter);
@@ -1263,9 +1541,22 @@ class FlyXTilePagedAttentionCooperativeEmitter final
     }
     Value block_table = entry_function.getArgument(
         descriptor_.block_table->parameter_number());
-    Value partial_output = entry_function.getArgument(parameter_count);
-    Value partial_maximum = entry_function.getArgument(parameter_count + 1);
-    Value partial_sum = entry_function.getArgument(parameter_count + 2);
+    Value output;
+    const int64_t partial_output_index =
+        parameter_count + (producer_descriptor_.fused_reducer ? 1 : 0);
+    if (producer_descriptor_.fused_reducer) {
+      output = entry_function.getArgument(parameter_count);
+    }
+    Value partial_output =
+        entry_function.getArgument(partial_output_index + 0);
+    Value partial_maximum =
+        entry_function.getArgument(partial_output_index + 1);
+    Value partial_sum = entry_function.getArgument(partial_output_index + 2);
+    Value completion_tickets;
+    if (producer_descriptor_.fused_reducer) {
+      completion_tickets =
+          entry_function.getArgument(partial_output_index + 3);
+    }
 
     mlir::Type element_type = descriptor_.element_type == BF16
                                   ? builder.getBF16Type()
@@ -1901,9 +2192,15 @@ class FlyXTilePagedAttentionCooperativeEmitter final
     }
     builder.setInsertionPointAfter(output_store);
     partial_output = output_store.getResult(0);
-    mlir::func::ReturnOp::create(
-        builder,
-        mlir::ValueRange{partial_output, partial_maximum, partial_sum});
+    if (producer_descriptor_.fused_reducer) {
+      RETURN_IF_ERROR(EmitFusedReducer(
+          builder, entry_function, thread_id, sequence, kv_head, output,
+          partial_output, partial_maximum, partial_sum, completion_tickets));
+    } else {
+      mlir::func::ReturnOp::create(
+          builder,
+          mlir::ValueRange{partial_output, partial_maximum, partial_sum});
+    }
     // Match Triton's staged static bodies.  The rolling K/V pipeline still
     // consumes one 16-token tile at a time, but grouping iterations amortizes
     // loop/address control and gives LLVM enough scope to interleave the next

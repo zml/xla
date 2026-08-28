@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
+#include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
@@ -168,9 +169,15 @@ bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
 
 struct ContractingScaleInput {
   const HloInstruction* data;
+  const HloInstruction* data_parameter;
   const HloInstruction* scale;
-  int64_t broadcast_dimension;
+  const HloInstruction* scale_view;
+  std::vector<int64_t> broadcast_dimensions;
+  bool collapsed_subchannel_scale = false;
 };
+
+const HloInstruction* FindContractionInputParameter(
+    const HloInstruction& input);
 
 // Matches the BF16/F16 rounding boundary used by RMSNorm's learned weight:
 //
@@ -180,53 +187,266 @@ struct ContractingScaleInput {
 // scaled activation while preserving the multiply-before-rounding semantics.
 std::optional<ContractingScaleInput> MatchContractingScaleInput(
     const HloInstruction& input) {
-  if (!IsHalfPrecisionFloat(input.shape().element_type()) ||
-      input.opcode() != HloOpcode::kConvert || input.operand_count() != 1 ||
-      input.operand(0)->shape().element_type() != F32 ||
-      !ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape())) {
+  if (!IsHalfPrecisionFloat(input.shape().element_type())) {
     return std::nullopt;
   }
-  const HloInstruction* multiply = input.operand(0);
-  if (multiply->opcode() != HloOpcode::kMultiply ||
-      multiply->operand_count() != 2 ||
-      multiply->shape().element_type() != F32) {
-    return std::nullopt;
-  }
-  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
-    const HloInstruction* widened_data = multiply->operand(data_operand);
-    const HloInstruction* widened_broadcast =
-        multiply->operand(1 - data_operand);
-    if (widened_data->opcode() != HloOpcode::kConvert ||
-        widened_data->operand_count() != 1 ||
-        widened_data->shape().element_type() != F32 ||
-        widened_data->operand(0)->opcode() != HloOpcode::kParameter ||
-        widened_data->operand(0)->shape().element_type() !=
-            input.shape().element_type() ||
-        !ShapeUtil::SameDimensions(widened_data->shape(), input.shape()) ||
-        widened_broadcast->opcode() != HloOpcode::kConvert ||
-        widened_broadcast->operand_count() != 1 ||
-        widened_broadcast->shape().element_type() != F32) {
-      continue;
+  // After layout assignment and BF16 normalization, the same subchannel
+  // producer is represented as:
+  //
+  //   bitcast(convert<T>(multiply(convert<f32>(transpose(convert(s4))),
+  //                               convert<f32>(broadcast(transpose(scale))))))
+  //
+  // The transposes only expose the physical layout selected for the dot.  The
+  // Fly emitter recovers the original parameter coordinates from these views.
+  if (input.opcode() == HloOpcode::kBitcast && input.operand_count() == 1 &&
+      input.operand(0)->opcode() == HloOpcode::kConvert &&
+      input.operand(0)->operand_count() == 1 &&
+      input.operand(0)->shape().element_type() == input.shape().element_type() &&
+      input.operand(0)->operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand(0)->shape().element_type() == F32 &&
+      ShapeUtil::ElementsIn(input.shape()) ==
+          ShapeUtil::ElementsIn(input.operand(0)->shape())) {
+    const HloInstruction* multiply = input.operand(0)->operand(0);
+    for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+      const HloInstruction* data_f32 = multiply->operand(data_operand);
+      const HloInstruction* broadcast_f32 =
+          multiply->operand(1 - data_operand);
+      if (data_f32->opcode() != HloOpcode::kConvert ||
+          data_f32->operand_count() != 1 ||
+          data_f32->shape().element_type() != F32 ||
+          broadcast_f32->opcode() != HloOpcode::kConvert ||
+          broadcast_f32->operand_count() != 1 ||
+          broadcast_f32->shape().element_type() != F32 ||
+          !ShapeUtil::SameDimensions(data_f32->shape(), multiply->shape()) ||
+          !ShapeUtil::SameDimensions(broadcast_f32->shape(),
+                                     multiply->shape())) {
+        continue;
+      }
+
+      const HloInstruction* data = data_f32->operand(0);
+      const HloInstruction* broadcast = broadcast_f32->operand(0);
+      if (data->opcode() != HloOpcode::kTranspose ||
+          data->operand_count() != 1 ||
+          data->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(data->shape(), multiply->shape()) ||
+          broadcast->opcode() != HloOpcode::kBroadcast ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(broadcast->shape(), multiply->shape()) ||
+          broadcast->dimensions().empty()) {
+        continue;
+      }
+
+      const HloInstruction* data_parameter = data->operand(0);
+      bool has_s4_conversion = false;
+      while (data_parameter->operand_count() == 1 &&
+             (data_parameter->opcode() == HloOpcode::kConvert ||
+              data_parameter->opcode() == HloOpcode::kBitcast)) {
+        const HloInstruction* operand = data_parameter->operand(0);
+        if (data_parameter->opcode() == HloOpcode::kBitcast &&
+            (data_parameter->shape().element_type() !=
+                 operand->shape().element_type() ||
+             ShapeUtil::ElementsIn(data_parameter->shape()) !=
+                 ShapeUtil::ElementsIn(operand->shape()))) {
+          break;
+        }
+        has_s4_conversion |= operand->shape().element_type() == S4;
+        data_parameter = operand;
+      }
+      if (data_parameter->opcode() != HloOpcode::kParameter ||
+          data_parameter->shape().element_type() != S4 ||
+          !has_s4_conversion ||
+          ShapeUtil::ElementsIn(data_parameter->shape()) !=
+              ShapeUtil::ElementsIn(input.shape())) {
+        continue;
+      }
+
+      const HloInstruction* scale_view = broadcast->operand(0);
+      if (scale_view->opcode() != HloOpcode::kTranspose ||
+          scale_view->operand_count() != 1 ||
+          scale_view->shape().element_type() != input.shape().element_type()) {
+        continue;
+      }
+      const HloInstruction* scale_parameter = scale_view->operand(0);
+      while (scale_parameter->operand_count() == 1 &&
+             scale_parameter->opcode() == HloOpcode::kBitcast &&
+             scale_parameter->shape().element_type() ==
+                 scale_parameter->operand(0)->shape().element_type() &&
+             ShapeUtil::ElementsIn(scale_parameter->shape()) ==
+                 ShapeUtil::ElementsIn(scale_parameter->operand(0)->shape())) {
+        scale_parameter = scale_parameter->operand(0);
+      }
+      if (scale_parameter->opcode() != HloOpcode::kParameter ||
+          scale_parameter->shape().element_type() !=
+              input.shape().element_type() ||
+          scale_view->shape().dimensions_size() !=
+              broadcast->dimensions().size() ||
+          !std::equal(scale_view->shape().dimensions().begin(),
+                      scale_view->shape().dimensions().end(),
+                      broadcast->dimensions().begin(),
+                      [&](int64_t scale_size, int64_t input_dimension) {
+                        return scale_size == multiply->shape().dimensions(
+                                                 input_dimension);
+                      })) {
+        continue;
+      }
+      return ContractingScaleInput{
+          data,
+          data_parameter,
+          scale_parameter,
+          scale_view,
+          std::vector<int64_t>(broadcast->dimensions().begin(),
+                               broadcast->dimensions().end()),
+          /*collapsed_subchannel_scale=*/true};
     }
-    const HloInstruction* broadcast = widened_broadcast->operand(0);
+  }
+  // Triton's subchannel dequantization grammar applies a scale before a
+  // bitcast collapses [batch, group, block, row] into [batch, k, row]:
+  //
+  //   bitcast(multiply(convert(bitcast(convert(s4))),
+  //                    broadcast(bitcast(scale))))
+  //
+  // Keep the physical views explicit in the match. The emitter uses them to
+  // recover the scale coordinate for each final contraction coordinate.
+  if (input.opcode() == HloOpcode::kBitcast && input.operand_count() == 1 &&
+      input.operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand_count() == 2 &&
+      ShapeUtil::ElementsIn(input.shape()) ==
+          ShapeUtil::ElementsIn(input.operand(0)->shape())) {
+    const HloInstruction* multiply = input.operand(0);
+    for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+      const HloInstruction* data = multiply->operand(data_operand);
+      const HloInstruction* broadcast = multiply->operand(1 - data_operand);
+      if (data->shape().element_type() != input.shape().element_type() ||
+          broadcast->opcode() != HloOpcode::kBroadcast ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(data->shape(), multiply->shape()) ||
+          !ShapeUtil::SameDimensions(broadcast->shape(), multiply->shape()) ||
+          broadcast->dimensions().empty()) {
+        continue;
+      }
+
+      const HloInstruction* data_parameter = data;
+      bool has_s4_conversion = false;
+      while (data_parameter->operand_count() == 1 &&
+             (data_parameter->opcode() == HloOpcode::kConvert ||
+              data_parameter->opcode() == HloOpcode::kBitcast)) {
+        const HloInstruction* operand = data_parameter->operand(0);
+        if (data_parameter->opcode() == HloOpcode::kBitcast &&
+            (data_parameter->shape().element_type() !=
+                 operand->shape().element_type() ||
+             ShapeUtil::ElementsIn(data_parameter->shape()) !=
+                 ShapeUtil::ElementsIn(operand->shape()))) {
+          break;
+        }
+        has_s4_conversion |= operand->shape().element_type() == S4;
+        data_parameter = operand;
+      }
+      if (data_parameter->opcode() != HloOpcode::kParameter ||
+          data_parameter->shape().element_type() != S4 ||
+          !has_s4_conversion ||
+          ShapeUtil::ElementsIn(data_parameter->shape()) !=
+              ShapeUtil::ElementsIn(input.shape())) {
+        continue;
+      }
+
+      const HloInstruction* scale_view = broadcast->operand(0);
+      const HloInstruction* scale_parameter = scale_view;
+      while (scale_parameter->operand_count() == 1 &&
+             scale_parameter->opcode() == HloOpcode::kBitcast &&
+             scale_parameter->shape().element_type() ==
+                 scale_parameter->operand(0)->shape().element_type() &&
+             ShapeUtil::ElementsIn(scale_parameter->shape()) ==
+                 ShapeUtil::ElementsIn(scale_parameter->operand(0)->shape())) {
+        scale_parameter = scale_parameter->operand(0);
+      }
+      if (scale_parameter->opcode() != HloOpcode::kParameter ||
+          scale_parameter->shape().element_type() !=
+              input.shape().element_type() ||
+          scale_view->shape().dimensions_size() !=
+              broadcast->dimensions().size() ||
+          !std::equal(scale_view->shape().dimensions().begin(),
+                      scale_view->shape().dimensions().end(),
+                      broadcast->dimensions().begin(),
+                      [&](int64_t scale_size, int64_t input_dimension) {
+                        return scale_size == multiply->shape().dimensions(
+                                                 input_dimension);
+                      })) {
+        continue;
+      }
+      return ContractingScaleInput{
+          data,
+          data_parameter,
+          scale_parameter,
+          scale_view,
+          std::vector<int64_t>(broadcast->dimensions().begin(),
+                               broadcast->dimensions().end()),
+          /*collapsed_subchannel_scale=*/true};
+    }
+  }
+  const bool direct_half_multiply =
+      input.opcode() == HloOpcode::kMultiply && input.operand_count() == 2;
+  const bool rounded_f32_multiply =
+      input.opcode() == HloOpcode::kConvert && input.operand_count() == 1 &&
+      input.operand(0)->shape().element_type() == F32 &&
+      ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape()) &&
+      input.operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand_count() == 2;
+  if (!direct_half_multiply && !rounded_f32_multiply) {
+    return std::nullopt;
+  }
+  const HloInstruction* multiply =
+      direct_half_multiply ? &input : input.operand(0);
+  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+    const HloInstruction* data = multiply->operand(data_operand);
+    const HloInstruction* broadcast = multiply->operand(1 - data_operand);
+    if (rounded_f32_multiply) {
+      if (data->opcode() != HloOpcode::kConvert ||
+          data->operand_count() != 1 || data->shape().element_type() != F32 ||
+          !ShapeUtil::SameDimensions(data->shape(), input.shape()) ||
+          broadcast->opcode() != HloOpcode::kConvert ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != F32) {
+        continue;
+      }
+      data = data->operand(0);
+      broadcast = broadcast->operand(0);
+    }
     if (broadcast->opcode() != HloOpcode::kBroadcast ||
         broadcast->operand_count() != 1 ||
         broadcast->shape().element_type() != input.shape().element_type() ||
         !ShapeUtil::SameDimensions(broadcast->shape(), input.shape()) ||
-        broadcast->dimensions().size() != 1) {
+        broadcast->dimensions().empty()) {
+      continue;
+    }
+    const HloInstruction* data_parameter =
+        FindContractionInputParameter(*data);
+    if (data->shape().element_type() != input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(data->shape(), input.shape()) ||
+        data_parameter == nullptr ||
+        (data_parameter->shape().element_type() !=
+             input.shape().element_type() &&
+         data_parameter->shape().element_type() != S4)) {
       continue;
     }
     const HloInstruction* scale = broadcast->operand(0);
-    const int64_t broadcast_dimension = broadcast->dimensions(0);
     if (scale->opcode() != HloOpcode::kParameter ||
-        scale->shape().dimensions_size() != 1 ||
+        scale->shape().dimensions_size() != broadcast->dimensions().size() ||
         scale->shape().element_type() != input.shape().element_type() ||
-        scale->shape().dimensions(0) !=
-            input.shape().dimensions(broadcast_dimension)) {
+        !std::equal(scale->shape().dimensions().begin(),
+                    scale->shape().dimensions().end(),
+                    broadcast->dimensions().begin(),
+                    [&](int64_t scale_size, int64_t input_dimension) {
+                      return scale_size ==
+                             input.shape().dimensions(input_dimension);
+                    })) {
       continue;
     }
-    return ContractingScaleInput{widened_data->operand(0), scale,
-                                 broadcast_dimension};
+    return ContractingScaleInput{
+        data, data_parameter, scale, scale,
+        std::vector<int64_t>(broadcast->dimensions().begin(),
+                             broadcast->dimensions().end())};
   }
   return std::nullopt;
 }
@@ -240,6 +460,10 @@ const HloInstruction* FindContractionInputParameter(
   }
   const std::optional<ContractingScaleInput> contracting_scale =
       MatchContractingScaleInput(input);
+  if (contracting_scale.has_value() &&
+      contracting_scale->collapsed_subchannel_scale) {
+    return contracting_scale->data_parameter;
+  }
   const HloInstruction* value =
       contracting_scale.has_value() ? contracting_scale->data : &input;
   bool has_conversion = false;
@@ -248,6 +472,7 @@ const HloInstruction* FindContractionInputParameter(
   bool physical_mapping_from_bitcast = false;
   bool has_static_slice = false;
   bool has_dynamic_slice = false;
+  bool has_batch_inner_transpose = false;
   while (value->opcode() == HloOpcode::kBitcast ||
          value->opcode() == HloOpcode::kConvert ||
          value->opcode() == HloOpcode::kSlice ||
@@ -266,6 +491,7 @@ const HloInstruction* FindContractionInputParameter(
       }
       has_input_view = true;
       physical_mapping_fixed = true;
+      has_batch_inner_transpose = true;
     } else if (value->opcode() == HloOpcode::kBitcast) {
       if (value->shape().element_type() != operand->shape().element_type() ||
           ShapeUtil::ElementsIn(value->shape()) !=
@@ -328,9 +554,13 @@ const HloInstruction* FindContractionInputParameter(
   }
   const PrimitiveType parameter_type = value->shape().element_type();
   if (parameter_type == S4) {
-    // Sub-byte views need nibble-aware physical offsets. Admit only direct
-    // dequantization until those views are represented explicitly.
-    return contraction_type == BF16 && has_conversion && !has_input_view
+    // Zero-offset batch-inner transposes preserve an element-addressable S4
+    // view and are needed by channel-scaled batched dequantization. Slices and
+    // dynamic offsets still require a separate nibble-aware representation.
+    return contraction_type == BF16 && has_conversion &&
+                   (!has_input_view ||
+                    (has_batch_inner_transpose && !has_static_slice &&
+                     !has_dynamic_slice))
                ? value
                : nullptr;
   }
@@ -458,20 +688,39 @@ bool IsGlobalSplitKContraction(const HloInstruction& dot) {
 }
 
 bool IsBatchedContraction(const HloInstruction& dot) {
-  if (dot.shape().dimensions_size() != 3) {
+  const int64_t output_rank = dot.shape().dimensions_size();
+  if (output_rank < 3) {
     return false;
   }
   const DotDimensionNumbers& dims = dot.dot_dimension_numbers();
-  return dims.lhs_batch_dimensions_size() == 1 &&
-         dims.rhs_batch_dimensions_size() == 1 &&
-         dims.lhs_batch_dimensions(0) == 0 &&
-         dims.rhs_batch_dimensions(0) == 0 &&
-         dims.lhs_contracting_dimensions_size() == 1 &&
-         dims.rhs_contracting_dimensions_size() == 1 &&
-         (dims.lhs_contracting_dimensions(0) == 1 ||
-          dims.lhs_contracting_dimensions(0) == 2) &&
-         (dims.rhs_contracting_dimensions(0) == 1 ||
-          dims.rhs_contracting_dimensions(0) == 2);
+  const int64_t batch_rank = output_rank - 2;
+  if (dims.lhs_batch_dimensions_size() != batch_rank ||
+      dims.rhs_batch_dimensions_size() != batch_rank ||
+      dims.lhs_contracting_dimensions_size() != 1 ||
+      dims.rhs_contracting_dimensions_size() != 1) {
+    return false;
+  }
+  const int64_t lhs_contracting = dims.lhs_contracting_dimensions(0);
+  const int64_t rhs_contracting = dims.rhs_contracting_dimensions(0);
+  if (absl::c_linear_search(dims.lhs_batch_dimensions(), lhs_contracting) ||
+      absl::c_linear_search(dims.rhs_batch_dimensions(), rhs_contracting)) {
+    return false;
+  }
+  for (int64_t batch = 0; batch < batch_rank; ++batch) {
+    const int64_t lhs_dimension = dims.lhs_batch_dimensions(batch);
+    const int64_t rhs_dimension = dims.rhs_batch_dimensions(batch);
+    if (lhs_dimension < 0 ||
+        lhs_dimension >= dot.operand(0)->shape().dimensions_size() ||
+        rhs_dimension < 0 ||
+        rhs_dimension >= dot.operand(1)->shape().dimensions_size() ||
+        dot.shape().dimensions(batch) !=
+            dot.operand(0)->shape().dimensions(lhs_dimension) ||
+        dot.shape().dimensions(batch) !=
+            dot.operand(1)->shape().dimensions(rhs_dimension)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool IsSupportedContraction(const HloInstruction& dot) {
@@ -526,13 +775,13 @@ bool IsSupportedContraction(const HloInstruction& dot) {
     default:
       return false;
   }
-  if ((rank != 2 && rank != 3) ||
+  if (rank < 2 ||
       dot.operand(0)->shape().dimensions_size() != rank ||
       dot.operand(1)->shape().dimensions_size() != rank ||
       (!is_bf16 && !is_f16 && !is_f32 && !is_fp8 && !is_int8) ||
       (is_int4 &&
-       (rank != 2 || is_scaled_dot || dot.shape().dimensions(0) == 1 ||
-        dot.shape().dimensions(1) == 1)) ||
+       (is_scaled_dot || dot.shape().dimensions(rank - 2) == 1 ||
+        dot.shape().dimensions(rank - 1) == 1)) ||
       !IsSupportedContractionInput(*dot.operand(0)) ||
       !IsSupportedContractionInput(*dot.operand(1)) ||
       (dot.shape().element_type() != F32 &&
@@ -551,12 +800,34 @@ bool IsSupportedContraction(const HloInstruction& dot) {
       MatchContractingScaleInput(*dot.operand(0));
   const std::optional<ContractingScaleInput> rhs_contracting_scale =
       MatchContractingScaleInput(*dot.operand(1));
-  if (rhs_contracting_scale.has_value() ||
-      (lhs_contracting_scale.has_value() &&
-       (dot.shape().dimensions(rank - 2) > 8 ||
-        dot.shape().dimensions(rank - 1) <= 1 ||
-        lhs_contracting_scale->broadcast_dimension !=
-            dims.lhs_contracting_dimensions(0)))) {
+  bool supported_lhs_scale = !lhs_contracting_scale.has_value();
+  if (lhs_contracting_scale.has_value()) {
+    const std::vector<int64_t>& scale_dimensions =
+        lhs_contracting_scale->broadcast_dimensions;
+    const int64_t lhs_contracting = dims.lhs_contracting_dimensions(0);
+    int64_t lhs_noncontracting = -1;
+    for (int64_t dimension = 0;
+         dimension < dot.operand(0)->shape().dimensions_size(); ++dimension) {
+      if (dimension != lhs_contracting &&
+          !absl::c_linear_search(dims.lhs_batch_dimensions(), dimension)) {
+        lhs_noncontracting = dimension;
+        break;
+      }
+    }
+    const bool contracting_scale =
+        scale_dimensions == std::vector<int64_t>{lhs_contracting};
+    const bool s4_channel_scale =
+        IsS4DequantizedInput(*dot.operand(0)) &&
+        !absl::c_linear_search(scale_dimensions, lhs_contracting) &&
+        absl::c_linear_search(scale_dimensions, lhs_noncontracting);
+    supported_lhs_scale =
+        (lhs_contracting_scale->collapsed_subchannel_scale &&
+         IsS4DequantizedInput(*dot.operand(0))) ||
+        (contracting_scale && dot.shape().dimensions(rank - 2) <= 8 &&
+         dot.shape().dimensions(rank - 1) > 1) ||
+        s4_channel_scale;
+  }
+  if (rhs_contracting_scale.has_value() || !supported_lhs_scale) {
     return false;
   }
   if (is_scaled_dot) {
@@ -564,7 +835,7 @@ bool IsSupportedContraction(const HloInstruction& dot) {
     const int64_t n = dot.shape().dimensions(rank - 1);
     const bool uniform_scale =
         IsUniformScale(*dot.operand(2)) && IsUniformScale(*dot.operand(3));
-    if (is_f32 || is_int8 || (rank == 3 && !IsBatchedContraction(dot)) ||
+    if (is_f32 || is_int8 || (rank >= 3 && !IsBatchedContraction(dot)) ||
         ((m == 1 || n == 1) && !uniform_scale) ||
         !ScaledDotKBlockSize(dot).has_value()) {
       return false;
@@ -884,10 +1155,11 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                        dot->operand(1)->shape().element_type() == S8;
   const bool is_int4 = IsS4DequantizedInput(*dot->operand(0)) ||
                        IsS4DequantizedInput(*dot->operand(1));
-  const bool rank_three = dot->shape().dimensions_size() == 3;
+  const int64_t output_rank = dot->shape().dimensions_size();
+  const bool rank_three = output_rank == 3;
   const bool global_split_k = IsGlobalSplitKContraction(*dot);
-  const int64_t m = dot->shape().dimensions(rank_three ? 1 : 0);
-  const int64_t n = dot->shape().dimensions(rank_three ? 2 : 1);
+  const int64_t m = dot->shape().dimensions(output_rank - 2);
+  const int64_t n = dot->shape().dimensions(output_rank - 1);
   const int64_t k = dot->operand(0)->shape().dimensions(
       dot->dot_dimension_numbers().lhs_contracting_dimensions(0));
   const int64_t lhs_contracting_dimension =
@@ -920,7 +1192,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const bool rhs_column_contiguous =
       rhs_noncontracting_dimension >= 0 &&
       IsDimensionContiguous(*dot->operand(1), rhs_noncontracting_dimension);
-  const bool has_lhs_contracting_scale =
+  const bool has_lhs_input_scale =
       MatchContractingScaleInput(*dot->operand(0)).has_value();
   const std::optional<ConcatInputInfo> lhs_concat =
       FindSupportedConcatInput(*dot->operand(0));
@@ -1328,11 +1600,11 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     // candidates below use the packed dword loads shared by the specialized
     // BF16 schedules to overlap dequantization with MFMA work.
     for (int64_t block_m : kBlockSizes) {
-      if (block_m > m || m % block_m != 0) {
+      if (block_m > m && block_m / 2 >= m && block_m != 16) {
         continue;
       }
       for (int64_t block_n : kBlockSizes) {
-        if (block_n > n || n % block_n != 0) {
+        if (block_n > n && block_n / 2 >= n && block_n != 16) {
           continue;
         }
         for (int64_t block_k : {32, 64, 128, 256}) {
@@ -1362,9 +1634,14 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
               const int64_t block_threads = num_warps * 64;
               const int64_t staged_lds_bytes =
                   2 * (block_m + block_n) * block_k * sizeof(uint16_t);
+              const bool supports_staged_output_tile =
+                  (m >= block_m && n >= block_n) ||
+                  (m >= 2 && m <= 8 && block_m == 16 &&
+                   n % block_n == 0);
               if ((block_m * block_k / 2) % block_threads == 0 &&
                   (block_n * block_k / 2) % block_threads == 0 &&
-                  staged_lds_bytes <= 64 * 1024) {
+                  staged_lds_bytes <= 64 * 1024 &&
+                  supports_staged_output_tile) {
                 for (int32_t waves_per_eu : {0, 2, 4}) {
                   for (bool schedule : {false, true}) {
                     configs.push_back(MakeConfig(
@@ -1451,7 +1728,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
     // N-contiguous inputs benefit from FlyDSL's square MFMA32 double buffer:
     // stage packed rows while preloaded LDS fragments feed the current tile.
-    if (!rhs_k_contiguous && m % 128 == 0 && n % 128 == 0 && k % 64 == 0) {
+    if (!rhs_k_contiguous && !has_lhs_input_scale && m % 128 == 0 &&
+        n % 128 == 0 && k % 64 == 0) {
       for (bool stage_output : {false, true}) {
         if (stage_output && output_element_type != BF16) {
           continue;
@@ -1847,10 +2125,10 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       if ((block_n > n && block_n / 2 >= n) || n % block_n != 0) {
         continue;
       }
-      if (has_lhs_contracting_scale && block_n > 64) {
+      if (has_lhs_input_scale && block_n > 64) {
         continue;
       }
-      if (has_lhs_contracting_scale && k % block_k != 0) {
+      if (has_lhs_input_scale && k % block_k != 0) {
         continue;
       }
       configs.insert(
@@ -1883,15 +2161,14 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
       configs.insert(
           configs.begin(),
           MakeConfig(/*block_m=*/16, /*block_n=*/64, /*block_k=*/128,
-                     /*num_warps=*/4,
-                     FlyGemmConfig::FLY_MFMA_16X16X16,
+                     /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_16X16X16,
                      /*prefetch_rhs=*/false, /*stage_output=*/false,
                      /*waves_per_eu=*/0, /*schedule_instructions=*/true,
                      /*stage_rhs=*/true, /*async_lhs=*/false,
                      /*preload_lds_fragments=*/true));
     }
   }
-  if (has_lhs_contracting_scale) {
+  if (has_lhs_input_scale) {
     if (dot->shape().dimensions_size() == 2 && m == 4 && n % 128 == 0 &&
         k % 128 == 0 && rhs_column_contiguous &&
         dot->operand(0)->shape().element_type() == BF16 &&
@@ -2001,7 +2278,7 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     }
     if (m == 4 && n % 64 == 0 && k >= 128 && rhs_column_contiguous && !is_f32 &&
         !is_fp8 && !is_int4 && !is_block_scaled_dot &&
-        !has_lhs_contracting_scale &&
+        !has_lhs_input_scale &&
         dot->operand(0)->shape().element_type() == BF16 &&
         dot->operand(1)->shape().element_type() == BF16) {
       // Decoder MLP-down dots put their real batch dimension between M and K,
@@ -2738,7 +3015,8 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
       fusion_config->mutable_block_level_fusion_config();
   block_config->Clear();
   Tile* output_tile = block_config->add_output_tiles();
-  if (output_rank == 3) {
+  for (int64_t batch_dimension = 0; batch_dimension < output_rank - 2;
+       ++batch_dimension) {
     output_tile->add_sizes(1);
   }
   output_tile->add_sizes(fly_config.block_m());
@@ -2796,6 +3074,9 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
     return true;
   }
   if (flydsl::IsFlySoftmaxFusion(analysis)) {
+    return true;
+  }
+  if (flydsl::IsFlyLayerNormFusion(analysis)) {
     return true;
   }
   if (flydsl::IsFlyXTileTransposeFusion(analysis)) {
@@ -2897,6 +3178,12 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       for (int64_t waves_per_eu : {0, 1, 2, 4}) {
         auto config = std::make_unique<BackendConfig>();
         BlockLevelFusionConfig* block = config->mutable_block_level();
+        if (producer->fused_reducer) {
+          Tile* final_tile = block->add_output_tiles();
+          final_tile->add_sizes(1);
+          final_tile->add_sizes(1);
+          final_tile->add_sizes(producer->attention.head_dimension);
+        }
         Tile* output_tile = block->add_output_tiles();
         output_tile->add_sizes(1);
         output_tile->add_sizes(1);
@@ -2908,11 +3195,16 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
           state_tile->add_sizes(1);
           state_tile->add_sizes(1);
         }
-        block->set_num_warps(
-            (producer->attention.max_context >= 65536 ||
-             producer->segment_tokens <= 64)
-                ? 2
-                : 4);
+        if (producer->fused_reducer) {
+          Tile* ticket_tile = block->add_output_tiles();
+          ticket_tile->add_sizes(1);
+          ticket_tile->add_sizes(1);
+          ticket_tile->add_sizes(1);
+        }
+        block->set_num_warps((producer->attention.max_context >= 65536 ||
+                              producer->segment_tokens <= 64)
+                                 ? 2
+                                 : 4);
         block->set_num_ctas(1);
         block->set_num_stages(num_stages);
         block->set_waves_per_eu(waves_per_eu);
@@ -2966,7 +3258,8 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     }
     return configs;
   }
-  if (flydsl::IsFlySoftmaxFusion(analysis)) {
+  if (flydsl::IsFlySoftmaxFusion(analysis) ||
+      flydsl::IsFlyLayerNormFusion(analysis)) {
     const Shape& shape = analysis.first_result_shape();
     const int64_t rank = shape.dimensions_size();
     const int64_t columns = shape.dimensions(rank - 1);
@@ -3002,20 +3295,34 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
         flydsl::GetFlyXTileTransposeMatrixShape(analysis);
     TF_RET_CHECK(matrix_shape.has_value());
     auto [rows, columns] = *matrix_shape;
-    for (int64_t tile_rows : {32, 64, 128}) {
-      for (int64_t tile_columns : {32, 64, 128}) {
-        if (rows % tile_rows != 0 || columns % tile_columns != 0) {
+    const int64_t element_bits =
+        primitive_util::BitWidth(analysis.first_result_shape().element_type());
+    const int64_t vector_width = 128 / element_bits;
+    const int64_t maximum_tile_elements = 65536 * 8 / element_bits;
+    for (int64_t tile_rows :
+         {32, 64, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416}) {
+      for (int64_t tile_columns : {32, 64, 128, 256}) {
+        if (tile_rows > rows || tile_columns > columns ||
+            (tile_rows + (element_bits == 32 ? 2 : 0)) * tile_columns >
+                maximum_tile_elements) {
           continue;
         }
-        auto config = std::make_unique<BackendConfig>();
-        BlockLevelFusionConfig* block = config->mutable_block_level();
-        Tile* tile = block->add_output_tiles();
-        tile->add_sizes(tile_rows);
-        tile->add_sizes(tile_columns);
-        block->set_num_warps(tile_rows * tile_columns / 1024);
-        block->set_num_ctas(1);
-        block->set_num_stages(1);
-        configs.push_back(std::move(config));
+        for (int64_t vectors_per_thread : {2, 4}) {
+          const int64_t threads = tile_rows * tile_columns /
+                                  (vectors_per_thread * vector_width);
+          if (threads < 64 || threads > 1024 || threads % 64 != 0) {
+            continue;
+          }
+          auto config = std::make_unique<BackendConfig>();
+          BlockLevelFusionConfig* block = config->mutable_block_level();
+          Tile* tile = block->add_output_tiles();
+          tile->add_sizes(tile_rows);
+          tile->add_sizes(tile_columns);
+          block->set_num_warps(threads / 64);
+          block->set_num_ctas(1);
+          block->set_num_stages(1);
+          configs.push_back(std::move(config));
+        }
       }
     }
     return configs;
@@ -3231,6 +3538,15 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
                             hlo_query::GetFirstInstructionWithOpcode(
                                 *instr.fused_instructions_computation(),
                                 HloOpcode::kDynamicSlice) != nullptr);
+  const bool has_native_minor_strided_slice =
+      is_native_indexed &&
+      absl::c_any_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* instruction) {
+            return instruction->opcode() == HloOpcode::kSlice &&
+                   !instruction->slice_strides().empty() &&
+                   instruction->slice_strides().back() > 1;
+          });
   const bool is_native_dynamic_update =
       is_native_indexed && hlo_query::GetFirstInstructionWithOpcode(
                                *instr.fused_instructions_computation(),
@@ -3253,6 +3569,11 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
       hlo_query::GetFirstInstructionWithOpcode(
           *instr.fused_instructions_computation(),
           HloOpcode::kReduceWindow) != nullptr;
+  const bool is_native_data_moving_transpose =
+      is_native_indexed &&
+      hlo_query::GetFirstInstructionWithOpcode(
+          *instr.fused_instructions_computation(), HloOpcode::kTranspose) !=
+          nullptr;
   auto storage_bit_width = [](PrimitiveType type) {
     // XLA's device ABI stores PRED as one byte even though its logical value
     // has one bit.
@@ -3401,7 +3722,51 @@ FlyFusionBackend::GetSupportedConfigs(const HloInstruction& instr) {
         }
       }
     }
+    if (is_native_data_moving_transpose) {
+      // A data-moving transpose either preserves a contiguous physical-minor
+      // input dimension or gathers lanes from a short packed span. Interleave
+      // 64- and 128-bit copies and small/large CTAs in the ordinary top-eight
+      // budget so neither rank-3 case is forced into one geometry.
+      constexpr std::array<std::array<int64_t, 3>, 8> kTransposeConfigs = {{
+          {1, 2, 64},
+          {1, 2, 128},
+          {1, 4, 64},
+          {1, 4, 128},
+          {2, 2, 64},
+          {2, 4, 64},
+          {1, 8, 64},
+          {1, 8, 128},
+      }};
+      for (const auto& [unroll, num_warps, vector_size_bits] :
+           kTransposeConfigs) {
+        add_config(unroll, num_warps, vector_size_bits);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
+    }
     if (is_native_slice) {
+      if (has_native_minor_strided_slice) {
+        // Minor-stride slices gather several logical lanes from one physical
+        // span.  Prefer narrower outputs and tune occupancy explicitly: the
+        // emitter can service a 64-bit BF16 output with one 128-bit packed
+        // load, while 128-bit output vectors require scalar gathers.
+        for (int64_t waves_per_eu : {0, 1, 2, 4}) {
+          add_config(/*unroll=*/1, /*num_warps=*/8,
+                     /*vector_size_bits=*/64, waves_per_eu);
+        }
+        add_config(/*unroll=*/2, /*num_warps=*/8,
+                   /*vector_size_bits=*/64);
+        add_config(/*unroll=*/1, /*num_warps=*/4,
+                   /*vector_size_bits=*/64);
+        add_config(/*unroll=*/1, /*num_warps=*/8,
+                   /*vector_size_bits=*/32);
+        add_config(/*unroll=*/2, /*num_warps=*/8,
+                   /*vector_size_bits=*/32);
+        if (configs.size() >= max_elementwise_configs) {
+          return configs;
+        }
+      }
       // Contiguous slices have no boundary scalarization in the main vector
       // loop. Start with the measured eight-wave/128-bit winner, including
       // occupancy requests, then keep both copy widths and nearby unrolls in

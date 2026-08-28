@@ -40,6 +40,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/gpu/codegen/flydsl/compiler.h"
 #include "xla/codegen/emitters/kernel_api_builder.h"
+#include "xla/codegen/emitters/type_util.h"
 #include "xla/codegen/ir_emission_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -55,8 +56,6 @@ namespace {
 
 using mlir::Value;
 
-constexpr int64_t kVectorWidth = 8;
-
 struct TransposeDescription {
   const HloInstruction* parameter = nullptr;
   int64_t batch_count = 0;
@@ -69,7 +68,16 @@ struct TransposeDescription {
   int64_t input_offset = 0;
   int64_t qkv_selector = -1;
   int64_t qkv_count = 0;
+  PrimitiveType element_type = BF16;
 };
+
+bool IsSupportedTransposeType(PrimitiveType type) {
+  return type == F16 || type == BF16 || type == F32;
+}
+
+int64_t TransposeElementBits(PrimitiveType type) {
+  return type == F32 ? 32 : 16;
+}
 
 bool HasDescendingLayout(const Shape& shape) {
   if (!shape.has_layout() ||
@@ -103,32 +111,51 @@ bool HasDimensions(const HloInstruction& instruction,
 std::optional<TransposeDescription> MatchTransposeRoot(
     const HloInstruction& root) {
   if (root.opcode() != HloOpcode::kTranspose || root.operand_count() != 1 ||
-      root.shape().element_type() != BF16 ||
+      !IsSupportedTransposeType(root.shape().element_type()) ||
       !HasDescendingLayout(root.shape())) {
     return std::nullopt;
   }
 
   const HloInstruction* input = root.operand(0);
-  if (root.shape().dimensions_size() == 2 && HasDimensions(root, {1, 0}) &&
-      input->opcode() == HloOpcode::kParameter &&
-      input->shape().element_type() == BF16 &&
-      input->shape().dimensions_size() == 2 &&
+  // A leading rotation [D0,...,Dn] -> [Dn,D0,...,D(n-1)] is physically one
+  // [prod(D0..D(n-1)), Dn] matrix transpose. Flattening the prefix lets the
+  // LDS path cover ordinary 2D transposes and Triton's rank-3 rotating form
+  // with the same tiled kernel.
+  const int64_t rank = root.shape().dimensions_size();
+  if (rank >= 2 && input->opcode() == HloOpcode::kParameter &&
+      input->shape().element_type() == root.shape().element_type() &&
+      input->shape().dimensions_size() == rank &&
       HasDescendingLayout(input->shape()) &&
-      root.shape().dimensions(0) == input->shape().dimensions(1) &&
-      root.shape().dimensions(1) == input->shape().dimensions(0)) {
-    const int64_t rows = input->shape().dimensions(0);
-    const int64_t columns = input->shape().dimensions(1);
-    return TransposeDescription{/*parameter=*/input,
-                                /*batch_count=*/1,
-                                /*rows=*/rows,
-                                /*columns=*/columns,
-                                /*input_row_stride=*/columns,
-                                /*input_group_size=*/1,
-                                /*input_group_stride=*/rows * columns,
-                                /*input_matrix_stride=*/0,
-                                /*input_offset=*/0,
-                                /*qkv_selector=*/-1,
-                                /*qkv_count=*/0};
+      root.dimensions().size() == rank && root.dimensions(0) == rank - 1) {
+    bool is_leading_rotation = true;
+    int64_t rows = 1;
+    for (int64_t dimension = 0; dimension < rank; ++dimension) {
+      const int64_t expected_input_dimension =
+          dimension == 0 ? rank - 1 : dimension - 1;
+      is_leading_rotation &=
+          root.dimensions(dimension) == expected_input_dimension &&
+          root.shape().dimensions(dimension) ==
+              input->shape().dimensions(expected_input_dimension);
+      if (dimension + 1 < rank) {
+        rows *= input->shape().dimensions(dimension);
+      }
+    }
+    const int64_t columns = input->shape().dimensions(rank - 1);
+    if (is_leading_rotation && rows > 0 && columns > 0) {
+      return TransposeDescription{
+          /*parameter=*/input,
+          /*batch_count=*/1,
+          /*rows=*/rows,
+          /*columns=*/columns,
+          /*input_row_stride=*/columns,
+          /*input_group_size=*/1,
+          /*input_group_stride=*/rows * columns,
+          /*input_matrix_stride=*/0,
+          /*input_offset=*/0,
+          /*qkv_selector=*/-1,
+          /*qkv_count=*/0,
+          /*element_type=*/root.shape().element_type()};
+    }
   }
 
   // Attention context changes [B,H,D,S] into [B,S,H,D]. Physically this is a
@@ -285,6 +312,7 @@ std::optional<std::vector<TransposeDescription>> MatchTransposes(
         description.input_group_size != first.input_group_size ||
         description.input_group_stride != first.input_group_stride ||
         description.input_matrix_stride != first.input_matrix_stride ||
+        description.element_type != first.element_type ||
         description.qkv_count != 3 || description.qkv_selector < 0 ||
         description.qkv_selector >= 3 || selectors[description.qkv_selector]) {
       return std::nullopt;
@@ -327,6 +355,10 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
         MatchTransposes(analysis);
     CHECK(descriptions.has_value());
     descriptions_ = std::move(*descriptions);
+    element_type_ = descriptions_.front().element_type;
+    element_bits_ = TransposeElementBits(element_type_);
+    vector_width_ = 128 / element_bits_;
+    elements_per_word_ = 32 / element_bits_;
     rows_ = descriptions_.front().rows;
     columns_ = descriptions_.front().columns;
     const BlockLevelFusionConfig& config =
@@ -335,14 +367,26 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     CHECK_EQ(config.output_tiles(0).sizes_size(), 2);
     tile_rows_ = config.output_tiles(0).sizes(0);
     tile_columns_ = config.output_tiles(0).sizes(1);
-    CHECK(tile_rows_ == 32 || tile_rows_ == 64 || tile_rows_ == 128);
-    CHECK(tile_columns_ == 32 || tile_columns_ == 64 ||
-          tile_columns_ == 128);
-    threads_ = tile_rows_ * tile_columns_ / (2 * kVectorWidth);
-    CHECK_EQ(config.num_warps() * 64, threads_);
+    CHECK_GE(tile_rows_, 32);
+    CHECK_LE(tile_rows_, 512);
+    CHECK_EQ(tile_rows_ % 32, 0);
+    CHECK_GE(tile_columns_, 32);
+    CHECK_LE(tile_columns_, 512);
+    CHECK_EQ(tile_columns_ % 32, 0);
+    threads_ = config.num_warps() * 64;
+    CHECK_LE(threads_, 1024);
+    CHECK_EQ((tile_rows_ * tile_columns_) % (threads_ * vector_width_), 0);
+    vectors_per_thread_ =
+        tile_rows_ * tile_columns_ / (threads_ * vector_width_);
+    CHECK(vectors_per_thread_ == 2 || vectors_per_thread_ == 4);
+    CHECK_EQ(vectors_per_thread_ % elements_per_word_, 0);
+    const int64_t row_tile_count =
+        (rows_ + tile_rows_ - 1) / tile_rows_;
+    const int64_t column_tile_count =
+        (columns_ + tile_columns_ - 1) / tile_columns_;
     launch_dimensions_ = LaunchDimensions(
-        se::BlockDim(descriptions_.front().batch_count * (rows_ / tile_rows_) *
-                         (columns_ / tile_columns_),
+        se::BlockDim(descriptions_.front().batch_count * row_tile_count *
+                         column_tile_count,
                      1, 1),
         se::ThreadDim(threads_, 1, 1));
   }
@@ -402,26 +446,38 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     // workgroup order used by Triton's transpose emitter: the input row tile
     // varies fastest, so neighboring workgroups write neighboring output
     // column tiles instead of regions separated by an entire output row.
-    const int64_t row_tile_count = rows_ / tile_rows_;
-    const int64_t column_tile_count = columns_ / tile_columns_;
+    const int64_t row_tile_count =
+        (rows_ + tile_rows_ - 1) / tile_rows_;
+    const int64_t column_tile_count =
+        (columns_ + tile_columns_ - 1) / tile_columns_;
     const int64_t tiles_per_matrix = row_tile_count * column_tile_count;
     Value matrix = Div(builder, block_id, tiles_per_matrix);
     Value matrix_tile = Rem(builder, block_id, tiles_per_matrix);
     Value block_row = Rem(builder, matrix_tile, row_tile_count);
     Value block_column = Div(builder, matrix_tile, row_tile_count);
-    Value input_row_base = Mul(builder, block_row, tile_rows_);
-    Value input_column_base = Mul(builder, block_column, tile_columns_);
-
-    Value local_row_pair =
-        Div(builder, thread_id, tile_columns_ / kVectorWidth);
+    Value input_row_base = mlir::arith::MinUIOp::create(
+        builder, Mul(builder, block_row, tile_rows_),
+        IndexConstant(builder, rows_ - tile_rows_));
+    Value input_column_base = mlir::arith::MinUIOp::create(
+        builder, Mul(builder, block_column, tile_columns_),
+        IndexConstant(builder, columns_ - tile_columns_));
+    const int64_t column_vectors = tile_columns_ / vector_width_;
+    const int64_t row_group_stride =
+        elements_per_word_ == 1 ? threads_ / column_vectors : 1;
+    Value local_row_group_base =
+        Div(builder, thread_id, column_vectors);
+    if (elements_per_word_ != 1) {
+      local_row_group_base =
+          Mul(builder, local_row_group_base,
+              vectors_per_thread_ / elements_per_word_);
+    }
     Value vector_group =
-        Rem(builder, thread_id, tile_columns_ / kVectorWidth);
-    Value local_column = Mul(builder, vector_group, kVectorWidth);
-    Value first_input_row = Mul(builder, local_row_pair, 2);
-    Value second_input_row =
-        Add(builder, first_input_row, IndexConstant(builder, 1));
+        Rem(builder, thread_id, column_vectors);
+    Value local_column = Mul(builder, vector_group, vector_width_);
+    mlir::Type scalar_type =
+        emitters::PrimitiveTypeToMlirType(element_type_, builder);
     auto vector_type =
-        mlir::VectorType::get({kVectorWidth}, builder.getBF16Type());
+        mlir::VectorType::get({vector_width_}, scalar_type);
     auto tile_buffer_load = [&](Value source, Value vector_index,
                                 Value tile_index) {
       mlir::OperationState state(entry_function.getLoc(),
@@ -440,37 +496,51 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
       return builder.create(state)->getResult(0);
     };
 
-    // Store adjacent input rows as packed dwords. The physical slot XORs the
-    // row pair with a four-bank rotation per eight input columns. Stores then
-    // hit every LDS bank exactly twice per wave (the wave64 minimum), while
-    // four adjacent row pairs remain a contiguous 128-bit output read.
-    const int64_t row_pairs = tile_rows_ / 2;
-    auto shared_type = mlir::RankedTensorType::get({tile_columns_ * row_pairs},
-                                                   builder.getI32Type());
+    // Store adjacent 16-bit input rows as packed dwords. The physical slot
+    // XORs the row pair with a four-bank rotation per input vector. F32 uses
+    // rows striped across the participating threads and two padding words per
+    // shared row. This is the same conflict-minimizing geometry as Triton's
+    // transpose: a Wave64 reaches every LDS bank exactly twice while four
+    // adjacent rows remain one 128-bit output read.
+    const int64_t row_groups = tile_rows_ / elements_per_word_;
+    const int64_t shared_row_stride =
+        row_groups + (elements_per_word_ == 1 ? 2 : 0);
+    auto shared_type = mlir::RankedTensorType::get(
+        {tile_columns_ * shared_row_stride}, builder.getI32Type());
     Value shared = AllocateSharedOp::create(builder, shared_type);
-    auto pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
+    auto word_elements_type =
+        mlir::VectorType::get({elements_per_word_}, scalar_type);
     auto word_vector_type = mlir::VectorType::get({1}, builder.getI32Type());
 
-    Value output_local_row =
-        Div(builder, thread_id, tile_rows_ / kVectorWidth);
-    Value second_output_local_row =
-        Add(builder, output_local_row,
-            IndexConstant(builder, tile_columns_ / 2));
+    Value output_local_row_base =
+        Div(builder, thread_id, tile_rows_ / vector_width_);
     Value output_local_column =
-        Mul(builder, Rem(builder, thread_id, tile_rows_ / kVectorWidth),
-            kVectorWidth);
+        Mul(builder, Rem(builder, thread_id, tile_rows_ / vector_width_),
+            vector_width_);
     auto packed_words_type =
-        mlir::VectorType::get({kVectorWidth / 2}, builder.getI32Type());
+        mlir::VectorType::get({vector_width_ / elements_per_word_},
+                              builder.getI32Type());
     auto read_output = [&](Value row) {
-      Value pair_start = Div(builder, output_local_column, 2);
-      Value column_group_rotation = Mul(builder, Div(builder, row, 8), 4);
-      if (tile_columns_ > tile_rows_) {
-        column_group_rotation =
-            Rem(builder, column_group_rotation, row_pairs);
+      Value word_start =
+          Div(builder, output_local_column, elements_per_word_);
+      const int64_t words_per_vector = vector_width_ / elements_per_word_;
+      Value physical_word = word_start;
+      if (elements_per_word_ != 1) {
+        Value column_group_rotation =
+            Mul(builder, Div(builder, row, vector_width_), words_per_vector);
+        if (tile_columns_ > tile_rows_) {
+          column_group_rotation =
+              Rem(builder, column_group_rotation, row_groups);
+        }
+        physical_word =
+            (row_groups & (row_groups - 1)) == 0
+                ? Xor(builder, word_start, column_group_rotation)
+                : Rem(builder,
+                      Add(builder, word_start, column_group_rotation),
+                      row_groups);
       }
-      Value physical_pair = Xor(builder, pair_start, column_group_rotation);
       Value shared_read_index =
-          Add(builder, Mul(builder, row, row_pairs), physical_pair);
+          Add(builder, Mul(builder, row, shared_row_stride), physical_word);
       Value packed_words = mlir::vector::TransferReadOp::create(
           builder, packed_words_type, shared,
           mlir::ValueRange{shared_read_index}, /*padding=*/std::nullopt,
@@ -507,50 +577,84 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
         return Add(builder, Mul(builder, row, description.input_row_stride),
                    local_column);
       };
-      Value first_loaded = tile_buffer_load(
-          input, input_local_index(first_input_row), input_tile_base);
-      Value second_loaded = tile_buffer_load(
-          input, input_local_index(second_input_row), input_tile_base);
-
-      for (int64_t element = 0; element < kVectorWidth; ++element) {
-        Value first_scalar = mlir::vector::ExtractOp::create(
-            builder, first_loaded, llvm::ArrayRef<int64_t>{element});
-        Value second_scalar = mlir::vector::ExtractOp::create(
-            builder, second_loaded, llvm::ArrayRef<int64_t>{element});
-        Value pair = mlir::vector::FromElementsOp::create(
-            builder, pair_type, mlir::ValueRange{first_scalar, second_scalar});
-        Value word_vector =
-            mlir::vector::BitCastOp::create(builder, word_vector_type, pair);
-        Value word = mlir::vector::ExtractOp::create(
-            builder, word_vector, llvm::ArrayRef<int64_t>{0});
-        Value column =
-            Add(builder, local_column, IndexConstant(builder, element));
-        Value column_group_rotation =
-            Mul(builder, Div(builder, column, 8), 4);
-        if (tile_columns_ > tile_rows_) {
-          column_group_rotation =
-              Rem(builder, column_group_rotation, row_pairs);
+      for (int64_t group_index = 0;
+           group_index < vectors_per_thread_ / elements_per_word_;
+           ++group_index) {
+        Value local_row_group =
+            Add(builder, local_row_group_base,
+                IndexConstant(builder, group_index * row_group_stride));
+        Value first_input_row =
+            Mul(builder, local_row_group, elements_per_word_);
+        llvm::SmallVector<Value> loaded_rows;
+        loaded_rows.reserve(elements_per_word_);
+        for (int64_t row = 0; row < elements_per_word_; ++row) {
+          Value input_row = first_input_row;
+          if (row != 0) {
+            input_row = Add(builder, first_input_row,
+                            IndexConstant(builder, row));
+          }
+          loaded_rows.push_back(tile_buffer_load(
+              input, input_local_index(input_row), input_tile_base));
         }
-        Value physical_pair =
-            Xor(builder, local_row_pair, column_group_rotation);
-        Value shared_write_index =
-            Add(builder, Mul(builder, column, row_pairs), physical_pair);
-        shared = mlir::tensor::InsertOp::create(
-            builder, word, shared, mlir::ValueRange{shared_write_index});
+
+        for (int64_t element = 0; element < vector_width_; ++element) {
+          llvm::SmallVector<Value> word_elements;
+          word_elements.reserve(elements_per_word_);
+          for (Value loaded : loaded_rows) {
+            word_elements.push_back(mlir::vector::ExtractOp::create(
+                builder, loaded, llvm::ArrayRef<int64_t>{element}));
+          }
+          Value packed_elements = mlir::vector::FromElementsOp::create(
+              builder, word_elements_type, word_elements);
+          Value word_vector =
+              mlir::vector::BitCastOp::create(builder, word_vector_type,
+                                              packed_elements);
+          Value word = mlir::vector::ExtractOp::create(
+              builder, word_vector, llvm::ArrayRef<int64_t>{0});
+          Value column =
+              Add(builder, local_column, IndexConstant(builder, element));
+          Value physical_word = local_row_group;
+          if (elements_per_word_ != 1) {
+            const int64_t words_per_vector =
+                vector_width_ / elements_per_word_;
+            Value column_group_rotation = Mul(
+                builder, Div(builder, column, vector_width_),
+                words_per_vector);
+            if (tile_columns_ > tile_rows_) {
+              column_group_rotation =
+                  Rem(builder, column_group_rotation, row_groups);
+            }
+            physical_word =
+                (row_groups & (row_groups - 1)) == 0
+                    ? Xor(builder, local_row_group, column_group_rotation)
+                    : Rem(builder,
+                          Add(builder, local_row_group, column_group_rotation),
+                          row_groups);
+          }
+          Value shared_write_index =
+              Add(builder, Mul(builder, column, shared_row_stride),
+                  physical_word);
+          shared = mlir::tensor::InsertOp::create(
+              builder, word, shared, mlir::ValueRange{shared_write_index});
+        }
       }
       shared =
           SyncThreadsOp::create(builder, mlir::TypeRange{shared_type}, shared)
               .getResult(0);
 
-      Value first_transposed = read_output(output_local_row);
-      Value second_transposed = read_output(second_output_local_row);
       Value output = entry_function.getArgument(1 + output_index);
-      output = tile_buffer_store(first_transposed, output,
-                                 output_local_index(output_local_row),
-                                 output_tile_base);
-      output = tile_buffer_store(second_transposed, output,
-                                 output_local_index(second_output_local_row),
-                                 output_tile_base);
+      for (int64_t vector_index = 0;
+           vector_index < vectors_per_thread_; ++vector_index) {
+        Value output_local_row = Add(
+            builder, output_local_row_base,
+            IndexConstant(builder,
+                          vector_index * tile_columns_ /
+                              vectors_per_thread_));
+        Value transposed = read_output(output_local_row);
+        Value vector_offset = output_local_index(output_local_row);
+        output = tile_buffer_store(transposed, output, vector_offset,
+                                   output_tile_base);
+      }
       outputs.push_back(output);
 
       // The next Q/K/V phase reuses the same LDS allocation. Synchronize after
@@ -565,11 +669,16 @@ class FlyXTileTransposeEmitter final : public MlirKernelEmitter {
     return absl::OkStatus();
   }
 
+  PrimitiveType element_type_ = PRIMITIVE_TYPE_INVALID;
+  int64_t element_bits_ = 0;
+  int64_t vector_width_ = 0;
+  int64_t elements_per_word_ = 0;
   int64_t rows_ = 0;
   int64_t columns_ = 0;
   int64_t tile_rows_ = 0;
   int64_t tile_columns_ = 0;
   int64_t threads_ = 0;
+  int64_t vectors_per_thread_ = 0;
   std::vector<TransposeDescription> descriptions_;
   LaunchDimensions launch_dimensions_;
 };
@@ -581,9 +690,8 @@ std::optional<std::pair<int64_t, int64_t>> GetFlyXTileTransposeMatrixShape(
   std::optional<std::vector<TransposeDescription>> descriptions =
       MatchTransposes(analysis);
   if (!descriptions.has_value() || descriptions->empty() ||
-      descriptions->front().rows <= 0 || descriptions->front().columns <= 0 ||
-      descriptions->front().rows % 32 != 0 ||
-      descriptions->front().columns % 32 != 0) {
+      descriptions->front().rows < 32 ||
+      descriptions->front().columns < 32) {
     return std::nullopt;
   }
   return std::pair<int64_t, int64_t>{descriptions->front().rows,
@@ -609,14 +717,28 @@ bool IsFlyXTileTransposeConfigSupported(const HloFusionAnalysis& analysis) {
   const int64_t tile_rows = config.output_tiles(0).sizes(0);
   const int64_t tile_columns = config.output_tiles(0).sizes(1);
   const auto is_supported_tile_extent = [](int64_t extent) {
-    return extent == 32 || extent == 64 || extent == 128;
+    return extent >= 32 && extent <= 512 && extent % 32 == 0;
   };
   auto [rows, columns] = *matrix_shape;
-  return is_supported_tile_extent(tile_rows) &&
-         is_supported_tile_extent(tile_columns) && rows % tile_rows == 0 &&
-         columns % tile_columns == 0 &&
-         config.num_warps() * 64 ==
-             tile_rows * tile_columns / (2 * kVectorWidth);
+  const int64_t element_bits =
+      TransposeElementBits(analysis.first_result_shape().element_type());
+  const int64_t vector_width = 128 / element_bits;
+  const int64_t maximum_tile_elements = 65536 * 8 / element_bits;
+  const int64_t shared_tile_elements =
+      (tile_rows + (element_bits == 32 ? 2 : 0)) * tile_columns;
+  const int64_t threads = config.num_warps() * 64;
+  const int64_t tile_elements = tile_rows * tile_columns;
+  if (!is_supported_tile_extent(tile_rows) ||
+      !is_supported_tile_extent(tile_columns) || tile_rows > rows ||
+      tile_columns > columns ||
+      shared_tile_elements > maximum_tile_elements ||
+      threads <= 0 || threads > 1024 ||
+      tile_elements % (threads * vector_width) != 0) {
+    return false;
+  }
+  const int64_t vectors_per_thread =
+      tile_elements / (threads * vector_width);
+  return vectors_per_thread == 2 || vectors_per_thread == 4;
 }
 
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileTransposeEmitter(

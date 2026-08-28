@@ -1321,6 +1321,11 @@ ENTRY triton_computation {
   TF_ASSERT_OK_AND_ASSIGN(TestedInstruction ti, ParseTemplateAndGetInstruction(
                                                     kHloTestTemplate, data_type,
                                                     HloOpcode::kAllGather));
+  ti.Module()
+      ->mutable_config()
+      .mutable_debug_options()
+      .add_xla_gpu_experimental_use_collective_kernels(
+          DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER);
   RunSupportTest(std::move(ti), /*output_tile_sizes=*/{2, 2}, cc);
 }
 

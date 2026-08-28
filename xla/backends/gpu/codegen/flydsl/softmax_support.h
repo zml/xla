@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_CODEGEN_FLYDSL_SOFTMAX_SUPPORT_H_
 #define XLA_BACKENDS_GPU_CODEGEN_FLYDSL_SOFTMAX_SUPPORT_H_
 
+#include <cstdint>
+
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
@@ -44,6 +46,12 @@ bool FlySoftmaxRecomputesMaximumAfterExternalRowOffset(
 // softmax result is narrowed to F16/BF16. Compound attention uses this to see
 // canonical select(-inf) masks instead of treating them as external inputs.
 const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root);
+
+// Generalized compound-softmax matcher for a specified logical reduction
+// dimension. Attention layouts can keep the key dimension non-minor while
+// still representing exactly the same stable row softmax.
+const HloInstruction* GetFlyCompoundSoftmaxInputAlongDimension(
+    const HloInstruction& root, int64_t reduction_dimension);
 
 // Recognizes the canonical row-wise F16, BF16, or F32 softmax produced by XLA:
 // optional conversion to FP32, row maximum, exp, row sum, normalize, and an

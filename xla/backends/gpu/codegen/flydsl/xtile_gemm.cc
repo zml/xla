@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/AsmParser/AsmParser.h"
@@ -294,59 +295,381 @@ bool IsSupportedBatchInnerTranspose(const HloInstruction& transpose) {
 
 struct ContractingScaleInput {
   const HloInstruction* data;
+  const HloInstruction* data_parameter;
   const HloInstruction* scale;
-  int64_t broadcast_dimension;
+  const HloInstruction* scale_view;
+  std::vector<int64_t> broadcast_dimensions;
+  bool collapsed_subchannel_scale = false;
+  const HloInstruction* multiply = nullptr;
+  std::vector<int64_t> data_parameter_strides_from_input;
+  std::vector<int64_t> scale_parameter_strides_from_view;
 };
+
+std::optional<std::vector<int64_t>>
+MapBitcastTransposeInputToParameterStrides(
+    const Shape& input_shape, const Shape& multiply_shape,
+    const HloInstruction& data_transpose) {
+  if (!input_shape.has_layout() || !multiply_shape.has_layout() ||
+      data_transpose.opcode() != HloOpcode::kTranspose ||
+      data_transpose.operand_count() != 1 ||
+      ShapeUtil::ElementsIn(input_shape) !=
+          ShapeUtil::ElementsIn(multiply_shape) ||
+      !ShapeUtil::SameDimensions(data_transpose.shape(), multiply_shape)) {
+    return std::nullopt;
+  }
+  const std::vector<int64_t> input_strides = PhysicalStrides(input_shape);
+  const std::vector<int64_t> multiply_strides =
+      PhysicalStrides(multiply_shape);
+  const std::vector<int64_t> parameter_strides =
+      PhysicalStrides(data_transpose.operand(0)->shape());
+  if (data_transpose.dimensions().size() != multiply_strides.size() ||
+      parameter_strides.size() != multiply_strides.size()) {
+    return std::nullopt;
+  }
+
+  auto mapped_linear = [&](absl::Span<const int64_t> input_indices) {
+    int64_t input_linear = 0;
+    for (int64_t dimension = 0; dimension < input_indices.size();
+         ++dimension) {
+      input_linear += input_indices[dimension] * input_strides[dimension];
+    }
+    int64_t parameter_linear = 0;
+    for (int64_t dimension = 0; dimension < multiply_strides.size();
+         ++dimension) {
+      const int64_t coordinate =
+          (input_linear / multiply_strides[dimension]) %
+          multiply_shape.dimensions(dimension);
+      parameter_linear +=
+          coordinate *
+          parameter_strides[data_transpose.dimensions(dimension)];
+    }
+    return parameter_linear;
+  };
+
+  std::vector<int64_t> mapped_strides(input_shape.dimensions_size(), 0);
+  std::vector<int64_t> indices(input_shape.dimensions_size(), 0);
+  for (int64_t dimension = 0; dimension < input_shape.dimensions_size();
+       ++dimension) {
+    if (input_shape.dimensions(dimension) > 1) {
+      indices[dimension] = 1;
+      mapped_strides[dimension] = mapped_linear(indices);
+      indices[dimension] = 0;
+    }
+  }
+
+  // A bitcast can split and merge dimensions. Validate representative carry
+  // boundaries before treating the resulting parameter address as a strided
+  // view of the dot input.
+  std::vector<std::vector<int64_t>> samples(input_shape.dimensions_size());
+  for (int64_t dimension = 0; dimension < input_shape.dimensions_size();
+       ++dimension) {
+    const int64_t size = input_shape.dimensions(dimension);
+    samples[dimension] = {0};
+    if (size > 1) samples[dimension].push_back(1);
+    if (size > 2) samples[dimension].push_back(size / 2);
+    if (size > 3) samples[dimension].push_back(size - 1);
+  }
+  bool valid = true;
+  auto validate_samples = [&](auto&& self, int64_t dimension) -> void {
+    if (!valid) return;
+    if (dimension == input_shape.dimensions_size()) {
+      int64_t strided_linear = 0;
+      for (int64_t index = 0; index < indices.size(); ++index) {
+        strided_linear += indices[index] * mapped_strides[index];
+      }
+      valid = mapped_linear(indices) == strided_linear;
+      return;
+    }
+    for (int64_t sample : samples[dimension]) {
+      indices[dimension] = sample;
+      self(self, dimension + 1);
+    }
+    indices[dimension] = 0;
+  };
+  validate_samples(validate_samples, 0);
+  return valid ? std::optional<std::vector<int64_t>>(mapped_strides)
+               : std::nullopt;
+}
 
 std::optional<ContractingScaleInput> MatchContractingScaleInput(
     const HloInstruction& input) {
-  if (!IsHalfPrecisionFloat(input.shape().element_type()) ||
-      input.opcode() != HloOpcode::kConvert || input.operand_count() != 1 ||
-      input.operand(0)->shape().element_type() != F32 ||
-      !ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape())) {
+  if (!IsHalfPrecisionFloat(input.shape().element_type())) {
     return std::nullopt;
   }
-  const HloInstruction* multiply = input.operand(0);
-  if (multiply->opcode() != HloOpcode::kMultiply ||
-      multiply->operand_count() != 2 ||
-      multiply->shape().element_type() != F32) {
-    return std::nullopt;
-  }
-  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
-    const HloInstruction* widened_data = multiply->operand(data_operand);
-    const HloInstruction* widened_broadcast =
-        multiply->operand(1 - data_operand);
-    if (widened_data->opcode() != HloOpcode::kConvert ||
-        widened_data->operand_count() != 1 ||
-        widened_data->shape().element_type() != F32 ||
-        widened_data->operand(0)->opcode() != HloOpcode::kParameter ||
-        widened_data->operand(0)->shape().element_type() !=
-            input.shape().element_type() ||
-        !ShapeUtil::SameDimensions(widened_data->shape(), input.shape()) ||
-        widened_broadcast->opcode() != HloOpcode::kConvert ||
-        widened_broadcast->operand_count() != 1 ||
-        widened_broadcast->shape().element_type() != F32) {
-      continue;
+  if (input.opcode() == HloOpcode::kBitcast && input.operand_count() == 1 &&
+      input.operand(0)->opcode() == HloOpcode::kConvert &&
+      input.operand(0)->operand_count() == 1 &&
+      input.operand(0)->shape().element_type() == input.shape().element_type() &&
+      input.operand(0)->operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand(0)->shape().element_type() == F32 &&
+      ShapeUtil::ElementsIn(input.shape()) ==
+          ShapeUtil::ElementsIn(input.operand(0)->shape())) {
+    const HloInstruction* multiply = input.operand(0)->operand(0);
+    for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+      const HloInstruction* data_f32 = multiply->operand(data_operand);
+      const HloInstruction* broadcast_f32 =
+          multiply->operand(1 - data_operand);
+      if (data_f32->opcode() != HloOpcode::kConvert ||
+          data_f32->operand_count() != 1 ||
+          data_f32->shape().element_type() != F32 ||
+          broadcast_f32->opcode() != HloOpcode::kConvert ||
+          broadcast_f32->operand_count() != 1 ||
+          broadcast_f32->shape().element_type() != F32 ||
+          !ShapeUtil::SameDimensions(data_f32->shape(), multiply->shape()) ||
+          !ShapeUtil::SameDimensions(broadcast_f32->shape(),
+                                     multiply->shape())) {
+        continue;
+      }
+
+      const HloInstruction* data = data_f32->operand(0);
+      const HloInstruction* broadcast = broadcast_f32->operand(0);
+      if (data->opcode() != HloOpcode::kTranspose ||
+          data->operand_count() != 1 ||
+          data->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(data->shape(), multiply->shape()) ||
+          broadcast->opcode() != HloOpcode::kBroadcast ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(broadcast->shape(), multiply->shape()) ||
+          broadcast->dimensions().empty()) {
+        continue;
+      }
+
+      const HloInstruction* data_parameter = data->operand(0);
+      bool has_s4_conversion = false;
+      while (data_parameter->operand_count() == 1 &&
+             (data_parameter->opcode() == HloOpcode::kConvert ||
+              data_parameter->opcode() == HloOpcode::kBitcast)) {
+        const HloInstruction* operand = data_parameter->operand(0);
+        if (data_parameter->opcode() == HloOpcode::kBitcast &&
+            (data_parameter->shape().element_type() !=
+                 operand->shape().element_type() ||
+             ShapeUtil::ElementsIn(data_parameter->shape()) !=
+                 ShapeUtil::ElementsIn(operand->shape()))) {
+          break;
+        }
+        has_s4_conversion |= operand->shape().element_type() == S4;
+        data_parameter = operand;
+      }
+      if (data_parameter->opcode() != HloOpcode::kParameter ||
+          data_parameter->shape().element_type() != S4 ||
+          !has_s4_conversion ||
+          ShapeUtil::ElementsIn(data_parameter->shape()) !=
+              ShapeUtil::ElementsIn(input.shape())) {
+        continue;
+      }
+
+      const HloInstruction* scale_view = broadcast->operand(0);
+      if (scale_view->opcode() != HloOpcode::kTranspose ||
+          scale_view->operand_count() != 1 ||
+          scale_view->shape().element_type() != input.shape().element_type()) {
+        continue;
+      }
+      const HloInstruction* scale_parameter = scale_view->operand(0);
+      while (scale_parameter->operand_count() == 1 &&
+             scale_parameter->opcode() == HloOpcode::kBitcast &&
+             scale_parameter->shape().element_type() ==
+                 scale_parameter->operand(0)->shape().element_type() &&
+             ShapeUtil::ElementsIn(scale_parameter->shape()) ==
+                 ShapeUtil::ElementsIn(scale_parameter->operand(0)->shape())) {
+        scale_parameter = scale_parameter->operand(0);
+      }
+      if (scale_parameter->opcode() != HloOpcode::kParameter ||
+          scale_parameter->shape().element_type() !=
+              input.shape().element_type() ||
+          scale_view->shape().dimensions_size() !=
+              broadcast->dimensions().size() ||
+          !std::equal(scale_view->shape().dimensions().begin(),
+                      scale_view->shape().dimensions().end(),
+                      broadcast->dimensions().begin(),
+                      [&](int64_t scale_size, int64_t input_dimension) {
+                        return scale_size == multiply->shape().dimensions(
+                                                 input_dimension);
+                      })) {
+        continue;
+      }
+
+      std::optional<std::vector<int64_t>> data_strides =
+          MapBitcastTransposeInputToParameterStrides(
+              input.shape(), multiply->shape(), *data);
+      if (!data_strides.has_value()) {
+        continue;
+      }
+      const std::vector<int64_t> scale_operand_strides =
+          PhysicalStrides(scale_view->operand(0)->shape());
+      if (scale_view->dimensions().size() != scale_operand_strides.size()) {
+        continue;
+      }
+      std::vector<int64_t> scale_strides(scale_view->dimensions().size());
+      for (int64_t dimension = 0; dimension < scale_strides.size();
+           ++dimension) {
+        scale_strides[dimension] =
+            scale_operand_strides[scale_view->dimensions(dimension)];
+      }
+
+      ContractingScaleInput result{
+          data,
+          data_parameter,
+          scale_parameter,
+          scale_view,
+          std::vector<int64_t>(broadcast->dimensions().begin(),
+                               broadcast->dimensions().end()),
+          /*collapsed_subchannel_scale=*/true};
+      result.multiply = multiply;
+      result.data_parameter_strides_from_input = std::move(*data_strides);
+      result.scale_parameter_strides_from_view = std::move(scale_strides);
+      return result;
     }
-    const HloInstruction* broadcast = widened_broadcast->operand(0);
+  }
+  if (input.opcode() == HloOpcode::kBitcast && input.operand_count() == 1 &&
+      input.operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand_count() == 2 &&
+      ShapeUtil::ElementsIn(input.shape()) ==
+          ShapeUtil::ElementsIn(input.operand(0)->shape())) {
+    const HloInstruction* multiply = input.operand(0);
+    for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+      const HloInstruction* data = multiply->operand(data_operand);
+      const HloInstruction* broadcast = multiply->operand(1 - data_operand);
+      if (data->shape().element_type() != input.shape().element_type() ||
+          broadcast->opcode() != HloOpcode::kBroadcast ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != input.shape().element_type() ||
+          !ShapeUtil::SameDimensions(data->shape(), multiply->shape()) ||
+          !ShapeUtil::SameDimensions(broadcast->shape(), multiply->shape()) ||
+          broadcast->dimensions().empty()) {
+        continue;
+      }
+
+      const HloInstruction* data_parameter = data;
+      bool has_s4_conversion = false;
+      while (data_parameter->operand_count() == 1 &&
+             (data_parameter->opcode() == HloOpcode::kConvert ||
+              data_parameter->opcode() == HloOpcode::kBitcast)) {
+        const HloInstruction* operand = data_parameter->operand(0);
+        if (data_parameter->opcode() == HloOpcode::kBitcast &&
+            (data_parameter->shape().element_type() !=
+                 operand->shape().element_type() ||
+             ShapeUtil::ElementsIn(data_parameter->shape()) !=
+                 ShapeUtil::ElementsIn(operand->shape()))) {
+          break;
+        }
+        has_s4_conversion |= operand->shape().element_type() == S4;
+        data_parameter = operand;
+      }
+      if (data_parameter->opcode() != HloOpcode::kParameter ||
+          data_parameter->shape().element_type() != S4 ||
+          !has_s4_conversion ||
+          ShapeUtil::ElementsIn(data_parameter->shape()) !=
+              ShapeUtil::ElementsIn(input.shape())) {
+        continue;
+      }
+
+      const HloInstruction* scale_view = broadcast->operand(0);
+      const HloInstruction* scale_parameter = scale_view;
+      while (scale_parameter->operand_count() == 1 &&
+             scale_parameter->opcode() == HloOpcode::kBitcast &&
+             scale_parameter->shape().element_type() ==
+                 scale_parameter->operand(0)->shape().element_type() &&
+             ShapeUtil::ElementsIn(scale_parameter->shape()) ==
+                 ShapeUtil::ElementsIn(scale_parameter->operand(0)->shape())) {
+        scale_parameter = scale_parameter->operand(0);
+      }
+      if (scale_parameter->opcode() != HloOpcode::kParameter ||
+          scale_parameter->shape().element_type() !=
+              input.shape().element_type() ||
+          scale_view->shape().dimensions_size() !=
+              broadcast->dimensions().size() ||
+          !std::equal(scale_view->shape().dimensions().begin(),
+                      scale_view->shape().dimensions().end(),
+                      broadcast->dimensions().begin(),
+                      [&](int64_t scale_size, int64_t input_dimension) {
+                        return scale_size == multiply->shape().dimensions(
+                                                 input_dimension);
+                      })) {
+        continue;
+      }
+      ContractingScaleInput result{
+          data,
+          data_parameter,
+          scale_parameter,
+          scale_view,
+          std::vector<int64_t>(broadcast->dimensions().begin(),
+                               broadcast->dimensions().end()),
+          /*collapsed_subchannel_scale=*/true};
+      result.multiply = multiply;
+      return result;
+    }
+  }
+  const bool direct_half_multiply =
+      input.opcode() == HloOpcode::kMultiply && input.operand_count() == 2;
+  const bool rounded_f32_multiply =
+      input.opcode() == HloOpcode::kConvert && input.operand_count() == 1 &&
+      input.operand(0)->shape().element_type() == F32 &&
+      ShapeUtil::SameDimensions(input.shape(), input.operand(0)->shape()) &&
+      input.operand(0)->opcode() == HloOpcode::kMultiply &&
+      input.operand(0)->operand_count() == 2;
+  if (!direct_half_multiply && !rounded_f32_multiply) {
+    return std::nullopt;
+  }
+  const HloInstruction* multiply =
+      direct_half_multiply ? &input : input.operand(0);
+  for (int64_t data_operand = 0; data_operand < 2; ++data_operand) {
+    const HloInstruction* data = multiply->operand(data_operand);
+    const HloInstruction* broadcast = multiply->operand(1 - data_operand);
+    if (rounded_f32_multiply) {
+      if (data->opcode() != HloOpcode::kConvert ||
+          data->operand_count() != 1 || data->shape().element_type() != F32 ||
+          !ShapeUtil::SameDimensions(data->shape(), input.shape()) ||
+          broadcast->opcode() != HloOpcode::kConvert ||
+          broadcast->operand_count() != 1 ||
+          broadcast->shape().element_type() != F32) {
+        continue;
+      }
+      data = data->operand(0);
+      broadcast = broadcast->operand(0);
+    }
     if (broadcast->opcode() != HloOpcode::kBroadcast ||
         broadcast->operand_count() != 1 ||
         broadcast->shape().element_type() != input.shape().element_type() ||
         !ShapeUtil::SameDimensions(broadcast->shape(), input.shape()) ||
-        broadcast->dimensions().size() != 1) {
+        broadcast->dimensions().empty()) {
+      continue;
+    }
+    if (data->shape().element_type() != input.shape().element_type() ||
+        !ShapeUtil::SameDimensions(data->shape(), input.shape())) {
+      continue;
+    }
+    const HloInstruction* data_parameter = data;
+    while (data_parameter->operand_count() == 1 &&
+           (data_parameter->opcode() == HloOpcode::kConvert ||
+            data_parameter->opcode() == HloOpcode::kBitcast ||
+            data_parameter->opcode() == HloOpcode::kTranspose ||
+            data_parameter->opcode() == HloOpcode::kSlice)) {
+      data_parameter = data_parameter->operand(0);
+    }
+    if (data_parameter->opcode() != HloOpcode::kParameter ||
+        (data_parameter->shape().element_type() !=
+             input.shape().element_type() &&
+         data_parameter->shape().element_type() != S4)) {
       continue;
     }
     const HloInstruction* scale = broadcast->operand(0);
-    const int64_t broadcast_dimension = broadcast->dimensions(0);
     if (scale->opcode() != HloOpcode::kParameter ||
-        scale->shape().dimensions_size() != 1 ||
+        scale->shape().dimensions_size() != broadcast->dimensions().size() ||
         scale->shape().element_type() != input.shape().element_type() ||
-        scale->shape().dimensions(0) !=
-            input.shape().dimensions(broadcast_dimension)) {
+        !std::equal(scale->shape().dimensions().begin(),
+                    scale->shape().dimensions().end(),
+                    broadcast->dimensions().begin(),
+                    [&](int64_t scale_size, int64_t input_dimension) {
+                      return scale_size ==
+                             input.shape().dimensions(input_dimension);
+                    })) {
       continue;
     }
-    return ContractingScaleInput{widened_data->operand(0), scale,
-                                 broadcast_dimension};
+    return ContractingScaleInput{
+        data, data_parameter, scale, scale,
+        std::vector<int64_t>(broadcast->dimensions().begin(),
+                             broadcast->dimensions().end())};
   }
   return std::nullopt;
 }
@@ -366,7 +689,15 @@ struct ContractionInput {
   std::vector<int64_t> dynamic_offset_limits;
   int64_t scale_parameter_number = -1;
   PrimitiveType scale_parameter_type = PRIMITIVE_TYPE_INVALID;
-  int64_t scale_broadcast_dimension = -1;
+  std::vector<int64_t> scale_broadcast_dimensions;
+  bool scale_collapsed_subchannel = false;
+  std::vector<int64_t> scale_input_physical_strides;
+  std::vector<int64_t> scale_broadcast_shape_dimensions;
+  std::vector<int64_t> scale_broadcast_shape_physical_strides;
+  std::vector<int64_t> scale_view_shape_dimensions;
+  std::vector<int64_t> scale_view_shape_physical_strides;
+  std::vector<int64_t> scale_parameter_shape_dimensions;
+  std::vector<int64_t> scale_parameter_shape_physical_strides;
 };
 
 ContractionInput FindContractionInput(const HloInstruction& input) {
@@ -446,6 +777,48 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
   }
   const std::optional<ContractingScaleInput> contracting_scale =
       MatchContractingScaleInput(input);
+  if (contracting_scale.has_value() &&
+      contracting_scale->collapsed_subchannel_scale) {
+    const HloInstruction* multiply = contracting_scale->multiply;
+    CHECK(multiply != nullptr);
+    ContractionInput result;
+    result.parameter_numbers = {
+        contracting_scale->data_parameter->parameter_number()};
+    result.parameter_type = S4;
+    result.requires_linear_addressing = true;
+    result.physical_offset = 0;
+    result.physical_strides =
+        contracting_scale->data_parameter_strides_from_input.empty()
+            ? PhysicalStrides(input.shape())
+            : contracting_scale->data_parameter_strides_from_input;
+    result.concat_dimension = -1;
+    result.scale_parameter_number =
+        contracting_scale->scale->parameter_number();
+    result.scale_parameter_type =
+        contracting_scale->scale->shape().element_type();
+    result.scale_broadcast_dimensions =
+        contracting_scale->broadcast_dimensions;
+    result.scale_collapsed_subchannel = true;
+    result.scale_input_physical_strides = PhysicalStrides(input.shape());
+    result.scale_broadcast_shape_dimensions.assign(
+        multiply->shape().dimensions().begin(),
+        multiply->shape().dimensions().end());
+    result.scale_broadcast_shape_physical_strides =
+        PhysicalStrides(multiply->shape());
+    result.scale_view_shape_dimensions.assign(
+        contracting_scale->scale_view->shape().dimensions().begin(),
+        contracting_scale->scale_view->shape().dimensions().end());
+    result.scale_view_shape_physical_strides =
+        contracting_scale->scale_parameter_strides_from_view.empty()
+            ? PhysicalStrides(contracting_scale->scale_view->shape())
+            : contracting_scale->scale_parameter_strides_from_view;
+    result.scale_parameter_shape_dimensions.assign(
+        contracting_scale->scale->shape().dimensions().begin(),
+        contracting_scale->scale->shape().dimensions().end());
+    result.scale_parameter_shape_physical_strides =
+        PhysicalStrides(contracting_scale->scale->shape());
+    return result;
+  }
   const HloInstruction* value =
       contracting_scale.has_value() ? contracting_scale->data : &input;
   bool has_conversion = false;
@@ -455,6 +828,7 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
   bool physical_mapping_from_bitcast = false;
   bool has_static_slice = false;
   bool has_dynamic_slice = false;
+  bool has_batch_inner_transpose = false;
   int64_t physical_offset = 0;
   std::vector<int64_t> logical_offsets(input.shape().dimensions_size(), 0);
   std::vector<int64_t> physical_strides;
@@ -488,6 +862,7 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
       physical_mapping_fixed = true;
       physical_mapping_from_bitcast = false;
       has_input_view = true;
+      has_batch_inner_transpose = true;
       requires_linear_addressing = true;
     } else if (value->opcode() == HloOpcode::kBitcast) {
       CHECK_EQ(value->shape().element_type(), operand->shape().element_type());
@@ -574,7 +949,9 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
   if (parameter_type == S4) {
     CHECK_EQ(contraction_type, BF16);
     CHECK(has_conversion);
-    CHECK(!has_input_view);
+    CHECK(!has_input_view ||
+          (has_batch_inner_transpose && !has_static_slice &&
+           !has_dynamic_slice));
   } else if (parameter_type == F32) {
     CHECK((contraction_type == BF16 && has_conversion) ||
           (contraction_type == F32 && !has_conversion));
@@ -614,8 +991,9 @@ ContractionInput FindContractionInput(const HloInstruction& input) {
       contracting_scale.has_value()
           ? contracting_scale->scale->shape().element_type()
           : PRIMITIVE_TYPE_INVALID,
-      contracting_scale.has_value() ? contracting_scale->broadcast_dimension
-                                    : -1};
+      contracting_scale.has_value()
+          ? contracting_scale->broadcast_dimensions
+          : std::vector<int64_t>{}};
 }
 
 std::vector<int64_t> PhysicalStrides(const Shape& shape) {
@@ -753,8 +1131,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     const BlockLevelFusionConfig& xtile_config =
         analysis.fusion_backend_config().block_level_fusion_config();
     if (xtile_config.output_tiles_size() == 1 &&
-        (xtile_config.output_tiles(0).sizes_size() == 2 ||
-         xtile_config.output_tiles(0).sizes_size() == 3)) {
+        xtile_config.output_tiles(0).sizes_size() >= 2) {
       const int64_t tile_rank = xtile_config.output_tiles(0).sizes_size();
       block_m_ = xtile_config.output_tiles(0).sizes(tile_rank - 2);
       block_n_ = xtile_config.output_tiles(0).sizes(tile_rank - 1);
@@ -837,8 +1214,24 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     lhs_concat_physical_strides_ = lhs_input.concat_physical_strides;
     lhs_input_scale_parameter_number_ = lhs_input.scale_parameter_number;
     lhs_input_scale_parameter_type_ = lhs_input.scale_parameter_type;
-    lhs_input_scale_broadcast_dimension_ =
-        lhs_input.scale_broadcast_dimension;
+    lhs_input_scale_broadcast_dimensions_ =
+        lhs_input.scale_broadcast_dimensions;
+    lhs_input_scale_collapsed_subchannel_ =
+        lhs_input.scale_collapsed_subchannel;
+    lhs_input_scale_input_physical_strides_ =
+        lhs_input.scale_input_physical_strides;
+    lhs_input_scale_broadcast_shape_dimensions_ =
+        lhs_input.scale_broadcast_shape_dimensions;
+    lhs_input_scale_broadcast_shape_physical_strides_ =
+        lhs_input.scale_broadcast_shape_physical_strides;
+    lhs_input_scale_view_shape_dimensions_ =
+        lhs_input.scale_view_shape_dimensions;
+    lhs_input_scale_view_shape_physical_strides_ =
+        lhs_input.scale_view_shape_physical_strides;
+    lhs_input_scale_parameter_shape_dimensions_ =
+        lhs_input.scale_parameter_shape_dimensions;
+    lhs_input_scale_parameter_shape_physical_strides_ =
+        lhs_input.scale_parameter_shape_physical_strides;
     const ContractionInput rhs_input = FindContractionInput(*dot->operand(1));
     rhs_parameter_numbers_ = rhs_input.parameter_numbers;
     rhs_input_type_ = rhs_input.parameter_type;
@@ -898,32 +1291,56 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     }
     CHECK(!dequantize_block_scales_ || block_scaled_dot_);
     const DotDimensionNumbers& dot_dims = dot->dot_dimension_numbers();
-    const bool rank_three = dot->shape().dimensions_size() == 3;
+    const int64_t output_rank = dot->shape().dimensions_size();
+    const bool rank_three = output_rank == 3;
     global_split_k_ = rank_three && dot_dims.lhs_batch_dimensions_size() == 1 &&
                       dot_dims.lhs_batch_dimensions(0) == 1;
-    batched_gemm_ = rank_three && dot_dims.lhs_batch_dimensions_size() == 1 &&
-                    dot_dims.lhs_batch_dimensions(0) == 0;
-    CHECK(!rank_three || global_split_k_ || batched_gemm_);
-    batch_count_ = rank_three ? dot->shape().dimensions(0) : 1;
+    batched_gemm_ =
+        !global_split_k_ && output_rank >= 3 &&
+        dot_dims.lhs_batch_dimensions_size() == output_rank - 2 &&
+        dot_dims.rhs_batch_dimensions_size() == output_rank - 2;
+    CHECK(output_rank == 2 || global_split_k_ || batched_gemm_);
+    batch_count_ = 1;
+    for (int64_t dimension = 0; dimension < output_rank - 2; ++dimension) {
+      batch_count_ *= dot->shape().dimensions(dimension);
+      batch_dimension_sizes_.push_back(dot->shape().dimensions(dimension));
+    }
     split_k_batches_ = global_split_k_ ? batch_count_ : 1;
-    m_ = dot->shape().dimensions(rank_three ? 1 : 0);
-    n_ = dot->shape().dimensions(rank_three ? 2 : 1);
+    m_ = dot->shape().dimensions(output_rank - 2);
+    n_ = dot->shape().dimensions(output_rank - 1);
     k_ = dot->operand(0)->shape().dimensions(
         dot->dot_dimension_numbers().lhs_contracting_dimensions(0));
     lhs_contracting_dimension_ =
         dot->dot_dimension_numbers().lhs_contracting_dimensions(0);
     rhs_contracting_dimension_ =
         dot->dot_dimension_numbers().rhs_contracting_dimensions(0);
-    if (global_split_k_ || batched_gemm_) {
+    if (global_split_k_) {
       lhs_batch_dimension_ = dot_dims.lhs_batch_dimensions(0);
       rhs_batch_dimension_ = dot_dims.rhs_batch_dimensions(0);
-      for (int64_t dimension = 0; dimension < 3; ++dimension) {
+    } else if (batched_gemm_) {
+      lhs_batch_dimensions_.assign(dot_dims.lhs_batch_dimensions().begin(),
+                                   dot_dims.lhs_batch_dimensions().end());
+      rhs_batch_dimensions_.assign(dot_dims.rhs_batch_dimensions().begin(),
+                                   dot_dims.rhs_batch_dimensions().end());
+      lhs_batch_dimension_ = lhs_batch_dimensions_.front();
+      rhs_batch_dimension_ = rhs_batch_dimensions_.front();
+    }
+    if (global_split_k_ || batched_gemm_) {
+      for (int64_t dimension = 0;
+           dimension < dot->operand(0)->shape().dimensions_size();
+           ++dimension) {
         if (dimension != lhs_batch_dimension_ &&
-            dimension != lhs_contracting_dimension_) {
+            dimension != lhs_contracting_dimension_ &&
+            !absl::c_linear_search(lhs_batch_dimensions_, dimension)) {
           lhs_noncontracting_dimension_ = dimension;
         }
+      }
+      for (int64_t dimension = 0;
+           dimension < dot->operand(1)->shape().dimensions_size();
+           ++dimension) {
         if (dimension != rhs_batch_dimension_ &&
-            dimension != rhs_contracting_dimension_) {
+            dimension != rhs_contracting_dimension_ &&
+            !absl::c_linear_search(rhs_batch_dimensions_, dimension)) {
           rhs_noncontracting_dimension_ = dimension;
         }
       }
@@ -948,6 +1365,20 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
          supports_masked_k_tail)) {
       stage_k_ = contraction_tile->sizes(0);
     }
+    const bool lhs_has_channel_scale =
+        lhs_input_type_ == S4 && lhs_input_scale_parameter_number_ >= 0 &&
+        !absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,
+                               lhs_contracting_dimension_) &&
+        absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,
+                              lhs_noncontracting_dimension_);
+    // This MFMA32 double-buffer schedule interleaves the transposed LHS rows
+    // while preloading its LDS fragments. It cannot yet preserve a distinct
+    // per-row S4 scale, so reject it rather than exposing a numerically invalid
+    // candidate to autotune levels that do not compare outputs.
+    unsupported_channel_scale_mfma32_preload_ =
+        lhs_has_channel_scale && !lhs_k_contiguous_ && use_mfma_32_ &&
+        stage_rhs_ && preload_lds_fragments_ && !single_buffer_lds_ &&
+        block_m_ == 128 && block_n_ == 128 && stage_k_ == 64;
     const int64_t blocks = batch_count_ * ((m_ + block_m_ - 1) / block_m_) *
                            ((n_ + block_n_ - 1) / block_n_);
     launch_dimensions_ = LaunchDimensions(se::BlockDim(blocks, 1, 1),
@@ -1000,6 +1431,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   absl::Status EmitKernel(mlir::func::FuncOp entry_function) const {
     TF_RET_CHECK(entry_function.getNumArguments() ==
                  fusion_parameter_count_ + 1);
+    TF_RET_CHECK(!unsupported_channel_scale_mfma32_preload_);
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
@@ -1116,6 +1548,15 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       }
     };
     Value batch_id;
+    llvm::SmallVector<Value, 3> batch_indices;
+    auto batch_coordinate_for_dimension =
+        [&](llvm::ArrayRef<int64_t> operand_batch_dimensions,
+            int64_t operand_dimension) -> Value {
+      auto it = std::find(operand_batch_dimensions.begin(),
+                          operand_batch_dimensions.end(), operand_dimension);
+      CHECK(it != operand_batch_dimensions.end());
+      return batch_indices[std::distance(operand_batch_dimensions.begin(), it)];
+    };
     Value lhs_concat_fragment;
     Value rhs_concat_fragment;
     auto concat_local_index = [&](Value index, Value fragment,
@@ -1145,11 +1586,19 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         m = concat_local_index(m, lhs_concat_fragment,
                                lhs_concat_fragment_sizes_);
       }
-      if (global_split_k_ || batched_gemm_) {
+      if (global_split_k_) {
         indices.resize(3);
         indices[lhs_noncontracting_dimension_] = m;
         indices[lhs_batch_dimension_] = batch_id;
         indices[lhs_contracting_dimension_] = k;
+      } else if (batched_gemm_) {
+        indices.resize(lhs_physical_strides_.size());
+        indices[lhs_noncontracting_dimension_] = m;
+        indices[lhs_contracting_dimension_] = k;
+        for (int64_t dimension : lhs_batch_dimensions_) {
+          indices[dimension] = batch_coordinate_for_dimension(
+              lhs_batch_dimensions_, dimension);
+        }
       } else {
         indices.resize(2);
         indices[1 - lhs_contracting_dimension_] = m;
@@ -1170,10 +1619,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         indices[rhs_batch_dimension_] = batch_id;
         indices[rhs_contracting_dimension_] = k;
       } else if (batched_gemm_) {
-        if (rhs_contracting_dimension_ == 1) {
-          indices.assign({batch_id, k, n});
-        } else {
-          indices.assign({batch_id, n, k});
+        indices.resize(rhs_physical_strides_.size());
+        indices[rhs_noncontracting_dimension_] = n;
+        indices[rhs_contracting_dimension_] = k;
+        for (int64_t dimension : rhs_batch_dimensions_) {
+          indices[dimension] = batch_coordinate_for_dimension(
+              rhs_batch_dimensions_, dimension);
         }
       } else if (rhs_contracting_dimension_ == 0) {
         indices.assign({k, n});
@@ -1584,6 +2035,17 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     batch_id = (global_split_k_ || batched_gemm_)
                    ? Div(builder, block_id, output_grid)
                    : IndexConstant(builder, 0);
+    if (batched_gemm_) {
+      batch_indices.resize(batch_dimension_sizes_.size());
+      Value remaining_batch = batch_id;
+      for (int64_t dimension = batch_dimension_sizes_.size() - 1;
+           dimension >= 0; --dimension) {
+        batch_indices[dimension] =
+            Rem(builder, remaining_batch, batch_dimension_sizes_[dimension]);
+        remaining_batch =
+            Div(builder, remaining_batch, batch_dimension_sizes_[dimension]);
+      }
+    }
     Value output_block_id = (global_split_k_ || batched_gemm_)
                                 ? Rem(builder, block_id, output_grid)
                                 : block_id;
@@ -1779,7 +2241,13 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         return indices;
       }
       if (global_split_k_ || batched_gemm_) {
-        indices.assign({batch_id, row, column});
+        if (global_split_k_) {
+          indices.assign({batch_id, row, column});
+        } else {
+          indices.append(batch_indices.begin(), batch_indices.end());
+          indices.push_back(row);
+          indices.push_back(column);
+        }
       } else {
         indices.assign({row, column});
       }
@@ -2084,6 +2552,33 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       return emit_selected_input(
           source, result_type, [&](Value selected_source) -> Value {
             if (source_type == S4) {
+              if (result_type.getNumElements() == 1) {
+                // Scalar tail loads can start at either nibble of any byte.
+                // Align the buffer read to the containing eight-S4 dword,
+                // select the requested nibble, and sign-extend it before the
+                // exact BF16 conversion.
+                Value nibble = Rem(builder, source_linear_index, 8);
+                Value aligned_index = Sub(builder, source_linear_index, nibble);
+                Value packed_word = emit_buffer_load(
+                    selected_source, aligned_index, builder.getI32Type());
+                Value bit_offset = mlir::arith::IndexCastOp::create(
+                    builder, builder.getI32Type(),
+                    Mul(builder, nibble, IndexConstant(builder, 4)));
+                Value shifted = mlir::arith::ShRUIOp::create(
+                    builder, packed_word, bit_offset);
+                Value sign_shift = mlir::arith::ConstantIntOp::create(
+                    builder, /*value=*/28, /*width=*/32);
+                shifted = mlir::arith::ShLIOp::create(builder, shifted,
+                                                      sign_shift);
+                Value signed_nibble = mlir::arith::ShRSIOp::create(
+                    builder, shifted, sign_shift);
+                Value converted = mlir::arith::SIToFPOp::create(
+                    builder, builder.getF32Type(), signed_nibble);
+                Value bf16 = mlir::arith::TruncFOp::create(
+                    builder, builder.getBF16Type(), converted);
+                return mlir::vector::FromElementsOp::create(
+                    builder, result_type, mlir::ValueRange{bf16});
+              }
               CHECK_EQ(result_type.getNumElements() % 2, 0);
               const int64_t packed_elements = result_type.getNumElements() / 2;
               CHECK_LE(packed_elements, 4);
@@ -2665,15 +3160,92 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         builder, rhs_element_type, builder.getZeroAttr(rhs_element_type));
     const bool masked_k_tail = k_ % stage_k_ != 0;
     Value lhs_input_scale;
+    const bool contracting_scale =
+        lhs_input_scale_broadcast_dimensions_ ==
+        std::vector<int64_t>{lhs_contracting_dimension_};
     if (lhs_input_scale_parameter_number_ >= 0) {
+      const bool channel_scale =
+          lhs_input_type_ == S4 &&
+          !absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,
+                                 lhs_contracting_dimension_) &&
+          absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,
+                                lhs_noncontracting_dimension_);
       TF_RET_CHECK(lhs_input_scale_parameter_type_ == lhs_element_type_ &&
-                   lhs_input_scale_broadcast_dimension_ ==
-                       lhs_contracting_dimension_ &&
+                   (contracting_scale || channel_scale ||
+                    lhs_input_scale_collapsed_subchannel_) &&
                    IsHalfPrecisionFloat(lhs_element_type_));
       lhs_input_scale = entry_function.getArgument(
           lhs_input_scale_parameter_number_);
     }
-    auto apply_lhs_input_scale = [&](Value loaded, Value first_k) -> Value {
+    auto load_collapsed_subchannel_scale = [&](Value row, Value k) -> Value {
+      CHECK(lhs_input_scale_collapsed_subchannel_);
+      CHECK(batched_gemm_);
+      CHECK_EQ(lhs_input_scale_input_physical_strides_.size(),
+               lhs_physical_strides_.size());
+      llvm::SmallVector<Value, 3> input_indices(
+          lhs_input_scale_input_physical_strides_.size());
+      for (int64_t dimension : lhs_batch_dimensions_) {
+        input_indices[dimension] = batch_coordinate_for_dimension(
+            lhs_batch_dimensions_, dimension);
+      }
+      input_indices[lhs_noncontracting_dimension_] = row;
+      input_indices[lhs_contracting_dimension_] = k;
+      Value input_linear = physical_linear_index(
+          input_indices, lhs_input_scale_input_physical_strides_, 0);
+
+      CHECK_EQ(lhs_input_scale_broadcast_shape_dimensions_.size(),
+               lhs_input_scale_broadcast_shape_physical_strides_.size());
+      llvm::SmallVector<Value, 4> broadcast_indices;
+      broadcast_indices.reserve(
+          lhs_input_scale_broadcast_shape_dimensions_.size());
+      for (int64_t dimension = 0;
+           dimension < lhs_input_scale_broadcast_shape_dimensions_.size();
+           ++dimension) {
+        broadcast_indices.push_back(Rem(
+            builder,
+            Div(builder, input_linear,
+                lhs_input_scale_broadcast_shape_physical_strides_[dimension]),
+            lhs_input_scale_broadcast_shape_dimensions_[dimension]));
+      }
+
+      CHECK_EQ(lhs_input_scale_broadcast_dimensions_.size(),
+               lhs_input_scale_view_shape_dimensions_.size());
+      CHECK_EQ(lhs_input_scale_view_shape_dimensions_.size(),
+               lhs_input_scale_view_shape_physical_strides_.size());
+      Value scale_view_linear = IndexConstant(builder, 0);
+      for (int64_t dimension = 0;
+           dimension < lhs_input_scale_view_shape_dimensions_.size();
+           ++dimension) {
+        const int64_t broadcast_dimension =
+            lhs_input_scale_broadcast_dimensions_[dimension];
+        scale_view_linear = Add(
+            builder, scale_view_linear,
+            Mul(builder, broadcast_indices[broadcast_dimension],
+                IndexConstant(
+                    builder,
+                    lhs_input_scale_view_shape_physical_strides_[dimension])));
+      }
+
+      CHECK_EQ(lhs_input_scale_parameter_shape_dimensions_.size(),
+               lhs_input_scale_parameter_shape_physical_strides_.size());
+      llvm::SmallVector<Value, 4> parameter_indices;
+      parameter_indices.reserve(
+          lhs_input_scale_parameter_shape_dimensions_.size());
+      for (int64_t dimension = 0;
+           dimension < lhs_input_scale_parameter_shape_dimensions_.size();
+           ++dimension) {
+        parameter_indices.push_back(Rem(
+            builder,
+            Div(builder, scale_view_linear,
+                lhs_input_scale_parameter_shape_physical_strides_[dimension]),
+            lhs_input_scale_parameter_shape_dimensions_[dimension]));
+      }
+      return mlir::tensor::ExtractOp::create(builder, lhs_input_scale,
+                                              parameter_indices);
+    };
+    auto apply_lhs_input_scale = [&](Value loaded, Value global_row,
+                                     Value first_k,
+                                     bool vectorized_rows = false) -> Value {
       if (!lhs_input_scale) {
         return loaded;
       }
@@ -2681,11 +3253,121 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       //   convert<T>(convert<f32>(data) * convert<f32>(scale)).
       // Applying it while loading A into LDS lets every output-column wave
       // reuse the scaled tile instead of repeating the VALU work per N tile.
-      CHECK(!masked_k_tail);
-      Value scale = mlir::vector::TransferReadOp::create(
-          builder, load_vector_type, lhs_input_scale,
-          mlir::ValueRange{first_k}, /*padding=*/std::nullopt,
-          llvm::ArrayRef<bool>{true});
+      Value scale;
+      if (lhs_input_scale_collapsed_subchannel_) {
+        llvm::SmallVector<Value, 8> scale_elements;
+        scale_elements.reserve(load_vector_width);
+        Value zero_scale = mlir::arith::ConstantOp::create(
+            builder, lhs_element_type, builder.getZeroAttr(lhs_element_type));
+        for (int64_t element = 0; element < load_vector_width; ++element) {
+          Value row = vectorized_rows
+                          ? Add(builder, global_row,
+                                IndexConstant(builder, element))
+                          : global_row;
+          Value k = vectorized_rows
+                        ? first_k
+                        : Add(builder, first_k,
+                              IndexConstant(builder, element));
+          Value row_in_bounds = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ult, row,
+              IndexConstant(builder, m_));
+          Value k_in_bounds = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ult, k,
+              IndexConstant(builder, k_));
+          Value in_bounds = mlir::arith::AndIOp::create(
+              builder, row_in_bounds, k_in_bounds);
+          Value safe_row = mlir::arith::SelectOp::create(
+              builder, row_in_bounds, row, IndexConstant(builder, 0));
+          Value safe_k = mlir::arith::SelectOp::create(
+              builder, k_in_bounds, k, IndexConstant(builder, 0));
+          Value element_scale =
+              load_collapsed_subchannel_scale(safe_row, safe_k);
+          scale_elements.push_back(mlir::arith::SelectOp::create(
+              builder, in_bounds, element_scale, zero_scale));
+        }
+        scale = mlir::vector::FromElementsOp::create(
+            builder, load_vector_type, scale_elements);
+      } else if (vectorized_rows && contracting_scale) {
+        llvm::SmallVector<Value, 2> scale_indices;
+        for (int64_t dimension : lhs_input_scale_broadcast_dimensions_) {
+          CHECK_EQ(dimension, lhs_contracting_dimension_);
+          scale_indices.push_back(first_k);
+        }
+        Value scalar_scale = mlir::tensor::ExtractOp::create(
+            builder, lhs_input_scale, scale_indices);
+        scale = mlir::vector::BroadcastOp::create(builder, load_vector_type,
+                                                  scalar_scale);
+      } else if (vectorized_rows &&
+                 (m_ % block_m_ == 0 || shift_m_edge)) {
+        llvm::SmallVector<Value, 2> scale_indices;
+        for (int64_t dimension : lhs_input_scale_broadcast_dimensions_) {
+          if (batched_gemm_ &&
+              absl::c_linear_search(lhs_batch_dimensions_, dimension)) {
+            scale_indices.push_back(batch_coordinate_for_dimension(
+                lhs_batch_dimensions_, dimension));
+          } else {
+            CHECK_EQ(dimension, lhs_noncontracting_dimension_);
+            scale_indices.push_back(global_row);
+          }
+        }
+        scale = mlir::vector::TransferReadOp::create(
+            builder, load_vector_type, lhs_input_scale, scale_indices,
+            /*padding=*/std::nullopt, llvm::ArrayRef<bool>{true});
+      } else if (vectorized_rows) {
+        llvm::SmallVector<Value, 8> scale_elements;
+        scale_elements.reserve(load_vector_width);
+        Value zero_scale = mlir::arith::ConstantOp::create(
+            builder, lhs_element_type, builder.getZeroAttr(lhs_element_type));
+        for (int64_t element = 0; element < load_vector_width; ++element) {
+          Value row = Add(builder, global_row, IndexConstant(builder, element));
+          Value in_bounds = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ult, row,
+              IndexConstant(builder, m_));
+          Value safe_row = mlir::arith::SelectOp::create(
+              builder, in_bounds, row, IndexConstant(builder, 0));
+          llvm::SmallVector<Value, 2> scale_indices;
+          for (int64_t dimension : lhs_input_scale_broadcast_dimensions_) {
+            if (batched_gemm_ &&
+                absl::c_linear_search(lhs_batch_dimensions_, dimension)) {
+              scale_indices.push_back(batch_coordinate_for_dimension(
+                  lhs_batch_dimensions_, dimension));
+            } else if (dimension == lhs_noncontracting_dimension_) {
+              scale_indices.push_back(safe_row);
+            } else {
+              CHECK_EQ(dimension, lhs_contracting_dimension_);
+              scale_indices.push_back(first_k);
+            }
+          }
+          Value element_scale = mlir::tensor::ExtractOp::create(
+              builder, lhs_input_scale, scale_indices);
+          scale_elements.push_back(mlir::arith::SelectOp::create(
+              builder, in_bounds, element_scale, zero_scale));
+        }
+        scale = mlir::vector::FromElementsOp::create(
+            builder, load_vector_type, scale_elements);
+      } else if (contracting_scale) {
+        CHECK(!masked_k_tail);
+        scale = mlir::vector::TransferReadOp::create(
+            builder, load_vector_type, lhs_input_scale,
+            mlir::ValueRange{first_k}, /*padding=*/std::nullopt,
+            llvm::ArrayRef<bool>{true});
+      } else {
+        llvm::SmallVector<Value, 2> scale_indices;
+        for (int64_t dimension : lhs_input_scale_broadcast_dimensions_) {
+          if (batched_gemm_ &&
+              absl::c_linear_search(lhs_batch_dimensions_, dimension)) {
+            scale_indices.push_back(batch_coordinate_for_dimension(
+                lhs_batch_dimensions_, dimension));
+          } else {
+            CHECK_EQ(dimension, lhs_noncontracting_dimension_);
+            scale_indices.push_back(global_row);
+          }
+        }
+        Value scalar_scale = mlir::tensor::ExtractOp::create(
+            builder, lhs_input_scale, scale_indices);
+        scale = mlir::vector::BroadcastOp::create(builder, load_vector_type,
+                                                  scalar_scale);
+      }
       auto f32_vector_type = mlir::VectorType::get(
           {load_vector_width}, builder.getF32Type());
       Value widened_data = mlir::arith::ExtFOp::create(
@@ -2748,7 +3430,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             lhs_physical_linear_index(global_row, first_k);
         Value loaded = emit_input_buffer_load(
             lhs, lhs_input_type_, source_linear_index, load_vector_type);
-        return apply_lhs_input_scale(loaded, first_k);
+        return apply_lhs_input_scale(loaded, global_row, first_k);
       };
       auto emit_row_checked_vector = [&]() -> Value {
         if (m_ % block_m_ == 0 || shift_m_edge) {
@@ -3830,10 +4512,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           Value logical_k = Add(builder, global_k, shared_k);
           llvm::SmallVector<Value, 3> indices =
               lhs_indices(global_row, logical_k);
-          const int64_t lhs_noncontracting_dimension = batched_gemm_ ? 1 : 0;
           mlir::AffineMap m_vector_map = mlir::AffineMap::get(
               /*dimCount=*/indices.size(), /*symbolCount=*/0,
-              builder.getAffineDimExpr(lhs_noncontracting_dimension),
+              builder.getAffineDimExpr(lhs_noncontracting_dimension_),
               builder.getContext());
           Value loaded;
           if (m_ % block_m_ == 0 || shift_m_edge) {
@@ -3866,6 +4547,8 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
             loaded = mlir::vector::FromElementsOp::create(
                 builder, load_vector_type, elements);
           }
+          loaded = apply_lhs_input_scale(
+              loaded, global_row, logical_k, /*vectorized_rows=*/true);
           Value written = load_loop.getRegionIterArg(0);
           for (int64_t element = 0; element < load_vector_width; ++element) {
             Value scalar = mlir::vector::ExtractOp::create(
@@ -3970,7 +4653,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         };
         auto emit_lhs_vector = [&]() -> Value {
           return apply_lhs_input_scale(
-              emit_unscaled_lhs_vector(),
+              emit_unscaled_lhs_vector(), global_row,
               Add(builder, global_k, logical_k));
         };
         Value loaded;
@@ -9296,6 +9979,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   bool batched_gemm_ = false;
   bool is_scaled_dot_ = false;
   bool block_scaled_dot_ = false;
+  bool unsupported_channel_scale_mfma32_preload_ = false;
   bool has_vector_epilogue_ = false;
   bool has_row_epilogue_ = false;
   int64_t epilogue_row_dimension_ = 0;
@@ -9311,7 +9995,15 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   int64_t rhs_scale_parameter_number_ = 3;
   int64_t lhs_input_scale_parameter_number_ = -1;
   PrimitiveType lhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
-  int64_t lhs_input_scale_broadcast_dimension_ = -1;
+  std::vector<int64_t> lhs_input_scale_broadcast_dimensions_;
+  bool lhs_input_scale_collapsed_subchannel_ = false;
+  std::vector<int64_t> lhs_input_scale_input_physical_strides_;
+  std::vector<int64_t> lhs_input_scale_broadcast_shape_dimensions_;
+  std::vector<int64_t> lhs_input_scale_broadcast_shape_physical_strides_;
+  std::vector<int64_t> lhs_input_scale_view_shape_dimensions_;
+  std::vector<int64_t> lhs_input_scale_view_shape_physical_strides_;
+  std::vector<int64_t> lhs_input_scale_parameter_shape_dimensions_;
+  std::vector<int64_t> lhs_input_scale_parameter_shape_physical_strides_;
   PrimitiveType lhs_scale_element_type_ = BF16;
   PrimitiveType rhs_scale_element_type_ = BF16;
   std::vector<int64_t> lhs_scale_dimensions_;
@@ -9344,6 +10036,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
   std::vector<EpilogueStep> epilogue_steps_;
   int64_t split_k_batches_ = 1;
   int64_t batch_count_ = 1;
+  std::vector<int64_t> batch_dimension_sizes_;
+  std::vector<int64_t> lhs_batch_dimensions_;
+  std::vector<int64_t> rhs_batch_dimensions_;
   int64_t lhs_batch_dimension_ = 0;
   int64_t rhs_batch_dimension_ = 0;
   int64_t lhs_contracting_dimension_ = 0;
@@ -9411,8 +10106,8 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
     lhs_dynamic_offset_limits_ = lhs_input.dynamic_offset_limits;
     lhs_input_scale_parameter_number_ = lhs_input.scale_parameter_number;
     lhs_input_scale_parameter_type_ = lhs_input.scale_parameter_type;
-    lhs_input_scale_broadcast_dimension_ =
-        lhs_input.scale_broadcast_dimension;
+    lhs_input_scale_broadcast_dimensions_ =
+        lhs_input.scale_broadcast_dimensions;
     const ContractionInput rhs_input = FindContractionInput(*dot->operand(1));
     CHECK_EQ(rhs_input.parameter_numbers.size(), 1);
     rhs_parameter_number_ = rhs_input.parameter_numbers.front();
@@ -9426,8 +10121,8 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
     rhs_dynamic_offset_limits_ = rhs_input.dynamic_offset_limits;
     rhs_input_scale_parameter_number_ = rhs_input.scale_parameter_number;
     rhs_input_scale_parameter_type_ = rhs_input.scale_parameter_type;
-    rhs_input_scale_broadcast_dimension_ =
-        rhs_input.scale_broadcast_dimension;
+    rhs_input_scale_broadcast_dimensions_ =
+        rhs_input.scale_broadcast_dimensions;
     const DotDimensionNumbers& dot_dims = dot->dot_dimension_numbers();
     rank_three_ = dot->shape().dimensions_size() == 3;
     CHECK_EQ(dot_dims.lhs_contracting_dimensions_size(), 1);
@@ -9812,15 +10507,21 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       const PrimitiveType parameter_type =
           is_lhs ? lhs_input_scale_parameter_type_
                  : rhs_input_scale_parameter_type_;
-      const int64_t broadcast_dimension =
-          is_lhs ? lhs_input_scale_broadcast_dimension_
-                 : rhs_input_scale_broadcast_dimension_;
+      const std::vector<int64_t>& broadcast_dimensions =
+          is_lhs ? lhs_input_scale_broadcast_dimensions_
+                 : rhs_input_scale_broadcast_dimensions_;
       CHECK(IsHalfPrecisionFloat(parameter_type));
-      CHECK_GE(broadcast_dimension, 0);
-      CHECK_LT(broadcast_dimension, indices.size());
+      CHECK(!broadcast_dimensions.empty());
+      llvm::SmallVector<Value, 3> scale_indices;
+      scale_indices.reserve(broadcast_dimensions.size());
+      for (int64_t broadcast_dimension : broadcast_dimensions) {
+        CHECK_GE(broadcast_dimension, 0);
+        CHECK_LT(broadcast_dimension, indices.size());
+        scale_indices.push_back(indices[broadcast_dimension]);
+      }
       Value scale = mlir::tensor::ExtractOp::create(
           builder, entry_function.getArgument(parameter_number),
-          mlir::ValueRange{indices[broadcast_dimension]});
+          scale_indices);
       return mlir::arith::ExtFOp::create(builder, builder.getF32Type(), scale)
           .getResult();
     };
@@ -11263,8 +11964,8 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
   int64_t rhs_input_scale_parameter_number_ = -1;
   PrimitiveType lhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
   PrimitiveType rhs_input_scale_parameter_type_ = PRIMITIVE_TYPE_INVALID;
-  int64_t lhs_input_scale_broadcast_dimension_ = -1;
-  int64_t rhs_input_scale_broadcast_dimension_ = -1;
+  std::vector<int64_t> lhs_input_scale_broadcast_dimensions_;
+  std::vector<int64_t> rhs_input_scale_broadcast_dimensions_;
   int64_t epilogue_row_dimension_ = 0;
   int64_t epilogue_column_dimension_ = 1;
   std::vector<EpilogueStep> epilogue_steps_;

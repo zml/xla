@@ -147,8 +147,8 @@ struct ExternalRowSoftmaxInputs {
   bool recompute_maximum;
 };
 
-std::optional<ExternalRowSoftmaxInputs>
-GetExternalRowSoftmaxF32Inputs(const HloInstruction& root) {
+std::optional<ExternalRowSoftmaxInputs> GetExternalRowSoftmaxF32Inputs(
+    const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
   if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
       root.shape().dimensions_size() < 2) {
@@ -218,15 +218,150 @@ bool HasCompatibleSoftmaxShape(const HloInstruction& root,
   return columns > 0 && columns <= kMaxColumns;
 }
 
+const HloInstruction* GetReductionAlongDimension(
+    const HloInstruction* reduction, HloOpcode reducer_opcode,
+    const HloInstruction* input, int64_t reduction_dimension) {
+  while (reduction->opcode() == HloOpcode::kBitcast &&
+         reduction->operand_count() == 1) {
+    reduction = reduction->operand(0);
+  }
+  while (input->opcode() == HloOpcode::kBitcast &&
+         input->operand_count() == 1) {
+    input = input->operand(0);
+  }
+  const int64_t input_rank = input->shape().dimensions_size();
+  if (reduction_dimension < 0 || reduction_dimension >= input_rank ||
+      reduction->opcode() != HloOpcode::kReduce ||
+      reduction->operand_count() != 2 || reduction->operand(0) != input ||
+      reduction->dimensions().size() != 1 ||
+      reduction->dimensions(0) != reduction_dimension ||
+      reduction->shape().dimensions_size() != input_rank - 1 ||
+      !ShapeUtil::SameDimensions(
+          reduction->shape(),
+          ShapeUtil::DeleteDimension(reduction_dimension, input->shape())) ||
+      reduction->called_computations().size() != 1 ||
+      reduction->called_computations().front()->root_instruction()->opcode() !=
+          reducer_opcode) {
+    return nullptr;
+  }
+  return reduction;
+}
+
+const HloInstruction* BroadcastOperandAlongDimension(
+    const HloInstruction* instruction, const Shape& output_shape,
+    int64_t reduction_dimension) {
+  const int64_t output_rank = output_shape.dimensions_size();
+  if (reduction_dimension < 0 || reduction_dimension >= output_rank ||
+      instruction->opcode() != HloOpcode::kBroadcast ||
+      !ShapeUtil::Compatible(instruction->shape(), output_shape) ||
+      instruction->dimensions().size() != output_rank - 1) {
+    return nullptr;
+  }
+  int64_t operand_dimension = 0;
+  for (int64_t output_dimension = 0; output_dimension < output_rank;
+       ++output_dimension) {
+    if (output_dimension == reduction_dimension) {
+      continue;
+    }
+    if (instruction->dimensions(operand_dimension) != output_dimension) {
+      return nullptr;
+    }
+    ++operand_dimension;
+  }
+  return instruction->operand(0);
+}
+
+const HloInstruction* StableShiftInputAlongDimension(
+    const HloInstruction* shifted, int64_t reduction_dimension) {
+  if (shifted->opcode() != HloOpcode::kSubtract ||
+      shifted->operand_count() != 2) {
+    return nullptr;
+  }
+  const HloInstruction* input = shifted->operand(0);
+  const HloInstruction* row_max = BroadcastOperandAlongDimension(
+      shifted->operand(1), input->shape(), reduction_dimension);
+  const HloInstruction* reduction =
+      row_max == nullptr
+          ? nullptr
+          : GetReductionAlongDimension(row_max, HloOpcode::kMaximum, input,
+                                       reduction_dimension);
+  if (reduction == nullptr ||
+      !IsScalarConstant(reduction->operand(1),
+                        -std::numeric_limits<double>::infinity())) {
+    return nullptr;
+  }
+  return input;
+}
+
+const HloInstruction* GetStableSoftmaxF32InputAlongDimension(
+    const HloInstruction& root, int64_t reduction_dimension) {
+  const PrimitiveType element_type = root.shape().element_type();
+  const int64_t rank = root.shape().dimensions_size();
+  if ((element_type != F16 && element_type != BF16 && element_type != F32) ||
+      rank < 2 || reduction_dimension < 0 || reduction_dimension >= rank) {
+    return nullptr;
+  }
+  const HloInstruction* normalized = &root;
+  if (element_type != F32) {
+    if (root.opcode() != HloOpcode::kConvert || root.operand_count() != 1 ||
+        root.operand(0)->shape().element_type() != F32) {
+      return nullptr;
+    }
+    normalized = root.operand(0);
+  }
+  if (normalized->opcode() != HloOpcode::kDivide ||
+      normalized->operand_count() != 2) {
+    return nullptr;
+  }
+  const HloInstruction* exponential = normalized->operand(0);
+  const HloInstruction* row_sum = BroadcastOperandAlongDimension(
+      normalized->operand(1), exponential->shape(), reduction_dimension);
+  const HloInstruction* sum_reduction =
+      row_sum == nullptr
+          ? nullptr
+          : GetReductionAlongDimension(row_sum, HloOpcode::kAdd, exponential,
+                                       reduction_dimension);
+  if (exponential->opcode() != HloOpcode::kExp || sum_reduction == nullptr ||
+      !IsScalarConstant(sum_reduction->operand(1), 0.0)) {
+    return nullptr;
+  }
+  const HloInstruction* input = StableShiftInputAlongDimension(
+      exponential->operand(0), reduction_dimension);
+  if (input == nullptr) {
+    return nullptr;
+  }
+  if (const HloInstruction* original =
+          StableShiftInputAlongDimension(input, reduction_dimension)) {
+    input = original;
+  }
+  return input;
+}
+
+bool HasCompatibleSoftmaxShapeAlongDimension(const HloInstruction& root,
+                                             const HloInstruction& input,
+                                             int64_t reduction_dimension) {
+  const int64_t rank = root.shape().dimensions_size();
+  if (rank != input.shape().dimensions_size() || reduction_dimension < 0 ||
+      reduction_dimension >= rank ||
+      ShapeUtil::ElementsIn(root.shape()) !=
+          ShapeUtil::ElementsIn(input.shape()) ||
+      root.shape().dimensions(reduction_dimension) !=
+          input.shape().dimensions(reduction_dimension)) {
+    return false;
+  }
+  constexpr int64_t kMaxColumns = 16 * 64 * 64;
+  const int64_t columns = root.shape().dimensions(reduction_dimension);
+  return columns > 0 && columns <= kMaxColumns;
+}
+
 }  // namespace
 
 const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
   const PrimitiveType element_type = root.shape().element_type();
   std::optional<ExternalRowSoftmaxInputs> external =
       GetExternalRowSoftmaxF32Inputs(root);
-  const HloInstruction* converted = external.has_value()
-                                        ? external->input
-                                        : GetStableSoftmaxF32Input(root);
+  const HloInstruction* converted =
+      external.has_value() ? external->input : GetStableSoftmaxF32Input(root);
   if (converted == nullptr) {
     return nullptr;
   }
@@ -257,8 +392,8 @@ const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root) {
 
 const HloInstruction* GetFlySoftmaxExternalRowOffset(
     const HloInstruction& root) {
-  std::optional<ExternalRowSoftmaxInputs>
-      external = GetExternalRowSoftmaxF32Inputs(root);
+  std::optional<ExternalRowSoftmaxInputs> external =
+      GetExternalRowSoftmaxF32Inputs(root);
   return external.has_value() ? external->row_offset : nullptr;
 }
 
@@ -280,6 +415,24 @@ const HloInstruction* GetFlyCompoundSoftmaxInput(const HloInstruction& root) {
     input = input->operand(0);
   }
   return HasCompatibleSoftmaxShape(root, *input) ? input : nullptr;
+}
+
+const HloInstruction* GetFlyCompoundSoftmaxInputAlongDimension(
+    const HloInstruction& root, int64_t reduction_dimension) {
+  const HloInstruction* input =
+      GetStableSoftmaxF32InputAlongDimension(root, reduction_dimension);
+  if (input == nullptr) {
+    return nullptr;
+  }
+  if (input->opcode() == HloOpcode::kConvert && input->operand_count() == 1 &&
+      input->operand(0)->shape().element_type() ==
+          root.shape().element_type()) {
+    input = input->operand(0);
+  }
+  return HasCompatibleSoftmaxShapeAlongDimension(root, *input,
+                                                 reduction_dimension)
+             ? input
+             : nullptr;
 }
 
 bool IsFlySoftmaxRoot(const HloInstruction& root) {
@@ -308,8 +461,8 @@ bool IsFlySoftmaxRoot(const HloInstruction& root) {
   const int64_t columns =
       root.shape().dimensions(root.shape().dimensions_size() - 1);
   if (parameter->shape().dimensions_size() < 2 ||
-      parameter->shape().dimensions(
-          parameter->shape().dimensions_size() - 1) != columns) {
+      parameter->shape().dimensions(parameter->shape().dimensions_size() - 1) !=
+          columns) {
     return false;
   }
   return true;

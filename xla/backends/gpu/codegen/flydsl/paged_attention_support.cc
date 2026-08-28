@@ -124,15 +124,22 @@ GetFlyPagedAttentionSegmentedProducerDescriptor(const HloInstruction& call) {
   if (call.opcode() != HloOpcode::kCustomCall) {
     return std::nullopt;
   }
-  if (call.custom_call_target() !=
-          kFlyPagedAttentionSegmentedProducerCallTarget ||
-      !call.shape().IsTuple() || call.shape().tuple_shapes_size() != 3 ||
+  const bool fused_reducer =
+      call.custom_call_target() == kFlyPagedAttentionSegmentedFusedCallTarget;
+  if ((call.custom_call_target() !=
+           kFlyPagedAttentionSegmentedProducerCallTarget &&
+       !fused_reducer) ||
+      !call.shape().IsTuple() ||
+      call.shape().tuple_shapes_size() != (fused_reducer ? 5 : 3) ||
       call.operand_count() != 6) {
     return std::nullopt;
   }
-  const Shape& partial_output = call.shape().tuple_shapes(0);
-  const Shape& partial_maximum = call.shape().tuple_shapes(1);
-  const Shape& partial_sum = call.shape().tuple_shapes(2);
+  const int64_t partial_index = fused_reducer ? 1 : 0;
+  const Shape& partial_output =
+      call.shape().tuple_shapes(partial_index + 0);
+  const Shape& partial_maximum =
+      call.shape().tuple_shapes(partial_index + 1);
+  const Shape& partial_sum = call.shape().tuple_shapes(partial_index + 2);
   if (partial_output.element_type() != F32 ||
       partial_output.dimensions_size() != 4 ||
       !partial_output.has_layout() ||
@@ -149,11 +156,27 @@ GetFlyPagedAttentionSegmentedProducerDescriptor(const HloInstruction& call) {
   }
   const Shape& query_shape = call.operand(0)->shape();
   std::optional<FlyPagedAttentionDescriptor> attention =
-      GetDescriptorForTarget(call,
-                             kFlyPagedAttentionSegmentedProducerCallTarget,
-                             query_shape);
+      GetDescriptorForTarget(
+          call, fused_reducer ? kFlyPagedAttentionSegmentedFusedCallTarget
+                              : kFlyPagedAttentionSegmentedProducerCallTarget,
+          query_shape);
   if (!attention.has_value()) {
     return std::nullopt;
+  }
+  if (fused_reducer) {
+    const Shape& final_output = call.shape().tuple_shapes(0);
+    const Shape& completion_tickets = call.shape().tuple_shapes(4);
+    if (!ShapeUtil::Compatible(final_output, query_shape) ||
+        completion_tickets.element_type() != U32 ||
+        completion_tickets.dimensions_size() != 3 ||
+        !completion_tickets.has_layout() ||
+        !LayoutUtil::IsMonotonicWithDim0Major(
+            completion_tickets.layout()) ||
+        completion_tickets.dimensions(0) != attention->sequences ||
+        completion_tickets.dimensions(1) != attention->kv_heads ||
+        completion_tickets.dimensions(2) != 2) {
+      return std::nullopt;
+    }
   }
   const int64_t num_segments = partial_output.dimensions(2);
   if (partial_output.dimensions(0) != attention->sequences ||
@@ -171,7 +194,7 @@ GetFlyPagedAttentionSegmentedProducerDescriptor(const HloInstruction& call) {
        kTokenAlignment - 1) /
       kTokenAlignment * kTokenAlignment;
   return FlyPagedAttentionSegmentedProducerDescriptor{
-      *attention, num_segments, segment_tokens};
+      *attention, num_segments, segment_tokens, fused_reducer};
 }
 
 std::optional<FlyPagedAttentionSegmentedProducerDescriptor>

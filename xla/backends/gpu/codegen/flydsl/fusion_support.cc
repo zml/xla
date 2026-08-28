@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "absl/strings/string_view.h"
 #include "xla/backends/gpu/codegen/flydsl/attention_support.h"
+#include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/scan_support.h"
 #include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
@@ -80,14 +81,22 @@ FlyFusionRoute ClassifyFlyFusion(const HloFusionAnalysis& analysis) {
   if (IsFlySoftmaxFusion(analysis)) {
     return FlyFusionRoute::kSoftmax;
   }
+  if (IsFlyLayerNormFusion(analysis)) {
+    return FlyFusionRoute::kLayerNorm;
+  }
   if (IsFlyXTileTransposeConfigSupported(analysis)) {
     return FlyFusionRoute::kTranspose;
   }
-  if (IsFlyXTileElementwiseFusion(analysis)) {
-    return FlyFusionRoute::kElementwise;
-  }
+  // The native elementwise emitter deliberately accepts embedded reductions,
+  // but its generic lowering assigns an entire reduction to each output lane.
+  // Prefer the dedicated wave-per-row emitter whenever its stricter matcher
+  // recognizes the graph. Non-row (strided) reductions still fall through to
+  // the elementwise emitter and retain its cooperative specialization.
   if (IsFlyXTileRowReductionFusion(analysis)) {
     return FlyFusionRoute::kRowReduction;
+  }
+  if (IsFlyXTileElementwiseFusion(analysis)) {
+    return FlyFusionRoute::kElementwise;
   }
   return FlyFusionRoute::kGenericXla;
 }
@@ -110,6 +119,8 @@ absl::string_view FlyFusionRouteName(FlyFusionRoute route) {
       return "native-attention";
     case FlyFusionRoute::kSoftmax:
       return "native-softmax";
+    case FlyFusionRoute::kLayerNorm:
+      return "native-layer-norm";
     case FlyFusionRoute::kTranspose:
       return "native-transpose";
     case FlyFusionRoute::kElementwise:

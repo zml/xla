@@ -503,6 +503,7 @@ class FlyAllReduceTest : public AllReduceTestNoParams {
   DebugOptions GetDebugOptionsForTest() const override {
     DebugOptions opts = CollectiveOpsWithFlagsBase::GetDebugOptionsForTest();
     opts.set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(true);
+    opts.set_xla_gpu_enable_flydsl_fusion(true);
     opts.set_xla_gpu_flydsl_replace_triton(true);
     return opts;
   }
@@ -576,7 +577,339 @@ ENTRY main {
           << "ExpectedOutput != Result at rank " << i;
     }
   }
+
+  void RunBf16ResidualAddEpilogue(int64_t elements, int64_t num_replicas,
+                                  absl::string_view reduction = "add") {
+    if (!CheckDeviceCount(num_replicas)) {
+      return;
+    }
+
+    std::vector<int64_t> replicas(num_replicas);
+    std::iota(replicas.begin(), replicas.end(), 0);
+    const std::string replica_group =
+        absl::StrCat("{", absl::StrJoin(replicas, ","), "}");
+
+    const std::string module_str = absl::StrReplaceAll(
+        R"(
+HloModule fly_all_reduce_residual
+
+apply_op {
+  x = bf16[] parameter(0)
+  y = bf16[] parameter(1)
+  ROOT result = bf16[] __REDUCTION__(x, y)
+}
+
+ENTRY main {
+  input = bf16[__ELEMENTS__]{0} parameter(0)
+  residual = bf16[__ELEMENTS__]{0} parameter(1)
+  reduced = bf16[__ELEMENTS__]{0} all-reduce(input), to_apply=apply_op,
+      replica_groups={__REPLICA_GROUP__}
+  reduced_f32 = f32[__ELEMENTS__]{0} convert(reduced)
+  residual_f32 = f32[__ELEMENTS__]{0} convert(residual)
+  summed = f32[__ELEMENTS__]{0} add(reduced_f32, residual_f32)
+  ROOT output = bf16[__ELEMENTS__]{0} convert(summed)
+}
+)",
+        {{"__ELEMENTS__", absl::StrCat(elements)},
+         {"__REPLICA_GROUP__", replica_group},
+         {"__REDUCTION__", reduction}});
+    ASSERT_OK_AND_ASSIGN(
+        auto module,
+        ParseAndReturnVerifiedModule(module_str, num_replicas));
+
+    std::vector<Literal> inputs;
+    std::vector<Literal> residuals;
+    std::vector<Literal> expected;
+    std::vector<std::vector<Literal*>> arguments;
+    const int64_t reduced_value =
+        reduction == "maximum"
+            ? num_replicas
+            : num_replicas * (num_replicas + 1) / 2;
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      Array<bfloat16> input({elements}, bfloat16(replica + 1));
+      Array<bfloat16> residual({elements}, bfloat16(10 * (replica + 1)));
+      Array<bfloat16> output(
+          {elements}, bfloat16(reduced_value + 10 * (replica + 1)));
+      inputs.push_back(LiteralUtil::CreateFromArray(input));
+      residuals.push_back(LiteralUtil::CreateFromArray(residual));
+      expected.push_back(LiteralUtil::CreateFromArray(output));
+    }
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      arguments.push_back({&inputs[replica], &residuals[replica]});
+    }
+
+    ASSERT_OK_AND_ASSIGN(
+        ExecutionResult execution_result,
+        ExecuteReplicated(std::move(module), arguments));
+    ASSERT_EQ(execution_result.results.size(), num_replicas);
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      ASSERT_TRUE(
+          LiteralTestUtil::Equal(expected[replica],
+                                 execution_result.results[replica]))
+          << "ExpectedOutput != Result at rank " << replica;
+    }
+  }
+
+  void RunBf16ScaledEpilogue(int64_t elements, int64_t num_replicas,
+                             bool add_residual, bool add_bias = false) {
+    if (!CheckDeviceCount(num_replicas)) {
+      return;
+    }
+    ASSERT_FALSE(add_bias && !add_residual);
+
+    std::vector<int64_t> replicas(num_replicas);
+    std::iota(replicas.begin(), replicas.end(), 0);
+    const std::string replica_group =
+        absl::StrCat("{", absl::StrJoin(replicas, ","), "}");
+    const std::string residual_parameter = add_residual
+                                               ? absl::StrCat(
+                                                     "residual = bf16[",
+                                                     elements,
+                                                     "]{0} parameter(1)")
+                                               : "";
+    const std::string bias_parameter =
+        add_bias ? absl::StrCat("bias = bf16[", elements,
+                                "]{0} parameter(2)")
+                 : "";
+    const std::string residual_expression =
+        add_bias
+            ? absl::StrReplaceAll(
+                  R"(
+  residual_f32 = f32[__ELEMENTS__]{0} convert(residual)
+  with_residual = f32[__ELEMENTS__]{0} add(scaled, residual_f32)
+  bias_f32 = f32[__ELEMENTS__]{0} convert(bias)
+  with_bias = f32[__ELEMENTS__]{0} add(with_residual, bias_f32)
+  ROOT output = bf16[__ELEMENTS__]{0} convert(with_bias))",
+                  {{"__ELEMENTS__", absl::StrCat(elements)}})
+            : add_residual
+            ? absl::StrReplaceAll(
+                  R"(
+  residual_f32 = f32[__ELEMENTS__]{0} convert(residual)
+  with_residual = f32[__ELEMENTS__]{0} add(scaled, residual_f32)
+  ROOT output = bf16[__ELEMENTS__]{0} convert(with_residual))",
+                  {{"__ELEMENTS__", absl::StrCat(elements)}})
+            : absl::StrCat("ROOT output = bf16[", elements,
+                           "]{0} convert(scaled)");
+    const std::string module_str = absl::StrReplaceAll(
+        R"(
+HloModule fly_all_reduce_scaled_epilogue
+
+apply_op {
+  x = bf16[] parameter(0)
+  y = bf16[] parameter(1)
+  ROOT result = bf16[] add(x, y)
+}
+
+ENTRY main {
+  input = bf16[__ELEMENTS__]{0} parameter(0)
+  __RESIDUAL_PARAMETER__
+  __BIAS_PARAMETER__
+  reduced = bf16[__ELEMENTS__]{0} all-reduce(input), to_apply=apply_op,
+      replica_groups={__REPLICA_GROUP__}
+  reduced_f32 = f32[__ELEMENTS__]{0} convert(reduced)
+  scale = f32[] constant(0.125)
+  scale_broadcast = f32[__ELEMENTS__]{0} broadcast(scale), dimensions={}
+  scaled = f32[__ELEMENTS__]{0} multiply(reduced_f32, scale_broadcast)
+  __RESIDUAL_EXPRESSION__
+}
+)",
+        {{"__ELEMENTS__", absl::StrCat(elements)},
+         {"__REPLICA_GROUP__", replica_group},
+         {"__RESIDUAL_PARAMETER__", residual_parameter},
+         {"__BIAS_PARAMETER__", bias_parameter},
+         {"__RESIDUAL_EXPRESSION__", residual_expression}});
+    ASSERT_OK_AND_ASSIGN(
+        auto module,
+        ParseAndReturnVerifiedModule(module_str, num_replicas));
+
+    std::vector<Literal> inputs;
+    std::vector<Literal> residuals;
+    std::vector<Literal> biases;
+    std::vector<Literal> expected;
+    std::vector<std::vector<Literal*>> arguments;
+    const float reduced_value =
+        0.125f * num_replicas * (num_replicas + 1) / 2;
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      Array<bfloat16> input({elements}, bfloat16(replica + 1));
+      Array<bfloat16> residual({elements}, bfloat16(10 * (replica + 1)));
+      Array<bfloat16> bias({elements}, bfloat16(2 * (replica + 1)));
+      Array<bfloat16> output(
+          {elements},
+          bfloat16(reduced_value +
+                   (add_residual ? 10 * (replica + 1) : 0) +
+                   (add_bias ? 2 * (replica + 1) : 0)));
+      inputs.push_back(LiteralUtil::CreateFromArray(input));
+      residuals.push_back(LiteralUtil::CreateFromArray(residual));
+      biases.push_back(LiteralUtil::CreateFromArray(bias));
+      expected.push_back(LiteralUtil::CreateFromArray(output));
+    }
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      if (add_bias) {
+        arguments.push_back(
+            {&inputs[replica], &residuals[replica], &biases[replica]});
+      } else if (add_residual) {
+        arguments.push_back({&inputs[replica], &residuals[replica]});
+      } else {
+        arguments.push_back({&inputs[replica]});
+      }
+    }
+
+    ASSERT_OK_AND_ASSIGN(
+        ExecutionResult execution_result,
+        ExecuteReplicated(std::move(module), arguments));
+    ASSERT_EQ(execution_result.results.size(), num_replicas);
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      ASSERT_TRUE(
+          LiteralTestUtil::Equal(expected[replica],
+                                 execution_result.results[replica]))
+          << "ExpectedOutput != Result at rank " << replica;
+    }
+  }
+
+  void RunBf16ProducerFusion(int64_t elements, int64_t num_replicas,
+                             bool gated) {
+    if (!CheckDeviceCount(num_replicas)) {
+      return;
+    }
+
+    std::vector<int64_t> replicas(num_replicas);
+    std::iota(replicas.begin(), replicas.end(), 0);
+    const std::string replica_group =
+        absl::StrCat("{", absl::StrJoin(replicas, ","), "}");
+    const std::string gate_parameter =
+        gated ? absl::StrCat("gate = bf16[", elements,
+                             "]{0} parameter(1)")
+              : "";
+    const std::string producer =
+        gated
+            ? absl::StrReplaceAll(
+                  R"(
+  gate_f32 = f32[__ELEMENTS__]{0} convert(gate)
+  produced_f32 = f32[__ELEMENTS__]{0} multiply(input_f32, gate_f32))",
+                  {{"__ELEMENTS__", absl::StrCat(elements)}})
+            : absl::StrReplaceAll(
+                  R"(
+  scale = f32[] constant(0.5)
+  scale_broadcast = f32[__ELEMENTS__]{0} broadcast(scale), dimensions={}
+  produced_f32 = f32[__ELEMENTS__]{0} multiply(input_f32, scale_broadcast))",
+                  {{"__ELEMENTS__", absl::StrCat(elements)}});
+    const std::string module_str = absl::StrReplaceAll(
+        R"(
+HloModule fly_all_reduce_producer_fusion
+
+apply_op {
+  x = bf16[] parameter(0)
+  y = bf16[] parameter(1)
+  ROOT result = bf16[] add(x, y)
+}
+
+ENTRY main {
+  input = bf16[__ELEMENTS__]{0} parameter(0)
+  __GATE_PARAMETER__
+  input_f32 = f32[__ELEMENTS__]{0} convert(input)
+  __PRODUCER__
+  produced = bf16[__ELEMENTS__]{0} convert(produced_f32)
+  ROOT reduced = bf16[__ELEMENTS__]{0} all-reduce(produced),
+      to_apply=apply_op, replica_groups={__REPLICA_GROUP__}
+}
+)",
+        {{"__ELEMENTS__", absl::StrCat(elements)},
+         {"__GATE_PARAMETER__", gate_parameter},
+         {"__PRODUCER__", producer},
+         {"__REPLICA_GROUP__", replica_group}});
+    ASSERT_OK_AND_ASSIGN(
+        auto module,
+        ParseAndReturnVerifiedModule(module_str, num_replicas));
+
+    std::vector<Literal> inputs;
+    std::vector<Literal> gates;
+    std::vector<Literal> expected;
+    std::vector<std::vector<Literal*>> arguments;
+    const int64_t reduced_value =
+        num_replicas * (num_replicas + 1) / 2;
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      Array<bfloat16> input({elements}, bfloat16(2 * (replica + 1)));
+      Array<bfloat16> gate({elements}, bfloat16(0.5f));
+      Array<bfloat16> output({elements}, bfloat16(reduced_value));
+      inputs.push_back(LiteralUtil::CreateFromArray(input));
+      gates.push_back(LiteralUtil::CreateFromArray(gate));
+      expected.push_back(LiteralUtil::CreateFromArray(output));
+    }
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      arguments.push_back(gated ? std::vector<Literal*>{&inputs[replica],
+                                                        &gates[replica]}
+                                : std::vector<Literal*>{&inputs[replica]});
+    }
+
+    ASSERT_OK_AND_ASSIGN(
+        ExecutionResult execution_result,
+        ExecuteReplicated(std::move(module), arguments));
+    ASSERT_EQ(execution_result.results.size(), num_replicas);
+    for (int64_t replica = 0; replica < num_replicas; ++replica) {
+      ASSERT_TRUE(
+          LiteralTestUtil::Equal(expected[replica],
+                                 execution_result.results[replica]))
+          << "ExpectedOutput != Result at rank " << replica;
+    }
+  }
 };
+
+TEST_F(FlyAllReduceTest, ResidualAddEpilogue) {
+  RunBf16ResidualAddEpilogue(/*elements=*/65536, /*num_replicas=*/2);
+}
+
+TEST_F(FlyAllReduceTest, ResidualAddEpilogueEightRanks) {
+  RunBf16ResidualAddEpilogue(/*elements=*/65536, /*num_replicas=*/8);
+}
+
+TEST_F(FlyAllReduceTest, ResidualAddEpilogueTwoShotEightRanks) {
+  RunBf16ResidualAddEpilogue(/*elements=*/524288, /*num_replicas=*/8);
+}
+
+TEST_F(FlyAllReduceTest, MaximumResidualAddEpilogueEightRanks) {
+  RunBf16ResidualAddEpilogue(/*elements=*/65536, /*num_replicas=*/8,
+                             /*reduction=*/"maximum");
+}
+
+TEST_F(FlyAllReduceTest, ScaledEpilogueEightRanks) {
+  RunBf16ScaledEpilogue(/*elements=*/65536, /*num_replicas=*/8,
+                        /*add_residual=*/false);
+}
+
+TEST_F(FlyAllReduceTest, ScaledResidualEpilogueEightRanks) {
+  RunBf16ScaledEpilogue(/*elements=*/65536, /*num_replicas=*/8,
+                        /*add_residual=*/true);
+}
+
+TEST_F(FlyAllReduceTest, ScaledResidualEpilogueTwoShotEightRanks) {
+  RunBf16ScaledEpilogue(/*elements=*/524288, /*num_replicas=*/8,
+                        /*add_residual=*/true);
+}
+
+TEST_F(FlyAllReduceTest, ScaledTwoBufferEpilogueEightRanks) {
+  RunBf16ScaledEpilogue(/*elements=*/65536, /*num_replicas=*/8,
+                        /*add_residual=*/true, /*add_bias=*/true);
+}
+
+TEST_F(FlyAllReduceTest, ScaledProducerTwoRanks) {
+  RunBf16ProducerFusion(/*elements=*/65536, /*num_replicas=*/2,
+                        /*gated=*/false);
+}
+
+TEST_F(FlyAllReduceTest, ScaledProducerEightRanks) {
+  RunBf16ProducerFusion(/*elements=*/65536, /*num_replicas=*/8,
+                        /*gated=*/false);
+}
+
+TEST_F(FlyAllReduceTest, ScaledProducerTwoShotEightRanks) {
+  RunBf16ProducerFusion(/*elements=*/524288, /*num_replicas=*/8,
+                        /*gated=*/false);
+}
+
+TEST_F(FlyAllReduceTest, GatedProducerEightRanks) {
+  RunBf16ProducerFusion(/*elements=*/65536, /*num_replicas=*/8,
+                        /*gated=*/true);
+}
 
 TEST_F(FlyAllReduceTest, RepeatedOneShotWithVectorTail) {
   RunRepeatedBf16AllReduce(/*elements=*/65537);

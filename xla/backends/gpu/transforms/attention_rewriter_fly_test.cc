@@ -252,6 +252,191 @@ ENTRY main {
 }
 )";
 
+constexpr absl::string_view kGroupedQueryAttentionHlo = R"(
+HloModule fly_grouped_query_attention_rewriter
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+qk {
+  key = bf16[8,128,64]{2,1,0} parameter(0)
+  query = bf16[8,64,512]{2,1,0} parameter(1)
+  scores = bf16[8,128,512]{2,1,0} dot(key, query),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scale = bf16[] constant(0.125)
+  scales = bf16[8,128,512]{2,1,0} broadcast(scale), dimensions={}
+  ROOT result = bf16[8,128,512]{2,1,0} multiply(scores, scales)
+}
+
+pv {
+  value = bf16[8,64,128]{2,1,0} parameter(0)
+  probabilities = bf16[8,128,512]{2,1,0} parameter(1)
+  ROOT result = bf16[8,64,512]{2,1,0} dot(value, probabilities),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+}
+
+ENTRY main {
+  packed_qkv = bf16[256,1536]{1,0} parameter(0)
+  packed_view = bf16[2,128,1536]{2,1,0} bitcast(packed_qkv)
+
+  kv_segment = bf16[2,128,512]{2,1,0} slice(packed_view),
+    slice={[0:2], [0:128], [1024:1536]}
+  kv_view = bf16[2,128,2,4,64]{4,3,2,1,0} bitcast(kv_segment)
+  value_slice = bf16[2,128,1,4,64]{4,3,2,1,0} slice(kv_view),
+    slice={[0:2], [0:128], [1:2], [0:4], [0:64]}
+  value_transpose = bf16[2,1,4,64,128]{4,3,2,1,0}
+    transpose(value_slice), dimensions={0,2,3,4,1}
+  value = bf16[8,64,128]{2,1,0} bitcast(value_transpose)
+  key_slice = bf16[2,128,1,4,64]{4,3,2,1,0} slice(kv_view),
+    slice={[0:2], [0:128], [0:1], [0:4], [0:64]}
+  key_transpose = bf16[2,1,4,128,64]{4,3,2,1,0}
+    transpose(key_slice), dimensions={0,2,3,1,4}
+  key = bf16[8,128,64]{2,1,0} bitcast(key_transpose)
+
+  query_segment = bf16[2,128,1024]{2,1,0} slice(packed_view),
+    slice={[0:2], [0:128], [0:1024]}
+  query_view = bf16[2,128,4,4,64]{4,3,2,1,0}
+    bitcast(query_segment)
+  query_transpose = bf16[2,4,64,128,4]{4,3,2,1,0}
+    transpose(query_view), dimensions={0,2,4,1,3}
+  query = bf16[8,64,512]{2,1,0} bitcast(query_transpose)
+
+  qk_fusion = bf16[8,128,512]{2,1,0} fusion(key, query),
+    kind=kCustom, calls=qk,
+    backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+  scores = bf16[2,4,128,128,4]{4,3,2,1,0} bitcast(qk_fusion)
+  scores_f32 = f32[2,4,128,128,4]{4,3,2,1,0} convert(scores)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[2,4,128,4]{3,2,1,0} reduce(scores_f32, minus_inf),
+    dimensions={2}, to_apply=maximum
+  maxima = f32[2,4,128,128,4]{4,3,2,1,0} broadcast(row_max),
+    dimensions={0,1,3,4}
+  shifted = f32[2,4,128,128,4]{4,3,2,1,0}
+    subtract(scores_f32, maxima)
+  exponential = f32[2,4,128,128,4]{4,3,2,1,0}
+    exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,4,128,4]{3,2,1,0} reduce(exponential, zero),
+    dimensions={2}, to_apply=add
+  sums = f32[2,4,128,128,4]{4,3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,3,4}
+  normalized = f32[2,4,128,128,4]{4,3,2,1,0}
+    divide(exponential, sums)
+  probabilities = bf16[2,4,128,128,4]{4,3,2,1,0}
+    convert(normalized)
+  probabilities_transpose = bf16[2,4,128,4,128]{4,3,2,1,0}
+    transpose(probabilities), dimensions={0,1,2,4,3}
+  probabilities_flat = bf16[8,128,512]{2,1,0}
+    bitcast(probabilities_transpose)
+
+  pv_fusion = bf16[8,64,512]{2,1,0} fusion(value, probabilities_flat),
+    kind=kCustom, calls=pv,
+    backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+  context = bf16[2,4,64,4,128]{4,3,2,1,0} bitcast(pv_fusion)
+  context_transpose = bf16[2,128,4,4,64]{4,3,2,1,0}
+    transpose(context), dimensions={0,4,1,3,2}
+  ROOT result = bf16[2,128,1024]{2,1,0} bitcast(context_transpose)
+}
+)";
+
+constexpr absl::string_view kCrossAttentionHlo = R"(
+HloModule fly_cross_attention_rewriter
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+qk {
+  query = bf16[32,128,64]{2,1,0} parameter(0)
+  key = bf16[32,64,256]{2,1,0} parameter(1)
+  scores = bf16[32,128,256]{2,1,0} dot(query, key),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scale = bf16[] constant(0.125)
+  scales = bf16[32,128,256]{2,1,0} broadcast(scale), dimensions={}
+  ROOT result = bf16[32,128,256]{2,1,0} multiply(scores, scales)
+}
+
+pv {
+  value = bf16[32,64,256]{2,1,0} parameter(0)
+  probabilities = bf16[32,128,256]{2,1,0} parameter(1)
+  context = bf16[32,64,128]{2,1,0} dot(value, probabilities),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={2}
+  view = bf16[2,16,64,128]{3,2,1,0} bitcast(context)
+  ROOT result = bf16[2,128,16,64]{3,2,1,0} transpose(view),
+    dimensions={0,3,1,2}
+}
+
+ENTRY main {
+  projected_query = bf16[256,1024]{1,0} parameter(0)
+  query_view = bf16[2,128,16,64]{3,2,1,0} bitcast(projected_query)
+  query_transpose = bf16[2,16,128,64]{3,2,1,0}
+    transpose(query_view), dimensions={0,2,1,3}
+  query = bf16[32,128,64]{2,1,0} bitcast(query_transpose)
+
+  projected_key_value = bf16[512,2048]{1,0} parameter(1)
+  key_value_view = bf16[2,256,2,16,64]{4,3,2,1,0}
+    bitcast(projected_key_value)
+  key_slice = bf16[2,256,1,16,64]{4,3,2,1,0}
+    slice(key_value_view),
+    slice={[0:2], [0:256], [0:1], [0:16], [0:64]}
+  key_transpose = bf16[2,1,16,64,256]{4,3,2,1,0}
+    transpose(key_slice), dimensions={0,2,3,4,1}
+  key = bf16[32,64,256]{2,1,0} bitcast(key_transpose)
+  value_slice = bf16[2,256,1,16,64]{4,3,2,1,0}
+    slice(key_value_view),
+    slice={[0:2], [0:256], [1:2], [0:16], [0:64]}
+  value_transpose = bf16[2,1,16,64,256]{4,3,2,1,0}
+    transpose(value_slice), dimensions={0,2,3,4,1}
+  value = bf16[32,64,256]{2,1,0} bitcast(value_transpose)
+
+  qk_fusion = bf16[32,128,256]{2,1,0} fusion(query, key),
+    kind=kCustom, calls=qk,
+    backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+  score_view = bf16[2,16,128,256]{3,2,1,0} bitcast(qk_fusion)
+  scores_f32 = f32[2,16,128,256]{3,2,1,0} convert(score_view)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[2,16,128]{2,1,0} reduce(scores_f32, minus_inf),
+    dimensions={3}, to_apply=maximum
+  maxima = f32[2,16,128,256]{3,2,1,0} broadcast(row_max),
+    dimensions={0,1,2}
+  shifted = f32[2,16,128,256]{3,2,1,0} subtract(scores_f32, maxima)
+  exponential = f32[2,16,128,256]{3,2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,16,128]{2,1,0} reduce(exponential, zero),
+    dimensions={3}, to_apply=add
+  sums = f32[2,16,128,256]{3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,2}
+  normalized = f32[2,16,128,256]{3,2,1,0}
+    divide(exponential, sums)
+  probabilities = bf16[2,16,128,256]{3,2,1,0} convert(normalized)
+  probabilities_bh = bf16[32,128,256]{2,1,0} bitcast(probabilities)
+  ROOT pv_fusion = bf16[2,128,16,64]{3,2,1,0}
+    fusion(value, probabilities_bh), kind=kCustom, calls=pv,
+    backend_config={"fusion_backend_config":{"kind":"__fly_gemm"}}
+}
+)";
+
 class AttentionRewriterFlyTest : public HloHardwareIndependentTestBase {};
 
 TEST_F(AttentionRewriterFlyTest, FusesQkSoftmaxPvAndQkvTranspose) {
@@ -280,12 +465,9 @@ TEST_F(AttentionRewriterFlyTest, FusesQkSoftmaxPvAndQkvTranspose) {
 
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                        fusion->backend_config<GpuBackendConfig>());
-  const FusionBackendConfig& fusion_config =
-      gpu_config.fusion_backend_config();
+  const FusionBackendConfig& fusion_config = gpu_config.fusion_backend_config();
   EXPECT_EQ(fusion_config.kind(), kFlyFusionKind);
-  EXPECT_THAT(fusion_config.block_level_fusion_config()
-                  .output_tiles(0)
-                  .sizes(),
+  EXPECT_THAT(fusion_config.block_level_fusion_config().output_tiles(0).sizes(),
               ElementsAre(1, 128, 1, 64));
   EXPECT_EQ(fusion_config.block_level_fusion_config().num_warps(), 4);
   EXPECT_EQ(fusion_config.block_level_fusion_config().waves_per_eu(), 2);
@@ -318,6 +500,51 @@ TEST_F(AttentionRewriterFlyTest, FusesEarlyPipelineCausalAttentionGraph) {
   EXPECT_EQ(dots, 2);
   EXPECT_EQ(nested_fusions, 0);
   EXPECT_EQ(selects, 1);
+}
+
+TEST_F(AttentionRewriterFlyTest, FusesGroupedQueryAttentionGraph) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kGroupedQueryAttentionHlo));
+
+  EXPECT_THAT(AttentionRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  EXPECT_THAT(fusion->name(), HasSubstr("fly_attention"));
+  ASSERT_EQ(fusion->operand_count(), 1);
+  EXPECT_THAT(fusion->operand(0)->name(), HasSubstr("packed_qkv"));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 2);
+
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  const FusionBackendConfig& fusion_config = gpu_config.fusion_backend_config();
+  EXPECT_EQ(fusion_config.kind(), kFlyFusionKind);
+  EXPECT_THAT(fusion_config.block_level_fusion_config().output_tiles(0).sizes(),
+              ElementsAre(1, 128, 1, 64));
+}
+
+TEST_F(AttentionRewriterFlyTest, FusesUnequalLengthCrossAttentionGraph) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kCrossAttentionHlo));
+
+  EXPECT_THAT(AttentionRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  EXPECT_THAT(fusion->name(), HasSubstr("fly_attention"));
+  ASSERT_EQ(fusion->operand_count(), 2);
+  EXPECT_THAT(fusion->operand(0)->name(), HasSubstr("projected_query"));
+  EXPECT_THAT(fusion->operand(1)->name(), HasSubstr("projected_key_value"));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  const FusionBackendConfig& fusion_config = gpu_config.fusion_backend_config();
+  EXPECT_EQ(fusion_config.kind(), kFlyFusionKind);
+  EXPECT_THAT(fusion_config.block_level_fusion_config().output_tiles(0).sizes(),
+              ElementsAre(1, 128, 1, 64));
 }
 
 }  // namespace

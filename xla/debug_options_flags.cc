@@ -474,6 +474,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_unsupported_enable_all_reduce_decomposer(false);
   opts.set_xla_gpu_unsupported_enable_ragged_all_to_all_decomposer(false);
   opts.set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(true);
+  opts.add_xla_gpu_experimental_use_collective_kernels(
+      DebugOptions::COLLECTIVE_KERNEL_ALL_REDUCE);
   opts.set_xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel(true);
   opts.set_xla_gpu_experimental_enable_fusion_autotuner(true);
   opts.set_xla_gpu_experimental_max_unroll_factor(32);
@@ -613,6 +615,20 @@ static void ApplyPjRtPluginFlyDslOverrides(DebugOptions* debug_options) {
     // is emitted through native Fly in replacement mode.
     debug_options->set_xla_gpu_unsupported_use_all_reduce_one_shot_kernel(
         true);
+    auto* collective_kernels =
+        debug_options->mutable_xla_gpu_experimental_use_collective_kernels();
+    if (FindRepeatedFieldValue(
+            collective_kernels,
+            DebugOptions::COLLECTIVE_KERNEL_ALL_REDUCE) ==
+        collective_kernels->end()) {
+      collective_kernels->Add(DebugOptions::COLLECTIVE_KERNEL_ALL_REDUCE);
+    }
+    if (FindRepeatedFieldValue(
+            collective_kernels,
+            DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER) ==
+        collective_kernels->end()) {
+      collective_kernels->Add(DebugOptions::COLLECTIVE_KERNEL_ALL_GATHER);
+    }
     add_autotune_backend(autotuner::Backend::FLY);
     add_autotune_backend(autotuner::Backend::FLY_FISSION);
     add_autotune_backend(autotuner::Backend::FLY_FUSION);
@@ -1045,6 +1061,17 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       }
     };
     return absl::StrJoin(collective_ops, ", ", Formatter());
+  };
+
+  auto collective_kernel_types_to_string =
+      [](google::protobuf::RepeatedField<int> collective_kernels)
+      -> std::string {
+    struct Formatter {
+      void operator()(std::string* out, int type) const {
+        absl::StrAppend(out, DebugOptions::CollectiveKernelType_Name(type));
+      }
+    };
+    return absl::StrJoin(collective_kernels, ", ", Formatter());
   };
 
   // Custom parser for `xla_cpu_xnn_graph_fusion_mode` flag.
@@ -2918,6 +2945,23 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "  '+cudnn,-cublas' (adds/removes from defaults)\n"
       "Available: cudnn, triton, cublas, cublaslt etc, check "
       "xla.autotuner.Backend for the full list."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_use_collective_kernels",
+      SetterForRepeatedEnum<DebugOptions::CollectiveKernelType>(
+          "xla_gpu_experimental_use_collective_kernels",
+          /*enum_prefix=*/"COLLECTIVE_KERNEL_",
+          [](absl::string_view s, DebugOptions::CollectiveKernelType* v) {
+            return DebugOptions::CollectiveKernelType_Parse(s, v);
+          },
+          [debug_options]() {
+            return debug_options
+                ->mutable_xla_gpu_experimental_use_collective_kernels();
+          }),
+      collective_kernel_types_to_string(
+          debug_options->xla_gpu_experimental_use_collective_kernels()),
+      "Experimental comma-separated filter of collectives implemented by "
+      "device-side kernels instead of NCCL/RCCL. Accepted values: "
+      "ALL_REDUCE, ALL_GATHER."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_all_fusions_with_triton",
       bool_setter_for(

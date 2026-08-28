@@ -101,8 +101,21 @@ absl::StatusOr<int32_t> AddCollectiveMetadataArguments(
 absl::StatusOr<std::vector<Shape>> GetCollectiveUnmanagedKernelArguments(
     const HloFusionInstruction* fusion);
 
+absl::StatusOr<std::optional<BlockLevelFusionConfig>>
+GetBlockLevelFusionConfigForAllGather(
+    const GpuTopology& gpu_topology, const HloAllGatherInstruction* all_gather,
+    const DeviceAssignment* device_assignment = nullptr);
+
+absl::StatusOr<std::vector<Shape>> GetAllGatherUnmanagedKernelArguments(
+    const HloComputation* computation,
+    const HloAllGatherInstruction* all_gather);
+
 // Rewrites stablehlo all-reduce op to a triton implementation.
 mlir::LogicalResult RewriteAllReduce(mlir::stablehlo::AllReduceOp op,
+                                     mlir::PatternRewriter& rewriter);
+
+// Rewrites stablehlo all-gather op to a Triton implementation.
+mlir::LogicalResult RewriteAllGather(mlir::stablehlo::AllGatherOp op,
                                      mlir::PatternRewriter& rewriter);
 
 // Creates a CollectiveKernelSpec for a given collective or fusion instruction.

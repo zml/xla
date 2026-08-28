@@ -1,0 +1,39 @@
+HloModule fly_fusion_bf16_offset_contiguous_overwrite_scatter_benchmark
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[65536,1023]{1,0} parameter(0)
+  updates = bf16[65536,511]{1,0} parameter(1)
+  transformed = bf16[65536,511]{1,0} abs(updates)
+  canonical_updates = bf16[65536,1,511]{2,1,0} bitcast(transformed)
+  row_ids = s32[65536]{0} iota(), iota_dimension=0
+  multiplier = s32[] constant(31337)
+  multipliers = s32[65536]{0} broadcast(multiplier), dimensions={}
+  permuted = s32[65536]{0} multiply(row_ids, multipliers)
+  row_mask_value = s32[] constant(65535)
+  row_mask = s32[65536]{0} broadcast(row_mask_value), dimensions={}
+  bounded_rows = s32[65536]{0} and(permuted, row_mask)
+  column_limit_value = s32[] constant(513)
+  column_limit = s32[65536]{0} broadcast(column_limit_value), dimensions={}
+  columns = s32[65536]{0} remainder(row_ids, column_limit)
+  row_column = s32[65536,1]{1,0} bitcast(bounded_rows)
+  offset_column = s32[65536,1]{1,0} bitcast(columns)
+  indices = s32[65536,2]{1,0}
+    concatenate(row_column, offset_column), dimensions={1}
+  ROOT scatter = bf16[65536,1023]{1,0}
+    scatter(base, indices, canonical_updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[65536,1023]{1,0} parameter(0)
+  updates = bf16[65536,511]{1,0} parameter(1)
+  ROOT fusion = bf16[65536,1023]{1,0} fusion(base, updates), kind=kInput,
+    calls=elementwise
+}

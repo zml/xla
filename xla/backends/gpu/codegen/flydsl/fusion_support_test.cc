@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "xla/backends/gpu/codegen/custom.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_elementwise.h"
+#include "xla/backends/gpu/codegen/flydsl/xtile_reduction.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/fusions.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -82,6 +84,55 @@ ENTRY main {
   EXPECT_EQ(FlyFusionRouteName(ClassifyFlyFusion(generic_analysis)),
             "generic-xla-emitter");
   EXPECT_FALSE(IsNativeFlyFusionRoute(ClassifyFlyFusion(generic_analysis)));
+}
+
+TEST_F(FlyFusionSupportTest, PrefersNativeRowReductionOverElementwiseFallback) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+HloModule fly_rms_norm_route
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+body {
+  p0 = bf16[2,128,1024]{2,1,0} parameter(0)
+  converted = f32[2,128,1024]{2,1,0} convert(p0)
+  squared = f32[2,128,1024]{2,1,0} multiply(converted, converted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,128]{1,0} reduce(squared, zero), dimensions={2},
+      to_apply=add
+  reciprocal_width = f32[] constant(0.0009765625)
+  widths = f32[2,128]{1,0} broadcast(reciprocal_width), dimensions={}
+  mean_square = f32[2,128]{1,0} multiply(row_sum, widths)
+  epsilon = f32[] constant(1e-06)
+  epsilons = f32[2,128]{1,0} broadcast(epsilon), dimensions={}
+  variance = f32[2,128]{1,0} add(mean_square, epsilons)
+  reciprocal_stddev = f32[2,128]{1,0} rsqrt(variance)
+  scales = f32[2,128,1024]{2,1,0} broadcast(reciprocal_stddev),
+      dimensions={0,1}
+  normalized = f32[2,128,1024]{2,1,0} multiply(converted, scales)
+  ROOT result = bf16[2,128,1024]{2,1,0} convert(normalized)
+}
+
+ENTRY main {
+  p0 = bf16[2,128,1024]{2,1,0} parameter(0)
+  ROOT fusion = bf16[2,128,1024]{2,1,0} fusion(p0), kind=kCustom,
+      calls=body,
+      backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+  auto device = TestGpuDeviceInfo::AMDMI210DeviceInfo();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *module->entry_computation()->root_instruction(), device);
+
+  // This overlap is intentional: elementwise remains a broad correctness
+  // fallback, while the row matcher identifies the efficient launch domain.
+  EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
+  EXPECT_TRUE(IsFlyXTileRowReductionFusion(analysis));
+  EXPECT_EQ(ClassifyFlyFusion(analysis), FlyFusionRoute::kRowReduction);
 }
 
 TEST_F(FlyFusionSupportTest, RoutesOpaqueCustomCallToErrorEmitter) {

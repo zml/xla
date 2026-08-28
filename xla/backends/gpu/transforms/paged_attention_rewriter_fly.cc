@@ -175,6 +175,60 @@ absl::StatusOr<HloFusionInstruction*> MakeSegmentedProducerFusion(
   return Cast<HloFusionInstruction>(fusion);
 }
 
+absl::StatusOr<HloFusionInstruction*> MakeSegmentedFusedFusion(
+    HloCustomCallInstruction* call, int64_t num_segments,
+    int64_t num_warps) {
+  const Shape& output_shape = call->shape();
+  Shape partial_output_shape = ShapeUtil::MakeShapeWithDenseLayout(
+      F32,
+      {output_shape.dimensions(0), output_shape.dimensions(1), num_segments,
+       output_shape.dimensions(2)},
+      {3, 2, 1, 0});
+  Shape partial_state_shape = ShapeUtil::MakeShapeWithDenseLayout(
+      F32,
+      {output_shape.dimensions(0), output_shape.dimensions(1), num_segments},
+      {2, 1, 0});
+  Shape completion_ticket_shape = ShapeUtil::MakeShapeWithDenseLayout(
+      U32,
+      {output_shape.dimensions(0), call->operand(1)->shape().dimensions(2), 2},
+      {2, 1, 0});
+  Shape fused_shape = ShapeUtil::MakeTupleShape(
+      {output_shape, partial_output_shape, partial_state_shape,
+       partial_state_shape, completion_ticket_shape});
+
+  HloComputation::Builder builder("fly_paged_attention_segmented_fused");
+  std::vector<HloInstruction*> fused_operands;
+  fused_operands.reserve(call->operand_count());
+  for (int64_t i = 0; i < 5; ++i) {
+    fused_operands.push_back(
+        builder.AddInstruction(HloInstruction::CreateParameter(
+            i, call->operand(i)->shape(), call->operand(i)->name())));
+  }
+  fused_operands.push_back(builder.AddInstruction(call->operand(5)->Clone()));
+  HloInstruction* root = builder.AddInstruction(HloInstruction::CreateCustomCall(
+      fused_shape, fused_operands,
+      flydsl::kFlyPagedAttentionSegmentedFusedCallTarget));
+
+  HloModule* module = call->GetModule();
+  HloComputation* parent = call->parent();
+  HloComputation* fused_computation =
+      module->AddComputationAndUnifyNamesAndIds(builder.Build(root),
+                                                /*is_entry=*/false);
+  std::vector<HloInstruction*> external_operands(call->operands().begin(),
+                                                 call->operands().begin() + 5);
+  HloInstruction* fusion = parent->AddInstruction(
+      HloInstruction::CreateFusion(fused_shape,
+                                   HloInstruction::FusionKind::kCustom,
+                                   external_operands, fused_computation),
+      /*new_name=*/"fly_paged_attention_segmented_fused");
+  fusion->set_metadata(call->metadata());
+  TF_RETURN_IF_ERROR(SetPagedAttentionBackendConfig(fusion, num_warps));
+  HloInstruction* output = parent->AddInstruction(
+      HloInstruction::CreateGetTupleElement(output_shape, fusion, 0));
+  TF_RETURN_IF_ERROR(parent->ReplaceInstruction(call, output));
+  return Cast<HloFusionInstruction>(fusion);
+}
+
 absl::StatusOr<HloFusionInstruction*> MakeSegmentedReducerFusion(
     HloCustomCallInstruction* call, HloInstruction* producer) {
   TF_RET_CHECK(producer->shape().IsTuple() &&
@@ -250,6 +304,19 @@ absl::StatusOr<bool> PagedAttentionRewriterFly::RunImpl(
         CeilOfRatio(descriptor->max_context, num_segments);
     const int64_t num_warps =
         (descriptor->max_context >= 65536 || segment_tokens <= 64) ? 2 : 4;
+    const int64_t attention_streams =
+        descriptor->sequences * descriptor->kv_heads;
+    const bool use_fused_reducer =
+        descriptor->max_context >= 65536 && descriptor->gqa_group == 4 &&
+        num_segments <= 128 &&
+        (descriptor->max_context >= 131072 || attention_streams <= 2);
+    if (use_fused_reducer) {
+      TF_ASSIGN_OR_RETURN(HloFusionInstruction * fusion,
+                          MakeSegmentedFusedFusion(call, num_segments,
+                                                   num_warps));
+      (void)fusion;
+      continue;
+    }
     TF_ASSIGN_OR_RETURN(
         HloFusionInstruction * producer,
         MakeSegmentedProducerFusion(call, num_segments, num_warps));

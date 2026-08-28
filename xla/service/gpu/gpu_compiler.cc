@@ -1436,13 +1436,12 @@ void AddCollectiveCombinerPasses(
   // get the correct backend config.
   pipeline.AddPass<CollectiveBackendAssigner>();
 
-  // Annotate AllReduce ops with the Triton kernel strategy (one-shot /
-  // two-shot) that will be used at runtime. This annotation is consumed by
-  // SolLatencyEstimator to apply the correct NVLink-based cost model instead
-  // of the NCCL ring model.  Only added when the Triton collective kernel flag
-  // is enabled; when the flag is off all collectives keep
-  // KERNEL_STRATEGY_DEFAULT.
-  if (opts.xla_gpu_unsupported_use_all_reduce_one_shot_kernel()) {
+  // Annotate collectives selected for device-side kernels. The annotation is
+  // consumed by scheduling and late thunk emission. Keep the legacy
+  // all-reduce flag as an alias while allowing all-gather to be selected
+  // independently (or implicitly by strict Fly replacement mode).
+  if (opts.xla_gpu_unsupported_use_all_reduce_one_shot_kernel() ||
+      !opts.xla_gpu_experimental_use_collective_kernels().empty()) {
     pipeline.AddPass<CollectiveKernelStrategyAnnotator>(
         gpu_topology, /*is_multimem_enabled=*/false);
   }

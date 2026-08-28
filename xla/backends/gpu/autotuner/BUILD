@@ -359,6 +359,7 @@ cc_library(
         "//xla/backends/autotuner:codegen_backend",
         "//xla/backends/gpu/codegen/flydsl:attention_support",
         "//xla/backends/gpu/codegen/flydsl:fusion_support",
+        "//xla/backends/gpu/codegen/flydsl:layer_norm_support",
         "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
         "//xla/backends/gpu/codegen/flydsl:scan_support",
         "//xla/backends/gpu/codegen/flydsl:xtile_elementwise",
@@ -990,6 +991,7 @@ xla_cc_binary(
     ],
     visibility = ["//xla/backends/gpu/codegen/flydsl:__pkg__"],
     deps = [
+        ":autotuner_main_util",
         ":factory",
         ":gpu_profiler",
         ":legacy_cache",
@@ -1052,6 +1054,34 @@ xla_cc_binary(
     ]),
 )
 
+cc_library(
+    name = "autotuner_main_util",
+    srcs = ["autotuner_main_util.cc"],
+    hdrs = ["autotuner_main_util.h"],
+    deps = [
+        "//xla:status_macros",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+xla_cc_test(
+    name = "autotuner_main_util_test",
+    srcs = ["autotuner_main_util_test.cc"],
+    deps = [
+        ":autotuner_main_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 xla_test(
     name = "autotuner_main_test",
     srcs = ["autotuner_main.cc"],
@@ -1064,6 +1094,7 @@ xla_test(
     # This test is for Google internal use only and should not be run on TAP.
     tags = ["notap"],
     deps = [
+        ":autotuner_main_util",
         ":gpu_profiler",
         "//xla:debug_options_flags",
         "//xla:status_macros",

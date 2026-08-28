@@ -69,26 +69,48 @@ constexpr int64_t kFlyCollectiveMaxBlocks = 32;
 
 class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
  public:
-  explicit FlyXTileCollectiveEmitter(const HloFusionAnalysis& analysis) {
+  explicit FlyXTileCollectiveEmitter(const HloFusionAnalysis& analysis,
+                                     CollectiveEpilogue producer,
+                                     CollectiveEpilogue epilogue)
+      : producer_(std::move(producer)), epilogue_(std::move(epilogue)) {
     const HloInstruction& root = analysis.fusion_root(0).instruction();
-    const auto* all_reduce = Cast<HloAllReduceInstruction>(&root);
-    CHECK_EQ(all_reduce->operand_count(), 1);
-    element_type_ = all_reduce->shape().element_type();
-    num_elements_ = ShapeUtil::ElementsIn(all_reduce->shape());
-    world_size_ = all_reduce->device_list()->num_devices_per_group();
+    collective_opcode_ = root.opcode();
+    if (const auto* all_reduce = DynCast<HloAllReduceInstruction>(&root)) {
+      CHECK_EQ(all_reduce->operand_count(), 1);
+      element_type_ = all_reduce->shape().element_type();
+      num_elements_ = ShapeUtil::ElementsIn(all_reduce->shape());
+      output_elements_ = num_elements_;
+      world_size_ = all_reduce->device_list()->num_devices_per_group();
+      reduction_opcode_ = all_reduce->called_computations()
+                              .front()
+                              ->root_instruction()
+                              ->opcode();
+      const int64_t element_bytes = primitive_util::ByteWidth(element_type_);
+      strategy_ = GetAllReduceStrategy(num_elements_ * element_bytes,
+                                       /*is_multimem_enabled=*/false);
+    } else {
+      const auto* all_gather = Cast<HloAllGatherInstruction>(&root);
+      CHECK_EQ(all_gather->operand_count(), 1);
+      CHECK(ShapeUtil::IsEffectivelyMostMajorDimension(
+          all_gather->operand(0)->shape(),
+          all_gather->all_gather_dimension()));
+      element_type_ = all_gather->operand(0)->shape().element_type();
+      num_elements_ = ShapeUtil::ElementsIn(all_gather->operand(0)->shape());
+      output_elements_ = ShapeUtil::ElementsIn(all_gather->shape());
+      world_size_ = all_gather->device_list()->num_devices_per_group();
+      CHECK_EQ(output_elements_, num_elements_ * world_size_);
+      strategy_ = AllReduceStrategy::kOneShot;
+    }
     CHECK_GT(world_size_, 0);
     CHECK_LE(world_size_, se::gpu::kMaxNumAllReduceInputPtrs);
-    reduction_opcode_ =
-        all_reduce->called_computations().front()->root_instruction()->opcode();
 
     const int64_t element_bytes = primitive_util::ByteWidth(element_type_);
-    strategy_ = GetAllReduceStrategy(num_elements_ * element_bytes,
-                                     /*is_multimem_enabled=*/false);
     vector_lanes_ = std::max<int64_t>(1, kTransactionBytes / element_bytes);
     // Small BF16 reductions are latency-bound. Match Triton's four-element
     // per-thread schedule here: it halves each thread's dependent reduction
     // chain and gives every one of the 32 workgroups useful work.
-    if (element_type_ == BF16 &&
+    if (collective_opcode_ == HloOpcode::kAllReduce &&
+        element_type_ == BF16 &&
         num_elements_ * element_bytes <= 1024 * 1024) {
       vector_lanes_ = 4;
     }
@@ -109,8 +131,17 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         (work_elements + vector_lanes_ - 1) / vector_lanes_;
     const int64_t total_threads =
         ((logical_threads + wave_size - 1) / wave_size) * wave_size;
+    // All-gather performs eight peer copies after its local publish on the
+    // common eight-rank path. Spreading the same useful threads over smaller
+    // workgroups lets MI300X schedule more independent stripes while retaining
+    // 16-byte vector transactions. The 32-workgroup cap balances CU occupancy
+    // against the cost and launch-skew sensitivity of cross-rank barriers.
+    const int64_t max_threads_per_block =
+        collective_opcode_ == HloOpcode::kAllGather
+            ? kFlyCollectiveThreads / 2
+            : kFlyCollectiveThreads;
     const int64_t threads_per_block = std::min<int64_t>(
-        kFlyCollectiveThreads,
+        max_threads_per_block,
         llvm::bit_ceil(static_cast<uint64_t>(total_threads)));
     const int64_t blocks = std::min<int64_t>(
         kFlyCollectiveMaxBlocks,
@@ -125,7 +156,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     // reduces the values through LDS. All waves must execute the same number
     // of barrier-containing loop iterations, so retain the generic exact-tail
     // implementation when the pack count does not divide the launch evenly.
-    if (full_vectors_only_ && element_type_ == BF16 &&
+    if (collective_opcode_ == HloOpcode::kAllReduce && full_vectors_only_ &&
+        element_type_ == BF16 &&
         reduction_opcode_ == HloOpcode::kAdd && world_size_ == 8 &&
         strategy_ == AllReduceStrategy::kTwoShot &&
         num_elements_ * element_bytes >= 2 * 1024 * 1024) {
@@ -194,12 +226,16 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     mlir::Type table_pointer =
         mlir::fly::PointerType::get(module_builder.getI64Type(),
                                     global_address);
+    llvm::SmallVector<mlir::Type> argument_types{data_pointer, data_pointer};
+    for (int64_t input = 0;
+         input < producer_.buffer_count + epilogue_.buffer_count; ++input) {
+      argument_types.push_back(data_pointer);
+    }
+    argument_types.append({module_builder.getI32Type(),
+                           module_builder.getI32Type(), table_pointer,
+                           table_pointer});
     mlir::FunctionType function_type = mlir::FunctionType::get(
-        &context,
-        mlir::TypeRange{data_pointer, data_pointer, module_builder.getI32Type(),
-                        module_builder.getI32Type(), table_pointer,
-                        table_pointer},
-        /*results=*/mlir::TypeRange{});
+        &context, argument_types, /*results=*/mlir::TypeRange{});
     mlir::gpu::GPUFuncOp kernel = mlir::gpu::GPUFuncOp::create(
         module_builder, location, entry_function_name, function_type);
     kernel.setKernelAttr(module_builder.getUnitAttr());
@@ -218,6 +254,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
 
   mlir::Type StorageType(mlir::Builder& builder) const {
     switch (element_type_) {
+      case F16:
+        return builder.getF16Type();
       case F32:
         return builder.getF32Type();
       case BF16:
@@ -228,6 +266,10 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         return builder.getI32Type();
       case S64:
         return builder.getI64Type();
+      case S8:
+        return builder.getI8Type();
+      case S16:
+        return builder.getI16Type();
       case PRED:
         // XLA's device ABI stores predicates as bytes.
         return builder.getI8Type();
@@ -458,6 +500,14 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
             type, builder.getIntegerAttr(type.getElementType(), value)));
   }
 
+  Value SplatFloat(mlir::ImplicitLocOpBuilder& builder, mlir::VectorType type,
+                   double value) const {
+    return mlir::arith::ConstantOp::create(
+        builder, type,
+        mlir::DenseElementsAttr::get(
+            type, builder.getFloatAttr(type.getElementType(), value)));
+  }
+
   Value Bf16PairToF32(mlir::ImplicitLocOpBuilder& builder, Value pair) const {
     auto i16_type = mlir::VectorType::get({2}, builder.getI16Type());
     auto i32_type = mlir::VectorType::get({2}, builder.getI32Type());
@@ -542,6 +592,40 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     return AssemblePairs(builder, std::move(pairs));
   }
 
+  Value Bf16VectorToF32(mlir::ImplicitLocOpBuilder& builder,
+                        Value value) const {
+    auto vector_type = mlir::cast<mlir::VectorType>(value.getType());
+    const int64_t vector_width = vector_type.getNumElements();
+    CHECK_EQ(vector_width % 2, 0);
+    auto bf16_pair_type = mlir::VectorType::get({2}, builder.getBF16Type());
+    llvm::SmallVector<Value> pairs;
+    pairs.reserve(vector_width / 2);
+    for (int64_t pair = 0; pair < vector_width / 2; ++pair) {
+      llvm::SmallVector<int64_t, 2> mask{2 * pair, 2 * pair + 1};
+      pairs.push_back(Bf16PairToF32(
+          builder, mlir::vector::ShuffleOp::create(
+                       builder, bf16_pair_type, value, value, mask)));
+    }
+    return AssemblePairs(builder, std::move(pairs));
+  }
+
+  Value RoundF32VectorToBf16(mlir::ImplicitLocOpBuilder& builder,
+                             Value value) const {
+    auto vector_type = mlir::cast<mlir::VectorType>(value.getType());
+    const int64_t vector_width = vector_type.getNumElements();
+    CHECK_EQ(vector_width % 2, 0);
+    auto f32_pair_type = mlir::VectorType::get({2}, builder.getF32Type());
+    llvm::SmallVector<Value> pairs;
+    pairs.reserve(vector_width / 2);
+    for (int64_t pair = 0; pair < vector_width / 2; ++pair) {
+      llvm::SmallVector<int64_t, 2> mask{2 * pair, 2 * pair + 1};
+      pairs.push_back(RoundF32PairToBf16(
+          builder, mlir::vector::ShuffleOp::create(
+                       builder, f32_pair_type, value, value, mask)));
+    }
+    return AssemblePairs(builder, std::move(pairs));
+  }
+
   Value Combine(mlir::ImplicitLocOpBuilder& builder, Value lhs,
                 Value rhs) const {
     const bool floating = element_type_ == F32 || element_type_ == BF16 ||
@@ -580,6 +664,69 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         LOG(FATAL) << "Unsupported Fly collective reduction: "
                    << HloOpcodeString(reduction_opcode_);
     }
+  }
+
+  Value ApplyElementwise(mlir::ImplicitLocOpBuilder& builder,
+                         const CollectiveEpilogue& program, Value value,
+                         llvm::ArrayRef<Value> inputs, Value offset,
+                         Value limit) const {
+    if (program.empty()) {
+      return value;
+    }
+    CHECK_EQ(inputs.size(), program.buffer_count);
+    auto bf16_type = mlir::cast<mlir::VectorType>(value.getType());
+    auto f32_type = mlir::VectorType::get(bf16_type.getShape(),
+                                          builder.getF32Type());
+    Value accumulator = Bf16VectorToF32(builder, value);
+    for (const CollectiveEpilogueStep& step : program.steps) {
+      Value operand;
+      if (step.uses_buffer()) {
+        CHECK_LT(step.buffer_index, inputs.size());
+        operand = Bf16VectorToF32(
+            builder, LoadVector(builder, inputs[step.buffer_index], offset,
+                                limit, bf16_type));
+      } else {
+        operand = SplatFloat(builder, f32_type, step.scalar_value);
+      }
+      Value lhs = step.accumulator_is_lhs ? accumulator : operand;
+      Value rhs = step.accumulator_is_lhs ? operand : accumulator;
+      switch (step.opcode) {
+        case HloOpcode::kAdd:
+          accumulator = mlir::arith::AddFOp::create(builder, lhs, rhs);
+          break;
+        case HloOpcode::kSubtract:
+          accumulator = mlir::arith::SubFOp::create(builder, lhs, rhs);
+          break;
+        case HloOpcode::kMultiply:
+          accumulator = mlir::arith::MulFOp::create(builder, lhs, rhs);
+          break;
+        case HloOpcode::kDivide:
+          accumulator = mlir::arith::DivFOp::create(builder, lhs, rhs);
+          break;
+        case HloOpcode::kMaximum:
+          accumulator = mlir::arith::MaximumFOp::create(builder, lhs, rhs);
+          break;
+        case HloOpcode::kMinimum:
+          accumulator = mlir::arith::MinimumFOp::create(builder, lhs, rhs);
+          break;
+        default:
+          LOG(FATAL) << "Unsupported Fly collective epilogue operation: "
+                     << HloOpcodeString(step.opcode);
+      }
+    }
+    return RoundF32VectorToBf16(builder, accumulator);
+  }
+
+  Value ApplyProducer(mlir::ImplicitLocOpBuilder& builder, Value value,
+                      llvm::ArrayRef<Value> inputs, Value offset,
+                      Value limit) const {
+    return ApplyElementwise(builder, producer_, value, inputs, offset, limit);
+  }
+
+  Value ApplyEpilogue(mlir::ImplicitLocOpBuilder& builder, Value value,
+                      llvm::ArrayRef<Value> inputs, Value offset,
+                      Value limit) const {
+    return ApplyElementwise(builder, epilogue_, value, inputs, offset, limit);
   }
 
   void EmitSync(mlir::ImplicitLocOpBuilder& builder, Value signal_table,
@@ -690,7 +837,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     return {thread, group, lane, first_pack, pack_stride};
   }
 
-  void EmitWideCopy(mlir::ImplicitLocOpBuilder& builder, Value input,
+  void EmitWideCopy(mlir::ImplicitLocOpBuilder& builder,
+                    llvm::ArrayRef<Value> producer_inputs, Value input,
                     Value local_scratch) const {
     const int64_t tile_elements =
         num_elements_ / launch_dimensions_.num_blocks();
@@ -719,13 +867,17 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
       builder.setInsertionPointToStart(copy.getBody());
       Value offset = copy.getInductionVar();
       StoreVector(builder,
-                  LoadVector(builder, input, offset, limit, vector_type),
+                  ApplyProducer(
+                      builder,
+                      LoadVector(builder, input, offset, limit, vector_type),
+                      producer_inputs, offset, limit),
                   local_scratch, offset, limit);
     }
     builder.setInsertionPointAfter(copy);
   }
 
-  void EmitWideGather(mlir::ImplicitLocOpBuilder& builder, Value output,
+  void EmitWideGather(mlir::ImplicitLocOpBuilder& builder,
+                      llvm::ArrayRef<Value> epilogue_inputs, Value output,
                       Value scratch_table, Value buffer_offset) const {
     const int64_t tile_elements =
         num_elements_ / launch_dimensions_.num_blocks();
@@ -760,7 +912,10 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
           builder, tile_base, local_offset);
       Value value = LoadVector(builder, source, offset,
                                I64(builder, num_elements_), vector_type);
-      StoreVector(builder, value, output, offset, I64(builder, num_elements_));
+      StoreVector(builder,
+                  ApplyEpilogue(builder, value, epilogue_inputs, offset,
+                                I64(builder, num_elements_)),
+                  output, offset, I64(builder, num_elements_));
     }
     builder.setInsertionPointAfter(gather);
   }
@@ -842,7 +997,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     builder.setInsertionPointAfter(reduce);
   }
 
-  void EmitFlySegmentCopy(mlir::ImplicitLocOpBuilder& builder, Value input,
+  void EmitFlySegmentCopy(mlir::ImplicitLocOpBuilder& builder,
+                          llvm::ArrayRef<Value> producer_inputs, Value input,
                           Value local_scratch) const {
     auto vector_type = mlir::VectorType::get(
         {vector_lanes_}, StorageType(builder));
@@ -863,12 +1019,16 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
       Value value = mlir::fly::PtrLoadOp::create(
           builder, vector_type, AddOffset(builder, input, offset));
       mlir::fly::PtrStoreOp::create(
-          builder, value, AddOffset(builder, local_scratch, offset));
+          builder,
+          ApplyProducer(builder, value, producer_inputs, offset,
+                        I64(builder, num_elements_)),
+          AddOffset(builder, local_scratch, offset));
     }
     builder.setInsertionPointAfter(copy);
   }
 
-  void EmitFlyGather(mlir::ImplicitLocOpBuilder& builder, Value output,
+  void EmitFlyGather(mlir::ImplicitLocOpBuilder& builder,
+                     llvm::ArrayRef<Value> epilogue_inputs, Value output,
                      Value rank, Value scratch_table,
                      Value buffer_offset) const {
     auto vector_type = mlir::VectorType::get(
@@ -897,14 +1057,19 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
       Value value = mlir::fly::PtrLoadOp::create(
           builder, vector_type, AddOffset(builder, source, offset));
       mlir::fly::PtrStoreOp::create(
-          builder, value, AddOffset(builder, output, offset));
+          builder,
+          ApplyEpilogue(builder, value, epilogue_inputs, offset,
+                        I64(builder, num_elements_)),
+          AddOffset(builder, output, offset));
     }
     builder.setInsertionPointAfter(gather);
   }
 
   void EmitOneShot(mlir::ImplicitLocOpBuilder& builder, Value input,
-                   Value output, Value rank, Value signal_value,
-                   Value signal_table, Value scratch_table,
+                   llvm::ArrayRef<Value> producer_inputs,
+                   llvm::ArrayRef<Value> epilogue_inputs, Value output,
+                   Value rank, Value signal_value, Value signal_table,
+                   Value scratch_table,
                    Value buffer_offset) const {
     auto vector_type = mlir::VectorType::get(
         {vector_lanes_}, StorageType(builder));
@@ -928,7 +1093,10 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
       builder.setInsertionPointToStart(copy.getBody());
       Value offset = copy.getInductionVar();
       StoreVector(builder,
-                  LoadVector(builder, input, offset, limit, vector_type),
+                  ApplyProducer(
+                      builder,
+                      LoadVector(builder, input, offset, limit, vector_type),
+                      producer_inputs, offset, limit),
                   local_scratch, offset, limit);
     }
     builder.setInsertionPointAfter(copy);
@@ -948,14 +1116,72 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
             LoadVector(builder, peer_scratch[peer], offset, limit,
                        vector_type));
       }
-      StoreVector(builder, accumulator, output, offset, limit);
+      StoreVector(builder,
+                  ApplyEpilogue(builder, accumulator, epilogue_inputs, offset,
+                                limit),
+                  output, offset, limit);
     }
     builder.setInsertionPointAfter(reduce);
   }
 
+  // Each workgroup owns a disjoint contiguous stripe of the local input. It
+  // publishes that stripe once, synchronizes with the workgroup having the
+  // same block id on every peer, then copies the corresponding peer stripes
+  // to their rank-ordered output chunks. Unlike an output-tiled formulation,
+  // this does not replicate the local publish phase once per source rank.
+  void EmitAllGather(mlir::ImplicitLocOpBuilder& builder, Value input,
+                     Value output, Value rank, Value signal_value,
+                     Value signal_table, Value scratch_table,
+                     Value buffer_offset) const {
+    auto vector_type = mlir::VectorType::get(
+        {vector_lanes_}, StorageType(builder));
+    Value input_limit = I64(builder, num_elements_);
+    Value output_limit = I64(builder, output_elements_);
+    Value local_scratch =
+        ScratchPointer(builder, scratch_table, rank, buffer_offset);
+    Value first = LinearOffset(builder);
+    Value stride = LinearStride(builder);
+
+    mlir::scf::ForOp publish =
+        mlir::scf::ForOp::create(builder, first, input_limit, stride);
+    {
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(publish.getBody());
+      Value offset = publish.getInductionVar();
+      StoreVector(builder,
+                  LoadVector(builder, input, offset, input_limit, vector_type),
+                  local_scratch, offset, input_limit);
+    }
+    builder.setInsertionPointAfter(publish);
+    EmitSync(builder, signal_table, rank, signal_value);
+
+    for (int64_t peer = 0; peer < world_size_; ++peer) {
+      Value peer_scratch = ScratchPointer(
+          builder, scratch_table, I32(builder, peer), buffer_offset);
+      Value output_base = I64(builder, peer * num_elements_);
+      mlir::scf::ForOp gather =
+          mlir::scf::ForOp::create(builder, first, input_limit, stride);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(gather.getBody());
+        Value input_offset = gather.getInductionVar();
+        Value output_offset = mlir::arith::AddIOp::create(
+            builder, output_base, input_offset);
+        StoreVector(
+            builder,
+            LoadVector(builder, peer_scratch, input_offset, input_limit,
+                       vector_type),
+            output, output_offset, output_limit);
+      }
+      builder.setInsertionPointAfter(gather);
+    }
+  }
+
   void EmitTwoShot(mlir::ImplicitLocOpBuilder& builder, Value input,
-                   Value output, Value rank, Value signal_value,
-                   Value signal_table, Value scratch_table,
+                   llvm::ArrayRef<Value> producer_inputs,
+                   llvm::ArrayRef<Value> epilogue_inputs, Value output,
+                   Value rank, Value signal_value, Value signal_table,
+                   Value scratch_table,
                    Value buffer_offset) const {
     auto vector_type = mlir::VectorType::get(
         {vector_lanes_}, StorageType(builder));
@@ -965,7 +1191,7 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         ScratchPointer(builder, scratch_table, rank, buffer_offset);
 
     if (use_lds_algorithm_) {
-      EmitFlySegmentCopy(builder, input, local_scratch);
+      EmitFlySegmentCopy(builder, producer_inputs, input, local_scratch);
       EmitSync(builder, signal_table, rank, signal_value);
       Value rank_base = mlir::arith::MulIOp::create(
           builder, ToI64(builder, rank), I64(builder, segment_elements_));
@@ -974,7 +1200,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
       Value next_signal = mlir::arith::AddIOp::create(
           builder, signal_value, I32(builder, 1));
       EmitSync(builder, signal_table, rank, next_signal);
-      EmitFlyGather(builder, output, rank, scratch_table, buffer_offset);
+      EmitFlyGather(builder, epilogue_inputs, output, rank, scratch_table,
+                    buffer_offset);
       return;
     }
 
@@ -992,7 +1219,7 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         num_elements_ % launch_dimensions_.num_blocks() == 0 &&
         (num_elements_ / launch_dimensions_.num_blocks()) % world_size_ == 0;
     if (use_wide_io) {
-      EmitWideCopy(builder, input, local_scratch);
+      EmitWideCopy(builder, producer_inputs, input, local_scratch);
     } else {
       mlir::scf::ForOp copy =
           mlir::scf::ForOp::create(builder, first, segment_limit, stride);
@@ -1008,8 +1235,11 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
               builder,
               std::min(num_elements_, (segment + 1) * segment_elements_));
           StoreVector(builder,
-                      LoadVector(builder, input, offset, segment_end,
-                                 vector_type),
+                      ApplyProducer(
+                          builder,
+                          LoadVector(builder, input, offset, segment_end,
+                                     vector_type),
+                          producer_inputs, offset, segment_end),
                       local_scratch, offset, segment_end);
         }
       }
@@ -1079,7 +1309,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
     EmitSync(builder, signal_table, rank, next_signal);
 
     if (use_wide_io) {
-      EmitWideGather(builder, output, scratch_table, buffer_offset);
+      EmitWideGather(builder, epilogue_inputs, output, scratch_table,
+                     buffer_offset);
     } else {
       mlir::scf::ForOp gather =
           mlir::scf::ForOp::create(builder, first, segment_limit, stride);
@@ -1094,9 +1325,11 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
           Value segment_end = I64(
               builder,
               std::min(num_elements_, (peer + 1) * segment_elements_));
+          Value value = LoadVector(builder, peer_scratch[peer], offset,
+                                   segment_end, vector_type);
           StoreVector(builder,
-                      LoadVector(builder, peer_scratch[peer], offset,
-                                 segment_end, vector_type),
+                      ApplyEpilogue(builder, value, epilogue_inputs, offset,
+                                    segment_end),
                       output, offset, segment_end);
         }
       }
@@ -1128,21 +1361,45 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
   }
 
   absl::Status EmitKernel(mlir::gpu::GPUFuncOp kernel) const {
-    TF_RET_CHECK(kernel.getNumArguments() == 6);
+    TF_RET_CHECK(kernel.getNumArguments() ==
+                 6 + producer_.buffer_count + epilogue_.buffer_count);
     mlir::ImplicitLocOpBuilder builder(kernel.getLoc(), kernel);
     builder.setInsertionPointToStart(&kernel.getBody().front());
-    Value input = kernel.getArgument(0);
-    Value output = kernel.getArgument(1);
-    Value rank = kernel.getArgument(2);
-    Value signal_value = kernel.getArgument(3);
-    Value signal_table = kernel.getArgument(4);
-    Value scratch_table = kernel.getArgument(5);
+    int64_t argument = 0;
+    Value input = kernel.getArgument(argument++);
+    Value output = kernel.getArgument(argument++);
+    llvm::SmallVector<Value> producer_inputs;
+    producer_inputs.reserve(producer_.buffer_count);
+    for (int64_t producer_input = 0;
+         producer_input < producer_.buffer_count; ++producer_input) {
+      producer_inputs.push_back(kernel.getArgument(argument++));
+    }
+    llvm::SmallVector<Value> epilogue_inputs;
+    epilogue_inputs.reserve(epilogue_.buffer_count);
+    for (int64_t epilogue_input = 0;
+         epilogue_input < epilogue_.buffer_count; ++epilogue_input) {
+      epilogue_inputs.push_back(kernel.getArgument(argument++));
+    }
+    Value rank = kernel.getArgument(argument++);
+    Value signal_value = kernel.getArgument(argument++);
+    Value signal_table = kernel.getArgument(argument++);
+    Value scratch_table = kernel.getArgument(argument++);
 
     if (full_vectors_only_) {
-      const int64_t allocation_bytes =
+      const int64_t input_allocation_bytes =
           num_elements_ * primitive_util::ByteWidth(element_type_);
-      input = BufferPointer(builder, input, allocation_bytes);
-      output = BufferPointer(builder, output, allocation_bytes);
+      const int64_t output_allocation_bytes =
+          output_elements_ * primitive_util::ByteWidth(element_type_);
+      input = BufferPointer(builder, input, input_allocation_bytes);
+      for (Value& producer_input : producer_inputs) {
+        producer_input =
+            BufferPointer(builder, producer_input, input_allocation_bytes);
+      }
+      for (Value& epilogue_input : epilogue_inputs) {
+        epilogue_input =
+            BufferPointer(builder, epilogue_input, output_allocation_bytes);
+      }
+      output = BufferPointer(builder, output, output_allocation_bytes);
     }
 
     Value buffer_signal = signal_value;
@@ -1156,14 +1413,24 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
         builder, ToI64(builder, buffer_index),
         I64(builder, scratch_elements_per_buffer_));
 
+    if (collective_opcode_ == HloOpcode::kAllGather) {
+      TF_RET_CHECK(producer_inputs.empty() && epilogue_inputs.empty());
+      EmitAllGather(builder, input, output, rank, signal_value, signal_table,
+                    scratch_table, buffer_offset);
+      mlir::gpu::ReturnOp::create(builder);
+      return absl::OkStatus();
+    }
+
     switch (strategy_) {
       case AllReduceStrategy::kOneShot:
-        EmitOneShot(builder, input, output, rank, signal_value, signal_table,
-                    scratch_table, buffer_offset);
+        EmitOneShot(builder, input, producer_inputs, epilogue_inputs, output,
+                    rank, signal_value, signal_table, scratch_table,
+                    buffer_offset);
         break;
       case AllReduceStrategy::kTwoShot:
-        EmitTwoShot(builder, input, output, rank, signal_value, signal_table,
-                    scratch_table, buffer_offset);
+        EmitTwoShot(builder, input, producer_inputs, epilogue_inputs, output,
+                    rank, signal_value, signal_table, scratch_table,
+                    buffer_offset);
         break;
       case AllReduceStrategy::kMultimem:
         return absl::UnimplementedError(
@@ -1174,8 +1441,10 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
   }
 
   PrimitiveType element_type_ = PRIMITIVE_TYPE_INVALID;
+  HloOpcode collective_opcode_ = HloOpcode::kAllReduce;
   HloOpcode reduction_opcode_ = HloOpcode::kAdd;
   int64_t num_elements_ = 0;
+  int64_t output_elements_ = 0;
   int64_t world_size_ = 0;
   int64_t vector_lanes_ = 0;
   int64_t io_vector_lanes_ = 0;
@@ -1183,6 +1452,8 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
   int64_t scratch_elements_per_buffer_ = 0;
   bool full_vectors_only_ = false;
   bool use_lds_algorithm_ = false;
+  CollectiveEpilogue producer_;
+  CollectiveEpilogue epilogue_;
   AllReduceStrategy strategy_ = AllReduceStrategy::kOneShot;
   LaunchDimensions launch_dimensions_;
 };
@@ -1190,8 +1461,10 @@ class FlyXTileCollectiveEmitter final : public MlirKernelEmitter {
 }  // namespace
 
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileCollectiveEmitter(
-    const HloFusionAnalysis& analysis) {
-  return std::make_unique<FlyXTileCollectiveEmitter>(analysis);
+    const HloFusionAnalysis& analysis, CollectiveEpilogue producer,
+    CollectiveEpilogue epilogue) {
+  return std::make_unique<FlyXTileCollectiveEmitter>(
+      analysis, std::move(producer), std::move(epilogue));
 }
 
 }  // namespace xla::gpu::flydsl

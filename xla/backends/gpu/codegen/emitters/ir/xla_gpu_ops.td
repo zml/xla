@@ -160,6 +160,25 @@ def XLAGPU_BufferStoreOp : XLAGPU_Op<"buffer_store", [
   }];
 }
 
+def XLAGPU_BufferCompletionTicketOp :
+    XLAGPU_Op<"buffer_completion_ticket"> {
+  let summary = "Claims a generation-tagged inter-workgroup completion ticket.";
+
+  let description = [{
+    Treats two adjacent U32 buffer elements as an epoch and completion count.
+    The operation returns the previous count for the current AMD dispatch. It
+    lowers to a noinline device helper so ticket bookkeeping does not increase
+    register pressure in the producer/reducer kernel.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$tickets, Index:$ticket_index);
+  let results = (outs I32:$previous);
+
+  let assemblyFormat = [{
+    $tickets `[` $ticket_index `]` attr-dict `:` type($tickets)
+  }];
+}
+
 def XLAGPU_AccumulatorStoreOp : XLAGPU_Op<"accumulator_store", [
     TypesMatchWith<"result type matches destination type",
                    "destination", "result", "$_self">

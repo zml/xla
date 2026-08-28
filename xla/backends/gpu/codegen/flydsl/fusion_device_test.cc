@@ -75,6 +75,108 @@ class FlyFusionAutotuningPipelineDeviceTest
   }
 };
 
+class FlyInt4DequantizationPipelineDeviceTest
+    : public FlyFusionPipelineDeviceTest {
+ protected:
+  DebugOptions GetDebugOptionsForTest() const override {
+    DebugOptions debug_options =
+        FlyFusionPipelineDeviceTest::GetDebugOptionsForTest();
+    debug_options.set_xla_gpu_cublas_fallback(false);
+    debug_options.set_xla_gpu_gemm_rewrite_size_threshold(0);
+    debug_options.set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(
+        true);
+    debug_options.add_xla_disable_hlo_passes("splitk-rewriter");
+    return debug_options;
+  }
+};
+
+TEST_F(FlyInt4DequantizationPipelineDeviceTest,
+       FormsAndExecutesS4SubchannelScaledBatchedGemm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_s4_subchannel_scaled_batched_gemm_pipeline
+
+ENTRY main {
+  weights.s4 = s4[2,2048,32] parameter(0)
+  weights.s8 = s8[2,2048,32] convert(weights.s4)
+  weights.bf16 = bf16[2,2048,32] convert(weights.s8)
+  weights.groups = bf16[2,8,256,32] reshape(weights.bf16)
+
+  scales = bf16[2,8,1,32] parameter(1)
+  scales.view = bf16[2,8,32] reshape(scales)
+  scales.broadcast = bf16[2,8,256,32]
+      broadcast(scales.view), dimensions={0,1,3}
+  weights.scaled.groups = bf16[2,8,256,32]
+      multiply(weights.groups, scales.broadcast)
+  weights.scaled = bf16[2,2048,32] reshape(weights.scaled.groups)
+
+  activations = bf16[2,2,1,2048] parameter(2)
+  activations.view = bf16[2,2,2048] reshape(activations)
+  ROOT dot = f32[2,32,2] dot(weights.scaled, activations.view),
+      lhs_batch_dims={0}, lhs_contracting_dims={1},
+      rhs_batch_dims={1}, rhs_contracting_dims={2}
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), "__fly_gemm")
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompareNoHloPasses(
+      std::move(optimized), ErrorSpec{/*aabs=*/1.0, /*arel=*/0.04}));
+}
+
+TEST_F(FlyInt4DequantizationPipelineDeviceTest,
+       ExecutesS4ChannelScaledMultiBatchGemmWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_s4_channel_scaled_multi_batch_gemm_pipeline
+
+ENTRY main {
+  weights.s4 = s4[3,2,32,16] parameter(0)
+  weights.s8 = s8[3,2,32,16] convert(weights.s4)
+  weights.bf16 = bf16[3,2,32,16] convert(weights.s8)
+  scales = bf16[3,16] parameter(1)
+  scales.broadcast = bf16[3,2,32,16]
+      broadcast(scales), dimensions={0,3}
+  weights.scaled = bf16[3,2,32,16]
+      multiply(weights.bf16, scales.broadcast)
+  activations = bf16[3,2,32,16] parameter(2)
+  ROOT dot = f32[2,3,16,16] dot(weights.scaled, activations),
+      lhs_batch_dims={1,0}, lhs_contracting_dims={2},
+      rhs_batch_dims={1,0}, rhs_contracting_dims={2}
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kBitcast) << optimized->ToString();
+  const HloInstruction* gemm = root->operand(0);
+  ASSERT_EQ(gemm->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       gemm->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), "__fly_gemm")
+      << optimized->ToString();
+  for (const HloInstruction* instruction :
+       optimized->entry_computation()->MakeInstructionPostOrder()) {
+    if (instruction->opcode() != HloOpcode::kFusion) {
+      continue;
+    }
+    ASSERT_OK_AND_ASSIGN(GpuBackendConfig fusion_config,
+                         instruction->backend_config<GpuBackendConfig>());
+    EXPECT_TRUE(fusion_config.fusion_backend_config().kind() == "__fly_gemm" ||
+                fusion_config.fusion_backend_config().kind() == "__fly")
+        << instruction->ToString();
+  }
+  EXPECT_TRUE(RunAndCompareNoHloPasses(
+      std::move(optimized), ErrorSpec{/*aabs=*/0.5, /*arel=*/0.04}));
+}
+
 TEST_F(FlyFusionPipelineDeviceTest,
        ExecutesRaggedPagedAttentionDecodeDtypesAndGqa) {
   constexpr absl::string_view kPagedHloTemplate = R"(
@@ -311,13 +413,13 @@ TEST_F(FlyFusionPipelineDeviceTest,
 HloModule fly_non_power_of_two_segmented_paged_attention_decode
 
 ENTRY main {
-  q = bf16[1,4,128]{2,1,0} parameter(0)
-  k = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
-  v = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
+  q = __TYPE__[1,4,128]{2,1,0} parameter(0)
+  k = __TYPE__[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
+  v = __TYPE__[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
   used_k = s32[1]{0} parameter(3)
   table = s32[1,__PAGES__]{1,0} parameter(4)
   scale = f32[] constant(0.0883883476)
-  ROOT attention = bf16[1,4,128]{2,1,0}
+  ROOT attention = __TYPE__[1,4,128]{2,1,0}
     custom-call(q, k, v, used_k, table, scale),
     custom_call_target="__fly$paged_attention_decode"
 }
@@ -339,13 +441,13 @@ add {
 }
 
 ENTRY main {
-  q = bf16[1,4,128]{2,1,0} parameter(0)
-  k = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
-  v = bf16[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
+  q = __TYPE__[1,4,128]{2,1,0} parameter(0)
+  k = __TYPE__[__PAGES__,16,1,128]{3,2,1,0} parameter(1)
+  v = __TYPE__[__PAGES__,16,1,128]{3,2,1,0} parameter(2)
   used_k_argument = s32[1]{0} parameter(3)
   table_argument = s32[1,__PAGES__]{1,0} parameter(4)
   q_f32 = f32[1,4,128]{2,1,0} convert(q)
-  k_flat = bf16[__TOKENS__,128]{1,0} reshape(k)
+  k_flat = __TYPE__[__TOKENS__,128]{1,0} reshape(k)
   k_f32 = f32[__TOKENS__,128]{1,0} convert(k_flat)
   scores = f32[1,4,__TOKENS__]{2,1,0} dot(q_f32, k_f32),
     lhs_contracting_dims={2}, rhs_contracting_dims={1}
@@ -371,24 +473,30 @@ ENTRY main {
     to_apply=add
   sum_broadcast = f32[1,4,__TOKENS__]{2,1,0} broadcast(row_sum), dimensions={0,1}
   probabilities = f32[1,4,__TOKENS__]{2,1,0} divide(exponential, sum_broadcast)
-  probabilities_element = bf16[1,4,__TOKENS__]{2,1,0} convert(probabilities)
+  probabilities_element = __TYPE__[1,4,__TOKENS__]{2,1,0} convert(probabilities)
   staged_probabilities = f32[1,4,__TOKENS__]{2,1,0} convert(probabilities_element)
-  v_flat = bf16[__TOKENS__,128]{1,0} reshape(v)
+  v_flat = __TYPE__[__TOKENS__,128]{1,0} reshape(v)
   v_f32 = f32[__TOKENS__,128]{1,0} convert(v_flat)
   result = f32[1,4,128]{2,1,0} dot(staged_probabilities, v_f32),
     lhs_contracting_dims={2}, rhs_contracting_dims={0}
-  ROOT output = bf16[1,4,128]{2,1,0} convert(result)
+  ROOT output = __TYPE__[1,4,128]{2,1,0} convert(result)
 }
 )";
 
-  constexpr std::array<std::array<int64_t, 3>, 2> kCases = {
-      {{4096, 65536, 65521}, {8192, 131072, 131057}}};
-  for (const auto& [pages, tokens, used_tokens] : kCases) {
-    SCOPED_TRACE(std::to_string(tokens));
-    const std::string paged_hlo =
-        absl::StrReplaceAll(kPagedHlo, {{"__PAGES__", std::to_string(pages)}});
+  constexpr std::array<std::tuple<absl::string_view, int64_t, int64_t,
+                                  int64_t>,
+                       3>
+      kCases = {{{"bf16", 4096, 65536, 65521},
+                 {"bf16", 8192, 131072, 131057},
+                 {"f16", 4096, 65536, 65521}}};
+  for (const auto& [element_type, pages, tokens, used_tokens] : kCases) {
+    SCOPED_TRACE(std::string(element_type) + "/" + std::to_string(tokens));
+    const std::string paged_hlo = absl::StrReplaceAll(
+        kPagedHlo, {{"__TYPE__", element_type},
+                    {"__PAGES__", std::to_string(pages)}});
     const std::string reference_hlo = absl::StrReplaceAll(
-        kReferenceHlo, {{"__PAGES__", std::to_string(pages)},
+        kReferenceHlo, {{"__TYPE__", element_type},
+                        {"__PAGES__", std::to_string(pages)},
                         {"__TOKENS__", std::to_string(tokens)}});
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                          ParseAndReturnVerifiedModule(paged_hlo));
@@ -414,16 +522,25 @@ ENTRY main {
       argument_pointers.push_back(&argument);
     }
     ASSERT_OK(PreprocessModuleForTestRunner(module.get()));
-    ASSERT_OK_AND_ASSIGN(
-        Literal actual,
-        test_runner().Execute(std::move(module), argument_pointers,
-                              /*run_hlo_passes=*/true));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<OpaqueExecutable> executable,
+                         CreateExecutable(std::move(module),
+                                          /*run_hlo_passes=*/true));
     ASSERT_OK_AND_ASSIGN(Literal expected,
                          reference_runner().Execute(std::move(reference_module),
                                                     argument_pointers,
                                                     /*run_hlo_passes=*/false));
-    EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
-        expected, actual, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
+    // Reuse the executable so the completion-ticket scratch allocation can be
+    // reused with a different dispatch generation. A stale segment count must
+    // never make a producer workgroup reduce incomplete partials.
+    for (int64_t iteration = 0; iteration < 3; ++iteration) {
+      SCOPED_TRACE(iteration);
+      ASSERT_OK_AND_ASSIGN(
+          Literal actual,
+          test_runner().ExecuteWithExecutable(executable.get(),
+                                              argument_pointers));
+      EXPECT_TRUE(LiteralTestUtil::NearOrEqual(
+          expected, actual, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
+    }
   }
 }
 
@@ -470,6 +587,233 @@ ENTRY main {
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       FormsAndExecutesDependentLayerNormAsOneFusion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_dependent_layer_norm_pipeline
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = bf16[256,4096]{1,0} parameter(0)
+  converted = f32[256,4096]{1,0} convert(p0)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(converted, zero), dimensions={1}, to_apply=add
+  divisor = f32[] constant(4096)
+  divisors = f32[256]{0} broadcast(divisor), dimensions={}
+  mean = f32[256]{0} divide(sum, divisors)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(converted, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} divide(square_sum, divisors)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  scales = f32[256,4096]{1,0} broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0} multiply(centered, scales)
+  ROOT result = bf16[256,4096]{1,0} convert(normalized)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloComputation* entry = optimized->entry_computation();
+  EXPECT_EQ(entry->instruction_count(), 2) << optimized->ToString();
+  const HloInstruction* root = entry->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.02, /*arel=*/0.02}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       FormsAndExecutesAffineLayerNormAsOneFusion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_affine_layer_norm_pipeline
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  input_f32 = f32[256,4096]{1,0} convert(input)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(input_f32, zero), dimensions={1}, to_apply=add
+  divisor = f32[] constant(4096)
+  divisors = f32[256]{0} broadcast(divisor), dimensions={}
+  mean = f32[256]{0} divide(sum, divisors)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(input_f32, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} divide(square_sum, divisors)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  reciprocal_stddev_broadcast = f32[256,4096]{1,0}
+      broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0}
+      multiply(centered, reciprocal_stddev_broadcast)
+  gamma_f32 = f32[4096]{0} convert(gamma)
+  gamma_broadcast = f32[256,4096]{1,0} broadcast(gamma_f32), dimensions={1}
+  scaled = f32[256,4096]{1,0} multiply(normalized, gamma_broadcast)
+  beta_f32 = f32[4096]{0} convert(beta)
+  beta_broadcast = f32[256,4096]{1,0} broadcast(beta_f32), dimensions={1}
+  shifted = f32[256,4096]{1,0} add(scaled, beta_broadcast)
+  ROOT result = bf16[256,4096]{1,0} convert(shifted)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloComputation* entry = optimized->entry_computation();
+  EXPECT_EQ(entry->instruction_count(), 4) << optimized->ToString();
+  const HloInstruction* root = entry->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       FormsAndExecutesTrainingLayerNormAsOneMultiOutputFusion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_training_layer_norm_pipeline
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  input_f32 = f32[256,4096]{1,0} convert(input)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(input_f32, zero), dimensions={1}, to_apply=add
+  divisor = f32[] constant(4096)
+  divisors = f32[256]{0} broadcast(divisor), dimensions={}
+  mean = f32[256]{0} divide(sum, divisors)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(input_f32, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} divide(square_sum, divisors)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  reciprocal_stddev_broadcast = f32[256,4096]{1,0}
+      broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0}
+      multiply(centered, reciprocal_stddev_broadcast)
+  gamma_f32 = f32[4096]{0} convert(gamma)
+  gamma_broadcast = f32[256,4096]{1,0} broadcast(gamma_f32), dimensions={1}
+  scaled = f32[256,4096]{1,0} multiply(normalized, gamma_broadcast)
+  beta_f32 = f32[4096]{0} convert(beta)
+  beta_broadcast = f32[256,4096]{1,0} broadcast(beta_f32), dimensions={1}
+  shifted = f32[256,4096]{1,0} add(scaled, beta_broadcast)
+  result = bf16[256,4096]{1,0} convert(shifted)
+  ROOT outputs = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0})
+      tuple(result, mean, reciprocal_stddev)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloComputation* entry = optimized->entry_computation();
+  EXPECT_EQ(entry->instruction_count(), 4) << optimized->ToString();
+  const HloInstruction* root = entry->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  EXPECT_TRUE(root->IsMultiOutputFusion()) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
+}
+
+TEST_F(FlyFusionPipelineDeviceTest,
+       FormsAndExecutesMomentsTrainingLayerNormAsOneMultiOutputFusion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_moments_training_layer_norm_pipeline
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  input_f32 = f32[256,4096]{1,0} convert(input)
+  input_square = f32[256,4096]{1,0} multiply(input_f32, input_f32)
+  zero = f32[] constant(0)
+  square_sum = f32[256]{0} reduce(input_square, zero), dimensions={1},
+      to_apply=add
+  reciprocal_columns = f32[] constant(0.000244140625)
+  reciprocal_columns_broadcast = f32[256]{0}
+      broadcast(reciprocal_columns), dimensions={}
+  square_mean = f32[256]{0}
+      multiply(square_sum, reciprocal_columns_broadcast)
+  sum = f32[256]{0} reduce(input_f32, zero), dimensions={1}, to_apply=add
+  mean = f32[256]{0} multiply(sum, reciprocal_columns_broadcast)
+  mean_square = f32[256]{0} multiply(mean, mean)
+  variance = f32[256]{0} subtract(square_mean, mean_square)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  reciprocal_stddev_broadcast = f32[256,4096]{1,0}
+      broadcast(reciprocal_stddev), dimensions={0}
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(input_f32, means)
+  normalized = f32[256,4096]{1,0}
+      multiply(centered, reciprocal_stddev_broadcast)
+  gamma_f32 = f32[4096]{0} convert(gamma)
+  gamma_broadcast = f32[256,4096]{1,0} broadcast(gamma_f32), dimensions={1}
+  scaled = f32[256,4096]{1,0} multiply(normalized, gamma_broadcast)
+  beta_f32 = f32[4096]{0} convert(beta)
+  beta_broadcast = f32[256,4096]{1,0} broadcast(beta_f32), dimensions={1}
+  shifted = f32[256,4096]{1,0} add(scaled, beta_broadcast)
+  result = bf16[256,4096]{1,0} convert(shifted)
+  reciprocal_stddev_cube = f32[256]{0}
+      divide(reciprocal_stddev, variance_epsilon)
+  ROOT outputs = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0}, f32[256]{0})
+      tuple(result, mean, reciprocal_stddev, reciprocal_stddev_cube)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloComputation* entry = optimized->entry_computation();
+  EXPECT_EQ(entry->instruction_count(), 4) << optimized->ToString();
+  const HloInstruction* root = entry->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  EXPECT_TRUE(root->IsMultiOutputFusion()) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.05, /*arel=*/0.05}));
 }
 
 TEST_F(FlyFusionPipelineDeviceTest,
@@ -620,6 +964,125 @@ ENTRY main {
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
 }
 
+TEST_F(FlyFusionDeviceTest, NativeGroupedQueryBf16Attention) {
+  constexpr absl::string_view kHloTemplate = R"(
+HloModule fly_grouped_query_attention_pipeline
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+attention {
+  packed_qkv = bf16[256,1536]{1,0} parameter(0)
+  packed_view = bf16[2,128,1536]{2,1,0} bitcast(packed_qkv)
+
+  kv_segment = bf16[2,128,512]{2,1,0} slice(packed_view),
+    slice={[0:2], [0:128], [1024:1536]}
+  kv_view = bf16[2,128,2,4,64]{4,3,2,1,0} bitcast(kv_segment)
+  value_slice = bf16[2,128,1,4,64]{4,3,2,1,0} slice(kv_view),
+    slice={[0:2], [0:128], [1:2], [0:4], [0:64]}
+  value_transpose = bf16[2,1,4,64,128]{4,3,2,1,0}
+    transpose(value_slice), dimensions={0,2,3,4,1}
+  value = bf16[8,64,128]{2,1,0} bitcast(value_transpose)
+  key_slice = bf16[2,128,1,4,64]{4,3,2,1,0} slice(kv_view),
+    slice={[0:2], [0:128], [0:1], [0:4], [0:64]}
+  key_transpose = bf16[2,1,4,128,64]{4,3,2,1,0}
+    transpose(key_slice), dimensions={0,2,3,1,4}
+  key = bf16[8,128,64]{2,1,0} bitcast(key_transpose)
+
+  query_segment = bf16[2,128,1024]{2,1,0} slice(packed_view),
+    slice={[0:2], [0:128], [0:1024]}
+  query_view = bf16[2,128,4,4,64]{4,3,2,1,0}
+    bitcast(query_segment)
+  query_transpose = bf16[2,4,64,128,4]{4,3,2,1,0}
+    transpose(query_view), dimensions={0,2,4,1,3}
+  query = bf16[8,64,512]{2,1,0} bitcast(query_transpose)
+
+  qk_dot = bf16[8,128,512]{2,1,0} dot(key, query),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scale = bf16[] constant(0.125)
+  scales = bf16[8,128,512]{2,1,0} broadcast(scale), dimensions={}
+  scaled_scores = bf16[8,128,512]{2,1,0} multiply(qk_dot, scales)
+  scores = bf16[2,4,128,128,4]{4,3,2,1,0} bitcast(scaled_scores)
+  scores_f32 = f32[2,4,128,128,4]{4,3,2,1,0} convert(scores)
+  minus_inf = f32[] constant(-inf)
+__MASK__
+  row_max = f32[2,4,128,4]{3,2,1,0} reduce(__SCORES__, minus_inf),
+    dimensions={2}, to_apply=maximum
+  maxima = f32[2,4,128,128,4]{4,3,2,1,0} broadcast(row_max),
+    dimensions={0,1,3,4}
+  shifted = f32[2,4,128,128,4]{4,3,2,1,0}
+    subtract(__SCORES__, maxima)
+  exponential = f32[2,4,128,128,4]{4,3,2,1,0}
+    exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[2,4,128,4]{3,2,1,0} reduce(exponential, zero),
+    dimensions={2}, to_apply=add
+  sums = f32[2,4,128,128,4]{4,3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,3,4}
+  normalized = f32[2,4,128,128,4]{4,3,2,1,0}
+    divide(exponential, sums)
+  probabilities = bf16[2,4,128,128,4]{4,3,2,1,0}
+    convert(normalized)
+  probabilities_transpose = bf16[2,4,128,4,128]{4,3,2,1,0}
+    transpose(probabilities), dimensions={0,1,2,4,3}
+  probabilities_flat = bf16[8,128,512]{2,1,0}
+    bitcast(probabilities_transpose)
+
+  pv_dot = bf16[8,64,512]{2,1,0} dot(value, probabilities_flat),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  context = bf16[2,4,64,4,128]{4,3,2,1,0} bitcast(pv_dot)
+  context_transpose = bf16[2,128,4,4,64]{4,3,2,1,0}
+    transpose(context), dimensions={0,4,1,3,2}
+  ROOT result = bf16[2,128,1024]{2,1,0} bitcast(context_transpose)
+}
+
+ENTRY main {
+  packed_qkv = bf16[256,1536]{1,0} parameter(0)
+  ROOT fusion = bf16[2,128,1024]{2,1,0} fusion(packed_qkv),
+    kind=kCustom, calls=attention,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","32","1","64"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1",
+        "waves_per_eu":"4"}}}
+}
+)";
+
+  const std::string noncausal_hlo = absl::StrReplaceAll(
+      kHloTemplate, {{"__MASK__", ""}, {"__SCORES__", "scores_f32"}});
+  EXPECT_TRUE(RunAndCompareNoHloPasses(
+      noncausal_hlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+
+  constexpr absl::string_view kCausalMask = R"(
+  key_iota = s32[128,128]{1,0} iota(), iota_dimension=0
+  query_iota = s32[128,128]{1,0} iota(), iota_dimension=1
+  causal = pred[128,128]{1,0} compare(key_iota, query_iota), direction=LE
+  causal_broadcast = pred[2,4,128,128,4]{4,3,2,1,0}
+    broadcast(causal), dimensions={2,3}
+  masked_values = f32[2,4,128,128,4]{4,3,2,1,0}
+    broadcast(minus_inf), dimensions={}
+  masked_scores = f32[2,4,128,128,4]{4,3,2,1,0}
+    select(causal_broadcast, scores_f32, masked_values)
+)";
+  const std::string causal_hlo = absl::StrReplaceAll(
+      kHloTemplate,
+      {{"__MASK__", kCausalMask}, {"__SCORES__", "masked_scores"}});
+  EXPECT_TRUE(RunAndCompareNoHloPasses(
+      causal_hlo, ErrorSpec{/*aabs=*/0.001, /*arel=*/0.01}));
+}
+
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
        FormsAndExecutesNativeElementwiseFusionEndToEnd) {
   constexpr absl::string_view kHlo = R"(
@@ -672,6 +1135,34 @@ ENTRY main {
   EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
       << optimized->ToString();
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0.002, /*arel=*/0.01}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesMajorDimensionStridedSliceWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_major_dimension_strided_slice_pipeline
+
+ENTRY main {
+  p0 = bf16[257,259]{1,0} parameter(0)
+  sliced = bf16[129,259]{1,0} slice(p0),
+    slice={[0:257:2], [0:259]}
+  ROOT result = bf16[129,259]{1,0} abs(sliced)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  if (root->opcode() == HloOpcode::kBitcast) {
+    root = root->operand(0);
+  }
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -781,6 +1272,111 @@ ENTRY main {
   ROOT scatter = bf16[257,259]{1,0}
     scatter(base, row_ids, transformed),
     update_window_dims={1}, inserted_window_dims={0},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesPartialContiguousOverwriteRowScatterWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_partial_contiguous_overwrite_row_scatter_pipeline
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+ENTRY main {
+  base = bf16[17,67]{1,0} parameter(0)
+  updates = bf16[13,31]{1,0} parameter(1)
+  transformed = bf16[13,31]{1,0} abs(updates)
+  row_ids = s32[13]{0} iota(), iota_dimension=0
+  ROOT scatter = bf16[17,67]{1,0}
+    scatter(base, row_ids, transformed),
+    update_window_dims={1}, inserted_window_dims={0},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesOffsetContiguousOverwriteRowScatterWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_offset_contiguous_overwrite_row_scatter_pipeline
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+ENTRY main {
+  base = bf16[64,67]{1,0} parameter(0)
+  updates = bf16[38,31]{1,0} parameter(1)
+  transformed = bf16[38,31]{1,0} abs(updates)
+  indices = s32[38,2]{1,0} iota(), iota_dimension=0
+  ROOT scatter = bf16[64,67]{1,0}
+    scatter(base, indices, transformed),
+    update_window_dims={1}, inserted_window_dims={0},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesRectangularOverwriteScatterWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_rectangular_overwrite_scatter_pipeline
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+ENTRY main {
+  base = bf16[16,5,67]{2,1,0} parameter(0)
+  updates = bf16[15,1,3,31]{3,2,1,0} parameter(1)
+  transformed = bf16[15,1,3,31]{3,2,1,0} abs(updates)
+  indices = s32[15,1]{1,0} iota(), iota_dimension=0
+  ROOT scatter = bf16[16,5,67]{2,1,0}
+    scatter(base, indices, transformed),
+    update_window_dims={1,2,3}, inserted_window_dims={},
     scatter_dims_to_operand_dims={0}, index_vector_dim=1,
     unique_indices=true, to_apply=assign
 }
@@ -1588,6 +2184,63 @@ ENTRY main {
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesMultipleReductionsWithDependentRowwiseOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_multiple_reductions_dependent_rowwise_output_pipeline
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = f32[127,259]{1,0} parameter(0)
+  squared = f32[127,259]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[127]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[127]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+  epsilon = f32[] constant(1e-6)
+  epsilons = f32[127]{0} broadcast(epsilon), dimensions={}
+  variance = f32[127]{0} add(row_sum, epsilons)
+  scale = f32[127]{0} rsqrt(variance)
+  scales = f32[127,259]{1,0} broadcast(scale), dimensions={0}
+  maxima = f32[127,259]{1,0} broadcast(row_max), dimensions={0}
+  centered = f32[127,259]{1,0} subtract(p0, maxima)
+  normalized = f32[127,259]{1,0} multiply(centered, scales)
+  ROOT result = (f32[127,259]{1,0}, f32[127]{0}, f32[127]{0})
+    tuple(normalized, row_max, row_sum)
+})";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* fly_fusion = nullptr;
+  for (const HloInstruction* instruction :
+       optimized->entry_computation()->instructions()) {
+    if (instruction->opcode() != HloOpcode::kFusion ||
+        !instruction->shape().IsTuple()) {
+      continue;
+    }
+    ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                         instruction->backend_config<GpuBackendConfig>());
+    if (backend_config.fusion_backend_config().kind() == kFlyFusionKind) {
+      fly_fusion = instruction;
+      break;
+    }
+  }
+  ASSERT_NE(fly_fusion, nullptr) << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
        FormsAndExecutesTritonReductionTypes) {
   constexpr absl::string_view kS32Hlo = R"(
 HloModule fly_native_s32_row_reduction_pipeline
@@ -1812,6 +2465,183 @@ ENTRY main {
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-4, /*arel=*/1e-4}));
+}
+
+TEST_F(FlyFusionDeviceTest, ExecutesIrregularMiddleMaximumReduction) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_irregular_middle_maximum_reduction
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+body {
+  p0 = f32[5,5,5,5,3]{4,3,2,1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[5,5,5,3]{3,2,1,0} reduce(p0, zero), dimensions={2},
+      to_apply=maximum
+}
+
+ENTRY main {
+  p0 = f32[5,5,5,5,3]{4,3,2,1,0} parameter(0)
+  ROOT fusion = f32[5,5,5,3]{3,2,1,0} fusion(p0), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["8"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, ExecutesNestedS32Reductions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_nested_s32_reductions
+
+add {
+  lhs = s32[] parameter(0)
+  rhs = s32[] parameter(1)
+  ROOT result = s32[] add(lhs, rhs)
+}
+
+body {
+  p0 = s32[4,8]{1,0} parameter(0)
+  view = s32[4,2,4]{2,1,0} bitcast(p0)
+  zero = s32[] constant(0)
+  inner = s32[4,2]{1,0} reduce(view, zero), dimensions={2}, to_apply=add
+  ROOT result = s32[2]{0} reduce(inner, zero), dimensions={0}, to_apply=add
+}
+
+ENTRY main {
+  p0 = s32[4,8]{1,0} parameter(0)
+  ROOT fusion = s32[2]{0} fusion(p0), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, ExecutesNestedSplatReductions) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_nested_splat_reductions
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+body {
+  p0 = f32[] parameter(0)
+  exponential = f32[] exponential(p0)
+  rows = f32[10] broadcast(exponential), dimensions={}
+  matrix0 = f32[10,10] broadcast(exponential), dimensions={}
+  matrix1 = f32[10,10] broadcast(rows), dimensions={0}
+  values = f32[10,10] add(matrix0, matrix1)
+  zero = f32[] constant(0)
+  inner = f32[10]{0} reduce(values, zero), dimensions={0}, to_apply=add
+  ROOT result = f32[] reduce(inner, zero), dimensions={0}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f32[] parameter(0)
+  ROOT fusion = f32[] fusion(p0), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-5}));
+}
+
+TEST_F(FlyFusionDeviceTest, ExecutesReductionOfConcatenate) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_reduction_of_concatenate
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+body {
+  p0 = f32[4,2]{1,0} parameter(0)
+  p1 = f32[4,2]{1,0} parameter(1)
+  joined = f32[4,4]{1,0} concatenate(p0, p1), dimensions={1}
+  zero = f32[] constant(0)
+  ROOT result = f32[4]{0} reduce(joined, zero), dimensions={0}, to_apply=add
+}
+
+ENTRY main {
+  p0 = f32[4,2]{1,0} parameter(0)
+  p1 = f32[4,2]{1,0} parameter(1)
+  ROOT fusion = f32[4]{0} fusion(p0, p1), kind=kCustom, calls=body,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-6, /*arel=*/1e-6}));
+}
+
+TEST_F(FlyFusionDeviceTest, ExecutesPartialRowwiseReductionOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_partial_rowwise_reduction_output
+
+maximum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] maximum(lhs, rhs)
+}
+
+body {
+  p0 = bf16[128,4,256]{2,1,0} parameter(0)
+  zero = bf16[] constant(0)
+  row_max = bf16[128,4]{1,0} reduce(p0, zero), dimensions={2},
+      to_apply=maximum
+  view0 = bf16[1,128,4]{2,1,0} bitcast(row_max)
+  converted = f32[1,128,4]{2,1,0} convert(view0)
+  rooted = f32[1,128,4]{2,1,0} sqrt(converted)
+  rounded = bf16[1,128,4]{2,1,0} convert(rooted)
+  view1 = bf16[128,4]{1,0} bitcast(rounded)
+  expanded = bf16[128,4,256]{2,1,0} broadcast(view1), dimensions={0,1}
+  ROOT result = bf16[128,4,128]{2,1,0} slice(expanded),
+      slice={[0:128], [0:4], [0:128]}
+}
+
+ENTRY main {
+  p0 = bf16[128,4,256]{2,1,0} parameter(0)
+  ROOT fusion = bf16[128,4,128]{2,1,0} fusion(p0), kind=kCustom,
+      calls=body,
+      backend_config={"fusion_backend_config":{
+        "kind":"__fly",
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["1"]}],
+          "num_stages":"1", "num_warps":"8", "num_ctas":"1",
+          "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
 TEST_F(FlyFusionAutotuningPipelineDeviceTest,
@@ -2233,6 +3063,102 @@ ENTRY main {
         "num_stages":"1", "num_warps":"4", "num_ctas":"1",
         "waves_per_eu":"2"}}}
 })";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeCrossAttentionWithSplitKQuery) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_cross_attention_split_k_query
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+attention {
+  key_value = bf16[256,128]{1,0} parameter(0)
+  query_partials = f32[2,128,64]{2,1,0} parameter(1)
+  zero = f32[] constant(0)
+  query_sum = f32[128,64]{1,0} reduce(query_partials, zero),
+    dimensions={0}, to_apply=add
+  query = bf16[128,64]{1,0} convert(query_sum)
+  query_view = bf16[1,128,1,64]{3,2,1,0} bitcast(query)
+  query_transpose = bf16[1,1,128,64]{3,2,1,0}
+    transpose(query_view), dimensions={0,2,1,3}
+  query_bh = bf16[1,128,64]{2,1,0} bitcast(query_transpose)
+
+  key_value_view = bf16[1,256,2,1,64]{4,3,2,1,0}
+    bitcast(key_value)
+  key_slice = bf16[1,256,1,1,64]{4,3,2,1,0}
+    slice(key_value_view),
+    slice={[0:1], [0:256], [0:1], [0:1], [0:64]}
+  key_transpose = bf16[1,1,1,64,256]{4,3,2,1,0}
+    transpose(key_slice), dimensions={0,2,3,4,1}
+  key = bf16[1,64,256]{2,1,0} bitcast(key_transpose)
+  value_slice = bf16[1,256,1,1,64]{4,3,2,1,0}
+    slice(key_value_view),
+    slice={[0:1], [0:256], [1:2], [0:1], [0:64]}
+  value_transpose = bf16[1,1,1,64,256]{4,3,2,1,0}
+    transpose(value_slice), dimensions={0,2,3,4,1}
+  value = bf16[1,64,256]{2,1,0} bitcast(value_transpose)
+
+  scores = bf16[1,128,256]{2,1,0} dot(query_bh, key),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={1}
+  scores_f32 = f32[1,128,256]{2,1,0} convert(scores)
+  scale_bf16 = bf16[] constant(0.125)
+  scales_bf16 = bf16[1,128,256]{2,1,0} broadcast(scale_bf16),
+    dimensions={}
+  scales = f32[1,128,256]{2,1,0} convert(scales_bf16)
+  scaled = f32[1,128,256]{2,1,0} multiply(scores_f32, scales)
+  scaled_bf16 = bf16[1,128,256]{2,1,0} convert(scaled)
+  score_view = bf16[1,1,128,256]{3,2,1,0} bitcast(scaled_bf16)
+  converted = f32[1,1,128,256]{3,2,1,0} convert(score_view)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[1,1,128]{2,1,0} reduce(converted, minus_inf),
+    dimensions={3}, to_apply=maximum
+  maxima = f32[1,1,128,256]{3,2,1,0} broadcast(row_max),
+    dimensions={0,1,2}
+  shifted = f32[1,1,128,256]{3,2,1,0} subtract(converted, maxima)
+  exponential = f32[1,1,128,256]{3,2,1,0} exponential(shifted)
+  row_sum = f32[1,1,128]{2,1,0} reduce(exponential, zero),
+    dimensions={3}, to_apply=add
+  sums = f32[1,1,128,256]{3,2,1,0} broadcast(row_sum),
+    dimensions={0,1,2}
+  normalized = f32[1,1,128,256]{3,2,1,0}
+    divide(exponential, sums)
+  probabilities = bf16[1,1,128,256]{3,2,1,0} convert(normalized)
+  probabilities_bh = bf16[1,128,256]{2,1,0} bitcast(probabilities)
+  context = bf16[1,64,128]{2,1,0} dot(value, probabilities_bh),
+    lhs_batch_dims={0}, lhs_contracting_dims={2},
+    rhs_batch_dims={0}, rhs_contracting_dims={2}
+  context_view = bf16[1,1,64,128]{3,2,1,0} bitcast(context)
+  ROOT result = bf16[1,128,1,64]{3,2,1,0} transpose(context_view),
+    dimensions={0,3,1,2}
+}
+
+ENTRY main {
+  key_value = bf16[256,128]{1,0} parameter(0)
+  query_partials = f32[2,128,64]{2,1,0} parameter(1)
+  ROOT fusion = bf16[1,128,1,64]{3,2,1,0}
+    fusion(key_value, query_partials), kind=kCustom, calls=attention,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","32","1","64"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1",
+        "waves_per_eu":"4"}}}
+}
+)";
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0.03, /*arel=*/0.03}));
@@ -3666,6 +4592,104 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
+TEST_F(FlyFusionDeviceTest, F32Rank3LeadingRotationTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_f32_rank3_leading_rotation_transpose
+
+transpose {
+  p0 = f32[64,128,32]{2,1,0} parameter(0)
+  ROOT result = f32[32,64,128]{2,1,0} transpose(p0), dimensions={2,0,1}
+}
+
+ENTRY main {
+  p0 = f32[64,128,32]{2,1,0} parameter(0)
+  ROOT fusion = f32[32,64,128]{2,1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64","32"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, F16Transpose64x96) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_f16_transpose
+
+transpose {
+  p0 = f16[64,96]{1,0} parameter(0)
+  ROOT result = f16[96,64]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = f16[64,96]{1,0} parameter(0)
+  ROOT fusion = f16[96,64]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64","64"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, GenericF32Rank3RotatingTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_generic_f32_rank3_rotating_transpose
+
+transpose {
+  p0 = f32[15,7,3]{2,1,0} parameter(0)
+  ROOT result = f32[3,15,7]{2,1,0} transpose(p0), dimensions={2,0,1}
+}
+
+ENTRY main {
+  p0 = f32[15,7,3]{2,1,0} parameter(0)
+  ROOT fusion = f32[3,15,7]{2,1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, GenericF32Rank3OuterTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_generic_f32_rank3_outer_transpose
+
+transpose {
+  p0 = f32[3,8,20]{2,1,0} parameter(0)
+  ROOT result = f32[8,3,20]{2,1,0} transpose(p0), dimensions={1,0,2}
+}
+
+ENTRY main {
+  p0 = f32[3,8,20]{2,1,0} parameter(0)
+  ROOT fusion = f32[8,3,20]{2,1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
 TEST_F(FlyFusionDeviceTest, Bf16Transpose32Tile) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_bf16_transpose_32_tile
@@ -3922,12 +4946,59 @@ ENTRY main {
     backend_config={"fusion_backend_config":{
       "kind":"__fly",
       "block_level_fusion_config":{
-        "output_tiles":[{"sizes":["1","1"]}],
+        "output_tiles":[{"sizes":["64","64"]}],
         "num_stages":"1", "num_warps":"4", "num_ctas":"1"}}}
 })";
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, Bf16TransposePartialIrregularLdsTile) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_bf16_transpose_partial_irregular_lds_tile
+
+transpose {
+  p0 = bf16[193,257]{1,0} parameter(0)
+  ROOT result = bf16[257,193]{1,0} transpose(p0), dimensions={1,0}
+}
+
+ENTRY main {
+  p0 = bf16[193,257]{1,0} parameter(0)
+  ROOT fusion = bf16[257,193]{1,0} fusion(p0), kind=kCustom,
+    calls=transpose,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["192","128"]}],
+        "num_stages":"1", "num_warps":"12", "num_ctas":"1"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionAutotuningPipelineDeviceTest,
+       FormsAndExecutesPartialBf16TransposeWithoutTriton) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_partial_bf16_transpose_pipeline
+
+ENTRY main {
+  p0 = bf16[65,127]{1,0} parameter(0)
+  ROOT result = bf16[127,65]{1,0} transpose(p0), dimensions={1,0}
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> optimized,
+                       GetOptimizedModule(kHlo));
+  const HloInstruction* root =
+      optimized->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kFusion) << optimized->ToString();
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig backend_config,
+                       root->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(backend_config.fusion_backend_config().kind(), kFlyFusionKind)
+      << optimized->ToString();
+  EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
 TEST_F(FlyFusionDeviceTest, GenericBf16Elementwise) {
@@ -4205,6 +5276,60 @@ ENTRY main {
 
   EXPECT_TRUE(
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-4, /*arel=*/1e-4}));
+}
+
+TEST_F(FlyFusionDeviceTest,
+       NativeMultipleReductionsWithDependentRowwiseOutput) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_multiple_reductions_dependent_rowwise_output
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[127,259]{1,0} parameter(0)
+  squared = f32[127,259]{1,0} multiply(p0, p0)
+  zero = f32[] constant(0)
+  row_sum = f32[127]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[127]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+  epsilon = f32[] constant(1e-6)
+  epsilons = f32[127]{0} broadcast(epsilon), dimensions={}
+  variance = f32[127]{0} add(row_sum, epsilons)
+  scale = f32[127]{0} rsqrt(variance)
+  scales = f32[127,259]{1,0} broadcast(scale), dimensions={0}
+  maxima = f32[127,259]{1,0} broadcast(row_max), dimensions={0}
+  centered = f32[127,259]{1,0} subtract(p0, maxima)
+  normalized = f32[127,259]{1,0} multiply(centered, scales)
+  ROOT result = (f32[127,259]{1,0}, f32[127]{0}, f32[127]{0})
+    tuple(normalized, row_max, row_sum)
+}
+
+ENTRY main {
+  p0 = f32[127,259]{1,0} parameter(0)
+  ROOT fusion = (f32[127,259]{1,0}, f32[127]{0}, f32[127]{0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]},{"sizes":["1"]},
+                        {"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
 }
 
 TEST_F(FlyFusionDeviceTest, NativeRowReductionsWithDynamicInit) {
@@ -5429,6 +6554,215 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
+TEST_F(FlyFusionDeviceTest,
+       NativePartialContiguousOverwriteRowScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_partial_contiguous_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[17,67]{1,0} parameter(0)
+  updates = bf16[13,31]{1,0} parameter(1)
+  transformed = bf16[13,31]{1,0} abs(updates)
+  canonical_updates = bf16[13,1,31]{2,1,0} bitcast(transformed)
+  row_ids = s32[13]{0} iota(), iota_dimension=0
+  canonical_indices = s32[13,1]{1,0} bitcast(row_ids)
+  ROOT scatter = bf16[17,67]{1,0}
+    scatter(base, canonical_indices, canonical_updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[17,67]{1,0} parameter(0)
+  updates = bf16[13,31]{1,0} parameter(1)
+  ROOT fusion = bf16[17,67]{1,0} fusion(base, updates), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeOffsetContiguousOverwriteRowScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_offset_contiguous_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[64,67]{1,0} parameter(0)
+  updates = bf16[38,31]{1,0} parameter(1)
+  transformed = bf16[38,31]{1,0} abs(updates)
+  canonical_updates = bf16[38,1,31]{2,1,0} bitcast(transformed)
+  indices = s32[38,2]{1,0} iota(), iota_dimension=0
+  ROOT scatter = bf16[64,67]{1,0}
+    scatter(base, indices, canonical_updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[64,67]{1,0} parameter(0)
+  updates = bf16[38,31]{1,0} parameter(1)
+  ROOT fusion = bf16[64,67]{1,0} fusion(base, updates), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRectangularOverwriteScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rectangular_overwrite_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[16,5,67]{2,1,0} parameter(0)
+  updates = bf16[15,1,3,31]{3,2,1,0} parameter(1)
+  transformed = bf16[15,1,3,31]{3,2,1,0} abs(updates)
+  indices = s32[15,1]{1,0} iota(), iota_dimension=0
+  ROOT scatter = bf16[16,5,67]{2,1,0}
+    scatter(base, indices, transformed),
+    update_window_dims={1,2,3}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[16,5,67]{2,1,0} parameter(0)
+  updates = bf16[15,1,3,31]{3,2,1,0} parameter(1)
+  ROOT fusion = bf16[16,5,67]{2,1,0}
+    fusion(base, updates), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeIndexedRectangularOverwriteScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_indexed_rectangular_overwrite_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[16,16,67]{2,1,0} parameter(0)
+  updates = bf16[4,2,3,31]{3,2,1,0} parameter(1)
+  transformed = bf16[4,2,3,31]{3,2,1,0} abs(updates)
+  ids = s32[4]{0} iota(), iota_dimension=0
+  two = s32[] constant(2)
+  twos = s32[4]{0} broadcast(two), dimensions={}
+  rows = s32[4]{0} multiply(ids, twos)
+  row_column = s32[4,1]{1,0} bitcast(rows)
+  three = s32[] constant(3)
+  threes = s32[4]{0} broadcast(three), dimensions={}
+  middles = s32[4]{0} multiply(ids, threes)
+  middle_column = s32[4,1]{1,0} bitcast(middles)
+  indices = s32[4,2]{1,0}
+    concatenate(row_column, middle_column), dimensions={1}
+  ROOT scatter = bf16[16,16,67]{2,1,0}
+    scatter(base, indices, transformed),
+    update_window_dims={1,2,3}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY main {
+  base = bf16[16,16,67]{2,1,0} parameter(0)
+  updates = bf16[4,2,3,31]{3,2,1,0} parameter(1)
+  ROOT fusion = bf16[16,16,67]{2,1,0}
+    fusion(base, updates), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRectangularAdditiveScatter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rectangular_additive_scatter
+
+add {
+  old = bf16[] parameter(0)
+  update = bf16[] parameter(1)
+  ROOT result = bf16[] add(old, update)
+}
+
+elementwise {
+  base = bf16[8,3,10]{2,1,0} parameter(0)
+  indices = s32[7,1]{1,0} iota(), iota_dimension=0
+  one = bf16[] constant(1)
+  updates = bf16[7,1,2,6]{3,2,1,0} broadcast(one), dimensions={}
+  ROOT scatter = bf16[8,3,10]{2,1,0}
+    scatter(base, indices, updates),
+    update_window_dims={1,2,3}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=add
+}
+
+ENTRY main {
+  base = bf16[8,3,10]{2,1,0} parameter(0)
+  ROOT fusion = bf16[8,3,10]{2,1,0} fusion(base), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
 TEST_F(FlyFusionDeviceTest, NativeNonUniqueOverwriteRowScatter) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_native_non_unique_overwrite_row_scatter
@@ -5533,6 +6867,50 @@ elementwise {
   canonical_indices = s32[191,1]{1,0} bitcast(row_ids)
   update = bf16[] constant(1)
   updates = bf16[191,1,67]{2,1,0} broadcast(update), dimensions={}
+  ROOT scatter = bf16[17,67]{1,0}
+    scatter(base, canonical_indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=add
+}
+
+ENTRY main {
+  base = bf16[17,67]{1,0} parameter(0)
+  ROOT fusion = bf16[17,67]{1,0} fusion(base), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest,
+       NativePartialContiguousAdditiveRowScatterOddOutputRowWidth) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_partial_contiguous_additive_row_scatter_odd_output_width
+
+add {
+  old = bf16[] parameter(0)
+  update = bf16[] parameter(1)
+  ROOT result = bf16[] add(old, update)
+}
+
+elementwise {
+  base = bf16[17,67]{1,0} parameter(0)
+  linear_ids = s32[191]{0} iota(), iota_dimension=0
+  divisor = s32[] constant(13)
+  divisors = s32[191]{0} broadcast(divisor), dimensions={}
+  row_ids = s32[191]{0} remainder(linear_ids, divisors)
+  canonical_indices = s32[191,1]{1,0} bitcast(row_ids)
+  update = bf16[] constant(1)
+  updates = bf16[191,1,30]{2,1,0} broadcast(update), dimensions={}
   ROOT scatter = bf16[17,67]{1,0}
     scatter(base, canonical_indices, updates),
     update_window_dims={1,2}, inserted_window_dims={},
@@ -6056,6 +7434,31 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
 }
 
+TEST_F(FlyFusionDeviceTest, NativeBf16ScalarParameterBroadcast) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_scalar_parameter_broadcast
+
+elementwise {
+  scalar = bf16[] parameter(0)
+  ROOT result = bf16[1024,1024]{1,0} broadcast(scalar), dimensions={}
+}
+
+ENTRY main {
+  scalar = bf16[] parameter(0)
+  ROOT fusion = bf16[1024,1024]{1,0} fusion(scalar), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
 TEST_F(FlyFusionDeviceTest, NativeUnalignedBf16ContiguousSlice) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_native_unaligned_bf16_slice
@@ -6124,6 +7527,87 @@ elementwise {
 ENTRY main {
   p0 = bf16[4,6,8,11]{3,2,1,0} parameter(0)
   ROOT fusion = bf16[2,4,6,9]{3,2,1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16MajorDimensionStridedSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_major_dimension_strided_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  absolute = bf16[19,67]{1,0} abs(p0)
+  ROOT result = bf16[9,67]{1,0} slice(absolute),
+    slice={[1:19:2], [0:67]}
+}
+
+ENTRY main {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[9,67]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeBf16MinorDimensionStridedSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_bf16_minor_dimension_strided_slice
+
+elementwise {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  absolute = bf16[19,67]{1,0} abs(p0)
+  ROOT result = bf16[19,22]{1,0} slice(absolute),
+    slice={[0:19], [1:67:3]}
+}
+
+ENTRY main {
+  p0 = bf16[19,67]{1,0} parameter(0)
+  ROOT fusion = bf16[19,22]{1,0} fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeRank4Bf16MixedStridedSlice) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_rank4_bf16_mixed_strided_slice
+
+elementwise {
+  p0 = bf16[5,7,11,17]{3,2,1,0} parameter(0)
+  absolute = bf16[5,7,11,17]{3,2,1,0} abs(p0)
+  ROOT result = bf16[2,3,5,6]{3,2,1,0} slice(absolute),
+    slice={[1:5:2], [0:7:3], [2:11:2], [1:17:3]}
+}
+
+ENTRY main {
+  p0 = bf16[5,7,11,17]{3,2,1,0} parameter(0)
+  ROOT fusion = bf16[2,3,5,6]{3,2,1,0} fusion(p0), kind=kCustom,
     calls=elementwise,
     backend_config={"fusion_backend_config":{
       "kind":"__fly",
@@ -6636,6 +8120,72 @@ ENTRY main {
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["1"]}],
         "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeDifferentSizedSliceOutputs) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_different_sized_slice_outputs
+
+elementwise {
+  p0 = f32[64]{0} parameter(0)
+  absolute = f32[64]{0} abs(p0)
+  slice = f32[63]{0} slice(absolute), slice={[0:63]}
+  negate = f32[63]{0} negate(slice)
+  ROOT result = (f32[63]{0}, f32[64]{0}) tuple(negate, absolute)
+}
+
+ENTRY main {
+  p0 = f32[64]{0} parameter(0)
+  ROOT fusion = (f32[63]{0}, f32[64]{0}) fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"8", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/0, /*arel=*/0}));
+}
+
+TEST_F(FlyFusionDeviceTest, NativeDifferentSizedInteriorReductionOutputs) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_native_different_sized_interior_reduction_outputs
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+elementwise {
+  p0 = f32[64]{0} parameter(0)
+  absolute = f32[64]{0} abs(p0)
+  bitcast = f32[4,4,4]{2,1,0} bitcast(absolute)
+  zero = f32[] constant(0)
+  reduce = f32[4,4]{1,0} reduce(bitcast, zero), dimensions={1},
+    to_apply=maximum
+  ROOT result = (f32[4,4]{1,0}, f32[64]{0}) tuple(reduce, absolute)
+}
+
+ENTRY main {
+  p0 = f32[64]{0} parameter(0)
+  ROOT fusion = (f32[4,4]{1,0}, f32[64]{0}) fusion(p0), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["8"]}],
+        "num_stages":"1", "num_warps":"1", "num_ctas":"1",
         "vector_size_bits":"64"}}}
 }
 )";

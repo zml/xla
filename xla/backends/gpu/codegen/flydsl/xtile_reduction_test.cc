@@ -136,6 +136,43 @@ ENTRY main {
 )"));
 }
 
+TEST_F(FlyXTileReductionTest, RecognizesPartialRowwiseOutput) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule partial_rowwise_output
+
+maximum {
+  lhs = bf16[] parameter(0)
+  rhs = bf16[] parameter(1)
+  ROOT result = bf16[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = bf16[128,4,256]{2,1,0} parameter(0)
+  zero = bf16[] constant(0)
+  row_max = bf16[128,4]{1,0} reduce(p0, zero), dimensions={2},
+    to_apply=maximum
+  view0 = bf16[1,128,4]{2,1,0} bitcast(row_max)
+  converted = f32[1,128,4]{2,1,0} convert(view0)
+  rooted = f32[1,128,4]{2,1,0} sqrt(converted)
+  rounded = bf16[1,128,4]{2,1,0} convert(rooted)
+  view1 = bf16[128,4]{1,0} bitcast(rounded)
+  expanded = bf16[128,4,256]{2,1,0} broadcast(view1), dimensions={0,1}
+  ROOT result = bf16[128,4,128]{2,1,0} slice(expanded),
+    slice={[0:128], [0:4], [0:128]}
+}
+
+ENTRY main {
+  p0 = bf16[128,4,256]{2,1,0} parameter(0)
+  ROOT fusion = bf16[128,4,128]{2,1,0} fusion(p0), kind=kCustom,
+    calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1,
+      "vector_size_bits":"128"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileReductionTest, RecognizesTwoIndependentRowReductions) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule two_independent_row_reductions
@@ -198,6 +235,47 @@ reduction {
     to_apply=maximum
   ROOT result = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
     tuple(row_sum, row_max, absolute)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  ROOT fusion = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    fusion(p0), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesMultipleReductionsWithDependentRowwiseOutput) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule multiple_reductions_dependent_rowwise_output
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT max = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  row_sum = f32[128]{0} reduce(p0, zero), dimensions={1}, to_apply=add
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[128]{0} reduce(p0, minus_inf), dimensions={1},
+    to_apply=maximum
+  sums = f32[128,512]{1,0} broadcast(row_sum), dimensions={0}
+  maxima = f32[128,512]{1,0} broadcast(row_max), dimensions={0}
+  centered = f32[128,512]{1,0} subtract(p0, maxima)
+  normalized = f32[128,512]{1,0} divide(centered, sums)
+  ROOT result = (f32[128]{0}, f32[128]{0}, f32[128,512]{1,0})
+    tuple(row_sum, row_max, normalized)
 }
 
 ENTRY main {
