@@ -29,6 +29,11 @@ namespace xla::gpu::flydsl {
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileSoftmaxEmitter(
     const HloFusionAnalysis& analysis);
 
+// Emits inference LayerNorm with both dependent reductions and normalization
+// in one workgroup while retaining the row in registers.
+std::unique_ptr<MlirKernelEmitter> CreateFlyXTileLayerNormEmitter(
+    const HloFusionAnalysis& analysis);
+
 }  // namespace xla::gpu::flydsl
 
 #endif  // XLA_BACKENDS_GPU_CODEGEN_FLYDSL_XTILE_SOFTMAX_H_

@@ -26,17 +26,23 @@ limitations under the License.
 namespace xla::gpu::flydsl {
 
 // Static properties of the dense packed-QKV attention region formed by
-// AttentionRewriterFly. Q, K, and V are laid out as [B,S,3,H,D] in a single
-// rank-2 parameter; output is [B,S,H,D].
+// AttentionRewriterFly. The rank-2 parameter stores Q, K, and V consecutively
+// for each token. MHA uses H query and H key/value heads; GQA uses H query and
+// a smaller number of key/value heads. Output is logically [B,S,H,D].
 struct FlyAttentionDescriptor {
   int64_t batch;
+  // `sequence` is the query length. Packed self-attention has the same key/
+  // value length; cross-attention may use a different one and two parameters.
   int64_t sequence;
+  int64_t key_value_sequence;
   int64_t heads;
+  int64_t key_value_heads;
   int64_t head_dimension;
   double scale;
   bool causal;
   PrimitiveType element_type;
   const HloInstruction* qkv_parameter;
+  const HloInstruction* key_value_parameter;
   const HloInstruction* qk_dot;
   const HloInstruction* pv_dot;
   const HloInstruction* softmax_root;
@@ -47,6 +53,12 @@ struct FlyAttentionDescriptor {
 // select(predicate, scores, -inf). Returns nullptr for any other expression.
 const HloInstruction* GetFlyCausalMaskScores(const HloInstruction& input,
                                              int64_t sequence);
+
+// As above, for layouts where the logical query/key dimensions are not the
+// final two physical dimensions (for example grouped-query attention).
+const HloInstruction* GetFlyCausalMaskScoresAlongDimensions(
+    const HloInstruction& input, int64_t sequence, int64_t query_dimension,
+    int64_t key_dimension);
 
 // Recognizes a dense F16/BF16 attention region with canonical stable softmax,
 // optional causal masking, and packed QKV input. The matcher validates

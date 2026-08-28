@@ -16,10 +16,12 @@ autotuner="${workspace_root}/xla/backends/gpu/autotuner/autotuner_main"
 benchmark_root="${workspace_root}/xla/backends/gpu/codegen/flydsl"
 direct_template="${benchmark_root}/paged_attention_preconfigured_benchmark.hlo.tpl"
 segmented_template="${benchmark_root}/paged_attention_segmented_preconfigured_benchmark.hlo.tpl"
+segmented_fused_template="${benchmark_root}/paged_attention_segmented_fused_preconfigured_benchmark.hlo.tpl"
 rocm_lib="${runfiles_root}/local_config_rocm/rocm/rocm_dist/lib"
 
 if [[ ! -x "${autotuner}" || ! -f "${direct_template}" ||
-      ! -f "${segmented_template}" || ! -d "${rocm_lib}" ]]; then
+      ! -f "${segmented_template}" || ! -f "${segmented_fused_template}" ||
+      ! -d "${rocm_lib}" ]]; then
   echo "Could not locate paged-attention benchmark runfiles." >&2
   exit 1
 fi
@@ -96,8 +98,21 @@ for shape in "$@"; do
     exit 1
   fi
   template=${direct_template}
+  autotune_backends=fly_fusion,triton
   if ((segments > 1)); then
     template=${segmented_template}
+  fi
+  # Exercise the public-call rewrite for the long-context GQA4 shapes where
+  # Fly combines the segmented producer and reducer into one device kernel.
+  if [[ "${FLY_PAGED_ATTENTION_FORCE_SEPARATE:-0}" != "1" ]] &&
+     ((max_context >= 65536 && query_heads / kv_heads == 4 &&
+       segments <= 128 &&
+       (max_context >= 131072 || batch * kv_heads <= 2))); then
+    template=${segmented_fused_template}
+    # Triton's compiler cannot implement the inter-CTA completion protocol in
+    # this custom tuple ABI. The separate producer/reducer path remains the
+    # like-for-like Triton baseline selected with FORCE_SEPARATE below.
+    autotune_backends=fly_fusion
   fi
   hlo="${output_dir}/paged_attention_${dtype}_${shape}.hlo"
   selected="${output_dir}/paged_attention_${dtype}_${shape}.autotuned.hlo"
@@ -117,7 +132,7 @@ for shape in "$@"; do
 --xla_gpu_autotune_num_repetitions=${FLY_PAGED_ATTENTION_BENCHMARK_REPETITIONS:-100} \
 --xla_gpu_enable_flydsl_fusion=true \
 --xla_gpu_experimental_enable_fusion_autotuner=true \
---xla_gpu_experimental_autotune_backends=fly_fusion,triton \
+--xla_gpu_experimental_autotune_backends=${autotune_backends} \
 --xla_gpu_force_compilation_parallelism=1 \
 --xla_gpu_dump_autotune_logs_to=${log}" \
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \

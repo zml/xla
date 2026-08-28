@@ -17,6 +17,12 @@ package_group(
 )
 
 cc_library(
+    name = "collective_epilogue",
+    hdrs = ["collective_epilogue.h"],
+    deps = ["//xla/hlo/ir:hlo"],
+)
+
+cc_library(
     name = "copy",
     srcs = ["copy.cc"],
     hdrs = ["copy.h"],

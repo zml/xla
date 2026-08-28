@@ -25,11 +25,14 @@ limitations under the License.
 #include "absl/base/nullability.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "llvm/IR/Module.h"
 #include "xla/backends/gpu/runtime/async_execution.h"
+#include "xla/backends/gpu/codegen/collective_epilogue.h"
 #include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/host_send_recv_thunk.h"
@@ -107,7 +110,8 @@ class ThunkEmitter {
 
   AsyncThunkSequence EmitCollectiveKernelThunk(
       Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
-      const HloInstruction* instr, const CollectiveConfig& config);
+      const HloInstruction* instr, const CollectiveConfig& config,
+      CollectiveEpilogue producer, CollectiveEpilogue epilogue);
   absl::StatusOr<ThunkSequence> EmitCollectiveAsyncDone(
       const HloInstruction* inst);
 
@@ -252,6 +256,12 @@ class ThunkEmitter {
   // AsyncExecution.
   absl::flat_hash_map<const HloInstruction*, std::shared_ptr<AsyncExecution>>
       hlo_async_executions_;
+
+  // Fusions whose work was folded into a native Fly collective kernel during
+  // thunk emission.
+  absl::Mutex fly_collective_fusions_mutex_;
+  absl::flat_hash_set<const HloFusionInstruction*>
+      fly_collective_fusions_ ABSL_GUARDED_BY(fly_collective_fusions_mutex_);
 
   // Cache to store the call_graph.
   std::unique_ptr<CallGraph> call_graph_;

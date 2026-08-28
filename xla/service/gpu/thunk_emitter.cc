@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/gpu/thunk_emitter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -330,38 +331,336 @@ ShapeIndex GetDstShapeIndex(const HloInstruction* async_start,
   return is_multi_output ? ShapeIndex({operand_index}) : ShapeIndex({});
 }
 
+struct FlyCollectiveEpilogueMatch {
+  const HloFusionInstruction* fusion;
+  std::vector<const HloInstruction*> inputs;
+  CollectiveEpilogue epilogue;
+};
+
+struct FlyCollectiveProducerMatch {
+  const HloFusionInstruction* fusion;
+  const HloInstruction* primary_input;
+  std::vector<const HloInstruction*> inputs;
+  CollectiveEpilogue producer;
+};
+
+std::optional<int64_t> GetWidenedBf16ParameterNumber(
+    const HloInstruction* instruction) {
+  if (instruction->opcode() != HloOpcode::kConvert ||
+      instruction->shape().element_type() != F32 ||
+      instruction->operand(0)->shape().element_type() != BF16) {
+    return std::nullopt;
+  }
+  const HloInstruction* parameter = instruction->operand(0);
+  if (parameter->opcode() != HloOpcode::kParameter) {
+    return std::nullopt;
+  }
+  return parameter->parameter_number();
+}
+
+std::optional<double> GetF32ScalarBroadcastConstant(
+    const HloInstruction* instruction) {
+  if (instruction->opcode() != HloOpcode::kBroadcast ||
+      instruction->shape().element_type() != F32 ||
+      !instruction->dimensions().empty() ||
+      instruction->operand_count() != 1) {
+    return std::nullopt;
+  }
+  const HloInstruction* constant = instruction->operand(0);
+  if (constant->opcode() != HloOpcode::kConstant ||
+      constant->shape().element_type() != F32 ||
+      !ShapeUtil::IsScalar(constant->shape())) {
+    return std::nullopt;
+  }
+  return constant->literal().GetAsDouble({});
+}
+
+bool IsSupportedFlyCollectiveEpilogueOpcode(HloOpcode opcode) {
+  switch (opcode) {
+    case HloOpcode::kAdd:
+    case HloOpcode::kSubtract:
+    case HloOpcode::kMultiply:
+    case HloOpcode::kDivide:
+    case HloOpcode::kMaximum:
+    case HloOpcode::kMinimum:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::optional<std::vector<CollectiveEpilogueStep>>
+ParseFlyCollectiveEpilogue(const HloInstruction* instruction,
+                          int64_t collective_parameter,
+                          const Shape& output_shape) {
+  if (std::optional<int64_t> parameter =
+          GetWidenedBf16ParameterNumber(instruction);
+      parameter.has_value() && *parameter == collective_parameter &&
+      instruction->shape().dimensions() == output_shape.dimensions()) {
+    return std::vector<CollectiveEpilogueStep>{};
+  }
+  if (!IsSupportedFlyCollectiveEpilogueOpcode(instruction->opcode()) ||
+      instruction->operand_count() != 2 ||
+      instruction->shape().element_type() != F32 ||
+      instruction->shape().dimensions() != output_shape.dimensions()) {
+    return std::nullopt;
+  }
+
+  auto make_step = [&](const HloInstruction* side,
+                       bool accumulator_is_lhs)
+      -> std::optional<CollectiveEpilogueStep> {
+    if (std::optional<int64_t> parameter =
+            GetWidenedBf16ParameterNumber(side);
+        parameter.has_value() && *parameter != collective_parameter &&
+        side->shape().dimensions() == output_shape.dimensions()) {
+      CollectiveEpilogueStep step;
+      step.opcode = instruction->opcode();
+      step.accumulator_is_lhs = accumulator_is_lhs;
+      step.buffer_index = *parameter;
+      return step;
+    }
+    if (std::optional<double> constant =
+            GetF32ScalarBroadcastConstant(side);
+        constant.has_value() &&
+        side->shape().dimensions() == output_shape.dimensions()) {
+      CollectiveEpilogueStep step;
+      step.opcode = instruction->opcode();
+      step.accumulator_is_lhs = accumulator_is_lhs;
+      step.scalar_value = *constant;
+      return step;
+    }
+    return std::nullopt;
+  };
+
+  if (std::optional<std::vector<CollectiveEpilogueStep>> prefix =
+          ParseFlyCollectiveEpilogue(instruction->operand(0),
+                                    collective_parameter, output_shape)) {
+    if (std::optional<CollectiveEpilogueStep> step =
+            make_step(instruction->operand(1),
+                      /*accumulator_is_lhs=*/true)) {
+      prefix->push_back(*step);
+      return prefix;
+    }
+  }
+  if (std::optional<std::vector<CollectiveEpilogueStep>> prefix =
+          ParseFlyCollectiveEpilogue(instruction->operand(1),
+                                    collective_parameter, output_shape)) {
+    if (std::optional<CollectiveEpilogueStep> step =
+            make_step(instruction->operand(0),
+                      /*accumulator_is_lhs=*/false)) {
+      prefix->push_back(*step);
+      return prefix;
+    }
+  }
+  return std::nullopt;
+}
+
+// Matches a schedule-safe widened-BF16 producer immediately feeding an
+// all-reduce. The producer is evaluated while the collective copies its local
+// input into symmetric scratch, eliminating both the producer launch and its
+// materialized BF16 result.
+std::optional<FlyCollectiveProducerMatch> MatchFlyCollectiveProducer(
+    const HloInstruction* async_start, const HloInstruction* collective) {
+  const auto* all_reduce = DynCast<HloAllReduceInstruction>(collective);
+  if (all_reduce == nullptr ||
+      all_reduce->device_list()->num_devices_per_group() < 8 ||
+      async_start->opcode() != HloOpcode::kAsyncStart ||
+      async_start->operand_count() != 1) {
+    return std::nullopt;
+  }
+  const auto* fusion =
+      DynCast<HloFusionInstruction>(async_start->operand(0));
+  if (fusion == nullptr || fusion->user_count() != 1 ||
+      fusion->users().front() != async_start || fusion->operand_count() < 1 ||
+      fusion->shape() != all_reduce->shape() ||
+      fusion->shape().element_type() != BF16 ||
+      !IsGpuFusionKind(*fusion, kFlyFusionKind)) {
+    return std::nullopt;
+  }
+  const HloInstruction* root = fusion->fused_expression_root();
+  if (root->opcode() != HloOpcode::kConvert ||
+      root->shape().element_type() != BF16 ||
+      root->operand(0)->shape().element_type() != F32) {
+    return std::nullopt;
+  }
+
+  for (int64_t primary_parameter = 0;
+       primary_parameter < fusion->operand_count(); ++primary_parameter) {
+    std::optional<std::vector<CollectiveEpilogueStep>> steps =
+        ParseFlyCollectiveEpilogue(root->operand(0), primary_parameter,
+                                  root->shape());
+    if (!steps.has_value() || steps->empty() || steps->size() > 4) {
+      continue;
+    }
+    const HloInstruction* primary_input =
+        fusion->operand(primary_parameter);
+    if (primary_input->opcode() != HloOpcode::kParameter ||
+        primary_input->shape() != all_reduce->shape()) {
+      continue;
+    }
+
+    std::vector<const HloInstruction*> inputs;
+    bool schedule_safe = true;
+    for (CollectiveEpilogueStep& step : *steps) {
+      if (!step.uses_buffer()) {
+        continue;
+      }
+      const int64_t fusion_parameter = step.buffer_index;
+      if (fusion_parameter < 0 ||
+          fusion_parameter >= fusion->operand_count()) {
+        schedule_safe = false;
+        break;
+      }
+      const HloInstruction* input = fusion->operand(fusion_parameter);
+      if (input->opcode() != HloOpcode::kParameter ||
+          input->shape() != all_reduce->shape()) {
+        schedule_safe = false;
+        break;
+      }
+      auto existing = std::find(inputs.begin(), inputs.end(), input);
+      if (existing == inputs.end()) {
+        step.buffer_index = inputs.size();
+        inputs.push_back(input);
+      } else {
+        step.buffer_index = std::distance(inputs.begin(), existing);
+      }
+    }
+    if (!schedule_safe) {
+      continue;
+    }
+    CollectiveEpilogue producer{
+        /*buffer_count=*/static_cast<int64_t>(inputs.size()),
+        /*steps=*/std::move(*steps)};
+    return FlyCollectiveProducerMatch{fusion, primary_input,
+                                      std::move(inputs), std::move(producer)};
+  }
+  return std::nullopt;
+}
+
+// Matches a linear widened-BF16 post-collective expression. The first native
+// surface covers same-shaped BF16 input buffers and F32 scalar constants, with
+// arithmetic retained in F32 until one final BF16 round-to-nearest-even.
+std::optional<FlyCollectiveEpilogueMatch> MatchFlyCollectiveEpilogue(
+    const HloInstruction* async_start, const HloInstruction* collective) {
+  const auto* all_reduce = DynCast<HloAllReduceInstruction>(collective);
+  // The extra widened BF16 arithmetic is not profitable for two ranks at this
+  // message size. Eight-rank MI300X measurements recover it by eliminating the
+  // separate launch and output round trip.
+  if (all_reduce == nullptr ||
+      all_reduce->device_list()->num_devices_per_group() < 8) {
+    return std::nullopt;
+  }
+  if (async_start->opcode() != HloOpcode::kAsyncStart ||
+      async_start->user_count() != 1) {
+    return std::nullopt;
+  }
+  const HloInstruction* async_done = async_start->users().front();
+  if (async_done->opcode() != HloOpcode::kAsyncDone ||
+      async_done->user_count() != 1 ||
+      async_done->shape().element_type() != BF16) {
+    return std::nullopt;
+  }
+  const auto* fusion = DynCast<HloFusionInstruction>(
+      async_done->users().front());
+  if (fusion == nullptr || fusion->operand_count() < 1 ||
+      fusion->shape() != async_done->shape() ||
+      !IsGpuFusionKind(*fusion, kFlyFusionKind)) {
+    return std::nullopt;
+  }
+
+  int64_t collective_parameter = -1;
+  for (int64_t operand = 0; operand < fusion->operand_count(); ++operand) {
+    if (fusion->operand(operand) == async_done) {
+      collective_parameter = operand;
+      break;
+    }
+  }
+  if (collective_parameter < 0) {
+    return std::nullopt;
+  }
+
+  const HloInstruction* root = fusion->fused_expression_root();
+  if (root->opcode() != HloOpcode::kConvert ||
+      root->shape().element_type() != BF16 ||
+      root->operand(0)->shape().element_type() != F32) {
+    return std::nullopt;
+  }
+  std::optional<std::vector<CollectiveEpilogueStep>> steps =
+      ParseFlyCollectiveEpilogue(root->operand(0), collective_parameter,
+                                root->shape());
+  if (!steps.has_value() || steps->empty() || steps->size() > 4) {
+    return std::nullopt;
+  }
+
+  std::vector<const HloInstruction*> inputs;
+  for (CollectiveEpilogueStep& step : *steps) {
+    if (!step.uses_buffer()) {
+      continue;
+    }
+    const int64_t fusion_parameter = step.buffer_index;
+    if (fusion_parameter < 0 || fusion_parameter >= fusion->operand_count()) {
+      return std::nullopt;
+    }
+    const HloInstruction* input = fusion->operand(fusion_parameter);
+    // Entry parameters are guaranteed to be available before the asynchronous
+    // collective starts. General producers require a schedule-order proof.
+    if (input->opcode() != HloOpcode::kParameter ||
+        input->shape() != async_done->shape()) {
+      return std::nullopt;
+    }
+    auto existing = std::find(inputs.begin(), inputs.end(), input);
+    if (existing == inputs.end()) {
+      step.buffer_index = inputs.size();
+      inputs.push_back(input);
+    } else {
+      step.buffer_index = std::distance(inputs.begin(), existing);
+    }
+  }
+  CollectiveEpilogue epilogue{/*buffer_count=*/
+                                  static_cast<int64_t>(inputs.size()),
+                              /*steps=*/std::move(*steps)};
+  return FlyCollectiveEpilogueMatch{fusion, std::move(inputs),
+                                    std::move(epilogue)};
+}
+
 }  // namespace
 
 AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
     Thunk::ThunkInfo thunk_info, std::vector<CollectiveThunk::Buffer> buffers,
-    const HloInstruction* instr, const CollectiveConfig& config) {
+    const HloInstruction* instr, const CollectiveConfig& config,
+    CollectiveEpilogue producer, CollectiveEpilogue epilogue) {
   std::unique_ptr<HloModule> fused_module =
       NewModuleWithFusion(instr, HloInstruction::FusionKind::kLoop);
   HloFusionInstruction* fusion_instr = Cast<HloFusionInstruction>(
       fused_module->entry_computation()->root_instruction());
-  static constexpr bool kMultimemDisabled = false;
-  const bool should_flatten = [&](const HloInstruction* instr) {
+  bool is_collective_kernel_enabled = false;
+  if (auto gpu_config = instr->backend_config<GpuBackendConfig>();
+      gpu_config.ok()) {
+    is_collective_kernel_enabled = IsTritonCollectiveKernel(
+        gpu_config->collective_backend_config().kernel_strategy());
+  }
+  bool should_flatten = false;
+  if (instr->opcode() == HloOpcode::kAllReduce &&
+      is_collective_kernel_enabled) {
+    static constexpr bool kMultimemDisabled = false;
     const int64_t size_bytes =
         ShapeUtil::ElementsIn(instr->shape()) *
         primitive_util::ByteWidth(instr->shape().element_type());
     const bool has_rank_higher_than_1 =
         instr->shape().IsArray() && instr->shape().dimensions().size() > 1;
-    return has_rank_higher_than_1 &&
-           GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
-               se::gpu::AllReduceStrategy::kTwoShot;
-  }(instr);
-  bool is_collective_kernel_enabled =
-      instr->GetModule()
-          ->config()
-          .debug_options()
-          .xla_gpu_unsupported_use_all_reduce_one_shot_kernel();
+    should_flatten = has_rank_higher_than_1 &&
+                     GetAllReduceStrategy(size_bytes, kMultimemDisabled) ==
+                         se::gpu::AllReduceStrategy::kTwoShot;
+  }
   if (is_collective_kernel_enabled && should_flatten) {
     RETURN_IF_ERROR(FlattenCollectiveFusion(fusion_instr));
   }
   const auto make_thunk =
       [thunk_info = std::move(thunk_info), buffers = std::move(buffers), config,
        fusion_instr, is_async = !IsGPUSyncCollective(*instr),
-       is_collective_kernel_enabled](
+       is_collective_kernel_enabled,
+       elementwise_buffer_count =
+           producer.buffer_count + epilogue.buffer_count](
           absl::string_view kernel_name, int32_t shmem_bytes,
           LaunchDimensions launch_dimensions, const std::vector<uint8_t>& cubin,
           bool use_pdl, bool skip_collective_clique)
@@ -369,6 +668,16 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
     ASSIGN_OR_RETURN(
         CollectiveKernelSpec kernel_spec,
         CreateCollectiveKernelSpec(fusion_instr, launch_dimensions));
+    for (int64_t input = 0; input < elementwise_buffer_count; ++input) {
+      IoBufferSpec unmanaged_buffer{/*requires_multimem=*/false,
+                                    SymmetricMemoryType::kNone};
+      kernel_spec.input_buffer_specs.push_back(unmanaged_buffer);
+      kernel_spec.output_buffer_specs.push_back(unmanaged_buffer);
+      kernel_spec.argument_descriptors.insert(
+          kernel_spec.argument_descriptors.begin() + 2 + input,
+          KernelArgDescriptor{KernelArgType::kInputBuffer,
+                              /*index=*/1 + input});
+    }
     return std::make_unique<CollectiveKernelThunk>(
         thunk_info, config, std::move(kernel_spec), is_async,
         std::move(buffers), is_collective_kernel_enabled, kernel_name,
@@ -408,11 +717,18 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveKernelThunk(
           *fusion_instr, ir_emitter_context_->gpu_device_info())));
   ASSIGN_OR_RETURN(std::vector<Shape> unmanaged_arguments,
                    GetCollectiveUnmanagedKernelArguments(fusion_instr));
+  const int64_t elementwise_buffer_count =
+      producer.buffer_count + epilogue.buffer_count;
+  if (elementwise_buffer_count != 0) {
+    unmanaged_arguments.insert(unmanaged_arguments.begin(),
+                               elementwise_buffer_count, instr->shape());
+  }
 #if TENSORFLOW_USE_ROCM
   if (use_fly_collective) {
     auto emitter = std::make_unique<MlirKernelFusion>(
         flydsl::CreateFlyXTileCollectiveEmitter(
-            *analysis_garbage_collector_.back()));
+            *analysis_garbage_collector_.back(), std::move(producer),
+            std::move(epilogue)));
     return emitter
         ->Emit(*ir_emitter_context_, *fusion_instr,
                /*instr_override=*/instr, unmanaged_arguments)
@@ -1798,6 +2114,13 @@ AsyncThunkSequence ThunkEmitter::EmitStaticSliceCopyFusion(
 }
 
 AsyncThunkSequence ThunkEmitter::EmitFusion(const HloFusionInstruction* instr) {
+  {
+    absl::MutexLock lock(&fly_collective_fusions_mutex_);
+    if (fly_collective_fusions_.contains(instr)) {
+      return ThunkSequence{};
+    }
+  }
+
   ASSIGN_OR_RETURN(std::optional<StaticSliceCopyFusion> static_copy,
                    AnalyzeStaticSliceCopyFusion(instr));
   if (static_copy.has_value()) {
@@ -2343,8 +2666,62 @@ AsyncThunkSequence ThunkEmitter::EmitCollectiveThunk(
   if (use_triton) {
     CollectiveConfig collective_config =
         GetCollectiveConfig(inst, use_global_device_ids);
-    thunks =
-        EmitCollectiveKernelThunk(thunk_info, buffers, inst, collective_config);
+    CollectiveEpilogue collective_producer;
+    CollectiveEpilogue collective_epilogue;
+#if TENSORFLOW_USE_ROCM
+    if (ir_emitter_context_->debug_options().xla_gpu_flydsl_replace_triton()) {
+      std::vector<const HloInstruction*> elementwise_inputs;
+      if (std::optional<FlyCollectiveProducerMatch> producer =
+              MatchFlyCollectiveProducer(async_start, inst)) {
+        ASSIGN_OR_RETURN(BufferAllocation::Slice input_slice,
+                         GetAllocationSliceForHlo(producer->primary_input));
+        const Shape& input_shape = producer->primary_input->shape();
+        buffers[0].source_buffer = ShapedSlice{input_slice, input_shape};
+        buffers[0].source_memory_space =
+            input_shape.layout().memory_space();
+        elementwise_inputs.insert(elementwise_inputs.end(),
+                                  producer->inputs.begin(),
+                                  producer->inputs.end());
+        {
+          absl::MutexLock lock(&fly_collective_fusions_mutex_);
+          fly_collective_fusions_.insert(producer->fusion);
+        }
+        collective_producer = std::move(producer->producer);
+      }
+      if (std::optional<FlyCollectiveEpilogueMatch> epilogue =
+              MatchFlyCollectiveEpilogue(async_start, inst)) {
+        ASSIGN_OR_RETURN(BufferAllocation::Slice output_slice,
+                         GetAllocationSliceForHlo(epilogue->fusion));
+        const Shape& shape = epilogue->fusion->shape();
+        buffers[0].destination_buffer = ShapedSlice{output_slice, shape};
+        buffers[0].destination_memory_space = shape.layout().memory_space();
+        elementwise_inputs.insert(elementwise_inputs.end(),
+                                  epilogue->inputs.begin(),
+                                  epilogue->inputs.end());
+        {
+          absl::MutexLock lock(&fly_collective_fusions_mutex_);
+          fly_collective_fusions_.insert(epilogue->fusion);
+        }
+        collective_epilogue = std::move(epilogue->epilogue);
+      }
+      for (const HloInstruction* input : elementwise_inputs) {
+        ASSIGN_OR_RETURN(BufferAllocation::Slice input_slice,
+                         GetAllocationSliceForHlo(input));
+        const Shape& shape = input->shape();
+        buffers.push_back(CollectiveThunk::Buffer{
+            /*element_count=*/ShapeUtil::ElementsIn(shape),
+            /*source_buffer=*/ShapedSlice{input_slice, shape},
+            /*destination_buffer=*/buffers[0].destination_buffer,
+            /*source_memory_space=*/shape.layout().memory_space(),
+            /*destination_memory_space=*/buffers[0]
+                .destination_memory_space});
+      }
+    }
+#endif
+    thunks = EmitCollectiveKernelThunk(thunk_info, buffers, inst,
+                                       collective_config,
+                                       std::move(collective_producer),
+                                       std::move(collective_epilogue));
   } else {
     if constexpr (std::is_constructible_v<
                       CollectiveThunkType, Thunk::ThunkInfo, decltype(inst),
@@ -3270,9 +3647,20 @@ AsyncThunkSequence ThunkEmitter::EmitHloComputation(
   }
 
   return tsl::JoinFutures(absl::MakeSpan(futures))
-      .Map([&instructions,
+      .Map([this, &instructions,
             &concurrent_regions_ordering = concurrent_regions_ordering_,
             hlo_module](std::vector<ThunkSequence> sequences) {
+        {
+          absl::MutexLock lock(&fly_collective_fusions_mutex_);
+          for (int i = 0; i < instructions.size(); ++i) {
+            if (const auto* fusion =
+                    DynCast<HloFusionInstruction>(instructions[i]);
+                fusion != nullptr &&
+                fly_collective_fusions_.contains(fusion)) {
+              sequences[i].clear();
+            }
+          }
+        }
         absl::flat_hash_map<const HloInstruction*, Thunk*> instr_to_thunk;
         for (int i = 0; i < instructions.size(); i++) {
           const HloInstruction* instr = instructions[i];

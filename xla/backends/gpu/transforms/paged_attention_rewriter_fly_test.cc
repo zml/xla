@@ -179,13 +179,75 @@ TEST_F(PagedAttentionRewriterFlyTest, UsesTunedCooperativeSegmentGeometry) {
 HloModule fly_paged_attention_cooperative_decode
 
 ENTRY main {
-  q = bf16[1,32,128]{2,1,0} parameter(0)
-  k = bf16[4096,16,8,128]{3,2,1,0} parameter(1)
-  v = bf16[4096,16,8,128]{3,2,1,0} parameter(2)
+  q = bf16[1,4,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,1,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,1,128]{3,2,1,0} parameter(2)
   used_k = s32[1]{0} parameter(3)
   table = s32[1,4096]{1,0} parameter(4)
   scale = f32[] constant(0.0883883476)
-  ROOT attention = bf16[1,32,128]{2,1,0}
+  ROOT attention = bf16[1,4,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+)"));
+
+  EXPECT_THAT(PagedAttentionRewriterFly().Run(module.get()),
+              IsOkAndHolds(true));
+  const HloInstruction* output =
+      module->entry_computation()->root_instruction();
+  ASSERT_EQ(output->opcode(), HloOpcode::kGetTupleElement);
+  EXPECT_EQ(output->tuple_index(), 0);
+  const auto* producer =
+      Cast<const HloFusionInstruction>(output->operand(0));
+  ASSERT_TRUE(producer->shape().IsTuple());
+  ASSERT_EQ(producer->shape().tuple_shapes_size(), 5);
+  EXPECT_THAT(producer->shape().tuple_shapes(0).dimensions(),
+              ElementsAre(1, 4, 128));
+  EXPECT_THAT(producer->shape().tuple_shapes(1).dimensions(),
+              ElementsAre(1, 4, 114, 128));
+  EXPECT_THAT(producer->shape().tuple_shapes(2).dimensions(),
+              ElementsAre(1, 4, 114));
+  EXPECT_THAT(producer->shape().tuple_shapes(3).dimensions(),
+              ElementsAre(1, 4, 114));
+  EXPECT_EQ(producer->shape().tuple_shapes(4).element_type(), U32);
+  EXPECT_THAT(producer->shape().tuple_shapes(4).dimensions(),
+              ElementsAre(1, 1, 2));
+  HloFusionAnalysis producer_analysis = HloFusionAnalysis::Create(
+      *producer, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<flydsl::FlyPagedAttentionSegmentedProducerDescriptor>
+      descriptor = flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(
+          producer_analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_EQ(descriptor->num_segments, 114);
+  EXPECT_EQ(descriptor->segment_tokens, 576);
+  EXPECT_TRUE(descriptor->fused_reducer);
+
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       producer->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config()
+                .block_level_fusion_config()
+                .num_warps(),
+            2);
+  EXPECT_EQ(gpu_config.fusion_backend_config()
+                .block_level_fusion_config()
+                .output_tiles_size(),
+            5);
+}
+
+TEST_F(PagedAttentionRewriterFlyTest,
+       KeepsSeparateReducerForHighParallelismAtKv65536) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+HloModule fly_paged_attention_cooperative_decode_high_parallelism
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[4096,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[4096,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,4096]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = bf16[1,16,128]{2,1,0}
     custom-call(q, k, v, used_k, table, scale),
     custom_call_target="__fly$paged_attention_decode"
 }
@@ -195,23 +257,53 @@ ENTRY main {
               IsOkAndHolds(true));
   const auto* reducer = Cast<const HloFusionInstruction>(
       module->entry_computation()->root_instruction());
+  ASSERT_EQ(reducer->operand_count(), 3);
   const auto* producer =
       Cast<const HloFusionInstruction>(reducer->operand(0)->operand(0));
-  HloFusionAnalysis producer_analysis = HloFusionAnalysis::Create(
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
       *producer, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
   std::optional<flydsl::FlyPagedAttentionSegmentedProducerDescriptor>
       descriptor = flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(
-          producer_analysis);
+          analysis);
   ASSERT_TRUE(descriptor.has_value());
+  EXPECT_FALSE(descriptor->fused_reducer);
   EXPECT_EQ(descriptor->num_segments, 114);
-  EXPECT_EQ(descriptor->segment_tokens, 576);
+}
 
-  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
-                       producer->backend_config<GpuBackendConfig>());
-  EXPECT_EQ(gpu_config.fusion_backend_config()
-                .block_level_fusion_config()
-                .num_warps(),
-            2);
+TEST_F(PagedAttentionRewriterFlyTest,
+       FusesHighParallelismReducerAtKv131072) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+HloModule fly_paged_attention_cooperative_decode_131072
+
+ENTRY main {
+  q = bf16[1,16,128]{2,1,0} parameter(0)
+  k = bf16[8192,16,4,128]{3,2,1,0} parameter(1)
+  v = bf16[8192,16,4,128]{3,2,1,0} parameter(2)
+  used_k = s32[1]{0} parameter(3)
+  table = s32[1,8192]{1,0} parameter(4)
+  scale = f32[] constant(0.0883883476)
+  ROOT attention = bf16[1,16,128]{2,1,0}
+    custom-call(q, k, v, used_k, table, scale),
+    custom_call_target="__fly$paged_attention_decode"
+}
+)"));
+
+  EXPECT_THAT(PagedAttentionRewriterFly().Run(module.get()),
+              IsOkAndHolds(true));
+  const HloInstruction* output =
+      module->entry_computation()->root_instruction();
+  ASSERT_EQ(output->opcode(), HloOpcode::kGetTupleElement);
+  const auto* fusion = Cast<const HloFusionInstruction>(output->operand(0));
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *fusion, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<flydsl::FlyPagedAttentionSegmentedProducerDescriptor>
+      descriptor = flydsl::GetFlyPagedAttentionSegmentedProducerDescriptor(
+          analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_TRUE(descriptor->fused_reducer);
+  EXPECT_EQ(descriptor->num_segments, 114);
+  EXPECT_EQ(descriptor->segment_tokens, 1152);
 }
 
 }  // namespace

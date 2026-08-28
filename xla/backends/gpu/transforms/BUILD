@@ -3125,6 +3125,7 @@ cc_library(
     srcs = ["softmax_rewriter_fly.cc"],
     hdrs = ["softmax_rewriter_fly.h"],
     deps = [
+        "//xla/backends/gpu/codegen/flydsl:layer_norm_support",
         "//xla/backends/gpu/codegen/flydsl:softmax_support",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
@@ -3144,6 +3145,7 @@ xla_cc_test(
     srcs = ["softmax_rewriter_fly_test.cc"],
     deps = [
         ":softmax_rewriter_fly",
+        "//xla/backends/gpu/codegen/flydsl:layer_norm_support",
         "//xla/backends/gpu/codegen/flydsl:softmax_support",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",

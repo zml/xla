@@ -15,9 +15,11 @@ limitations under the License.
 
 #include "xla/backends/gpu/transforms/softmax_rewriter_fly.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
 #include "xla/backends/gpu/codegen/flydsl/softmax_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -56,9 +59,14 @@ int64_t DefaultNumWarps(int64_t columns) {
   return 16;
 }
 
-absl::StatusOr<HloFusionInstruction*> MakeFlySoftmaxFusion(
+absl::StatusOr<HloFusionInstruction*> MakeFlyNormalizationFusion(
     HloInstruction* root) {
-  HloComputation::Builder builder("fly_softmax_computation");
+  const bool is_softmax = flydsl::IsFlySoftmaxRoot(*root);
+  std::optional<flydsl::FlyLayerNormDescriptor> layer_norm =
+      is_softmax ? std::nullopt : flydsl::GetFlyLayerNormDescriptor(*root);
+  TF_RET_CHECK(is_softmax || layer_norm.has_value());
+  HloComputation::Builder builder(is_softmax ? "fly_softmax_computation"
+                                             : "fly_layer_norm_computation");
   absl::flat_hash_map<const HloInstruction*, HloInstruction*> old_to_new;
   std::vector<HloInstruction*> parameters;
   int64_t parameter_number = 0;
@@ -98,7 +106,7 @@ absl::StatusOr<HloFusionInstruction*> MakeFlySoftmaxFusion(
       HloInstruction::CreateFusion(root->shape(),
                                    HloInstruction::FusionKind::kCustom,
                                    parameters, fused_computation),
-      /*new_name=*/"fly_softmax");
+      /*new_name=*/is_softmax ? "fly_softmax" : "fly_layer_norm");
   fusion->set_metadata(root->metadata());
 
   ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
@@ -108,14 +116,15 @@ absl::StatusOr<HloFusionInstruction*> MakeFlySoftmaxFusion(
   fusion_config->set_kind(kFlyFusionKind);
   BlockLevelFusionConfig* block_config =
       fusion_config->mutable_block_level_fusion_config();
-  const int64_t rank = root->shape().dimensions_size();
-  const int64_t columns = root->shape().dimensions(rank - 1);
+  const Shape& tiled_shape =
+      is_softmax ? root->shape() : layer_norm->output->shape();
+  const int64_t rank = tiled_shape.dimensions_size();
+  const int64_t columns = tiled_shape.dimensions(rank - 1);
   const int64_t num_warps = DefaultNumWarps(columns);
   Tile* output_tile = block_config->add_output_tiles();
   for (int64_t dimension = 0; dimension < rank - 1; ++dimension) {
-    output_tile->add_sizes(columns <= 256 && dimension == rank - 2
-                               ? num_warps
-                               : 1);
+    output_tile->add_sizes(columns <= 256 && dimension == rank - 2 ? num_warps
+                                                                   : 1);
   }
   output_tile->add_sizes(columns);
   block_config->set_num_warps(num_warps);
@@ -137,25 +146,39 @@ absl::StatusOr<HloFusionInstruction*> MakeFlySoftmaxFusion(
 absl::StatusOr<bool> SoftmaxRewriterFly::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
-  std::vector<HloInstruction*> softmax_roots;
+  std::vector<HloInstruction*> normalization_roots;
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
     if (!computation->caller_instructions(HloOpcode::kCustomCall).empty()) {
       continue;
     }
-    for (HloInstruction* instruction : computation->MakeInstructionPostOrder()) {
+    for (HloInstruction* instruction :
+         computation->MakeInstructionPostOrder()) {
       if (flydsl::IsFlySoftmaxRoot(*instruction)) {
-        softmax_roots.push_back(instruction);
+        normalization_roots.push_back(instruction);
+        continue;
       }
+      std::optional<flydsl::FlyLayerNormDescriptor> layer_norm =
+          flydsl::GetFlyLayerNormDescriptor(*instruction);
+      if (!layer_norm.has_value()) {
+        continue;
+      }
+      if (layer_norm->output_count > 1) {
+        normalization_roots.erase(
+            std::remove(normalization_roots.begin(),
+                        normalization_roots.end(), layer_norm->output),
+            normalization_roots.end());
+      }
+      normalization_roots.push_back(instruction);
     }
   }
 
-  for (HloInstruction* root : softmax_roots) {
+  for (HloInstruction* root : normalization_roots) {
     ASSIGN_OR_RETURN(HloFusionInstruction * fusion,
-                     MakeFlySoftmaxFusion(root));
+                     MakeFlyNormalizationFusion(root));
     (void)fusion;
   }
-  return !softmax_roots.empty();
+  return !normalization_roots.empty();
 }
 
 }  // namespace xla::gpu

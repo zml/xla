@@ -16,11 +16,13 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/xtile_softmax.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest.h>
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
+#include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
@@ -273,6 +275,144 @@ ENTRY entry {
   HloFusionAnalysis analysis = HloFusionAnalysis::Create(
       *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
   EXPECT_TRUE(IsFlySoftmaxFusion(analysis));
+}
+
+TEST_F(FlyXTileSoftmaxTest, RecognizesAffineTrainingBf16LayerNorm) {
+  constexpr char kLayerNormHlo[] = R"(
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+layer_norm {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  input_f32 = f32[256,4096]{1,0} convert(input)
+  zero = f32[] constant(0)
+  sum = f32[256]{0} reduce(input_f32, zero), dimensions={1}, to_apply=add
+  reciprocal = f32[] constant(0.000244140625)
+  reciprocals = f32[256]{0} broadcast(reciprocal), dimensions={}
+  mean = f32[256]{0} multiply(sum, reciprocals)
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(input_f32, means)
+  squared = f32[256,4096]{1,0} multiply(centered, centered)
+  square_sum = f32[256]{0} reduce(squared, zero), dimensions={1}, to_apply=add
+  variance = f32[256]{0} multiply(square_sum, reciprocals)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  reciprocal_stddev_broadcast = f32[256,4096]{1,0}
+      broadcast(reciprocal_stddev), dimensions={0}
+  normalized = f32[256,4096]{1,0}
+      multiply(centered, reciprocal_stddev_broadcast)
+  gamma_f32 = f32[4096]{0} convert(gamma)
+  gamma_broadcast = f32[256,4096]{1,0} broadcast(gamma_f32), dimensions={1}
+  scaled = f32[256,4096]{1,0} multiply(normalized, gamma_broadcast)
+  beta_f32 = f32[4096]{0} convert(beta)
+  beta_broadcast = f32[256,4096]{1,0} broadcast(beta_f32), dimensions={1}
+  shifted = f32[256,4096]{1,0} add(scaled, beta_broadcast)
+  result = bf16[256,4096]{1,0} convert(shifted)
+  ROOT outputs = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0})
+      tuple(result, mean, reciprocal_stddev)
+}
+
+ENTRY entry {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  ROOT fusion = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0})
+      fusion(input, gamma, beta), kind=kInput, calls=layer_norm
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kLayerNormHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<FlyLayerNormDescriptor> descriptor =
+      GetFlyLayerNormDescriptor(analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  ASSERT_NE(descriptor->gamma, nullptr);
+  ASSERT_NE(descriptor->beta, nullptr);
+  EXPECT_EQ(descriptor->gamma->parameter_number(), 1);
+  EXPECT_EQ(descriptor->beta->parameter_number(), 2);
+  EXPECT_EQ(descriptor->output_count, 3);
+}
+
+TEST_F(FlyXTileSoftmaxTest, RecognizesMomentsTrainingBf16LayerNorm) {
+  constexpr char kLayerNormHlo[] = R"(
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+layer_norm {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  input_f32 = f32[256,4096]{1,0} convert(input)
+  input_square = f32[256,4096]{1,0} multiply(input_f32, input_f32)
+  zero = f32[] constant(0)
+  square_sum = f32[256]{0} reduce(input_square, zero), dimensions={1},
+      to_apply=add
+  reciprocal_columns = f32[] constant(0.000244140625)
+  reciprocal_columns_broadcast = f32[256]{0}
+      broadcast(reciprocal_columns), dimensions={}
+  square_mean = f32[256]{0}
+      multiply(square_sum, reciprocal_columns_broadcast)
+  sum = f32[256]{0} reduce(input_f32, zero), dimensions={1}, to_apply=add
+  mean = f32[256]{0} multiply(sum, reciprocal_columns_broadcast)
+  mean_square = f32[256]{0} multiply(mean, mean)
+  variance = f32[256]{0} subtract(square_mean, mean_square)
+  epsilon = f32[] constant(1e-5)
+  epsilons = f32[256]{0} broadcast(epsilon), dimensions={}
+  variance_epsilon = f32[256]{0} add(variance, epsilons)
+  reciprocal_stddev = f32[256]{0} rsqrt(variance_epsilon)
+  reciprocal_stddev_broadcast = f32[256,4096]{1,0}
+      broadcast(reciprocal_stddev), dimensions={0}
+  means = f32[256,4096]{1,0} broadcast(mean), dimensions={0}
+  centered = f32[256,4096]{1,0} subtract(input_f32, means)
+  normalized = f32[256,4096]{1,0}
+      multiply(centered, reciprocal_stddev_broadcast)
+  gamma_f32 = f32[4096]{0} convert(gamma)
+  gamma_broadcast = f32[256,4096]{1,0} broadcast(gamma_f32), dimensions={1}
+  scaled = f32[256,4096]{1,0} multiply(normalized, gamma_broadcast)
+  beta_f32 = f32[4096]{0} convert(beta)
+  beta_broadcast = f32[256,4096]{1,0} broadcast(beta_f32), dimensions={1}
+  shifted = f32[256,4096]{1,0} add(scaled, beta_broadcast)
+  result = bf16[256,4096]{1,0} convert(shifted)
+  reciprocal_stddev_cube = f32[256]{0}
+      divide(reciprocal_stddev, variance_epsilon)
+  ROOT outputs = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0}, f32[256]{0})
+      tuple(result, mean, reciprocal_stddev, reciprocal_stddev_cube)
+}
+
+ENTRY entry {
+  input = bf16[256,4096]{1,0} parameter(0)
+  gamma = bf16[4096]{0} parameter(1)
+  beta = bf16[4096]{0} parameter(2)
+  ROOT fusion = (bf16[256,4096]{1,0}, f32[256]{0}, f32[256]{0}, f32[256]{0})
+      fusion(input, gamma, beta), kind=kInput, calls=layer_norm
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kLayerNormHlo).value();
+  const HloInstruction* fusion =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *fusion, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<FlyLayerNormDescriptor> descriptor =
+      GetFlyLayerNormDescriptor(analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_TRUE(IsFlyLayerNormFusion(analysis));
+  EXPECT_EQ(descriptor->output_count, 4);
+  EXPECT_TRUE(descriptor->uses_moments_variance);
+  EXPECT_NE(descriptor->reciprocal_stddev_cube, nullptr);
 }
 
 }  // namespace

@@ -707,6 +707,142 @@ struct RewriteBufferStore : OpRewritePattern<gpu::BufferStoreOp> {
   }
 };
 
+ml::LLVMFuncOp GetOrCreateCompletionTicketHelper(mlir::ModuleOp module,
+                                                 Location location) {
+  constexpr llvm::StringLiteral kName = "__xla_gpu_completion_ticket";
+  if (auto helper = module.lookupSymbol<ml::LLVMFuncOp>(kName)) return helper;
+
+  mlir::OpBuilder module_builder(module.getBodyRegion());
+  module_builder.setInsertionPointToEnd(module.getBody());
+  Type i32 = module_builder.getI32Type();
+  Type i64 = module_builder.getI64Type();
+  auto ptr = ml::LLVMPointerType::get(module.getContext());
+  auto helper = ml::LLVMFuncOp::create(
+      module_builder, location, kName,
+      ml::LLVMFunctionType::get(i32, llvm::SmallVector<Type>{ptr}));
+  helper.setLinkage(ml::Linkage::Internal);
+  helper.setPassthroughAttr(module_builder.getArrayAttr(
+      {module_builder.getStringAttr("noinline")}));
+
+  mlir::Block* entry = helper.addEntryBlock(module_builder);
+  auto add_block = [&]() {
+    auto* block = new mlir::Block();
+    helper.getBody().push_back(block);
+    return block;
+  };
+  mlir::Block* loop = add_block();
+  loop->addArgument(i32, location);
+  mlir::Block* examine = add_block();
+  examine->addArgument(i32, location);
+  mlir::Block* wait = add_block();
+  mlir::Block* attempt = add_block();
+  attempt->addArgument(i32, location);
+  mlir::Block* won = add_block();
+  mlir::Block* ready = add_block();
+
+  mlir::ImplicitLocOpBuilder b(location, module_builder);
+  auto constant = [&](int32_t value) -> Value {
+    return ml::ConstantOp::create(b, i32, b.getI32IntegerAttr(value));
+  };
+  b.setInsertionPointToStart(entry);
+  Value epoch_ptr = entry->getArgument(0);
+  Value count_ptr = ml::GEPOp::create(
+      b, ptr, i32, epoch_ptr,
+      llvm::SmallVector<mlir::LLVM::GEPArg>{1});
+  Value dispatch_id =
+      ml::CallIntrinsicOp::create(
+          b, i64, b.getStringAttr("llvm.amdgcn.dispatch.id"), ValueRange{})
+          .getResult(0);
+  Value dispatch_id32 = ml::TruncOp::create(b, i32, dispatch_id);
+  Value generation = ml::AddOp::create(
+      b, ml::AndOp::create(b, dispatch_id32, constant(0x3fffffff)),
+      constant(1));
+  Value initializing =
+      ml::OrOp::create(b, generation, constant(-2147483647 - 1));
+  Value observed = ml::LoadOp::create(
+      b, i32, epoch_ptr, /*alignment=*/4, /*isVolatile=*/false,
+      /*isNonTemporal=*/false, /*isInvariant=*/false,
+      /*isInvariantGroup=*/false, ml::AtomicOrdering::acquire,
+      "agent-one-as");
+  ml::BrOp::create(b, ValueRange{observed}, loop);
+
+  b.setInsertionPointToStart(loop);
+  Value loop_observed = loop->getArgument(0);
+  Value stale = ml::ICmpOp::create(
+      b, ml::ICmpPredicate::ne, loop_observed, generation);
+  ml::CondBrOp::create(b, stale, examine, ValueRange{loop_observed}, ready,
+                       ValueRange{});
+
+  b.setInsertionPointToStart(examine);
+  Value examined = examine->getArgument(0);
+  Value locked =
+      ml::ICmpOp::create(b, ml::ICmpPredicate::eq, examined, initializing);
+  ml::CondBrOp::create(b, locked, wait, attempt, ValueRange{examined});
+
+  b.setInsertionPointToStart(wait);
+  Value refreshed = ml::LoadOp::create(
+      b, i32, epoch_ptr, /*alignment=*/4, /*isVolatile=*/false,
+      /*isNonTemporal=*/false, /*isInvariant=*/false,
+      /*isInvariantGroup=*/false, ml::AtomicOrdering::acquire,
+      "agent-one-as");
+  ml::BrOp::create(b, ValueRange{refreshed}, loop);
+
+  b.setInsertionPointToStart(attempt);
+  Value expected = attempt->getArgument(0);
+  Value pair = ml::AtomicCmpXchgOp::create(
+      b, epoch_ptr, expected, initializing, ml::AtomicOrdering::acq_rel,
+      ml::AtomicOrdering::acquire, "agent-one-as");
+  Value exchanged = ml::ExtractValueOp::create(b, pair, 0);
+  Value success = ml::ExtractValueOp::create(b, pair, 1);
+  ml::CondBrOp::create(b, success, won, loop, ValueRange{exchanged});
+
+  b.setInsertionPointToStart(won);
+  (void)ml::AtomicRMWOp::create(b, ml::AtomicBinOp::xchg, count_ptr,
+                                constant(0), ml::AtomicOrdering::acq_rel,
+                                "agent-one-as");
+  (void)ml::AtomicRMWOp::create(b, ml::AtomicBinOp::xchg, epoch_ptr,
+                                generation, ml::AtomicOrdering::acq_rel,
+                                "agent-one-as");
+  ml::BrOp::create(b, ready);
+
+  b.setInsertionPointToStart(ready);
+  Value previous = ml::AtomicRMWOp::create(
+      b, ml::AtomicBinOp::add, count_ptr, constant(1),
+      ml::AtomicOrdering::acq_rel, "agent-one-as");
+  ml::ReturnOp::create(b, previous);
+  return helper;
+}
+
+struct RewriteBufferCompletionTicket
+    : OpRewritePattern<gpu::BufferCompletionTicketOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      gpu::BufferCompletionTicketOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    Value tickets = GetDestinationBuffer(op.getTickets());
+    if (!tickets) return failure();
+    auto tensor_tickets =
+        mlir::cast<TypedValue<mlir::RankedTensorType>>(tickets);
+    if (!tensor_tickets.getType().getElementType().isInteger(32)) {
+      return rewriter.notifyMatchFailure(
+          op, "completion tickets must use a 32-bit integer tensor");
+    }
+
+    Value ticket_linear_index =
+        GetLinearIndex(mlir::ValueRange{op.getTicketIndex()}, b);
+    Value ticket_ptr = CreateGep(tensor_tickets, ticket_linear_index, b);
+    mlir::ModuleOp module = op->getParentOfType<mlir::ModuleOp>();
+    ml::LLVMFuncOp helper =
+        GetOrCreateCompletionTicketHelper(module, op.getLoc());
+    Value previous =
+        ml::CallOp::create(b, helper, ValueRange{ticket_ptr}).getResult();
+    rewriter.replaceOp(op, previous);
+    return success();
+  }
+};
+
 struct RewriteAccumulatorStore
     : OpRewritePattern<gpu::AccumulatorStoreOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -1890,7 +2026,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
     tensor_patterns.add<
         RewriteAccumulatorStore, RewriteAllocateShared,
         RewriteAsyncCopyGlobalToShared,
-        RewriteBufferLoad, RewriteBufferStore, RewriteGetDynamicDimSize,
+        RewriteBufferCompletionTicket, RewriteBufferLoad, RewriteBufferStore,
+        RewriteGetDynamicDimSize,
         RewriteNonScalarConstants, RewriteSplitBufferLoad,
         RewriteScalarBufferLoad, RewriteTileBufferLoad, RewriteTileBufferStore,
         RewriteSyncThreads, RewriteTensorExtract,

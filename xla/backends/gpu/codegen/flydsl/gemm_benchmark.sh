@@ -27,6 +27,9 @@ for mode in FLY_GEMM_BENCHMARK_SCALED FLY_GEMM_BENCHMARK_SCALED_FP8 \
             FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K \
             FLY_GEMM_BENCHMARK_INT8 \
             FLY_GEMM_BENCHMARK_INT4 \
+            FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_BATCHED \
+            FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_MULTI_BATCH \
+            FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED \
             FLY_GEMM_BENCHMARK_SCALAR FLY_GEMM_BENCHMARK_VECTOR \
             FLY_GEMM_BENCHMARK_CHAIN FLY_GEMM_BENCHMARK_CONVERTED_INPUTS \
             FLY_GEMM_BENCHMARK_BITCAST_INPUTS \
@@ -86,6 +89,15 @@ elif [[ "${FLY_GEMM_BENCHMARK_INT8:-0}" == "1" ]]; then
 elif [[ "${FLY_GEMM_BENCHMARK_INT4:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/int4_gemm_benchmark.hlo.tpl"
   benchmark_name="s4_dequantized_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_BATCHED:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/s4_channel_scaled_batched_gemm_benchmark.hlo.tpl"
+  benchmark_name="s4_channel_scaled_batched_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_MULTI_BATCH:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/s4_channel_scaled_multi_batch_gemm_benchmark.hlo.tpl"
+  benchmark_name="s4_channel_scaled_multi_batch_gemm"
+elif [[ "${FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED:-0}" == "1" ]]; then
+  template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/s4_subchannel_scaled_batched_gemm_benchmark.hlo.tpl"
+  benchmark_name="s4_subchannel_scaled_batched_gemm"
 elif [[ "${FLY_GEMM_BENCHMARK_SCALAR:-0}" == "1" ]]; then
   template="${runfiles_root}/${workspace_name}/xla/backends/gpu/codegen/flydsl/scalar_gemm_benchmark.hlo.tpl"
   benchmark_name="f32_dot_scalar_epilogue"
@@ -151,14 +163,22 @@ if [[ "${rhs_layout}" != "1,0" && "${rhs_layout}" != "0,1" ]]; then
 fi
 
 if [[ "$#" -eq 0 ]]; then
-  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
+  if [[ "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_MULTI_BATCH:-0}" == "1" ]]; then
+    set -- 32x2x256x256x64 16x4x256x512x64 8x8x512x512x128
+  elif [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
     if [[ "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
       set -- 2x256x1024x512 4x256x1024x1024
+    elif [[ "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_BATCHED:-0}" == "1" ]]; then
+      set -- 32x128x256x64 16x256x512x64 8x512x1024x128
+    elif [[ "${FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED:-0}" == "1" ]]; then
+      set -- 2x32x2x2048 8x64x64x2048 8x128x256x4096
     else
       set -- 8x256x256x256 8x512x512x512 8x1024x1024x1024
     fi
@@ -169,11 +189,18 @@ fi
 
 for shape in "$@"; do
   batch=1
-  if [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
+  batch0=1
+  batch1=1
+  if [[ "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_MULTI_BATCH:-0}" == "1" ]]; then
+    IFS=x read -r batch0 batch1 m n k extra <<<"${shape}"
+    expected_shape="B0xB1xMxNxK"
+  elif [[ "${FLY_GEMM_BENCHMARK_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_F16_BATCHED_EPILOGUE:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_FP8:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_BATCHED_SCALED_FP8:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_S4_CHANNEL_SCALED_BATCHED:-0}" == "1" ||
+        "${FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED:-0}" == "1" ||
         "${FLY_GEMM_BENCHMARK_GLOBAL_SPLIT_K:-0}" == "1" ]]; then
     IFS=x read -r batch m n k extra <<<"${shape}"
     expected_shape="BxMxNxK"
@@ -181,8 +208,10 @@ for shape in "$@"; do
     IFS=x read -r m n k extra <<<"${shape}"
     expected_shape="MxNxK"
   fi
-  if [[ -n "${extra:-}" || -z "${batch}" || -z "${m}" || -z "${n}" ||
-        -z "${k}" || ! "${batch}" =~ ^[0-9]+$ ||
+  if [[ -n "${extra:-}" || -z "${batch}" || -z "${batch0}" ||
+        -z "${batch1}" || -z "${m}" || -z "${n}" || -z "${k}" ||
+        ! "${batch}" =~ ^[0-9]+$ || ! "${batch0}" =~ ^[0-9]+$ ||
+        ! "${batch1}" =~ ^[0-9]+$ ||
         ! "${m}" =~ ^[0-9]+$ || ! "${n}" =~ ^[0-9]+$ ||
         ! "${k}" =~ ^[0-9]+$ ]]; then
     echo "Invalid shape '${shape}'; expected ${expected_shape}." >&2
@@ -191,6 +220,11 @@ for shape in "$@"; do
   if [[ "${FLY_GEMM_BENCHMARK_BLOCK_SCALED_FP8:-0}" == "1" ]] &&
       ((k % 32 != 0)); then
     echo "Block-scaled FP8 benchmark requires K divisible by 32; got '${shape}'." >&2
+    exit 1
+  fi
+  if [[ "${FLY_GEMM_BENCHMARK_S4_SUBCHANNEL_SCALED_BATCHED:-0}" == "1" ]] &&
+      ((k % 256 != 0)); then
+    echo "Subchannel-scaled S4 benchmark requires K divisible by 256; got '${shape}'." >&2
     exit 1
   fi
 
@@ -207,6 +241,7 @@ for shape in "$@"; do
   half_m=$((m / 2))
   half_n=$((n / 2))
   scale_k=$((k / 32))
+  subchannel_groups=$((k / 256))
   if [[ "${rhs_layout}" == "1,0" ]]; then
     batch_rhs_layout="2,1,0"
   else
@@ -217,9 +252,11 @@ for shape in "$@"; do
     echo "Concat-input benchmark requires even M and N; got '${shape}'." >&2
     exit 1
   fi
-  sed -e "s/__B__/${batch}/g" -e "s/__M__/${m}/g" \
+  sed -e "s/__B__/${batch}/g" -e "s/__B0__/${batch0}/g" \
+    -e "s/__B1__/${batch1}/g" -e "s/__M__/${m}/g" \
     -e "s/__N__/${n}/g" -e "s/__K__/${k}/g" \
     -e "s/__KB__/${scale_k}/g" \
+    -e "s/__KG__/${subchannel_groups}/g" \
     -e "s/__MH__/${half_m}/g" -e "s/__NH__/${half_n}/g" \
     -e "s/__MP__/${padded_m}/g" -e "s/__NP__/${padded_n}/g" \
     -e "s/__KP__/${padded_k}/g" -e "s/__MEND__/${end_m}/g" \

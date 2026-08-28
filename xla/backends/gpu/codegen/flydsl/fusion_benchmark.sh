@@ -32,6 +32,8 @@ declare -A hlo_files=(
   [contiguous_slice]="fly_fusion_bf16_contiguous_slice_benchmark.hlo"
   [rectangular_slice]="fly_fusion_bf16_rectangular_slice_benchmark.hlo"
   [rank4_rectangular_slice]="fly_fusion_bf16_rank4_rectangular_slice_benchmark.hlo"
+  [major_strided_slice]="fly_fusion_bf16_major_strided_slice_benchmark.hlo"
+  [minor_strided_slice]="fly_fusion_bf16_minor_strided_slice_benchmark.hlo"
   [dynamic_slice]="fly_fusion_bf16_dynamic_slice_benchmark.hlo"
   [rank4_dynamic_slice]="fly_fusion_bf16_rank4_dynamic_slice_benchmark.hlo"
   [dynamic_slice_native]="fly_fusion_bf16_dynamic_slice_native_benchmark.hlo"
@@ -40,6 +42,9 @@ declare -A hlo_files=(
   [partial_row_gather]="fly_fusion_bf16_partial_row_gather_benchmark.hlo"
   [strided_axis_gather]="fly_fusion_bf16_strided_axis_gather_benchmark.hlo"
   [overwrite_row_scatter]="fly_fusion_bf16_overwrite_row_scatter_benchmark.hlo"
+  [partial_contiguous_overwrite_scatter]="fly_fusion_bf16_partial_contiguous_overwrite_scatter_benchmark.hlo"
+  [offset_contiguous_overwrite_scatter]="fly_fusion_bf16_offset_contiguous_overwrite_scatter_benchmark.hlo"
+  [rectangular_overwrite_scatter]="fly_fusion_bf16_rectangular_overwrite_scatter_benchmark.hlo"
   [non_unique_overwrite_scatter]="fly_fusion_bf16_non_unique_overwrite_scatter_benchmark.hlo"
   [non_unique_additive_scatter]="fly_fusion_bf16_non_unique_additive_scatter_benchmark.hlo"
   [scalar_additive_scatter]="fly_fusion_bf16_scalar_additive_scatter_benchmark.hlo"
@@ -82,6 +87,7 @@ declare -A hlo_files=(
   [f32_negative_squared_sum_reduce_512]="fly_fusion_f32_negative_squared_sum_row_reduction_512_benchmark.hlo"
   [f32_multiple_reductions]="fly_fusion_f32_multiple_row_reductions_benchmark.hlo"
   [f32_multiple_reductions_extra_output]="fly_fusion_f32_multiple_row_reductions_extra_output_benchmark.hlo"
+  [f32_multiple_reductions_dependent_output]="fly_fusion_f32_multiple_reductions_dependent_output_benchmark.hlo"
   [f32_sum_reduce_512]="fly_fusion_f32_sum_row_reduction_512_benchmark.hlo"
   [f32_squared_max_reduce_512]="fly_fusion_f32_squared_max_row_reduction_512_benchmark.hlo"
   [f16_direct_reduce]="fly_fusion_f16_direct_row_reduction_benchmark.hlo"
@@ -116,6 +122,9 @@ declare -A hlo_files=(
   [transpose_1024]="fly_fusion_bf16_transpose_1024_benchmark.hlo"
   [transpose_4096]="fly_fusion_bf16_transpose_4096_benchmark.hlo"
   [transpose_4096x16384]="fly_fusion_bf16_transpose_4096x16384_benchmark.hlo"
+  [transpose_partial]="fly_fusion_bf16_transpose_partial_benchmark.hlo"
+  [transpose_f32_rank3_rotating]="fly_fusion_f32_rank3_rotating_transpose_benchmark.hlo"
+  [transpose_f32_rank3_outer]="fly_fusion_f32_rank3_outer_transpose_benchmark.hlo"
   [transpose_transformer_qkv]="fly_fusion_bf16_transformer_qkv_transpose_benchmark.hlo"
   [transpose_transformer_qkv_multi_output]="fly_fusion_bf16_transformer_qkv_multi_output_transpose_benchmark.hlo"
   [transpose_transformer_context]="fly_fusion_bf16_transformer_context_transpose_benchmark.hlo"
@@ -141,7 +150,7 @@ for benchmark in "$@"; do
   hlo_name="${hlo_files[${benchmark}]:-}"
   if [[ -z "${hlo_name}" ]]; then
     echo "Unknown benchmark '${benchmark}'." >&2
-    echo "Available benchmarks: concatenate concatenate_native middle_concatenate contiguous_slice rectangular_slice rank4_rectangular_slice dynamic_slice rank4_dynamic_slice dynamic_slice_native row_gather gather_nd partial_row_gather strided_axis_gather overwrite_row_scatter non_unique_overwrite_scatter non_unique_additive_scatter scalar_additive_scatter s32_maximum_scatter multi_component_overwrite_scatter dynamic_update_slice dynamic_update_slice_native rank4_dynamic_update_slice rank4_dynamic_update_slice_native flat_edge_pad flat_edge_pad_native rectangular_edge_pad rectangular_edge_pad_native interior_pad interior_pad_native rank4_interior_pad rank4_interior_pad_native reduce_window reduce_window_native reduce_window_15 reduce_window_15_native scan flat_reverse flat_reverse_native partial_reverse partial_reverse_native rank4_partial_reverse rank4_partial_reverse_native trailing_broadcast arbitrary_broadcast softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f32_reduce_extra_output f32_dependent_rowwise_output f32_normalized_rowwise_512 f32_negative_squared_sum_reduce_512 f32_multiple_reductions f32_multiple_reductions_extra_output f32_sum_reduce_512 f32_squared_max_reduce_512 f16_direct_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce f32_leading_reduce elementwise elementwise_f16 elementwise_f32 elementwise_pred elementwise_s32 fp8_to_f32 f32_to_fp8 s4_to_bf16 s4_rectangular_slice s8_to_s4 iota physical_view type_bitcast bitcast_convert erf_gelu ragged_elementwise multi_output_elementwise multi_output_physical_view mixed_type_multi_output sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
+    echo "Available benchmarks: concatenate concatenate_native middle_concatenate contiguous_slice rectangular_slice rank4_rectangular_slice major_strided_slice minor_strided_slice dynamic_slice rank4_dynamic_slice dynamic_slice_native row_gather gather_nd partial_row_gather strided_axis_gather overwrite_row_scatter partial_contiguous_overwrite_scatter offset_contiguous_overwrite_scatter rectangular_overwrite_scatter non_unique_overwrite_scatter non_unique_additive_scatter scalar_additive_scatter s32_maximum_scatter multi_component_overwrite_scatter dynamic_update_slice dynamic_update_slice_native rank4_dynamic_update_slice rank4_dynamic_update_slice_native flat_edge_pad flat_edge_pad_native rectangular_edge_pad rectangular_edge_pad_native interior_pad interior_pad_native rank4_interior_pad rank4_interior_pad_native reduce_window reduce_window_native reduce_window_15 reduce_window_15_native scan flat_reverse flat_reverse_native partial_reverse partial_reverse_native rank4_partial_reverse rank4_partial_reverse_native trailing_broadcast arbitrary_broadcast softmax softmax_transformer softmax_bf16_tail softmax_f16_tail softmax_f32_tail bf16_reduce f32_reduce_extra_output f32_dependent_rowwise_output f32_normalized_rowwise_512 f32_negative_squared_sum_reduce_512 f32_multiple_reductions f32_multiple_reductions_extra_output f32_multiple_reductions_dependent_output f32_sum_reduce_512 f32_squared_max_reduce_512 f16_direct_reduce bf16_narrowing_reduce bf16_ragged_narrowing_reduce bf16_squared_difference_reduce rms_norm_1024 residual_rms_norm_1024 f32_reduce f32_leading_reduce elementwise elementwise_f16 elementwise_f32 elementwise_pred elementwise_s32 fp8_to_f32 f32_to_fp8 s4_to_bf16 s4_rectangular_slice s8_to_s4 iota physical_view type_bitcast bitcast_convert erf_gelu ragged_elementwise multi_output_elementwise multi_output_physical_view mixed_type_multi_output sigmoid transpose transpose_1024 transpose_4096 transpose_4096x16384 transpose_partial transpose_f32_rank3_rotating transpose_f32_rank3_outer transpose_transformer_qkv transpose_transformer_qkv_multi_output transpose_transformer_context" >&2
     exit 1
   fi
   hlo="${benchmark_root}/${hlo_name}"
@@ -157,7 +166,7 @@ for benchmark in "$@"; do
   # here so multi-output benchmarks have a real Triton candidate to compare
   # against. Fly formation itself does not depend on this flag.
   XLA_FLAGS="${XLA_FLAGS:-} \
---xla_gpu_autotune_level=3 \
+--xla_gpu_autotune_level=${FLY_FUSION_AUTOTUNE_LEVEL:-4} \
 --xla_gpu_autotune_num_repetitions=${FLY_FUSION_BENCHMARK_REPETITIONS:-5} \
 --xla_gpu_enable_flydsl_fusion=true \
 --xla_gpu_fusion_autotune_top_k_configs=${FLY_FUSION_AUTOTUNE_TOP_K:-8} \
@@ -166,7 +175,8 @@ for benchmark in "$@"; do
 --xla_gpu_experimental_autotune_backends=${backends} \
 --xla_gpu_dump_autotune_logs_to=${log}" \
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
-    "${autotuner}" --hlo_files="${hlo}" >"${selected}"
+    "${autotuner}" --retune_preexisting_block_level_configs \
+    --hlo_files="${hlo}" >"${selected}"
 
   echo "${benchmark}:"
   grep -m2 -E '  Backend:|  Config:' "${selected}" | sed 's/^/  selected /'

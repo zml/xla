@@ -58,9 +58,9 @@ ENTRY entry {
 )"));
 }
 
-TEST_F(FlyXTileTransposeTest, RejectsNonBf16Transpose) {
-  EXPECT_FALSE(IsSupported(R"(
-HloModule transpose
+TEST_F(FlyXTileTransposeTest, RecognizesF16F32AndRank3Transpose) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule f32_transpose
 
 transpose {
   p0 = f32[128,192]{1,0} parameter(0)
@@ -73,10 +73,41 @@ ENTRY entry {
     calls=transpose
 }
 )"));
+
+  EXPECT_TRUE(IsSupported(R"(
+HloModule f16_transpose
+
+transpose {
+  p0 = f16[128,192]{1,0} parameter(0)
+  ROOT result = f16[192,128]{1,0} transpose(p0), dimensions={1,0}
 }
 
-TEST_F(FlyXTileTransposeTest, RejectsPartialTiles) {
-  EXPECT_FALSE(IsSupported(R"(
+ENTRY entry {
+  p0 = f16[128,192]{1,0} parameter(0)
+  ROOT fusion = f16[192,128]{1,0} fusion(p0), kind=kInput,
+    calls=transpose
+}
+)"));
+
+  EXPECT_TRUE(IsSupported(R"(
+HloModule f32_rank3_rotating_transpose
+
+transpose {
+  p0 = f32[64,128,32]{2,1,0} parameter(0)
+  ROOT result = f32[32,64,128]{2,1,0} transpose(p0),
+    dimensions={2,0,1}
+}
+
+ENTRY entry {
+  p0 = f32[64,128,32]{2,1,0} parameter(0)
+  ROOT fusion = f32[32,64,128]{2,1,0} fusion(p0), kind=kInput,
+    calls=transpose
+}
+)"));
+}
+
+TEST_F(FlyXTileTransposeTest, RecognizesPartialTiles) {
+  EXPECT_TRUE(IsSupported(R"(
 HloModule transpose
 
 transpose {

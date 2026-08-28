@@ -18,17 +18,21 @@ limitations under the License.
 
 #include <memory>
 
+#include "xla/backends/gpu/codegen/collective_epilogue.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
 namespace xla::gpu::flydsl {
 
-// Creates a native Fly/FlyROCDL one-shot or two-shot all-reduce emitter. The
-// emitted ABI is consumed by CollectiveKernelThunk and includes XLA-managed
-// input/output pointers followed by rank, invocation count, signal-pointer
-// table, and symmetric scratch-pointer table.
+// Creates a native Fly/FlyROCDL collective emitter. It implements striped
+// one-shot all-gather and one-shot or two-shot all-reduce. The emitted ABI is
+// consumed by CollectiveKernelThunk and includes XLA-managed input/output
+// pointers, any all-reduce epilogue input pointers, rank, invocation count,
+// signal-pointer table, and symmetric scratch-pointer table.
 std::unique_ptr<MlirKernelEmitter> CreateFlyXTileCollectiveEmitter(
-    const HloFusionAnalysis& analysis);
+    const HloFusionAnalysis& analysis,
+    CollectiveEpilogue producer = {},
+    CollectiveEpilogue epilogue = {});
 
 }  // namespace xla::gpu::flydsl
 

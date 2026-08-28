@@ -31,6 +31,8 @@ inline constexpr char kFlyPagedAttentionSegmentedProducerCallTarget[] =
     "__fly$paged_attention_decode_segmented_producer";
 inline constexpr char kFlyPagedAttentionSegmentedReducerCallTarget[] =
     "__fly$paged_attention_decode_segmented_reducer";
+inline constexpr char kFlyPagedAttentionSegmentedFusedCallTarget[] =
+    "__fly$paged_attention_decode_segmented_fused";
 
 // Static properties of the first native unified-attention specialization.
 // The public custom-call operands are Q, K cache, V cache, used-K lengths,
@@ -65,6 +67,11 @@ struct FlyPagedAttentionSegmentedProducerDescriptor {
   FlyPagedAttentionDescriptor attention;
   int64_t num_segments;
   int64_t segment_tokens;
+  // The fused form returns final output, partial output/max/sum, and a compact
+  // two-word U32 generation/count completion-ticket buffer. Its last producer
+  // workgroup performs the online reduction, avoiding a second kernel launch
+  // and a separate ticket-clear dispatch.
+  bool fused_reducer;
 };
 
 struct FlyPagedAttentionSegmentedReducerDescriptor {
