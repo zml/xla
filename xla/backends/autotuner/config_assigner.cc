@@ -360,11 +360,11 @@ tsl::Future<ConfigAssigner::Config> ConfigAssigner::GetConfig(
   // Look up (or create) an in-flight entry for this fingerprint. The first
   // thread to see CREATED becomes the leader, performs the tuning work, and
   // signals all waiters through the condition variable.
-  const tsl::Fprint128 fingerprint = GetFingerprint(instr);
+  const tsl::Fprint128 key = GetFingerprint(instr);
   std::shared_ptr<InFlightEntry> entry;
   {
     absl::MutexLock lock(&in_flight_tuning_->mu);
-    auto [it, inserted] = in_flight_tuning_->entries.try_emplace(fingerprint);
+    auto [it, inserted] = in_flight_tuning_->entries.try_emplace(key);
     if (inserted) {
       it->second = std::make_shared<InFlightEntry>();
     }
@@ -385,14 +385,21 @@ tsl::Future<ConfigAssigner::Config> ConfigAssigner::GetConfig(
         auto [promise, future] = tsl::MakePromise<Config>();
         std::move(autotuner_->GetTunedConfig(instr))
             .OnReady(
-                [this, instr, entry, promise = std::move(promise)](
+                [this, instr, entry, key, promise = std::move(promise)](
                     absl::StatusOr<ConfigAssigner::Config> config_or) mutable {
                   auto finish = [&](absl::StatusOr<ConfigAssigner::Config>
                                         result) mutable {
-                    absl::MutexLock lock(&entry->mu);
-                    entry->state = result.ok() ? InFlightEntry::State::FINISHED
-                                               : InFlightEntry::State::ERROR;
-                    entry->cond_var.SignalAll();
+                    {
+                      absl::MutexLock lock(&entry->mu);
+                      entry->state = result.ok()
+                                         ? InFlightEntry::State::FINISHED
+                                         : InFlightEntry::State::ERROR;
+                      entry->cond_var.SignalAll();
+                    }
+                    {
+                      absl::MutexLock lock(&in_flight_tuning_->mu);
+                      in_flight_tuning_->entries.erase(key);
+                    }
                     promise.Set(std::move(result));
                   };
 
