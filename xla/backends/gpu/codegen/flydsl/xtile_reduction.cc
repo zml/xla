@@ -81,6 +81,13 @@ struct RowReductionSpec {
   int64_t integer_init_value;
 };
 
+struct RowReductionFusionSpec {
+  std::vector<RowReductionSpec> reductions;
+  std::vector<int64_t> reduction_root_indices;
+  std::vector<int64_t> dependent_rowwise_root_indices;
+  std::vector<const HloInstruction*> roots;
+};
+
 int64_t ElementBits(PrimitiveType type) {
   switch (type) {
     case PRED:
@@ -870,12 +877,163 @@ std::optional<RowReductionSpec> MatchRowReduction(const HloInstruction& root) {
                           integer_init_value};
 }
 
+std::optional<RowReductionFusionSpec> MatchRowReductionFusion(
+    const HloFusionAnalysis& analysis) {
+  if (analysis.fusion_root_count() == 0) {
+    return std::nullopt;
+  }
+
+  std::vector<const HloInstruction*> roots;
+  roots.reserve(analysis.fusion_root_count());
+  for (int64_t root_index = 0; root_index < analysis.fusion_root_count();
+       ++root_index) {
+    roots.push_back(&analysis.fusion_root(root_index).instruction());
+  }
+
+  if (roots.size() == 1) {
+    std::optional<RowReductionSpec> reduction = MatchRowReduction(*roots[0]);
+    if (!reduction.has_value()) {
+      return std::nullopt;
+    }
+    std::vector<RowReductionSpec> reductions;
+    reductions.push_back(std::move(*reduction));
+    return RowReductionFusionSpec{std::move(reductions),
+                                  /*reduction_root_indices=*/{0},
+                                  /*dependent_rowwise_root_indices=*/{},
+                                  std::move(roots)};
+  }
+
+  // A reduction plus an input-shaped side result shares one efficient launch
+  // domain: every Wave64 owns a row, stores its ordinary vector result while
+  // loading that row, and then writes the scalar reduction. This is the native
+  // Fly counterpart of Triton's reduce-with-extra-output fusion. Independent
+  // same-domain reductions use the same row launch and cached input graph,
+  // while carrying one register accumulator per reduction.
+  std::vector<RowReductionSpec> reductions;
+  std::vector<int64_t> reduction_root_indices;
+  for (int64_t root_index = 0; root_index < roots.size(); ++root_index) {
+    std::optional<RowReductionSpec> candidate =
+        MatchRowReduction(*roots[root_index]);
+    if (!candidate.has_value() || candidate->has_rowwise_output) {
+      continue;
+    }
+    reductions.push_back(std::move(*candidate));
+    reduction_root_indices.push_back(root_index);
+  }
+  if (reductions.empty()) {
+    return std::nullopt;
+  }
+
+  if (reductions.size() > 1) {
+    // Multiple same-domain reductions share the input load/cache path while
+    // carrying independent register accumulators. Input-shaped side roots can
+    // use that same cache and store as the row is consumed.
+    const int64_t rows = reductions.front().rows;
+    const int64_t columns = reductions.front().columns;
+    for (const RowReductionSpec& reduction : reductions) {
+      if (reduction.output_type != F32 || reduction.reduction_type != F32 ||
+          reduction.has_rowwise_output || reduction.rows != rows ||
+          reduction.columns != columns ||
+          reduction.init_parameter_number.has_value() ||
+          !HasSamePhysicalDimensions(
+              reduction.reduction->operand(0)->shape(),
+              reductions.front().reduction->operand(0)->shape())) {
+        return std::nullopt;
+      }
+    }
+  } else if (reductions.front().reduction_type != F32) {
+    return std::nullopt;
+  }
+
+  RowReductionSpec* primary = &reductions.front();
+  const Shape& input_shape = primary->reduction->operand(0)->shape();
+  std::vector<int64_t> dependent_rowwise_root_indices;
+  std::vector<std::pair<int64_t, PrimitiveType>> input_parameters =
+      primary->input_parameters;
+  int64_t max_vector_element_bits = primary->max_vector_element_bits;
+  if (reductions.size() > 1) {
+    for (const RowReductionSpec& reduction : reductions) {
+      input_parameters.insert(input_parameters.end(),
+                              reduction.input_parameters.begin(),
+                              reduction.input_parameters.end());
+      max_vector_element_bits = std::max(
+          max_vector_element_bits, reduction.max_vector_element_bits);
+    }
+  }
+  for (int64_t root_index = 0; root_index < roots.size(); ++root_index) {
+    if (std::find(reduction_root_indices.begin(),
+                  reduction_root_indices.end(),
+                  root_index) != reduction_root_indices.end()) {
+      continue;
+    }
+    const HloInstruction* root = roots[root_index];
+    std::optional<RowReductionSpec> rowwise = MatchRowReduction(*root);
+    if (reductions.size() == 1 && rowwise.has_value() &&
+        rowwise->has_rowwise_output &&
+        rowwise->reduction == primary->reduction &&
+        ShapeUtil::ByteSizeOfElements(root->shape()) <=
+            std::numeric_limits<uint32_t>::max()) {
+      dependent_rowwise_root_indices.push_back(root_index);
+      input_parameters.insert(input_parameters.end(),
+                              rowwise->input_parameters.begin(),
+                              rowwise->input_parameters.end());
+      max_vector_element_bits = std::max(
+          max_vector_element_bits, rowwise->max_vector_element_bits);
+      continue;
+    }
+    const int64_t output_bits = ElementBits(root->shape().element_type());
+    if (output_bits == 0 ||
+        !HasSamePhysicalDimensions(root->shape(), input_shape) ||
+        ShapeUtil::ByteSizeOfElements(root->shape()) >
+            std::numeric_limits<uint32_t>::max()) {
+      return std::nullopt;
+    }
+    for (const RowReductionSpec& reduction : reductions) {
+      if (DependsOnInstruction(root, reduction.reduction)) {
+        return std::nullopt;
+      }
+    }
+    llvm::DenseSet<const HloInstruction*> visited;
+    if (!IsSupportedReductionInputGraph(root, input_shape, visited,
+                                        input_parameters)) {
+      return std::nullopt;
+    }
+    max_vector_element_bits = std::max(max_vector_element_bits, output_bits);
+  }
+
+  std::sort(input_parameters.begin(), input_parameters.end());
+  input_parameters.erase(
+      std::unique(input_parameters.begin(), input_parameters.end()),
+      input_parameters.end());
+  for (auto [parameter_number, input_type] : input_parameters) {
+    if (parameter_number < 0 ||
+        parameter_number >= roots[0]->parent()->num_parameters()) {
+      return std::nullopt;
+    }
+    const HloInstruction* parameter =
+        roots[0]->parent()->parameter_instruction(parameter_number);
+    if (parameter == nullptr ||
+        parameter->shape().element_type() != input_type) {
+      return std::nullopt;
+    }
+    max_vector_element_bits =
+        std::max(max_vector_element_bits, ElementBits(input_type));
+  }
+  primary->input_parameters = std::move(input_parameters);
+  primary->max_vector_element_bits = max_vector_element_bits;
+  return RowReductionFusionSpec{std::move(reductions),
+                                std::move(reduction_root_indices),
+                                std::move(dependent_rowwise_root_indices),
+                                std::move(roots)};
+}
+
 class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
  public:
   explicit FlyXTileRowReductionEmitter(const HloFusionAnalysis& analysis) {
-    std::optional<RowReductionSpec> spec =
-        MatchRowReduction(analysis.fusion_root(0).instruction());
-    CHECK(spec.has_value());
+    std::optional<RowReductionFusionSpec> fusion_spec =
+        MatchRowReductionFusion(analysis);
+    CHECK(fusion_spec.has_value());
+    RowReductionSpec* spec = &fusion_spec->reductions.front();
     rows_ = spec->rows;
     columns_ = spec->columns;
     output_type_ = spec->output_type;
@@ -886,16 +1044,33 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
     init_parameter_number_ = spec->init_parameter_number;
     init_value_ = spec->init_value;
     integer_init_value_ = spec->integer_init_value;
+    input_parameters_ = spec->input_parameters;
+    reduction_root_indices_ = fusion_spec->reduction_root_indices;
+    dependent_rowwise_root_indices_ =
+        fusion_spec->dependent_rowwise_root_indices;
+    reduction_root_index_ = reduction_root_indices_.front();
+    output_count_ = fusion_spec->roots.size();
+    output_types_.reserve(output_count_);
+    output_elements_.reserve(output_count_);
+    for (const HloInstruction* root : fusion_spec->roots) {
+      output_types_.push_back(root->shape().element_type());
+      output_elements_.push_back(ShapeUtil::ElementsIn(root->shape()));
+    }
 
     const BlockLevelFusionConfig& config =
         analysis.fusion_backend_config().block_level_fusion_config();
     num_warps_ = config.num_warps();
     CHECK_GT(num_warps_, 0);
     CHECK_LE(num_warps_, 16);
-    CHECK_EQ(config.output_tiles_size(), 1);
-    CHECK_GT(config.output_tiles(0).sizes_size(), 0);
+    CHECK(config.output_tiles_size() == 1 ||
+          config.output_tiles_size() == output_count_);
+    const int64_t reduction_tile_index =
+        config.output_tiles_size() == output_count_ ? reduction_root_index_ : 0;
+    CHECK_GT(config.output_tiles(reduction_tile_index).sizes_size(), 0);
     output_partitions_ =
-        has_rowwise_output_ ? config.output_tiles(0).sizes(0) : 1;
+        has_rowwise_output_
+            ? config.output_tiles(reduction_tile_index).sizes(0)
+            : 1;
     CHECK_GT(output_partitions_, 0);
     CHECK_LE(output_partitions_, 16);
     vector_size_bits_ =
@@ -957,16 +1132,17 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         mlir::fly::AddressSpaceAttr::get(&context,
                                          mlir::fly::AddressSpace::Global);
     llvm::SmallVector<mlir::Type> argument_types;
-    argument_types.reserve(fusion.operand_count() + 1);
+    argument_types.reserve(fusion.operand_count() + output_count_);
     for (const HloInstruction* operand : fusion.operands()) {
       mlir::Type element_type =
           StorageElementType(operand->shape().element_type(), module_builder);
       argument_types.push_back(
           mlir::fly::PointerType::get(element_type, global_address));
     }
-    mlir::Type output_type = StorageElementType(output_type_, module_builder);
-    argument_types.push_back(
-        mlir::fly::PointerType::get(output_type, global_address));
+    for (PrimitiveType output_type : output_types_) {
+      argument_types.push_back(mlir::fly::PointerType::get(
+          StorageElementType(output_type, module_builder), global_address));
+    }
     mlir::FunctionType function_type = mlir::FunctionType::get(
         &context, argument_types, /*results=*/mlir::TypeRange{});
     mlir::gpu::GPUFuncOp kernel = mlir::gpu::GPUFuncOp::create(
@@ -1889,8 +2065,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         if (is_vector &&
             !HasSamePhysicalDimensions(instruction->operand(0)->shape(),
                                        input_shape) &&
-            !HasCompatibleColumnShape(input_shape,
-                                      instruction->operand(0)->shape())) {
+            !IsColumnBroadcast(*instruction, input_shape)) {
           auto vector_type =
               mlir::VectorType::get({vector_width}, builder.getF32Type());
           result =
@@ -2030,9 +2205,11 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
 
   OutputState CreateOutputState(mlir::ImplicitLocOpBuilder& builder,
                                 mlir::gpu::GPUFuncOp kernel,
+                                int64_t output_index,
+                                PrimitiveType output_type,
                                 int64_t vector_width, int64_t elements) const {
     mlir::MLIRContext* context = builder.getContext();
-    mlir::Type element_type = StorageElementType(output_type_, builder);
+    mlir::Type element_type = StorageElementType(output_type, builder);
     auto vector_type = mlir::VectorType::get({vector_width}, element_type);
     auto shape_attr =
         mlir::fly::IntTupleAttr::getLeafStatic(context, vector_width);
@@ -2047,7 +2224,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
     Value layout =
         mlir::fly::MakeLayoutOp::create(builder, layout_type, shape, stride);
 
-    const int64_t output_bits = ElementBits(output_type_);
+    const int64_t output_bits = ElementBits(output_type);
     const int64_t copy_bits = vector_width * output_bits;
     auto copy_atom_type = mlir::fly::CopyAtomType::get(
         mlir::fly_rocdl::CopyOpCDNA3BufferCopyType::get(context, copy_bits,
@@ -2055,8 +2232,11 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         output_bits);
     Value copy_atom =
         mlir::fly::MakeCopyAtomOp::create(builder, copy_atom_type, output_bits);
-    Value pointer = MakeDescriptorPointer(builder, kernel.getArguments().back(),
-                                          output_type_, elements);
+    Value pointer = MakeDescriptorPointer(
+        builder,
+        kernel.getArgument(kernel.getNumArguments() - output_count_ +
+                           output_index),
+        output_type, elements);
     auto pointer_type = mlir::cast<mlir::fly::PointerType>(pointer.getType());
     auto memref_type = mlir::fly::MemRefType::get(
         element_type, pointer_type.getAddressSpace(), layout_type.getAttr());
@@ -2082,11 +2262,360 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
         builder, mlir::TypeRange{}, state.copy_atom, output, view, predicate);
   }
 
+  bool IsDependentRowwiseRoot(int64_t root_index) const {
+    return std::find(dependent_rowwise_root_indices_.begin(),
+                     dependent_rowwise_root_indices_.end(),
+                     root_index) != dependent_rowwise_root_indices_.end();
+  }
+
+  double F32NeutralValue(HloOpcode opcode) const {
+    switch (opcode) {
+      case HloOpcode::kAdd:
+        return 0.0;
+      case HloOpcode::kMultiply:
+        return 1.0;
+      case HloOpcode::kMaximum:
+        return -std::numeric_limits<double>::infinity();
+      case HloOpcode::kMinimum:
+        return std::numeric_limits<double>::infinity();
+      default:
+        LOG(FATAL) << "Unexpected Fly multi-reduction opcode.";
+    }
+  }
+
+  bool HasNeutralF32Init(const RowReductionSpec& spec) const {
+    switch (spec.reducer_opcode) {
+      case HloOpcode::kAdd:
+        return spec.init_value == 0.0 && !std::signbit(spec.init_value);
+      case HloOpcode::kMultiply:
+        return spec.init_value == 1.0;
+      case HloOpcode::kMaximum:
+        return spec.init_value ==
+               -std::numeric_limits<double>::infinity();
+      case HloOpcode::kMinimum:
+        return spec.init_value == std::numeric_limits<double>::infinity();
+      default:
+        LOG(FATAL) << "Unexpected Fly multi-reduction opcode.";
+    }
+  }
+
+  mlir::vector::CombiningKind F32CombiningKind(HloOpcode opcode) const {
+    switch (opcode) {
+      case HloOpcode::kAdd:
+        return mlir::vector::CombiningKind::ADD;
+      case HloOpcode::kMultiply:
+        return mlir::vector::CombiningKind::MUL;
+      case HloOpcode::kMaximum:
+        return mlir::vector::CombiningKind::MAXIMUMF;
+      case HloOpcode::kMinimum:
+        return mlir::vector::CombiningKind::MINIMUMF;
+      default:
+        LOG(FATAL) << "Unexpected Fly multi-reduction opcode.";
+    }
+  }
+
+  Value ReduceF32AcrossWave(mlir::ImplicitLocOpBuilder& builder, Value local,
+                            HloOpcode opcode) const {
+    Value poison = mlir::ub::PoisonOp::create(builder, local.getType());
+    for (int32_t distance : {8, 4, 2, 1}) {
+      Value shuffled = mlir::amdgpu::DPPOp::create(
+          builder, local.getType(), /*old=*/poison, /*src=*/local,
+          mlir::amdgpu::DPPPerm::row_shr,
+          builder.getI32IntegerAttr(distance), /*row_mask=*/0xF,
+          /*bank_mask=*/0xF, /*bound_ctrl=*/true);
+      local = EmitF32Binary(builder, opcode, local, shuffled);
+    }
+    Value adjacent_row = mlir::amdgpu::DPPOp::create(
+        builder, local.getType(), /*old=*/local, /*src=*/local,
+        mlir::amdgpu::DPPPerm::row_bcast_15,
+        /*permArgument=*/nullptr, /*row_mask=*/0xA, /*bank_mask=*/0xF,
+        /*bound_ctrl=*/true);
+    local = EmitF32Binary(builder, opcode, local, adjacent_row);
+    Value lower_half = mlir::amdgpu::DPPOp::create(
+        builder, local.getType(), /*old=*/poison, /*src=*/local,
+        mlir::amdgpu::DPPPerm::row_bcast_31,
+        /*permArgument=*/nullptr, /*row_mask=*/0xF, /*bank_mask=*/0xF,
+        /*bound_ctrl=*/true);
+    local = EmitF32Binary(builder, opcode, local, lower_half);
+    return mlir::gpu::ShuffleOp::create(builder, local, /*offset=*/63,
+                                        /*width=*/64,
+                                        mlir::gpu::ShuffleMode::IDX)
+        .getShuffleResult();
+  }
+
+  absl::Status EmitMultiReductionKernel(
+      mlir::gpu::GPUFuncOp kernel, const HloFusionInstruction& fusion,
+      const std::vector<const HloInstruction*>& roots) const {
+    TF_RET_CHECK(reduction_root_indices_.size() > 1 &&
+                 reduction_root_indices_.size() <= output_count_ &&
+                 output_partitions_ == 1);
+    llvm::DenseSet<int64_t> reduction_roots(reduction_root_indices_.begin(),
+                                            reduction_root_indices_.end());
+    std::vector<RowReductionSpec> specs;
+    specs.reserve(reduction_root_indices_.size());
+    for (int64_t root_index : reduction_root_indices_) {
+      TF_RET_CHECK(root_index >= 0 && root_index < roots.size());
+      std::optional<RowReductionSpec> spec =
+          MatchRowReduction(*roots[root_index]);
+      TF_RET_CHECK(spec.has_value() && spec->reduction_type == F32 &&
+                   spec->output_type == F32 && !spec->has_rowwise_output &&
+                   !spec->init_parameter_number.has_value() &&
+                   spec->rows == rows_ && spec->columns == columns_);
+      specs.push_back(std::move(*spec));
+    }
+
+    mlir::ImplicitLocOpBuilder builder(kernel.getLoc(), kernel);
+    builder.setInsertionPointToStart(&kernel.getBody().front());
+    Value thread_id =
+        mlir::gpu::ThreadIdOp::create(builder, mlir::gpu::Dimension::x);
+    Value block_id =
+        mlir::gpu::BlockIdOp::create(builder, mlir::gpu::Dimension::x);
+    Value thread = mlir::arith::IndexCastOp::create(
+        builder, builder.getI64Type(), thread_id);
+    Value block = mlir::arith::IndexCastOp::create(
+        builder, builder.getI64Type(), block_id);
+    Value lane =
+        mlir::arith::RemUIOp::create(builder, thread, I64(builder, 64));
+    Value wave =
+        mlir::arith::DivUIOp::create(builder, thread, I64(builder, 64));
+    Value row = mlir::arith::AddIOp::create(
+        builder,
+        mlir::arith::MulIOp::create(builder, block, I64(builder, num_warps_)),
+        wave);
+    Value row_valid = mlir::arith::CmpIOp::create(
+        builder, mlir::arith::CmpIPredicate::ult, row, I64(builder, rows_));
+
+    std::vector<std::optional<InputState>> input_states(fusion.operand_count());
+    std::vector<std::optional<InputState>> scalar_input_states(
+        fusion.operand_count());
+    const int64_t tail_elements = columns_ % vector_width_;
+    std::vector<std::optional<InputState>> tail_input_states(
+        tail_elements == 0 ? 0 : fusion.operand_count());
+    for (auto [parameter_number, input_type] : input_parameters_) {
+      TF_RET_CHECK(parameter_number >= 0 &&
+                   parameter_number < fusion.operand_count());
+      const int64_t input_elements =
+          ShapeUtil::ElementsIn(fusion.operand(parameter_number)->shape());
+      input_states[parameter_number] =
+          CreateInputState(builder, kernel, parameter_number, input_type,
+                           input_elements, vector_width_);
+      scalar_input_states[parameter_number] =
+          CreateInputState(builder, kernel, parameter_number, input_type,
+                           input_elements, /*vector_width=*/1);
+      if (tail_elements != 0) {
+        tail_input_states[parameter_number] =
+            CreateInputState(builder, kernel, parameter_number, input_type,
+                             input_elements, /*vector_width=*/1);
+      }
+    }
+
+    std::vector<std::optional<OutputState>> side_output_states(output_count_);
+    for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+      if (reduction_roots.contains(root_index)) {
+        continue;
+      }
+      side_output_states[root_index] = CreateOutputState(
+          builder, kernel, root_index, output_types_[root_index], vector_width_,
+          output_elements_[root_index]);
+    }
+
+    auto vector_type =
+        mlir::VectorType::get({vector_width_}, builder.getF32Type());
+    std::vector<Value> neutral_scalars;
+    std::vector<Value> neutral_vectors;
+    std::vector<Value> local_vectors;
+    neutral_scalars.reserve(specs.size());
+    neutral_vectors.reserve(specs.size());
+    local_vectors.reserve(specs.size());
+    for (const RowReductionSpec& spec : specs) {
+      const float neutral = static_cast<float>(F32NeutralValue(
+          spec.reducer_opcode));
+      Value neutral_scalar = mlir::arith::ConstantFloatOp::create(
+          builder, builder.getF32Type(), llvm::APFloat(neutral));
+      Value neutral_vector = mlir::arith::ConstantOp::create(
+          builder, vector_type,
+          mlir::DenseElementsAttr::get(
+              vector_type, builder.getF32FloatAttr(neutral)));
+      neutral_scalars.push_back(neutral_scalar);
+      neutral_vectors.push_back(neutral_vector);
+      local_vectors.push_back(neutral_vector);
+    }
+
+    Value row_base =
+        mlir::arith::MulIOp::create(builder, row, I64(builder, columns_));
+    Value lane_base = mlir::arith::MulIOp::create(
+        builder, lane, I64(builder, vector_width_));
+    Value base = mlir::arith::AddIOp::create(builder, row_base, lane_base);
+    const int64_t elements_per_wave = 64 * vector_width_;
+    const int64_t full_columns = columns_ - tail_elements;
+    const int64_t vectors_per_lane =
+        (full_columns + elements_per_wave - 1) / elements_per_wave;
+    for (int64_t tile = 0; tile < vectors_per_lane; ++tile) {
+      Value offset = base;
+      Value column_offset = lane_base;
+      if (tile != 0) {
+        offset = mlir::arith::AddIOp::create(
+            builder, base, I64(builder, tile * elements_per_wave));
+        column_offset = mlir::arith::AddIOp::create(
+            builder, lane_base, I64(builder, tile * elements_per_wave));
+      }
+      Value vector_valid = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, column_offset,
+          I64(builder, full_columns));
+      Value load_valid =
+          mlir::arith::AndIOp::create(builder, row_valid, vector_valid);
+      llvm::DenseMap<const HloInstruction*, Value> input_cache;
+      for (int64_t reduction_index = 0; reduction_index < specs.size();
+           ++reduction_index) {
+        const RowReductionSpec& spec = specs[reduction_index];
+        TF_ASSIGN_OR_RETURN(
+            Value values,
+            EmitReductionInputGraph(
+                builder, spec.reduction->operand(0), offset, load_valid,
+                input_states, scalar_input_states, vector_width_, input_cache));
+        values = mlir::arith::SelectOp::create(
+            builder, load_valid, values, neutral_vectors[reduction_index]);
+        local_vectors[reduction_index] = EmitF32Binary(
+            builder, spec.reducer_opcode, local_vectors[reduction_index],
+            values);
+      }
+      for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+        if (reduction_roots.contains(root_index)) {
+          continue;
+        }
+        TF_ASSIGN_OR_RETURN(
+            Value side_output,
+            EmitReductionInputGraph(builder, roots[root_index], offset,
+                                    load_valid, input_states,
+                                    scalar_input_states, vector_width_,
+                                    input_cache));
+        EmitOutputStore(builder, *side_output_states[root_index], offset,
+                        load_valid, side_output);
+      }
+    }
+
+    std::vector<Value> locals;
+    locals.reserve(specs.size());
+    for (int64_t reduction_index = 0; reduction_index < specs.size();
+         ++reduction_index) {
+      locals.push_back(mlir::vector::ReductionOp::create(
+          builder, F32CombiningKind(specs[reduction_index].reducer_opcode),
+          local_vectors[reduction_index], neutral_scalars[reduction_index],
+          mlir::arith::FastMathFlags::reassoc));
+    }
+
+    if (tail_elements != 0) {
+      Value tail_lane_valid = mlir::arith::CmpIOp::create(
+          builder, mlir::arith::CmpIPredicate::ult, lane,
+          I64(builder, tail_elements));
+      Value tail_valid =
+          mlir::arith::AndIOp::create(builder, row_valid, tail_lane_valid);
+      Value tail_offset = mlir::arith::AddIOp::create(
+          builder, row_base,
+          mlir::arith::AddIOp::create(builder, I64(builder, full_columns),
+                                      lane));
+      llvm::DenseMap<const HloInstruction*, Value> tail_cache;
+      for (int64_t reduction_index = 0; reduction_index < specs.size();
+           ++reduction_index) {
+        const RowReductionSpec& spec = specs[reduction_index];
+        TF_ASSIGN_OR_RETURN(
+            Value values,
+            EmitReductionInputGraph(
+                builder, spec.reduction->operand(0), tail_offset, tail_valid,
+                tail_input_states, scalar_input_states, /*vector_width=*/1,
+                tail_cache));
+        auto scalar_vector_type =
+            mlir::VectorType::get({1}, builder.getF32Type());
+        Value neutral_vector = mlir::arith::ConstantOp::create(
+            builder, scalar_vector_type,
+            mlir::DenseElementsAttr::get(
+                scalar_vector_type,
+                builder.getF32FloatAttr(static_cast<float>(
+                    F32NeutralValue(spec.reducer_opcode)))));
+        values = mlir::arith::SelectOp::create(builder, tail_valid, values,
+                                               neutral_vector);
+        Value tail_local = mlir::vector::ReductionOp::create(
+            builder, F32CombiningKind(spec.reducer_opcode), values,
+            neutral_scalars[reduction_index],
+            mlir::arith::FastMathFlags::reassoc);
+        locals[reduction_index] = EmitF32Binary(
+            builder, spec.reducer_opcode, locals[reduction_index], tail_local);
+      }
+      for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+        if (reduction_roots.contains(root_index)) {
+          continue;
+        }
+        TF_ASSIGN_OR_RETURN(
+            Value side_output,
+            EmitReductionInputGraph(builder, roots[root_index], tail_offset,
+                                    tail_valid, tail_input_states,
+                                    scalar_input_states, /*vector_width=*/1,
+                                    tail_cache));
+        OutputState tail_output_state = CreateOutputState(
+            builder, kernel, root_index, output_types_[root_index],
+            /*vector_width=*/1, output_elements_[root_index]);
+        EmitOutputStore(builder, tail_output_state, tail_offset, tail_valid,
+                        side_output);
+      }
+    }
+
+    Value lane_zero = mlir::arith::CmpIOp::create(
+        builder, mlir::arith::CmpIPredicate::eq, lane, I64(builder, 0));
+    Value store =
+        mlir::arith::AndIOp::create(builder, row_valid, lane_zero);
+    for (int64_t reduction_index = 0; reduction_index < specs.size();
+         ++reduction_index) {
+      const RowReductionSpec& spec = specs[reduction_index];
+      Value local = ReduceF32AcrossWave(builder, locals[reduction_index],
+                                        spec.reducer_opcode);
+      if (!HasNeutralF32Init(spec)) {
+        local = EmitF32Binary(
+            builder, spec.reducer_opcode, local,
+            mlir::arith::ConstantFloatOp::create(
+                builder, builder.getF32Type(),
+                llvm::APFloat(static_cast<float>(spec.init_value))));
+      }
+      llvm::DenseMap<const HloInstruction*, Value> output_cache;
+      TF_ASSIGN_OR_RETURN(
+          Value output,
+          EmitReductionOutputGraph(builder, spec.root, spec.reduction, local,
+                                   row, row_valid, scalar_input_states,
+                                   output_cache));
+      const int64_t root_index = reduction_root_indices_[reduction_index];
+      OutputState output_state = CreateOutputState(
+          builder, kernel, root_index, output_types_[root_index],
+          /*vector_width=*/1, rows_);
+      Value output_vector = mlir::vector::FromElementsOp::create(
+          builder, output_state.vector_type, mlir::ValueRange{output});
+      EmitOutputStore(builder, output_state, row, store, output_vector);
+    }
+
+    mlir::gpu::ReturnOp::create(builder);
+    return absl::OkStatus();
+  }
+
   absl::Status EmitKernel(mlir::gpu::GPUFuncOp kernel,
                           const HloFusionInstruction& fusion) const {
-    TF_RET_CHECK(kernel.getNumArguments() == fusion.operand_count() + 1);
+    TF_RET_CHECK(kernel.getNumArguments() ==
+                 fusion.operand_count() + output_count_);
+    std::vector<const HloInstruction*> roots;
+    roots.reserve(output_count_);
+    const HloInstruction* expression_root = fusion.fused_expression_root();
+    if (output_count_ == 1) {
+      roots.push_back(expression_root);
+    } else {
+      TF_RET_CHECK(expression_root->opcode() == HloOpcode::kTuple &&
+                   expression_root->operand_count() == output_count_);
+      roots.assign(expression_root->operands().begin(),
+                   expression_root->operands().end());
+    }
+    TF_RET_CHECK(reduction_root_index_ >= 0 &&
+                 reduction_root_index_ < roots.size());
+    if (reduction_root_indices_.size() > 1) {
+      return EmitMultiReductionKernel(kernel, fusion, roots);
+    }
     std::optional<RowReductionSpec> spec =
-        MatchRowReduction(*fusion.fused_expression_root());
+        MatchRowReduction(*roots[reduction_root_index_]);
     TF_RET_CHECK(spec.has_value());
 
     mlir::ImplicitLocOpBuilder builder(kernel.getLoc(), kernel);
@@ -2127,7 +2656,7 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
     const int64_t tail_elements = columns_ % vector_width_;
     std::vector<std::optional<InputState>> tail_input_states(
         tail_elements == 0 ? 0 : fusion.operand_count());
-    for (auto [parameter_number, input_type] : spec->input_parameters) {
+    for (auto [parameter_number, input_type] : input_parameters_) {
       TF_RET_CHECK(parameter_number >= 0 &&
                    parameter_number < fusion.operand_count());
       const int64_t input_elements =
@@ -2145,6 +2674,17 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
             CreateInputState(builder, kernel, parameter_number, input_type,
                              input_elements, /*vector_width=*/1);
       }
+    }
+
+    std::vector<std::optional<OutputState>> extra_output_states(output_count_);
+    for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+      if (root_index == reduction_root_index_ ||
+          IsDependentRowwiseRoot(root_index)) {
+        continue;
+      }
+      extra_output_states[root_index] = CreateOutputState(
+          builder, kernel, root_index, output_types_[root_index], vector_width_,
+          output_elements_[root_index]);
     }
 
     Value neutral = UsesIntegerCompute()
@@ -2193,6 +2733,20 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           EmitReductionInputGraph(builder, spec->reduction->operand(0), offset,
                                   load_valid, input_states, output_input_states,
                                   vector_width_, input_cache));
+      for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+        if (root_index == reduction_root_index_ ||
+            IsDependentRowwiseRoot(root_index)) {
+          continue;
+        }
+        TF_ASSIGN_OR_RETURN(
+            Value extra_output,
+            EmitReductionInputGraph(builder, roots[root_index], offset,
+                                    load_valid, input_states,
+                                    output_input_states, vector_width_,
+                                    input_cache));
+        EmitOutputStore(builder, *extra_output_states[root_index], offset,
+                        load_valid, extra_output);
+      }
       values = mlir::arith::SelectOp::create(builder, load_valid, values,
                                              neutral_vector);
       // Keep one independent accumulator chain per vector lane and perform a
@@ -2222,6 +2776,23 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                                   tail_offset, tail_valid, tail_input_states,
                                   output_input_states, /*vector_width=*/1,
                                   tail_input_cache));
+      for (int64_t root_index = 0; root_index < output_count_; ++root_index) {
+        if (root_index == reduction_root_index_ ||
+            IsDependentRowwiseRoot(root_index)) {
+          continue;
+        }
+        TF_ASSIGN_OR_RETURN(
+            Value extra_output,
+            EmitReductionInputGraph(builder, roots[root_index], tail_offset,
+                                    tail_valid, tail_input_states,
+                                    output_input_states, /*vector_width=*/1,
+                                    tail_input_cache));
+        OutputState tail_output_state = CreateOutputState(
+            builder, kernel, root_index, output_types_[root_index],
+            /*vector_width=*/1, output_elements_[root_index]);
+        EmitOutputStore(builder, tail_output_state, tail_offset, tail_valid,
+                        extra_output);
+      }
       auto scalar_vector_type =
           mlir::VectorType::get({1}, compute_element_type);
       Value scalar_neutral = mlir::arith::ConstantOp::create(
@@ -2297,14 +2868,18 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                           ? IntegerComputeConstant(builder, integer_init_value_)
                           : ComputeConstant(builder, init_value_));
     }
+    std::vector<int64_t> rowwise_root_indices =
+        dependent_rowwise_root_indices_;
     if (!has_rowwise_output_) {
       llvm::DenseMap<const HloInstruction*, Value> output_cache;
       TF_ASSIGN_OR_RETURN(
-          local, EmitReductionOutputGraph(builder, spec->root, spec->reduction,
-                                          local, row, row_valid,
-                                          output_input_states, output_cache));
+          Value scalar_output,
+          EmitReductionOutputGraph(builder, spec->root, spec->reduction, local,
+                                   row, row_valid, output_input_states,
+                                   output_cache));
       OutputState output_state =
-          CreateOutputState(builder, kernel, /*vector_width=*/1, rows_);
+          CreateOutputState(builder, kernel, reduction_root_index_,
+                            output_type_, /*vector_width=*/1, rows_);
       Value lane_zero = mlir::arith::CmpIOp::create(
           builder, mlir::arith::CmpIPredicate::eq, lane, I64(builder, 0));
       Value store = mlir::arith::AndIOp::create(builder, row_valid, lane_zero);
@@ -2312,18 +2887,33 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           output_type_ == PRED ? mlir::VectorType::get({1}, builder.getI1Type())
                                : output_state.vector_type;
       Value output_value = mlir::vector::FromElementsOp::create(
-          builder, logical_output_type, mlir::ValueRange{local});
+          builder, logical_output_type, mlir::ValueRange{scalar_output});
       if (output_type_ == PRED) {
         output_value = mlir::arith::ExtUIOp::create(
             builder, output_state.vector_type, output_value);
       }
       EmitOutputStore(builder, output_state, row, store, output_value);
     } else {
-      const Shape& input_shape = spec->reduction->operand(0)->shape();
-      const Shape& row_shape = spec->reduction->shape();
+      rowwise_root_indices.insert(rowwise_root_indices.begin(),
+                                  reduction_root_index_);
+    }
+
+    for (int64_t rowwise_root_index : rowwise_root_indices) {
+      TF_RET_CHECK(rowwise_root_index >= 0 &&
+                   rowwise_root_index < roots.size());
+      std::optional<RowReductionSpec> rowwise_spec =
+          MatchRowReduction(*roots[rowwise_root_index]);
+      TF_RET_CHECK(rowwise_spec.has_value() &&
+                   rowwise_spec->has_rowwise_output &&
+                   rowwise_spec->reduction == spec->reduction);
+      const Shape& input_shape =
+          rowwise_spec->reduction->operand(0)->shape();
+      const Shape& row_shape = rowwise_spec->reduction->shape();
       llvm::DenseMap<const HloInstruction*, Value> row_output_cache;
-      OutputState output_state =
-          CreateOutputState(builder, kernel, vector_width_, rows_ * columns_);
+      OutputState output_state = CreateOutputState(
+          builder, kernel, rowwise_root_index,
+          output_types_[rowwise_root_index], vector_width_,
+          output_elements_[rowwise_root_index]);
       if (output_partitions_ == 1) {
         for (int64_t tile = 0; tile < vectors_per_lane; ++tile) {
           Value offset = base;
@@ -2344,9 +2934,10 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           TF_ASSIGN_OR_RETURN(
               Value output,
               EmitRowwiseOutputGraph(
-                  builder, spec->root, spec->reduction, input_shape, row_shape,
-                  local, offset, store, input_states, output_input_states,
-                  vector_width_, vector_output_cache, row_output_cache));
+                  builder, rowwise_spec->root, rowwise_spec->reduction,
+                  input_shape, row_shape, local, offset, store, input_states,
+                  output_input_states, vector_width_, vector_output_cache,
+                  row_output_cache));
           EmitOutputStore(builder, output_state, offset, store, output);
         }
       } else {
@@ -2372,9 +2963,10 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
           TF_ASSIGN_OR_RETURN(
               Value output,
               EmitRowwiseOutputGraph(
-                  builder, spec->root, spec->reduction, input_shape, row_shape,
-                  local, offset, row_valid, input_states, output_input_states,
-                  vector_width_, vector_output_cache, row_output_cache));
+                  builder, rowwise_spec->root, rowwise_spec->reduction,
+                  input_shape, row_shape, local, offset, row_valid,
+                  input_states, output_input_states, vector_width_,
+                  vector_output_cache, row_output_cache));
           EmitOutputStore(builder, output_state, offset, row_valid, output);
         }
       }
@@ -2390,13 +2982,15 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
                                         lane));
         TF_ASSIGN_OR_RETURN(
             Value output,
-            EmitRowwiseOutputGraph(builder, spec->root, spec->reduction,
-                                   input_shape, row_shape, local, tail_offset,
-                                   store, tail_input_states,
-                                   output_input_states, /*vector_width=*/1,
-                                   tail_input_cache, row_output_cache));
+            EmitRowwiseOutputGraph(
+                builder, rowwise_spec->root, rowwise_spec->reduction,
+                input_shape, row_shape, local, tail_offset, store,
+                tail_input_states, output_input_states, /*vector_width=*/1,
+                tail_input_cache, row_output_cache));
         OutputState tail_output_state = CreateOutputState(
-            builder, kernel, /*vector_width=*/1, rows_ * columns_);
+            builder, kernel, rowwise_root_index,
+            output_types_[rowwise_root_index], /*vector_width=*/1,
+            output_elements_[rowwise_root_index]);
         EmitOutputStore(builder, tail_output_state, tail_offset, store, output);
       }
     }
@@ -2415,6 +3009,13 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
   std::optional<int64_t> init_parameter_number_;
   double init_value_ = 0.0;
   int64_t integer_init_value_ = 0;
+  std::vector<std::pair<int64_t, PrimitiveType>> input_parameters_;
+  std::vector<int64_t> reduction_root_indices_;
+  std::vector<int64_t> dependent_rowwise_root_indices_;
+  int64_t reduction_root_index_ = 0;
+  int64_t output_count_ = 1;
+  std::vector<PrimitiveType> output_types_;
+  std::vector<int64_t> output_elements_;
   int64_t num_warps_ = 0;
   int64_t output_partitions_ = 1;
   int64_t vector_size_bits_ = 0;
@@ -2425,24 +3026,27 @@ class FlyXTileRowReductionEmitter final : public MlirKernelEmitter {
 }  // namespace
 
 bool IsFlyXTileRowReductionFusion(const HloFusionAnalysis& analysis) {
-  return analysis.fusion_root_count() == 1 &&
-         MatchRowReduction(analysis.fusion_root(0).instruction()).has_value();
+  return MatchRowReductionFusion(analysis).has_value();
 }
 
 bool IsFlyXTileRowReductionConfigSupported(const HloFusionAnalysis& analysis,
                                            int64_t vector_size_bits,
                                            int64_t output_partitions) {
-  if (analysis.fusion_root_count() != 1) {
+  std::optional<RowReductionFusionSpec> fusion_spec =
+      MatchRowReductionFusion(analysis);
+  if (!fusion_spec.has_value()) {
     return false;
   }
-  std::optional<RowReductionSpec> spec =
-      MatchRowReduction(analysis.fusion_root(0).instruction());
-  if (!spec.has_value() || output_partitions <= 0 || output_partitions > 16 ||
+  const RowReductionSpec* spec = &fusion_spec->reductions.front();
+  if (output_partitions <= 0 || output_partitions > 16 ||
       (vector_size_bits != 16 && vector_size_bits != 32 &&
        vector_size_bits != 64 && vector_size_bits != 128) ||
       vector_size_bits < spec->max_vector_element_bits ||
       vector_size_bits > 128 ||
       vector_size_bits % spec->max_vector_element_bits != 0) {
+    return false;
+  }
+  if (fusion_spec->roots.size() > 1 && output_partitions != 1) {
     return false;
   }
   if (output_partitions == 1) {

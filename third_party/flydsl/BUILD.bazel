@@ -1,7 +1,9 @@
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "atomic_exchange.patch",
     "flydsl.BUILD.bazel",
     "mlir_property_ref.patch",
+    "vector_atomic.patch",
     "xf32_mfma.patch",
 ])

@@ -8,7 +8,9 @@ def repo():
         name = "flydsl",
         build_file = "//third_party/flydsl:flydsl.BUILD.bazel",
         patch_file = [
+            "//third_party/flydsl:atomic_exchange.patch",
             "//third_party/flydsl:mlir_property_ref.patch",
+            "//third_party/flydsl:vector_atomic.patch",
             "//third_party/flydsl:xf32_mfma.patch",
         ],
         sha256 = "bb124ad3819dfcd5b7739108d12025d00dbbd14e9f70a9cb33a5405cec5f6d27",

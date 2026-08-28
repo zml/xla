@@ -519,8 +519,8 @@ ENTRY entry {
 )"));
 }
 
-TEST_F(FlyXTileElementwiseTest, RejectsMismatchedMultiOutputShapes) {
-  EXPECT_FALSE(IsSupported(R"(
+TEST_F(FlyXTileElementwiseTest, RecognizesMultiOutputPhysicalViews) {
+  EXPECT_TRUE(IsSupported(R"(
 HloModule mismatched_multi_output_elementwise
 
 elementwise {
@@ -533,6 +533,32 @@ elementwise {
 ENTRY entry {
   p0 = f32[128,64]{1,0} parameter(0)
   ROOT fusion = (f32[128,64]{1,0}, f32[8192]{0}) fusion(p0),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesMixedTypeMultiOutputDag) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule mixed_type_multi_output_elementwise
+
+elementwise {
+  p0 = f32[128,64]{1,0} parameter(0)
+  negated = f32[128,64]{1,0} negate(p0)
+  narrowed = bf16[128,64]{1,0} convert(negated)
+  ROOT tuple = (f32[128,64]{1,0}, bf16[128,64]{1,0})
+    tuple(negated, narrowed)
+}
+
+ENTRY entry {
+  p0 = f32[128,64]{1,0} parameter(0)
+  ROOT fusion = (f32[128,64]{1,0}, bf16[128,64]{1,0}) fusion(p0),
     kind=kCustom, calls=elementwise,
     backend_config={"fusion_backend_config":{
       "kind":"__fly",
@@ -1600,6 +1626,368 @@ ENTRY entry {
       "kind":"__fly",
       "block_level_fusion_config":{
         "output_tiles":[{"sizes":["4"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesRowGather) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule row_gather
+
+elementwise {
+  values = bf16[127,259]{1,0} parameter(0)
+  indices = s32[191]{0} parameter(1)
+  gathered = bf16[191,259]{1,0} gather(values, indices),
+    offset_dims={1}, collapsed_slice_dims={0}, start_index_map={0},
+    index_vector_dim=1, slice_sizes={1,259}
+  ROOT result = bf16[191,259]{1,0} negate(gathered)
+}
+
+ENTRY entry {
+  values = bf16[127,259]{1,0} parameter(0)
+  indices = s32[191]{0} parameter(1)
+  ROOT fusion = bf16[191,259]{1,0} fusion(values, indices), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesPartialRowGather) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule partial_row_gather
+
+elementwise {
+  values = bf16[127,521]{1,0} parameter(0)
+  indices = s32[191]{0} parameter(1)
+  gathered = bf16[191,259]{1,0} gather(values, indices),
+    offset_dims={1}, collapsed_slice_dims={0}, start_index_map={0},
+    index_vector_dim=1, slice_sizes={1,259}
+  ROOT result = bf16[191,259]{1,0} negate(gathered)
+}
+
+ENTRY entry {
+  values = bf16[127,521]{1,0} parameter(0)
+  indices = s32[191]{0} parameter(1)
+  ROOT fusion = bf16[191,259]{1,0} fusion(values, indices), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesStridedAxisGather) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule strided_axis_gather
+
+elementwise {
+  values = bf16[7,11,259]{2,1,0} parameter(0)
+  indices = s32[13]{0} parameter(1)
+  gathered = bf16[7,13,259]{2,1,0} gather(values, indices),
+    offset_dims={0,2}, collapsed_slice_dims={1}, start_index_map={1},
+    index_vector_dim=1, slice_sizes={7,1,259}
+  ROOT result = bf16[7,13,259]{2,1,0} negate(gathered)
+}
+
+ENTRY entry {
+  values = bf16[7,11,259]{2,1,0} parameter(0)
+  indices = s32[13]{0} parameter(1)
+  ROOT fusion = bf16[7,13,259]{2,1,0} fusion(values, indices), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesOverwriteRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = bf16[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY entry {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest,
+       RecognizesMultiComponentOverwriteRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule multi_component_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[7,11,67]{2,1,0} parameter(0)
+  indices = s32[13,2]{1,0} parameter(1)
+  updates = bf16[13,1,1,67]{3,2,1,0} parameter(2)
+  ROOT scatter = bf16[7,11,67]{2,1,0} scatter(base, indices, updates),
+    update_window_dims={1,2,3}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=true, to_apply=assign
+}
+
+ENTRY entry {
+  base = bf16[7,11,67]{2,1,0} parameter(0)
+  indices = s32[13,2]{1,0} parameter(1)
+  updates = bf16[13,1,1,67]{3,2,1,0} parameter(2)
+  ROOT fusion = bf16[7,11,67]{2,1,0}
+    fusion(base, indices, updates), kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesNonUniqueOverwriteRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule non_unique_overwrite_row_scatter
+
+assign {
+  old = bf16[] parameter(0)
+  ROOT update = bf16[] parameter(1)
+}
+
+elementwise {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = bf16[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=assign
+}
+
+ENTRY entry {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesAdditiveRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule additive_row_scatter
+
+add {
+  old = bf16[] parameter(0)
+  update = bf16[] parameter(1)
+  ROOT result = bf16[] add(old, update)
+}
+
+elementwise {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = bf16[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=true, to_apply=add
+}
+
+ENTRY entry {
+  base = bf16[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = bf16[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesSignedMaximumRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule signed_maximum_row_scatter
+
+maximum {
+  old = s32[] parameter(0)
+  update = s32[] parameter(1)
+  ROOT result = s32[] maximum(old, update)
+}
+
+elementwise {
+  base = s32[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = s32[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=maximum
+}
+
+ENTRY entry {
+  base = s32[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = s32[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesSignedMinimumRowScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule signed_minimum_row_scatter
+
+minimum {
+  old = s32[] parameter(0)
+  update = s32[] parameter(1)
+  ROOT result = s32[] minimum(old, update)
+}
+
+elementwise {
+  base = s32[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,259]{2,1,0} parameter(2)
+  ROOT scatter = s32[257,259]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=minimum
+}
+
+ENTRY entry {
+  base = s32[257,259]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,259]{2,1,0} parameter(2)
+  ROOT fusion = s32[257,259]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesScalarAdditiveScatter) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule scalar_additive_scatter
+
+add {
+  old = bf16[] parameter(0)
+  update = bf16[] parameter(1)
+  ROOT result = bf16[] add(old, update)
+}
+
+elementwise {
+  base = bf16[17,19]{1,0} parameter(0)
+  indices = s32[191,2]{1,0} parameter(1)
+  updates = bf16[191,1,1]{2,1,0} parameter(2)
+  ROOT scatter = bf16[17,19]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0,1}, index_vector_dim=1,
+    unique_indices=false, to_apply=add
+}
+
+ENTRY entry {
+  base = bf16[17,19]{1,0} parameter(0)
+  indices = s32[191,2]{1,0} parameter(1)
+  updates = bf16[191,1,1]{2,1,0} parameter(2)
+  ROOT fusion = bf16[17,19]{1,0} fusion(base, indices, updates),
+    kind=kCustom, calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"2", "num_ctas":"1",
+        "vector_size_bits":"32"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesGatherNdContiguousSlice) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule gather_nd_contiguous_slice
+
+elementwise {
+  values = bf16[7,11,259]{2,1,0} parameter(0)
+  indices = s32[191,2]{1,0} parameter(1)
+  gathered = bf16[191,259]{1,0} gather(values, indices),
+    offset_dims={1}, collapsed_slice_dims={0,1}, start_index_map={0,1},
+    index_vector_dim=1, slice_sizes={1,1,259}
+  ROOT result = bf16[191,259]{1,0} negate(gathered)
+}
+
+ENTRY entry {
+  values = bf16[7,11,259]{2,1,0} parameter(0)
+  indices = s32[191,2]{1,0} parameter(1)
+  ROOT fusion = bf16[191,259]{1,0} fusion(values, indices), kind=kCustom,
+    calls=elementwise,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}],
         "num_stages":"1", "num_warps":"2", "num_ctas":"1",
         "vector_size_bits":"64"}}}
 }

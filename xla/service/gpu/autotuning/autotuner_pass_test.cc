@@ -129,6 +129,46 @@ ENTRY main {
   EXPECT_FALSE(should_autotune(*fusion));
 }
 
+TEST_F(AutotunerPassTest, SignedMaximumScatterFusionIsAutotuned) {
+  constexpr absl::string_view kHlo = R"(
+HloModule signed_maximum_scatter
+
+maximum {
+  old = s32[] parameter(0)
+  update = s32[] parameter(1)
+  ROOT result = s32[] maximum(old, update)
+}
+
+scatter_fusion {
+  base = s32[17,68]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,68]{2,1,0} parameter(2)
+  ROOT scatter = s32[17,68]{1,0} scatter(base, indices, updates),
+    update_window_dims={1,2}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=maximum
+}
+
+ENTRY main {
+  base = s32[17,68]{1,0} parameter(0)
+  indices = s32[191,1]{1,0} parameter(1)
+  updates = s32[191,1,68]{2,1,0} parameter(2)
+  ROOT fusion = s32[17,68]{1,0} fusion(base, indices, updates),
+    kind=kInput, calls=scatter_fusion
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_autotune_level(3);
+  debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(true);
+  InstructionFilterFn should_autotune = GetShouldAutotuneInstructionFn(
+      debug_options,
+      stream_executor_->GetDeviceDescription().gpu_compute_capability());
+  EXPECT_TRUE(
+      should_autotune(*module->entry_computation()->root_instruction()));
+}
+
 const char kCublasCustomCallHlo[] = R"(
 HloModule module, entry_computation_layout={(f32[100,100]{1,0}, f32[100,100]{1,0})->f32[100,100]{1,0}}
 

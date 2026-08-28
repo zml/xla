@@ -117,6 +117,8 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     if (const HloInstruction* row_offset =
             GetFlySoftmaxExternalRowOffset(root)) {
       external_row_parameter_number_ = row_offset->parameter_number();
+      recompute_maximum_after_external_row_offset_ =
+          FlySoftmaxRecomputesMaximumAfterExternalRowOffset(root);
     }
     const Shape& shape = analysis.first_result_shape();
     dimensions_.assign(shape.dimensions().begin(), shape.dimensions().end());
@@ -256,6 +258,31 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
         builder, builder.getF32Type(),
         llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(),
                               /*negative=*/true));
+    const bool all_rows_in_bounds =
+        !independent_rows_ || rows_ % num_warps_ == 0;
+
+    Value row_offset;
+    if (has_external_row) {
+      if (all_rows_in_bounds) {
+        row_offset = mlir::tensor::ExtractOp::create(
+            builder, external_row, mlir::ValueRange(input_row_indices));
+      } else {
+        mlir::scf::IfOp load = mlir::scf::IfOp::create(
+            builder, mlir::TypeRange{builder.getF32Type()}, row_in_bounds,
+            /*withElseRegion=*/true);
+        {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPointToStart(load.thenBlock());
+          Value value = mlir::tensor::ExtractOp::create(
+              builder, external_row, mlir::ValueRange(input_row_indices));
+          mlir::scf::YieldOp::create(builder, value);
+          builder.setInsertionPointToStart(load.elseBlock());
+          mlir::scf::YieldOp::create(builder, zero);
+        }
+        builder.setInsertionPointAfter(load);
+        row_offset = load.getResult(0);
+      }
+    }
 
     auto convert_input = [&](Value value) -> Value {
       if (!value.getType().isF32()) {
@@ -265,8 +292,6 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       return value;
     };
 
-    const bool all_rows_in_bounds =
-        !independent_rows_ || rows_ % num_warps_ == 0;
     auto load_input = [&](Value column, bool all_columns_in_bounds) -> Value {
       const bool all_threads_in_bounds =
           all_rows_in_bounds && all_columns_in_bounds;
@@ -310,6 +335,9 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
           Add(builder, element_thread_id,
               IndexConstant(builder, i * threads));
       Value value = load_input(column, (i + 1) * threads <= columns_);
+      if (recompute_maximum_after_external_row_offset_) {
+        value = mlir::arith::SubFOp::create(builder, value, row_offset);
+      }
       values.push_back(value);
       local_max = mlir::arith::MaxNumFOp::create(builder, local_max, value);
     }
@@ -431,26 +459,9 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     };
 
     Value block_max;
-    if (has_external_row) {
-      if (all_rows_in_bounds) {
-        block_max = mlir::tensor::ExtractOp::create(
-            builder, external_row, mlir::ValueRange(input_row_indices));
-      } else {
-        mlir::scf::IfOp load = mlir::scf::IfOp::create(
-            builder, mlir::TypeRange{builder.getF32Type()}, row_in_bounds,
-            /*withElseRegion=*/true);
-        {
-          mlir::OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToStart(load.thenBlock());
-          Value value = mlir::tensor::ExtractOp::create(
-              builder, external_row, mlir::ValueRange(input_row_indices));
-          mlir::scf::YieldOp::create(builder, value);
-          builder.setInsertionPointToStart(load.elseBlock());
-          mlir::scf::YieldOp::create(builder, zero);
-        }
-        builder.setInsertionPointAfter(load);
-        block_max = load.getResult(0);
-      }
+    if (has_external_row &&
+        !recompute_maximum_after_external_row_offset_) {
+      block_max = row_offset;
     } else {
       block_max = block_reduce(local_max, maximum, minus_inf,
                                /*is_maximum=*/true);
@@ -539,6 +550,7 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
   bool independent_rows_ = false;
   int64_t input_parameter_number_ = 0;
   int64_t external_row_parameter_number_ = -1;
+  bool recompute_maximum_after_external_row_offset_ = false;
   int64_t num_warps_ = 4;
   LaunchDimensions launch_dimensions_;
 };

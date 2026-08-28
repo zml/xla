@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +58,7 @@ limitations under the License.
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/service/hlo_cost_analysis.h"
+#include "xla/shape_util.h"
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/platform/platform_object_registry.h"
@@ -73,6 +75,145 @@ namespace gpu {
 namespace {
 
 using AutotuneDecision = Decision;
+
+bool IsUniformAfterZeroingFusionParameters(
+    const HloInstruction* instruction,
+    absl::flat_hash_set<const HloInstruction*>& visited) {
+  if (!visited.insert(instruction).second) {
+    return true;
+  }
+  if (instruction->opcode() == HloOpcode::kParameter) {
+    return true;
+  }
+  if (instruction->opcode() == HloOpcode::kConstant) {
+    return ShapeUtil::IsEffectiveScalar(instruction->shape());
+  }
+  switch (instruction->opcode()) {
+    case HloOpcode::kBitcast:
+    case HloOpcode::kBitcastConvert:
+    case HloOpcode::kBroadcast:
+    case HloOpcode::kCopy:
+    case HloOpcode::kReshape:
+    case HloOpcode::kReverse:
+    case HloOpcode::kTranspose:
+      break;
+    default:
+      if (!instruction->IsElementwise()) {
+        return false;
+      }
+  }
+  return absl::c_all_of(instruction->operands(), [&](const auto* operand) {
+    return IsUniformAfterZeroingFusionParameters(operand, visited);
+  });
+}
+
+bool IsZeroAfterZeroingFusionParameters(
+    const HloInstruction* instruction,
+    absl::flat_hash_set<const HloInstruction*>& visited) {
+  if (!visited.insert(instruction).second) {
+    return true;
+  }
+  if (instruction->opcode() == HloOpcode::kParameter) {
+    return true;
+  }
+  switch (instruction->opcode()) {
+    case HloOpcode::kAbs:
+    case HloOpcode::kBitcast:
+    case HloOpcode::kBitcastConvert:
+    case HloOpcode::kBroadcast:
+    case HloOpcode::kConvert:
+    case HloOpcode::kCopy:
+    case HloOpcode::kNegate:
+    case HloOpcode::kReshape:
+    case HloOpcode::kReverse:
+    case HloOpcode::kTranspose:
+    case HloOpcode::kAdd:
+    case HloOpcode::kMaximum:
+    case HloOpcode::kMinimum:
+    case HloOpcode::kMultiply:
+    case HloOpcode::kSubtract:
+      break;
+    default:
+      return false;
+  }
+  return absl::c_all_of(instruction->operands(), [&](const auto* operand) {
+    return IsZeroAfterZeroingFusionParameters(operand, visited);
+  });
+}
+
+bool IsParameterBinaryScatterCombiner(const HloInstruction* root,
+                                      HloOpcode opcode) {
+  while (root != nullptr && root->opcode() == HloOpcode::kConvert &&
+         root->operand_count() == 1) {
+    root = root->operand(0);
+  }
+  if (root == nullptr || root->opcode() != opcode ||
+      root->operand_count() != 2) {
+    return false;
+  }
+  auto parameter_number_through_converts =
+      [](const HloInstruction* value) -> std::optional<int64_t> {
+    while (value->opcode() == HloOpcode::kConvert &&
+           value->operand_count() == 1) {
+      value = value->operand(0);
+    }
+    if (value->opcode() != HloOpcode::kParameter) {
+      return std::nullopt;
+    }
+    return value->parameter_number();
+  };
+  std::optional<int64_t> lhs =
+      parameter_number_through_converts(root->operand(0));
+  std::optional<int64_t> rhs =
+      parameter_number_through_converts(root->operand(1));
+  return lhs.has_value() && rhs.has_value() && *lhs != *rhs;
+}
+
+bool IsAddScatterCombiner(const HloInstruction* root) {
+  return IsParameterBinaryScatterCombiner(root, HloOpcode::kAdd);
+}
+
+bool IsAutotuneSafeOverwriteScatter(const HloFusionInstruction& fusion) {
+  const HloInstruction* root = fusion.fused_expression_root();
+  if (root == nullptr || root->opcode() != HloOpcode::kScatter ||
+      root->operand_count() != 3) {
+    return false;
+  }
+  const HloScatterInstruction* scatter =
+      Cast<const HloScatterInstruction>(root);
+  if (scatter->scatter_operand_count() != 1) {
+    return false;
+  }
+  const HloComputation* update = scatter->to_apply();
+  const HloInstruction* update_root =
+      update == nullptr ? nullptr : update->root_instruction();
+  if (update_root == nullptr || update->num_parameters() != 2) {
+    return false;
+  }
+  const bool is_overwrite = update_root->opcode() == HloOpcode::kParameter &&
+                            update_root->parameter_number() == 1;
+  const bool is_add = IsAddScatterCombiner(update_root);
+  const bool is_idempotent_s32_extremum =
+      scatter->shape().element_type() == S32 &&
+      (IsParameterBinaryScatterCombiner(update_root, HloOpcode::kMaximum) ||
+       IsParameterBinaryScatterCombiner(update_root, HloOpcode::kMinimum));
+  if (!is_overwrite && !is_add && !is_idempotent_s32_extremum) {
+    return false;
+  }
+  // Signed integer maximum/minimum is associative, commutative, and
+  // idempotent. Replaying the same update set while profiling candidates
+  // therefore leaves the aliased base at the same deterministic fixed point.
+  if (is_idempotent_s32_extremum) {
+    return true;
+  }
+  if (is_overwrite && scatter->unique_indices()) {
+    return true;
+  }
+  absl::flat_hash_set<const HloInstruction*> visited;
+  return is_overwrite
+             ? IsUniformAfterZeroingFusionParameters(root->operand(2), visited)
+             : IsZeroAfterZeroingFusionParameters(root->operand(2), visited);
+}
 
 // Register spilling is currently not allowed for GEMM/Conv fusions, but allowed
 // for non-GEMM fusions. Register spilling configurations can be expensive to
@@ -204,7 +345,8 @@ AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
     }
   }
   if (absl::c_any_of(fusion->fused_instructions_computation()->instructions(),
-                     HloPredicateIsOp<HloOpcode::kScatter>)) {
+                     HloPredicateIsOp<HloOpcode::kScatter>) &&
+      !IsAutotuneSafeOverwriteScatter(*fusion)) {
     return AutotuneDecision::Forbid("Fusions with Scatter are not supported");
   }
   return AutotuneDecision::Allow();

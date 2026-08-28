@@ -1,0 +1,34 @@
+HloModule fly_fusion_bf16_scalar_additive_scatter_benchmark
+
+add {
+  old = bf16[] parameter(0)
+  update = bf16[] parameter(1)
+  ROOT result = bf16[] add(old, update)
+}
+
+elementwise {
+  base = bf16[8388608]{0} parameter(0)
+  updates = bf16[16777216]{0} parameter(1)
+  transformed = bf16[16777216]{0} abs(updates)
+  canonical_updates = bf16[16777216,1]{1,0} bitcast(transformed)
+  update_ids = s32[16777216]{0} iota(), iota_dimension=0
+  multiplier = s32[] constant(31337)
+  multipliers = s32[16777216]{0} broadcast(multiplier), dimensions={}
+  permuted = s32[16777216]{0} multiply(update_ids, multipliers)
+  flat_mask_value = s32[] constant(8388607)
+  flat_mask = s32[16777216]{0} broadcast(flat_mask_value), dimensions={}
+  flat_indices = s32[16777216]{0} and(permuted, flat_mask)
+  indices = s32[16777216,1]{1,0} bitcast(flat_indices)
+  ROOT scatter = bf16[8388608]{0}
+    scatter(base, indices, canonical_updates),
+    update_window_dims={1}, inserted_window_dims={},
+    scatter_dims_to_operand_dims={0}, index_vector_dim=1,
+    unique_indices=false, to_apply=add
+}
+
+ENTRY main {
+  base = bf16[8388608]{0} parameter(0)
+  updates = bf16[16777216]{0} parameter(1)
+  ROOT fusion = bf16[8388608]{0} fusion(base, updates), kind=kInput,
+    calls=elementwise
+}

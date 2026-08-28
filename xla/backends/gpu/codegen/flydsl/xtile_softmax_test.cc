@@ -152,6 +152,60 @@ ENTRY entry {
   EXPECT_TRUE(IsFlySoftmaxFusion(analysis));
 }
 
+TEST_F(FlyXTileSoftmaxTest,
+       RecognizesStabilizedExternalRowOffsetSoftmax) {
+  constexpr char kSoftmaxHlo[] = R"(
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT maximum = f32[] maximum(lhs, rhs)
+}
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+softmax {
+  input = bf16[4,31,125]{2,1,0} parameter(0)
+  converted = f32[4,31,125]{2,1,0} convert(input)
+  row_offset = f32[4,31]{1,0} parameter(1)
+  row_offsets = f32[4,31,125]{2,1,0} broadcast(row_offset),
+    dimensions={0,1}
+  pre_shift = f32[4,31,125]{2,1,0} subtract(converted, row_offsets)
+  minus_inf = f32[] constant(-inf)
+  row_max = f32[4,31]{1,0} reduce(pre_shift, minus_inf), dimensions={2},
+    to_apply=maximum
+  row_maxes = f32[4,31,125]{2,1,0} broadcast(row_max), dimensions={0,1}
+  shifted = f32[4,31,125]{2,1,0} subtract(pre_shift, row_maxes)
+  exponential = f32[4,31,125]{2,1,0} exponential(shifted)
+  zero = f32[] constant(0)
+  row_sum = f32[4,31]{1,0} reduce(exponential, zero), dimensions={2},
+    to_apply=add
+  row_sums = f32[4,31,125]{2,1,0} broadcast(row_sum), dimensions={0,1}
+  normalized = f32[4,31,125]{2,1,0} divide(exponential, row_sums)
+  ROOT result = bf16[4,31,125]{2,1,0} convert(normalized)
+}
+
+ENTRY entry {
+  input = bf16[4,31,125]{2,1,0} parameter(0)
+  row_offset = f32[4,31]{1,0} parameter(1)
+  ROOT fusion = bf16[4,31,125]{2,1,0} fusion(input, row_offset),
+    kind=kInput, calls=softmax
+}
+)";
+  std::unique_ptr<HloModule> module =
+      ParseAndReturnVerifiedModule(kSoftmaxHlo).value();
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  EXPECT_TRUE(IsFlySoftmaxFusion(analysis));
+  EXPECT_TRUE(FlySoftmaxRecomputesMaximumAfterExternalRowOffset(
+      *root->fused_expression_root()));
+}
+
 TEST_F(FlyXTileSoftmaxTest, RejectsIncorrectMaximumIdentity) {
   EXPECT_FALSE(IsSupported("0"));
 }
