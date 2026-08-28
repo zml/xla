@@ -768,12 +768,13 @@ absl::StatusOr<std::unique_ptr<HloModule>> MetalGpuCompiler::RunHloPasses(
 
 absl::Status MetalGpuCompiler::OptimizeHloPostLayoutAssignment(
     HloModule* hlo_module, se::StreamExecutor* stream_exec,
-    const CompileOptions& options, const GpuTargetConfig& gpu_target_config,
+    const CompileOptions& options, const GpuTopology& gpu_topology,
     const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
     CompilationStats* compilation_stats, mlir::MLIRContext* mlir_context) {
   TF_RETURN_IF_ERROR(GpuCompiler::OptimizeHloPostLayoutAssignment(
-      hlo_module, stream_exec, options, gpu_target_config, alias_info,
-      thread_pool, compilation_stats, mlir_context));
+      hlo_module, stream_exec, options, gpu_topology, alias_info, thread_pool,
+      compilation_stats, mlir_context));
+  const GpuTargetConfig& gpu_target_config = gpu_topology.gpu_target_config();
   const se::MetalComputeCapability metal_arch =
       gpu_target_config.device_description.metal_compute_capability();
   return MetalWorkspaceRewriter(metal_arch.architecture_size(),
@@ -794,7 +795,7 @@ void MetalGpuCompiler::AddPaddingForGpublasGemms(
     const se::GpuComputeCapability& gpu_version) {
 }
 
-absl::Status MetalGpuCompiler::AddAutotunerPass(
+absl::Status MetalGpuCompiler::AddConfigAssignerPass(
     HloPassPipeline* pipeline, HloModule* hlo_module,
     const se::GpuComputeCapability& gpu_version, const CompileOptions& options,
     tsl::thread::ThreadPool* thread_pool,

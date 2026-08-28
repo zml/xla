@@ -46,8 +46,7 @@ class MetalGpuCompiler : public GpuCompiler {
 
   absl::Status OptimizeHloPostLayoutAssignment(
       HloModule* hlo_module, se::StreamExecutor* stream_exec,
-      const CompileOptions& options,
-      const GpuTargetConfig& gpu_target_config,
+      const CompileOptions& options, const GpuTopology& gpu_topology,
       const GpuAliasInfo* alias_info, tsl::thread::ThreadPool* thread_pool,
       CompilationStats* compilation_stats,
       mlir::MLIRContext* mlir_context) override;
@@ -77,7 +76,7 @@ class MetalGpuCompiler : public GpuCompiler {
 
   bool EnableFusionAutotuning() const override { return false; }
 
-  absl::Status AddAutotunerPass(
+  absl::Status AddConfigAssignerPass(
       HloPassPipeline* pipeline, HloModule* hlo_module,
       const se::GpuComputeCapability& gpu_version,
       const CompileOptions& options, tsl::thread::ThreadPool* thread_pool,

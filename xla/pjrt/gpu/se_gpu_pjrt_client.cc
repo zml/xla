@@ -324,14 +324,14 @@ void StreamExecutorGpuRawClient::UpdateCompileOptionsTopology(
 #if TENSORFLOW_USE_METAL
 
 absl::StatusOr<PjRtDeviceEventRefVector>
-StreamExecutorGpuClient::CrossHostTransferBuffers(
+StreamExecutorGpuRawClient::CrossHostTransferBuffers(
     PjRtDeviceEventRefVector transfer_dependencies,
-    std::vector<CrossHostTransferSpec> transfer_specs) {
+    std::vector<CommonPjRtClient::CrossHostTransferSpec> transfer_specs) {
   return absl::UnimplementedError(
       "Cross-host transfers are not implemented for Metal.");
 }
 
-void StreamExecutorGpuClient::ScheduleRemoteSend(
+void StreamExecutorGpuRawClient::ScheduleRemoteSend(
     PjRtMemorySpace* memory_space, PjRtRawBufferRef raw_buffer,
     PjRtDeviceEventRefVector definition_events,
     PjRtDeviceEventPromiseRef usage_event_promise,
@@ -343,10 +343,11 @@ void StreamExecutorGpuClient::ScheduleRemoteSend(
   std::move(on_done)(status, /*sends_were_enqueued=*/false);
 }
 
-absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
-StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(
-    absl::Span<const Shape> shapes, PjRtDevice* device,
-    PjRtCrossHostRecvNotifier notifier) {
+absl::StatusOr<PjRtDeviceEventRefVector>
+StreamExecutorGpuRawClient::CrossHostReceiveBuffersInto(
+    absl::Span<const PjRtRawBufferRef> buffers,
+    PjRtCrossHostRecvNotifier notifier,
+    PjRtDeviceEventSpan transfer_dependency_avs) {
   return absl::UnimplementedError(
       "Cross-host transfers are not implemented for Metal.");
 }
@@ -2140,6 +2141,7 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
     gpu_run_options->set_enable_mock_collectives();
   }
 
+#if !TENSORFLOW_USE_METAL
   if (options.abort_collectives_on_failure) {
     gpu_run_options->set_execution_timeout_handler(
         [process_index = options.node_id,
@@ -2173,6 +2175,7 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
           }
         });
   }
+#endif  // !TENSORFLOW_USE_METAL
 
   static const bool xla_gpu_require_exclusive_lock =
       xla::GetDebugOptionsFromFlags().xla_gpu_require_exclusive_lock();
