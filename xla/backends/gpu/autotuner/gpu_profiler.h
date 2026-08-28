@@ -84,9 +84,9 @@ class GpuProfiler : public Profiler {
   }
 
  private:
-  absl::StatusOr<ExecutionOutput> Execute(
-      Executable* executable, std::vector<ExecutionInput> inputs,
-      ExecutionProfile* profile, se::DeviceAddressAllocator* allocator);
+  absl::StatusOr<ExecutionOutput> Execute(Executable* executable,
+                                          std::vector<ExecutionInput> inputs,
+                                          ExecutionProfile* profile);
 
   se::StreamExecutor* stream_executor_;
   se::DeviceAddressAllocator* allocator_;
