@@ -2390,12 +2390,22 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         // The corresponding weight-gradient dot contracts the leading
         // dimension of the same scaled activation. The generic register-RHS
         // path already maps that physical transpose and applies the learned
-        // per-output-channel scale while loading each LHS vector.
+        // per-output-channel scale while loading each LHS vector. K128 reuses
+        // each output tile across four times as much reduction work and wins
+        // the wider transformer weight gradients; retain K32 for shallow or
+        // register-pressure-sensitive shapes and let autotuning decide.
         configs.insert(
             configs.begin(),
             MakeConfig(/*block_m=*/16, /*block_n=*/128, /*block_k=*/32,
                        /*num_warps=*/4,
                        FlyGemmConfig::FLY_MFMA_16X16X16));
+        if (k % 128 == 0) {
+          configs.insert(
+              configs.begin(),
+              MakeConfig(/*block_m=*/16, /*block_n=*/128, /*block_k=*/128,
+                         /*num_warps=*/4,
+                         FlyGemmConfig::FLY_MFMA_16X16X16));
+        }
       }
     }
     if (dot->shape().dimensions_size() == 2 && m == 4 && n % 128 == 0 &&
@@ -3341,9 +3351,15 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   if (flydsl::ContainsUnsupportedCustomCall(analysis)) {
     return false;
   }
-  if (flydsl::IsFlyXTileElementwiseFusion(analysis) ||
-      flydsl::IsFlyXTileRowReductionFusion(analysis)) {
+  if (flydsl::IsFlyXTileRowReductionFusion(analysis)) {
     return true;
+  }
+  if (flydsl::IsFlyXTileElementwiseFusion(analysis)) {
+    // Input fusions are already owned by XLA's native reduction emitter; they
+    // are not Triton fusions that strict replacement needs to cover. Keep the
+    // specialized Fly reductions above, but do not retag ordinary input
+    // reductions as generic __fly elementwise kernels.
+    return fusion->fusion_kind() != HloInstruction::FusionKind::kInput;
   }
   // Strict replacement is a native-Fly contract.  Do not attach __fly to an
   // otherwise valid XLA loop/reduction merely because the legacy generic

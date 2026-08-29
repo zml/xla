@@ -116,7 +116,7 @@ absl::StatusOr<std::unique_ptr<Executable>> CodegenOrchestrator::Compile(
           << instr.ToString();
   absl::StatusOr<std::unique_ptr<Executable>> executable =
       config.codegen_backend->Compile(instr, *config.backend_config);
-  if (absl::Status status = IsValidExecutable(executable, instr);
+  if (absl::Status status = IsValidExecutable(executable, instr, config);
       !status.ok()) {
     return status;
   }
@@ -151,7 +151,7 @@ absl::Status CodegenOrchestrator::ApplyConfig(HloInstruction& instr,
 
 absl::Status CodegenOrchestrator::IsValidExecutable(
     const absl::StatusOr<std::unique_ptr<Executable>>& executable,
-    const HloInstruction& instr) const {
+    const HloInstruction& instr, const Config& config) const {
   if (!executable.ok()) {
     return tsl::errors::CreateWithUpdatedMessage(
         executable.status(),
@@ -164,7 +164,10 @@ absl::Status CodegenOrchestrator::IsValidExecutable(
   }
 
   if (!allow_spills && *executable) {
-    const auto spills_registers = [](const auto& pair) {
+    const auto spills_registers = [&](const auto& pair) {
+      if (!config.codegen_backend->ShouldFilterKernelSpills(pair.first)) {
+        return false;
+      }
       const KernelStats& kernel_stats = pair.second;
       return kernel_stats.store_bytes_spilled > 0 ||
              kernel_stats.load_bytes_spilled > 0;

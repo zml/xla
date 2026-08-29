@@ -140,13 +140,19 @@ ENTRY main {
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                           backend_.GetSupportedConfigs(*fusion));
-  ASSERT_EQ(configs.size(), 1);
-  const FlyGemmConfig& config = configs.front()->fly();
-  EXPECT_EQ(config.block_m(), 16);
-  EXPECT_EQ(config.block_n(), 128);
-  EXPECT_EQ(config.block_k(), 32);
-  EXPECT_EQ(config.mfma_atom(), FlyGemmConfig::FLY_MFMA_16X16X16);
-  EXPECT_FALSE(config.stage_rhs());
+  ASSERT_EQ(configs.size(), 2);
+  for (int64_t block_k : {32, 128}) {
+    auto config = std::find_if(
+        configs.begin(), configs.end(), [&](const auto& candidate) {
+          return candidate->fly().block_k() == block_k;
+        });
+    ASSERT_NE(config, configs.end());
+    EXPECT_EQ((*config)->fly().block_m(), 16);
+    EXPECT_EQ((*config)->fly().block_n(), 128);
+    EXPECT_EQ((*config)->fly().mfma_atom(),
+              FlyGemmConfig::FLY_MFMA_16X16X16);
+    EXPECT_FALSE((*config)->fly().stage_rhs());
+  }
 }
 
 }  // namespace

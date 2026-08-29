@@ -432,6 +432,19 @@ bool FissionBackend::IsSupported(const HloInstruction& instr) {
   return instr.opcode() == HloOpcode::kFusion;
 }
 
+bool FissionBackend::ShouldFilterKernelSpills(
+    absl::string_view kernel_name) const {
+  if (backend() != autotuner::Backend::FLY_FISSION) {
+    return true;
+  }
+  // Fly fission can materialize unsupported producers and consumers around
+  // the GEMM. Their register usage is invariant across the GEMM candidates and
+  // must not reject every candidate. Keep filtering the tuned GEMM itself.
+  constexpr absl::string_view kFlyFissionGemmName = "fly_fission_gemm";
+  return kernel_name.substr(0, kFlyFissionGemmName.size()) ==
+         kFlyFissionGemmName;
+}
+
 absl::StatusOr<std::unique_ptr<HloModule>>
 FissionBackend::GetFissionedAndRewrittenModule(
     const HloInstruction& fusion_instr) {

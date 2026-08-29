@@ -181,14 +181,18 @@ absl::StatusOr<bool> ShouldTryRewriteFusion(
       return false;
     }
 
-    HloFusionAnalysis analysis =
-        HloFusionAnalysis::Create(*fusion, device_description);
-    return analysis.emitter_fusion_kind() ==
-               HloFusionAnalysis::EmitterFusionKind::kLoop ||
-           analysis.emitter_fusion_kind() ==
-               HloFusionAnalysis::EmitterFusionKind::kReduction ||
-           analysis.emitter_fusion_kind() ==
-               HloFusionAnalysis::EmitterFusionKind::kTranspose;
+    // Replacement means that Fly owns every fusion Triton would own.  It
+    // does not mean displacing XLA's native emitters after their backend
+    // decision has already been made.  Mirror the ordinary Triton rewrite
+    // policy for late fusions, but route each selected fusion to Fly below.
+    if (fusion->GetModule()
+            ->config()
+            .debug_options()
+            .xla_gpu_experimental_enable_fusion_block_level_rewriter()) {
+      return true;
+    }
+    return ShouldRewriteLoopTransposeFusion(fusion, device_description) ||
+           ShouldRewriteReductionFusion(fusion, device_description);
   }
 
   if (fusion->IsMultiOutputFusion() &&

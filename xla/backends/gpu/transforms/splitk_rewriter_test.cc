@@ -230,8 +230,8 @@ TEST_F(SplitkRewriterTest, FlyLocalSplitCandidateKeepsEligibleBf16DotIntact) {
 HloModule module
 
 ENTRY test {
-  lhs = bf16[128,4096]{1,0} parameter(0)
-  rhs = bf16[11008,4096]{1,0} parameter(1)
+  lhs = bf16[128,2048]{1,0} parameter(0)
+  rhs = bf16[11008,2048]{1,0} parameter(1)
   ROOT dot = bf16[128,11008]{1,0} dot(lhs, rhs),
       lhs_contracting_dims={1}, rhs_contracting_dims={1}
 })";
@@ -247,6 +247,33 @@ ENTRY test {
   EXPECT_FALSE(changed);
   EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
             HloOpcode::kDot);
+}
+
+TEST_F(SplitkRewriterTest, FlyLargeKUsesGlobalSplitK) {
+  const char* hlo_string = R"(
+HloModule module
+
+ENTRY test {
+  lhs = bf16[256,4096]{1,0} parameter(0)
+  rhs = bf16[512,4096]{1,0} parameter(1)
+  ROOT dot = bf16[256,512]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={1}
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_enable_flydsl_gemm(true);
+  SplitkRewriter rewriter(GetRocmDeviceDescription());
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          rewriter.HloModulePass::Run(module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_TRUE(RunFileCheck(module->ToString(), R"(
+CHECK: f32[8,256,512]{{.*}} dot({{.*}}), lhs_batch_dims={1}, lhs_contracting_dims={2}, rhs_batch_dims={1}, rhs_contracting_dims={2}
+CHECK: ROOT {{.*}} = bf16[256,512]{1,0} convert
+  )")
+                  .value_or(false));
 }
 
 }  // namespace

@@ -98,7 +98,7 @@ class CodegenOrchestrator {
 
   absl::Status IsValidExecutable(
       const absl::StatusOr<std::unique_ptr<Executable>>& executable,
-      const HloInstruction& instr) const;
+      const HloInstruction& instr, const Config& config) const;
 
   std::vector<std::unique_ptr<CodegenBackend>> codegen_backends_;
   Options options_;

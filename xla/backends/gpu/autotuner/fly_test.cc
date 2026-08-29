@@ -1168,6 +1168,42 @@ ENTRY main {
 }
 
 TEST_F(FlyFusionBackendTest,
+       StrictReplacementLeavesOrdinaryInputReductionOnNativeEmitter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_ordinary_input_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+body {
+  input = bf16[2,128,512]{2,1,0} parameter(0)
+  flattened = bf16[256,512]{1,0} bitcast(input)
+  converted = f32[256,512]{1,0} convert(flattened)
+  zero_bf16 = bf16[] constant(0)
+  zero = f32[] convert(zero_bf16)
+  reduced = f32[512]{0} reduce(converted, zero), dimensions={0},
+    to_apply=add
+  ROOT result = bf16[512]{0} convert(reduced)
+}
+
+ENTRY main {
+  input = bf16[2,128,512]{2,1,0} parameter(0)
+  ROOT fusion = bf16[512]{0} fusion(input), kind=kInput, calls=body
+}
+)";
+  debug_options_.set_xla_gpu_flydsl_replace_triton(true);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+  EXPECT_THAT(configs, IsEmpty());
+}
+
+TEST_F(FlyFusionBackendTest,
        StrictReplacementAcceptsNativeMixedOutputLeadingReduction) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_non_native_mixed_output_reduction

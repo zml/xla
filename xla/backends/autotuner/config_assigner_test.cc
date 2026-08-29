@@ -165,6 +165,11 @@ class MockCodegenBackend : public CodegenBackend {
               (HloInstruction & instr, const BackendConfig& config),
               (override));
   MOCK_METHOD(bool, CanProduceWrongResults, (), (const, override));
+  bool ShouldFilterKernelSpills(absl::string_view kernel_name) const override {
+    return should_filter_kernel_spills;
+  }
+
+  bool should_filter_kernel_spills = true;
 };
 
 class MockCodegenBackendWithWrongResults : public MockCodegenBackend {
@@ -289,7 +294,8 @@ class ConfigAssignerTest : public HloHardwareIndependentTestBase {
   ConfigAssigner::Options config_;
 };
 
-std::unique_ptr<Executable> RegisterSpillingExecutable(int spilled = 8) {
+std::unique_ptr<Executable> RegisterSpillingExecutable(
+    int spilled = 8, absl::string_view kernel_name = "test_config_2") {
   gpu::GpuExecutable::Params params;
   params.executable =
       std::make_unique<gpu::ThunkExecutor>(gpu::ThunkSequence{});
@@ -298,7 +304,7 @@ std::unique_ptr<Executable> RegisterSpillingExecutable(int spilled = 8) {
   KernelStats kernel_stats;
   kernel_stats.store_bytes_spilled = spilled;
   kernel_stats.load_bytes_spilled = spilled;
-  params.module_stats = {{"test_config_2", kernel_stats}};
+  params.module_stats = {{std::string(kernel_name), kernel_stats}};
   return gpu::GpuExecutable::Create(std::move(params)).value();
 }
 
@@ -1253,6 +1259,72 @@ TEST_F(ConfigAssignerTest, ConfigsWithRegisterSpillingAreFiltered) {
                        ParseAndReturnVerifiedModule(kHlo));
   auto dummy_instr = module->entry_computation()->root_instruction();
   EXPECT_THAT(config_assigner->AssignConfig(dummy_instr), absl_testing::IsOk());
+}
+
+TEST_F(ConfigAssignerTest, AuxiliaryKernelSpillsDoNotRejectCandidate) {
+  config_.select_first_config = true;
+  CodegenOrchestrator::Options orchestrator_options;
+  orchestrator_options.allow_reg_spills_fn = [](const HloInstruction&) {
+    return false;
+  };
+
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(GetTestConfig("test_config_1"));
+  auto backend = std::make_unique<MockCodegenBackend>();
+  backend->should_filter_kernel_spills = false;
+  EXPECT_CALL(*backend, GetSupportedConfigs(_))
+      .WillOnce(Return(std::move(configs)));
+  EXPECT_CALL(*backend, Compile(_, ConfigMatcher("test_config_1")))
+      .WillOnce(Return(RegisterSpillingExecutable(12, "auxiliary_kernel")));
+  EXPECT_CALL(*backend, ApplyConfig(_, ConfigMatcher("test_config_1")))
+      .WillOnce(Return(absl::OkStatus()));
+  std::vector<std::unique_ptr<CodegenBackend>> backends;
+  backends.push_back(std::move(backend));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto config_assigner,
+      CreateConfigAssigner(std::move(backends),
+                           std::make_unique<MockProfiler>(), config_, nullptr,
+                           nullptr, orchestrator_options));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  EXPECT_THAT(config_assigner->AssignConfig(
+                  module->entry_computation()->root_instruction()),
+              IsOk());
+}
+
+TEST_F(ConfigAssignerTest, TunedKernelSpillsStillRejectCandidate) {
+  config_.select_first_config = true;
+  CodegenOrchestrator::Options orchestrator_options;
+  orchestrator_options.allow_reg_spills_fn = [](const HloInstruction&) {
+    return false;
+  };
+
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  configs.push_back(GetTestConfig("test_config_1"));
+  configs.push_back(GetTestConfig("test_config_2"));
+  auto backend = std::make_unique<MockCodegenBackend>();
+  EXPECT_CALL(*backend, GetSupportedConfigs(_))
+      .WillOnce(Return(std::move(configs)));
+  EXPECT_CALL(*backend, Compile(_, ConfigMatcher("test_config_1")))
+      .WillOnce(Return(RegisterSpillingExecutable(8, "tuned_kernel")));
+  EXPECT_CALL(*backend, Compile(_, ConfigMatcher("test_config_2")))
+      .WillOnce(Return(std::unique_ptr<Executable>()));
+  EXPECT_CALL(*backend, ApplyConfig(_, ConfigMatcher("test_config_2")))
+      .WillOnce(Return(absl::OkStatus()));
+  std::vector<std::unique_ptr<CodegenBackend>> backends;
+  backends.push_back(std::move(backend));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto config_assigner,
+      CreateConfigAssigner(std::move(backends),
+                           std::make_unique<MockProfiler>(), config_, nullptr,
+                           nullptr, orchestrator_options));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  EXPECT_THAT(config_assigner->AssignConfig(
+                  module->entry_computation()->root_instruction()),
+              IsOk());
 }
 
 TEST_F(ConfigAssignerTest, SelectFirstConfigFirstConfigFails) {

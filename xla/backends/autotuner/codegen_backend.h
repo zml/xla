@@ -69,6 +69,13 @@ class CodegenBackend {
 
   // Returns true if the backend can produce numerically wrong results.
   virtual bool CanProduceWrongResults() const = 0;
+
+  // Returns whether spills reported for `kernel_name` should invalidate this
+  // candidate. Backends that materialize auxiliary kernels may narrow the
+  // filter to the kernel whose configuration is being autotuned.
+  virtual bool ShouldFilterKernelSpills(absl::string_view kernel_name) const {
+    return true;
+  }
 };
 
 }  // namespace xla
