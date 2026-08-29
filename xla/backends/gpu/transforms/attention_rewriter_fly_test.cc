@@ -16,11 +16,14 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/attention_rewriter_fly.h"
 
 #include <memory>
+#include <string>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status_matchers.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
+#include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -28,6 +31,8 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/gpu_device_info_for_tests.h"
+#include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 
 namespace xla::gpu {
@@ -500,6 +505,123 @@ TEST_F(AttentionRewriterFlyTest, FusesEarlyPipelineCausalAttentionGraph) {
   EXPECT_EQ(dots, 2);
   EXPECT_EQ(nested_fusions, 0);
   EXPECT_EQ(selects, 1);
+}
+
+TEST_F(AttentionRewriterFlyTest, FusesBroadcastScoreBiasAsAnOperand) {
+  std::string hlo = absl::StrReplaceAll(
+      kEarlyPipelineAttentionHlo,
+      {{"  qkv = bf16[256,3072]{1,0} parameter(0)\n",
+        "  qkv = bf16[256,3072]{1,0} parameter(0)\n"
+        "  bias = f32[1,16,128,128]{3,2,1,0} parameter(1)\n"},
+       {"  scores_f32 = f32[2,16,128,128]{3,2,1,0} convert(scores_view)\n",
+        "  scores_f32 = f32[2,16,128,128]{3,2,1,0} convert(scores_view)\n"
+        "  bias_view = f32[16,128,128]{2,1,0} bitcast(bias)\n"
+        "  broadcast_bias = f32[2,16,128,128]{3,2,1,0} "
+        "broadcast(bias_view), dimensions={1,2,3}\n"
+        "  biased_scores = f32[2,16,128,128]{3,2,1,0} "
+        "add(scores_f32, broadcast_bias)\n"},
+       {"select(causal, scores_f32, masked_values)",
+        "select(causal, biased_scores, masked_values)"}});
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo));
+
+  EXPECT_THAT(AttentionRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  ASSERT_EQ(fusion->operand_count(), 2);
+  EXPECT_THAT(fusion->operand(0)->name(), HasSubstr("qkv"));
+  EXPECT_THAT(fusion->operand(1)->name(), HasSubstr("bias"));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *fusion, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<flydsl::FlyAttentionDescriptor> descriptor =
+      flydsl::GetFlyAttentionDescriptor(analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_EQ(descriptor->bias_parameter->parameter_number(), 1);
+  EXPECT_THAT(descriptor->bias_strides,
+              ElementsAre(0, 128 * 128, 128, 1));
+  EXPECT_TRUE(descriptor->causal);
+}
+
+TEST_F(AttentionRewriterFlyTest, FusesBroadcastPaddingMaskAsAnOperand) {
+  std::string hlo = absl::StrReplaceAll(
+      kEarlyPipelineAttentionHlo,
+      {{"  qkv = bf16[256,3072]{1,0} parameter(0)\n",
+        "  qkv = bf16[256,3072]{1,0} parameter(0)\n"
+        "  key_mask = pred[2,128]{1,0} parameter(1)\n"},
+       {"  key = s32[128,128]{1,0} iota(), iota_dimension=1\n"
+        "  query = s32[128,128]{1,0} iota(), iota_dimension=0\n"
+        "  key_le_query = pred[128,128]{1,0} compare(key, query), direction=LE\n"
+        "  causal = pred[2,16,128,128]{3,2,1,0} broadcast(key_le_query),\n"
+        "    dimensions={2,3}\n",
+        "  external_mask = pred[2,16,128,128]{3,2,1,0} "
+        "broadcast(key_mask), dimensions={0,3}\n"},
+       {"select(causal, scores_f32, masked_values)",
+        "select(external_mask, scores_f32, masked_values)"}});
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo));
+
+  EXPECT_THAT(AttentionRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  ASSERT_EQ(fusion->operand_count(), 2);
+  EXPECT_THAT(fusion->operand(0)->name(), HasSubstr("qkv"));
+  EXPECT_THAT(fusion->operand(1)->name(), HasSubstr("key_mask"));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *fusion, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<flydsl::FlyAttentionDescriptor> descriptor =
+      flydsl::GetFlyAttentionDescriptor(analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_EQ(descriptor->mask_parameter->parameter_number(), 1);
+  EXPECT_THAT(descriptor->mask_strides, ElementsAre(128, 0, 0, 1));
+  EXPECT_FALSE(descriptor->causal);
+}
+
+TEST_F(AttentionRewriterFlyTest,
+       FusesCombinedCausalAndPaddingMaskAsAnOperand) {
+  std::string hlo = absl::StrReplaceAll(
+      kEarlyPipelineAttentionHlo,
+      {{"  qkv = bf16[256,3072]{1,0} parameter(0)\n",
+        "  qkv = bf16[256,3072]{1,0} parameter(0)\n"
+        "  key_mask = pred[2,128]{1,0} parameter(1)\n"},
+       {"  causal = pred[2,16,128,128]{3,2,1,0} broadcast(key_le_query),\n"
+        "    dimensions={2,3}\n",
+        "  causal = pred[2,16,128,128]{3,2,1,0} broadcast(key_le_query),\n"
+        "    dimensions={2,3}\n"
+        "  external_mask = pred[2,16,128,128]{3,2,1,0} "
+        "broadcast(key_mask), dimensions={0,3}\n"
+        "  combined_mask = pred[2,16,128,128]{3,2,1,0} "
+        "and(causal, external_mask)\n"},
+       {"select(causal, scores_f32, masked_values)",
+        "select(combined_mask, scores_f32, masked_values)"}});
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo));
+
+  EXPECT_THAT(AttentionRewriterFly().Run(module.get()), IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), IsOkAndHolds(false));
+
+  const auto* fusion = Cast<const HloFusionInstruction>(
+      module->entry_computation()->root_instruction());
+  ASSERT_EQ(fusion->operand_count(), 2);
+  EXPECT_THAT(fusion->operand(0)->name(), HasSubstr("qkv"));
+  EXPECT_THAT(fusion->operand(1)->name(), HasSubstr("key_mask"));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+
+  HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+      *fusion, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+  std::optional<flydsl::FlyAttentionDescriptor> descriptor =
+      flydsl::GetFlyAttentionDescriptor(analysis);
+  ASSERT_TRUE(descriptor.has_value());
+  EXPECT_EQ(descriptor->mask_parameter->parameter_number(), 1);
+  EXPECT_THAT(descriptor->mask_strides, ElementsAre(128, 0, 0, 1));
+  EXPECT_TRUE(descriptor->causal);
 }
 
 TEST_F(AttentionRewriterFlyTest, FusesGroupedQueryAttentionGraph) {

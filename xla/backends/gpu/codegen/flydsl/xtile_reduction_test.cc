@@ -22,6 +22,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
@@ -37,6 +38,27 @@ class FlyXTileReductionTest : public HloHardwareIndependentTestBase {
         module->entry_computation()->root_instruction();
     HloFusionAnalysis analysis = HloFusionAnalysis::Create(
         *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
+    return IsFlyXTileRowReductionFusion(analysis);
+  }
+
+  bool IsMultiOutputProducerConsumerSupported(const std::string& hlo,
+                                              absl::string_view producer_name,
+                                              absl::string_view consumer_name) {
+    std::unique_ptr<HloModule> module =
+        ParseAndReturnVerifiedModule(hlo).value();
+    const HloInstruction* producer =
+        FindInstruction(module.get(), producer_name);
+    const HloInstruction* consumer =
+        FindInstruction(module.get(), consumer_name);
+    FusionBackendConfig backend_config;
+    backend_config.set_kind("__fly");
+    const se::DeviceDescription& device_info =
+        TestGpuDeviceInfo::CudaOrRocmDeviceInfo();
+    HloFusionAnalysis analysis = HloFusionAnalysis::Create(
+        std::move(backend_config),
+        HloFusionAdaptor::ForProducerConsumer(producer, consumer,
+                                              /*with_extra_outputs=*/true),
+        &device_info);
     return IsFlyXTileRowReductionFusion(analysis);
   }
 };
@@ -100,8 +122,7 @@ ENTRY main {
 )"));
 }
 
-TEST_F(FlyXTileReductionTest,
-       RecognizesReductionWithDependentRowwiseOutput) {
+TEST_F(FlyXTileReductionTest, RecognizesReductionWithDependentRowwiseOutput) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule reduction_dependent_rowwise_output
 
@@ -134,6 +155,81 @@ ENTRY main {
     backend_config={"fusion_backend_config":{"kind":"__fly"}}
 }
 )"));
+}
+
+TEST_F(FlyXTileReductionTest, RecognizesRowwiseReductionWithConvertedCopy) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule rowwise_reduction_with_converted_copy
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  squared = f32[128,512]{1,0} multiply(p0, p0)
+  row_sum = f32[128]{0} reduce(squared, init), dimensions={1}, to_apply=add
+  sums = f32[128,512]{1,0} broadcast(row_sum), dimensions={0}
+  scales = f32[128,512]{1,0} broadcast(scale), dimensions={}
+  scaled = f32[128,512]{1,0} multiply(p0, scales)
+  normalized = f32[128,512]{1,0} multiply(scaled, sums)
+  converted = bf16[128,512]{1,0} convert(normalized)
+  ROOT result = (f32[128,512]{1,0}, bf16[128,512]{1,0})
+    tuple(normalized, converted)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  ROOT fusion = (f32[128,512]{1,0}, bf16[128,512]{1,0})
+    fusion(p0, scale, init), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+}
+)"));
+}
+
+TEST_F(FlyXTileReductionTest,
+       RecognizesVirtualRowwiseReductionWithConvertedCopy) {
+  EXPECT_TRUE(IsMultiOutputProducerConsumerSupported(
+      R"(
+HloModule virtual_rowwise_reduction_with_converted_copy
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[128,512]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  squared = f32[128,512]{1,0} multiply(p0, p0)
+  row_sum = f32[128]{0} reduce(squared, init), dimensions={1}, to_apply=add
+  sums = f32[128,512]{1,0} broadcast(row_sum), dimensions={0}
+  scales = f32[128,512]{1,0} broadcast(scale), dimensions={}
+  scaled = f32[128,512]{1,0} multiply(p0, scales)
+  ROOT normalized = f32[128,512]{1,0} multiply(scaled, sums)
+}
+
+ENTRY main {
+  p0 = f32[128,512]{1,0} parameter(0)
+  scale = f32[] constant(0.25)
+  init = f32[] constant(0)
+  producer = f32[128,512]{1,0} fusion(p0, scale, init),
+    kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{"kind":"__fly"}}
+  consumer = bf16[128,512]{1,0} convert(producer)
+  ROOT result = (f32[128,512]{1,0}, bf16[128,512]{1,0})
+    tuple(producer, consumer)
+}
+)",
+      "producer", "consumer"));
 }
 
 TEST_F(FlyXTileReductionTest, RecognizesPartialRowwiseOutput) {
@@ -208,8 +304,7 @@ ENTRY main {
 )"));
 }
 
-TEST_F(FlyXTileReductionTest,
-       RecognizesMultipleRowReductionsWithExtraOutput) {
+TEST_F(FlyXTileReductionTest, RecognizesMultipleRowReductionsWithExtraOutput) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule multiple_row_reductions_extra_output
 
@@ -885,8 +980,7 @@ ENTRY main {
 )"));
 }
 
-TEST_F(FlyXTileReductionTest,
-       RecognizesBitcastBf16ColumnScaleRmsNorm) {
+TEST_F(FlyXTileReductionTest, RecognizesBitcastBf16ColumnScaleRmsNorm) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_bitcast_bf16_column_scale_rms_norm
 
@@ -935,8 +1029,7 @@ ENTRY main {
 )"));
 }
 
-TEST_F(FlyXTileReductionTest,
-       RecognizesFlattenedRank3Bf16ColumnScaleRmsNorm) {
+TEST_F(FlyXTileReductionTest, RecognizesFlattenedRank3Bf16ColumnScaleRmsNorm) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule native_flattened_rank3_bf16_column_scale_rms_norm
 

@@ -1225,6 +1225,96 @@ ENTRY main {
   EXPECT_TRUE(IsGenericFlyFusion(*fusion0));
 }
 
+TEST_F(PriorityFusionTest,
+       FlySharedReductionConvertedCopyUsesOneMultiOutputFusion) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_shared_reduction_converted_copy
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+producer_computation {
+  input = f32[128,1024]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  squared = f32[128,1024]{1,0} multiply(input, input)
+  row_sum = f32[128]{0} reduce(squared, init), dimensions={1}, to_apply=add
+  sums = f32[128,1024]{1,0} broadcast(row_sum), dimensions={0}
+  scales = f32[128,1024]{1,0} broadcast(scale), dimensions={}
+  scaled = f32[128,1024]{1,0} multiply(input, scales)
+  ROOT normalized = f32[128,1024]{1,0} multiply(scaled, sums)
+}
+
+consumer_computation {
+  shared = f32[128,1024]{1,0} parameter(0)
+  other = f32[128,1024]{1,0} parameter(1)
+  ROOT result = f32[128,1024]{1,0} add(shared, other)
+}
+
+ENTRY main {
+  input = f32[128,1024]{1,0} parameter(0)
+  other = f32[128,1024]{1,0} parameter(1)
+  scale = f32[] constant(0.25)
+  init = f32[] constant(0)
+  producer = f32[128,1024]{1,0} fusion(input, scale, init), kind=kInput,
+    calls=producer_computation
+  converted = bf16[128,1024]{1,0} convert(producer)
+  consumer = f32[128,1024]{1,0} fusion(producer, other), kind=kLoop,
+    calls=consumer_computation
+  ROOT result = (f32[128,1024]{1,0}, bf16[128,1024]{1,0})
+    tuple(consumer, converted)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  DebugOptions& debug_options =
+      module->mutable_config().mutable_debug_options();
+  debug_options.set_xla_gpu_enable_flydsl_fusion(true);
+  debug_options.set_xla_gpu_flydsl_replace_triton(true);
+
+  se::DeviceDescription rocm_device = TestGpuDeviceInfo::AMDMI210DeviceInfo();
+  GpuHloCostAnalysis::Options options;
+  options.count_multiple_input_accesses = true;
+  PriorityFusion fly_priority_fusion(/*thread_pool=*/nullptr, rocm_device,
+                                     &alias_info_, options, &mlir_context_);
+  EXPECT_THAT(fly_priority_fusion.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+  EXPECT_THAT(verifier().Run(module.get()), absl_testing::IsOk());
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kTuple);
+  HloInstruction* converted = root->mutable_operand(1);
+  ASSERT_EQ(converted->opcode(), HloOpcode::kGetTupleElement);
+  HloInstruction* multi_output = converted->mutable_operand(0);
+  ASSERT_TRUE(IsGenericFlyFusion(*multi_output));
+  ASSERT_TRUE(multi_output->shape().IsTuple());
+  ASSERT_EQ(multi_output->shape().tuple_shapes_size(), 2);
+
+  int64_t reduction_count = 0;
+  int64_t convert_count = 0;
+  for (const HloInstruction* instruction :
+       multi_output->fused_instructions_computation()->instructions()) {
+    reduction_count += instruction->opcode() == HloOpcode::kReduce;
+    convert_count += instruction->opcode() == HloOpcode::kConvert;
+  }
+  EXPECT_EQ(reduction_count, 1);
+  EXPECT_EQ(convert_count, 1);
+
+  HloInstruction* consumer = root->mutable_operand(0);
+  ASSERT_EQ(consumer->opcode(), HloOpcode::kFusion);
+  EXPECT_NE(consumer, multi_output);
+  bool consumes_shared_f32_output = false;
+  for (const HloInstruction* operand : consumer->operands()) {
+    consumes_shared_f32_output |=
+        operand->opcode() == HloOpcode::kGetTupleElement &&
+        operand->operand(0) == multi_output && operand->tuple_index() == 1;
+  }
+  EXPECT_TRUE(consumes_shared_f32_output);
+}
+
 TEST_F(PriorityFusionTest, FuseTritonProducerWithTwoConsumers) {
   const std::string kHloText = R"(
 HloModule t

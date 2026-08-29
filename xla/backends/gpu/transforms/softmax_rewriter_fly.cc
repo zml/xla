@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -59,9 +60,123 @@ int64_t DefaultNumWarps(int64_t columns) {
   return 16;
 }
 
+bool HasEscapingSoftmaxIntermediate(const HloInstruction* root,
+                                    const HloInstruction* input) {
+  const HloInstruction* row_offset =
+      flydsl::GetFlySoftmaxExternalRowOffset(*root);
+  absl::flat_hash_set<const HloInstruction*> body;
+  std::vector<const HloInstruction*> worklist = {root};
+  while (!worklist.empty()) {
+    const HloInstruction* instruction = worklist.back();
+    worklist.pop_back();
+    if (instruction == input || instruction == row_offset ||
+        !body.insert(instruction).second) {
+      continue;
+    }
+    worklist.insert(worklist.end(), instruction->operands().begin(),
+                    instruction->operands().end());
+  }
+  for (const HloInstruction* instruction : body) {
+    if (instruction == root) {
+      continue;
+    }
+    for (const HloInstruction* user : instruction->users()) {
+      if (user->parent() == root->parent() && !body.contains(user)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+absl::Status ConfigureFlyNormalizationFusion(HloInstruction* fusion,
+                                             const Shape& tiled_shape) {
+  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   fusion->backend_config<GpuBackendConfig>());
+  FusionBackendConfig* fusion_config =
+      gpu_config.mutable_fusion_backend_config();
+  fusion_config->set_kind(kFlyFusionKind);
+  BlockLevelFusionConfig* block_config =
+      fusion_config->mutable_block_level_fusion_config();
+  const int64_t rank = tiled_shape.dimensions_size();
+  const int64_t columns = tiled_shape.dimensions(rank - 1);
+  const int64_t num_warps = DefaultNumWarps(columns);
+  Tile* output_tile = block_config->add_output_tiles();
+  for (int64_t dimension = 0; dimension < rank - 1; ++dimension) {
+    output_tile->add_sizes(columns <= 256 && dimension == rank - 2 ? num_warps
+                                                                   : 1);
+  }
+  output_tile->add_sizes(columns);
+  block_config->set_num_warps(num_warps);
+  block_config->set_num_ctas(1);
+  block_config->set_num_stages(1);
+  return fusion->set_backend_config(std::move(gpu_config));
+}
+
+absl::StatusOr<HloFusionInstruction*> MakeFlySoftmaxBackwardFusion(
+    HloInstruction* root) {
+  std::optional<flydsl::FlySoftmaxBackwardDescriptor> backward =
+      flydsl::GetFlySoftmaxBackwardDescriptor(*root);
+  TF_RET_CHECK(backward.has_value());
+  HloComputation::Builder builder("fly_softmax_backward_computation");
+  absl::flat_hash_map<const HloInstruction*, HloInstruction*> old_to_new;
+  std::vector<HloInstruction*> parameters;
+  int64_t parameter_number = 0;
+
+  std::function<void(HloInstruction*)> clone =
+      [&](HloInstruction* instruction) {
+        if (old_to_new.contains(instruction)) {
+          return;
+        }
+        if (instruction == backward->scores ||
+            instruction == backward->upstream_gradient) {
+          old_to_new[instruction] =
+              builder.AddInstruction(HloInstruction::CreateParameter(
+                  parameter_number, instruction->shape(),
+                  absl::StrCat("parameter_", parameter_number)));
+          parameters.push_back(instruction);
+          ++parameter_number;
+          return;
+        }
+        std::vector<HloInstruction*> operands;
+        operands.reserve(instruction->operand_count());
+        for (HloInstruction* operand : instruction->mutable_operands()) {
+          clone(operand);
+          operands.push_back(old_to_new.at(operand));
+        }
+        old_to_new[instruction] = builder.AddInstruction(
+            instruction->CloneWithNewOperands(instruction->shape(), operands));
+      };
+  clone(root);
+
+  HloModule* module = root->GetModule();
+  HloComputation* parent = root->parent();
+  HloComputation* fused_computation =
+      module->AddComputationAndUnifyNamesAndIds(builder.Build(),
+                                                /*is_entry=*/false);
+  HloInstruction* fusion = parent->AddInstruction(
+      HloInstruction::CreateFusion(root->shape(),
+                                   HloInstruction::FusionKind::kCustom,
+                                   parameters, fused_computation),
+      /*new_name=*/"fly_softmax_backward");
+  fusion->set_metadata(root->metadata());
+  RETURN_IF_ERROR(ConfigureFlyNormalizationFusion(fusion, root->shape()));
+
+  if (root->IsRoot()) {
+    parent->set_root_instruction(fusion);
+  } else {
+    RETURN_IF_ERROR(root->ReplaceAllUsesWith(fusion));
+  }
+  RETURN_IF_ERROR(parent->RemoveInstructionAndUnusedOperands(root));
+  return Cast<HloFusionInstruction>(fusion);
+}
+
 absl::StatusOr<HloFusionInstruction*> MakeFlyNormalizationFusion(
     HloInstruction* root) {
-  const bool is_softmax = flydsl::IsFlySoftmaxRoot(*root);
+  const HloInstruction* softmax_input = flydsl::GetFlySoftmaxInput(*root);
+  const HloInstruction* softmax_row_offset =
+      flydsl::GetFlySoftmaxExternalRowOffset(*root);
+  const bool is_softmax = softmax_input != nullptr;
   std::optional<flydsl::FlyLayerNormDescriptor> layer_norm =
       is_softmax ? std::nullopt : flydsl::GetFlyLayerNormDescriptor(*root);
   TF_RET_CHECK(is_softmax || layer_norm.has_value());
@@ -76,7 +191,17 @@ absl::StatusOr<HloFusionInstruction*> MakeFlyNormalizationFusion(
         if (old_to_new.contains(instruction)) {
           return;
         }
-        if (instruction->opcode() == HloOpcode::kParameter) {
+        // Keep an arbitrary softmax producer outside the normalization
+        // fusion. In a transformer this is normally the QK contraction; the
+        // standalone matcher used to require it to be an HLO parameter and
+        // consequently missed real graphs. The normalization body sees the
+        // producer (and an optional externally-computed row offset) as fusion
+        // parameters, just like Triton's softmax diamond rewriter.
+        const bool is_softmax_boundary =
+            is_softmax &&
+            (instruction == softmax_input || instruction == softmax_row_offset);
+        if (instruction->opcode() == HloOpcode::kParameter ||
+            is_softmax_boundary) {
           old_to_new[instruction] =
               builder.AddInstruction(HloInstruction::CreateParameter(
                   parameter_number, instruction->shape(),
@@ -109,28 +234,9 @@ absl::StatusOr<HloFusionInstruction*> MakeFlyNormalizationFusion(
       /*new_name=*/is_softmax ? "fly_softmax" : "fly_layer_norm");
   fusion->set_metadata(root->metadata());
 
-  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
-                   fusion->backend_config<GpuBackendConfig>());
-  FusionBackendConfig* fusion_config =
-      gpu_config.mutable_fusion_backend_config();
-  fusion_config->set_kind(kFlyFusionKind);
-  BlockLevelFusionConfig* block_config =
-      fusion_config->mutable_block_level_fusion_config();
   const Shape& tiled_shape =
       is_softmax ? root->shape() : layer_norm->output->shape();
-  const int64_t rank = tiled_shape.dimensions_size();
-  const int64_t columns = tiled_shape.dimensions(rank - 1);
-  const int64_t num_warps = DefaultNumWarps(columns);
-  Tile* output_tile = block_config->add_output_tiles();
-  for (int64_t dimension = 0; dimension < rank - 1; ++dimension) {
-    output_tile->add_sizes(columns <= 256 && dimension == rank - 2 ? num_warps
-                                                                   : 1);
-  }
-  output_tile->add_sizes(columns);
-  block_config->set_num_warps(num_warps);
-  block_config->set_num_ctas(1);
-  block_config->set_num_stages(1);
-  RETURN_IF_ERROR(fusion->set_backend_config(std::move(gpu_config)));
+  RETURN_IF_ERROR(ConfigureFlyNormalizationFusion(fusion, tiled_shape));
 
   if (root->IsRoot()) {
     parent->set_root_instruction(fusion);
@@ -146,6 +252,35 @@ absl::StatusOr<HloFusionInstruction*> MakeFlyNormalizationFusion(
 absl::StatusOr<bool> SoftmaxRewriterFly::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
+  // Rewrite the derivative first. It consumes the forward exponentials and
+  // row sum in XLA's autodiff graph. Once those external uses disappear, a
+  // second scan can safely collapse the now-unshared forward softmax too.
+  std::vector<HloInstruction*> backward_roots;
+  for (HloComputation* computation :
+       module->MakeNonfusionComputations(execution_threads)) {
+    if (!computation->caller_instructions(HloOpcode::kCustomCall).empty()) {
+      continue;
+    }
+    for (HloInstruction* instruction :
+         computation->MakeInstructionPostOrder()) {
+      if (!flydsl::GetFlySoftmaxBackwardDescriptor(*instruction).has_value()) {
+        continue;
+      }
+      backward_roots.erase(
+          std::remove_if(backward_roots.begin(), backward_roots.end(),
+                         [&](const HloInstruction* candidate) {
+                           return instruction->IsUserOf(candidate);
+                         }),
+          backward_roots.end());
+      backward_roots.push_back(instruction);
+    }
+  }
+  for (HloInstruction* root : backward_roots) {
+    ASSIGN_OR_RETURN(HloFusionInstruction * fusion,
+                     MakeFlySoftmaxBackwardFusion(root));
+    (void)fusion;
+  }
+
   std::vector<HloInstruction*> normalization_roots;
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
@@ -154,7 +289,21 @@ absl::StatusOr<bool> SoftmaxRewriterFly::RunImpl(
     }
     for (HloInstruction* instruction :
          computation->MakeInstructionPostOrder()) {
-      if (flydsl::IsFlySoftmaxRoot(*instruction)) {
+      const HloInstruction* softmax_input =
+          flydsl::GetFlySoftmaxInput(*instruction);
+      if (softmax_input != nullptr &&
+          !HasEscapingSoftmaxIntermediate(instruction, softmax_input)) {
+        // A narrowed softmax has two individually valid roots: the inner F32
+        // divide and the outer F16/BF16 conversion. Prefer the outer root so
+        // the conversion remains in the native kernel and do not later visit
+        // a candidate whose body was removed by the first rewrite.
+        normalization_roots.erase(
+            std::remove_if(normalization_roots.begin(),
+                           normalization_roots.end(),
+                           [&](const HloInstruction* candidate) {
+                             return instruction->IsUserOf(candidate);
+                           }),
+            normalization_roots.end());
         normalization_roots.push_back(instruction);
         continue;
       }
@@ -165,8 +314,8 @@ absl::StatusOr<bool> SoftmaxRewriterFly::RunImpl(
       }
       if (layer_norm->output_count > 1) {
         normalization_roots.erase(
-            std::remove(normalization_roots.begin(),
-                        normalization_roots.end(), layer_norm->output),
+            std::remove(normalization_roots.begin(), normalization_roots.end(),
+                        layer_norm->output),
             normalization_roots.end());
       }
       normalization_roots.push_back(instruction);
@@ -178,7 +327,7 @@ absl::StatusOr<bool> SoftmaxRewriterFly::RunImpl(
                      MakeFlyNormalizationFusion(root));
     (void)fusion;
   }
-  return !normalization_roots.empty();
+  return !backward_roots.empty() || !normalization_roots.empty();
 }
 
 }  // namespace xla::gpu

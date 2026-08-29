@@ -5332,6 +5332,50 @@ ENTRY main {
       RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
 }
 
+TEST_F(FlyFusionDeviceTest,
+       NativeRowwiseReductionWithScalarParametersAndConvertedCopy) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_rowwise_reduction_scalar_parameters_converted_copy
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  p0 = f32[127,259]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  squared = f32[127,259]{1,0} multiply(p0, p0)
+  row_sum = f32[127]{0} reduce(squared, init), dimensions={1}, to_apply=add
+  sums = f32[127,259]{1,0} broadcast(row_sum), dimensions={0}
+  scales = f32[127,259]{1,0} broadcast(scale), dimensions={}
+  scaled = f32[127,259]{1,0} multiply(p0, scales)
+  normalized = f32[127,259]{1,0} multiply(scaled, sums)
+  rounded = bf16[127,259]{1,0} convert(normalized)
+  ROOT result = (f32[127,259]{1,0}, bf16[127,259]{1,0})
+    tuple(normalized, rounded)
+}
+
+ENTRY main {
+  p0 = f32[127,259]{1,0} parameter(0)
+  scale = f32[] parameter(1)
+  init = f32[] parameter(2)
+  ROOT fusion = (f32[127,259]{1,0}, bf16[127,259]{1,0})
+    fusion(p0, scale, init), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]},{"sizes":["1"]}],
+        "num_stages":"1", "num_warps":"4", "num_ctas":"1",
+        "vector_size_bits":"128"}}}
+})";
+
+  EXPECT_TRUE(
+      RunAndCompareNoHloPasses(kHlo, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+}
+
 TEST_F(FlyFusionDeviceTest, NativeRowReductionsWithDynamicInit) {
   constexpr absl::string_view kF32Hlo = R"(
 HloModule fly_native_f32_dynamic_init_row_reduction

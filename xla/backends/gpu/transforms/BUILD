@@ -2342,6 +2342,7 @@ cc_library(
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/flydsl:attention_support",
         "//xla/backends/gpu/codegen/flydsl:fusion_support",
         "//xla/backends/gpu/codegen/flydsl:paged_attention_support",
         "//xla/backends/gpu/codegen/triton:support",
@@ -2821,6 +2822,7 @@ cc_library(
         "//xla/hlo/evaluator:hlo_evaluator",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
+        "//xla/service:hlo_cse",
         "//xla/service/gpu:backend_configs_cc",
         "//xla/service/gpu:ir_emission_utils",
         "//xla/tsl/platform:status_macros",
@@ -3110,11 +3112,15 @@ xla_cc_test(
     srcs = ["attention_rewriter_fly_test.cc"],
     deps = [
         ":attention_rewriter_fly",
+        "//xla/backends/gpu/codegen/flydsl:attention_support",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emission_utils",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
@@ -3153,6 +3159,34 @@ xla_cc_test(
         "//xla/service/gpu:ir_emission_utils",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "softmax_rewriter_fly_producer_test",
+    srcs = ["softmax_rewriter_fly_producer_test.cc"],
+    deps = [
+        ":softmax_rewriter_fly",
+        "//xla/backends/gpu/codegen/flydsl:softmax_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "softmax_rewriter_fly_backward_test",
+    srcs = ["softmax_rewriter_fly_backward_test.cc"],
+    deps = [
+        ":softmax_rewriter_fly",
+        "//xla/backends/gpu/codegen/flydsl:softmax_support",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )

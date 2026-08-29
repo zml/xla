@@ -1569,6 +1569,39 @@ ENTRY main {
       }));
 }
 
+TEST_F(FlyBackendTest, OffersCompactVectorRefillForShallowBf16Projection) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_shallow_bf16_projection
+
+gemm {
+  lhs = bf16[128,1024]{1,0} parameter(0)
+  rhs = bf16[1024,256]{0,1} parameter(1)
+  ROOT dot = bf16[128,256]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY main {
+  lhs = bf16[128,1024]{1,0} parameter(0)
+  rhs = bf16[1024,256]{0,1} parameter(1)
+  ROOT fusion = bf16[128,256]{1,0} fusion(lhs, rhs), kind=kCustom,
+      calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+
+  EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
+    const FlyGemmConfig& fly = c->fly();
+    return fly.block_m() == 32 && fly.block_n() == 16 &&
+           fly.block_k() == 256 && fly.num_warps() == 2 && fly.stage_rhs() &&
+           fly.single_buffer_lds() && !fly.preload_lds_fragments() &&
+           !fly.schedule_instructions();
+  }));
+}
+
 TEST_F(FlyBackendTest, OffersK32PipelineForRaggedBatchedRowMajorRhs) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_ragged_batched_row_major_rhs

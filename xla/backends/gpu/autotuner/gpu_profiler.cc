@@ -421,6 +421,11 @@ std::unique_ptr<GpuProfiler> GpuProfiler::Create(
 
 absl::StatusOr<std::unique_ptr<InputBuffers>> GpuProfiler::CreateInputBuffers(
     const Executable* executable, const HloInstruction* instr) {
+  // ConfigRunner creates one buffer set per instruction's candidate sweep.
+  // ROCm may have returned to its idle SCLK while that sweep was compiled, so
+  // make the first candidate establish the clock state again instead of only
+  // warming once for the lifetime of the profiler.
+  initial_device_warmup_done_ = false;
   ASSIGN_OR_RETURN(
       RedzoneBuffers buffers,
       RedzoneBuffers::FromProgramShape(
@@ -453,11 +458,12 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(
   {
     // A single short kernel launch does not bring ROCm devices to a stable
     // performance state. That systematically penalizes the first autotuning
-    // candidate relative to later backends. Warm the device once per profiler,
-    // then use a shorter ramp for every candidate: compiling and installing a
-    // new executable can leave an MI300 idle long enough to drop its clocks.
-    constexpr int kInitialRocmWarmupRuns = 32;
-    constexpr int kPerCandidateRocmWarmupRuns = 8;
+    // candidate relative to later backends. Warm the device once per
+    // instruction sweep, then use a shorter ramp for every candidate:
+    // compiling and installing a new executable can leave an MI300 idle long
+    // enough to drop its clocks.
+    constexpr int kInitialRocmWarmupRuns = 1024;
+    constexpr int kPerCandidateRocmWarmupRuns = 32;
     const bool is_rocm = stream_executor_->GetDeviceDescription()
                              .gpu_compute_capability()
                              .IsRocm();

@@ -816,6 +816,10 @@ bool IsSupportedContraction(const HloInstruction& dot) {
     }
     const bool contracting_scale =
         scale_dimensions == std::vector<int64_t>{lhs_contracting};
+    const bool learned_half_scale =
+        rank == 2 && is_bf16 &&
+        (contracting_scale ||
+         scale_dimensions == std::vector<int64_t>{lhs_noncontracting});
     const bool s4_channel_scale =
         IsS4DequantizedInput(*dot.operand(0)) &&
         !absl::c_linear_search(scale_dimensions, lhs_contracting) &&
@@ -823,6 +827,7 @@ bool IsSupportedContraction(const HloInstruction& dot) {
     supported_lhs_scale =
         (lhs_contracting_scale->collapsed_subchannel_scale &&
          IsS4DequantizedInput(*dot.operand(0))) ||
+        learned_half_scale ||
         (contracting_scale && dot.shape().dimensions(rank - 2) <= 8 &&
          dot.shape().dimensions(rank - 1) > 1) ||
         s4_channel_scale;
@@ -2169,10 +2174,61 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
     }
   }
   if (has_lhs_input_scale) {
+    const bool homogeneous_bf16 =
+        dot->operand(0)->shape().element_type() == BF16 &&
+        dot->operand(1)->shape().element_type() == BF16;
+    if (dot->shape().dimensions_size() == 2 && m >= 16 && n % 64 == 0 &&
+        homogeneous_bf16 && rhs_column_contiguous &&
+        output_element_type == BF16) {
+      if (lhs_k_contiguous && !rhs_k_contiguous && m % 32 == 0 &&
+          k >= 256 && k % 128 == 0) {
+        // Transformer forward projections apply a learned RMSNorm scale to
+        // an MxK activation before multiplying it by a row-major KxN weight.
+        // Keep that multiply and its BF16 rounding boundary in the LHS load
+        // feeding the same short-K MFMA32 pipeline used after Fly fission.
+        configs.insert(
+            configs.begin(),
+            MakeConfig(
+                /*block_m=*/32, /*block_n=*/64, /*block_k=*/128,
+                /*num_warps=*/2, FlyGemmConfig::FLY_MFMA_32X32X8,
+                /*prefetch_rhs=*/false, /*stage_output=*/false,
+                /*waves_per_eu=*/0, /*schedule_instructions=*/false,
+                /*stage_rhs=*/true, /*async_lhs=*/false,
+                /*preload_lds_fragments=*/true,
+                /*single_buffer_lds=*/true, /*direct_to_vgpr=*/false,
+                /*rolling_refill=*/true));
+
+        // The learned-scale projection is shallow enough that a compact tile
+        // wins by exposing four times as many CTAs as the M32/N64
+        // repository-style refill. M32/N32/K64 uses four MFMA16 waves and a
+        // 16 KiB ping-pong A+B allocation, so four workgroups can reside on a
+        // gfx942 CU. Keep instruction scheduling and occupancy measured: the
+        // same tile wins both the N768 QKV and N1024 MLP projections, while
+        // the larger K128/K256 alternatives only make autotuning noisier.
+        for (int32_t waves_per_eu : {0, 2, 4}) {
+          for (bool schedule : {false, true}) {
+            configs.push_back(MakeConfig(
+                /*block_m=*/32, /*block_n=*/32, /*block_k=*/64,
+                /*num_warps=*/4, FlyGemmConfig::FLY_MFMA_16X16X16,
+                /*prefetch_rhs=*/false, /*stage_output=*/false,
+                waves_per_eu, schedule, /*stage_rhs=*/true));
+          }
+        }
+      } else if (!lhs_k_contiguous && k % 32 == 0 && n % 128 == 0) {
+        // The corresponding weight-gradient dot contracts the leading
+        // dimension of the same scaled activation. The generic register-RHS
+        // path already maps that physical transpose and applies the learned
+        // per-output-channel scale while loading each LHS vector.
+        configs.insert(
+            configs.begin(),
+            MakeConfig(/*block_m=*/16, /*block_n=*/128, /*block_k=*/32,
+                       /*num_warps=*/4,
+                       FlyGemmConfig::FLY_MFMA_16X16X16));
+      }
+    }
     if (dot->shape().dimensions_size() == 2 && m == 4 && n % 128 == 0 &&
         k % 128 == 0 && rhs_column_contiguous &&
-        dot->operand(0)->shape().element_type() == BF16 &&
-        dot->operand(1)->shape().element_type() == BF16) {
+        homogeneous_bf16) {
       // Keep the learned per-K scale inside the MFMA4 decoder projection.
       // Returning before this candidate forces Fly fission to materialize a
       // 4xK temporary, while Triton folds the same multiply/rounding producer
@@ -2185,8 +2241,9 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
                          FlyGemmConfig::FLY_MFMA_4X4X4_BF16,
                          /*split_k=*/false, /*block_k=*/128));
     }
-    // Only the dedicated decoder GEMV family and its staged M16 variants
-    // lower this exact learned-scale producer grammar.
+    // Do not expose configurations outside the learned-scale load paths
+    // audited above. In particular, local-split and direct-to-VGPR schedules
+    // intentionally bypass producer arithmetic while moving split buffers.
     return configs;
   }
 
@@ -2607,6 +2664,24 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   // Apply the remaining gfx942 A+B LDS pipelines selected for long row-major
   // RHS inputs. Both geometries fit within the MI300X 64 KiB LDS allocation.
   if (k >= 1024) {
+    // Triton's winning shallow-output projection tile stages a K256 panel for
+    // two waves that share the same N16 RHS fragment. The generic Fly kernel
+    // streams that fragment independently in both waves; offer the equivalent
+    // A+B LDS pipeline so autotuning can measure reuse against the extra
+    // synchronization. Two stages occupy 48 KiB for BF16/F16.
+    add_staged_rhs_configs(/*block_m=*/32, /*block_n=*/16, /*block_k=*/256,
+                           /*num_warps_values=*/{2});
+    if (rhs_k_contiguous && m % 32 == 0 && n % 16 == 0 && k % 256 == 0) {
+      for (bool schedule : {false, true}) {
+        configs.push_back(MakeConfig(
+            /*block_m=*/32, /*block_n=*/16, /*block_k=*/256,
+            /*num_warps=*/2, FlyGemmConfig::FLY_MFMA_16X16X16,
+            /*prefetch_rhs=*/false, /*stage_output=*/false,
+            /*waves_per_eu=*/0, schedule, /*stage_rhs=*/true,
+            /*async_lhs=*/false, /*preload_lds_fragments=*/false,
+            /*single_buffer_lds=*/true));
+      }
+    }
     if (output_element_type == BF16 && !rhs_k_contiguous && m % 128 == 0 &&
         n % 128 == 0 && k % 64 == 0) {
       // Keep one 32 KiB A/B tile in LDS while the next tile is prefetched in
