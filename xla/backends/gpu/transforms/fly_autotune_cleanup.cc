@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/evaluator/hlo_evaluator.h"
 #include "xla/literal.h"
+#include "xla/service/hlo_cse.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape_util.h"
@@ -152,6 +153,54 @@ absl::StatusOr<bool> FoldScalarMaterialization(HloInstruction* producer) {
   return true;
 }
 
+bool IsEquivalentWrappedTranspose(const HloInstruction& fusion,
+                                  const HloInstruction& transpose) {
+  if (fusion.opcode() != HloOpcode::kFusion ||
+      (fusion.fusion_kind() != HloInstruction::FusionKind::kInput &&
+       !HasFlyFusionKind(fusion, kFlyFusionKind)) ||
+      fusion.operand_count() != 1 || transpose.opcode() != HloOpcode::kTranspose ||
+      fusion.operand(0) != transpose.operand(0) ||
+      !ShapeUtil::Equal(fusion.shape(), transpose.shape())) {
+    return false;
+  }
+  const HloComputation* computation = fusion.called_computations().front();
+  const HloInstruction* root = computation->root_instruction();
+  return computation->instruction_count() == 2 &&
+         root->opcode() == HloOpcode::kTranspose &&
+         IsParameter(root->operand(0), 0) &&
+         root->dimensions() == transpose.dimensions();
+}
+
+absl::StatusOr<bool> DeduplicateWrappedTransposes(
+    HloComputation* computation) {
+  std::vector<HloInstruction*> transposes;
+  for (HloInstruction* instruction : computation->instructions()) {
+    if (instruction->opcode() == HloOpcode::kTranspose &&
+        !instruction->IsRoot()) {
+      transposes.push_back(instruction);
+    }
+  }
+
+  bool changed = false;
+  for (HloInstruction* transpose : transposes) {
+    HloInstruction* replacement = nullptr;
+    for (HloInstruction* sibling : transpose->operand(0)->users()) {
+      if (sibling != transpose &&
+          IsEquivalentWrappedTranspose(*sibling, *transpose)) {
+        replacement = sibling;
+        break;
+      }
+    }
+    if (replacement == nullptr) {
+      continue;
+    }
+    RETURN_IF_ERROR(transpose->ReplaceAllUsesWith(replacement));
+    RETURN_IF_ERROR(computation->RemoveInstruction(transpose));
+    changed = true;
+  }
+  return changed;
+}
+
 }  // namespace
 
 absl::StatusOr<bool> FlyAutotuneCleanup::RunImpl(
@@ -179,6 +228,31 @@ absl::StatusOr<bool> FlyAutotuneCleanup::RunImpl(
       ASSIGN_OR_RETURN(bool folded, FoldScalePrologue(gemm));
       changed |= folded;
     }
+
+    // Fission can leave a transpose wrapped as an input fusion next to an
+    // equivalent, still-unwrapped transpose. The latter is wrapped during a
+    // later codegen preparation pass, which would otherwise turn this pair
+    // into two identical launches.
+    ASSIGN_OR_RETURN(bool deduplicated_transposes,
+                     DeduplicateWrappedTransposes(computation));
+    changed |= deduplicated_transposes;
+
+    // Config assignment fissions independently-autotuned Fly fusions in
+    // isolation. When two such fusions share a producer, inlining the
+    // fissioned computations can leave structurally identical Fly launch
+    // boundaries with the same operands. Common only those Fly fusions here;
+    // running unrestricted CSE would make this backend-specific cleanup pass
+    // change unrelated XLA codegen decisions.
+    HloCSE cse(
+        /*is_layout_sensitive=*/true,
+        /*ignore_control_dependencies=*/false,
+        /*should_eliminate_computation=*/nullptr,
+        /*should_eliminate_instruction=*/[](const HloInstruction* instruction) {
+          return HasFlyFusionKind(*instruction, kFlyFusionKind) &&
+                 HloCSE::ShouldEliminateInstruction(instruction);
+        });
+    ASSIGN_OR_RETURN(bool deduplicated, cse.RunOnComputation(computation));
+    changed |= deduplicated;
   }
   return changed;
 }

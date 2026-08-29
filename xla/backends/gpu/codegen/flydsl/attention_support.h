@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_GPU_CODEGEN_FLYDSL_ATTENTION_SUPPORT_H_
 #define XLA_BACKENDS_GPU_CODEGEN_FLYDSL_ATTENTION_SUPPORT_H_
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -43,6 +44,14 @@ struct FlyAttentionDescriptor {
   PrimitiveType element_type;
   const HloInstruction* qkv_parameter;
   const HloInstruction* key_value_parameter;
+  // Optional additive score bias, addressed logically as [B,H,Q,K]. A zero
+  // stride denotes a broadcast dimension.
+  const HloInstruction* bias_parameter;
+  std::array<int64_t, 4> bias_strides;
+  // Optional predicate score mask, also addressed as [B,H,Q,K]. False values
+  // are replaced by negative infinity before online softmax.
+  const HloInstruction* mask_parameter;
+  std::array<int64_t, 4> mask_strides;
   const HloInstruction* qk_dot;
   const HloInstruction* pv_dot;
   const HloInstruction* softmax_root;

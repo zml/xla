@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/flydsl/xtile_attention.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -31,6 +32,7 @@ limitations under the License.
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
@@ -174,8 +176,11 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
   absl::Status EmitKernel(mlir::func::FuncOp entry_function) const {
     const bool has_separate_key_value =
         descriptor_.key_value_parameter != descriptor_.qkv_parameter;
+    const bool has_bias = descriptor_.bias_parameter != nullptr;
+    const bool has_mask = descriptor_.mask_parameter != nullptr;
     TF_RET_CHECK(entry_function.getNumArguments() ==
-                 (has_separate_key_value ? 3 : 2));
+                 2 + (has_separate_key_value ? 1 : 0) + (has_bias ? 1 : 0) +
+                     (has_mask ? 1 : 0));
     TF_RET_CHECK(
         (descriptor_.element_type == BF16 || descriptor_.element_type == F16) &&
         descriptor_.sequence % 64 == 0 && block_m_ >= 32 &&
@@ -184,7 +189,12 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
         descriptor_.heads % descriptor_.key_value_heads == 0 &&
         descriptor_.key_value_sequence % 64 == 0 &&
         descriptor_.qkv_parameter->opcode() == HloOpcode::kParameter &&
-        descriptor_.key_value_parameter->opcode() == HloOpcode::kParameter);
+        descriptor_.key_value_parameter->opcode() == HloOpcode::kParameter &&
+        (!has_bias ||
+         descriptor_.bias_parameter->opcode() == HloOpcode::kParameter) &&
+        (!has_mask ||
+         (descriptor_.mask_parameter->opcode() == HloOpcode::kParameter &&
+          descriptor_.mask_parameter->shape().element_type() == PRED)));
 
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
@@ -192,6 +202,16 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
         descriptor_.qkv_parameter->parameter_number());
     Value key_value = entry_function.getArgument(
         descriptor_.key_value_parameter->parameter_number());
+    Value bias;
+    if (has_bias) {
+      bias = entry_function.getArgument(
+          descriptor_.bias_parameter->parameter_number());
+    }
+    Value mask;
+    if (has_mask) {
+      mask = entry_function.getArgument(
+          descriptor_.mask_parameter->parameter_number());
+    }
     Value output =
         entry_function.getArgument(entry_function.getNumArguments() - 1);
     mlir::Type element_type = descriptor_.element_type == BF16
@@ -285,6 +305,21 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
               IndexConstant(builder, plane_offset));
       return Add(builder, Add(builder, token_base, plane_base), column);
     };
+    auto logical_parameter_index =
+        [&](const std::array<int64_t, 4>& strides, Value key) {
+      Value index = IndexConstant(builder, 0);
+      const std::array<Value, 4> coordinates = {batch, head, q_row, key};
+      for (int dimension = 0; dimension < 4; ++dimension) {
+        if (strides[dimension] == 0) {
+          continue;
+        }
+        index = Add(
+            builder, index,
+            Mul(builder, coordinates[dimension],
+                IndexConstant(builder, strides[dimension])));
+      }
+      return index;
+    };
 
     constexpr int64_t kBlockN = 64;
     const int64_t kStride = descriptor_.head_dimension + 4;
@@ -349,22 +384,44 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
         llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(),
                               /*negative=*/true));
     Value l_running = F32Constant(builder, 0.0f);
+    constexpr double kLog2E = 1.4426950408889634;
+    // With a bias, scores become (QK * scale + bias) before online softmax, so
+    // the exponent only needs log2(e). Preserve the existing cheaper path for
+    // unbiased attention by folding the QK scale into log2(e).
     Value log2_scale = F32Constant(
-        builder, static_cast<float>(descriptor_.scale * 1.4426950408889634));
+        builder, static_cast<float>((has_bias ? 1.0 : descriptor_.scale) *
+                                    kLog2E));
+    Value score_scale;
+    mlir::Type bias_element_type;
+    if (has_bias) {
+      score_scale =
+          F32Constant(builder, static_cast<float>(descriptor_.scale));
+      switch (descriptor_.bias_parameter->shape().element_type()) {
+        case F32:
+          bias_element_type = builder.getF32Type();
+          break;
+        case BF16:
+          bias_element_type = builder.getBF16Type();
+          break;
+        case F16:
+          bias_element_type = builder.getF16Type();
+          break;
+        default:
+          return absl::InternalError("Unsupported Fly attention bias type.");
+      }
+    }
 
     const int64_t block_threads = num_warps_ * 64;
     const int64_t vectors_per_tile = kBlockN * descriptor_.head_dimension / 8;
     TF_RET_CHECK(vectors_per_tile % block_threads == 0);
     const int64_t vectors_per_thread = vectors_per_tile / block_threads;
 
-    for (int64_t kv_block = 0;
-         kv_block < descriptor_.key_value_sequence / kBlockN; ++kv_block) {
-      if (kv_block != 0) {
-        shared =
-            SyncThreadsOp::create(builder, mlir::TypeRange{shared_type}, shared)
-                .getResult(0);
-      }
-
+    auto emit_kv_block = [&](Value kv_block, Value& shared,
+                             std::vector<Value>& o_accumulators,
+                             Value& m_running, Value& l_running,
+                             bool synchronize_after) {
+      Value kv_token_base =
+          Mul(builder, kv_block, IndexConstant(builder, kBlockN));
       // Cooperative 128-bit global loads. K is stored row-major with the same
       // XOR16 swizzle as FlyDSL; V is transposed into [D,64+2] LDS so MFMA2
       // consumes a contiguous four-element K fragment.
@@ -375,8 +432,7 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
         Value column =
             Mul(builder, Rem(builder, flat, descriptor_.head_dimension / 8),
                 IndexConstant(builder, 8));
-        Value token =
-            Add(builder, IndexConstant(builder, kv_block * kBlockN), row);
+        Value token = Add(builder, kv_token_base, row);
         Value k_vector = EmitBufferLoad(
             builder, entry_function.getLoc(), key_value,
             key_value_index(token, /*plane=*/1, column), v8_element);
@@ -431,17 +487,63 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
       for (int64_t element = 0; element < 16; ++element) {
         Value lo = ExtractVectorElement(builder, scores_lo, element);
         Value hi = ExtractVectorElement(builder, scores_hi, element);
+        // MFMA32 distributes four adjacent key columns to each lane for each
+        // of four K steps. The second accumulator covers columns 32..63.
+        Value key_lo = Add(
+            builder,
+            Add(builder, kv_token_base,
+                IndexConstant(builder, (element / 4) * 8 + element % 4)),
+            Mul(builder, lane_div_32, IndexConstant(builder, 4)));
+        Value key_hi = Add(builder, key_lo, IndexConstant(builder, 32));
+        if (has_bias) {
+          Value bias_lo = EmitBufferLoad(builder, entry_function.getLoc(), bias,
+                                         logical_parameter_index(
+                                             descriptor_.bias_strides, key_lo),
+                                         bias_element_type);
+          Value bias_hi = EmitBufferLoad(builder, entry_function.getLoc(), bias,
+                                         logical_parameter_index(
+                                             descriptor_.bias_strides, key_hi),
+                                         bias_element_type);
+          if (!bias_element_type.isF32()) {
+            bias_lo = mlir::arith::ExtFOp::create(
+                builder, builder.getF32Type(), bias_lo);
+            bias_hi = mlir::arith::ExtFOp::create(
+                builder, builder.getF32Type(), bias_hi);
+          }
+          lo = mlir::arith::AddFOp::create(
+              builder,
+              mlir::arith::MulFOp::create(builder, lo, score_scale), bias_lo);
+          hi = mlir::arith::AddFOp::create(
+              builder,
+              mlir::arith::MulFOp::create(builder, hi, score_scale), bias_hi);
+        }
+        if (has_mask) {
+          Value mask_lo = EmitBufferLoad(
+              builder, entry_function.getLoc(), mask,
+              logical_parameter_index(descriptor_.mask_strides, key_lo),
+              builder.getI8Type());
+          Value mask_hi = EmitBufferLoad(
+              builder, entry_function.getLoc(), mask,
+              logical_parameter_index(descriptor_.mask_strides, key_hi),
+              builder.getI8Type());
+          Value zero = mlir::arith::ConstantIntOp::create(
+              builder, builder.getI8Type(), 0);
+          Value lo_valid = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ne, mask_lo, zero);
+          Value hi_valid = mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ne, mask_hi, zero);
+          Value negative_infinity = mlir::arith::ConstantFloatOp::create(
+              builder, builder.getF32Type(),
+              llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(),
+                                    /*negative=*/true));
+          lo = mlir::arith::SelectOp::create(builder, lo_valid, lo,
+                                             negative_infinity);
+          hi = mlir::arith::SelectOp::create(builder, hi_valid, hi,
+                                             negative_infinity);
+        }
         if (descriptor_.causal) {
-          // MFMA32 distributes four adjacent key columns to each lane for
-          // each of four K steps. The second accumulator covers columns
-          // 32..63. Mask in registers before the online-softmax reduction so
-          // the score matrix and predicate are never materialized.
-          Value key_lo =
-              Add(builder,
-                  IndexConstant(builder, kv_block * kBlockN +
-                                             (element / 4) * 8 + element % 4),
-                  Mul(builder, lane_div_32, IndexConstant(builder, 4)));
-          Value key_hi = Add(builder, key_lo, IndexConstant(builder, 32));
+          // Mask in registers before the online-softmax reduction so the
+          // score matrix and predicate are never materialized.
           Value lo_valid = mlir::arith::CmpIOp::create(
               builder, mlir::arith::CmpIPredicate::ule, key_lo, q_row);
           Value hi_valid = mlir::arith::CmpIOp::create(
@@ -561,6 +663,61 @@ class FlyXTileAttentionEmitter final : public MlirKernelEmitter {
       }
       m_running = m_new;
       l_running = l_new;
+      if (synchronize_after) {
+        shared =
+            SyncThreadsOp::create(builder, mlir::TypeRange{shared_type}, shared)
+                .getResult(0);
+      }
+    };
+
+    const int64_t kv_blocks = descriptor_.key_value_sequence / kBlockN;
+    constexpr int64_t kMaxUnrolledKvBlocks = 4;
+    if (kv_blocks <= kMaxUnrolledKvBlocks) {
+      for (int64_t kv_block = 0; kv_block < kv_blocks; ++kv_block) {
+        if (kv_block != 0) {
+          shared = SyncThreadsOp::create(
+                       builder, mlir::TypeRange{shared_type}, shared)
+                       .getResult(0);
+        }
+        emit_kv_block(IndexConstant(builder, kv_block), shared, o_accumulators,
+                      m_running, l_running, /*synchronize_after=*/false);
+      }
+    } else {
+      llvm::SmallVector<Value> initial_state = {shared};
+      initial_state.append(o_accumulators.begin(), o_accumulators.end());
+      initial_state.append({m_running, l_running});
+      mlir::scf::ForOp kv_loop = mlir::scf::ForOp::create(
+          builder, IndexConstant(builder, 0), IndexConstant(builder, kv_blocks),
+          IndexConstant(builder, 1), initial_state,
+          [](mlir::OpBuilder&, mlir::Location, Value, mlir::ValueRange) {});
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(kv_loop.getBody());
+        Value loop_shared = kv_loop.getRegionIterArg(0);
+        std::vector<Value> loop_accumulators;
+        loop_accumulators.reserve(o_accumulators.size());
+        for (int64_t d_chunk = 0; d_chunk < o_accumulators.size(); ++d_chunk) {
+          loop_accumulators.push_back(kv_loop.getRegionIterArg(1 + d_chunk));
+        }
+        Value loop_max =
+            kv_loop.getRegionIterArg(1 + o_accumulators.size());
+        Value loop_sum =
+            kv_loop.getRegionIterArg(2 + o_accumulators.size());
+        emit_kv_block(kv_loop.getInductionVar(), loop_shared,
+                      loop_accumulators, loop_max, loop_sum,
+                      /*synchronize_after=*/true);
+        llvm::SmallVector<Value> next_state = {loop_shared};
+        next_state.append(loop_accumulators.begin(), loop_accumulators.end());
+        next_state.append({loop_max, loop_sum});
+        mlir::scf::YieldOp::create(builder, next_state);
+      }
+      builder.setInsertionPointAfter(kv_loop);
+      shared = kv_loop.getResult(0);
+      for (int64_t d_chunk = 0; d_chunk < o_accumulators.size(); ++d_chunk) {
+        o_accumulators[d_chunk] = kv_loop.getResult(1 + d_chunk);
+      }
+      m_running = kv_loop.getResult(1 + o_accumulators.size());
+      l_running = kv_loop.getResult(2 + o_accumulators.size());
     }
 
     Value inverse_sum =

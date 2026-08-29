@@ -206,6 +206,7 @@ cc_library(
         "@llvm-project//mlir:MathDialect",
         "@llvm-project//mlir:Parser",
         "@llvm-project//mlir:ROCDLDialect",
+        "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:VectorDialect",
     ],
@@ -536,6 +537,7 @@ xla_cc_test(
         ":xtile_reduction",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/utils:hlo_traversal",
         "//xla/service/gpu:gpu_device_info_for_tests",
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/tests:xla_internal_test_main",
@@ -624,6 +626,64 @@ xla_test(
         "//xla:error_spec",
         "//xla/backends/autotuner:backends_proto_cc",
         "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
+        "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_test(
+    name = "softmax_backward_device_test",
+    srcs = ["softmax_backward_device_test.cc"],
+    backends = ["amdgpu_any"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        "//xla:error_spec",
+        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
+        "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_test(
+    name = "learned_scale_gemm_device_test",
+    srcs = ["learned_scale_gemm_device_test.cc"],
+    backends = ["amdgpu_any"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        "//xla:error_spec",
+        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
+        "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_test(
+    name = "attention_device_test",
+    srcs = ["attention_device_test.cc"],
+    backends = ["amdgpu_any"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        "//xla:error_spec",
+        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
         "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
         "//xla/tests:xla_internal_test_main",
         "@com_google_absl//absl/strings",

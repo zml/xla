@@ -17,17 +17,42 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_CODEGEN_FLYDSL_SOFTMAX_SUPPORT_H_
 
 #include <cstdint>
+#include <optional>
 
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 
 namespace xla::gpu::flydsl {
 
+// The two tensor inputs and score scale of a canonical softmax derivative.
+// The native kernel recomputes the stable softmax from `scores` and applies
+//   scale * p * (upstream_gradient - sum(upstream_gradient * p)).
+// The inputs are allowed to be view-compatible F16/BF16 interface tensors;
+// widening conversions and element-preserving bitcasts remain inside the
+// fusion. Their element count and final minor dimension match the output.
+struct FlySoftmaxBackwardDescriptor {
+  const HloInstruction* scores;
+  const HloInstruction* upstream_gradient;
+  const HloInstruction* output;
+  double scale;
+};
+
+std::optional<FlySoftmaxBackwardDescriptor> GetFlySoftmaxBackwardDescriptor(
+    const HloInstruction& root);
+std::optional<FlySoftmaxBackwardDescriptor> GetFlySoftmaxBackwardDescriptor(
+    const HloFusionAnalysis& analysis);
+
 // Returns the tensor entering a canonical stable softmax, or nullptr when the
 // root is not a supported softmax. Unlike IsFlySoftmaxRoot, this accepts a
-// producer expression instead of requiring the input to be a fusion parameter;
-// compound kernels such as attention use it to keep that producer on chip.
+// producer expression instead of requiring the input to be a fusion parameter.
+// The producer may remain F32 when an F16/BF16 result narrows scaled attention
+// scores; the native emitter performs the interface conversion on store.
 const HloInstruction* GetFlySoftmaxInput(const HloInstruction& root);
+
+// Returns a scalar producer scale folded into the native softmax input. The
+// input returned above is before this scale, so the emitter applies it before
+// the maximum and exponential reductions.
+double GetFlySoftmaxInputScale(const HloInstruction& root);
 
 // Returns a runtime row offset used by `exp(input - row_offset)` when the
 // normalized result is otherwise a canonical softmax. The offset is optional:

@@ -149,5 +149,124 @@ ENTRY main {
   }
 }
 
+TEST_F(FlyAutotuneCleanupTest, DeduplicatesIdenticalFlyFissionBoundaries) {
+  constexpr absl::string_view kHlo = R"(
+HloModule duplicate_fission_boundaries
+
+transpose_first {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  ROOT result = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+}
+
+transpose_second {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  ROOT result = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+}
+
+ENTRY main {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  first = bf16[2,64,3,4,64]{4,3,2,1,0} fusion(input), kind=kCustom,
+    calls=transpose_first,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","1","1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1}}}
+  second = bf16[2,64,3,4,64]{4,3,2,1,0} fusion(input), kind=kCustom,
+    calls=transpose_second,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","1","1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1}}}
+  ROOT result = (bf16[2,64,3,4,64]{4,3,2,1,0},
+                 bf16[2,64,3,4,64]{4,3,2,1,0}) tuple(first, second)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  FlyAutotuneCleanup cleanup;
+  ASSERT_OK_AND_ASSIGN(bool changed, cleanup.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(root->operand(0), root->operand(1));
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+}
+
+TEST_F(FlyAutotuneCleanupTest, DeduplicatesWrappedAndUnwrappedTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule wrapped_and_unwrapped_transpose
+
+wrapped_computation {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  ROOT result = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+}
+
+ENTRY main {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  unwrapped = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+  wrapped = bf16[2,64,3,4,64]{4,3,2,1,0} fusion(input), kind=kInput,
+    calls=wrapped_computation
+  ROOT result = (bf16[2,64,3,4,64]{4,3,2,1,0},
+                 bf16[2,64,3,4,64]{4,3,2,1,0}) tuple(unwrapped, wrapped)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  FlyAutotuneCleanup cleanup;
+  ASSERT_OK_AND_ASSIGN(bool changed, cleanup.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(root->operand(0), root->operand(1));
+  EXPECT_EQ(root->operand(0)->fusion_kind(),
+            HloInstruction::FusionKind::kInput);
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+}
+
+TEST_F(FlyAutotuneCleanupTest,
+       DeduplicatesConfiguredFlyAndUnwrappedTranspose) {
+  constexpr absl::string_view kHlo = R"(
+HloModule configured_fly_and_unwrapped_transpose
+
+wrapped_computation {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  ROOT result = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+}
+
+ENTRY main {
+  input = bf16[2,3,4,64,64]{4,3,2,1,0} parameter(0)
+  unwrapped = bf16[2,64,3,4,64]{4,3,2,1,0} transpose(input),
+    dimensions={0,4,1,2,3}
+  wrapped = bf16[2,64,3,4,64]{4,3,2,1,0} fusion(input), kind=kCustom,
+    calls=wrapped_computation,
+    backend_config={"fusion_backend_config":{"kind":"__fly",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["1","1","1","1","1"]}],
+      "num_warps":"4","num_ctas":1,"num_stages":1}}}
+  ROOT result = (bf16[2,64,3,4,64]{4,3,2,1,0},
+                 bf16[2,64,3,4,64]{4,3,2,1,0}) tuple(unwrapped, wrapped)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  FlyAutotuneCleanup cleanup;
+  ASSERT_OK_AND_ASSIGN(bool changed, cleanup.Run(module.get()));
+  EXPECT_TRUE(changed);
+
+  HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kTuple);
+  EXPECT_EQ(root->operand(0), root->operand(1));
+  EXPECT_EQ(root->operand(0)->fusion_kind(),
+            HloInstruction::FusionKind::kCustom);
+  EXPECT_EQ(module->entry_computation()->instruction_count(), 3);
+}
+
 }  // namespace
 }  // namespace xla::gpu

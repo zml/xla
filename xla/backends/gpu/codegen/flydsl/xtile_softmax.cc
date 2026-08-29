@@ -108,17 +108,25 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
  public:
   explicit FlyXTileSoftmaxEmitter(const HloFusionAnalysis& analysis) {
     const HloInstruction& root = analysis.fusion_root(0).instruction();
+    std::optional<FlySoftmaxBackwardDescriptor> softmax_backward =
+        GetFlySoftmaxBackwardDescriptor(analysis);
     std::optional<FlyLayerNormDescriptor> layer_norm =
         GetFlyLayerNormDescriptor(analysis);
+    is_softmax_backward_ = softmax_backward.has_value();
+    softmax_backward_scale_ =
+        softmax_backward.has_value() ? softmax_backward->scale : 1.0;
+    softmax_input_scale_ =
+        softmax_backward.has_value() || layer_norm.has_value()
+            ? 1.0
+            : GetFlySoftmaxInputScale(root);
     is_layer_norm_ = layer_norm.has_value();
     epsilon_ = layer_norm.has_value() ? layer_norm->epsilon : 0.0;
     output_count_ = layer_norm.has_value() ? layer_norm->output_count : 1;
     uses_moments_variance_ =
         layer_norm.has_value() && layer_norm->uses_moments_variance;
     layer_norm_parameter_count_ =
-        layer_norm.has_value()
-            ? layer_norm->input->parent()->num_parameters()
-            : 0;
+        layer_norm.has_value() ? layer_norm->input->parent()->num_parameters()
+                               : 0;
     gamma_parameter_number_ =
         layer_norm.has_value() && layer_norm->gamma != nullptr
             ? layer_norm->gamma->parameter_number()
@@ -128,7 +136,10 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
             ? layer_norm->beta->parameter_number()
             : -1;
     const HloInstruction* input =
-        layer_norm.has_value() ? layer_norm->input : GetFlySoftmaxInput(root);
+        layer_norm.has_value()
+            ? layer_norm->input
+            : (softmax_backward.has_value() ? softmax_backward->scores
+                                            : GetFlySoftmaxInput(root));
     CHECK(input != nullptr);
     while (input->opcode() == HloOpcode::kBitcast &&
            input->operand_count() == 1) {
@@ -136,7 +147,15 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     }
     CHECK_EQ(input->opcode(), HloOpcode::kParameter);
     input_parameter_number_ = input->parameter_number();
-    if (!is_layer_norm_) {
+    if (softmax_backward.has_value()) {
+      const HloInstruction* upstream = softmax_backward->upstream_gradient;
+      while (upstream->opcode() == HloOpcode::kBitcast &&
+             upstream->operand_count() == 1) {
+        upstream = upstream->operand(0);
+      }
+      CHECK_EQ(upstream->opcode(), HloOpcode::kParameter);
+      upstream_gradient_parameter_number_ = upstream->parameter_number();
+    } else if (!is_layer_norm_) {
       const HloInstruction* row_offset = GetFlySoftmaxExternalRowOffset(root);
       if (row_offset != nullptr) {
         external_row_parameter_number_ = row_offset->parameter_number();
@@ -214,9 +233,10 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
                           mlir::func::FuncOp maximum,
                           mlir::func::FuncOp add_reducer) const {
     const bool has_external_row = external_row_parameter_number_ >= 0;
-    const int64_t parameter_count =
-        is_layer_norm_ ? layer_norm_parameter_count_
-                       : (has_external_row ? 2 : 1);
+    const int64_t parameter_count = is_layer_norm_ ? layer_norm_parameter_count_
+                                    : is_softmax_backward_
+                                        ? 2
+                                        : (has_external_row ? 2 : 1);
     const int64_t expected_arguments = parameter_count + output_count_;
     TF_RET_CHECK(entry_function.getNumArguments() == expected_arguments);
     TF_RET_CHECK(input_parameter_number_ >= 0 &&
@@ -225,6 +245,11 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     TF_RET_CHECK(beta_parameter_number_ < parameter_count);
     TF_RET_CHECK(!has_external_row ||
                  external_row_parameter_number_ < parameter_count);
+    TF_RET_CHECK(
+        !is_softmax_backward_ ||
+        (upstream_gradient_parameter_number_ >= 0 &&
+         upstream_gradient_parameter_number_ < parameter_count &&
+         upstream_gradient_parameter_number_ != input_parameter_number_));
     const int64_t threads = independent_rows_ ? 64 : num_warps_ * 64;
     TF_RET_CHECK(num_warps_ > 0 && num_warps_ <= 16 && columns_ > 0 &&
                  (columns_ + threads - 1) / threads <= 64);
@@ -232,6 +257,10 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
     mlir::ImplicitLocOpBuilder builder(entry_function.getLoc(), entry_function);
     builder.setInsertionPointToStart(entry_function.addEntryBlock());
     Value input = entry_function.getArgument(input_parameter_number_);
+    Value upstream_gradient =
+        is_softmax_backward_
+            ? entry_function.getArgument(upstream_gradient_parameter_number_)
+            : Value();
     Value gamma = gamma_parameter_number_ >= 0
                       ? entry_function.getArgument(gamma_parameter_number_)
                       : Value();
@@ -247,13 +276,11 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
                             ? entry_function.getArgument(parameter_count + 1)
                             : Value();
     Value reciprocal_stddev_output =
-        output_count_ > 1
-            ? entry_function.getArgument(parameter_count + 2)
-            : Value();
+        output_count_ > 1 ? entry_function.getArgument(parameter_count + 2)
+                          : Value();
     Value reciprocal_stddev_cube_output =
-        output_count_ > 3
-            ? entry_function.getArgument(parameter_count + 3)
-            : Value();
+        output_count_ > 3 ? entry_function.getArgument(parameter_count + 3)
+                          : Value();
     Value thread_id = EmitThreadId(builder, 0);
     Value block_id = EmitBlockId(builder, 0);
     Value wave_id = Div(builder, thread_id, 64);
@@ -292,9 +319,15 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
       return type && type.getRank() == 1 && type.getDimSize(0) == columns_;
     };
-    TF_RET_CHECK(has_minor_vector_shape(gamma) &&
-                 has_minor_vector_shape(beta));
+    TF_RET_CHECK(has_minor_vector_shape(gamma) && has_minor_vector_shape(beta));
     std::vector<Value> input_row_indices = make_row_indices(input_dimensions);
+    if (upstream_gradient) {
+      auto upstream_type =
+          mlir::dyn_cast<mlir::RankedTensorType>(upstream_gradient.getType());
+      TF_RET_CHECK(upstream_type &&
+                   upstream_type.getShape() ==
+                       llvm::ArrayRef<int64_t>(input_dimensions));
+    }
     auto has_row_output_shape = [&](Value value) {
       if (!value) return true;
       auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
@@ -324,9 +357,9 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
 
     auto store_row_output = [&](Value row_output, Value value) -> Value {
       Value writer_id = independent_rows_ ? lane_id : thread_id;
-      Value condition = mlir::arith::CmpIOp::create(
-          builder, mlir::arith::CmpIPredicate::eq, writer_id,
-          IndexConstant(builder, 0));
+      Value condition =
+          mlir::arith::CmpIOp::create(builder, mlir::arith::CmpIPredicate::eq,
+                                      writer_id, IndexConstant(builder, 0));
       if (!all_rows_in_bounds) {
         condition =
             mlir::arith::AndIOp::create(builder, condition, row_in_bounds);
@@ -338,8 +371,7 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(store.thenBlock());
         Value updated = mlir::tensor::InsertOp::create(
-            builder, value, row_output,
-            mlir::ValueRange(output_row_indices));
+            builder, value, row_output, mlir::ValueRange(output_row_indices));
         mlir::scf::YieldOp::create(builder, updated);
         builder.setInsertionPointToStart(store.elseBlock());
         mlir::scf::YieldOp::create(builder, row_output);
@@ -395,8 +427,8 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       {
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(load.thenBlock());
-        Value value = mlir::tensor::ExtractOp::create(
-            builder, vector, mlir::ValueRange{column});
+        Value value = mlir::tensor::ExtractOp::create(builder, vector,
+                                                      mlir::ValueRange{column});
         mlir::scf::YieldOp::create(builder, convert_input(value));
         builder.setInsertionPointToStart(load.elseBlock());
         mlir::scf::YieldOp::create(builder, fallback);
@@ -439,9 +471,55 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       return load.getResult(0);
     };
 
+    auto load_upstream_gradient = [&](Value column,
+                                      bool all_columns_in_bounds) -> Value {
+      CHECK(upstream_gradient);
+      const bool all_threads_in_bounds =
+          all_rows_in_bounds && all_columns_in_bounds;
+      if (all_threads_in_bounds) {
+        std::vector<Value> indices = input_row_indices;
+        indices.push_back(column);
+        return convert_input(mlir::tensor::ExtractOp::create(
+            builder, upstream_gradient, mlir::ValueRange(indices)));
+      }
+      Value in_bounds =
+          mlir::arith::CmpIOp::create(builder, mlir::arith::CmpIPredicate::ult,
+                                      column, IndexConstant(builder, columns_));
+      if (!all_rows_in_bounds) {
+        in_bounds =
+            mlir::arith::AndIOp::create(builder, in_bounds, row_in_bounds);
+      }
+      mlir::scf::IfOp load = mlir::scf::IfOp::create(
+          builder, mlir::TypeRange{builder.getF32Type()}, in_bounds,
+          /*withElseRegion=*/true);
+      {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(load.thenBlock());
+        std::vector<Value> indices = input_row_indices;
+        indices.push_back(column);
+        Value value = mlir::tensor::ExtractOp::create(
+            builder, upstream_gradient, mlir::ValueRange(indices));
+        mlir::scf::YieldOp::create(builder, convert_input(value));
+        builder.setInsertionPointToStart(load.elseBlock());
+        mlir::scf::YieldOp::create(builder, zero);
+      }
+      builder.setInsertionPointAfter(load);
+      return load.getResult(0);
+    };
+
     std::vector<Value> values;
+    std::vector<Value> upstream_gradient_values;
     const int64_t values_per_thread = (columns_ + threads - 1) / threads;
     values.reserve(values_per_thread);
+    if (is_softmax_backward_) {
+      upstream_gradient_values.reserve(values_per_thread);
+    }
+    Value backward_scale = mlir::arith::ConstantFloatOp::create(
+        builder, builder.getF32Type(),
+        llvm::APFloat(static_cast<float>(softmax_backward_scale_)));
+    Value softmax_input_scale = mlir::arith::ConstantFloatOp::create(
+        builder, builder.getF32Type(),
+        llvm::APFloat(static_cast<float>(softmax_input_scale_)));
     Value local_max = minus_inf;
     Value local_sum = zero;
     Value local_input_squared_sum = zero;
@@ -449,6 +527,14 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       Value column =
           Add(builder, element_thread_id, IndexConstant(builder, i * threads));
       Value value = load_input(column, (i + 1) * threads <= columns_);
+      if (is_softmax_backward_) {
+        upstream_gradient_values.push_back(
+            load_upstream_gradient(column, (i + 1) * threads <= columns_));
+        value = mlir::arith::MulFOp::create(builder, value, backward_scale);
+      } else if (!is_layer_norm_ && softmax_input_scale_ != 1.0) {
+        value =
+            mlir::arith::MulFOp::create(builder, value, softmax_input_scale);
+      }
       if (recompute_maximum_after_external_row_offset_) {
         value = mlir::arith::SubFOp::create(builder, value, row_offset);
       }
@@ -456,8 +542,7 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       local_max = mlir::arith::MaxNumFOp::create(builder, local_max, value);
       local_sum = mlir::arith::AddFOp::create(builder, local_sum, value);
       if (uses_moments_variance_) {
-        Value square =
-            mlir::arith::MulFOp::create(builder, value, value);
+        Value square = mlir::arith::MulFOp::create(builder, value, value);
         local_input_squared_sum = mlir::arith::AddFOp::create(
             builder, local_input_squared_sum, square);
       }
@@ -612,15 +697,14 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
                          /*is_maximum=*/false);
         Value square_mean = mlir::arith::MulFOp::create(
             builder, block_input_squared_sum, reciprocal_columns);
-        Value mean_square =
-            mlir::arith::MulFOp::create(builder, mean, mean);
+        Value mean_square = mlir::arith::MulFOp::create(builder, mean, mean);
         variance =
             mlir::arith::SubFOp::create(builder, square_mean, mean_square);
       } else {
         Value block_squared_sum = block_reduce(local_squared_sum, add_reducer,
                                                zero, /*is_maximum=*/false);
         variance = mlir::arith::MulFOp::create(builder, block_squared_sum,
-                                              reciprocal_columns);
+                                               reciprocal_columns);
       }
       Value epsilon = mlir::arith::ConstantFloatOp::create(
           builder, builder.getF32Type(),
@@ -642,20 +726,19 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
       Value one = mlir::arith::ConstantFloatOp::create(
           builder, builder.getF32Type(), llvm::APFloat(1.0f));
       for (int64_t i = 0; i < centered.size(); ++i) {
-        Value result = mlir::arith::MulFOp::create(
-            builder, centered[i], reciprocal_stddev);
-        Value column =
-            Add(builder, element_thread_id,
-                IndexConstant(builder, i * threads));
+        Value result = mlir::arith::MulFOp::create(builder, centered[i],
+                                                   reciprocal_stddev);
+        Value column = Add(builder, element_thread_id,
+                           IndexConstant(builder, i * threads));
         const bool all_columns_in_bounds = (i + 1) * threads <= columns_;
         if (gamma) {
-          Value scale = load_minor_vector(gamma, column,
-                                          all_columns_in_bounds, one);
+          Value scale =
+              load_minor_vector(gamma, column, all_columns_in_bounds, one);
           result = mlir::arith::MulFOp::create(builder, result, scale);
         }
         if (beta) {
-          Value bias = load_minor_vector(beta, column,
-                                         all_columns_in_bounds, zero);
+          Value bias =
+              load_minor_vector(beta, column, all_columns_in_bounds, zero);
           result = mlir::arith::AddFOp::create(builder, result, bias);
         }
         normalized_values.push_back(result);
@@ -684,9 +767,34 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
                                      /*is_maximum=*/false);
       Value reciprocal = mlir::ROCDL::ROCDLRcp::create(
           builder, builder.getF32Type(), block_sum);
-      for (Value exponential : exponentials) {
-        normalized_values.push_back(
-            mlir::arith::MulFOp::create(builder, exponential, reciprocal));
+      if (is_softmax_backward_) {
+        Value local_weighted_sum = zero;
+        for (int64_t i = 0; i < exponentials.size(); ++i) {
+          Value weighted = mlir::arith::MulFOp::create(
+              builder, exponentials[i], upstream_gradient_values[i]);
+          local_weighted_sum = mlir::arith::AddFOp::create(
+              builder, local_weighted_sum, weighted);
+        }
+        Value block_weighted_sum =
+            block_reduce(local_weighted_sum, add_reducer, zero,
+                         /*is_maximum=*/false);
+        Value mean_gradient = mlir::arith::MulFOp::create(
+            builder, block_weighted_sum, reciprocal);
+        for (int64_t i = 0; i < exponentials.size(); ++i) {
+          Value centered_gradient = mlir::arith::SubFOp::create(
+              builder, upstream_gradient_values[i], mean_gradient);
+          Value probability =
+              mlir::arith::MulFOp::create(builder, exponentials[i], reciprocal);
+          Value result = mlir::arith::MulFOp::create(builder, centered_gradient,
+                                                     probability);
+          normalized_values.push_back(
+              mlir::arith::MulFOp::create(builder, result, backward_scale));
+        }
+      } else {
+        for (Value exponential : exponentials) {
+          normalized_values.push_back(
+              mlir::arith::MulFOp::create(builder, exponential, reciprocal));
+        }
       }
     }
     mlir::Type result_type;
@@ -761,9 +869,13 @@ class FlyXTileSoftmaxEmitter final : public MlirKernelEmitter {
   std::vector<int64_t> dimensions_;
   bool independent_rows_ = false;
   int64_t input_parameter_number_ = 0;
+  int64_t upstream_gradient_parameter_number_ = -1;
   int64_t external_row_parameter_number_ = -1;
   bool recompute_maximum_after_external_row_offset_ = false;
   bool is_layer_norm_ = false;
+  bool is_softmax_backward_ = false;
+  double softmax_backward_scale_ = 1.0;
+  double softmax_input_scale_ = 1.0;
   double epsilon_ = 0.0;
   int64_t layer_norm_parameter_count_ = 0;
   int64_t gamma_parameter_number_ = -1;

@@ -171,6 +171,349 @@ std::optional<double> MatchScaledDot(const HloInstruction* instruction,
   }
 }
 
+struct BroadcastParameterMatch {
+  const HloInstruction* parameter;
+  std::array<int64_t, 4> strides;
+};
+
+std::optional<std::vector<int64_t>> InitialLogicalDimensions(
+    const Shape& score_shape,
+    const std::array<int64_t, 4>& logical_score_shape) {
+  if (score_shape.dimensions_size() == 4 &&
+      score_shape.dimensions(0) == logical_score_shape[0] &&
+      score_shape.dimensions(1) == logical_score_shape[1] &&
+      score_shape.dimensions(2) == logical_score_shape[2] &&
+      score_shape.dimensions(3) == logical_score_shape[3]) {
+    return std::vector<int64_t>{0, 1, 2, 3};
+  }
+  if (score_shape.dimensions_size() == 3 && logical_score_shape[1] == 1 &&
+      score_shape.dimensions(0) == logical_score_shape[0] &&
+      score_shape.dimensions(1) == logical_score_shape[2] &&
+      score_shape.dimensions(2) == logical_score_shape[3]) {
+    // Layout simplification folds a unit head dimension out of attention
+    // scores. Preserve the logical [B,H,Q,K] mapping with a zero H stride.
+    return std::vector<int64_t>{0, 2, 3};
+  }
+  return std::nullopt;
+}
+
+// Carries the logical score-dimension mapping through one materialization-free
+// unary operation. Reshapes are intentionally limited to inserting/removing
+// unit dimensions; accepting arbitrary flattening would lose which dimension
+// is the query or key coordinate.
+bool MapLogicalDimensionsToOperand(
+    const HloInstruction* instruction,
+    std::vector<int64_t>* logical_dimensions) {
+  if (instruction->operand_count() != 1 ||
+      instruction->shape().dimensions_size() != logical_dimensions->size()) {
+    return false;
+  }
+  const HloInstruction* operand = instruction->operand(0);
+  switch (instruction->opcode()) {
+    case HloOpcode::kConvert:
+    case HloOpcode::kCopy:
+      return ShapeUtil::SameDimensions(instruction->shape(), operand->shape());
+    case HloOpcode::kBroadcast: {
+      if (instruction->dimensions().size() !=
+          operand->shape().dimensions_size()) {
+        return false;
+      }
+      std::vector<int64_t> operand_dimensions(
+          operand->shape().dimensions_size(), -1);
+      for (int64_t dimension = 0;
+           dimension < operand->shape().dimensions_size(); ++dimension) {
+        const int64_t output_dimension = instruction->dimensions(dimension);
+        if (output_dimension < 0 ||
+            output_dimension >= logical_dimensions->size()) {
+          return false;
+        }
+        operand_dimensions[dimension] =
+            (*logical_dimensions)[output_dimension];
+      }
+      *logical_dimensions = std::move(operand_dimensions);
+      return true;
+    }
+    case HloOpcode::kBitcast:
+    case HloOpcode::kReshape: {
+      std::vector<int64_t> output_non_unit;
+      std::vector<int64_t> input_non_unit;
+      for (int64_t dimension = 0;
+           dimension < instruction->shape().dimensions_size(); ++dimension) {
+        if (instruction->shape().dimensions(dimension) != 1) {
+          output_non_unit.push_back(dimension);
+        }
+      }
+      for (int64_t dimension = 0;
+           dimension < operand->shape().dimensions_size(); ++dimension) {
+        if (operand->shape().dimensions(dimension) != 1) {
+          input_non_unit.push_back(dimension);
+        }
+      }
+      if (output_non_unit.size() != input_non_unit.size()) {
+        return false;
+      }
+      std::vector<int64_t> operand_dimensions(
+          operand->shape().dimensions_size(), -1);
+      for (int64_t index = 0; index < output_non_unit.size(); ++index) {
+        const int64_t output_dimension = output_non_unit[index];
+        const int64_t input_dimension = input_non_unit[index];
+        if (instruction->shape().dimensions(output_dimension) !=
+            operand->shape().dimensions(input_dimension)) {
+          return false;
+        }
+        operand_dimensions[input_dimension] =
+            (*logical_dimensions)[output_dimension];
+      }
+      *logical_dimensions = std::move(operand_dimensions);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+std::optional<BroadcastParameterMatch> MatchBroadcastParameterFromDimensions(
+    const HloInstruction* instruction,
+    std::vector<int64_t> logical_dimensions,
+    const std::array<int64_t, 4>& logical_score_shape, bool predicate) {
+  while (instruction->opcode() != HloOpcode::kParameter) {
+    if (!MapLogicalDimensionsToOperand(instruction, &logical_dimensions)) {
+      return std::nullopt;
+    }
+    instruction = instruction->operand(0);
+  }
+
+  const Shape& parameter_shape = instruction->shape();
+  const bool supported_type =
+      predicate
+          ? parameter_shape.element_type() == PRED
+          : (parameter_shape.element_type() == F32 ||
+             parameter_shape.element_type() == BF16 ||
+             parameter_shape.element_type() == F16);
+  if (!supported_type || !parameter_shape.has_layout() ||
+      !LayoutUtil::IsMonotonicWithDim0Major(parameter_shape.layout()) ||
+      parameter_shape.dimensions_size() != logical_dimensions.size()) {
+    return std::nullopt;
+  }
+
+  std::vector<int64_t> parameter_strides(parameter_shape.dimensions_size());
+  int64_t stride = 1;
+  for (int64_t dimension = parameter_shape.dimensions_size() - 1;
+       dimension >= 0; --dimension) {
+    parameter_strides[dimension] = stride;
+    stride *= parameter_shape.dimensions(dimension);
+  }
+  std::array<int64_t, 4> logical_strides = {0, 0, 0, 0};
+  std::array<bool, 4> seen = {false, false, false, false};
+  for (int64_t dimension = 0; dimension < logical_dimensions.size();
+       ++dimension) {
+    const int64_t logical_dimension = logical_dimensions[dimension];
+    if (logical_dimension < 0) {
+      if (parameter_shape.dimensions(dimension) != 1) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    if (logical_dimension >= 4 || seen[logical_dimension] ||
+        parameter_shape.dimensions(dimension) !=
+            logical_score_shape[logical_dimension]) {
+      return std::nullopt;
+    }
+    seen[logical_dimension] = true;
+    logical_strides[logical_dimension] = parameter_strides[dimension];
+  }
+  return BroadcastParameterMatch{instruction, logical_strides};
+}
+
+// Maps a broadcastable bias expression back to its parameter. The score
+// tensor is logically [B,H,Q,K]. We accept unary conversions/copies,
+// broadcasts, and bitcasts/reshapes that only insert or remove unit
+// dimensions. This is enough for XLA's canonical [1,H,Q,K] bias lowering
+// without pretending arbitrary reshapes are safe.
+std::optional<BroadcastParameterMatch> MatchBroadcastParameter(
+    const HloInstruction* instruction, const Shape& score_shape,
+    const std::array<int64_t, 4>& logical_score_shape, bool predicate) {
+  if (!ShapeUtil::SameDimensions(instruction->shape(), score_shape)) {
+    return std::nullopt;
+  }
+  std::optional<std::vector<int64_t>> logical_dimensions =
+      InitialLogicalDimensions(score_shape, logical_score_shape);
+  if (!logical_dimensions.has_value()) {
+    return std::nullopt;
+  }
+  return MatchBroadcastParameterFromDimensions(
+      instruction, std::move(*logical_dimensions), logical_score_shape,
+      predicate);
+}
+
+bool IsCausalPredicateFromDimensions(
+    const HloInstruction* instruction,
+    std::vector<int64_t> logical_dimensions, int64_t sequence) {
+  while (instruction->operand_count() == 1) {
+    if (!MapLogicalDimensionsToOperand(instruction, &logical_dimensions)) {
+      break;
+    }
+    instruction = instruction->operand(0);
+  }
+  if (instruction->opcode() != HloOpcode::kCompare ||
+      instruction->operand_count() != 2 ||
+      instruction->shape().dimensions_size() != logical_dimensions.size()) {
+    return false;
+  }
+  const HloInstruction* lhs = instruction->operand(0);
+  const HloInstruction* rhs = instruction->operand(1);
+  if (lhs->opcode() != HloOpcode::kIota ||
+      rhs->opcode() != HloOpcode::kIota ||
+      !ShapeUtil::Compatible(lhs->shape(), rhs->shape())) {
+    return false;
+  }
+  const int64_t lhs_dimension =
+      Cast<const HloIotaInstruction>(lhs)->iota_dimension();
+  const int64_t rhs_dimension =
+      Cast<const HloIotaInstruction>(rhs)->iota_dimension();
+  if (lhs_dimension < 0 || lhs_dimension >= logical_dimensions.size() ||
+      rhs_dimension < 0 || rhs_dimension >= logical_dimensions.size() ||
+      lhs->shape().dimensions(lhs_dimension) != sequence ||
+      rhs->shape().dimensions(rhs_dimension) != sequence) {
+    return false;
+  }
+  const int64_t lhs_logical_dimension = logical_dimensions[lhs_dimension];
+  const int64_t rhs_logical_dimension = logical_dimensions[rhs_dimension];
+  const bool key_le_query =
+      instruction->comparison_direction() == ComparisonDirection::kLe &&
+      lhs_logical_dimension == 3 && rhs_logical_dimension == 2;
+  const bool query_ge_key =
+      instruction->comparison_direction() == ComparisonDirection::kGe &&
+      lhs_logical_dimension == 2 && rhs_logical_dimension == 3;
+  return key_le_query || query_ge_key;
+}
+
+bool HasCausalPredicateFromDimensions(
+    const HloInstruction* instruction,
+    std::vector<int64_t> logical_dimensions, int64_t sequence) {
+  if (IsCausalPredicateFromDimensions(instruction, logical_dimensions,
+                                      sequence)) {
+    return true;
+  }
+  while (instruction->operand_count() == 1 &&
+         MapLogicalDimensionsToOperand(instruction, &logical_dimensions)) {
+    instruction = instruction->operand(0);
+  }
+  if (instruction->opcode() != HloOpcode::kAnd ||
+      instruction->operand_count() != 2) {
+    return false;
+  }
+  const bool lhs_causal = IsCausalPredicateFromDimensions(
+      instruction->operand(0), logical_dimensions, sequence);
+  const bool rhs_causal = IsCausalPredicateFromDimensions(
+      instruction->operand(1), logical_dimensions, sequence);
+  // Accept exactly one top-level causal conjunct. Keeping the pure matcher
+  // separate prevents nested conjunctions from silently dropping a mask.
+  return lhs_causal != rhs_causal;
+}
+
+struct AttentionMaskMatch {
+  bool causal;
+  std::optional<BroadcastParameterMatch> external;
+};
+
+std::optional<AttentionMaskMatch> MatchAttentionMask(
+    const HloInstruction* instruction, const Shape& score_shape,
+    const std::array<int64_t, 4>& logical_score_shape) {
+  if (instruction->opcode() != HloOpcode::kSelect ||
+      instruction->operand_count() != 3 ||
+      !ShapeUtil::SameDimensions(instruction->shape(), score_shape)) {
+    return std::nullopt;
+  }
+  std::optional<double> masked_value = UniformConstant(instruction->operand(2));
+  if (!masked_value.has_value() || !std::isinf(*masked_value) ||
+      *masked_value >= 0.0) {
+    return std::nullopt;
+  }
+  std::optional<std::vector<int64_t>> initial_dimensions =
+      InitialLogicalDimensions(score_shape, logical_score_shape);
+  if (!initial_dimensions.has_value()) {
+    return std::nullopt;
+  }
+  const HloInstruction* predicate = instruction->operand(0);
+  if (std::optional<BroadcastParameterMatch> external =
+          MatchBroadcastParameterFromDimensions(
+              predicate, *initial_dimensions, logical_score_shape,
+              /*predicate=*/true)) {
+    return AttentionMaskMatch{/*causal=*/false, std::move(external)};
+  }
+
+  const bool causal = HasCausalPredicateFromDimensions(
+      predicate, *initial_dimensions, logical_score_shape[2]);
+  if (!causal) {
+    return std::nullopt;
+  }
+
+  // Carry the score mapping through any outer broadcast/unit views to the
+  // conjunction. A bare causal predicate has no external parameter.
+  std::vector<int64_t> conjunct_dimensions = *initial_dimensions;
+  const HloInstruction* conjunction = predicate;
+  while (conjunction->operand_count() == 1 &&
+         MapLogicalDimensionsToOperand(conjunction, &conjunct_dimensions)) {
+    conjunction = conjunction->operand(0);
+  }
+  if (conjunction->opcode() != HloOpcode::kAnd ||
+      conjunction->operand_count() != 2) {
+    return AttentionMaskMatch{/*causal=*/true, std::nullopt};
+  }
+
+  const bool lhs_causal = IsCausalPredicateFromDimensions(
+      conjunction->operand(0), conjunct_dimensions, logical_score_shape[2]);
+  const bool rhs_causal = IsCausalPredicateFromDimensions(
+      conjunction->operand(1), conjunct_dimensions, logical_score_shape[2]);
+  if (lhs_causal == rhs_causal) {
+    return std::nullopt;
+  }
+  std::optional<BroadcastParameterMatch> external =
+      MatchBroadcastParameterFromDimensions(
+          conjunction->operand(lhs_causal ? 1 : 0), conjunct_dimensions,
+          logical_score_shape, /*predicate=*/true);
+  if (!external.has_value()) {
+    return std::nullopt;
+  }
+  return AttentionMaskMatch{/*causal=*/true, std::move(external)};
+}
+
+struct AttentionScoresMatch {
+  double scale;
+  const HloInstruction* bias_parameter;
+  std::array<int64_t, 4> bias_strides;
+};
+
+std::optional<AttentionScoresMatch> MatchAttentionScores(
+    const HloInstruction* instruction, const HloInstruction* dot,
+    const Shape& score_shape,
+    const std::array<int64_t, 4>& logical_score_shape) {
+  if (std::optional<double> scale = MatchScaledDot(instruction, dot)) {
+    return AttentionScoresMatch{*scale, nullptr, {0, 0, 0, 0}};
+  }
+  if (instruction->opcode() != HloOpcode::kAdd ||
+      instruction->operand_count() != 2) {
+    return std::nullopt;
+  }
+  for (int dot_operand = 0; dot_operand < 2; ++dot_operand) {
+    std::optional<double> scale =
+        MatchScaledDot(instruction->operand(dot_operand), dot);
+    if (!scale.has_value()) {
+      continue;
+    }
+    std::optional<BroadcastParameterMatch> bias = MatchBroadcastParameter(
+        instruction->operand(1 - dot_operand), score_shape,
+        logical_score_shape,
+        /*predicate=*/false);
+    if (!bias.has_value()) {
+      continue;
+    }
+    return AttentionScoresMatch{*scale, bias->parameter, bias->strides};
+  }
+  return std::nullopt;
+}
+
 bool IsQkDot(const HloInstruction& dot, int64_t batch_heads,
              int64_t query_sequence, int64_t key_value_sequence,
              int64_t head_dimension) {
@@ -377,6 +720,10 @@ std::optional<FlyAttentionDescriptor> MatchGroupedAttentionDescriptor(
                                   element_type,
                                   qkv,
                                   qkv,
+                                  nullptr,
+                                  {0, 0, 0, 0},
+                                  nullptr,
+                                  {0, 0, 0, 0},
                                   qk_dot,
                                   pv_dot,
                                   softmax_root};
@@ -485,6 +832,10 @@ std::optional<FlyAttentionDescriptor> MatchCrossAttentionDescriptor(
                                   element_type,
                                   query_parameter,
                                   key_value_parameter,
+                                  nullptr,
+                                  {0, 0, 0, 0},
+                                  nullptr,
+                                  {0, 0, 0, 0},
                                   qk_dot,
                                   pv_dot,
                                   softmax_root};
@@ -513,52 +864,13 @@ const HloInstruction* GetFlyCausalMaskScoresAlongDimensions(
     return nullptr;
   }
 
-  const HloInstruction* predicate = input.operand(0);
-  if (predicate->opcode() != HloOpcode::kBroadcast ||
-      predicate->operand_count() != 1 ||
-      !ShapeUtil::SameDimensions(predicate->shape(), input.shape())) {
-    return nullptr;
-  }
-  if (predicate->dimensions().size() != 2) {
-    return nullptr;
-  }
-
-  const HloInstruction* compare = predicate->operand(0);
-  if (compare->opcode() != HloOpcode::kCompare ||
-      compare->operand_count() != 2 ||
-      compare->shape().dimensions_size() != 2 ||
-      compare->shape().dimensions(0) != sequence ||
-      compare->shape().dimensions(1) != sequence) {
-    return nullptr;
-  }
-  const HloInstruction* lhs = compare->operand(0);
-  const HloInstruction* rhs = compare->operand(1);
-  if (lhs->opcode() != HloOpcode::kIota || rhs->opcode() != HloOpcode::kIota ||
-      !ShapeUtil::Compatible(lhs->shape(), rhs->shape())) {
-    return nullptr;
-  }
-
-  // Broadcast dimensions map compare dimensions back to the score tensor.
-  // Accept key <= query, or the algebraically identical query >= key.
-  const int64_t lhs_dimension =
-      Cast<const HloIotaInstruction>(lhs)->iota_dimension();
-  const int64_t rhs_dimension =
-      Cast<const HloIotaInstruction>(rhs)->iota_dimension();
-  if (lhs_dimension < 0 || lhs_dimension >= predicate->dimensions().size() ||
-      rhs_dimension < 0 || rhs_dimension >= predicate->dimensions().size()) {
-    return nullptr;
-  }
-  const int64_t lhs_output_dimension = predicate->dimensions(lhs_dimension);
-  const int64_t rhs_output_dimension = predicate->dimensions(rhs_dimension);
-  const bool key_le_query =
-      compare->comparison_direction() == ComparisonDirection::kLe &&
-      lhs_output_dimension == key_dimension &&
-      rhs_output_dimension == query_dimension;
-  const bool query_ge_key =
-      compare->comparison_direction() == ComparisonDirection::kGe &&
-      lhs_output_dimension == query_dimension &&
-      rhs_output_dimension == key_dimension;
-  return key_le_query || query_ge_key ? input.operand(1) : nullptr;
+  std::vector<int64_t> logical_dimensions(rank, -1);
+  logical_dimensions[query_dimension] = 2;
+  logical_dimensions[key_dimension] = 3;
+  return HasCausalPredicateFromDimensions(input.operand(0), logical_dimensions,
+                                          sequence)
+             ? input.operand(1)
+             : nullptr;
 }
 
 const HloInstruction* GetFlyCausalMaskScores(const HloInstruction& input,
@@ -606,7 +918,7 @@ std::optional<FlyAttentionDescriptor> GetFlyAttentionDescriptor(
   std::vector<const HloInstruction*> dots;
   std::vector<const HloInstruction*> parameters;
   CollectGraph(root, visited, dots, parameters);
-  if (dots.size() != 2 || parameters.size() != 1) {
+  if (dots.size() != 2 || parameters.empty() || parameters.size() > 3) {
     return std::nullopt;
   }
 
@@ -633,35 +945,67 @@ std::optional<FlyAttentionDescriptor> GetFlyAttentionDescriptor(
   if (softmax_input == nullptr || !ContainsInstruction(softmax_input, qk_dot)) {
     return std::nullopt;
   }
+  const std::array<int64_t, 4> logical_score_shape = {
+      batch, heads, sequence, sequence};
+  std::optional<AttentionMaskMatch> mask = MatchAttentionMask(
+      softmax_input, softmax_input->shape(), logical_score_shape);
+  const bool causal = mask.has_value() && mask->causal;
   const HloInstruction* scaled_scores =
-      GetFlyCausalMaskScores(*softmax_input, sequence);
-  const bool causal = scaled_scores != nullptr;
-  if (!causal) {
-    scaled_scores = softmax_input;
-  }
+      mask.has_value() ? softmax_input->operand(1) : softmax_input;
   // XLA can remove an intermediate BF16 round trip and leave the QK scale in
-  // F32. The native attention kernel already accumulates and scales scores in
-  // F32, so accept both forms, but only when the complete producer is a dot,
-  // unary view/conversion chain, and uniform multiplication. This excludes
-  // unsupported bias or arbitrary score epilogues.
-  std::optional<double> scale = MatchScaledDot(scaled_scores, qk_dot);
-  if (!scale.has_value() || *scale <= 0.0) {
+  // F32. The native attention kernel accumulates and applies both the scale
+  // and an optional canonical broadcast bias in F32.
+  std::optional<AttentionScoresMatch> scores =
+      MatchAttentionScores(scaled_scores, qk_dot, softmax_input->shape(),
+                           logical_score_shape);
+  if (!scores.has_value() || scores->scale <= 0.0) {
     return std::nullopt;
   }
 
-  const HloInstruction* qkv = parameters.front();
-  if (qkv->shape().element_type() != element_type ||
-      qkv->shape().dimensions_size() != 2 || !qkv->shape().has_layout() ||
-      qkv->shape().layout().minor_to_major(0) != 1 ||
-      qkv->shape().dimensions(0) != batch * sequence ||
-      qkv->shape().dimensions(1) != 3 * heads * head_dimension) {
+  const HloInstruction* qkv = nullptr;
+  for (const HloInstruction* parameter : parameters) {
+    if (parameter->shape().element_type() == element_type &&
+        parameter->shape().dimensions_size() == 2 &&
+        parameter->shape().has_layout() &&
+        parameter->shape().layout().minor_to_major(0) == 1 &&
+        parameter->shape().dimensions(0) == batch * sequence &&
+        parameter->shape().dimensions(1) == 3 * heads * head_dimension) {
+      if (qkv != nullptr) {
+        return std::nullopt;
+      }
+      qkv = parameter;
+    }
+  }
+  const int64_t expected_parameter_count =
+      1 + (scores->bias_parameter == nullptr ? 0 : 1) +
+      (mask.has_value() && mask->external.has_value() ? 1 : 0);
+  if (qkv == nullptr || parameters.size() != expected_parameter_count ||
+      (scores->bias_parameter != nullptr &&
+       scores->bias_parameter == qkv) ||
+      (mask.has_value() && mask->external.has_value() &&
+       (mask->external->parameter == qkv ||
+        mask->external->parameter == scores->bias_parameter))) {
     return std::nullopt;
+  }
+  for (const HloInstruction* parameter : parameters) {
+    if (parameter != qkv && parameter != scores->bias_parameter &&
+        (!mask.has_value() || !mask->external.has_value() ||
+         parameter != mask->external->parameter)) {
+      return std::nullopt;
+    }
   }
 
   return FlyAttentionDescriptor{
       batch,  sequence,    sequence,     heads, heads, head_dimension,
-      *scale, causal,      element_type, qkv,   qkv,   qk_dot,
-      pv_dot, softmax_root};
+      scores->scale, causal, element_type, qkv, qkv, scores->bias_parameter,
+      scores->bias_strides,
+      mask.has_value() && mask->external.has_value()
+          ? mask->external->parameter
+          : nullptr,
+      mask.has_value() && mask->external.has_value()
+          ? mask->external->strides
+          : std::array<int64_t, 4>{0, 0, 0, 0},
+      qk_dot, pv_dot, softmax_root};
 }
 
 }  // namespace xla::gpu::flydsl

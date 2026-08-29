@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/transforms/attention_rewriter_fly.h"
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -217,6 +218,149 @@ const HloFusionInstruction* FindScoreProducerFusion(
   return result;
 }
 
+bool ContainsInstruction(const HloInstruction* root,
+                         const HloInstruction* needle) {
+  absl::flat_hash_set<const HloInstruction*> visited;
+  std::vector<const HloInstruction*> worklist = {root};
+  while (!worklist.empty()) {
+    const HloInstruction* instruction = worklist.back();
+    worklist.pop_back();
+    if (instruction == needle) {
+      return true;
+    }
+    if (!visited.insert(instruction).second) {
+      continue;
+    }
+    worklist.insert(worklist.end(), instruction->operands().begin(),
+                    instruction->operands().end());
+  }
+  return false;
+}
+
+// Returns the sole external parameter behind a score bias. Materialization-
+// free views and broadcasting are intentionally accepted; arithmetic is not.
+// The code generator validates the exact logical-to-physical mapping later.
+const HloInstruction* FindScoreBiasParameter(
+    const HloInstruction* instruction) {
+  while (instruction->operand_count() == 1 &&
+         (instruction->opcode() == HloOpcode::kBitcast ||
+          instruction->opcode() == HloOpcode::kBroadcast ||
+          instruction->opcode() == HloOpcode::kConvert ||
+          instruction->opcode() == HloOpcode::kCopy ||
+          instruction->opcode() == HloOpcode::kReshape)) {
+    instruction = instruction->operand(0);
+  }
+  return instruction->opcode() == HloOpcode::kParameter ? instruction
+                                                         : nullptr;
+}
+
+std::optional<double> UniformConstant(const HloInstruction* instruction) {
+  if (instruction->opcode() == HloOpcode::kConstant &&
+      ShapeUtil::IsScalar(instruction->shape())) {
+    return instruction->literal().GetAsDouble({});
+  }
+  if (instruction->operand_count() != 1) {
+    return std::nullopt;
+  }
+  switch (instruction->opcode()) {
+    case HloOpcode::kBitcast:
+    case HloOpcode::kBroadcast:
+    case HloOpcode::kConvert:
+    case HloOpcode::kCopy:
+    case HloOpcode::kReshape:
+      return UniformConstant(instruction->operand(0));
+    default:
+      return std::nullopt;
+  }
+}
+
+// Matches select(mask, scores, -inf). A present null pointer means there is
+// no select mask; an empty optional rejects a select that is not the supported
+// external broadcast-mask form.
+std::optional<const HloInstruction*> MatchScoreMaskParameter(
+    const HloInstruction* instruction,
+    const HloFusionInstruction* qk_fusion, bool causal) {
+  if (instruction->opcode() != HloOpcode::kSelect) {
+    return static_cast<const HloInstruction*>(nullptr);
+  }
+  if (instruction->operand_count() != 3 ||
+      !ContainsInstruction(instruction->operand(1), qk_fusion)) {
+    return std::nullopt;
+  }
+  std::optional<double> masked_value = UniformConstant(instruction->operand(2));
+  if (!masked_value.has_value() || !std::isinf(*masked_value) ||
+      *masked_value >= 0.0) {
+    return std::nullopt;
+  }
+  const HloInstruction* parameter = nullptr;
+  if (causal) {
+    const HloInstruction* conjunction = instruction->operand(0);
+    while (conjunction->operand_count() == 1 &&
+           (conjunction->opcode() == HloOpcode::kBitcast ||
+            conjunction->opcode() == HloOpcode::kBroadcast ||
+            conjunction->opcode() == HloOpcode::kCopy ||
+            conjunction->opcode() == HloOpcode::kReshape)) {
+      conjunction = conjunction->operand(0);
+    }
+    if (conjunction->opcode() == HloOpcode::kAnd &&
+        conjunction->operand_count() == 2) {
+      const HloInstruction* lhs_parameter =
+          FindScoreBiasParameter(conjunction->operand(0));
+      const HloInstruction* rhs_parameter =
+          FindScoreBiasParameter(conjunction->operand(1));
+      if ((lhs_parameter == nullptr) != (rhs_parameter == nullptr)) {
+        parameter = lhs_parameter != nullptr ? lhs_parameter : rhs_parameter;
+      } else {
+        return std::nullopt;
+      }
+    }
+  } else {
+    parameter = FindScoreBiasParameter(instruction->operand(0));
+  }
+  if (parameter == nullptr) {
+    return causal ? std::optional<const HloInstruction*>(nullptr)
+                  : std::nullopt;
+  }
+  if (parameter->shape().element_type() != PRED) {
+    return std::nullopt;
+  }
+  return parameter;
+}
+
+// Matches the optional `scaled_qk + bias` score epilogue in the parent
+// computation and returns the bias's external parameter. Scaling may live in
+// the QK fusion or in the parent graph. A present null pointer means there is
+// no additive epilogue; an empty optional rejects an unsupported additive
+// epilogue before fusion construction.
+std::optional<const HloInstruction*> MatchScoreBiasParameter(
+    const HloInstruction* instruction,
+    const HloFusionInstruction* qk_fusion) {
+  while (instruction->operand_count() == 1 &&
+         (instruction->opcode() == HloOpcode::kBitcast ||
+          instruction->opcode() == HloOpcode::kConvert ||
+          instruction->opcode() == HloOpcode::kCopy ||
+          instruction->opcode() == HloOpcode::kReshape)) {
+    instruction = instruction->operand(0);
+  }
+  if (instruction->opcode() != HloOpcode::kAdd ||
+      instruction->operand_count() != 2) {
+    return static_cast<const HloInstruction*>(nullptr);
+  }
+  const bool lhs_has_qk =
+      ContainsInstruction(instruction->operand(0), qk_fusion);
+  const bool rhs_has_qk =
+      ContainsInstruction(instruction->operand(1), qk_fusion);
+  if (lhs_has_qk == rhs_has_qk) {
+    return std::nullopt;
+  }
+  const HloInstruction* parameter = FindScoreBiasParameter(
+      instruction->operand(lhs_has_qk ? 1 : 0));
+  if (parameter == nullptr) {
+    return std::nullopt;
+  }
+  return parameter;
+}
+
 template <typename Dimensions>
 bool IsSingleDimension(const Dimensions& dimensions, int64_t dimension) {
   return dimensions.size() == 1 && dimensions.Get(0) == dimension;
@@ -379,6 +523,8 @@ struct AttentionMatch {
   HloInstruction* output = nullptr;
   const HloInstruction* qkv = nullptr;
   const HloInstruction* key_value = nullptr;
+  const HloInstruction* score_bias = nullptr;
+  const HloInstruction* score_mask = nullptr;
   int64_t batch = 0;
   int64_t sequence = 0;
   int64_t key_value_sequence = 0;
@@ -442,9 +588,11 @@ std::optional<AttentionMatch> MatchAttention(HloInstruction* instruction) {
   }
   const int64_t sequence = instruction->shape().dimensions(1);
   const HloInstruction* score_producer = softmax_input;
+  bool has_causal_mask = false;
   if (const HloInstruction* causal_scores =
           flydsl::GetFlyCausalMaskScores(*softmax_input, sequence)) {
     score_producer = causal_scores;
+    has_causal_mask = true;
   }
   const HloFusionInstruction* qk = FindScoreProducerFusion(score_producer);
   if (qk == nullptr || qk->operand_count() != 2 || qk->user_count() != 1) {
@@ -477,6 +625,21 @@ std::optional<AttentionMatch> MatchAttention(HloInstruction* instruction) {
   if (q_view == nullptr || k_view == nullptr) {
     return std::nullopt;
   }
+  std::optional<const HloInstruction*> score_mask_match =
+      MatchScoreMaskParameter(softmax_input, qk, has_causal_mask);
+  if (!score_mask_match.has_value()) {
+    return std::nullopt;
+  }
+  const HloInstruction* score_mask = *score_mask_match;
+  if (score_mask != nullptr) {
+    score_producer = softmax_input->operand(1);
+  }
+  std::optional<const HloInstruction*> score_bias_match =
+      MatchScoreBiasParameter(score_producer, qk);
+  if (!score_bias_match.has_value()) {
+    return std::nullopt;
+  }
+  const HloInstruction* score_bias = *score_bias_match;
 
   const Shape& output = instruction->shape();
   const int64_t batch = output.dimensions(0);
@@ -510,9 +673,9 @@ std::optional<AttentionMatch> MatchAttention(HloInstruction* instruction) {
                                 head_dimension) == tuple_qkv &&
         MatchPackedQkvTupleView(v_view, 2, batch, sequence, heads,
                                 head_dimension) == tuple_qkv) {
-      return AttentionMatch{pv,    instruction,   tuple_qkv, tuple_qkv,
-                            batch, sequence,      sequence,  heads,
-                            heads, head_dimension};
+      return AttentionMatch{pv,         instruction, tuple_qkv, tuple_qkv,
+                            score_bias, score_mask,  batch,     sequence,
+                            sequence,   heads,       heads,     head_dimension};
     }
 
     const HloInstruction* qkv =
@@ -522,9 +685,9 @@ std::optional<AttentionMatch> MatchAttention(HloInstruction* instruction) {
             qkv &&
         MatchPackedQkvView(v_view, 2, batch, sequence, heads, head_dimension) ==
             qkv) {
-      return AttentionMatch{pv,    instruction,   qkv,      qkv,
-                            batch, sequence,      sequence, heads,
-                            heads, head_dimension};
+      return AttentionMatch{pv,         instruction, qkv,      qkv,
+                            score_bias, score_mask,  batch,    sequence,
+                            sequence,   heads,       heads,    head_dimension};
     }
   }
 
@@ -538,9 +701,18 @@ std::optional<AttentionMatch> MatchAttention(HloInstruction* instruction) {
                                   head_dimension) != key_value) {
     return std::nullopt;
   }
-  return AttentionMatch{
-      pv,       instruction,        query, key_value, batch,
-      sequence, key_value_sequence, heads, heads,     head_dimension};
+  return AttentionMatch{pv,
+                        instruction,
+                        query,
+                        key_value,
+                        score_bias,
+                        score_mask,
+                        batch,
+                        sequence,
+                        key_value_sequence,
+                        heads,
+                        heads,
+                        head_dimension};
 }
 
 std::optional<AttentionMatch> MatchGroupedQueryAttention(
@@ -658,6 +830,8 @@ std::optional<AttentionMatch> MatchGroupedQueryAttention(
                         instruction,
                         qkv,
                         qkv,
+                        nullptr,
+                        nullptr,
                         batch,
                         sequence,
                         sequence,
@@ -746,6 +920,12 @@ absl::StatusOr<HloFusionInstruction*> MakeAttentionFusion(
   std::vector<const HloInstruction*> inputs = {match.qkv};
   if (match.key_value != match.qkv) {
     inputs.push_back(match.key_value);
+  }
+  if (match.score_bias != nullptr) {
+    inputs.push_back(match.score_bias);
+  }
+  if (match.score_mask != nullptr) {
+    inputs.push_back(match.score_mask);
   }
   HloComputation::Builder builder("fly_attention_computation");
   AttentionFusionCloner cloner(&builder, inputs);

@@ -43,6 +43,7 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/backends/gpu/codegen/flydsl/paged_attention_support.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
@@ -166,6 +167,34 @@ GpuBackendConfig GetBlockLevelGpuBackendConfig(
        ->mutable_block_level_fusion_config() =
       block_level_parameters.ToBlockLevelFusionConfig();
   return gpu_backend_config;
+}
+
+// Priority fusion's symbolic tiler describes the producer-consumer boundary,
+// but a native Fly attention fusion has a stricter Wave64 launch contract.
+// Re-forming attention around a producer must not replace that contract with a
+// generic tile which happens to be legal for the absorbed producer.
+std::optional<BlockLevelParameters> GetSpecializedFlyFormationParameters(
+    const HloInstruction& fusion,
+    const se::DeviceDescription& device_description) {
+  HloFusionAnalysis analysis =
+      HloFusionAnalysis::Create(fusion, device_description);
+  std::optional<flydsl::FlyAttentionDescriptor> attention =
+      flydsl::GetFlyAttentionDescriptor(analysis);
+  if (!attention.has_value()) {
+    return std::nullopt;
+  }
+
+  // Match FlyFusionBackend's deterministic attention formation point. The
+  // autotuner can subsequently explore 32/64/128/256-row alternatives.
+  const int64_t block_m = std::min<int64_t>(128, attention->sequence);
+  BlockLevelParameters parameters;
+  parameters.output_tile_sizes = {
+      {1, block_m, 1, attention->head_dimension}};
+  parameters.num_warps = block_m / 32;
+  parameters.num_ctas = 1;
+  parameters.num_stages = 1;
+  parameters.waves_per_eu = 2;
+  return parameters;
 }
 
 // An implementation of FusionQueue that determines whether to fuse instructions
@@ -821,9 +850,16 @@ class PriorityFusionQueue {
           device_info_);
       const int64_t elements =
           ShapeUtil::ElementsIn(analysis.first_result_shape());
+      const flydsl::FlyFusionRoute route = flydsl::ClassifyFlyFusion(analysis);
       BlockLevelParameters parameters;
-      parameters.output_tile_sizes = {
-          {std::max<int64_t>(1, std::min<int64_t>(4, elements))}};
+      // The first row-reduction tile dimension is the number of output
+      // partitions, not a generic element count. One partition is always a
+      // legal formation config; autotuning replaces it before code emission.
+      const int64_t formation_tile =
+          route == flydsl::FlyFusionRoute::kRowReduction
+              ? 1
+              : std::max<int64_t>(1, std::min<int64_t>(4, elements));
+      parameters.output_tile_sizes = {{formation_tile}};
       parameters.num_warps = 4;
       parameters.num_ctas = 1;
       parameters.num_stages = 1;
@@ -919,6 +955,20 @@ class PriorityFusionQueue {
                                ->config()
                                .debug_options()
                                .xla_gpu_flydsl_replace_triton()) {
+      // Normal producer-consumer fusion duplicates a producer that has other
+      // users. Merging two existing reduction fusions this way can materialize
+      // multiple embedded reductions under an elementwise or specialized raw
+      // consumer route, serializing both reductions in every output lane. The
+      // multi-output path has a complete native reduction proof and remains
+      // eligible.
+      if (!use_multi_output_fusion &&
+          producer->opcode() == HloOpcode::kFusion &&
+          consumer->opcode() == HloOpcode::kFusion &&
+          ContainsReduction(producer) && ContainsReduction(consumer)) {
+        return FusionDecision::Forbid(
+            "strict Fly replacement does not duplicate one reduction fusion "
+            "into another");
+      }
       GpuBackendConfig gpu_config = GetBlockLevelGpuBackendConfig(
           tiled_run_time_data.block_level_parameters, kFlyFusionKind);
       HloFusionAnalysis native_analysis = HloFusionAnalysis::Create(
@@ -1110,6 +1160,31 @@ class PriorityFusionQueue {
     return false;
   }
 
+  bool IsFlyConvertedCopyConsumer(const HloInstruction* producer,
+                                  const HloInstruction* consumer) const {
+    if (consumer->opcode() != HloOpcode::kConvert ||
+        consumer->operand_count() != 1 || consumer->operand(0) != producer ||
+        !producer->shape().IsArray() || !consumer->shape().IsArray() ||
+        producer->shape().element_type() != F32 ||
+        (consumer->shape().element_type() != BF16 &&
+         consumer->shape().element_type() != F16)) {
+      return false;
+    }
+    return ShapeUtil::SameDimensions(producer->shape(), consumer->shape());
+  }
+
+  bool ContainsReduction(const HloInstruction* instruction) const {
+    if (instruction->opcode() != HloOpcode::kFusion) {
+      return instruction->opcode() == HloOpcode::kReduce;
+    }
+    const auto& fused_instructions =
+        instruction->fused_instructions_computation()->instructions();
+    return std::any_of(fused_instructions.begin(), fused_instructions.end(),
+                       [](const HloInstruction* fused) {
+                         return fused->opcode() == HloOpcode::kReduce;
+                       });
+  }
+
   std::vector<HloInstruction*>
   FindPossibleConsumersForBlockLevelMultiOutputFusion(
       HloInstruction* producer) {
@@ -1142,8 +1217,25 @@ class PriorityFusionQueue {
         possible_consumers.push_back(user);
       } else {
         VLOG(10) << "Cannot form block-level multi-output fusion of "
-                 << producer->name() << " with " << user->name()
-                 << ": " << can_fuse.Explain();
+                 << producer->name() << " with " << user->name() << ": "
+                 << can_fuse.Explain();
+      }
+    }
+    // A reduction value and its lower-precision converted copy must be emitted
+    // by one multi-output kernel. If the reduction has another consumer, the
+    // normal all-users path clones the reduction into both consumers. Select
+    // the converted copy here so MergeFusionInstructionIntoMultiOutput keeps
+    // the original value available to the other consumer without duplication.
+    if (debug_options.xla_gpu_flydsl_replace_triton() &&
+        possible_consumers.size() > 1 && ContainsReduction(producer)) {
+      std::vector<HloInstruction*> converted_copy_consumers;
+      for (HloInstruction* consumer : possible_consumers) {
+        if (IsFlyConvertedCopyConsumer(producer, consumer)) {
+          converted_copy_consumers.push_back(consumer);
+        }
+      }
+      if (converted_copy_consumers.size() == 1) {
+        return converted_copy_consumers;
       }
     }
     return possible_consumers;
@@ -1171,11 +1263,15 @@ class PriorityFusionQueue {
     }
 
     bool has_non_bitcast_user = false;
+    int64_t non_bitcast_user_count = 0;
+    bool has_converted_copy_consumer = false;
     for (const auto& user : producer->users()) {
       if (IsFusibleBitcast(*user)) {
         continue;
       }
       has_non_bitcast_user = true;
+      ++non_bitcast_user_count;
+      has_converted_copy_consumer |= IsFlyConvertedCopyConsumer(producer, user);
       if (auto fusion_decision = CanFuseCached(producer, user);
           !fusion_decision) {
         VLOG(10) << "Cannot fuse " << producer->name() << " with "
@@ -1194,6 +1290,16 @@ class PriorityFusionQueue {
     if (!has_non_bitcast_user) {
       return FusionDecision::Forbid(
           "not fusing because there are only bitcast users");
+    }
+    if (producer->GetModule()
+            ->config()
+            .debug_options()
+            .xla_gpu_flydsl_replace_triton() &&
+        non_bitcast_user_count > 1 && has_converted_copy_consumer &&
+        ContainsReduction(producer)) {
+      return FusionDecision::Forbid(
+          "strict Fly replacement preserves a shared reduction and its "
+          "converted copy with multi-output fusion");
     }
     return FusionDecision::Allow();
   }
@@ -1419,6 +1525,15 @@ absl::StatusOr<bool> PriorityFusion::RunImpl(
         const bool use_fly_backend =
             fusion_queue->ShouldUseFlyBlockLevelBackend(
                 producer, consumer, use_multi_output_fusion);
+        std::optional<BlockLevelParameters> specialized_fly_parameters;
+        if (use_fly_backend) {
+          // `Fuse` replaces the consumer instruction. Capture any specialized
+          // launch contract before that happens; analysis of the transient
+          // replacement fusion is not guaranteed to retain the consumer's
+          // custom backend identity until its new config is installed below.
+          specialized_fly_parameters = GetSpecializedFlyFormationParameters(
+              *consumer, device_info_);
+        }
 
         fusion_queue->PreFusion(producer, consumer);
         int64_t consumer_pre_fusion_id = consumer->unique_id();
@@ -1427,9 +1542,20 @@ absl::StatusOr<bool> PriorityFusion::RunImpl(
             Fuse(producer, consumer, use_multi_output_fusion);
         auto backend_config_it = block_level_parameters_map.find(consumer);
         if (backend_config_it != block_level_parameters_map.end()) {
+          BlockLevelParameters parameters = backend_config_it->second;
+          if (use_fly_backend) {
+            if (!specialized_fly_parameters.has_value()) {
+              specialized_fly_parameters =
+                  GetSpecializedFlyFormationParameters(*fusion_instruction,
+                                                        device_info_);
+            }
+            if (specialized_fly_parameters.has_value()) {
+              parameters = std::move(*specialized_fly_parameters);
+            }
+          }
           RETURN_IF_ERROR(fusion_instruction->set_backend_config(
               GetBlockLevelGpuBackendConfig(
-                  backend_config_it->second,
+                  parameters,
                   use_fly_backend ? kFlyFusionKind : kTritonFusionKind)));
           fusion_instruction->set_fusion_kind(
               HloInstruction::FusionKind::kCustom);

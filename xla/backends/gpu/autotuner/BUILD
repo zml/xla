@@ -414,6 +414,35 @@ xla_test(
 )
 
 xla_test(
+    name = "fly_learned_scale_test",
+    srcs = ["fly_learned_scale_test.cc"],
+    backends = ["amdgpu_any"],
+    env = {
+        "HIPBLASLT_PRELOAD_KERNELS": "0",
+        "HIPBLASLT_ROCROLLER_NO_CUSTOM_KERNEL": "1",
+    },
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    use_legacy_runtime = True,
+    deps = [
+        ":fly",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:compiler",
+        "//xla/service:platform_util",
+        "//xla/stream_executor:platform",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_test(
     name = "triton_test",
     srcs = ["triton_test.cc"],
     env = {
@@ -850,6 +879,7 @@ cc_library(
         "//xla/hlo/analysis:alias_info",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass_pipeline",
+        "//xla/hlo/utils:hlo_query",
         "//xla/service:compiler",
         "//xla/service:hlo_cost_analysis",
         "//xla/stream_executor:stream_executor_h",

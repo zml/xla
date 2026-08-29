@@ -1324,6 +1324,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                                    dot_dims.rhs_batch_dimensions().end());
       lhs_batch_dimension_ = lhs_batch_dimensions_.front();
       rhs_batch_dimension_ = rhs_batch_dimensions_.front();
+    } else {
+      lhs_noncontracting_dimension_ = 1 - lhs_contracting_dimension_;
+      rhs_noncontracting_dimension_ = 1 - rhs_contracting_dimension_;
     }
     if (global_split_k_ || batched_gemm_) {
       for (int64_t dimension = 0;
@@ -1832,7 +1835,12 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
                     row_major_rhs_square_double_buffer ||
                     tiny_gemv_local_split || small_m_double_buffer));
     }
-    TF_RET_CHECK(!single_buffer_lds_ || preload_lds_fragments_);
+    const bool compact_vector_refill_single_buffer =
+        single_buffer_lds_ && !preload_lds_fragments_ && !use_mfma_32_ &&
+        num_warps_ == 2 && block_m_ == 32 && block_n_ == 16 &&
+        stage_k_ == 256 && rhs_k_contiguous_;
+    TF_RET_CHECK(!single_buffer_lds_ || preload_lds_fragments_ ||
+                 compact_vector_refill_single_buffer);
     if (async_lhs_) {
       TF_RET_CHECK(stage_k_ == 64 && block_m_ == 128 && block_n_ == 128 &&
                    (num_warps_ == 4 || num_warps_ == 8 || num_warps_ == 16) &&
@@ -3165,7 +3173,6 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
         std::vector<int64_t>{lhs_contracting_dimension_};
     if (lhs_input_scale_parameter_number_ >= 0) {
       const bool channel_scale =
-          lhs_input_type_ == S4 &&
           !absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,
                                  lhs_contracting_dimension_) &&
           absl::c_linear_search(lhs_input_scale_broadcast_dimensions_,

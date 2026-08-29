@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/utils/hlo_query.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/service/compiler.h"
 #include "xla/service/hlo_cost_analysis.h"
@@ -98,6 +99,77 @@ const absl::flat_hash_set<std::string>& Mi300DefaultFlyTileKeys() {
       "256:8:32:2",   "256:128:32:4", "256:128:64:8", "256:256:32:8",
   });
   return *keys;
+}
+
+// A native Fly GEMM can consume the BF16 rounding boundary around a learned
+// per-channel scale directly from its LHS load:
+//
+//   convert<bf16>(convert<f32>(data) *
+//                 convert<f32>(broadcast(scale)))
+//
+// Fly fission deliberately makes the dot independently tunable, but doing so
+// also offers configurations that materialize the scaled activation as an
+// extra launch. Those alternatives are not useful once the native backend has
+// accepted this audited producer grammar, and microsecond profiling noise can
+// otherwise make the graph topology nondeterministic.
+bool HasRoundedBf16LearnedScaleLhs(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  const HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
+      *instr.fused_instructions_computation(), HloOpcode::kDot);
+  if (dot == nullptr || dot->operand_count() != 2 ||
+      dot->shape().dimensions_size() != 2 ||
+      dot->shape().element_type() != BF16 ||
+      dot->operand(0)->shape().element_type() != BF16 ||
+      dot->operand(1)->shape().element_type() != BF16) {
+    return false;
+  }
+
+  const HloInstruction* rounded = dot->operand(0);
+  if (rounded->opcode() == HloOpcode::kBitcast &&
+      rounded->operand_count() == 1) {
+    rounded = rounded->operand(0);
+  }
+  if (rounded->opcode() != HloOpcode::kConvert ||
+      rounded->operand_count() != 1 ||
+      rounded->shape().element_type() != BF16 ||
+      rounded->operand(0)->opcode() != HloOpcode::kMultiply ||
+      rounded->operand(0)->shape().element_type() != F32) {
+    return false;
+  }
+
+  const HloInstruction* multiply = rounded->operand(0);
+  for (int scale_operand = 0; scale_operand < 2; ++scale_operand) {
+    const HloInstruction* scale_f32 = multiply->operand(scale_operand);
+    const HloInstruction* data_f32 = multiply->operand(1 - scale_operand);
+    if (scale_f32->opcode() != HloOpcode::kConvert ||
+        scale_f32->operand_count() != 1 ||
+        scale_f32->shape().element_type() != F32 ||
+        data_f32->opcode() != HloOpcode::kConvert ||
+        data_f32->operand_count() != 1 ||
+        data_f32->shape().element_type() != F32) {
+      continue;
+    }
+    const HloInstruction* broadcast = scale_f32->operand(0);
+    if (broadcast->opcode() != HloOpcode::kBroadcast ||
+        broadcast->operand_count() != 1 ||
+        broadcast->shape().element_type() != BF16 ||
+        broadcast->dimensions().size() != 1 ||
+        broadcast->operand(0)->opcode() != HloOpcode::kParameter ||
+        broadcast->operand(0)->shape().element_type() != BF16 ||
+        broadcast->operand(0)->shape().dimensions_size() != 1) {
+      continue;
+    }
+    const int64_t dimension = broadcast->dimensions(0);
+    if (dimension >= 0 &&
+        dimension < dot->operand(0)->shape().dimensions_size() &&
+        broadcast->operand(0)->shape().dimensions(0) ==
+            dot->operand(0)->shape().dimensions(dimension)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Replaces the fusion instruction with the instructions from the fissioned
@@ -213,6 +285,17 @@ FissionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     VLOG(3) << "Instruction not supported by " << name() << ": "
             << instr.ToString();
     return std::vector<std::unique_ptr<BackendConfig>>();
+  }
+  if (codegen_backend_->backend() == autotuner::Backend::FLY &&
+      HasRoundedBf16LearnedScaleLhs(instr)) {
+    ASSIGN_OR_RETURN(
+        std::vector<std::unique_ptr<BackendConfig>> native_configs,
+        codegen_backend_->GetSupportedConfigs(instr));
+    if (!native_configs.empty()) {
+      VLOG(2) << "Native Fly owns learned-scale GEMM; suppressing materialized "
+                 "fission alternatives.";
+      return std::vector<std::unique_ptr<BackendConfig>>();
+    }
   }
   ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
                    GetFissionedAndRewrittenModule(instr));
