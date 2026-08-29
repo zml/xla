@@ -1055,9 +1055,7 @@ std::optional<DynamicSlice> GetDynamicSlice(const HloInstruction* instruction) {
     const HloInstruction* start = instruction->operand(dimension + 1);
     if (!ShapeUtil::IsScalar(start->shape()) ||
         (start->shape().element_type() != S32 &&
-         start->shape().element_type() != S64) ||
-        (start->opcode() != HloOpcode::kParameter &&
-         start->opcode() != HloOpcode::kConstant)) {
+         start->shape().element_type() != S64)) {
       return std::nullopt;
     }
     slice.input_strides[dimension] = input_stride;
@@ -1113,9 +1111,7 @@ std::optional<DynamicUpdateSlice> GetDynamicUpdateSlice(
     const HloInstruction* start = instruction->operand(dimension + 2);
     if (!ShapeUtil::IsScalar(start->shape()) ||
         (start->shape().element_type() != S32 &&
-         start->shape().element_type() != S64) ||
-        (start->opcode() != HloOpcode::kParameter &&
-         start->opcode() != HloOpcode::kConstant)) {
+         start->shape().element_type() != S64)) {
       return std::nullopt;
     }
     descriptor.update_strides[dimension] = update_stride;
@@ -1387,9 +1383,42 @@ struct StridedReductionDescriptor {
   int64_t input_parameter_number;
   PrimitiveType type;
   HloOpcode reducer;
+  const HloComputation* reducer_computation;
+  bool direct_binary_reducer;
   double floating_init_value;
   int64_t integer_init_value;
 };
+
+bool IsSupportedElementwiseGraph(
+    const HloInstruction* instruction, const Shape& output_shape,
+    absl::flat_hash_set<const HloInstruction*>& visited);
+
+std::optional<double> GetScalarConstantAsDouble(
+    const HloInstruction* instruction) {
+  if (!ShapeUtil::IsScalar(instruction->shape())) {
+    return std::nullopt;
+  }
+  if (instruction->opcode() == HloOpcode::kConstant) {
+    if (IsSupportedFloatingType(instruction->shape().element_type())) {
+      return instruction->literal().GetAsDouble({});
+    }
+    switch (instruction->shape().element_type()) {
+      case S8:
+        return instruction->literal().GetFirstElement<int8_t>();
+      case S16:
+        return instruction->literal().GetFirstElement<int16_t>();
+      case S32:
+        return instruction->literal().GetFirstElement<int32_t>();
+      default:
+        return std::nullopt;
+    }
+  }
+  if (instruction->opcode() == HloOpcode::kConvert &&
+      instruction->operand_count() == 1) {
+    return GetScalarConstantAsDouble(instruction->operand(0));
+  }
+  return std::nullopt;
+}
 
 bool IsSplatGraph(const HloInstruction* instruction) {
   switch (instruction->opcode()) {
@@ -1431,15 +1460,16 @@ std::optional<StridedReductionDescriptor> GetStridedReductionDescriptor(
       input->shape().element_type() != reduction_type ||
       input_rank != instruction->shape().dimensions_size() + 1 ||
       reduction_dimension < 0 || reduction_dimension >= input_rank ||
-      (reduction_dimension == input_rank - 1 &&
-       instruction->user_count() == 0 && !IsSplatGraph(input)) ||
       input->shape().dimensions(reduction_dimension) < 1 ||
       !input->shape().has_layout() || !instruction->shape().has_layout() ||
       !LayoutUtil::IsMonotonicWithDim0Major(input->shape().layout()) ||
       !LayoutUtil::IsMonotonicWithDim0Major(instruction->shape().layout()) ||
       !ShapeUtil::IsScalar(init->shape()) ||
-      init->opcode() != HloOpcode::kConstant ||
       init->shape().element_type() != reduction_type) {
+    return std::nullopt;
+  }
+  const std::optional<double> init_value = GetScalarConstantAsDouble(init);
+  if (!init_value.has_value()) {
     return std::nullopt;
   }
   for (int64_t input_dimension = 0, output_dimension = 0;
@@ -1454,15 +1484,39 @@ std::optional<StridedReductionDescriptor> GetStridedReductionDescriptor(
   }
   const HloComputation* reducer = instruction->to_apply();
   if (reducer == nullptr || reducer->num_parameters() != 2 ||
-      reducer->root_instruction()->operand_count() != 2 ||
+      !ShapeUtil::IsScalar(reducer->root_instruction()->shape()) ||
       reducer->root_instruction()->shape().element_type() != reduction_type) {
     return std::nullopt;
   }
+  const HloInstruction* reducer_root = reducer->root_instruction();
   const HloOpcode reducer_opcode = reducer->root_instruction()->opcode();
-  if (reducer_opcode != HloOpcode::kAdd &&
-      (reduction_type != F32 ||
-       (reducer_opcode != HloOpcode::kMaximum &&
-        reducer_opcode != HloOpcode::kMinimum))) {
+  const bool direct_binary_reducer =
+      reducer_root->operand_count() == 2 &&
+      reducer_root->operand(0)->opcode() == HloOpcode::kParameter &&
+      reducer_root->operand(1)->opcode() == HloOpcode::kParameter &&
+      reducer_root->operand(0)->parameter_number() !=
+          reducer_root->operand(1)->parameter_number() &&
+      (reducer_opcode == HloOpcode::kAdd ||
+       (reduction_type == F32 &&
+        (reducer_opcode == HloOpcode::kMaximum ||
+         reducer_opcode == HloOpcode::kMinimum)));
+  if (!direct_binary_reducer) {
+    // General reducer DAGs are evaluated in source order below. Keep them on
+    // the straight-line path so non-associative reducers are never silently
+    // reassociated by the eight-way unrolled reduction schedule.
+    if (reduction_type != F32 ||
+        input->shape().dimensions(reduction_dimension) > 32) {
+      return std::nullopt;
+    }
+    absl::flat_hash_set<const HloInstruction*> reducer_visited;
+    if (!IsSupportedElementwiseGraph(reducer_root, reducer_root->shape(),
+                                     reducer_visited)) {
+      return std::nullopt;
+    }
+  }
+  if (reduction_dimension == input_rank - 1 &&
+      instruction->user_count() == 0 && !IsSplatGraph(input) &&
+      direct_binary_reducer) {
     return std::nullopt;
   }
   int64_t inner_elements = 1;
@@ -1481,9 +1535,9 @@ std::optional<StridedReductionDescriptor> GetStridedReductionDescriptor(
           : -1;
   return StridedReductionDescriptor{
       input->shape().dimensions(reduction_dimension), inner_elements,
-      parameter_number, reduction_type, reducer_opcode,
-      reduction_type == F32 ? init->literal().GetFirstElement<float>() : 0.0,
-      reduction_type == S32 ? init->literal().GetFirstElement<int32_t>() : 0};
+      parameter_number, reduction_type, reducer_opcode, reducer,
+      direct_binary_reducer, reduction_type == F32 ? *init_value : 0.0,
+      reduction_type == S32 ? static_cast<int64_t>(*init_value) : 0};
 }
 
 bool IsStripedLoopInvariantBroadcast(const HloInstruction* instruction,
@@ -1556,7 +1610,7 @@ bool IsSupportedElementwiseGraph(
                   : HasSamePhysicalDimensions(instruction->shape(),
                                               output_shape));
     case HloOpcode::kConstant:
-      return ShapeUtil::IsScalar(instruction->shape()) &&
+      return ShapeUtil::ElementsIn(instruction->shape()) == 1 &&
              IsSupportedValueType(instruction->shape().element_type());
     case HloOpcode::kBroadcast:
       if (instruction->operand_count() != 1 ||
@@ -1633,13 +1687,25 @@ bool IsSupportedElementwiseGraph(
              IsSupportedElementwiseGraph(instruction->operand(0),
                                          instruction->operand(0)->shape(),
                                          visited);
-    case HloOpcode::kDynamicSlice:
-      return IsSupportedValueType(instruction->shape().element_type()) &&
-             HasSameFlatElements(instruction->shape(), output_shape) &&
-             GetDynamicSlice(instruction).has_value() &&
-             IsSupportedElementwiseGraph(instruction->operand(0),
-                                         instruction->operand(0)->shape(),
-                                         visited);
+    case HloOpcode::kDynamicSlice: {
+      if (!IsSupportedValueType(instruction->shape().element_type()) ||
+          !HasSameFlatElements(instruction->shape(), output_shape) ||
+          !GetDynamicSlice(instruction).has_value() ||
+          !IsSupportedElementwiseGraph(instruction->operand(0),
+                                       instruction->operand(0)->shape(),
+                                       visited)) {
+        return false;
+      }
+      for (int64_t operand = 1; operand < instruction->operand_count();
+           ++operand) {
+        if (!IsSupportedElementwiseGraph(
+                instruction->operand(operand),
+                instruction->operand(operand)->shape(), visited)) {
+          return false;
+        }
+      }
+      return true;
+    }
     case HloOpcode::kGather:
       return HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
              IsSupportedGather(instruction) &&
@@ -1649,16 +1715,28 @@ bool IsSupportedElementwiseGraph(
              IsSupportedElementwiseGraph(instruction->operand(1),
                                          instruction->operand(1)->shape(),
                                          visited);
-    case HloOpcode::kDynamicUpdateSlice:
-      return IsSupportedType(instruction->shape().element_type()) &&
-             HasSameFlatElements(instruction->shape(), output_shape) &&
-             GetDynamicUpdateSlice(instruction).has_value() &&
-             IsSupportedElementwiseGraph(instruction->operand(0),
-                                         instruction->operand(0)->shape(),
-                                         visited) &&
-             IsSupportedElementwiseGraph(instruction->operand(1),
-                                         instruction->operand(1)->shape(),
-                                         visited);
+    case HloOpcode::kDynamicUpdateSlice: {
+      if (!IsSupportedType(instruction->shape().element_type()) ||
+          !HasSameFlatElements(instruction->shape(), output_shape) ||
+          !GetDynamicUpdateSlice(instruction).has_value() ||
+          !IsSupportedElementwiseGraph(instruction->operand(0),
+                                       instruction->operand(0)->shape(),
+                                       visited) ||
+          !IsSupportedElementwiseGraph(instruction->operand(1),
+                                       instruction->operand(1)->shape(),
+                                       visited)) {
+        return false;
+      }
+      for (int64_t operand = 2; operand < instruction->operand_count();
+           ++operand) {
+        if (!IsSupportedElementwiseGraph(
+                instruction->operand(operand),
+                instruction->operand(operand)->shape(), visited)) {
+          return false;
+        }
+      }
+      return true;
+    }
     case HloOpcode::kReverse:
       return IsSupportedValueType(instruction->shape().element_type()) &&
              HasSamePhysicalDimensions(instruction->shape(), output_shape) &&
@@ -3431,7 +3509,10 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
               instruction->literal().untyped_data());
           scalar = builder.getIntegerAttr(builder.getI8Type(), value);
         } else if (IsSupportedFloatingType(instruction_type)) {
-          std::optional<double> value = instruction->literal().GetAsDouble({});
+          std::vector<int64_t> first_index(
+              instruction->shape().dimensions_size(), 0);
+          std::optional<double> value =
+              instruction->literal().GetAsDouble(first_index);
           TF_RET_CHECK(value.has_value());
           scalar = builder.getFloatAttr(vector_type.getElementType(), *value);
         } else {
@@ -5329,8 +5410,42 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         ScalarCopyContext scalar_copies =
             CreateScalarCopyContext(builder, copy_atoms);
 
-        auto scalar_vector_type = mlir::VectorType::get(
-            {1}, emitters::PrimitiveTypeToMlirType(instruction_type, builder));
+        // The AMD GPU control-flow conversion cannot carry vector<i1> block
+        // arguments. Predicate buffers are byte-backed at the XLA ABI, so
+        // retain that i8 storage representation through the concatenate's
+        // nested scf.if regions and recover logical predicates only after the
+        // selected fragment leaves control flow.
+        const bool predicate_concatenate = instruction_type == PRED;
+        mlir::Type control_flow_element_type =
+            predicate_concatenate
+                ? mlir::Type(builder.getI8Type())
+                : emitters::PrimitiveTypeToMlirType(instruction_type, builder);
+        auto control_flow_vector_type = mlir::VectorType::get(
+            {vector_width}, control_flow_element_type);
+        auto scalar_vector_type =
+            mlir::VectorType::get({1}, control_flow_element_type);
+        auto to_control_flow_value = [&](Value value) -> Value {
+          if (!predicate_concatenate) {
+            return value;
+          }
+          auto value_type = mlir::cast<mlir::VectorType>(value.getType());
+          auto storage_type =
+              mlir::VectorType::get(value_type.getShape(), builder.getI8Type());
+          return mlir::arith::ExtUIOp::create(builder, storage_type, value);
+        };
+        auto from_control_flow_value = [&](Value value) -> Value {
+          if (!predicate_concatenate) {
+            return value;
+          }
+          auto value_type = mlir::cast<mlir::VectorType>(value.getType());
+          Value zero = mlir::arith::ConstantOp::create(
+              builder, value_type,
+              mlir::DenseElementsAttr::get(
+                  value_type,
+                  builder.getIntegerAttr(value_type.getElementType(), 0)));
+          return mlir::arith::CmpIOp::create(
+              builder, mlir::arith::CmpIPredicate::ne, value, zero);
+        };
         std::function<absl::StatusOr<Value>(int64_t, int64_t, Value)>
             emit_scalar_operand =
                 [&](int64_t operand_index, int64_t operand_start,
@@ -5345,10 +5460,13 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
           }
           if (operand_index + 1 == instruction->operand_count()) {
             absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
-            return EmitVector(builder, argument_pointers, operand,
-                              operand_offset, predicate,
-                              scalar_copies.copy_atoms, scalar_copies.layout,
-                              /*vector_width=*/1, operand_cache);
+            TF_ASSIGN_OR_RETURN(
+                Value selected,
+                EmitVector(builder, argument_pointers, operand, operand_offset,
+                           predicate, scalar_copies.copy_atoms,
+                           scalar_copies.layout, /*vector_width=*/1,
+                           operand_cache));
+            return to_control_flow_value(selected);
           }
           const int64_t operand_end =
               operand_start + ShapeUtil::ElementsIn(operand->shape());
@@ -5369,7 +5487,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                            predicate, scalar_copies.copy_atoms,
                            scalar_copies.layout, /*vector_width=*/1,
                            operand_cache));
-            mlir::scf::YieldOp::create(builder, selected);
+            mlir::scf::YieldOp::create(builder,
+                                       to_control_flow_value(selected));
             builder.setInsertionPointToStart(select.elseBlock());
             TF_ASSIGN_OR_RETURN(
                 Value remaining,
@@ -5399,8 +5518,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
             lanes.push_back(
                 mlir::vector::ExtractOp::create(builder, scalar, 0));
           }
-          return mlir::vector::FromElementsOp::create(builder, vector_type,
-                                                      lanes)
+          return mlir::vector::FromElementsOp::create(
+                     builder, control_flow_vector_type, lanes)
               .getResult();
         };
 
@@ -5417,9 +5536,12 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
           }
           if (operand_index + 1 == instruction->operand_count()) {
             absl::flat_hash_map<const HloInstruction*, Value> operand_cache;
-            return EmitVector(builder, argument_pointers, operand,
-                              operand_offset, predicate, copy_atoms,
-                              vector_layout, vector_width, operand_cache);
+            TF_ASSIGN_OR_RETURN(
+                Value selected,
+                EmitVector(builder, argument_pointers, operand, operand_offset,
+                           predicate, copy_atoms, vector_layout, vector_width,
+                           operand_cache));
+            return to_control_flow_value(selected);
           }
 
           const int64_t operand_end =
@@ -5433,7 +5555,8 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
               mlir::arith::ConstantIntOp::create(builder, builder.getI64Type(),
                                                  operand_end));
           mlir::scf::IfOp select = mlir::scf::IfOp::create(
-              builder, mlir::TypeRange{vector_type}, fits_in_operand,
+              builder, mlir::TypeRange{control_flow_vector_type},
+              fits_in_operand,
               /*withElseRegion=*/true);
           {
             mlir::OpBuilder::InsertionGuard guard(builder);
@@ -5444,14 +5567,16 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                 EmitVector(builder, argument_pointers, operand, operand_offset,
                            predicate, copy_atoms, vector_layout, vector_width,
                            operand_cache));
-            mlir::scf::YieldOp::create(builder, selected);
+            mlir::scf::YieldOp::create(builder,
+                                       to_control_flow_value(selected));
             builder.setInsertionPointToStart(select.elseBlock());
             Value starts_in_operand = mlir::arith::CmpIOp::create(
                 builder, mlir::arith::CmpIPredicate::ult, element_offset,
                 mlir::arith::ConstantIntOp::create(
                     builder, builder.getI64Type(), operand_end));
             mlir::scf::IfOp boundary = mlir::scf::IfOp::create(
-                builder, mlir::TypeRange{vector_type}, starts_in_operand,
+                builder, mlir::TypeRange{control_flow_vector_type},
+                starts_in_operand,
                 /*withElseRegion=*/true);
             {
               mlir::OpBuilder::InsertionGuard boundary_guard(builder);
@@ -5471,6 +5596,7 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
         };
         TF_ASSIGN_OR_RETURN(result, emit_operand(/*operand_index=*/0,
                                                  /*operand_start=*/0));
+        result = from_control_flow_value(result);
         break;
       }
       case HloOpcode::kReduceWindow: {
@@ -5798,10 +5924,23 @@ class FlyXTileElementwiseEmitter final : public MlirKernelEmitter {
                 : SplatInteger(builder, vector_type,
                                descriptor->integer_init_value);
         auto combine = [&](Value lhs, Value rhs) -> absl::StatusOr<Value> {
-          return EmitStridedReductionBinary(builder, instruction_type,
-                                            descriptor->reducer, lhs, rhs);
+          if (descriptor->direct_binary_reducer) {
+            return EmitStridedReductionBinary(builder, instruction_type,
+                                              descriptor->reducer, lhs, rhs);
+          }
+          const HloComputation* reducer = descriptor->reducer_computation;
+          TF_RET_CHECK(reducer != nullptr && reducer->num_parameters() == 2);
+          absl::flat_hash_map<const HloInstruction*, Value> reducer_cache;
+          reducer_cache.emplace(reducer->parameter_instruction(0), lhs);
+          reducer_cache.emplace(reducer->parameter_instruction(1), rhs);
+          Value zero_offset = mlir::arith::ConstantIntOp::create(
+              builder, builder.getI64Type(), 0);
+          return EmitVector(builder, argument_pointers,
+                            reducer->root_instruction(), zero_offset,
+                            predicate, copy_atoms, vector_layout, vector_width,
+                            reducer_cache);
         };
-        if (IsSplatGraph(input)) {
+        if (descriptor->direct_binary_reducer && IsSplatGraph(input)) {
           Value zero_offset = mlir::arith::ConstantIntOp::create(
               builder, builder.getI64Type(), 0);
           absl::flat_hash_map<const HloInstruction*, Value> splat_cache;

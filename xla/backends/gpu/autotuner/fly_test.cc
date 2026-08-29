@@ -1081,6 +1081,27 @@ class FlyFusionBackendTest : public HloHardwareIndependentTestBase {
   FlyFusionBackend backend_;
 };
 
+TEST_F(FlyBackendTest, BoundsDefaultGemmSearchAndKeepsExhaustiveOptIn) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kF16DotHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> defaults,
+                       backend_.GetSupportedConfigs(*fusion));
+  EXPECT_LT(defaults.size(), 256);
+  EXPECT_TRUE(absl::c_any_of(defaults, [](const auto& config) {
+    const FlyGemmConfig& fly = config->fly();
+    return fly.block_m() == 32 && fly.block_n() == 16 &&
+           fly.block_k() == 256 && fly.num_warps() == 2 &&
+           fly.mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X16;
+  }));
+
+  debug_options_.set_xla_gpu_exhaustive_tiling_search(true);
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> exhaustive,
+                       backend_.GetSupportedConfigs(*fusion));
+  EXPECT_GT(exhaustive.size(), defaults.size() * 4);
+}
+
 TEST_F(FlyFusionBackendTest, RejectsGenericFusionWithOpaqueCustomCall) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_opaque_custom_call
@@ -1103,6 +1124,47 @@ ENTRY main {
                        backend_.GetSupportedConfigs(
                            *module->entry_computation()->root_instruction()));
   EXPECT_TRUE(configs.empty());
+}
+
+TEST_F(FlyFusionBackendTest, LeavesLargeOrdinaryIndexedDagOnNativeEmitter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_large_ordinary_indexed_dag
+
+body {
+  input = f32[16,256]{1,0} parameter(0)
+  slice0 = f32[1,256]{1,0} slice(input), slice={[0:1], [0:256]}
+  slice1 = f32[1,256]{1,0} slice(input), slice={[1:2], [0:256]}
+  slice2 = f32[1,256]{1,0} slice(input), slice={[2:3], [0:256]}
+  slice3 = f32[1,256]{1,0} slice(input), slice={[3:4], [0:256]}
+  slice4 = f32[1,256]{1,0} slice(input), slice={[4:5], [0:256]}
+  slice5 = f32[1,256]{1,0} slice(input), slice={[5:6], [0:256]}
+  slice6 = f32[1,256]{1,0} slice(input), slice={[6:7], [0:256]}
+  slice7 = f32[1,256]{1,0} slice(input), slice={[7:8], [0:256]}
+  slice8 = f32[1,256]{1,0} slice(input), slice={[8:9], [0:256]}
+  slice9 = f32[1,256]{1,0} slice(input), slice={[9:10], [0:256]}
+  slice10 = f32[1,256]{1,0} slice(input), slice={[10:11], [0:256]}
+  slice11 = f32[1,256]{1,0} slice(input), slice={[11:12], [0:256]}
+  slice12 = f32[1,256]{1,0} slice(input), slice={[12:13], [0:256]}
+  slice13 = f32[1,256]{1,0} slice(input), slice={[13:14], [0:256]}
+  slice14 = f32[1,256]{1,0} slice(input), slice={[14:15], [0:256]}
+  slice15 = f32[1,256]{1,0} slice(input), slice={[15:16], [0:256]}
+  ROOT result = f32[16,256]{1,0} concatenate(
+      slice0, slice1, slice2, slice3, slice4, slice5, slice6, slice7,
+      slice8, slice9, slice10, slice11, slice12, slice13, slice14, slice15),
+      dimensions={0}
+}
+
+ENTRY main {
+  input = f32[16,256]{1,0} parameter(0)
+  ROOT fusion = f32[16,256]{1,0} fusion(input), kind=kLoop, calls=body
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(
+                           *module->entry_computation()->root_instruction()));
+  EXPECT_THAT(configs, IsEmpty());
 }
 
 TEST_F(FlyFusionBackendTest,
@@ -3933,6 +3995,82 @@ TEST_F(FlyBackendTest, SupportsNativeF32MfmaGemm) {
   EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
 }
 
+TEST_F(FlyBackendTest, SupportsF32AlgorithmWithBf16Storage) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_f32_algorithm_bf16_storage
+
+gemm {
+  lhs = bf16[64,32]{1,0} parameter(0)
+  rhs = bf16[32,8]{1,0} parameter(1)
+  ROOT dot = bf16[64,8]{1,0} dot(lhs, rhs),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0},
+    algorithm=dot_f32_f32_f32
+}
+
+ENTRY main {
+  lhs = bf16[64,32]{1,0} parameter(0)
+  rhs = bf16[32,8]{1,0} parameter(1)
+  ROOT fusion = bf16[64,8]{1,0} fusion(lhs, rhs), kind=kCustom,
+    calls=gemm,
+    backend_config={"fusion_backend_config":{
+      "kind":"__triton_nested_gemm_fusion",
+      "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["64","8"]}],
+        "num_warps":"4","num_ctas":"1","num_stages":"1"}}}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_FALSE(configs.empty());
+  EXPECT_TRUE(std::all_of(configs.begin(), configs.end(), [](const auto& c) {
+    return c->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_16X16X16 ||
+           c->fly().mfma_atom() == FlyGemmConfig::FLY_MFMA_32X32X8;
+  }));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *configs.front()), IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                          fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
+}
+
+TEST_F(FlyBackendTest, SupportsSharedDotEpilogueOnSmallF32Gemm) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_small_f32_shared_dot
+
+gemm {
+  lhs = f32[4,8]{1,0} parameter(0)
+  rhs = f32[8,16]{1,0} parameter(1)
+  dot = f32[4,16]{1,0} dot(lhs, rhs),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  ROOT result = f32[4,16]{1,0} multiply(dot, dot)
+}
+
+ENTRY main {
+  lhs = f32[4,8]{1,0} parameter(0)
+  rhs = f32[8,16]{1,0} parameter(1)
+  ROOT fusion = f32[4,16]{1,0} fusion(lhs, rhs), kind=kCustom,
+    calls=gemm,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                          backend_.GetSupportedConfigs(*fusion));
+
+  ASSERT_EQ(configs.size(), 1);
+  const FlyGemmConfig& fly = configs.front()->fly();
+  EXPECT_EQ(fly.block_m(), 16);
+  EXPECT_EQ(fly.block_n(), 16);
+  EXPECT_EQ(fly.block_k(), 16);
+  EXPECT_EQ(fly.num_warps(), 1);
+  EXPECT_EQ(fly.mfma_atom(), FlyGemmConfig::FLY_MFMA_16X16X4_F32);
+}
+
 TEST_F(FlyBackendTest, SupportsNativeS8MfmaGemm) {
   constexpr absl::string_view kHlo = R"(
 HloModule fly_s8_gemm
@@ -4534,6 +4672,20 @@ TEST_F(FlyBackendTest, TunesShortKWorkgroupMapping) {
       std::any_of(configs.begin(), configs.end(), [](const auto& config) {
         return config->fly().workgroup_mapping_n() == 4;
       }));
+
+  const auto is_staged_32x16x128 = [](const auto& config) {
+    const FlyGemmConfig& fly = config->fly();
+    return fly.block_m() == 32 && fly.block_n() == 16 &&
+           fly.block_k() == 128 && fly.num_warps() == 2 && fly.stage_rhs();
+  };
+  EXPECT_EQ(absl::c_count_if(configs, is_staged_32x16x128), 12);
+
+  debug_options_.set_xla_gpu_exhaustive_tiling_search(true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> exhaustive,
+      backend_.GetSupportedConfigs(
+          *module->entry_computation()->root_instruction()));
+  EXPECT_EQ(absl::c_count_if(exhaustive, is_staged_32x16x128), 48);
 }
 
 TEST_F(FlyBackendTest, SupportsScalarEpilogue) {
@@ -5179,6 +5331,37 @@ ENTRY main {
   EXPECT_TRUE(std::any_of(configs.begin(), configs.end(), [](const auto& c) {
     return c->fly().block_k() <= 128 && !c->fly().stage_rhs();
   }));
+}
+
+TEST_F(FlyBackendTest, UsesGemmEmitterForMultiBatchMatrixVector) {
+  constexpr absl::string_view kHlo = R"(
+HloModule fly_multi_batch_matrix_vector
+
+gemm {
+  lhs = bf16[16,32,64,128]{3,2,1,0} parameter(0)
+  rhs = bf16[16,32,64,1]{3,2,1,0} parameter(1)
+  ROOT dot = f32[32,16,128,1]{3,2,1,0} dot(lhs, rhs),
+    lhs_batch_dims={1,0}, rhs_batch_dims={1,0},
+    lhs_contracting_dims={2}, rhs_contracting_dims={2}
+}
+
+ENTRY main {
+  lhs = bf16[16,32,64,128]{3,2,1,0} parameter(0)
+  rhs = bf16[16,32,64,1]{3,2,1,0} parameter(1)
+  ROOT fusion = f32[32,16,128,1]{3,2,1,0} fusion(lhs, rhs),
+    kind=kCustom, calls=gemm,
+    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<BackendConfig> config,
+                       backend_.GetDefaultConfig(*fusion));
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, *config), IsOk());
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), "__fly_gemm");
 }
 
 TEST_F(FlyBackendTest, SupportsBatchedBf16Gemv) {

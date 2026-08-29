@@ -1379,6 +1379,65 @@ ENTRY entry {
 )"));
 }
 
+TEST_F(FlyXTileElementwiseTest, RecognizesConvertedReductionInit) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule converted_reduction_init
+
+maximum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] maximum(lhs, rhs)
+}
+
+reduction {
+  input = f32[8,16]{1,0} parameter(0)
+  bf16_zero = bf16[] constant(0)
+  zero = f32[] convert(bf16_zero)
+  reduced = f32[8]{0} reduce(input, zero), dimensions={1}, to_apply=maximum
+  ROOT result = f32[8]{0} sqrt(reduced)
+}
+
+ENTRY entry {
+  input = f32[8,16]{1,0} parameter(0)
+  ROOT fusion = f32[8]{0} fusion(input), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}], "num_stages":"1",
+        "num_warps":"1", "num_ctas":"1", "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesSmallGeneralReducerDag) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule general_reducer_dag
+
+bounded_add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  sum = f32[] add(lhs, rhs)
+  eight = f32[] constant(8)
+  ROOT result = f32[] minimum(sum, eight)
+}
+
+reduction {
+  input = f32[2,2]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[2]{0} reduce(input, zero), dimensions={1},
+    to_apply=bounded_add
+}
+
+ENTRY entry {
+  input = f32[2,2]{1,0} parameter(0)
+  ROOT fusion = f32[2]{0} fusion(input), kind=kCustom, calls=reduction,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}], "num_stages":"1",
+        "num_warps":"1", "num_ctas":"1", "vector_size_bits":"128"}}}
+}
+)"));
+}
+
 TEST_F(FlyXTileElementwiseTest, RecognizesReductionOfConcatenate) {
   EXPECT_TRUE(IsSupported(R"(
 HloModule reduction_of_concatenate
@@ -1592,6 +1651,96 @@ ENTRY entry {
       *root, TestGpuDeviceInfo::CudaOrRocmDeviceInfo());
   EXPECT_TRUE(IsFlyXTileElementwiseFusion(analysis));
   EXPECT_TRUE(IsFlyXTileIndexedFusion(analysis));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesPredicateConcatenate) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule predicate_concatenate
+
+concatenate {
+  p0 = pred[128]{0} parameter(0)
+  p1 = pred[128]{0} parameter(1)
+  p2 = pred[25]{0} parameter(2)
+  ROOT result = pred[281]{0} concatenate(p0, p1, p2), dimensions={0}
+}
+
+ENTRY entry {
+  p0 = pred[128]{0} parameter(0)
+  p1 = pred[128]{0} parameter(1)
+  p2 = pred[25]{0} parameter(2)
+  ROOT fusion = pred[281]{0} fusion(p0, p1, p2), kind=kCustom,
+    calls=concatenate,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}], "num_stages":"1",
+        "num_warps":"2", "num_ctas":"1", "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesSingleElementArrayConstantConcat) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule single_element_array_constant_concat
+
+concatenate {
+  input = f32[8]{0} parameter(0)
+  four = f32[1]{0} constant({4})
+  ROOT result = f32[9]{0} concatenate(input, four), dimensions={0}
+}
+
+ENTRY entry {
+  input = f32[8]{0} parameter(0)
+  ROOT fusion = f32[9]{0} fusion(input), kind=kCustom, calls=concatenate,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}], "num_stages":"1",
+        "num_warps":"1", "num_ctas":"1", "vector_size_bits":"128"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesParameterFreeScalarExpression) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule parameter_free_scalar_expression
+
+expression {
+  ten = s32[] constant(10)
+  zero = s32[] constant(0)
+  ROOT result = s32[] divide(ten, zero)
+}
+
+ENTRY entry {
+  ROOT fusion = s32[] fusion(), kind=kCustom, calls=expression,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1"]}], "num_stages":"1",
+        "num_warps":"1", "num_ctas":"1", "vector_size_bits":"64"}}}
+}
+)"));
+}
+
+TEST_F(FlyXTileElementwiseTest, RecognizesDerivedDynamicSliceStart) {
+  EXPECT_TRUE(IsSupported(R"(
+HloModule derived_dynamic_slice_start
+
+slice {
+  input = s32[64]{0} parameter(0)
+  seven = s32[] constant(7)
+  thirteen = s32[] constant(13)
+  start = s32[] add(seven, thirteen)
+  ROOT result = s32[10]{0} dynamic-slice(input, start),
+    dynamic_slice_sizes={10}
+}
+
+ENTRY entry {
+  input = s32[64]{0} parameter(0)
+  ROOT fusion = s32[10]{0} fusion(input), kind=kCustom, calls=slice,
+    backend_config={"fusion_backend_config":{
+      "kind":"__fly", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["4"]}], "num_stages":"1",
+        "num_warps":"2", "num_ctas":"1", "vector_size_bits":"64"}}}
+}
+)"));
 }
 
 TEST_F(FlyXTileElementwiseTest, RecognizesMiddleDimensionConcatenateDag) {

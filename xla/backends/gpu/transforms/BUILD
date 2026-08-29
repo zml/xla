@@ -214,6 +214,7 @@ cc_library(
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
+        "//xla/backends/gpu/codegen/flydsl:fusion_support",
         "//xla/backends/gpu/codegen/flydsl:softmax_support",
         "//xla/backends/gpu/codegen/triton:support",
         "//xla/hlo/ir:hlo",

@@ -102,6 +102,20 @@ lit_device_test(
     ],
 )
 
+sh_binary(
+    name = "strict_fly_replacement_audit",
+    srcs = ["strict_fly_replacement_audit.sh"],
+    data = glob(["**/*.hlo"]) + [
+        "//xla/tools:run_hlo_module",
+    ],
+    tags = [
+        "gpu",
+        "manual",
+        "rocm-only",
+    ],
+    testonly = 1,
+)
+
 xla_cc_test(
     name = "fusion_emitter_deviceless_test",
     srcs = ["fusion_emitter_deviceless_test.cc"],

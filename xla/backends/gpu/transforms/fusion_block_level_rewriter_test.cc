@@ -191,6 +191,53 @@ ENTRY entry {
 }
 
 TEST_F(FlyFusionBlockLevelRewriterTest,
+       LeavesLargeLateIndexedDagOnNativeEmitter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule large_late_indexed_dag
+
+fusion_computation {
+  input = f32[16,256]{1,0} parameter(0)
+  slice0 = f32[1,256]{1,0} slice(input), slice={[0:1], [0:256]}
+  slice1 = f32[1,256]{1,0} slice(input), slice={[1:2], [0:256]}
+  slice2 = f32[1,256]{1,0} slice(input), slice={[2:3], [0:256]}
+  slice3 = f32[1,256]{1,0} slice(input), slice={[3:4], [0:256]}
+  slice4 = f32[1,256]{1,0} slice(input), slice={[4:5], [0:256]}
+  slice5 = f32[1,256]{1,0} slice(input), slice={[5:6], [0:256]}
+  slice6 = f32[1,256]{1,0} slice(input), slice={[6:7], [0:256]}
+  slice7 = f32[1,256]{1,0} slice(input), slice={[7:8], [0:256]}
+  slice8 = f32[1,256]{1,0} slice(input), slice={[8:9], [0:256]}
+  slice9 = f32[1,256]{1,0} slice(input), slice={[9:10], [0:256]}
+  slice10 = f32[1,256]{1,0} slice(input), slice={[10:11], [0:256]}
+  slice11 = f32[1,256]{1,0} slice(input), slice={[11:12], [0:256]}
+  slice12 = f32[1,256]{1,0} slice(input), slice={[12:13], [0:256]}
+  slice13 = f32[1,256]{1,0} slice(input), slice={[13:14], [0:256]}
+  slice14 = f32[1,256]{1,0} slice(input), slice={[14:15], [0:256]}
+  slice15 = f32[1,256]{1,0} slice(input), slice={[15:16], [0:256]}
+  ROOT result = f32[16,256]{1,0} concatenate(
+      slice0, slice1, slice2, slice3, slice4, slice5, slice6, slice7,
+      slice8, slice9, slice10, slice11, slice12, slice13, slice14, slice15),
+      dimensions={0}
+}
+
+ENTRY entry {
+  input = f32[16,256]{1,0} parameter(0)
+  ROOT fusion = f32[16,256]{1,0} fusion(input), kind=kLoop,
+    calls=fusion_computation
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(false));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kLoop);
+  EXPECT_FALSE(HasFlyBlockLevelFusionConfig(root));
+}
+
+TEST_F(FlyFusionBlockLevelRewriterTest,
        RewritesLateMultiOutputFusionWithoutTritonFlag) {
   constexpr absl::string_view kHlo = R"(
 fusion_computation {

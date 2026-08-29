@@ -207,11 +207,28 @@ absl::StatusOr<bool> FlyAutotuneCleanup::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   bool changed = false;
+  const bool replace_triton =
+      module->config().debug_options().xla_gpu_flydsl_replace_triton();
   for (HloComputation* computation :
        module->MakeNonfusionComputations(execution_threads)) {
     std::vector<HloInstruction*> scalar_materializations;
     std::vector<HloInstruction*> gemms;
     for (HloInstruction* instruction : computation->instructions()) {
+      if (replace_triton && instruction->opcode() == HloOpcode::kFusion) {
+        ASSIGN_OR_RETURN(GpuBackendConfig config,
+                         instruction->backend_config<GpuBackendConfig>());
+        FusionBackendConfig* fusion_config =
+            config.mutable_fusion_backend_config();
+        if (fusion_config->kind() == kTritonCollectiveFusionKind) {
+          // Collective thunk emission already selects the native Fly kernel
+          // in strict mode. Retag imported/preconfigured Triton collectives
+          // here as well so the post-autotune replacement contract reflects
+          // the backend that will actually be emitted.
+          fusion_config->set_kind(kFlyCollectiveFusionKind);
+          RETURN_IF_ERROR(instruction->set_backend_config(std::move(config)));
+          changed = true;
+        }
+      }
       if (IsFlyGemm(*instruction)) {
         gemms.push_back(instruction);
       } else if (instruction->opcode() == HloOpcode::kFusion &&

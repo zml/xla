@@ -31,6 +31,48 @@ namespace {
 
 class FlyAutotuneCleanupTest : public HloHardwareIndependentTestBase {};
 
+TEST_F(FlyAutotuneCleanupTest, RetagsImportedTritonCollectiveInReplacementMode) {
+  constexpr absl::string_view kHlo = R"(
+HloModule imported_triton_collective
+
+sum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT result = f32[] add(lhs, rhs)
+}
+
+collective {
+  input = f32[1024]{0} parameter(0)
+  ROOT result = f32[1024]{0} all-reduce(input), replica_groups={{0}},
+    to_apply=sum
+}
+
+ENTRY main {
+  input = f32[1024]{0} parameter(0)
+  ROOT fusion = f32[1024]{0} fusion(input), kind=kCustom,
+    calls=collective,
+    backend_config={"fusion_backend_config":{
+      "kind":"__triton_collective", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1024"]}], "num_warps":"16",
+        "num_ctas":"1", "num_stages":"1"}}}
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_flydsl_replace_triton(true);
+
+  FlyAutotuneCleanup cleanup;
+  ASSERT_OK_AND_ASSIGN(bool changed, cleanup.Run(module.get()));
+  EXPECT_TRUE(changed);
+  ASSERT_OK_AND_ASSIGN(
+      GpuBackendConfig config,
+      module->entry_computation()->root_instruction()->backend_config<
+          GpuBackendConfig>());
+  EXPECT_EQ(config.fusion_backend_config().kind(), kFlyCollectiveFusionKind);
+}
+
 TEST_F(FlyAutotuneCleanupTest, FoldsParameterFreeScalarFusionToConstant) {
   constexpr absl::string_view kHlo = R"(
 HloModule scalar_materialization

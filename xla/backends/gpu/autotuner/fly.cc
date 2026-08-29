@@ -758,6 +758,12 @@ bool IsSupportedContraction(const HloInstruction& dot) {
       if (!is_bf16) return false;
       break;
     case PrecisionConfig::ALG_DOT_F32_F32_F32:
+      // Triton's regular-dot lowering also accepts F16/BF16 storage for this
+      // algorithm.  That is numerically valid: products of two half-precision
+      // values are exactly representable in F32, and Fly's half-precision MFMA
+      // paths already accumulate in F32 before the requested output rounding.
+      if (!is_f32 && !is_f16 && !is_bf16) return false;
+      break;
     case PrecisionConfig::ALG_DOT_TF32_TF32_F32_X3:
     case PrecisionConfig::ALG_DOT_TF32_TF32_F32:
       if (!is_f32) return false;
@@ -1016,6 +1022,17 @@ bool IsSupportedEpilogue(const HloInstruction& instr,
     value = root->operand(0);
   }
   if (value == &dot) {
+    return true;
+  }
+
+  // Preserve shared contraction operands as a one-step accumulator epilogue.
+  // The GEMM emitter evaluates the dot once and feeds that accumulator to both
+  // sides of the elementwise operation.
+  if (IsSupportedBinaryEpilogue(value->opcode()) &&
+      value->operand_count() == 2 && value->operand(0) == &dot &&
+      value->operand(1) == &dot &&
+      ShapeUtil::SameDimensions(value->shape(), dot.shape()) &&
+      value->shape().element_type() == dot.shape().element_type()) {
     return true;
   }
 
@@ -1812,6 +1829,103 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
   };
 
   auto add_generic_gemm_configs = [&] {
+    if (!debug_options().xla_gpu_exhaustive_tiling_search()) {
+      // Follow Triton's online-autotuning policy: use a compact set of
+      // architecture-tuned output/K tiles by default and reserve the full
+      // Cartesian product for --xla_gpu_exhaustive_tiling_search.  Compiling
+      // the product is especially expensive for Fly because schedule,
+      // occupancy, output-staging, and MFMA-atom variants are real machine
+      // schedules rather than late metadata changes.
+      //
+      // The first group mirrors the ROCm/MI300 Triton hint set after rounding
+      // its N8 tiles up to Fly's minimum N16 MFMA atom.  The final group keeps
+      // the compact tiles selected by the audited transformer-training graph;
+      // those cover shallow projection gradients without reopening the full
+      // product.
+      constexpr std::array<std::array<int64_t, 4>, 40> kDefaultTiles = {{
+          {32, 32, 256, 4},
+          {64, 32, 32, 4},
+          {32, 64, 64, 4},
+          {128, 128, 64, 4},
+          {16, 16, 256, 1},
+          {16, 128, 32, 4},
+          {256, 256, 32, 8},
+          {128, 256, 64, 8},
+          {128, 256, 32, 4},
+          {256, 128, 64, 8},
+          {32, 16, 16, 2},
+          {64, 32, 16, 2},
+          {128, 32, 16, 4},
+          {128, 64, 128, 8},
+          {128, 128, 32, 4},
+          {256, 128, 32, 4},
+          {128, 32, 32, 4},
+          {64, 32, 128, 2},
+          {32, 32, 32, 2},
+          {32, 16, 128, 2},
+          {64, 16, 128, 2},
+          {32, 16, 256, 2},
+          {128, 16, 128, 8},
+          {64, 16, 16, 2},
+          {128, 16, 16, 2},
+          {256, 16, 32, 2},
+          {16, 16, 16, 1},
+          {16, 16, 32, 1},
+          {16, 16, 64, 1},
+          {16, 16, 128, 1},
+          {32, 16, 32, 2},
+          {32, 16, 64, 2},
+          {64, 32, 64, 4},
+          {32, 64, 16, 4},
+          {16, 128, 64, 4},
+          {16, 128, 128, 4},
+          {32, 32, 64, 4},
+          {32, 32, 128, 4},
+          {64, 64, 64, 4},
+          {64, 128, 64, 4},
+      }};
+
+      std::vector<std::array<int64_t, 5>> added;
+      auto add_default_tile = [&](int64_t block_m, int64_t block_n,
+                                  int64_t block_k, int64_t num_warps,
+                                  FlyGemmConfig::MfmaAtom atom) {
+        if ((block_m > m && block_m / 2 >= m && block_m != 16) ||
+            (block_n > n && block_n / 2 >= n && block_n != 16) ||
+            !supports_gemm_k_tile(block_k) ||
+            2 * block_m * block_k * sizeof(uint16_t) > 64 * 1024) {
+          return;
+        }
+        const bool atom_32 = atom == FlyGemmConfig::FLY_MFMA_32X32X8;
+        const int64_t atom_size = atom_32 ? 32 : 16;
+        if (block_m % atom_size != 0 || block_n % atom_size != 0) {
+          return;
+        }
+        const int64_t wave_tiles =
+            (block_m / atom_size) * (block_n / atom_size);
+        if (num_warps > wave_tiles || wave_tiles % num_warps != 0) {
+          return;
+        }
+        std::array<int64_t, 5> key = {
+            block_m, block_n, block_k, num_warps,
+            static_cast<int64_t>(atom)};
+        if (absl::c_linear_search(added, key)) {
+          return;
+        }
+        added.push_back(key);
+        add_gemm_configs(block_m, block_n, block_k, num_warps, atom);
+      };
+
+      for (const auto& tile : kDefaultTiles) {
+        add_default_tile(tile[0], tile[1], tile[2], tile[3],
+                         FlyGemmConfig::FLY_MFMA_16X16X16);
+        if (tile[0] % 32 == 0 && tile[1] % 32 == 0) {
+          add_default_tile(tile[0], tile[1], tile[2], tile[3],
+                           FlyGemmConfig::FLY_MFMA_32X32X8);
+        }
+      }
+      return;
+    }
+
     for (int64_t block_m : kBlockSizes) {
       // The generic emitter predicates its final M/N tile. Include the first
       // power-of-two tile larger than an odd dimension so small tails do not
@@ -1859,6 +1973,70 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         !supports_gemm_k_tile(block_k) || staged_lds_bytes > kMaxLdsBytes) {
       return;
     }
+    auto add_config = [&](int64_t num_warps, bool stage_output,
+                          int32_t waves_per_eu, bool schedule,
+                          int32_t workgroup_mapping_n) {
+      if (stage_output && output_element_type != BF16) {
+        return;
+      }
+      std::unique_ptr<BackendConfig> config = MakeConfig(
+          block_m, block_n, block_k, num_warps,
+          FlyGemmConfig::FLY_MFMA_16X16X16,
+          /*prefetch_rhs=*/false, stage_output, waves_per_eu,
+          /*schedule_instructions=*/schedule,
+          /*stage_rhs=*/true);
+      config->mutable_fly()->set_workgroup_mapping_n(workgroup_mapping_n);
+      configs.push_back(std::move(config));
+    };
+
+    if (!debug_options().xla_gpu_exhaustive_tiling_search()) {
+      // Keep the staged-RHS schedules which won the audited MI300X workloads
+      // without compiling their full Cartesian product. Occupancy caps only
+      // paid off with the matching instruction schedule, while CShuffle's
+      // four-wave cap won without it. Exhaustive mode below remains available
+      // for discovering new combinations.
+      struct PipelineVariant {
+        bool stage_output;
+        int32_t waves_per_eu;
+        bool schedule;
+      };
+      constexpr std::array<PipelineVariant, 8> kDefaultPipelineVariants = {{
+          {/*stage_output=*/false, /*waves_per_eu=*/0, /*schedule=*/false},
+          {/*stage_output=*/false, /*waves_per_eu=*/0, /*schedule=*/true},
+          {/*stage_output=*/false, /*waves_per_eu=*/2, /*schedule=*/true},
+          {/*stage_output=*/false, /*waves_per_eu=*/4, /*schedule=*/false},
+          {/*stage_output=*/true, /*waves_per_eu=*/0, /*schedule=*/false},
+          {/*stage_output=*/true, /*waves_per_eu=*/0, /*schedule=*/true},
+          {/*stage_output=*/true, /*waves_per_eu=*/2, /*schedule=*/true},
+          {/*stage_output=*/true, /*waves_per_eu=*/4, /*schedule=*/false},
+      }};
+      const bool tune_occupancy =
+          k < 1024 && block_m <= 32 && block_n <= 32;
+      const bool tune_workgroup_mapping =
+          k < 1024 && block_m == 32 && block_n == 16 && block_k == 128;
+      for (int64_t num_warps : num_warps_values) {
+        for (const PipelineVariant& variant : kDefaultPipelineVariants) {
+          if (variant.waves_per_eu != 0 && !tune_occupancy) {
+            continue;
+          }
+          add_config(num_warps, variant.stage_output, variant.waves_per_eu,
+                     variant.schedule, /*workgroup_mapping_n=*/0);
+        }
+        if (tune_workgroup_mapping && num_warps == 2 &&
+            output_element_type == BF16) {
+          // Mapping 4/8/16 covers the locality search while retaining the
+          // transformer winner at mapping 16. Mapping zero was added above.
+          for (int32_t mapping : {4, 8, 16}) {
+            add_config(num_warps, /*stage_output=*/true,
+                       /*waves_per_eu=*/0, /*schedule=*/true, mapping);
+          }
+          add_config(num_warps, /*stage_output=*/true,
+                     /*waves_per_eu=*/4, /*schedule=*/false,
+                     /*workgroup_mapping_n=*/16);
+        }
+      }
+      return;
+    }
     for (int64_t num_warps : num_warps_values) {
       for (bool stage_output : {false, true}) {
         if (stage_output && output_element_type != BF16) {
@@ -1876,15 +2054,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         for (int32_t workgroup_mapping_n : workgroup_mapping_values) {
           for (int32_t waves_per_eu : waves_per_eu_values) {
             for (bool schedule : {false, true}) {
-              std::unique_ptr<BackendConfig> config =
-                  MakeConfig(block_m, block_n, block_k, num_warps,
-                             FlyGemmConfig::FLY_MFMA_16X16X16,
-                             /*prefetch_rhs=*/false, stage_output, waves_per_eu,
-                             /*schedule_instructions=*/schedule,
-                             /*stage_rhs=*/true);
-              config->mutable_fly()->set_workgroup_mapping_n(
-                  workgroup_mapping_n);
-              configs.push_back(std::move(config));
+              add_config(num_warps, stage_output, waves_per_eu, schedule,
+                         workgroup_mapping_n);
             }
           }
         }
@@ -1947,11 +2118,11 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
         (precision.algorithm() == PrecisionConfig::ALG_UNSET ||
          precision.algorithm() == PrecisionConfig::ALG_DOT_TF32_TF32_F32);
     for (int64_t block_m : kF32BlockSizes) {
-      if (block_m > m && block_m / 2 >= m) {
+      if (block_m > m && block_m / 2 >= m && block_m != 16) {
         continue;
       }
       for (int64_t block_n : kF32BlockSizes) {
-        if (block_n > n && block_n / 2 >= n) {
+        if (block_n > n && block_n / 2 >= n && block_n != 16) {
           continue;
         }
         const int64_t mfma16_tiles = (block_m / 16) * (block_n / 16);
@@ -1960,7 +2131,8 @@ FlyBackend::GetSupportedConfigs(const HloInstruction& instr) {
           // The generic kernel ping-pongs two block_m x block_k FP32 LHS
           // stages and moves four FP32 values per 16-byte VMEM operation.
           const int64_t lhs_lds_bytes = 2 * block_m * block_k * sizeof(float);
-          if ((block_k > k && block_k / 2 >= k) || lhs_lds_bytes > 64 * 1024) {
+          if ((block_k > k && block_k / 2 >= k && block_k != 16) ||
+              lhs_lds_bytes > 64 * 1024) {
             continue;
           }
           for (int64_t num_warps : {1, 2, 4, 8}) {
@@ -3070,6 +3242,7 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
   const int64_t output_rank = dot->shape().dimensions_size();
   const bool is_gemv = dot->shape().dimensions(output_rank - 2) == 1 ||
                        dot->shape().dimensions(output_rank - 1) == 1;
+  const bool gemv_emitter_compatible = output_rank <= 3;
   const bool is_small_m_gemv =
       dot->shape().dimensions(output_rank - 2) >= 2 &&
       dot->shape().dimensions(output_rank - 2) <= 8 &&
@@ -3080,8 +3253,9 @@ absl::Status FlyBackend::ApplyConfig(HloInstruction& instr,
   // Scalar/vector GEMV configs use the dedicated Fly GEMV emitter.  The
   // cooperative MFMA candidate is structurally a tiled GEMM with a masked
   // M-tail and must therefore use the xTile GEMM emitter.
-  fusion_config->set_kind((is_gemv || is_small_m_gemv) &&
-                              !fly_config.local_split_k()
+  fusion_config->set_kind(gemv_emitter_compatible &&
+                                  (is_gemv || is_small_m_gemv) &&
+                                  !fly_config.local_split_k()
                               ? kFlyGemvFusionKind
                               : kFlyGemmFusionKind);
   *fusion_config->mutable_fly_gemm_config() = fly_config;
@@ -3118,7 +3292,8 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   // A parameter-free scalar fusion is compile-time constant materialization.
   // Leave it out of autotuning; FlyAutotuneCleanup evaluates it after backend
   // selection so it cannot become a standalone GPU launch.
-  if (fusion->operand_count() == 0 && ShapeUtil::IsScalar(fusion->shape())) {
+  if (fusion->operand_count() == 0 && ShapeUtil::IsScalar(fusion->shape()) &&
+      !debug_options().xla_gpu_flydsl_replace_triton()) {
     return false;
   }
   bool is_generic_block_fusion = false;
@@ -3128,10 +3303,16 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
       return false;
     }
     absl::string_view kind = gpu_config->fusion_backend_config().kind();
-    if (kind != kTritonFusionKind && kind != kFlyFusionKind) {
+    if (kind != kTritonFusionKind && kind != kFlyFusionKind &&
+        !(debug_options().xla_gpu_flydsl_replace_triton() &&
+          kind == kTritonNestedGemmFusionKind)) {
       return false;
     }
     is_generic_block_fusion = true;
+  }
+  if (!is_generic_block_fusion &&
+      flydsl::ShouldKeepLargeIndexedDagOnNativeEmitter(instr)) {
+    return false;
   }
   HloFusionAnalysis analysis =
       HloFusionAnalysis::Create(instr, target_config().device_description);

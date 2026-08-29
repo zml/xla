@@ -163,22 +163,14 @@ TEST_F(FlyDslReplacementVerifierTest, RejectsGenericXlaEmitterRoute) {
   constexpr absl::string_view kHlo = R"(
 HloModule replacement_verifier_generic_xla_route
 
-multiply {
-  lhs = f32[] parameter(0)
-  rhs = f32[] parameter(1)
-  ROOT product = f32[] multiply(lhs, rhs)
-}
-
 body {
-  p0 = f32[17,11]{1,0} parameter(0)
-  one = f32[] constant(1)
-  ROOT result = f32[11]{0} reduce(p0, one), dimensions={0},
-      to_apply=multiply
+  p0 = u32[17,11]{1,0} parameter(0)
+  ROOT result = u32[17,11]{1,0} copy(p0)
 }
 
 ENTRY main {
-  p0 = f32[17,11]{1,0} parameter(0)
-  ROOT fusion = f32[11]{0} fusion(p0), kind=kCustom, calls=body,
+  p0 = u32[17,11]{1,0} parameter(0)
+  ROOT fusion = u32[17,11]{1,0} fusion(p0), kind=kCustom, calls=body,
       backend_config={"fusion_backend_config":{"kind":"__fly"}}
 }
 )";
