@@ -111,6 +111,34 @@ TEST_F(PriorityFusionTest, FuseWithSharedArgument) {
   EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kLoop);
 }
 
+TEST_F(PriorityFusionTest, SkipsUnusableRootFusionCostEntry) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+HloModule imported_root_fusion
+
+fusion {
+  lhs = f32[4,8]{1,0} parameter(0)
+  rhs = f32[8,16]{1,0} parameter(1)
+  dot = f32[4,16]{1,0} dot(lhs, rhs),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  ROOT result = f32[4,16]{1,0} multiply(dot, dot)
+}
+
+ENTRY main {
+  lhs = f32[4,8]{1,0} parameter(0)
+  rhs = f32[8,16]{1,0} parameter(1)
+  ROOT imported = f32[4,16]{1,0} fusion(lhs, rhs), kind=kCustom,
+    calls=fusion, backend_config={"fusion_backend_config":{
+      "kind":"__triton", "block_level_fusion_config":{
+        "output_tiles":[{"sizes":["1","2"]}], "num_warps":"1",
+        "num_ctas":"1", "num_stages":"1"}}}
+}
+)")
+                    .value();
+
+  EXPECT_THAT(priority_fusion_.Run(module.get()),
+              absl_testing::IsOkAndHolds(false));
+}
+
 TEST_F(PriorityFusionTest, FusionOnStreamAnnotatedComputation) {
   auto module = ParseAndReturnVerifiedModule(R"(
     HloModule test_module

@@ -127,6 +127,62 @@ ENTRY main {
   gpu_config.mutable_fusion_backend_config()->set_kind("__custom");
   ASSERT_OK(fusion->set_backend_config(gpu_config));
   EXPECT_FALSE(should_autotune(*fusion));
+
+  // Strict replacement also has to convert imported/preconfigured Triton HLO
+  // when online fusion autotuning is otherwise disabled at level zero.
+  gpu_config.mutable_fusion_backend_config()->set_kind("__triton");
+  ASSERT_OK(fusion->set_backend_config(gpu_config));
+  debug_options.set_xla_gpu_autotune_level(0);
+  debug_options.set_xla_gpu_experimental_enable_fusion_autotuner(false);
+  debug_options.set_xla_gpu_flydsl_replace_triton(true);
+  should_autotune = GetShouldAutotuneInstructionFn(
+      debug_options,
+      stream_executor_->GetDeviceDescription().gpu_compute_capability());
+  EXPECT_TRUE(should_autotune(*fusion));
+
+  gpu_config.mutable_fusion_backend_config()->set_kind(
+      "__triton_nested_gemm_fusion");
+  ASSERT_OK(fusion->set_backend_config(gpu_config));
+  EXPECT_TRUE(should_autotune(*fusion));
+}
+
+TEST_F(AutotunerPassTest, ConfiguredTritonGemmIsRetunedForFlyReplacement) {
+  constexpr absl::string_view kHlo = R"(
+HloModule configured_triton_gemm
+
+gemm {
+  lhs = bf16[128,64]{1,0} parameter(0)
+  rhs = bf16[64,128]{1,0} parameter(1)
+  ROOT dot = bf16[128,128]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY main {
+  lhs = bf16[128,64]{1,0} parameter(0)
+  rhs = bf16[64,128]{1,0} parameter(1)
+  ROOT fusion = bf16[128,128]{1,0} fusion(lhs, rhs), kind=kCustom,
+    calls=gemm, backend_config={"fusion_backend_config":{
+      "kind":"__triton_gemm", "triton_gemm_config":{
+        "block_m":"64", "block_n":"64", "block_k":"32",
+        "split_k":"1", "num_stages":"1", "num_warps":"4",
+        "num_ctas":"1"}}}
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_autotune_level(0);
+  InstructionFilterFn should_autotune = GetShouldAutotuneInstructionFn(
+      debug_options,
+      stream_executor_->GetDeviceDescription().gpu_compute_capability());
+  EXPECT_FALSE(should_autotune(*fusion));
+
+  debug_options.set_xla_gpu_flydsl_replace_triton(true);
+  should_autotune = GetShouldAutotuneInstructionFn(
+      debug_options,
+      stream_executor_->GetDeviceDescription().gpu_compute_capability());
+  EXPECT_TRUE(should_autotune(*fusion));
 }
 
 TEST_F(AutotunerPassTest, SignedMaximumScatterFusionIsAutotuned) {
@@ -624,6 +680,27 @@ TEST_F(AutotunerFlagsTest, GetGpuAutotunerBackendsRespectsDeterminism) {
     EXPECT_NE(backend->backend(), autotuner::Backend::TRITON);
     EXPECT_NE(backend->backend(), autotuner::Backend::NATIVE_EMITTER);
     EXPECT_NE(backend->backend(), autotuner::Backend::BLOCK_LEVEL_EMITTER);
+  }
+}
+
+TEST_F(AutotunerFlagsTest, FlyReplacementDisablesTritonBackend) {
+  DebugOptions debug_options = GetDebugOptionsForTest();
+  debug_options.set_xla_gpu_flydsl_replace_triton(true);
+
+  GpuCompiler::GpuTargetConfig target_config(stream_executor_);
+  GpuAliasInfo alias_info(stream_executor_->GetDeviceDescription());
+  mlir::MLIRContext mlir_context;
+  RegisterSymbolicExprStorage(&mlir_context);
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<CodegenBackend>> backends,
+                       AutotunerPass::GetGpuAutotunerBackends(
+                           stream_executor_, allocator_.get(), &target_config,
+                           &alias_info, debug_options, &mlir_context,
+                           /*shape_size_fn=*/[](const Shape&) { return 0; },
+                           &compiler_, stream_executor_->GetPlatform()->id()));
+
+  for (const auto& backend : backends) {
+    EXPECT_NE(backend->backend(), autotuner::Backend::TRITON);
   }
 }
 

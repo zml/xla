@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -174,6 +175,9 @@ absl::StatusOr<bool> ShouldTryRewriteFusion(
     // created after autotuning (for example by the post-scheduling
     // FusionWrapper), so give them a default Fly configuration now.
     if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
+      return false;
+    }
+    if (flydsl::ShouldKeepLargeIndexedDagOnNativeEmitter(*fusion)) {
       return false;
     }
 

@@ -47,6 +47,13 @@ FlyFusionRoute ClassifyFlyFusion(const HloFusionAnalysis& analysis);
 absl::string_view FlyFusionRouteName(FlyFusionRoute route);
 bool IsNativeFlyFusionRoute(FlyFusionRoute route);
 
+// Returns true for an ordinary indexed fusion whose shared address-selection
+// DAG is large enough that xTile's per-output specialization has pathological
+// compile-time growth. Such a fusion should stay on XLA's native emitter; this
+// predicate does not apply to an explicit custom/Triton replacement boundary.
+bool ShouldKeepLargeIndexedDagOnNativeEmitter(
+    const HloInstruction& fusion);
+
 // Returns true when a fusion contains a custom call that is not owned by one
 // of Fly's specialized emitters. Generic loop/reduction/transpose emitters do
 // not lower arbitrary custom calls and must never be used as a fallback for

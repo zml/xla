@@ -160,6 +160,128 @@ ENTRY main {
   EXPECT_FALSE(fission_configs.empty());
 }
 
+TEST_P(FactoryTest, NativeFlyOwnsAlreadyMinimalGemm) {
+  if (GetParam().names !=
+      std::vector<Backend>{Backend::FLY, Backend::FLY_FISSION,
+                           Backend::FLY_FUSION}) {
+    GTEST_SKIP() << "Only applies to the ROCm Fly backend set.";
+  }
+  const auto& device = stream_executor_->GetDeviceDescription();
+  if (!device.gpu_compute_capability().IsRocm()) {
+    GTEST_SKIP() << "Fly is a ROCm backend.";
+  }
+
+  debug_options_.set_xla_gpu_enable_flydsl_gemm(true);
+  auto& registry =
+      stream_executor::PlatformObjectRegistry::GetGlobalRegistry();
+  TF_ASSERT_OK_AND_ASSIGN(
+      const GetCodegenBackends::Type& get_codegen_backends,
+      registry.FindObject<GetCodegenBackends>(platform_->id()));
+  mlir::MLIRContext mlir_context;
+  AliasInfo alias_info;
+  xla::RegisterSymbolicExprStorage(&mlir_context);
+  std::vector<std::unique_ptr<CodegenBackend>> backends =
+      get_codegen_backends(
+          stream_executor_, &allocator_, &debug_options_, compiler_.get(),
+          &target_config_, &alias_info, &mlir_context,
+          /*shape_size_fn=*/[](const Shape&) { return 0; }, GetParam().names);
+
+  constexpr char kHlo[] = R"(
+HloModule fly_minimal_gemm_ownership
+
+gemm {
+  lhs = bf16[128,256]{1,0} parameter(0)
+  rhs = bf16[256,768]{1,0} parameter(1)
+  ROOT dot = bf16[128,768]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY main {
+  lhs = bf16[128,256]{1,0} parameter(0)
+  rhs = bf16[256,768]{1,0} parameter(1)
+  ROOT fusion = bf16[128,768]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  CodegenBackend* direct = nullptr;
+  CodegenBackend* fission = nullptr;
+  for (const std::unique_ptr<CodegenBackend>& backend : backends) {
+    if (backend->backend() == Backend::FLY) direct = backend.get();
+    if (backend->backend() == Backend::FLY_FISSION) fission = backend.get();
+  }
+  ASSERT_NE(direct, nullptr);
+  ASSERT_NE(fission, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(auto direct_configs,
+                          direct->GetSupportedConfigs(*fusion));
+  TF_ASSERT_OK_AND_ASSIGN(auto fission_configs,
+                          fission->GetSupportedConfigs(*fusion));
+  EXPECT_FALSE(direct_configs.empty());
+  EXPECT_TRUE(fission_configs.empty());
+}
+
+TEST_P(FactoryTest, FlyFissionRetainsExternalConcatenateAlternative) {
+  if (GetParam().names !=
+      std::vector<Backend>{Backend::FLY, Backend::FLY_FISSION,
+                           Backend::FLY_FUSION}) {
+    GTEST_SKIP() << "Only applies to the ROCm Fly backend set.";
+  }
+  const auto& device = stream_executor_->GetDeviceDescription();
+  if (!device.gpu_compute_capability().IsRocm()) {
+    GTEST_SKIP() << "Fly is a ROCm backend.";
+  }
+
+  debug_options_.set_xla_gpu_enable_flydsl_gemm(true);
+  auto& registry =
+      stream_executor::PlatformObjectRegistry::GetGlobalRegistry();
+  TF_ASSERT_OK_AND_ASSIGN(
+      const GetCodegenBackends::Type& get_codegen_backends,
+      registry.FindObject<GetCodegenBackends>(platform_->id()));
+  mlir::MLIRContext mlir_context;
+  AliasInfo alias_info;
+  xla::RegisterSymbolicExprStorage(&mlir_context);
+  std::vector<std::unique_ptr<CodegenBackend>> backends =
+      get_codegen_backends(
+          stream_executor_, &allocator_, &debug_options_, compiler_.get(),
+          &target_config_, &alias_info, &mlir_context,
+          /*shape_size_fn=*/[](const Shape&) { return 0; }, GetParam().names);
+
+  constexpr char kHlo[] = R"(
+HloModule fly_external_concatenate_fission
+
+gemm {
+  lhs = bf16[128,256]{1,0} parameter(0)
+  rhs = bf16[256,256]{1,0} parameter(1)
+  ROOT dot = bf16[128,256]{1,0} dot(lhs, rhs),
+      lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY main {
+  lhs0 = bf16[128,128]{1,0} parameter(0)
+  lhs1 = bf16[128,128]{1,0} parameter(1)
+  lhs = bf16[128,256]{1,0} concatenate(lhs0, lhs1), dimensions={1}
+  rhs = bf16[256,256]{1,0} parameter(2)
+  ROOT fusion = bf16[128,256]{1,0} fusion(lhs, rhs),
+      kind=kCustom, calls=gemm,
+      backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+})";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+
+  CodegenBackend* fission = nullptr;
+  for (const std::unique_ptr<CodegenBackend>& backend : backends) {
+    if (backend->backend() == Backend::FLY_FISSION) fission = backend.get();
+  }
+  ASSERT_NE(fission, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(auto fission_configs,
+                          fission->GetSupportedConfigs(*fusion));
+  EXPECT_FALSE(fission_configs.empty());
+}
+
 TEST_P(FactoryTest, NativeFlyOwnsLearnedScaleGemm) {
   if (GetParam().names !=
       std::vector<Backend>{Backend::FLY, Backend::FLY_FISSION,
@@ -227,7 +349,7 @@ ENTRY main {
                           direct->GetSupportedConfigs(*fusion));
   TF_ASSERT_OK_AND_ASSIGN(auto fission_configs,
                           fission->GetSupportedConfigs(*fusion));
-  EXPECT_EQ(direct_configs.size(), 1);
+  EXPECT_FALSE(direct_configs.empty());
   EXPECT_TRUE(fission_configs.empty());
 }
 

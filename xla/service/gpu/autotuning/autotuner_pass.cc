@@ -284,7 +284,8 @@ AutotuneDecision ShouldAutotuneCustomCall(bool do_not_autotune_cublas,
       "Instruction is not a supported custom call (GEMM or Conv)");
 }
 
-AutotuneDecision ShouldAutotuneGemmFusion(const HloInstruction& instruction) {
+AutotuneDecision ShouldAutotuneGemmFusion(
+    bool replace_triton, const HloInstruction& instruction) {
   auto gpu_config = instruction.backend_config<GpuBackendConfig>();
   if (!gpu_config.ok()) {
     return AutotuneDecision::Forbid(absl::StrCat(
@@ -293,7 +294,11 @@ AutotuneDecision ShouldAutotuneGemmFusion(const HloInstruction& instruction) {
   const FusionBackendConfig& backend_config =
       gpu_config->fusion_backend_config();
   if (backend_config.kind() == kTritonGemmFusionKind) {
-    if (backend_config.has_triton_gemm_config()) {
+    // Imported HLO can already carry a selected Triton configuration. In
+    // replacement mode that configuration is an input to convert, not a
+    // reason to skip the instruction: the Fly backend must choose and attach
+    // its own configuration before the final no-Triton verifier runs.
+    if (!replace_triton && backend_config.has_triton_gemm_config()) {
       return AutotuneDecision::Forbid(
           "Triton GEMM fusion already has a config");
     }
@@ -323,11 +328,10 @@ AutotuneDecision ShouldAutotuneGemmFusion(const HloInstruction& instruction) {
 }
 
 AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
+                                            bool replace_triton,
                                             const HloInstruction& instruction) {
-  if (!enable_fusion_autotuner) {
-    return AutotuneDecision::Forbid("Fusion autotuner is disabled");
-  }
   auto fusion = Cast<const HloFusionInstruction>(&instruction);
+  bool is_imported_triton_fusion = false;
   if (fusion->fusion_kind() == HloInstruction::FusionKind::kCustom) {
     auto gpu_config = instruction.backend_config<GpuBackendConfig>();
     if (!gpu_config.ok()) {
@@ -339,10 +343,20 @@ AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
     // generic, tiled HLO fusions and can be emitted by another backend. Keep
     // other custom kinds pinned to their owning code generators.
     absl::string_view kind = gpu_config->fusion_backend_config().kind();
-    if (kind != kTritonFusionKind && kind != kFlyFusionKind) {
+    is_imported_triton_fusion =
+        kind == kTritonFusionKind || kind == kTritonNestedGemmFusionKind;
+    if (kind != kTritonFusionKind && kind != kFlyFusionKind &&
+        !(replace_triton && kind == kTritonNestedGemmFusionKind)) {
       return AutotuneDecision::Forbid(
           "Custom fusion is not a generic block-level fusion");
     }
+  }
+  // Normal level-zero compilation leaves generic loop fusions on XLA's
+  // default emitter. Strict replacement only overrides that policy for
+  // imported Triton launch boundaries; ordinary XLA fusions remain ordinary.
+  if (!enable_fusion_autotuner &&
+      !(replace_triton && is_imported_triton_fusion)) {
+    return AutotuneDecision::Forbid("Fusion autotuner is disabled");
   }
   if (absl::c_any_of(fusion->fused_instructions_computation()->instructions(),
                      HloPredicateIsOp<HloOpcode::kScatter>) &&
@@ -355,6 +369,7 @@ AutotuneDecision ShouldAutotunGenericFusion(bool enable_fusion_autotuner,
 AutotuneDecision ShouldAutotuneInstruction(bool do_not_autotune_cublas,
                                            bool do_not_autotune_cudnn,
                                            bool enable_fusion_autotuner,
+                                           bool replace_triton,
                                            const HloInstruction& instruction) {
   // 1. Custom calls.
   if (instruction.opcode() == HloOpcode::kCustomCall) {
@@ -375,10 +390,11 @@ AutotuneDecision ShouldAutotuneInstruction(bool do_not_autotune_cublas,
         backend_config.kind() == kFlyGemvFusionKind ||
         backend_config.kind() == kCuDnnFusionKind ||
         backend_config.kind() == kCustomFusionKind) {
-      return ShouldAutotuneGemmFusion(instruction);
+      return ShouldAutotuneGemmFusion(replace_triton, instruction);
     }
     // 3. Generic fusions.
-    return ShouldAutotunGenericFusion(enable_fusion_autotuner, instruction);
+    return ShouldAutotunGenericFusion(enable_fusion_autotuner, replace_triton,
+                                      instruction);
   }
   return AutotuneDecision::Forbid(
       "Instruction is neither custom call nor fusion");
@@ -502,12 +518,15 @@ InstructionFilterFn GetShouldAutotuneInstructionFn(
       debug_options.xla_gpu_autotune_level() != 0 &&
       !debug_options.xla_gpu_exclude_nondeterministic_ops() &&
       debug_options.xla_gpu_experimental_enable_fusion_autotuner();
+  bool replace_triton = debug_options.xla_gpu_flydsl_replace_triton();
 
   return [do_not_autotune_cublas, do_not_autotune_cudnn,
-          enable_fusion_autotuner](const HloInstruction& instruction) -> bool {
+          enable_fusion_autotuner,
+          replace_triton](const HloInstruction& instruction) -> bool {
     AutotuneDecision decision =
         ShouldAutotuneInstruction(do_not_autotune_cublas, do_not_autotune_cudnn,
-                                  enable_fusion_autotuner, instruction);
+                                  enable_fusion_autotuner, replace_triton,
+                                  instruction);
     if (!decision) {
       VLOG(3) << "Not autotuning " << instruction.name() << ": "
               << decision.Explain();
@@ -548,7 +567,8 @@ AutotunerPass::GetGpuAutotunerBackends(
   }
 
   if (debug_options.xla_gpu_exclude_nondeterministic_ops() ||
-      debug_options.xla_gpu_deterministic_ops()) {
+      debug_options.xla_gpu_deterministic_ops() ||
+      debug_options.xla_gpu_flydsl_replace_triton()) {
     disabled_autotune_backends.push_back(autotuner::Backend::TRITON);
   }
 

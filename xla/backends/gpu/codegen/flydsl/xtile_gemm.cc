@@ -1054,6 +1054,7 @@ struct EpilogueStep {
   int64_t broadcast_dimension = -2;
   int64_t contraction_operand = 0;
   bool input_is_constant = false;
+  bool reuse_contraction = false;
   double constant_value = 0.0;
   PrimitiveType round_input_type = PRIMITIVE_TYPE_INVALID;
 };
@@ -1078,24 +1079,35 @@ std::vector<EpilogueStep> FindEpilogueSteps(const HloInstruction& root,
             value->opcode() == HloOpcode::kDivide ||
             value->opcode() == HloOpcode::kMaximum ||
             value->opcode() == HloOpcode::kMinimum);
-      const bool lhs_contains =
-          ContainsInstruction(*value->operand(0), contraction);
-      const int64_t contraction_operand = lhs_contains ? 0 : 1;
-      step.contraction_operand = contraction_operand;
-      contraction_value = value->operand(contraction_operand);
-      const HloInstruction* broadcast = value->operand(1 - contraction_operand);
-      if (broadcast->opcode() == HloOpcode::kConvert) {
-        broadcast = broadcast->operand(0);
-      }
-      const HloInstruction* input = broadcast->operand(0);
-      step.input_type = input->shape().element_type();
-      step.broadcast_dimension =
-          broadcast->dimensions().empty() ? -1 : broadcast->dimensions(0);
-      if (input->opcode() == HloOpcode::kConstant) {
-        step.input_is_constant = true;
-        step.constant_value = input->literal().GetAsDouble({}).value();
+      if (value->operand(0) == value->operand(1) &&
+          ContainsInstruction(*value->operand(0), contraction)) {
+        // A shared HLO contraction can feed both operands of an elementwise
+        // epilogue without recomputing the MFMA. Reuse the accumulator value
+        // directly instead of trying to interpret the second edge as a
+        // broadcast input.
+        step.reuse_contraction = true;
+        contraction_value = value->operand(0);
       } else {
-        step.parameter_number = input->parameter_number();
+        const bool lhs_contains =
+            ContainsInstruction(*value->operand(0), contraction);
+        const int64_t contraction_operand = lhs_contains ? 0 : 1;
+        step.contraction_operand = contraction_operand;
+        contraction_value = value->operand(contraction_operand);
+        const HloInstruction* broadcast =
+            value->operand(1 - contraction_operand);
+        if (broadcast->opcode() == HloOpcode::kConvert) {
+          broadcast = broadcast->operand(0);
+        }
+        const HloInstruction* input = broadcast->operand(0);
+        step.input_type = input->shape().element_type();
+        step.broadcast_dimension =
+            broadcast->dimensions().empty() ? -1 : broadcast->dimensions(0);
+        if (input->opcode() == HloOpcode::kConstant) {
+          step.input_is_constant = true;
+          step.constant_value = input->literal().GetAsDouble({}).value();
+        } else {
+          step.parameter_number = input->parameter_number();
+        }
       }
     }
     const PrimitiveType contraction_value_type =
@@ -1474,7 +1486,7 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
     llvm::SmallVector<Value> scalar_epilogue_values(epilogue_steps_.size());
     for (int64_t index = 0; index < epilogue_steps_.size(); ++index) {
       const EpilogueStep& step = epilogue_steps_[index];
-      if (step.opcode == HloOpcode::kNegate) {
+      if (step.opcode == HloOpcode::kNegate || step.reuse_contraction) {
         continue;
       }
       if (step.input_is_constant) {
@@ -2385,7 +2397,9 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
           epilogue_steps_.size() - (fold_final_negate_ ? 1 : 0);
       for (int64_t step_index = 0; step_index < step_count; ++step_index) {
         Value operand;
-        if (epilogue_steps_[step_index].opcode != HloOpcode::kNegate) {
+        if (epilogue_steps_[step_index].reuse_contraction) {
+          operand = value;
+        } else if (epilogue_steps_[step_index].opcode != HloOpcode::kNegate) {
           operand = load_epilogue_element(step_index, row, column);
         }
         value = apply_epilogue_step(value, step_index, operand);
@@ -2397,8 +2411,10 @@ class FlyXTileGemmEmitter final : public MlirKernelEmitter {
       const int64_t step_count =
           epilogue_steps_.size() - (fold_final_negate_ ? 1 : 0);
       for (int64_t step_index = 0; step_index < step_count; ++step_index) {
-        value = apply_epilogue_step(value, step_index,
-                                    scalar_epilogue_values[step_index]);
+        Value operand = epilogue_steps_[step_index].reuse_contraction
+                            ? value
+                            : scalar_epilogue_values[step_index];
+        value = apply_epilogue_step(value, step_index, operand);
       }
       return value;
     };
@@ -10275,7 +10291,7 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
     llvm::SmallVector<Value> scalar_epilogue_values(epilogue_steps_.size());
     for (int64_t index = 0; index < epilogue_steps_.size(); ++index) {
       const EpilogueStep& step = epilogue_steps_[index];
-      if (step.opcode == HloOpcode::kNegate) {
+      if (step.opcode == HloOpcode::kNegate || step.reuse_contraction) {
         continue;
       }
       if (step.input_is_constant) {
@@ -10495,7 +10511,9 @@ class FlyXTileGemvEmitter final : public MlirKernelEmitter {
       for (int64_t step_index = 0; step_index < epilogue_steps_.size();
            ++step_index) {
         Value operand;
-        if (epilogue_steps_[step_index].opcode != HloOpcode::kNegate) {
+        if (epilogue_steps_[step_index].reuse_contraction) {
+          operand = value;
+        } else if (epilogue_steps_[step_index].opcode != HloOpcode::kNegate) {
           operand = load_epilogue_element(step_index, row, column);
         }
         value = apply_epilogue_step(value, step_index, operand);

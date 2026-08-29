@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/codegen/flydsl/fusion_support.h"
 
+#include "absl/algorithm/container.h"
 #include "absl/strings/string_view.h"
 #include "xla/backends/gpu/codegen/flydsl/attention_support.h"
 #include "xla/backends/gpu/codegen/flydsl/layer_norm_support.h"
@@ -139,6 +140,33 @@ bool IsNativeFlyFusionRoute(FlyFusionRoute route) {
   return route != FlyFusionRoute::kNotFly &&
          route != FlyFusionRoute::kGenericXla &&
          route != FlyFusionRoute::kUnsupportedCustomCall;
+}
+
+bool ShouldKeepLargeIndexedDagOnNativeEmitter(
+    const HloInstruction& fusion) {
+  if (fusion.opcode() != HloOpcode::kFusion ||
+      fusion.fusion_kind() == HloInstruction::FusionKind::kCustom) {
+    return false;
+  }
+  const int64_t indexed_operations = absl::c_count_if(
+      Cast<const HloFusionInstruction>(&fusion)
+          ->fused_instructions_computation()
+          ->instructions(),
+      [](const HloInstruction* instruction) {
+        switch (instruction->opcode()) {
+          case HloOpcode::kConcatenate:
+          case HloOpcode::kDynamicSlice:
+          case HloOpcode::kDynamicUpdateSlice:
+          case HloOpcode::kGather:
+          case HloOpcode::kPad:
+          case HloOpcode::kSlice:
+            return true;
+          default:
+            return false;
+        }
+      });
+  constexpr int64_t kMaximumOrdinaryIndexedOperations = 15;
+  return indexed_operations > kMaximumOrdinaryIndexedOperations;
 }
 
 bool ContainsUnsupportedCustomCall(const HloInstruction& instruction) {

@@ -172,6 +172,41 @@ bool HasRoundedBf16LearnedScaleLhs(const HloInstruction& instr) {
   return false;
 }
 
+// Fission is useful when a fusion contains producers or consumers that can be
+// materialized around a contraction. If the fusion is already only parameters
+// and one contraction, rewriting it cannot expose a new boundary; it merely
+// recompiles the same Fly GEMM configurations under a second backend label.
+bool IsAlreadyMinimalContractionFusion(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  const HloComputation* computation = instr.fused_instructions_computation();
+  const HloInstruction* root = computation->root_instruction();
+  if (root->opcode() != HloOpcode::kDot &&
+      root->opcode() != HloOpcode::kScaledDot) {
+    return false;
+  }
+  for (const HloInstruction* fused : computation->instructions()) {
+    if (fused != root && fused->opcode() != HloOpcode::kParameter) {
+      return false;
+    }
+  }
+  // A concatenate outside the current fusion is a measured exception: the
+  // fission route gives the contraction a materially faster boundary even
+  // when the inner computation itself is already minimal. Preserve that route
+  // for direct or wrapped concatenate producers.
+  for (const HloInstruction* operand : instr.operands()) {
+    if (operand->opcode() == HloOpcode::kConcatenate ||
+        (operand->opcode() == HloOpcode::kFusion &&
+         hlo_query::GetFirstInstructionWithOpcode(
+             *operand->fused_instructions_computation(),
+             HloOpcode::kConcatenate) != nullptr)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Replaces the fusion instruction with the instructions from the fissioned
 // computation.
 absl::Status InlineFissionedComputation(HloInstruction* fusion_instr,
@@ -287,13 +322,14 @@ FissionBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return std::vector<std::unique_ptr<BackendConfig>>();
   }
   if (codegen_backend_->backend() == autotuner::Backend::FLY &&
-      HasRoundedBf16LearnedScaleLhs(instr)) {
+      (HasRoundedBf16LearnedScaleLhs(instr) ||
+       IsAlreadyMinimalContractionFusion(instr))) {
     ASSIGN_OR_RETURN(
         std::vector<std::unique_ptr<BackendConfig>> native_configs,
         codegen_backend_->GetSupportedConfigs(instr));
     if (!native_configs.empty()) {
-      VLOG(2) << "Native Fly owns learned-scale GEMM; suppressing materialized "
-                 "fission alternatives.";
+      VLOG(2) << "Native Fly owns a GEMM with no useful fission boundary; "
+                 "suppressing redundant fission alternatives.";
       return std::vector<std::unique_ptr<BackendConfig>>();
     }
   }

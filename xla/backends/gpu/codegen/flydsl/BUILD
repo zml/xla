@@ -87,6 +87,7 @@ cc_library(
         "//xla/hlo/utils:hlo_traversal",
         "//xla/service/gpu:hlo_fusion_analysis",
         "//xla/service/gpu:ir_emission_utils",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/strings:string_view",
     ],
 )

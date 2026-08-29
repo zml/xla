@@ -391,6 +391,19 @@ class PriorityFusionQueue {
     if (!IsFusible(*producer)) {
       return absl::OkStatus();
     }
+    // A root whose outer operands are all parameters cannot participate in
+    // priority fusion: it has no users and there is no producer instruction
+    // outside its existing fusion boundary. Avoid asking the symbolic tiling
+    // model to reconstruct imported block-level metadata solely to populate a
+    // cache entry that can never be queried. In particular, older serialized
+    // Triton fusions may omit the inner dot's contracting tile.
+    if (producer->user_count() == 0 &&
+        std::all_of(producer->operands().begin(), producer->operands().end(),
+                    [](const HloInstruction* operand) {
+                      return operand->opcode() == HloOpcode::kParameter;
+                    })) {
+      return absl::OkStatus();
+    }
 
     // Discard the result, we only care about ensuring that the cost model's
     // cache contains the entry for the producer.

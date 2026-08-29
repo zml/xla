@@ -92,7 +92,7 @@ static int64_t CountMultiOutputFusions(const HloModule* module) {
 }
 
 TEST_F(MultiOutputFusionTest,
-       StrictFlyReplacementPreservesMixedOutputReductionBoundary) {
+       StrictFlyReplacementAllowsNativeMixedOutputReduction) {
   constexpr absl::string_view kHlo = R"(
 HloModule strict_fly_mixed_output_boundary
 
@@ -136,8 +136,8 @@ ENTRY main {
   module->mutable_config()
       .mutable_debug_options()
       .set_xla_gpu_flydsl_replace_triton(true);
-  EXPECT_FALSE(mof_.Run(module.get()).value());
-  EXPECT_EQ(CountMultiOutputFusions(module.get()), 0);
+  EXPECT_TRUE(mof_.Run(module.get()).value());
+  EXPECT_EQ(CountMultiOutputFusions(module.get()), 1);
 }
 
 TEST_F(MultiOutputFusionTest, MultiOutputFusionSiblingReduceAndReduceFusion) {
