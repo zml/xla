@@ -231,7 +231,9 @@ size_t ChooseSplitK(const DotDimensions& dims,
 // FP32 accumulators inside the workgroup. It therefore gets split-K
 // parallelism without materializing FP32 partials or launching a reduction.
 // Keep eligible dots intact so this kernel can compete with unsplit library
-// and Triton candidates in the ordinary backend autotuner.
+// and Triton candidates in the ordinary backend autotuner. At very large K,
+// XLA's global split-K rewrite exposes substantially more parallelism than a
+// two-wave local split, so leave those dots to the ordinary cost model.
 bool CanUseFlyLocalSplitK(const HloDotInstruction& dot) {
   if (dot.shape().dimensions_size() != 2 ||
       dot.operand(0)->shape().dimensions_size() != 2 ||
@@ -260,7 +262,7 @@ bool CanUseFlyLocalSplitK(const HloDotInstruction& dot) {
   }
   const DotDimensions dims = GetDotDimensions(&dot);
   return dims.m % 128 == 0 && dims.n % 64 == 0 && dims.k >= 256 &&
-         dims.k % 128 == 0;
+         dims.k <= 2048 && dims.k % 128 == 0;
 }
 
 // Pads the given instruction with zeros along the given dimension to the given

@@ -163,7 +163,8 @@ ENTRY entry {
   EXPECT_TRUE(HasTritonBlockLevelFusionConfig(root));
 }
 
-TEST_F(FlyFusionBlockLevelRewriterTest, RewritesLateLoopFusionToFly) {
+TEST_F(FlyFusionBlockLevelRewriterTest,
+       LeavesLateLoopFusionOnNativeEmitterByDefault) {
   constexpr absl::string_view kHlo = R"(
 fusion_computation {
   p0 = bf16[128,64]{1,0} parameter(0)
@@ -179,6 +180,37 @@ ENTRY entry {
 })";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(false));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kLoop);
+  EXPECT_FALSE(HasFlyBlockLevelFusionConfig(root));
+}
+
+TEST_F(FlyFusionBlockLevelRewriterTest,
+       RewritesLateLoopFusionWhenBlockLevelRewriterIsEnabled) {
+  constexpr absl::string_view kHlo = R"(
+fusion_computation {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  ROOT add = bf16[128,64]{1,0} add(p0, p1)
+}
+
+ENTRY entry {
+  p0 = bf16[128,64]{1,0} parameter(0)
+  p1 = bf16[128,64]{1,0} parameter(1)
+  ROOT fusion = bf16[128,64]{1,0} fusion(p0, p1), kind=kLoop,
+    calls=fusion_computation
+})";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_enable_fusion_block_level_rewriter(true);
 
   EXPECT_THAT(
       FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
@@ -238,7 +270,43 @@ ENTRY entry {
 }
 
 TEST_F(FlyFusionBlockLevelRewriterTest,
-       RewritesLateMultiOutputFusionWithoutTritonFlag) {
+       LeavesLateInputReductionOnNativeEmitter) {
+  constexpr absl::string_view kHlo = R"(
+HloModule late_input_reduction
+
+add {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT sum = f32[] add(lhs, rhs)
+}
+
+reduction {
+  input = f32[256,512]{1,0} parameter(0)
+  zero = f32[] constant(0)
+  ROOT result = f32[512]{0} reduce(input, zero), dimensions={0},
+    to_apply=add
+}
+
+ENTRY entry {
+  input = f32[256,512]{1,0} parameter(0)
+  ROOT fusion = f32[512]{0} fusion(input), kind=kInput, calls=reduction
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHlo));
+
+  EXPECT_THAT(
+      FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
+                               &mlir_context_)
+          .Run(module.get()),
+      IsOkAndHolds(false));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kInput);
+  EXPECT_FALSE(HasFlyBlockLevelFusionConfig(root));
+}
+
+TEST_F(FlyFusionBlockLevelRewriterTest,
+       LeavesLateMultiOutputFusionOnNativeEmitterWithoutTritonFlag) {
   constexpr absl::string_view kHlo = R"(
 fusion_computation {
   p0 = bf16[128,64]{1,0} parameter(0)
@@ -265,10 +333,10 @@ ENTRY entry {
       FusionBlockLevelRewriter(device_info_, HloCostAnalysis::DefaultShapeSize,
                                &mlir_context_)
           .Run(module.get()),
-      IsOkAndHolds(true));
+      IsOkAndHolds(false));
   const HloInstruction* root = module->entry_computation()->root_instruction();
-  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kCustom);
-  EXPECT_TRUE(HasFlyBlockLevelFusionConfig(root));
+  EXPECT_EQ(root->fusion_kind(), HloInstruction::FusionKind::kLoop);
+  EXPECT_FALSE(HasFlyBlockLevelFusionConfig(root));
 }
 
 TEST_F(FusionBlockLevelRewriterTest,
