@@ -21,6 +21,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -182,6 +183,11 @@ absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
     if (extra_filter_ && !extra_filter_(instruction)) {
       continue;
     }
+    if (on_fallback_ == OnFallback::kWarnAndExpand) {
+      LOG(WARNING) << "Expanding " << instruction->ToString()
+                   << " into a dequantize and a plain dot: no fusion backend "
+                      "and no FusedScaledDotRewriter arm claimed it.";
+    }
     changed = true;
     HloScaledDotInstruction* dot = Cast<HloScaledDotInstruction>(instruction);
     ABSL_ASSIGN_OR_RETURN(HloInstruction * lhs, Dequantize(dot, 0, 2, "LHS"));
@@ -193,11 +199,12 @@ absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
     dot_shape.set_element_type(GetTargetType(lhs->shape().element_type(),
                                              dot->shape().element_type()));
 
+    HloInstruction* dot_result =
+        computation->AddInstruction(HloInstruction::CreateDot(
+            dot_shape, lhs, rhs, dot->dot_dimension_numbers(),
+            dot->precision_config()));
     ABSL_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(
-        Convert(computation->AddInstruction(HloInstruction::CreateDot(
-                    dot_shape, lhs, rhs, dot->dot_dimension_numbers(),
-                    dot->precision_config())),
-                dot->shape().element_type())));
+        Convert(dot_result, dot->shape().element_type())));
     ABSL_RETURN_IF_ERROR(computation->RemoveInstruction(dot));
   }
   return changed;

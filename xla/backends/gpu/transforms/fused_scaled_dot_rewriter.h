@@ -1,4 +1,4 @@
-/* Copyright 2025 The OpenXLA Authors.
+/* Copyright 2026 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,36 +13,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef XLA_BACKENDS_GPU_TRANSFORMS_SCALED_DOT_REWRITER_H_
-#define XLA_BACKENDS_GPU_TRANSFORMS_SCALED_DOT_REWRITER_H_
+#ifndef XLA_BACKENDS_GPU_TRANSFORMS_FUSED_SCALED_DOT_REWRITER_H_
+#define XLA_BACKENDS_GPU_TRANSFORMS_FUSED_SCALED_DOT_REWRITER_H_
 
+#include <functional>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
-#include "xla/util.h"
 
 namespace xla {
 namespace gpu {
 
-// This pass rewrites ScaledDot instructions into a sequence of other HLO
-// instructions, including Convert, Broadcast, Reshape, Multiply, and Dot.
-class ScaledDotRewriter : public HloModulePass {
+// Returns the replacement for `dot`, already added to `computation` with the
+// same shape, or nullptr to decline. A declining arm must leave the module
+// unchanged.
+using FusedScaledDotArm = std::function<absl::StatusOr<HloInstruction*>(
+    HloComputation* computation, HloScaledDotInstruction* dot)>;
+
+class FusedScaledDotRewriter : public HloModulePass {
  public:
-  enum class OnFallback { kExpand, kWarnAndExpand };
+  explicit FusedScaledDotRewriter(std::vector<FusedScaledDotArm> arms)
+      : arms_(std::move(arms)) {}
 
-  // If `extra_filter` is provided, only ScaledDot instructions for which
-  // `extra_filter(instr)` returns `true` are rewritten. Instructions for which
-  // it returns `false` are preserved as ScaledDot.
-  explicit ScaledDotRewriter(HloPredicate extra_filter = nullptr,
-                             OnFallback on_fallback = OnFallback::kExpand)
-      : extra_filter_(std::move(extra_filter)), on_fallback_(on_fallback) {}
-
-  absl::string_view name() const override { return "scaled-dot-rewriter"; }
+  absl::string_view name() const override {
+    return "fused-scaled-dot-rewriter";
+  }
 
   absl::StatusOr<bool> RewriteComputation(HloComputation* computation);
 
@@ -52,11 +55,10 @@ class ScaledDotRewriter : public HloModulePass {
       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
 
  private:
-  HloPredicate extra_filter_;
-  OnFallback on_fallback_;
+  std::vector<FusedScaledDotArm> arms_;
 };
 
 }  // namespace gpu
 }  // namespace xla
 
-#endif  // XLA_BACKENDS_GPU_TRANSFORMS_SCALED_DOT_REWRITER_H_
+#endif  // XLA_BACKENDS_GPU_TRANSFORMS_FUSED_SCALED_DOT_REWRITER_H_
