@@ -1308,20 +1308,44 @@ GetStreamExecutorGpuDeviceAllocator(
         addressable_devices) {
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
   const DebugOptions& debug_options = xla::GetDebugOptionsFromFlags();
-  GpuAllocatorConfig::Kind effective_kind = allocator_config.kind;
-  if (debug_options.xla_gpu_command_buffer_update_mode() !=
+  const bool use_vmm_for_command_buffer_temps =
+      debug_options.xla_gpu_command_buffer_update_mode() !=
           DebugOptions::ALWAYS_UPDATE &&
-      effective_kind != GpuAllocatorConfig::Kind::kVmm) {
-    LOG(WARNING) << "xla_gpu_command_buffer_update_mode requires the "
-                    "VMM allocator. Overriding allocator kind to kVmm.";
-    effective_kind = GpuAllocatorConfig::Kind::kVmm;
+      allocator_config.kind != GpuAllocatorConfig::Kind::kVmm;
+
+  auto create_vmm_allocator =
+      [&]() -> absl::StatusOr<std::unique_ptr<se::DeviceAddressVmmAllocator>> {
+    std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
+    executor_streams.reserve(addressable_devices.size());
+    for (const auto& [ordinal, device] : addressable_devices) {
+      executor_streams.push_back(
+          {device->executor(), device->compute_stream()});
+    }
+#if GOOGLE_CUDA
+    return se::gpu::CudaDeviceAddressVmmAllocator::Create(
+        platform, allocator_config.memory_fraction,
+        allocator_config.gpu_system_memory_size, executor_streams);
+#elif TENSORFLOW_USE_ROCM
+    return se::gpu::RocmDeviceAddressVmmAllocator::Create(
+        platform, allocator_config.memory_fraction,
+        allocator_config.gpu_system_memory_size, executor_streams);
+#else
+    return absl::UnimplementedError(
+        "VMM allocator is only supported with CUDA or ROCm.");
+#endif
+  };
+
+  if (use_vmm_for_command_buffer_temps) {
+    LOG(INFO) << "Using the requested allocator for regular buffers and VMM "
+                 "for command-buffer temp buffers.";
   }
 
   // Set when a single preallocated BFC allocator serves both default and
   // collective memory via spatial partitioning; suppresses the separate
   // collective allocator below.
   bool shared_collective_pool = false;
-  switch (effective_kind) {
+  bool has_host_allocator = false;
+  switch (allocator_config.kind) {
     case GpuAllocatorConfig::Kind::kCudaAsync: {
       for (const auto& ordinal_and_device : addressable_devices) {
         ASSIGN_OR_RETURN(
@@ -1427,35 +1451,13 @@ GetStreamExecutorGpuDeviceAllocator(
             {std::move(host_allocator), stream,
              /*memory_space=*/static_cast<int>(se::MemorySpace::kHost)});
       }
-      return std::make_unique<se::MultiDeviceAdapter>(platform,
-                                                      std::move(allocators));
+      shared_collective_pool = true;
+      has_host_allocator = true;
+      break;
     }
 
     case GpuAllocatorConfig::Kind::kVmm: {
-      std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
-      executor_streams.reserve(addressable_devices.size());
-      for (const auto& [ordinal, device] : addressable_devices) {
-        executor_streams.push_back(
-            {device->executor(), device->compute_stream()});
-      }
-
-      std::unique_ptr<se::DeviceAddressVmmAllocator> vmm_allocator;
-#if GOOGLE_CUDA
-      ASSIGN_OR_RETURN(
-          vmm_allocator,
-          se::gpu::CudaDeviceAddressVmmAllocator::Create(
-              platform, allocator_config.memory_fraction,
-              allocator_config.gpu_system_memory_size, executor_streams));
-#elif TENSORFLOW_USE_ROCM
-      ASSIGN_OR_RETURN(
-          vmm_allocator,
-          se::gpu::RocmDeviceAddressVmmAllocator::Create(
-              platform, allocator_config.memory_fraction,
-              allocator_config.gpu_system_memory_size, executor_streams));
-#else
-      return absl::UnimplementedError(
-          "VMM allocator is only supported with CUDA or ROCm.");
-#endif  // GOOGLE_CUDA
+      ASSIGN_OR_RETURN(auto vmm_allocator, create_vmm_allocator());
 
       std::vector<se::MultiDeviceAdapter::AllocatorInfo> host_allocators;
       host_allocators.reserve(addressable_devices.size());
@@ -1492,13 +1494,16 @@ GetStreamExecutorGpuDeviceAllocator(
     }
   }
 
-  for (const auto& ordinal_and_device : addressable_devices) {
-    ASSIGN_OR_RETURN(
-        auto host_allocator,
-        GetGpuHostAllocator(ordinal_and_device.second->executor()));
-    allocators.push_back(
-        {std::move(host_allocator), ordinal_and_device.second->compute_stream(),
-         /*memory_space=*/static_cast<int>(se::MemorySpace::kHost)});
+  if (!has_host_allocator) {
+    for (const auto& ordinal_and_device : addressable_devices) {
+      ASSIGN_OR_RETURN(
+          auto host_allocator,
+          GetGpuHostAllocator(ordinal_and_device.second->executor()));
+      allocators.push_back(
+          {std::move(host_allocator),
+           ordinal_and_device.second->compute_stream(),
+           /*memory_space=*/static_cast<int>(se::MemorySpace::kHost)});
+    }
   }
 
 #if defined(GOOGLE_CUDA) && CUDA_VERSION >= 11020
@@ -1516,8 +1521,21 @@ GetStreamExecutorGpuDeviceAllocator(
     }
   }
 #endif
-  return std::make_unique<se::MultiDeviceAdapter>(platform,
-                                                  std::move(allocators));
+  auto regular_allocator =
+      std::make_unique<se::MultiDeviceAdapter>(platform, std::move(allocators));
+  if (!use_vmm_for_command_buffer_temps) {
+    return regular_allocator;
+  }
+
+  ASSIGN_OR_RETURN(auto vmm_allocator, create_vmm_allocator());
+  constexpr int64_t kDelegatedMemorySpaces[] = {
+      static_cast<int64_t>(gpu::MemorySpaceColor::kDefault),
+      static_cast<int64_t>(gpu::MemorySpaceColor::kCollective),
+      static_cast<int64_t>(se::MemorySpace::kHost),
+  };
+  vmm_allocator->SetAllocatorForMemorySpaces(kDelegatedMemorySpaces,
+                                             std::move(regular_allocator));
+  return vmm_allocator;
 }
 
 // Name the devices and threads that launch work on them. Note: the launcher

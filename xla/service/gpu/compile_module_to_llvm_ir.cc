@@ -162,8 +162,12 @@ absl::StatusOr<std::unique_ptr<BufferAssignment>> RunBufferAssignment(
 
   const DebugOptions& options = module->config().debug_options();
 
+  const bool command_buffer_va_remapping =
+      options.xla_gpu_command_buffer_update_mode() !=
+      DebugOptions::ALWAYS_UPDATE;
   std::optional<BufferValue::Color> color =
-      options.xla_gpu_temp_buffer_use_separate_color()
+      (options.xla_gpu_temp_buffer_use_separate_color() ||
+       command_buffer_va_remapping)
           ? std::optional<BufferValue::Color>(
                 (int)MemorySpaceColor::kTempBuffer)
           : std::nullopt;

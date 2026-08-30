@@ -238,11 +238,23 @@ DeviceAddressVmmAllocator::~DeviceAddressVmmAllocator() {
 
 void DeviceAddressVmmAllocator::SetAllocatorForMemorySpace(
     int64_t memory_space, std::unique_ptr<DeviceAddressAllocator> allocator) {
+  SetAllocatorForMemorySpaces(absl::MakeConstSpan(&memory_space, 1),
+                              std::move(allocator));
+}
+
+void DeviceAddressVmmAllocator::SetAllocatorForMemorySpaces(
+    absl::Span<const int64_t> memory_spaces,
+    std::unique_ptr<DeviceAddressAllocator> allocator) {
   CHECK(allocator != nullptr);
-  auto [it, inserted] = memory_space_allocators_.emplace(
-      memory_space, std::move(allocator));
-  CHECK(inserted) << "Allocator already registered for memory space "
-                  << memory_space;
+  CHECK(!memory_spaces.empty());
+  DeviceAddressAllocator* allocator_ptr = allocator.get();
+  for (int64_t memory_space : memory_spaces) {
+    auto [it, inserted] =
+        memory_space_allocators_.emplace(memory_space, allocator_ptr);
+    CHECK(inserted) << "Allocator already registered for memory space "
+                    << memory_space;
+  }
+  owned_memory_space_allocators_.push_back(std::move(allocator));
 }
 
 absl::Status DeviceAddressVmmAllocator::SynchronizeAllPendingOperations() {
@@ -714,7 +726,7 @@ DeviceAddressVmmAllocator::Allocate(int device_ordinal, uint64_t size,
                                     int64_t memory_space) {
   if (auto it = memory_space_allocators_.find(memory_space);
       it != memory_space_allocators_.end()) {
-    DeviceAddressAllocator* allocator = it->second.get();
+    DeviceAddressAllocator* allocator = it->second;
     ASSIGN_OR_RETURN(
         auto result,
         allocator->Allocate(device_ordinal, size, retry_on_failure,

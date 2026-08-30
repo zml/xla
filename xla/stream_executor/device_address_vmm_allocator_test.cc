@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -156,6 +157,45 @@ class TestDeviceAddressVmmAllocator final : public DeviceAddressVmmAllocator {
   int allocation_count_ = 0;
 };
 
+class TestDelegatingAllocator final : public DeviceAddressAllocator {
+ public:
+  TestDelegatingAllocator(const Platform* platform, Stream* stream)
+      : DeviceAddressAllocator(platform), stream_(stream) {}
+
+  absl::StatusOr<ScopedDeviceAddress<uint8_t>> Allocate(
+      int device_ordinal, uint64_t size, bool /*retry_on_failure*/,
+      int64_t memory_space) override {
+    ++allocation_count_;
+    allocated_memory_spaces_.push_back(memory_space);
+    auto* storage = new uint8_t[size];
+    return ScopedDeviceAddress<uint8_t>(DeviceAddressBase(storage, size),
+                                        device_ordinal, this);
+  }
+
+  absl::Status Deallocate(int /*device_ordinal*/,
+                          DeviceAddressBase mem) override {
+    ++deallocation_count_;
+    delete[] static_cast<uint8_t*>(mem.opaque());
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<Stream*> GetStream(int /*device_ordinal*/) override {
+    return stream_;
+  }
+
+  int allocation_count() const { return allocation_count_; }
+  int deallocation_count() const { return deallocation_count_; }
+  const std::vector<int64_t>& allocated_memory_spaces() const {
+    return allocated_memory_spaces_;
+  }
+
+ private:
+  Stream* stream_;
+  int allocation_count_ = 0;
+  int deallocation_count_ = 0;
+  std::vector<int64_t> allocated_memory_spaces_;
+};
+
 class DeviceAddressVmmAllocatorTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -171,6 +211,46 @@ class DeviceAddressVmmAllocatorTest : public ::testing::Test {
   NiceMock<MockStreamExecutor> executor_;
   NiceMock<MockStream> stream_;
 };
+
+TEST_F(DeviceAddressVmmAllocatorTest,
+       DelegatesSeveralMemorySpacesToOneAllocator) {
+  ASSERT_OK_AND_ASSIGN(auto allocator, TestDeviceAddressVmmAllocator::Create(
+                                           &platform_, {Config(UINT64_MAX)}));
+  auto delegate =
+      std::make_unique<TestDelegatingAllocator>(&platform_, &stream_);
+  TestDelegatingAllocator* delegate_ptr = delegate.get();
+  constexpr int64_t kDelegatedMemorySpaces[] = {0, 1, 5};
+  allocator->SetAllocatorForMemorySpaces(kDelegatedMemorySpaces,
+                                         std::move(delegate));
+
+  ASSERT_OK_AND_ASSIGN(auto default_buffer,
+                       allocator->Allocate(/*device_ordinal=*/0, 16,
+                                           /*retry_on_failure=*/true,
+                                           /*memory_space=*/0));
+  ASSERT_OK_AND_ASSIGN(auto collective_buffer,
+                       allocator->Allocate(/*device_ordinal=*/0, 16,
+                                           /*retry_on_failure=*/true,
+                                           /*memory_space=*/1));
+  ASSERT_OK_AND_ASSIGN(auto host_buffer,
+                       allocator->Allocate(/*device_ordinal=*/0, 16,
+                                           /*retry_on_failure=*/true,
+                                           /*memory_space=*/5));
+  ASSERT_OK_AND_ASSIGN(auto temp_buffer,
+                       allocator->Allocate(/*device_ordinal=*/0, 16,
+                                           /*retry_on_failure=*/true,
+                                           /*memory_space=*/2));
+
+  EXPECT_EQ(delegate_ptr->allocation_count(), 3);
+  EXPECT_THAT(delegate_ptr->allocated_memory_spaces(),
+              ::testing::ElementsAre(0, 1, 5));
+  EXPECT_EQ(allocator->allocation_count(), 1);
+
+  ASSERT_THAT(default_buffer.Free(), absl_testing::IsOk());
+  ASSERT_THAT(collective_buffer.Free(), absl_testing::IsOk());
+  ASSERT_THAT(host_buffer.Free(), absl_testing::IsOk());
+  ASSERT_THAT(temp_buffer.Free(), absl_testing::IsOk());
+  EXPECT_EQ(delegate_ptr->deallocation_count(), 3);
+}
 
 TEST_F(DeviceAddressVmmAllocatorTest, RetryFlagDoesNotDisablePendingReclaim) {
   const DeviceAddressVmmAllocator::DeviceConfig config =

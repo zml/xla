@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
@@ -184,6 +185,13 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
   // Must be called during allocator construction, before concurrent use.
   void SetAllocatorForMemorySpace(
       int64_t memory_space,
+      std::unique_ptr<DeviceAddressAllocator> allocator);
+
+  // Delegates every memory space in `memory_spaces` to the same allocator.
+  // This is useful for a composite allocator that serves default, collective,
+  // and host buffers while this allocator handles only VMM-backed temp space.
+  void SetAllocatorForMemorySpaces(
+      absl::Span<const int64_t> memory_spaces,
       std::unique_ptr<DeviceAddressAllocator> allocator);
 
   // Allocates raw physical memory and maps it into a caller-owned
@@ -520,7 +528,9 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
   // True iff the calling thread is inside a multi-device DeviceAssignmentScope.
   static bool CurrentMultiDevice();
 
-  absl::flat_hash_map<int64_t, std::unique_ptr<DeviceAddressAllocator>>
+  std::vector<std::unique_ptr<DeviceAddressAllocator>>
+      owned_memory_space_allocators_;
+  absl::flat_hash_map<int64_t, DeviceAddressAllocator*>
       memory_space_allocators_;
   absl::Mutex delegated_allocations_mu_;
   absl::flat_hash_map<std::pair<int, void*>, DeviceAddressAllocator*>
