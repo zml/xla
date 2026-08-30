@@ -139,6 +139,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/rename_fusions.h"
 #include "xla/backends/gpu/transforms/sanitize_constant_names.h"
 #include "xla/backends/gpu/transforms/scalar_constant_sinker.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/scan_rewriter.h"
 #include "xla/backends/gpu/transforms/scatter_determinism_expander.h"
@@ -802,6 +803,13 @@ absl::Status RunOptimizationPasses(
   pipeline.AddPass<RaggedDotRewriter>(
       gpu_version,
       se::dnn::VersionInfo(gpu_target_config.device_description.dnn_version()));
+  // keep alive through IsScaledDotSupportedByBackend.
+  if (std::vector<FusedScaledDotArm> arms = compiler.FusedScaledDotArms(
+          GpuCompiler::FusedScaledDotPhase::kPreLayout, debug_options,
+          gpu_target_config);
+      !arms.empty()) {
+    pipeline.AddPass<FusedScaledDotRewriter>(std::move(arms));
+  }
   pipeline.AddPass<ScaledDotRewriter>([&compiler, &gpu_target_config](
                                           const HloInstruction* instr) {
     return !compiler.IsScaledDotSupportedByBackend(instr, gpu_target_config);
@@ -2133,15 +2141,26 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     // AlgebraicSimplifier will simplify it away again.
     // TODO(b/375566188): Figure out whether we can get rid of this pass.
     pipeline.AddPass<DotNormalizer>();
+    std::vector<FusedScaledDotArm> fused_scaled_dot_arms = FusedScaledDotArms(
+        FusedScaledDotPhase::kPostLayout, debug_options, gpu_target_config);
     if (IsTritonGemmEnabled(debug_options, gpu_version)) {
       pipeline.AddPass<DotDimensionNormalizer>(
           /*normalize_noncontracting_dimensions=*/!debug_options
               .xla_gpu_experimental_gemm_fusion_v2());
       pipeline.AddPass<GemvRewriter>();
       pipeline.AddPass<SplitkRewriter>(gpu_target_config.device_description);
+      // After SplitkRewriter and before GemmFusion, which would otherwise fuse the
+      // scaled dots first.
+      if (!fused_scaled_dot_arms.empty()) {
+        pipeline.AddPass<FusedScaledDotRewriter>(
+            std::move(fused_scaled_dot_arms));
+      }
       pipeline.AddPass<GemmFusion>(gpu_version);
       pipeline.AddPass<HoistFusedBitcasts>();
       pipeline.AddPass<GemmFusionSwapOperands>();
+    } else if (!fused_scaled_dot_arms.empty()) {
+      pipeline.AddPass<FusedScaledDotRewriter>(
+          std::move(fused_scaled_dot_arms));
     }
 
     pipeline.AddPass<ScaledDotRewriter>(
