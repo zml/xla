@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/hlo/transforms/simplifiers/algebraic_simplifier.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
 #include "xla/runtime/object_pool.h"
@@ -133,6 +134,14 @@ class GpuCompiler : public LLVMCompiler {
   virtual bool IsScaledDotSupportedByBackend(
       const HloInstruction* instr,
       const GpuTargetConfig& gpu_target_config) const;
+
+  enum class FusedScaledDotPhase { kPreLayout, kPostLayout };
+
+  virtual std::vector<FusedScaledDotArm> FusedScaledDotArms(
+      FusedScaledDotPhase phase, const DebugOptions& debug_options,
+      const GpuTargetConfig& gpu_target_config) const {
+    return {};
+  }
 
   enum class AlgebraicSimplifierMode {
     kLayoutInsensitive,

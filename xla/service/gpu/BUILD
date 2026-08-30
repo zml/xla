@@ -1875,6 +1875,7 @@ cc_library(
         "//xla/backends/gpu/transforms:rename_fusions",
         "//xla/backends/gpu/transforms:sanitize_constant_names",
         "//xla/backends/gpu/transforms:scalar_constant_sinker",
+        "//xla/backends/gpu/transforms:fused_scaled_dot_rewriter",
         "//xla/backends/gpu/transforms:scaled_dot_rewriter",
         "//xla/backends/gpu/transforms:scan_rewriter",
         "//xla/backends/gpu/transforms:scatter_determinism_expander",

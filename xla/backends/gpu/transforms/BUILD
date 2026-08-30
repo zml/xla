@@ -2972,6 +2972,36 @@ cc_library(
 )
 
 cc_library(
+    name = "fused_scaled_dot_rewriter",
+    srcs = ["fused_scaled_dot_rewriter.cc"],
+    hdrs = ["fused_scaled_dot_rewriter.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "fused_scaled_dot_rewriter_test",
+    srcs = ["fused_scaled_dot_rewriter_test.cc"],
+    deps = [
+        ":fused_scaled_dot_rewriter",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "scaled_dot_rewriter",
     srcs = ["scaled_dot_rewriter.cc"],
     hdrs = ["scaled_dot_rewriter.h"],
