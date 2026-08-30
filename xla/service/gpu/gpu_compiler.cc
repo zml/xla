@@ -116,6 +116,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/estimate_cub_sort_scratch_size.h"
 #include "xla/backends/gpu/transforms/explicit_collectives_group_async_wrapper.h"
 #include "xla/backends/gpu/transforms/explicit_stream_annotation_async_wrapper.h"
+#include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
 #include "xla/backends/gpu/transforms/fusion_wrapper.h"
 #include "xla/backends/gpu/transforms/gemm_broadcast_folding_rewriter.h"
 #include "xla/backends/gpu/transforms/gemm_fusion.h"
@@ -800,6 +801,12 @@ absl::Status RunOptimizationPasses(
   pipeline.AddPass<RaggedDotRewriter>(
       gpu_version,
       se::dnn::VersionInfo(gpu_target_config.device_description.dnn_version()));
+  if (std::vector<FusedScaledDotArm> arms = compiler.FusedScaledDotArms(
+          GpuCompiler::FusedScaledDotPhase::kPreLayout, debug_options,
+          gpu_target_config);
+      !arms.empty()) {
+    pipeline.AddPass<FusedScaledDotRewriter>(std::move(arms));
+  }
   pipeline.AddPass<ScaledDotRewriter>([&compiler, &gpu_target_config](
                                           const HloInstruction* instr) {
     return !compiler.IsScaledDotSupportedByBackend(instr, gpu_target_config);
@@ -2116,6 +2123,14 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     // AlgebraicSimplifier will simplify it away again.
     // TODO(b/375566188): Figure out whether we can get rid of this pass.
     pipeline.AddPass<DotNormalizer>();
+    // Arms claim before anything downstream reshapes a kScaledDot; an arm
+    // splits its own contraction.
+    std::vector<FusedScaledDotArm> fused_scaled_dot_arms = FusedScaledDotArms(
+        FusedScaledDotPhase::kPostLayout, debug_options, gpu_target_config);
+    if (!fused_scaled_dot_arms.empty()) {
+      pipeline.AddPass<FusedScaledDotRewriter>(
+          std::move(fused_scaled_dot_arms));
+    }
     if (IsTritonGemmEnabled(debug_options, gpu_version)) {
       pipeline.AddPass<DotDimensionNormalizer>(
           /*normalize_noncontracting_dimensions=*/!debug_options
@@ -2126,6 +2141,9 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       pipeline.AddPass<HoistFusedBitcasts>();
       pipeline.AddPass<GemmFusionSwapOperands>();
     }
+
+    pipeline.AddPass<ScaledDotRewriter>(
+        /*extra_filter=*/nullptr, ScaledDotRewriter::OnFallback::kWarnAndExpand);
 
     // Rewrite GEMMs into custom calls.
     AddPaddingForGpublasGemms(pipeline, debug_options, gpu_version);
