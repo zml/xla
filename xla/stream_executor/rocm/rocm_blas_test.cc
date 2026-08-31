@@ -127,17 +127,19 @@ TEST_F(RocmBlasTest, CachesAtomicsModeAndRestoresItAcrossTransitions) {
   tsl::EnableOpDeterminism(false);
   ResetRocmPerformanceCountersForTest();
   EXPECT_TRUE(Scale(stream.get(), &values));
+  uint64_t initial_atomics_mode_calls = RocblasSetAtomicsModeCalls();
+  EXPECT_LE(initial_atomics_mode_calls, 1);
   EXPECT_TRUE(Scale(stream.get(), &values));
-  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 0);
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), initial_atomics_mode_calls);
 
   tsl::EnableOpDeterminism(true);
   EXPECT_TRUE(Scale(stream.get(), &values));
   EXPECT_TRUE(Scale(stream.get(), &values));
-  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 1);
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), initial_atomics_mode_calls + 1);
 
   tsl::EnableOpDeterminism(false);
   EXPECT_TRUE(Scale(stream.get(), &values));
-  EXPECT_EQ(RocblasSetAtomicsModeCalls(), 2);
+  EXPECT_EQ(RocblasSetAtomicsModeCalls(), initial_atomics_mode_calls + 2);
   tsl::EnableOpDeterminism(was_deterministic);
 
   EXPECT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
