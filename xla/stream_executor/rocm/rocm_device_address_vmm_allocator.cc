@@ -157,11 +157,11 @@ absl::Status RocmDeviceAddressVmmAllocator::InitializeDeviceState(
       static_cast<hipStream_t>(state.stream->platform_specific_handle().stream);
   IncrementRocmPerformanceCounter(
       RocmPerformanceCounter::kVmmTimelineWrite);
-  RETURN_IF_ERROR(ToStatus(
+  ABSL_RETURN_IF_ERROR(ToStatus(
       hipStreamWriteValue64(hip_stream, host_ptr, kStreamWriteSentinel,
                             hipStreamWriteValueDefault),
       "ROCm VMM allocator self-test hipStreamWriteValue64"));
-  RETURN_IF_ERROR(ToStatus(
+  ABSL_RETURN_IF_ERROR(ToStatus(
       hipStreamSynchronize(hip_stream),
       "ROCm VMM allocator self-test hipStreamSynchronize"));
 
