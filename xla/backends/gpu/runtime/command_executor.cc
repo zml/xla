@@ -611,35 +611,6 @@ absl::Status CommandExecutor::RecordUpdate(
       return false;
     }
 
-    const bool requires_initialization_update =
-        record_params.is_initialization &&
-        command->requires_update_on_initialize();
-
-    // Check updated allocations before scanning persistent allocations. In the
-    // common steady-state case the updated allocation set is empty, so we can
-    // skip the command without traversing the persistent allocation set.
-    if (!requires_initialization_update) {
-      if (record_params.updated_allocs->empty()) {
-        return true;
-      }
-
-      DCHECK(absl::c_is_sorted(*record_params.updated_allocs))
-          << "Updated allocs must be sorted: "
-          << absl::StrJoin(*record_params.updated_allocs, ", ");
-
-      DCHECK(absl::c_is_sorted(cmd_allocs_indices_[id]))
-          << "Command allocs must be sorted: "
-          << absl::StrJoin(cmd_allocs_indices_[id], ", ");
-
-      alloc_intersection.clear();
-      absl::c_set_intersection(cmd_allocs_indices_[id],
-                               *record_params.updated_allocs,
-                               std::back_inserter(alloc_intersection));
-      if (alloc_intersection.empty()) {
-        return true;
-      }
-    }
-
     // Persistent allocations keep stable command-buffer-visible addresses. If
     // every allocation referenced by this command is persistent, the command
     // does not need an update, including traced collective commands that also
@@ -653,6 +624,13 @@ absl::Status CommandExecutor::RecordUpdate(
         absl::c_includes(*execute_params.persistent_alloc_indices,
                          cmd_allocs_indices_[id])) {
       return true;
+    }
+
+    // We always update commands that require updates on initialization, even if
+    // buffer allocations didn't change.
+    if (command->requires_update_on_initialize() &&
+        record_params.is_initialization) {
+      return false;
     }
 
     return command_update_marks != nullptr &&
