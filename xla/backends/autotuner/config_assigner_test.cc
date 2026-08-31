@@ -144,7 +144,8 @@ absl::StatusOr<std::unique_ptr<ConfigAssigner>> CreateConfigAssigner(
 
   return ConfigAssigner::Create(assigner_options, std::move(cache),
                                 std::move(orchestrator), std::move(autotuner),
-                                thread_pool);
+                                thread_pool,
+                                std::make_shared<InFlightTuningMap>());
 }
 
 absl::StatusOr<std::unique_ptr<ConfigAssigner>>
