@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -29,6 +30,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/SmallVector.h"
 #include "xla/backends/autotuner/backend_config.pb.h"
+#include "xla/backends/gpu/codegen/kernels/fp8_block_gemm_cutlass.h"
 #include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/backends/gpu/codegen/kernels/fp8_block_gemv_kernel.h"
@@ -57,6 +59,10 @@ TileIrFusionConfig* SlotFor(Fp8BlockGemvBackend::Rung rung,
       return config.mutable_fp8_block_gemv_tile_ir();
     case Fp8BlockGemvBackend::Rung::kCuda:
       return config.mutable_fp8_block_gemv_cuda();
+    case Fp8BlockGemvBackend::Rung::kCutlass:
+      // The CUTLASS rung's config is a table index, not a tile, so it has no
+      // slot here and takes the PackCutlass path instead.
+      LOG(FATAL) << "the CUTLASS rung has no tile slot";
   }
 }
 
@@ -72,13 +78,16 @@ const TileIrFusionConfig* ConstSlotFor(Fp8BlockGemvBackend::Rung rung,
     case Fp8BlockGemvBackend::Rung::kCuda:
       return config.has_fp8_block_gemv_cuda() ? &config.fp8_block_gemv_cuda()
                                               : nullptr;
+    case Fp8BlockGemvBackend::Rung::kCutlass:
+      return nullptr;
   }
 }
 
 std::unique_ptr<BackendConfig> Pack(Fp8BlockGemvBackend::Rung rung,
                                     int64_t block_m, int64_t block_n,
                                     int64_t block_k, int num_warps,
-                                    int num_stages) {
+                                    int num_stages, bool tma = false,
+                                    bool warp_specialization = false) {
   auto config = std::make_unique<BackendConfig>();
   TileIrFusionConfig& fp8 = *SlotFor(rung, *config);
   xla::xtile::BlockLevelFusionConfig& block = *fp8.mutable_block_level_fusion_config();
@@ -88,7 +97,15 @@ std::unique_ptr<BackendConfig> Pack(Fp8BlockGemvBackend::Rung rung,
   block.set_num_warps(num_warps);
   block.set_num_stages(num_stages);
   block.set_num_ctas(1);
+  block.set_is_tma_allowed(tma);
+  block.set_is_warp_specialization_allowed(warp_specialization);
   fp8.set_contracting_tile_size(block_k);
+  return config;
+}
+
+std::unique_ptr<BackendConfig> PackCutlass(int config_index) {
+  auto config = std::make_unique<BackendConfig>();
+  config->mutable_fp8_block_gemm_cutlass()->set_config_index(config_index);
   return config;
 }
 
@@ -100,14 +117,27 @@ bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   if (!gpu_config.ok()) return false;
   absl::string_view kind = gpu_config->fusion_backend_config().kind();
   if (kind != kTritonNestedGemmFusionKind && kind != kTileIrFusionKind &&
-      kind != kFp8BlockGemvCudaFusionKind) {
+      kind != kFp8BlockGemvCudaFusionKind &&
+      kind != kFp8BlockGemmCutlassFusionKind) {
     return false;
   }
   if (rung_ == Rung::kTileIr &&
       !debug_options().xla_gpu_experimental_scaled_dot_with_tile_ir()) {
     return false;
   }
-  return MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr)).has_value();
+  std::optional<Fp8BlockGemvSpec> spec =
+      MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+  if (!spec.has_value()) return false;
+  if (rung_ == Rung::kCutlass) {
+    // The vendored collective is SM100-family and reads a real activation
+    // scale; a W8A16 fusion has no such buffer.
+    if (!HasCutlassBlockGemm(
+            target_config().device_description.gpu_compute_capability())) {
+      return false;
+    }
+    if (!spec->w8a8) return false;
+  }
+  return true;
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -120,13 +150,28 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const int64_t n = spec->n;
   const int64_t k = spec->k;
 
+  if (rung_ == Rung::kCutlass) {
+    // The table is fixed at build time, so the search is over indices; CanRun
+    // is the kernel's own legality test (tile vs problem, alignment, and the
+    // swap-A/B orientation a decode-shaped M needs).
+    for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
+      if (!kernel::Fp8BlockGemmCutlassCanRun(i, batch, n, k)) continue;
+      configs.push_back(PackCutlass(i));
+    }
+    return configs;
+  }
+
   const bool single_row = batch == 1;
+  const bool is_prefill = batch > 16;
   const int64_t min_block_k = single_row ? kScaleBlock : 2 * kScaleBlock;
   const int max_warps = single_row ? 16 : 8;
   const bool tile_ir = rung_ == Rung::kTileIr;
+  // The Tile IR lowering has no fp8 dot and no wide-row tiling here.
+  if (tile_ir && (is_prefill || spec->w8a8)) return configs;
 
   if (rung_ == Rung::kCuda) {
-    if (!single_row || k % 16 != 0) return configs;
+    // The hand-written kernel reads a bf16 activation row.
+    if (!single_row || k % 16 != 0 || spec->w8a8) return configs;
     for (int num_warps : {2, 4, 8, 16}) {
       for (int rows_per_warp : {2, 4}) {
         const int64_t rows_per_block = num_warps * rows_per_warp;
@@ -149,21 +194,50 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
   if (single_row) {
     block_ms.push_back(1);
   } else {
-    for (int64_t candidate : {16, 32, 64, 128}) {
-      if (candidate <= batch && batch % candidate == 0) {
+    for (int64_t candidate : {16, 32, 64, 128, 256}) {
+      if (candidate <= batch && batch % candidate == 0 &&
+          (is_prefill || candidate <= 128)) {
         block_ms.push_back(candidate);
       }
     }
-    if (block_ms.empty()) block_ms.push_back(batch);
+    // No fallback tile when nothing divides the batch: xtile.extract does not
+    // mask, so a tile the batch does not divide reads past the activation, and
+    // this rung has no reference check to catch it. A batch like that is the
+    // CUTLASS rung's -- it tiles an arbitrary M -- and the arm only claims one
+    // where that rung exists.
+    if (block_ms.empty()) return configs;
+  }
+  if (is_prefill) {
+    // Rows below 64 only when nothing wider divides the batch.
+    llvm::SmallVector<int64_t, 5> wide;
+    for (int64_t block_m : block_ms) {
+      if (block_m >= 64) wide.push_back(block_m);
+    }
+    if (!wide.empty()) block_ms = wide;
   }
 
-  const bool is_prefill = batch > 16;
+  // Operand tiles per pipeline stage must fit shared memory: the activation
+  // tile in its own width and the fp8 weight tile.
+  const int64_t smem =
+      target_config().device_description.shared_memory_per_block_optin();
+  const int64_t act_bytes = spec->w8a8 ? 1 : 2;
+  auto fits = [&](int64_t block_m, int64_t block_n, int64_t block_k,
+                  int num_stages) {
+    const int64_t per_stage =
+        block_m * block_k * act_bytes + block_n * block_k;
+    return num_stages * per_stage <= smem;
+  };
+
+  // Prefill tiles are shared-memory bound at bf16 activations: one scale
+  // block deep leaves room for four stages where two blocks leave two.
+  const int64_t max_block_k = is_prefill ? 512 : 2048;
+  const int64_t min_prefill_block_k = kScaleBlock;
   for (int64_t block_m : block_ms) {
-    if (is_prefill && block_m < 64) continue;
-    for (int64_t block_n = 4; block_n <= kScaleBlock; block_n *= 2) {
+    for (int64_t block_n = is_prefill ? 64 : 4; block_n <= kScaleBlock;
+         block_n *= 2) {
       if (n % block_n != 0 || kScaleBlock % block_n != 0) continue;
-      if (is_prefill && block_n < 64) continue;
-      for (int64_t block_k = min_block_k; block_k <= 2048; block_k *= 2) {
+      for (int64_t block_k = is_prefill ? min_prefill_block_k : min_block_k;
+           block_k <= max_block_k; block_k *= 2) {
         if (k % block_k != 0) continue;
         if (tile_ir) {
           configs.push_back(Pack(rung_, block_m, block_n, block_k,
@@ -173,8 +247,15 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
         for (int num_warps = is_prefill ? 4 : 2; num_warps <= max_warps;
              num_warps *= 2) {
           for (int num_stages = 2; num_stages <= 6; ++num_stages) {
+            if (!fits(block_m, block_n, block_k, num_stages)) break;
             configs.push_back(Pack(rung_, block_m, block_n, block_k, num_warps,
                                    num_stages));
+            // TMA on tiles that reach the 128-row MMA, head to head with the
+            // plain load, as the generic rung offers it.
+            if (is_prefill && block_m >= 128) {
+              configs.push_back(Pack(rung_, block_m, block_n, block_k,
+                                     num_warps, num_stages, /*tma=*/true));
+            }
           }
         }
       }
@@ -189,6 +270,19 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
     return absl::InvalidArgumentError(
         "Fp8BlockGemvBackend does not support this instruction.");
   }
+  if (rung_ == Rung::kCutlass) {
+    std::optional<Fp8BlockGemvSpec> spec =
+        MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+    for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
+      if (kernel::Fp8BlockGemmCutlassCanRun(i, spec->batch, spec->n, spec->k)) {
+        return PackCutlass(i);
+      }
+    }
+    return absl::InvalidArgumentError(absl::StrCat(
+        "no CUTLASS block gemm config runs m=", spec->batch, " n=", spec->n,
+        " k=", spec->k));
+  }
+
   ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
                    instr.backend_config<GpuBackendConfig>());
   const HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
@@ -244,6 +338,28 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
 
 absl::Status Fp8BlockGemvBackend::ApplyConfig(HloInstruction& instr,
                                               const BackendConfig& config) {
+  if (rung_ == Rung::kCutlass) {
+    if (!config.has_fp8_block_gemm_cutlass()) {
+      return absl::InvalidArgumentError(
+          "Expected an fp8_block_gemm_cutlass config for the CUTLASS rung.");
+    }
+    if (instr.opcode() != HloOpcode::kFusion) {
+      return absl::InvalidArgumentError("expected a fusion");
+    }
+    ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                          instr.backend_config<GpuBackendConfig>());
+    FusionBackendConfig& backend_config =
+        *gpu_config.mutable_fusion_backend_config();
+    backend_config.set_kind(std::string(kFp8BlockGemmCutlassFusionKind));
+    backend_config.clear_triton_gemm_config();
+    backend_config.clear_block_level_fusion_config();
+    backend_config.mutable_fp8_block_gemm_cutlass_config()->set_config_index(
+        config.fp8_block_gemm_cutlass().config_index());
+    ABSL_RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+    instr.set_fusion_kind(HloInstruction::FusionKind::kCustom);
+    return absl::OkStatus();
+  }
+
   const bool tile_ir = rung_ == Rung::kTileIr;
   const TileIrFusionConfig* slot = ConstSlotFor(rung_, config);
   if (slot == nullptr) {

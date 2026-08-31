@@ -304,18 +304,12 @@ bool NVPTXCompiler::IsScaledDotSupportedByBackend(
     return true;
   }
   if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
-    if (instr->GetModule()
-            ->config()
-            .debug_options()
-            .xla_gpu_experimental_emit_fp8_block_gemv() &&
-        Fp8BlockGemvSupportsScaledDot(*scaled_dot)) {
+    if (Fp8BlockGemvSupportsScaledDot(
+            *scaled_dot,
+            gpu_target_config.device_description.gpu_compute_capability())) {
       return true;
     }
-    if (instr->GetModule()
-            ->config()
-            .debug_options()
-            .xla_gpu_experimental_claim_nvfp4_decode_dot() &&
-        MatchNvfp4DecodeDot(*scaled_dot,
+    if (MatchNvfp4DecodeDot(*scaled_dot,
                             gpu_target_config.device_description
                                 .gpu_compute_capability())
             .has_value()) {
@@ -336,12 +330,8 @@ std::vector<FusedScaledDotArm> NVPTXCompiler::FusedScaledDotArms(
   }
   const se::GpuComputeCapability& gpu_version =
       gpu_target_config.device_description.gpu_compute_capability();
-  if (debug_options.xla_gpu_experimental_emit_fp8_block_gemv()) {
-    arms.push_back(Fp8BlockGemvArm(gpu_version));
-  }
-  if (debug_options.xla_gpu_experimental_claim_nvfp4_decode_dot()) {
-    arms.push_back(Nvfp4DecodeDotArm(gpu_version));
-  }
+  arms.push_back(Fp8BlockGemvArm(gpu_version));
+  arms.push_back(Nvfp4DecodeDotArm(gpu_version));
   return arms;
 }
 

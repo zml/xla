@@ -33,6 +33,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -561,6 +562,20 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
     const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
     if (dnums.lhs_contracting_dimensions_size() != 1 ||
         dnums.rhs_contracting_dimensions_size() != 1) {
+      return absl::OkStatus();
+    }
+    // A dot the block-128 FP8 arm will claim must not be split: this pass runs
+    // ten lines before FusedScaledDotRewriter, and a split leaves a rank-3
+    // scaled dot the arm's matcher rejects on its dimension numbers. The dot
+    // then falls to the generic route, so the split does not trade parallelism
+    // for a slower kernel -- it silently gives up the claimed one. Until W8A16
+    // the identity scale blocked this by failing the divides-by-split_k test
+    // below; a W8A8 activation scale has a real contracting dimension and
+    // passes it.
+    if (auto* scaled = DynCast<HloScaledDotInstruction>(instr);
+        scaled != nullptr &&
+        Fp8BlockGemvSupportsScaledDot(
+            *scaled, device_description_.gpu_compute_capability())) {
       return absl::OkStatus();
     }
     size_t split_k = 0;

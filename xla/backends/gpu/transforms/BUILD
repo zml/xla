@@ -4190,6 +4190,7 @@ cc_library(
     srcs = ["splitk_rewriter.cc"],
     hdrs = ["splitk_rewriter.h"],
     deps = [
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla:literal_util",
         "//xla:shape_util",
         "//xla:util",

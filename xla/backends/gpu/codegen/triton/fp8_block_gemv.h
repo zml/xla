@@ -34,10 +34,15 @@ struct Fp8BlockGemvSpec {
   int64_t activation_index;
   int64_t weight_index;
   int64_t scale_index;
+  // Only meaningful when w8a8: the activation's own [batch, k/128] scale.
+  int64_t act_scale_index;
   int64_t n;
   int64_t k;
   int64_t batch;
   bool activation_batch_major;
+  // f8e4m3fn activation with a real per-row, per-128 scale (W8A8); otherwise
+  // a bf16 activation with an identity scale (W8A16).
+  bool w8a8;
 };
 
 inline constexpr int64_t kMaxFp8BlockGemvReduceRows = 1;
@@ -59,7 +64,21 @@ std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
     const HloScaledDotInstruction& dot,
     const se::GpuComputeCapability& gpu_version);
 
-bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot);
+// Whether a backend here will claim this dot. Takes the compute capability
+// because the answer depends on it: a batch that is neither one row nor a
+// multiple of sixteen is servable only by the CUTLASS rung.
+bool Fp8BlockGemvSupportsScaledDot(
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version);
+
+// A batch the Triton emitter cannot tile -- it reduces a single row or mma's a
+// multiple of 16, and xtile.extract does not mask a partial tile. Such a batch
+// is claimable only where HasCutlassBlockGemm holds.
+bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch);
+
+// Whether this GPU has the vendored CUTLASS blockwise collective: it is
+// SM100-family, and it is the only rung that tiles an arbitrary M.
+bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version);
 
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
     absl::string_view fn_name, const HloFusionInstruction& fusion,

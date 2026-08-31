@@ -296,8 +296,21 @@ message FusionBackendConfig {
 
   CuDnnFusionConfig cudnn_fusion_config = 5;
 
+  // Only valid when kind == "__fp8_block_gemm_cutlass". Field 900 is the fork's
+  // block, kept away from upstream's next id.
+  Fp8BlockGemmCutlassConfig fp8_block_gemm_cutlass_config = 900;
+
   reserved 3, 7;
   reserved "dynamic_memcpy_config";
+}
+
+// Which compiled CUTLASS instantiation serves a claimed block-128 FP8 dot. The
+// table lives in fp8_block_gemm_cutlass.cu.cc and is fixed at build time, so
+// the config is an index rather than a description; two entries can share a
+// tile shape and differ only in swap-A/B, which is why the tile cannot stand in
+// for the index.
+message Fp8BlockGemmCutlassConfig {
+  int32 config_index = 1;
 }
 
 // Backed config for norm executed by cuDNN.

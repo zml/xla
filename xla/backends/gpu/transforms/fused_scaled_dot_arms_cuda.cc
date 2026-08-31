@@ -67,8 +67,19 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
   std::vector<HloInstruction*> parameters;
   operands.reserve(dot->operand_count());
   parameters.reserve(dot->operand_count());
+  // The CUTLASS rung's collective ties its scale element to the f32
+  // accumulator, so a claimed W8A8 dot carries scales already widened. The
+  // convert has to sit outside the fusion because that rung reads the operand
+  // buffers directly; it is a [n/128, k/128] elementwise, tens of KB. W8A16
+  // fusions keep bf16 -- CUTLASS does not bid on them and the other rungs read
+  // bf16 natively.
+  const bool w8a8 = dot->operand(0)->shape().element_type() == F8E4M3FN;
   for (int64_t i = 0; i < dot->operand_count(); ++i) {
     HloInstruction* operand = dot->mutable_operand(i);
+    if (w8a8 && i >= 2 && operand->shape().element_type() != F32) {
+      operand = comp->AddInstruction(HloInstruction::CreateConvert(
+          ShapeUtil::ChangeElementType(operand->shape(), F32), operand));
+    }
     operands.push_back(operand);
     parameters.push_back(builder.AddInstruction(HloInstruction::CreateParameter(
         i, operand->shape(), absl::StrCat("p", i))));

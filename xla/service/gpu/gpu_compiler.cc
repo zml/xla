@@ -1863,13 +1863,12 @@ absl::Status GpuCompiler::OptimizeHloModule(
   const se::DeviceDescription& device_description =
       gpu_topology.gpu_target_config().device_description;
 
-  if (hlo_module->config()
-          .debug_options()
-          .xla_gpu_experimental_emit_fp8_block_gemv()) {
-    hlo_module->mutable_config()
-        .mutable_debug_options()
-        .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);
-  }
+  // The block-scaled FP8 emitter implies the subchannel dequantize fusion: what
+  // the arm turns down still has to fuse, or the weight materializes and the
+  // dot goes to cuBLAS at less than half the throughput.
+  hlo_module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);
 
   ABSL_ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
                    mlir_context_pool_.GetOrCreate());

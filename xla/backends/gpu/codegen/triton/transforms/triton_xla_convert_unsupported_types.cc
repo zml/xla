@@ -22,6 +22,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
@@ -42,6 +43,29 @@ bool FindScaledDotOp(const ModuleOp& module) {
   auto walk_result = module->walk([&](Operation* op) {
     if (auto extSI = dyn_cast<triton::DotScaledOp>(op)) {
       return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return walk_result.wasInterrupted();
+}
+
+// A hand-emitted kernel may read a UE8M0 scale without a dot_scaled; it needs
+// the same byte reinterpretation.
+bool UsesE8M0(const ModuleOp& module) {
+  auto is_e8m0 = [](Type type) {
+    if (auto ptr = dyn_cast<triton::PointerType>(type)) {
+      type = ptr.getPointeeType();
+    }
+    return isa<Float8E8M0FNUType>(getElementTypeOrSelf(type));
+  };
+  auto walk_result = module->walk([&](Operation* op) {
+    for (Type type : op->getResultTypes()) {
+      if (is_e8m0(type)) return WalkResult::interrupt();
+    }
+    if (auto fn = dyn_cast<::xla::xtile::EntryFuncOp>(op)) {
+      for (Type type : fn.getFunctionType().getInputs()) {
+        if (is_e8m0(type)) return WalkResult::interrupt();
+      }
     }
     return WalkResult::advance();
   });
@@ -97,7 +121,7 @@ class TritonXLAConvertUnsupportedTypesPass
 
  private:
   void runOnOperation() override {
-    if (!FindScaledDotOp(getOperation())) {
+    if (!FindScaledDotOp(getOperation()) && !UsesE8M0(getOperation())) {
       return;
     }
     TypeConverter converter;

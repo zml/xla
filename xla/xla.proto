@@ -1763,8 +1763,6 @@ message DebugOptions {
 
   optional bool xla_gpu_experimental_scaled_dot_with_tile_ir = 900;
 
-  optional bool xla_gpu_experimental_emit_fp8_block_gemv = 901;
-
   // If true, use MultiGpuBarrierWithNcclKernel in one-shot RaggedAllToAll
   // thunk.
   optional bool xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl =
@@ -1819,8 +1817,6 @@ message DebugOptions {
   // check. Scope is FFI-only: legacy custom calls and custom calls lowered to
   // custom kernels (e.g. PTX) are not gated.
   repeated string xla_gpu_hlo_custom_call_allowlist = 537;
-
-  optional bool xla_gpu_experimental_claim_nvfp4_decode_dot = 902;
 
   // Note: when adding a new flag, please add it to one of the hardware-specific
   // or hardware-agnostic sections at the top of this proto message.
