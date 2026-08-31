@@ -311,7 +311,7 @@ absl::Status RocmCommandBuffer::UpdateClonedChildNode(
   if (flattened_child_kernels_.find(hip_node_handle) !=
       flattened_child_kernels_.end()) {
     size_t child_node_count = 0;
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         ToStatus(hipGraphGetNodes(child_graph, nullptr, &child_node_count),
                  "Failed to query flattened child graph node count"));
     if (child_node_count != 1) {
@@ -321,19 +321,20 @@ absl::Status RocmCommandBuffer::UpdateClonedChildNode(
 
     hipGraphNode_t child_node = nullptr;
     size_t node_capacity = 1;
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         ToStatus(hipGraphGetNodes(child_graph, &child_node, &node_capacity),
                  "Failed to get flattened child graph kernel node"));
     hipGraphNodeType node_type = hipGraphNodeTypeEmpty;
-    RETURN_IF_ERROR(ToStatus(hipGraphNodeGetType(child_node, &node_type),
-                             "Failed to get flattened child graph node type"));
+    ABSL_RETURN_IF_ERROR(
+        ToStatus(hipGraphNodeGetType(child_node, &node_type),
+                 "Failed to get flattened child graph node type"));
     if (node_type != hipGraphNodeTypeKernel) {
       return absl::InternalError(
           "Flattened child graph kernel changed node type during update");
     }
 
     hipKernelNodeParams params{};
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         ToStatus(hipGraphKernelNodeGetParams(child_node, &params),
                  "Failed to get flattened child graph kernel parameters"));
     IncrementRocmPerformanceCounter(
@@ -466,7 +467,7 @@ absl::StatusOr<GraphNodeHandle> RocmCommandBuffer::CreateEmptyNode(
 
 absl::Status RocmCommandBuffer::Trace(
     Stream* stream, absl::AnyInvocable<absl::Status(Stream* stream)> function) {
-  RETURN_IF_ERROR(CheckNotFinalized());
+  ABSL_RETURN_IF_ERROR(CheckNotFinalized());
 
   VLOG(5) << "Trace into GPU command buffer graph " << graph_
           << " on a stream: " << stream;
@@ -475,7 +476,7 @@ absl::Status RocmCommandBuffer::Trace(
   RocmStream* rocm_stream = static_cast<RocmStream*>(stream);
 
   uint64_t start_nanos = tsl::Env::Default()->NowNanos();
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       RocmStream::CaptureHandle capture_handle,
       rocm_stream->BeginCapture(
           graph_, /*dependencies=*/nullptr, /*num_dependencies=*/0,
@@ -497,7 +498,7 @@ absl::Status RocmCommandBuffer::Trace(
     return absl::InternalError(
         absl::StrCat("Failed to capture gpu graph: ", traced.message()));
   }
-  RETURN_IF_ERROR(ended);
+  ABSL_RETURN_IF_ERROR(ended);
 
   VLOG(5) << "Traced into the GPU command buffer graph " << graph_ << " (took "
           << (end_nanos - start_nanos) / 1000 << " μs)";

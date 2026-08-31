@@ -374,8 +374,9 @@ absl::StatusOr<bool> StreamIsCapturing(StreamExecutor* executor,
                                        hipStream_t stream) {
   auto activation = ActivateRocm(executor);
   hipStreamCaptureStatus status;
-  RETURN_IF_ERROR(ToStatus(hipStreamIsCapturing(stream, &status),
-                           "Failed to check HIP stream capture status"));
+  ABSL_RETURN_IF_ERROR(
+      ToStatus(hipStreamIsCapturing(stream, &status),
+               "Failed to check HIP stream capture status"));
   return status == hipStreamCaptureStatusActive;
 }
 
@@ -393,7 +394,7 @@ absl::Status RocmStream::CaptureHandle::EndCapture() {
   RocmStream* stream = std::exchange(stream_, nullptr);
   hipGraph_t graph = std::exchange(graph_, nullptr);
   hipGraph_t captured_graph = nullptr;
-  RETURN_IF_ERROR(ToStatus(
+  ABSL_RETURN_IF_ERROR(ToStatus(
       hipStreamEndCapture(stream->stream_handle_, &captured_graph),
       "Failed to end HIP stream capture"));
   if (captured_graph != graph) {
@@ -417,14 +418,15 @@ absl::StatusOr<RocmStream::CaptureHandle> RocmStream::BeginCapture(
 
   RocmStream* capture_stream =
       static_cast<RocmStream*>(capture_stream_->get());
-  ASSIGN_OR_RETURN(bool is_capturing,
-                   StreamIsCapturing(executor_, capture_stream->stream_handle_));
+  ABSL_ASSIGN_OR_RETURN(
+      bool is_capturing,
+      StreamIsCapturing(executor_, capture_stream->stream_handle_));
   if (is_capturing) {
     return absl::FailedPreconditionError(
         "HIP capture stream is already capturing");
   }
 
-  RETURN_IF_ERROR(ToStatus(
+  ABSL_RETURN_IF_ERROR(ToStatus(
       hipStreamBeginCaptureToGraph(
           capture_stream->stream_handle_, graph, dependencies,
           /*dependencyData=*/nullptr, num_dependencies, mode),
