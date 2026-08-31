@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/ir_emitter_context.h"
@@ -51,6 +52,12 @@ AsyncThunkSequence Fp8BlockGemvFusion::Emit(
         absl::StrCat(fusion.name(), ": the CUDA kernel is single-row only, got "
                                     "batch ",
                      spec->batch)));
+  }
+  // The kernel reads the scale as bf16; a cached config skips GetSupportedConfigs, so check here.
+  if (spec->weight_scale_type != BF16) {
+    return AsyncThunkSequence(absl::FailedPreconditionError(absl::StrCat(
+        fusion.name(), ": the CUDA kernel reads a bf16 weight scale, got ",
+        primitive_util::LowercasePrimitiveTypeName(spec->weight_scale_type))));
   }
 
   const xla::xtile::BlockLevelFusionConfig& block_config =

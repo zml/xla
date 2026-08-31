@@ -128,8 +128,11 @@ build:cuda --test_tag_filters -no_oss
 # build:cuda --config cuda_nvcc
 build:cuda --repo_env=HERMETIC_PYTHON_VERSION=3.11
 # 12.0a (not 12.0): sm_120a has block-scaled FP4 MMA; plain sm_120 does not.
+# 10.0a/10.3a for the same reason: tcgen05 and the TMA descriptor intrinsics are
+# architecture-specific, so a plain 10.3 build leaves CUTE_ARCH_TMA_SM90_ENABLED
+# unset and CUTLASS's blockwise kernels compile their fast paths out, then trap.
 # Spelling must be x.ya (not sm_120a) for cuda_configure.bzl capability list.
-build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="7.5,8.0,8.6,8.7,8.9,9.0,10.0,10.3,12.0a,12.1"
+build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="7.5,8.0,8.6,8.7,8.9,9.0,10.0a,10.3a,12.0a,12.1"
 build:cuda --repo_env=HERMETIC_CUDA_VERSION="13.3.0"
 build:cuda --repo_env=HERMETIC_CUDNN_VERSION="9.24.0"
 build:cuda --repo_env=HERMETIC_NVSHMEM_VERSION="3.6.5"

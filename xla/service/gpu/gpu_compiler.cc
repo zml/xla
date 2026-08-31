@@ -1863,9 +1863,10 @@ absl::Status GpuCompiler::OptimizeHloModule(
   const se::DeviceDescription& device_description =
       gpu_topology.gpu_target_config().device_description;
 
-  if (hlo_module->config()
-          .debug_options()
-          .xla_gpu_experimental_emit_fp8_block_gemv()) {
+  // The FP8 arm needs the subchannel dequantize fusion for what it declines; CUDA only, and it
+  // overrides an explicit =false on purpose.
+  if (device_description.gpu_compute_capability().cuda_compute_capability() !=
+      nullptr) {
     hlo_module->mutable_config()
         .mutable_debug_options()
         .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);

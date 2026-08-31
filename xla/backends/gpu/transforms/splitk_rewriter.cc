@@ -434,6 +434,28 @@ absl::StatusOr<HloInstruction*> SplitKDimensionOfDot(HloDotInstruction* src_dot,
 
 using ScaledDotOperandDims = std::array<DotOperandDims, 4>;
 
+// Whether the weight of this scaled dot is fp8 carrying a block-128 scale
+// grid, i.e. one scale element per 128 contracting elements. The activation
+// may be fp8 with a matching per-row grid (W8A8) or bf16 with an identity
+// scale (W8A16); only the weight side identifies the format.
+bool IsBlock128ScaledWeight(const HloScaledDotInstruction& dot) {
+  constexpr int64_t kScaleBlock = 128;
+  if (dot.operand(1)->shape().element_type() != F8E4M3FN) return false;
+  absl::StatusOr<ScaledDotOperandDims> dims =
+      DotOperandDims::FromScaledDot(&dot);
+  if (!dims.ok()) return false;
+  for (int i : {1, 3}) {
+    absl::Span<const int64_t> contracting =
+        (*dims)[i].Indices(DotOperandDims::kContracting);
+    if (contracting.size() != 1) return false;
+  }
+  const int64_t k = dot.operand(1)->shape().dimensions(
+      (*dims)[1].Indices(DotOperandDims::kContracting)[0]);
+  const int64_t scale_k = dot.operand(3)->shape().dimensions(
+      (*dims)[3].Indices(DotOperandDims::kContracting)[0]);
+  return scale_k * kScaleBlock == k;
+}
+
 absl::StatusOr<HloInstruction*> SplitKDimensionOfScaledDot(
     HloInstruction* src_dot, int64_t split_k) {
   const PrimitiveType output_type = src_dot->shape().element_type();
@@ -561,6 +583,31 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
     const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
     if (dnums.lhs_contracting_dimensions_size() != 1 ||
         dnums.rhs_contracting_dimensions_size() != 1) {
+      return absl::OkStatus();
+    }
+    // A dot with two narrow operands must not be split, whether or not an arm
+    // goes on to claim it. This pass runs ten lines before
+    // FusedScaledDotRewriter, and a split leaves a rank-3 scaled dot the arm's
+    // matcher rejects on its dimension numbers, so a claimed dot silently
+    // loses the kernel the claim exists to give it. An unclaimed one fares no
+    // better: the split's output is f32, that pulls the dequantize up to f32
+    // with it, and the whole thing lands on an f32 `__cublas$lt$matmul` --
+    // 232us on sm_120 where the unsplit bf16 one takes 98us.
+    //
+    // Until W8A8 this was unreachable: a weight-only block-128 dot carries an
+    // identity activation scale, which fails the divides-by-split_k test
+    // below. A real per-row scale has a contracting dimension and passes it,
+    // which is how a format change turned split-K on for a class of dots it
+    // had never seen.
+    //
+    // Recognised by the weight's block-128 scale grid rather than by its
+    // element type, because the element type alone would also catch MXFP8 --
+    // fp8 x fp8 on a 32-element block, whose scale contracting extent is k/32
+    // and therefore divides split_k just as readily. That form has always been
+    // split, Triton claims the batched dot it produces, and none of the
+    // measurement above was taken on it.
+    if (auto* scaled = DynCast<HloScaledDotInstruction>(instr);
+        scaled != nullptr && IsBlock128ScaledWeight(*scaled)) {
       return absl::OkStatus();
     }
     size_t split_k = 0;

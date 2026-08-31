@@ -67,8 +67,14 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
   std::vector<HloInstruction*> parameters;
   operands.reserve(dot->operand_count());
   parameters.reserve(dot->operand_count());
+  // The CUTLASS rung reads f32 scales straight from the buffers, so the convert stays outside the fusion.
+  const bool w8a8 = dot->operand(0)->shape().element_type() == F8E4M3FN;
   for (int64_t i = 0; i < dot->operand_count(); ++i) {
     HloInstruction* operand = dot->mutable_operand(i);
+    if (w8a8 && i >= 2 && operand->shape().element_type() != F32) {
+      operand = comp->AddInstruction(HloInstruction::CreateConvert(
+          ShapeUtil::ChangeElementType(operand->shape(), F32), operand));
+    }
     operands.push_back(operand);
     parameters.push_back(builder.AddInstruction(HloInstruction::CreateParameter(
         i, operand->shape(), absl::StrCat("p", i))));

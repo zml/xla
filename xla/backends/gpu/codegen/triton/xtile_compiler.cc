@@ -335,13 +335,10 @@ absl::StatusOr<TritonKernelSource> CreateTritonModule(
     return Internal("Unsupported fusion kind: %s", fusion_kind);
   }
 
-  // keep getting the generic tiling. It cannot gate a fusion whose root is the
+  // A claimed fusion must emit or fail; an opportunistic match may fall through to the generic tiling.
   const bool claimed_scaled_dot =
       absl::StartsWith(hlo_computation->name(), kFp8BlockGemvComputationPrefix);
-  if (claimed_scaled_dot || fusion.GetModule()
-                                ->config()
-                                .debug_options()
-                                .xla_gpu_experimental_emit_fp8_block_gemv()) {
+  {
     std::optional<Fp8BlockGemvSpec> spec = MatchFp8BlockGemv(fusion);
     if (spec.has_value()) {
       absl::Status status = absl::OkStatus();

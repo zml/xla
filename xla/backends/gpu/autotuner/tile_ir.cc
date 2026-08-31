@@ -26,6 +26,9 @@
 #include "llvm/Support/MathExtras.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/gpu/transforms/convert_triton_gemm_config.h"
+#include "absl/strings/match.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
+#include "xla/backends/gpu/codegen/triton/nvfp4_decode_dot.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -238,6 +241,13 @@ bool TileIrBackend::IsSupported(const HloInstruction& instr) {
       target_config().device_description.gpu_compute_capability()
           .cuda_compute_capability();
   if (cc == nullptr || cc->major < 10) {
+    return false;
+  }
+  // An arm's fusion is its own rungs' to serve; this space would only fail to lower it.
+  if (const HloComputation* body = instr.fused_instructions_computation();
+      body != nullptr &&
+      (absl::StartsWith(body->name(), kFp8BlockGemvComputationPrefix) ||
+       absl::StartsWith(body->name(), kNvfp4DecodeDotComputationPrefix))) {
     return false;
   }
   const HloInstruction* dot = GetScaledDot(instr);

@@ -131,6 +131,9 @@ inline constexpr absl::string_view kTileIrFusionKind = "__tile_ir";
 inline constexpr absl::string_view kFp8BlockGemvCudaFusionKind =
     "__fp8_block_gemv_cuda";
 
+inline constexpr absl::string_view kFp8BlockGemmCutlassFusionKind =
+    "__fp8_block_gemm_cutlass";
+
 // Fusions that use Triton have FusionBackendConfig.kind equal to this string.
 inline constexpr absl::string_view kCuDnnFusionKind = "__cudnn$fusion";
 

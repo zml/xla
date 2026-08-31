@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -34,7 +35,7 @@ namespace gpu {
 
 class Fp8BlockGemvBackend : public GpuCodegenBackend {
  public:
-  enum class Rung { kTriton, kTileIr, kCuda };
+  enum class Rung { kTriton, kTileIr, kCuda, kCutlass };
 
   explicit Fp8BlockGemvBackend(const DebugOptions* debug_options,
                                Compiler* compiler,
@@ -55,7 +56,11 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
 
   bool IsSupported(const HloInstruction& instr) override;
 
-  bool CanProduceWrongResults() const override { return rung_ == Rung::kCuda; }
+  std::pair<int, int> CutlassCc() const;
+
+  bool CanProduceWrongResults() const override {
+    return rung_ == Rung::kCuda || rung_ == Rung::kCutlass;
+  }
 
   std::string version() const override {
     switch (rung_) {
@@ -65,6 +70,9 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
         return "tile_ir_13.3";
       case Rung::kCuda:
         return "cuda_1";
+      case Rung::kCutlass:
+        // Bump when the config table changes: a cached entry is an index into it.
+        return "cutlass_2";
     }
   }
 
@@ -77,6 +85,8 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
         return autotuner::Backend::FP8_BLOCK_GEMV_TILE_IR;
       case Rung::kCuda:
         return autotuner::Backend::FP8_BLOCK_GEMV_CUDA;
+      case Rung::kCutlass:
+        return autotuner::Backend::FP8_BLOCK_GEMM_CUTLASS;
     }
   }
 

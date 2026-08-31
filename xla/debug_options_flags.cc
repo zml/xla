@@ -403,7 +403,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::PARTITIONING_ALGORITHM_NOOP);
 
   opts.set_xla_gpu_enable_triton_gemm(true);
-  opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
+  // On in this fork: it lets a block-scaled activation quantizer be one kernel.
+  opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(true);
   opts.set_xla_gpu_experimental_enable_same_shape_multi_output_fusion(false);
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
   opts.set_xla_gpu_triton_gemm_any(true);
@@ -549,14 +550,12 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_unsupported_crash_on_hlo_pass_noop_change(false);
   opts.set_xla_gpu_experimental_enable_collective_multi_streaming(false);
   opts.set_xla_gpu_experimental_force_split_k(0);
-  opts.set_xla_gpu_experimental_claim_nvfp4_decode_dot(true);
   opts.set_xla_gpu_experimental_enable_triton_warp_specialization(false);
   opts.set_xla_detect_unstable_reductions(DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_detect_unstable_reductions_post_optimizations(
       DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_gpu_experimental_scaled_dot_with_triton(true);
   opts.set_xla_gpu_experimental_scaled_dot_with_tile_ir(true);
-  opts.set_xla_gpu_experimental_emit_fp8_block_gemv(true);
   opts.set_xla_early_exit_with_layouts(false);
   opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
   opts.set_xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl(true);
@@ -3495,14 +3494,6 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "tables for matmuls. Expects `xla.gpu.DeviceHloInstructionProfiles` "
       "proto."));
   flag_list->push_back(tsl::Flag(
-      "xla_gpu_experimental_claim_nvfp4_decode_dot",
-      bool_setter_for(
-          &DebugOptions::set_xla_gpu_experimental_claim_nvfp4_decode_dot),
-      debug_options->xla_gpu_experimental_claim_nvfp4_decode_dot(),
-      "Let FusedScaledDotRewriter claim NVFP4 decode projections, swapping "
-      "their operands and owning their block-level config, instead of leaving "
-      "them to GemmFusion and the generic Triton search."));
-  flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_force_split_k",
       int32_setter_for(&DebugOptions::set_xla_gpu_experimental_force_split_k),
       debug_options->xla_gpu_experimental_force_split_k(),
@@ -3623,12 +3614,6 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_experimental_scaled_dot_with_triton(),
       "If true (default), use the Triton emitter for scaled dot. Together with "
       "scaled_dot_with_tile_ir the autotuner profiles both backends."));
-  flag_list->push_back(tsl::Flag(
-      "xla_gpu_experimental_emit_fp8_block_gemv",
-      bool_setter_for(&DebugOptions::set_xla_gpu_experimental_emit_fp8_block_gemv),
-      debug_options->xla_gpu_experimental_emit_fp8_block_gemv(),
-      "If true, emit a decode projection against a block-scaled FP8 weight "
-      "with a dedicated streaming kernel rather than the generic dot tiling."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_scaled_dot_with_tile_ir",
       bool_setter_for(

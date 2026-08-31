@@ -1311,6 +1311,30 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "fp8_block_gemm_cutlass_thunk",
+    srcs = ["fp8_block_gemm_cutlass_thunk.cc"],
+    hdrs = ["fp8_block_gemm_cutlass_thunk.h"],
+    tags = ["cuda-only"],
+    deps = [
+        ":thunk",
+        ":thunk_proto_cc",
+        ":traced_command",
+        "//xla:shape_util",
+        "//xla:util",
+        "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/codegen/kernels:fp8_block_gemm_cutlass",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:buffer_allocations",
+        "//xla/stream_executor:device_address",
+        "//xla/stream_executor:stream",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "gemm_thunk",
     srcs = ["gemm_thunk.cc"],
     hdrs = ["gemm_thunk.h"],
