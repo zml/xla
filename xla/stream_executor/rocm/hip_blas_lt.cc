@@ -310,10 +310,10 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
     }
 
     auto reset_descriptor = [&]() -> absl::Status {
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
           HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF));
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET, 0));
       applied_streamk_mode_ = HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF;
       applied_cu_count_target_ = 0;
@@ -333,13 +333,13 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
         -> absl::StatusOr<
             std::vector<hipblasLtMatmulHeuristicResult_t>> {
       blas_lt_.mu_.AssertHeld();
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
           streamk_mode));
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
           cu_count_target));
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           hip_preference, HIPBLASLT_MATMUL_PREF_SM_COUNT_TARGET,
           cu_count_target));
 
@@ -357,11 +357,11 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
       return results;
     };
 
-    ASSIGN_OR_RETURN(default_results,
-                     get_heuristics(
-                         max_algorithm_count,
-                         HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
-                         /*cu_count_target=*/0));
+    ABSL_ASSIGN_OR_RETURN(default_results,
+                          get_heuristics(
+                              max_algorithm_count,
+                              HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
+                              /*cu_count_target=*/0));
 
     // Preserve all existing algorithm indices, then append a bounded number
     // of ROCm 7.14 scheduling variants. Existing serialized HLO therefore
@@ -374,7 +374,7 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
           blas_lt_.executor_->GetDeviceDescription().core_count());
       const int32_t reduced_cu_target = core_count * 7 / 8;
 
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           auto streamk_results,
           get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_ON,
                          /*cu_count_target=*/0));
@@ -383,7 +383,7 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
            std::move(streamk_results)});
 
       if (reduced_cu_target > 0 && reduced_cu_target < core_count) {
-        ASSIGN_OR_RETURN(
+        ABSL_ASSIGN_OR_RETURN(
             auto reduced_results,
             get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_OFF,
                            reduced_cu_target));
@@ -391,7 +391,7 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
                                  reduced_cu_target,
                                  std::move(reduced_results)});
 
-        ASSIGN_OR_RETURN(
+        ABSL_ASSIGN_OR_RETURN(
             auto reduced_streamk_results,
             get_heuristics(count, HIPBLASLT_STREAMK_TILE_SCHEDULING_ON,
                            reduced_cu_target));
@@ -401,7 +401,7 @@ auto BlasLt::RegularMatmulPlan::GetAlgorithms(size_t max_algorithm_count,
       }
     }
 
-    RETURN_IF_ERROR(reset_descriptor());
+    ABSL_RETURN_IF_ERROR(reset_descriptor());
     std::move(cleanup).Cancel();
   }  // end mutex block
 
@@ -821,14 +821,14 @@ absl::Status BlasLt::RegularMatmulPlan::ExecuteOnStream(
         DisableHipblasLtTuning() ? 0 : cu_count_target_;
     if (!applied_streamk_mode_ ||
         *applied_streamk_mode_ != desired_streamk_mode) {
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_STREAMK_TILE_SCHEDULING_EXT,
           desired_streamk_mode));
       applied_streamk_mode_ = desired_streamk_mode;
     }
     if (!applied_cu_count_target_ ||
         *applied_cu_count_target_ != desired_cu_count_target) {
-      RETURN_IF_ERROR(SetAttr<int32_t>(
+      ABSL_RETURN_IF_ERROR(SetAttr<int32_t>(
           op_desc_.get(), HIPBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
           desired_cu_count_target));
       applied_cu_count_target_ = desired_cu_count_target;
