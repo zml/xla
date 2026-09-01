@@ -2992,6 +2992,7 @@ cc_library(
     tags = ["no-oneapi"],
     deps = [
         ":fused_scaled_dot_rewriter",
+        ":splitk_rewriter",
         "//xla:shape_util",
         "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
         "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
@@ -3007,6 +3008,7 @@ cc_library(
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -3014,6 +3016,11 @@ xla_cc_test(
     name = "fused_scaled_dot_rewriter_test",
     srcs = ["fused_scaled_dot_rewriter_test.cc"],
     deps = [
+        ":fused_scaled_dot_arms_cuda",
+        "//xla:shape_util",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status:status_matchers",
         ":fused_scaled_dot_rewriter",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",

@@ -48,6 +48,7 @@ constexpr Nvfp4DecodeLimits kTcgen05Limits = {
     /*tile_ir_min_weight_tile=*/128,
     /*tile_ir_min_batch_tile=*/16,
     /*tile_ir_max_batch_tile=*/16,
+    /*max_split_k=*/4,
 };
 
 constexpr Nvfp4DecodeLimits kSm120Limits = {
@@ -63,10 +64,12 @@ constexpr Nvfp4DecodeLimits kSm120Limits = {
     /*tile_ir_min_weight_tile=*/0,
     /*tile_ir_min_batch_tile=*/0,
     /*tile_ir_max_batch_tile=*/0,
+    /*max_split_k=*/4,
 };
 
 constexpr Nvfp4DecodeLimits kNoClaim = {
     /*claim=*/false, /*swap=*/false, 0, 0, 0, 0, {0, 0, 0, 0}, false, 0, 0, 0,
+    /*max_split_k=*/1,
 };
 
 bool IsNvfp4Operand(const HloInstruction& values, const HloInstruction& scales) {

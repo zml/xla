@@ -42,6 +42,8 @@ struct Nvfp4DecodeLimits {
   int64_t tile_ir_min_weight_tile;
   int64_t tile_ir_min_batch_tile;
   int64_t tile_ir_max_batch_tile;
+  // A ceiling on the arm's split-K; the block_k ladder is what usually binds.
+  int64_t max_split_k;
 };
 
 const Nvfp4DecodeLimits& Nvfp4DecodeLimitsFor(

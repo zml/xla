@@ -331,7 +331,7 @@ std::vector<FusedScaledDotArm> NVPTXCompiler::FusedScaledDotArms(
   const se::GpuComputeCapability& gpu_version =
       gpu_target_config.device_description.gpu_compute_capability();
   arms.push_back(Fp8BlockGemvArm(gpu_version));
-  arms.push_back(Nvfp4DecodeDotArm(gpu_version));
+  arms.push_back(Nvfp4DecodeDotArm(gpu_target_config.device_description));
   return arms;
 }
 

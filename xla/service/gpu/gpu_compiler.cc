@@ -2153,26 +2153,21 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     // AlgebraicSimplifier will simplify it away again.
     // TODO(b/375566188): Figure out whether we can get rid of this pass.
     pipeline.AddPass<DotNormalizer>();
+    // Arms claim before anything downstream reshapes a kScaledDot; an arm splits its own contraction.
     std::vector<FusedScaledDotArm> fused_scaled_dot_arms = FusedScaledDotArms(
         FusedScaledDotPhase::kPostLayout, debug_options, gpu_target_config);
+    if (!fused_scaled_dot_arms.empty()) {
+      pipeline.AddPass<FusedScaledDotRewriter>(std::move(fused_scaled_dot_arms));
+    }
     if (IsTritonGemmEnabled(debug_options, gpu_version)) {
       pipeline.AddPass<DotDimensionNormalizer>(
           /*normalize_noncontracting_dimensions=*/!debug_options
               .xla_gpu_experimental_gemm_fusion_v2());
       pipeline.AddPass<GemvRewriter>();
       pipeline.AddPass<SplitkRewriter>(gpu_target_config.device_description);
-      // After SplitkRewriter and before GemmFusion, which would otherwise fuse the
-      // scaled dots first.
-      if (!fused_scaled_dot_arms.empty()) {
-        pipeline.AddPass<FusedScaledDotRewriter>(
-            std::move(fused_scaled_dot_arms));
-      }
       pipeline.AddPass<GemmFusion>(gpu_version);
       pipeline.AddPass<HoistFusedBitcasts>();
       pipeline.AddPass<GemmFusionSwapOperands>();
-    } else if (!fused_scaled_dot_arms.empty()) {
-      pipeline.AddPass<FusedScaledDotRewriter>(
-          std::move(fused_scaled_dot_arms));
     }
 
     pipeline.AddPass<ScaledDotRewriter>(

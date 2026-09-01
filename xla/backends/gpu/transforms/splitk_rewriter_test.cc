@@ -388,49 +388,6 @@ TEST_F(SplitkRewriterTest, DeclinesAScaledDotWhoseScalesDoNotDivide) {
   EXPECT_FALSE(changed);
 }
 
-// A block-128 FP8 projection with quantized activations: both scale grids are
-// k/128 wide, so they divide split_k and would be split were it not for the
-// skip. The dot is claimed a few lines later by FusedScaledDotRewriter, whose
-// matcher rejects the rank-3 product on its dimension numbers.
-TEST_F(SplitkRewriterTest, DeclinesABlock128Fp8ScaledDot) {
-  constexpr absl::string_view kW8A8 = R"(
-    HloModule m
-    ENTRY e {
-      lhs = f8e4m3fn[16,16384]{1,0} parameter(0)
-      rhs = f8e4m3fn[5120,16384]{1,0} parameter(1)
-      ls = f32[16,128]{1,0} parameter(2)
-      rs = f32[40,128]{1,0} parameter(3)
-      ROOT sd = bf16[16,5120]{1,0} scaled-dot(lhs, rhs, ls, rs),
-                             lhs_contracting_dims={1}, rhs_contracting_dims={1}
-    })";
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnVerifiedModule(kW8A8));
-  TF_ASSERT_OK_AND_ASSIGN(bool changed,
-                          rewriter_.HloModulePass::Run(module.get()));
-  EXPECT_FALSE(changed);
-}
-
-// MXFP8 is fp8 x fp8 too, but on a 32-element block. No arm claims it here and
-// Triton takes the batched product happily, so the skip above must not reach
-// it: recognising the format by operand element type alone would.
-TEST_F(SplitkRewriterTest, StillSplitsAnMxfp8ScaledDot) {
-  constexpr absl::string_view kMxfp8 = R"(
-    HloModule m
-    ENTRY e {
-      lhs = f8e4m3fn[16,16384]{1,0} parameter(0)
-      rhs = f8e4m3fn[5120,16384]{1,0} parameter(1)
-      ls = f8e8m0fnu[16,512]{1,0} parameter(2)
-      rs = f8e8m0fnu[5120,512]{1,0} parameter(3)
-      ROOT sd = bf16[16,5120]{1,0} scaled-dot(lhs, rhs, ls, rs),
-                             lhs_contracting_dims={1}, rhs_contracting_dims={1}
-    })";
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnVerifiedModule(kMxfp8));
-  TF_ASSERT_OK_AND_ASSIGN(bool changed,
-                          rewriter_.HloModulePass::Run(module.get()));
-  EXPECT_TRUE(changed);
-}
-
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

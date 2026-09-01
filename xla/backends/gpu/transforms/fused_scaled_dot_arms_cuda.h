@@ -25,7 +25,7 @@ namespace gpu {
 FusedScaledDotArm Fp8BlockGemvArm(const se::GpuComputeCapability& gpu_version);
 
 FusedScaledDotArm Nvfp4DecodeDotArm(
-    const se::GpuComputeCapability& gpu_version);
+    const se::DeviceDescription& device_description);
 
 }  // namespace gpu
 }  // namespace xla

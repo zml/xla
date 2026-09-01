@@ -107,6 +107,18 @@ bool Nvfp4DecodeDotBackend::IsSupported(const HloInstruction& instr) {
             .offer_tile_ir_rung)) {
     return false;
   }
+  if (rung_ == Rung::kTileIr && instr.shape().dimensions().size() > 2) {
+    // The lowering to cuda_tile rejects a batch dimension, so a dot the arm
+    // split cannot be served here. Decline it at bid time: offering it instead
+    // spends a tile search and an emit on something that can only compile-fail,
+    // and the failure is swallowed at VLOG(2). Worse, a lone surviving config
+    // is returned without ever being compiled, so a fusion that reached this
+    // rung by itself would hard-error at emission rather than fall back.
+    VLOG(1) << "nvfp4 backend declined " << instr.name()
+            << ": the Tile IR rung cannot serve a rank-"
+            << instr.shape().dimensions().size() << " (split) dot";
+    return false;
+  }
   if (!MatchNvfp4DecodeDotFusion(*Cast<HloFusionInstruction>(&instr))
            .has_value()) {
     VLOG(1) << "nvfp4 backend declined " << instr.name()

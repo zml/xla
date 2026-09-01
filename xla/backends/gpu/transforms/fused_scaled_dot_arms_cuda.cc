@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/backends/gpu/transforms/fused_scaled_dot_arms_cuda.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,9 @@ limitations under the License.
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
+#include "xla/backends/gpu/transforms/splitk_rewriter.h"
 #include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/backends/gpu/codegen/triton/nvfp4_decode_dot.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -115,15 +118,100 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
   return fusion;
 }
 
+bool ScaledDotOperandsDivide(const HloScaledDotInstruction& dot,
+                             int64_t split_k) {
+  absl::StatusOr<std::array<DotOperandDims, 4>> dims =
+      DotOperandDims::FromScaledDot(&dot);
+  if (!dims.ok()) return false;
+  for (int i = 0; i < 4; ++i) {
+    absl::Span<const int64_t> contracting =
+        (*dims)[i].Indices(DotOperandDims::kContracting);
+    if (contracting.size() != 1) return false;
+    if (dot.operand(i)->shape().dimensions(contracting[0]) % split_k != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Whether the contraction still divides by a tile the autotuner would offer.
+//
+// GetSupportedConfigs skips every block_k that stops dividing k
+// (autotuner/nvfp4_decode_dot.cc), so a split -- which divides k -- can quietly
+// empty the tile search rather than merely re-tiling it. That is what the
+// split_k=8 cliff was: on sm_120 the down projection's per-device k is 8704, so
+// an eight-way split leaves 1088, which no offered block_k divides, and the
+// fusion falls back to a seed that does not divide it either. 67.9 tok/s where
+// unsplit is 98.2, and none of it is the reduce's fault.
+bool SplitPreservesBlockK(int64_t k, int64_t split_k) {
+  int64_t widest = 0;
+  for (int64_t block_k : {128, 256, 512}) {
+    if (k % block_k == 0) widest = block_k;
+  }
+  return widest != 0 && (k / split_k) % widest == 0;
+}
+
+// Split K only where narrowing N cannot fill the machine: tiles are counted against the
+// autotuner's floor tile, not this arm's seed. The batch axis keeps its real tile.
+int64_t ChooseNvfp4SplitK(const HloScaledDotInstruction& dot,
+                          const Nvfp4DecodeDotConfig& config,
+                          const se::DeviceDescription& device,
+                          const Nvfp4DecodeLimits& limits) {
+  if (limits.max_split_k <= 1) return 1;
+
+  std::optional<Nvfp4DecodeDotSpec> spec =
+      MatchNvfp4DecodeDot(dot, device.gpu_compute_capability());
+  if (!spec.has_value()) return 1;
+
+  const int64_t weight_tile = std::max<int64_t>(1, limits.min_weight_tile);
+  const int64_t batch_tile = std::max<int64_t>(1, config.batch_tile);
+  const int64_t tiles = CeilOfRatio(spec->weight_rows, weight_tile) *
+                        CeilOfRatio(spec->batch, batch_tile);
+  const int64_t cores = std::max<int64_t>(1, device.core_count());
+  if (tiles >= cores) return 1;
+
+  int64_t split_k = 1;
+  while (split_k * 2 <= limits.max_split_k && tiles * split_k * 2 <= cores &&
+         SplitPreservesBlockK(spec->k, split_k * 2)) {
+    split_k *= 2;
+  }
+  return split_k;
+}
+
 absl::StatusOr<HloInstruction*> TryEmitNvfp4DecodeDotFusion(
     HloComputation* comp, HloScaledDotInstruction* dot,
-    const se::GpuComputeCapability& gpu_version) {
+    const se::DeviceDescription& device_description) {
+  const se::GpuComputeCapability& gpu_version =
+      device_description.gpu_compute_capability();
   std::optional<Nvfp4DecodeDotConfig> config =
       Nvfp4DecodeDotConfigFor(*dot, gpu_version);
   if (!config.has_value()) {
     VLOG(1) << "nvfp4 arm declined " << dot->name() << ": "
             << dot->ToString();
     return nullptr;
+  }
+
+  // Split before claiming, so the fusion wraps the split dot and the reduce
+  // that sums it back down stays outside where later passes can still merge
+  // it. A dot that already carries a batch dimension is left alone.
+  HloInstruction* replacement = nullptr;
+  if (dot->dot_dimension_numbers().lhs_batch_dimensions().empty()) {
+    const int64_t split_k = ChooseNvfp4SplitK(
+        *dot, *config, device_description,
+        Nvfp4DecodeLimitsFor(gpu_version));
+    if (split_k > 1 && ScaledDotOperandsDivide(*dot, split_k)) {
+      ABSL_ASSIGN_OR_RETURN(SplitScaledDot split,
+                            SplitScaledDotContraction(dot, split_k));
+      // Re-match: the split changed the shape the config was derived from.
+      auto* split_dot = Cast<HloScaledDotInstruction>(split.dot);
+      std::optional<Nvfp4DecodeDotConfig> split_config =
+          Nvfp4DecodeDotConfigFor(*split_dot, gpu_version);
+      if (split_config.has_value()) {
+        replacement = split.root;
+        dot = split_dot;
+        config = split_config;
+      }
+    }
   }
 
   HloComputation::Builder builder(
@@ -212,7 +300,9 @@ absl::StatusOr<HloInstruction*> TryEmitNvfp4DecodeDotFusion(
   block_config.set_is_warp_specialization_allowed(true);
   ABSL_RETURN_IF_ERROR(fusion->set_backend_config(gpu_config));
 
-  return fusion;
+  if (replacement == nullptr) return fusion;
+  ABSL_RETURN_IF_ERROR(dot->parent()->ReplaceInstruction(dot, fusion));
+  return replacement;
 }
 
 }  // namespace
@@ -225,9 +315,10 @@ FusedScaledDotArm Fp8BlockGemvArm(
 }
 
 FusedScaledDotArm Nvfp4DecodeDotArm(
-    const se::GpuComputeCapability& gpu_version) {
-  return [gpu_version](HloComputation* comp, HloScaledDotInstruction* dot) {
-    return TryEmitNvfp4DecodeDotFusion(comp, dot, gpu_version);
+    const se::DeviceDescription& device_description) {
+  return [device_description](HloComputation* comp,
+                              HloScaledDotInstruction* dot) {
+    return TryEmitNvfp4DecodeDotFusion(comp, dot, device_description);
   };
 }
 
