@@ -219,7 +219,12 @@ bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch) {
 
 bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version) {
   const se::CudaComputeCapability* cc = gpu_version.cuda_compute_capability();
-  return cc != nullptr && cc->major == se::CudaComputeCapability::kBlackwell;
+  if (cc == nullptr) return false;
+  // Both Blackwell families, which take different collectives: the datacenter
+  // parts get tcgen05, the consumer one warp-level mma. The table carries an
+  // instantiation for each and CanRun picks by this same major.
+  return cc->major == se::CudaComputeCapability::kBlackwell ||
+         cc->major == se::CudaComputeCapability::kBlackwell_12;
 }
 
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(

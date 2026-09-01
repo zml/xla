@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/ir_emitter_context.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
@@ -61,12 +62,16 @@ AsyncThunkSequence Fp8BlockGemmCutlassFusion::Emit(
         absl::StrCat(fusion.name(), ": config index ", config,
                      " is outside the compiled table")));
   }
-  if (!kernel::Fp8BlockGemmCutlassCanRun(config, spec->batch, spec->n,
-                                         spec->k)) {
+  const se::CudaComputeCapability* cc =
+      ir_emitter_context.gpu_device_info()
+          .gpu_compute_capability()
+          .cuda_compute_capability();
+  if (cc == nullptr || !kernel::Fp8BlockGemmCutlassCanRun(
+                           config, cc->major, spec->batch, spec->n, spec->k)) {
     return AsyncThunkSequence(absl::FailedPreconditionError(absl::StrCat(
         fusion.name(), ": config ",
         kernel::Fp8BlockGemmCutlassConfigName(config), " cannot run m=",
-        spec->batch, " n=", spec->n, " k=", spec->k)));
+        spec->batch, " n=", spec->n, " k=", spec->k, " on this device")));
   }
 
   ABSL_ASSIGN_OR_RETURN(emitters::KernelArguments kernel_arguments,

@@ -111,6 +111,13 @@ std::unique_ptr<BackendConfig> PackCutlass(int config_index) {
 
 }  // namespace
 
+int Fp8BlockGemvBackend::CutlassCcMajor() const {
+  const se::CudaComputeCapability* cc =
+      target_config().device_description.gpu_compute_capability()
+          .cuda_compute_capability();
+  return cc == nullptr ? 0 : cc->major;
+}
+
 bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) return false;
   auto gpu_config = instr.backend_config<GpuBackendConfig>();
@@ -152,10 +159,12 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
   if (rung_ == Rung::kCutlass) {
     // The table is fixed at build time, so the search is over indices; CanRun
-    // is the kernel's own legality test (tile vs problem, alignment, and the
-    // swap-A/B orientation a decode-shaped M needs).
+    // is the kernel's own legality test (which Blackwell family the config was
+    // built for, and the scale grids).
     for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
-      if (!kernel::Fp8BlockGemmCutlassCanRun(i, batch, n, k)) continue;
+      if (!kernel::Fp8BlockGemmCutlassCanRun(i, CutlassCcMajor(), batch, n, k)) {
+        continue;
+      }
       configs.push_back(PackCutlass(i));
     }
     return configs;
@@ -274,7 +283,8 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
     std::optional<Fp8BlockGemvSpec> spec =
         MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
     for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
-      if (kernel::Fp8BlockGemmCutlassCanRun(i, spec->batch, spec->n, spec->k)) {
+      if (kernel::Fp8BlockGemmCutlassCanRun(i, CutlassCcMajor(), spec->batch,
+                                            spec->n, spec->k)) {
         return PackCutlass(i);
       }
     }

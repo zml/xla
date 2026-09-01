@@ -61,11 +61,15 @@ int Fp8BlockGemmCutlassNumConfigs();
 // "128x128x128_c1x1" or "swapab_256x16x128_c2x1".
 const char* Fp8BlockGemmCutlassConfigName(int config);
 
-// Whether the config can serve this problem at all. Every config takes an
-// arbitrary M -- a swap-A/B config puts the weight rows on the MMA's M axis so
-// a decode-shaped batch tiles exactly, while the plain orientation pads M up to
-// the tile -- so this is a filter on the scale grids, not on the batch.
-bool Fp8BlockGemmCutlassCanRun(int config, int64_t m, int64_t n, int64_t k);
+// Whether the config can serve this problem on this GPU. `cc_major` is the
+// CUDA compute capability major -- 10 for a GB200/GB300, 12 for an RTX 5090 --
+// and a config only runs on the family it was compiled for. Beyond that, every
+// config takes an arbitrary M (a swap-A/B config puts the weight rows on the
+// MMA's M axis so a decode-shaped batch tiles exactly, while the plain
+// orientation pads M up to the tile), so this is a filter on the architecture
+// and the scale grids, not on the batch.
+bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int64_t m, int64_t n,
+                               int64_t k);
 
 size_t Fp8BlockGemmCutlassWorkspaceSize(int config, int64_t m, int64_t n,
                                         int64_t k);

@@ -52,19 +52,42 @@ namespace {
 using namespace cute;  // NOLINT(build/namespaces) -- CUTLASS's own convention.
 
 // A kernel built for one architecture range traps rather than misbehaves if it
-// is ever launched outside it. vLLM's cutlass_extensions/common.hpp.
-template <typename Kernel>
-struct EnableSm100ToSm120 : Kernel {
+// is ever launched outside it. vLLM's cutlass_extensions/common.hpp. CanRun is
+// what actually keeps a config off the wrong GPU; this is the backstop, and it
+// is why the range has to be stated rather than assumed.
+template <typename Kernel, int ArchLo, int ArchHi>
+struct EnableArch : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
 #if defined(__CUDA_ARCH__)
-#if (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
-    Kernel::operator()(std::forward<Args>(args)...);
-#else
-    asm("trap;");
-#endif
+    if constexpr (__CUDA_ARCH__ >= ArchLo && __CUDA_ARCH__ < ArchHi) {
+      Kernel::operator()(std::forward<Args>(args)...);
+    } else {
+      asm("trap;");
+    }
 #endif
   }
+};
+
+// The two Blackwell families this file serves want different collectives:
+// SM100 (GB200/GB300) is tcgen05 with the 1-SM/2-SM blockwise mainloops, SM120
+// (the consumer part, an RTX 5090) is warp-level mma + TMA with its own. What
+// surrounds them -- operand layouts, the swap-A/B branch, the scale config --
+// is identical, so the family is a template parameter rather than a second
+// copy of the file. `cc_major` is the CUDA compute capability major the
+// instantiation is for, which is what CanRun filters on.
+struct Sm100Family {
+  static constexpr int cc_major = 10;
+  using ArchTag = cutlass::arch::Sm100;
+  template <class Kernel>
+  using Guard = EnableArch<Kernel, 1000, 1200>;
+};
+
+struct Sm120Family {
+  static constexpr int cc_major = 12;
+  using ArchTag = cutlass::arch::Sm120;
+  template <class Kernel>
+  using Guard = EnableArch<Kernel, 1200, 1300>;
 };
 
 // ScaleGranularity{M,N,K} describe the checkpoint's scale blocking, not the
@@ -73,12 +96,13 @@ struct EnableSm100ToSm120 : Kernel {
 // too -- the swapped M axis is the weight's N (128) and the swapped N axis is
 // the activation's M (1). They are therefore fixed by the data, and only
 // MmaTileShape and ClusterShape are free.
-template <class OutType, int ScaleGranularityM, int ScaleGranularityN,
-          int ScaleGranularityK, class MmaTileShape, class ClusterShape,
-          class EpilogueScheduler, class MainloopScheduler,
+template <class Family, class OutType, int ScaleGranularityM,
+          int ScaleGranularityN, int ScaleGranularityK, class MmaTileShape,
+          class ClusterShape, class EpilogueScheduler, class MainloopScheduler,
           bool swap_ab_ = false>
 struct Fp8BlockwiseGemm {
   static constexpr bool swap_ab = swap_ab_;
+  static constexpr int cc_major = Family::cc_major;
   using ElementAB = cutlass::float_e4m3_t;
 
   using ElementA = ElementAB;
@@ -131,7 +155,7 @@ struct Fp8BlockwiseGemm {
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
-  using ArchTag = cutlass::arch::Sm100;
+  using ArchTag = typename Family::ArchTag;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
 
   static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
@@ -167,8 +191,9 @@ struct Fp8BlockwiseGemm {
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
           MainloopScheduler>::CollectiveOp>;
 
-  using KernelType = EnableSm100ToSm120<cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
+  using KernelType =
+      typename Family::template Guard<cutlass::gemm::kernel::GemmUniversal<
+          Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>>;
 
   struct GemmKernel : public KernelType {};
 };
@@ -283,6 +308,10 @@ struct Runner {
 // a constraint on the problem, so there is nothing about it left to record.
 struct ConfigEntry {
   const char* name;
+  // The compute capability major this instantiation was built for. Its device
+  // code compiles out everywhere else, so offering it there would launch a
+  // trap; CanRun filters on this.
+  int cc_major;
   size_t (*workspace_size)(int64_t, int64_t, int64_t);
   int (*run)(const Fp8BlockGemmCutlassParams&, void*, const char**);
 };
@@ -302,19 +331,21 @@ using OutType = cutlass::bfloat16_t;
 // output it produces, so narrowing N is the lever on shapes that do not fill
 // the machine. TILE_K stays 128 for the reason vLLM's does: a deeper tile spans
 // two K scale groups and the scale copy cannot vectorize across them.
-template <int TileM, int TileN, class ClusterShape, class EpilogueSchedule,
-          class MainloopSchedule>
+template <class Family, int TileM, int TileN, class ClusterShape,
+          class EpilogueSchedule, class MainloopSchedule>
 using PlainGemm =
-    Fp8BlockwiseGemm<OutType, 1, 128, 128,
+    Fp8BlockwiseGemm<Family, OutType, 1, 128, 128,
                      Shape<Int<TileM>, Int<TileN>, _128>, ClusterShape,
                      EpilogueSchedule, MainloopSchedule, false>;
 
 // Swapped: the weight goes on the MMA's M axis (granularity 128, its own scale
 // block) and the activation on N (granularity 1, per row), so a decode-shaped
-// batch tiles exactly instead of padding out to 64 or 128 rows of MMA.
-template <int TileM, int TileN, class ClusterShape, class EpilogueSchedule,
-          class MainloopSchedule>
-using SwapGemm = Fp8BlockwiseGemm<OutType, 128, 1, 128,
+// batch tiles exactly instead of padding out to 64 or 128 rows of MMA. Note
+// this puts the weight's 128 granularity on M, so a swapped TileM below 128
+// does not exist -- "Scale Granularity M must evenly divide the tile shape M".
+template <class Family, int TileM, int TileN, class ClusterShape,
+          class EpilogueSchedule, class MainloopSchedule>
+using SwapGemm = Fp8BlockwiseGemm<Family, OutType, 128, 1, 128,
                                   Shape<Int<TileM>, Int<TileN>, _128>,
                                   ClusterShape, EpilogueSchedule,
                                   MainloopSchedule, true>;
@@ -328,12 +359,21 @@ using EpiTma2Sm = cutlass::epilogue::TmaWarpSpecialized2Sm;
 using EpiNoSmem1Sm = cutlass::epilogue::BlockwiseNoSmemWarpSpecialized1Sm;
 using EpiNoSmem2Sm = cutlass::epilogue::BlockwiseNoSmemWarpSpecialized2Sm;
 
-#define XLA_ENTRY(kind, name, tile_m, tile_n, cluster, epi, mainloop)    \
-  ConfigEntry {                                                          \
-    name,                                                                \
-        &Runner<kind<tile_m, tile_n, cluster, epi,                       \
-                     mainloop>>::WorkspaceSize,                          \
-        &Runner<kind<tile_m, tile_n, cluster, epi, mainloop>>::Run       \
+// SM120 has no blockwise-specific epilogue tag -- Auto is what all three of
+// CUTLASS's own examples use, and the SM100 tags above are not in its
+// builder's accept list. Cooperative wants a tile at least 128 rows tall, so a
+// 64-row tile is Pingpong's, the pairing example 87b uses.
+using MainloopSm120Coop = cutlass::gemm::KernelScheduleSm120Blockwise;
+using MainloopSm120Pingpong =
+    cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120;
+using EpiSm120 = cutlass::epilogue::collective::EpilogueScheduleAuto;
+
+#define XLA_ENTRY(family, kind, name, tile_m, tile_n, cluster, epi, mainloop) \
+  ConfigEntry {                                                               \
+    name, family::cc_major,                                                   \
+        &Runner<kind<family, tile_m, tile_n, cluster, epi,                    \
+                     mainloop>>::WorkspaceSize,                               \
+        &Runner<kind<family, tile_m, tile_n, cluster, epi, mainloop>>::Run    \
   }
 
 // Timed on sm_103a at n = k = 5120, the projection shape of a 27B block-128
@@ -353,12 +393,12 @@ using EpiNoSmem2Sm = cutlass::epilogue::BlockwiseNoSmemWarpSpecialized2Sm;
 // Tiles 256 wide in N were measured and dropped: 60us at m = 64 against 10.2,
 // and 172us at m = 2048 against 56.
 const ConfigEntry kConfigs[] = {
-    XLA_ENTRY(PlainGemm, "plain_64x128x128_c1x1_tma", 64, 128, Cluster1,
-              EpiTma1Sm, Mainloop1Sm),
-    XLA_ENTRY(PlainGemm, "plain_128x128x128_c1x1_tma", 128, 128, Cluster1,
-              EpiTma1Sm, Mainloop1Sm),
-    XLA_ENTRY(PlainGemm, "plain_256x128x128_c2x1_tma", 256, 128, Cluster2,
-              EpiTma2Sm, Mainloop2Sm),
+    XLA_ENTRY(Sm100Family, PlainGemm, "plain_64x128x128_c1x1_tma", 64, 128,
+              Cluster1, EpiTma1Sm, Mainloop1Sm),
+    XLA_ENTRY(Sm100Family, PlainGemm, "plain_128x128x128_c1x1_tma", 128, 128,
+              Cluster1, EpiTma1Sm, Mainloop1Sm),
+    XLA_ENTRY(Sm100Family, PlainGemm, "plain_256x128x128_c2x1_tma", 256, 128,
+              Cluster2, EpiTma2Sm, Mainloop2Sm),
     // No narrow-N plain config: a CTA reads TileN x k of the weight, so a 32-
     // or 64-wide tile would be the lever on a projection that cannot fill the
     // machine, but the collective refuses it --
@@ -368,18 +408,36 @@ const ConfigEntry kConfigs[] = {
     // The granularity is the checkpoint's 128, so TileN can only be a multiple
     // of it. The swap-A/B configs below narrow the other axis instead, which is
     // the activation's (granularity 1) and therefore free.
-    XLA_ENTRY(SwapGemm, "swapab_128x32x128_c1x1", 128, 32, Cluster1,
-              EpiNoSmem1Sm, Mainloop1Sm),
-    XLA_ENTRY(SwapGemm, "swapab_128x64x128_c1x1", 128, 64, Cluster1,
-              EpiNoSmem1Sm, Mainloop1Sm),
-    XLA_ENTRY(SwapGemm, "swapab_128x128x128_c1x1", 128, 128, Cluster1,
-              EpiNoSmem1Sm, Mainloop1Sm),
-    XLA_ENTRY(SwapGemm, "swapab_256x32x128_c2x1", 256, 32, Cluster2,
-              EpiNoSmem2Sm, Mainloop2Sm),
-    XLA_ENTRY(SwapGemm, "swapab_256x64x128_c2x1", 256, 64, Cluster2,
-              EpiNoSmem2Sm, Mainloop2Sm),
-    XLA_ENTRY(SwapGemm, "swapab_256x128x128_c2x1", 256, 128, Cluster2,
-              EpiNoSmem2Sm, Mainloop2Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_128x32x128_c1x1", 128, 32,
+              Cluster1, EpiNoSmem1Sm, Mainloop1Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_128x64x128_c1x1", 128, 64,
+              Cluster1, EpiNoSmem1Sm, Mainloop1Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_128x128x128_c1x1", 128, 128,
+              Cluster1, EpiNoSmem1Sm, Mainloop1Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_256x32x128_c2x1", 256, 32,
+              Cluster2, EpiNoSmem2Sm, Mainloop2Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_256x64x128_c2x1", 256, 64,
+              Cluster2, EpiNoSmem2Sm, Mainloop2Sm),
+    XLA_ENTRY(Sm100Family, SwapGemm, "swapab_256x128x128_c2x1", 256, 128,
+              Cluster2, EpiNoSmem2Sm, Mainloop2Sm),
+
+    // SM120, timed on an RTX 5090 at n = k = 5120 over m from 1 to 2048. The
+    // shape of the curve is the SM100 one with the crossover moved: the
+    // swapped 32-wide tile is flat at 17.2us through m = 128 (it is the weight
+    // read), the 64-wide takes 256 rows, and plain 128x128 owns everything from
+    // 512 up. Clusters are absent because a consumer part has no second SM to
+    // pair with, and plain 128x128 under Pingpong was 2x its Cooperative self
+    // at every m, so only the pairing that wins is here.
+    XLA_ENTRY(Sm120Family, PlainGemm, "sm120_plain_64x128x128_pp", 64, 128,
+              Cluster1, EpiSm120, MainloopSm120Pingpong),
+    XLA_ENTRY(Sm120Family, PlainGemm, "sm120_plain_128x128x128", 128, 128,
+              Cluster1, EpiSm120, MainloopSm120Coop),
+    XLA_ENTRY(Sm120Family, SwapGemm, "sm120_swapab_128x32x128", 128, 32,
+              Cluster1, EpiSm120, MainloopSm120Coop),
+    XLA_ENTRY(Sm120Family, SwapGemm, "sm120_swapab_128x64x128", 128, 64,
+              Cluster1, EpiSm120, MainloopSm120Coop),
+    XLA_ENTRY(Sm120Family, SwapGemm, "sm120_swapab_128x128x128", 128, 128,
+              Cluster1, EpiSm120, MainloopSm120Coop),
 };
 
 #undef XLA_ENTRY
@@ -396,9 +454,12 @@ const char* Fp8BlockGemmCutlassConfigName(int config) {
   return kConfigs[config].name;
 }
 
-bool Fp8BlockGemmCutlassCanRun(int config, int64_t m, int64_t n, int64_t k) {
+bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int64_t m, int64_t n,
+                               int64_t k) {
   if (config < 0 || config >= kNumConfigs) return false;
   const ConfigEntry& c = kConfigs[config];
+  // A config's device code exists only for the family it was built for.
+  if (c.cc_major != cc_major) return false;
   // The scale grids have to be whole. Nothing constrains m: vLLM needs m % 4
   // for its plain configs because an MN-major activation scale is copied in
   // M-vectors, and K-major moves that vector onto an axis whose extent is the
