@@ -403,7 +403,17 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::PARTITIONING_ALGORITHM_NOOP);
 
   opts.set_xla_gpu_enable_triton_gemm(true);
-  opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(false);
+  // On in this fork: it is what lets an activation quantizer be one kernel.
+  // The block-scaled quantize is a reduce whose result both escapes to the dot
+  // and feeds an epilogue over the unreduced shape, so the producer cannot fuse
+  // into all its users and PriorityFusion splits it in two -- each re-reading
+  // the activation and recomputing the RMS norm in front of it. That second
+  // kernel is the one cost that does not shrink when tensor parallelism halves
+  // the GEMM, which is why W8A8 lost at TP=2 and won at TP=1.
+  // Measured on Qwen3.6-27B-FP8: 20 -> 16 fusions per decode layer, TP=2 bs16
+  // from -7% against the weight-only path to parity, TP=1 bs64 +1.8%, and the
+  // greedy output is unchanged.
+  opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(true);
   opts.set_xla_gpu_experimental_enable_same_shape_multi_output_fusion(false);
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
   opts.set_xla_gpu_triton_gemm_any(true);
