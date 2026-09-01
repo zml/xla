@@ -55,6 +55,10 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
 
   bool IsSupported(const HloInstruction& instr) override;
 
+  // The compute capability major the CUTLASS table is filtered against, or 0
+  // when this is not a CUDA device.
+  int CutlassCcMajor() const;
+
   bool CanProduceWrongResults() const override {
     return rung_ == Rung::kCuda || rung_ == Rung::kCutlass;
   }
@@ -68,7 +72,12 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
       case Rung::kCuda:
         return "cuda_1";
       case Rung::kCutlass:
-        return "cutlass_1";
+        // Bump whenever the config table changes. A cached entry stores an
+        // index into it, so reordering, adding or dropping an entry silently
+        // renames every kernel a warm cache picked -- the failure is a
+        // mysteriously slow run, not an error. "2" is the K-major scales, the
+        // pruned SM100 tiles and the SM120 family.
+        return "cutlass_2";
     }
   }
 

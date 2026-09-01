@@ -35,6 +35,7 @@ limitations under the License.
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/primitive_util.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -564,18 +565,25 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
         dnums.rhs_contracting_dimensions_size() != 1) {
       return absl::OkStatus();
     }
-    // A dot the block-128 FP8 arm will claim must not be split: this pass runs
-    // ten lines before FusedScaledDotRewriter, and a split leaves a rank-3
-    // scaled dot the arm's matcher rejects on its dimension numbers. The dot
-    // then falls to the generic route, so the split does not trade parallelism
-    // for a slower kernel -- it silently gives up the claimed one. Until W8A16
-    // the identity scale blocked this by failing the divides-by-split_k test
-    // below; a W8A8 activation scale has a real contracting dimension and
-    // passes it.
+    // A dot with two narrow operands must not be split, whether or not an arm
+    // goes on to claim it. This pass runs ten lines before
+    // FusedScaledDotRewriter, and a split leaves a rank-3 scaled dot the arm's
+    // matcher rejects on its dimension numbers, so a claimed dot silently
+    // loses the kernel the claim exists to give it. An unclaimed one fares no
+    // better: the split's output is f32, that pulls the dequantize up to f32
+    // with it, and the whole thing lands on an f32 `__cublas$lt$matmul` --
+    // 232us on sm_120 where the unsplit bf16 one takes 98us.
+    //
+    // Until W8A8 this was unreachable: a weight-only dot carries an identity
+    // activation scale, which fails the divides-by-split_k test below. A real
+    // per-row scale has a contracting dimension and passes it, which is how a
+    // format change turned split-K on for a class of dots it had never seen.
+    // Restricted to the fp8 x fp8 form on purpose: NVFP4's split-K is measured
+    // and wanted, and its arm is a different question.
     if (auto* scaled = DynCast<HloScaledDotInstruction>(instr);
         scaled != nullptr &&
-        Fp8BlockGemvSupportsScaledDot(
-            *scaled, device_description_.gpu_compute_capability())) {
+        scaled->operand(0)->shape().element_type() == F8E4M3FN &&
+        scaled->operand(1)->shape().element_type() == F8E4M3FN) {
       return absl::OkStatus();
     }
     size_t split_k = 0;
