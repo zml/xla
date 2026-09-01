@@ -111,11 +111,12 @@ std::unique_ptr<BackendConfig> PackCutlass(int config_index) {
 
 }  // namespace
 
-int Fp8BlockGemvBackend::CutlassCcMajor() const {
+std::pair<int, int> Fp8BlockGemvBackend::CutlassCc() const {
   const se::CudaComputeCapability* cc =
       target_config().device_description.gpu_compute_capability()
           .cuda_compute_capability();
-  return cc == nullptr ? 0 : cc->major;
+  return cc == nullptr ? std::pair<int, int>{0, 0}
+                       : std::pair<int, int>{cc->major, cc->minor};
 }
 
 bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
@@ -136,8 +137,8 @@ bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
       MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
   if (!spec.has_value()) return false;
   if (rung_ == Rung::kCutlass) {
-    // The vendored collective is SM100-family and reads a real activation
-    // scale; a W8A16 fusion has no such buffer.
+    // The vendored collective exists for both Blackwell families and reads a
+    // real activation scale; a W8A16 fusion has no such buffer.
     if (!HasCutlassBlockGemm(
             target_config().device_description.gpu_compute_capability())) {
       return false;
@@ -161,8 +162,10 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
     // The table is fixed at build time, so the search is over indices; CanRun
     // is the kernel's own legality test (which Blackwell family the config was
     // built for, and the scale grids).
+    const auto [cc_major, cc_minor] = CutlassCc();
     for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
-      if (!kernel::Fp8BlockGemmCutlassCanRun(i, CutlassCcMajor(), batch, n, k)) {
+      if (!kernel::Fp8BlockGemmCutlassCanRun(i, cc_major, cc_minor, batch, n,
+                                             k)) {
         continue;
       }
       configs.push_back(PackCutlass(i));
@@ -179,8 +182,13 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
   if (tile_ir && (is_prefill || spec->w8a8)) return configs;
 
   if (rung_ == Rung::kCuda) {
-    // The hand-written kernel reads a bf16 activation row.
-    if (!single_row || k % 16 != 0 || spec->w8a8) return configs;
+    // The hand-written kernel reads a bf16 activation row and a bf16 weight
+    // scale. The matcher is wider than that on both counts, so decline what
+    // the kernel cannot address rather than misreading the buffer.
+    if (!single_row || k % 16 != 0 || spec->w8a8 ||
+        spec->weight_scale_type != BF16) {
+      return configs;
+    }
     for (int num_warps : {2, 4, 8, 16}) {
       for (int rows_per_warp : {2, 4}) {
         const int64_t rows_per_block = num_warps * rows_per_warp;
@@ -282,8 +290,9 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
   if (rung_ == Rung::kCutlass) {
     std::optional<Fp8BlockGemvSpec> spec =
         MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+    const auto [cc_major, cc_minor] = CutlassCc();
     for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
-      if (kernel::Fp8BlockGemmCutlassCanRun(i, CutlassCcMajor(), spec->batch,
+      if (kernel::Fp8BlockGemmCutlassCanRun(i, cc_major, cc_minor, spec->batch,
                                             spec->n, spec->k)) {
         return PackCutlass(i);
       }

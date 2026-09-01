@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -55,9 +56,9 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
 
   bool IsSupported(const HloInstruction& instr) override;
 
-  // The compute capability major the CUTLASS table is filtered against, or 0
+  // The compute capability the CUTLASS table is filtered against, or {0, 0}
   // when this is not a CUDA device.
-  int CutlassCcMajor() const;
+  std::pair<int, int> CutlassCc() const;
 
   bool CanProduceWrongResults() const override {
     return rung_ == Rung::kCuda || rung_ == Rung::kCutlass;

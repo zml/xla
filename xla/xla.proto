@@ -1830,6 +1830,15 @@ message DebugOptions {
   // Next id: 541 upstream. Fields 900+ are this fork's own debug options, kept
   // Next fork id: 904
 
+  // 901 and 902 were xla_gpu_experimental_emit_fp8_block_gemv and
+  // xla_gpu_experimental_claim_nvfp4_decode_dot, retired once both arms became
+  // unconditional. A DebugOptions travels inside HloModuleConfigProto and
+  // PJRT's CompileOptionsProto, so reusing either number would decode a stale
+  // bool as whatever replaced it.
+  reserved 901, 902;
+  reserved "xla_gpu_experimental_emit_fp8_block_gemv";
+  reserved "xla_gpu_experimental_claim_nvfp4_decode_dot";
+
   // Expand a scaled dot no backend claimed into a dequantize and a plain dot,
   // with a warning, instead of failing the compile.
   optional bool xla_gpu_scaled_dot_expand_on_fallback = 903;

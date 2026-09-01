@@ -27,6 +27,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
 
@@ -43,9 +44,11 @@ struct Fp8BlockGemvSpec {
   // f8e4m3fn activation with a real per-row, per-128 scale (W8A8); otherwise
   // a bf16 activation with an identity scale (W8A16).
   bool w8a8;
+  // The weight scale's element type. The matcher takes bf16, f32 and ue8m0,
+  // but the hand-written CUDA kernel reads the buffer as bf16, so that rung
+  // has to check this rather than assume it.
+  PrimitiveType weight_scale_type;
 };
-
-inline constexpr int64_t kMaxFp8BlockGemvReduceRows = 1;
 
 inline constexpr absl::string_view kFp8BlockGemvComputationPrefix =
     "fp8_block_gemv_";
@@ -76,8 +79,9 @@ bool Fp8BlockGemvSupportsScaledDot(
 // is claimable only where HasCutlassBlockGemm holds.
 bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch);
 
-// Whether this GPU has the vendored CUTLASS blockwise collective: it is
-// SM100-family, and it is the only rung that tiles an arbitrary M.
+// Whether this GPU has a vendored CUTLASS blockwise collective. Both
+// Blackwell families do -- SM100 and SM120 take different ones -- and it is
+// the only rung that tiles an arbitrary M.
 bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version);
 
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(

@@ -23,7 +23,6 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "xla/backends/gpu/codegen/kernels/fp8_block_gemm_cutlass.h"
-#include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/service/buffer_assignment.h"

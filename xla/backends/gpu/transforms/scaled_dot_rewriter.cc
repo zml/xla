@@ -80,26 +80,35 @@ HloInstruction* Convert(HloInstruction* instr, PrimitiveType target_type) {
       HloInstruction::CreateConvert(shape, instr));
 }
 
-// Returns a pair of instructions that upscale both operands to the same type.
 // How wide to dequantize in. GetTargetType alone answers "what holds both of
 // these", which is the wrong question when the scale is merely *stored* wide:
 // a bf16 dot whose block scale ships f32 would dequantize in f32 and take the
 // f32 cuBLAS call with it, measured at 2.4x the bf16 one (232us against 98us,
 // sm_120). A scale's storage width describes the checkpoint, not the
 // arithmetic the dot is doing, so it cannot push the dequantize past the dot's
-// own output -- and never below the operand's own width, which would be a real
-// narrowing rather than a refusal to widen.
+// own output.
+//
+// Only bf16 may absorb an f32 scale that way, and the reason is exponent range
+// rather than width: the scale is converted before it multiplies, so a target
+// with a narrower exponent throws away values the product never needed. In f16
+// a scale of 1e5 becomes inf and one of 2.2e-7 a two-bit subnormal, either of
+// which poisons a product the output could have held. The target must also be
+// strictly wider than the operand, or this stops being a refusal to widen and
+// becomes a real narrowing -- an fp8 operand with an fp8 output would round the
+// scale through 448.
 PrimitiveType DequantizeType(const HloInstruction& dot, PrimitiveType operand,
                              PrimitiveType scale) {
   const PrimitiveType promoted = GetTargetType(operand, scale);
   const PrimitiveType out = dot.shape().element_type();
-  if (primitive_util::BitWidth(promoted) > primitive_util::BitWidth(out) &&
-      primitive_util::BitWidth(out) >= primitive_util::BitWidth(operand)) {
+  if (out == BF16 &&
+      primitive_util::BitWidth(promoted) > primitive_util::BitWidth(out) &&
+      primitive_util::BitWidth(out) > primitive_util::BitWidth(operand)) {
     return out;
   }
   return promoted;
 }
 
+// Returns a pair of instructions that upscale both operands to the same type.
 std::pair<HloInstruction*, HloInstruction*> UpscaleBoth(
     HloInstruction* first, HloInstruction* second,
     PrimitiveType target_type) {

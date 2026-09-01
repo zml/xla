@@ -20,8 +20,10 @@ def repo():
         name = "cutlass_archive",
         build_file = "//third_party:cutlass.BUILD",
         # 4.8.0 (not 3.8.0): the SM100/SM120 blockwise-scaled collectives that
-        # serve a block-128 FP8 weight arrived after 3.8. Nothing in the tree
-        # compiled CUTLASS device code before, so this pin had no other user.
+        # serve a block-128 FP8 weight arrived after 3.8. This archive is
+        # headers-only and shared with TransformerEngine 2.5
+        # (transformer_engine.BUILD, reached from multihost_hlo_runner), which
+        # was written against 3.x, so the bump moves its headers too.
         sha256 = "c72a69301543f9fbe105a308df0936b91322ee4b979658e496dc94941681e504",
         strip_prefix = "cutlass-4.8.0dev",
         urls = tf_mirror_urls("https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.8.0dev.zip"),

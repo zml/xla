@@ -24,9 +24,10 @@ namespace xla::gpu::kernel {
 // A block-scaled FP8 GEMM: D[M,N] = (A * a_scale) @ (B * b_scale)^T, where the
 // activation carries one f32 scale per row per 128 of K and the weight one f32
 // scale per 128x128 tile -- the shape every projection of a block-128 FP8
-// checkpoint has. The kernel is CUTLASS's SM100 warp-specialized blockwise
-// collective, which promotes the f32 accumulator once per 128 of K inside the
-// mainloop; that is the step a Triton emitter cannot hide.
+// checkpoint has. The kernel is CUTLASS's blockwise collective -- the SM100
+// warp-specialized one on a datacenter part, the SM120 warp-level-mma one on a
+// consumer part -- which promotes the f32 accumulator once per 128 of K inside
+// the mainloop; that is the step a Triton emitter cannot hide.
 //
 // Buffers, all device pointers, every one row-major and every one already in
 // the layout its producer emits -- no scale is rewritten on the way in:
@@ -58,18 +59,20 @@ struct Fp8BlockGemmCutlassParams {
 // build time and an autotuner rung picks by index.
 int Fp8BlockGemmCutlassNumConfigs();
 
-// "128x128x128_c1x1" or "swapab_256x16x128_c2x1".
+// "plain_128x128x128_c1x1_tma" or "sm120_swapab_128x32x128".
 const char* Fp8BlockGemmCutlassConfigName(int config);
 
-// Whether the config can serve this problem on this GPU. `cc_major` is the
-// CUDA compute capability major -- 10 for a GB200/GB300, 12 for an RTX 5090 --
-// and a config only runs on the family it was compiled for. Beyond that, every
-// config takes an arbitrary M (a swap-A/B config puts the weight rows on the
-// MMA's M axis so a decode-shaped batch tiles exactly, while the plain
-// orientation pads M up to the tile), so this is a filter on the architecture
-// and the scale grids, not on the batch.
-bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int64_t m, int64_t n,
-                               int64_t k);
+// Whether the config can serve this problem on this GPU. `cc_major`/`cc_minor`
+// are the CUDA compute capability -- 10.0 or 10.3 for a GB200/GB300, 12.0 for
+// an RTX 5090 -- and a config only runs where its device code was actually
+// built with the architecture features it needs (the SM120 half is 12.0 only:
+// a plain 12.1 target compiles TMA out). Beyond that, every config takes an
+// arbitrary M (a swap-A/B config puts the weight rows on the MMA's M axis so a
+// decode-shaped batch tiles exactly, while the plain orientation pads M up to
+// the tile), so this is a filter on the architecture and the scale grids, not
+// on the batch.
+bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int cc_minor,
+                               int64_t m, int64_t n, int64_t k);
 
 size_t Fp8BlockGemmCutlassWorkspaceSize(int config, int64_t m, int64_t n,
                                         int64_t k);

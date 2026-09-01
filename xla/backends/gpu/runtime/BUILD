@@ -1327,7 +1327,6 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/service/gpu:buffer_allocations",
         "//xla/stream_executor:device_address",
-        "//xla/stream_executor:device_memory",
         "//xla/stream_executor:stream",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

@@ -209,6 +209,7 @@ cc_library(
         "//xla/backends/gpu/codegen/kernels:custom_kernel",
         "//xla/backends/gpu/codegen/kernels:fp8_block_gemv_kernel",
         "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
+        "//xla:shape_util",
         "//xla/backends/gpu/runtime:custom_kernel_thunk",
         "//xla/backends/gpu/runtime:thunk",
         "//xla/codegen/emitters:kernel_arguments",

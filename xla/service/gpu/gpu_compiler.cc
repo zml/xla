@@ -1865,10 +1865,17 @@ absl::Status GpuCompiler::OptimizeHloModule(
 
   // The block-scaled FP8 emitter implies the subchannel dequantize fusion: what
   // the arm turns down still has to fuse, or the weight materializes and the
-  // dot goes to cuBLAS at less than half the throughput.
-  hlo_module->mutable_config()
-      .mutable_debug_options()
-      .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);
+  // dot goes to cuBLAS at less than half the throughput. The arm is CUDA-only,
+  // so raise the option there and leave every other backend on the flag's own
+  // default -- this overrides an explicit `=false`, which is deliberate on
+  // CUDA (the two are one feature) and would be nothing but a surprise
+  // elsewhere.
+  if (device_description.gpu_compute_capability().cuda_compute_capability() !=
+      nullptr) {
+    hlo_module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_gpu_experimental_enable_subchannel_dequantisation_fusion(true);
+  }
 
   ABSL_ASSIGN_OR_RETURN(BorrowedMlirContext borrowed_context,
                    mlir_context_pool_.GetOrCreate());

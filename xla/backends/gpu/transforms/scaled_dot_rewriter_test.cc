@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/hlo/utils/hlo_query.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/primitive_util.h"
@@ -265,6 +266,57 @@ TEST_F(ScaledDotRewriterElementSizeTest, ScalarScaleIsMultiplied) {
           m::Multiply(m::Parameter(0), m::Broadcast(m::Parameter(2))),
           m::Multiply(m::Parameter(1),
                       m::Reshape(m::Broadcast(m::Parameter(3)))))));
+}
+
+// A wide scale is a statement about the checkpoint, not about the arithmetic,
+// so a bf16-output dot dequantizes in bf16 rather than dragging an f32 cuBLAS
+// call along behind it.
+TEST_F(ScaledDotRewriterElementSizeTest, F32ScaleDequantizesInBf16Output) {
+  const char* hlo = R"(
+    HloModule m
+    ENTRY main {
+      lhs = f8e4m3fn[32,256] parameter(0)
+      rhs = f8e4m3fn[16,256] parameter(1)
+      lhs_scale = f32[32,2] parameter(2)
+      rhs_scale = f32[16,2] parameter(3)
+      ROOT d = bf16[32,16] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+          lhs_contracting_dims={1}, rhs_contracting_dims={1}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
+  ScaledDotRewriter rewriter;
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  ASSERT_THAT(root, GmockMatch(m::Dot()));
+  EXPECT_EQ(root->operand(0)->shape().element_type(), BF16);
+  EXPECT_EQ(root->operand(1)->shape().element_type(), BF16);
+}
+
+// f16 does not share f32's exponent range, so converting the scale into it
+// first would turn a large one into inf and flush a small one to a subnormal --
+// for products the output could have held. Only bf16 may absorb the scale.
+TEST_F(ScaledDotRewriterElementSizeTest, F32ScaleStaysF32ForF16Output) {
+  const char* hlo = R"(
+    HloModule m
+    ENTRY main {
+      lhs = f8e4m3fn[32,256] parameter(0)
+      rhs = f8e4m3fn[16,256] parameter(1)
+      lhs_scale = f32[32,2] parameter(2)
+      rhs_scale = f32[16,2] parameter(3)
+      ROOT d = f16[32,16] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+          lhs_contracting_dims={1}, rhs_contracting_dims={1}
+    }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
+  ScaledDotRewriter rewriter;
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, rewriter.Run(module.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
+      *module->entry_computation(), HloOpcode::kDot);
+  ASSERT_NE(dot, nullptr);
+  EXPECT_EQ(dot->operand(0)->shape().element_type(), F32);
+  EXPECT_EQ(dot->operand(1)->shape().element_type(), F32);
 }
 
 TEST_F(ScaledDotRewriterElementSizeTest, SelectiveFilterCallbackBehavior) {

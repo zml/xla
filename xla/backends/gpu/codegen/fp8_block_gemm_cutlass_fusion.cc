@@ -66,8 +66,9 @@ AsyncThunkSequence Fp8BlockGemmCutlassFusion::Emit(
       ir_emitter_context.gpu_device_info()
           .gpu_compute_capability()
           .cuda_compute_capability();
-  if (cc == nullptr || !kernel::Fp8BlockGemmCutlassCanRun(
-                           config, cc->major, spec->batch, spec->n, spec->k)) {
+  if (cc == nullptr ||
+      !kernel::Fp8BlockGemmCutlassCanRun(config, cc->major, cc->minor,
+                                         spec->batch, spec->n, spec->k)) {
     return AsyncThunkSequence(absl::FailedPreconditionError(absl::StrCat(
         fusion.name(), ": config ",
         kernel::Fp8BlockGemmCutlassConfigName(config), " cannot run m=",

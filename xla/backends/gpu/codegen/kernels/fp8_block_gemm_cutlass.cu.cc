@@ -74,10 +74,20 @@ struct EnableArch : Kernel {
 // (the consumer part, an RTX 5090) is warp-level mma + TMA with its own. What
 // surrounds them -- operand layouts, the swap-A/B branch, the scale config --
 // is identical, so the family is a template parameter rather than a second
-// copy of the file. `cc_major` is the CUDA compute capability major the
-// instantiation is for, which is what CanRun filters on.
+// copy of the file.
+//
+// `cc_major`/`cc_minor` are the CUDA compute capability the instantiation is
+// for, which is what CanRun filters on; -1 for the minor means any minor in
+// the family. The distinction matters because the guarantee is really about
+// the *build*, not the family: both SM100 targets in the capability list carry
+// the `a` suffix (10.0a and 10.3a), so either minor gets arch-conditional
+// device code, while on the consumer side only 12.0a does. A plain 12.1 target
+// compiles CUTE_ARCH_TMA_SM90_ENABLED out and the mainloop's TMA path becomes
+// CUTE_INVALID_CONTROL_PATH, so an sm_121 part must not be offered a config
+// from this table at all.
 struct Sm100Family {
   static constexpr int cc_major = 10;
+  static constexpr int cc_minor = -1;
   using ArchTag = cutlass::arch::Sm100;
   template <class Kernel>
   using Guard = EnableArch<Kernel, 1000, 1200>;
@@ -85,9 +95,10 @@ struct Sm100Family {
 
 struct Sm120Family {
   static constexpr int cc_major = 12;
+  static constexpr int cc_minor = 0;
   using ArchTag = cutlass::arch::Sm120;
   template <class Kernel>
-  using Guard = EnableArch<Kernel, 1200, 1300>;
+  using Guard = EnableArch<Kernel, 1200, 1210>;
 };
 
 // ScaleGranularity{M,N,K} describe the checkpoint's scale blocking, not the
@@ -140,10 +151,11 @@ struct Fp8BlockwiseGemm {
   // was handed from the stride
   // (sm100_mma_warpspecialized_blockwise_scaling.hpp:150), so it serves both.
   //
-  // Measured on sm_103a against a CPU reference at m in
-  // {1,3,16,17,32,33,64,129,512,2048}: every tile below is correct K-major,
-  // and, unlike MN-major, none of them declines an m that is not a multiple of
-  // 4 -- that alignment rule was the MN-major scale copy's, not the GEMM's.
+  // Measured against a CPU reference at m in {1,3,16,17,32,33,64,129,512,2048}
+  // -- the SM100 tiles on sm_103a, the SM120 ones on an RTX 5090 -- every tile
+  // below is correct K-major, and, unlike MN-major, none of them declines an m
+  // that is not a multiple of 4: that alignment rule was the MN-major scale
+  // copy's, not the GEMM's.
   // The one width it cannot serve is a swapped tile 16 wide, whose scale tile
   // is 16x1 and whose copy vectorizes along the axis holding one element: it
   // reads neighbouring rows (wrong at 128x16) or off the end (an illegal
@@ -303,15 +315,17 @@ struct Runner {
 };
 
 // A config is a compiled instantiation, so the table is fixed at build time and
-// the autotuner picks by index. Nothing but the launcher and its workspace
-// question survives here: with K-major scales the tile shape no longer implies
-// a constraint on the problem, so there is nothing about it left to record.
+// the autotuner picks by index. What survives here is the launcher, its
+// workspace question and the capability its device code was built for; with
+// K-major scales the tile shape implies no further constraint on the problem,
+// so there is nothing about the shape left to record.
 struct ConfigEntry {
   const char* name;
-  // The compute capability major this instantiation was built for. Its device
-  // code compiles out everywhere else, so offering it there would launch a
-  // trap; CanRun filters on this.
+  // The compute capability this instantiation was built for, `cc_minor` being
+  // -1 for any minor in the family. Its device code compiles out everywhere
+  // else, so offering it there would launch a trap; CanRun filters on this.
   int cc_major;
+  int cc_minor;
   size_t (*workspace_size)(int64_t, int64_t, int64_t);
   int (*run)(const Fp8BlockGemmCutlassParams&, void*, const char**);
 };
@@ -370,7 +384,7 @@ using EpiSm120 = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
 #define XLA_ENTRY(family, kind, name, tile_m, tile_n, cluster, epi, mainloop) \
   ConfigEntry {                                                               \
-    name, family::cc_major,                                                   \
+    name, family::cc_major, family::cc_minor,                                 \
         &Runner<kind<family, tile_m, tile_n, cluster, epi,                    \
                      mainloop>>::WorkspaceSize,                               \
         &Runner<kind<family, tile_m, tile_n, cluster, epi, mainloop>>::Run    \
@@ -454,12 +468,13 @@ const char* Fp8BlockGemmCutlassConfigName(int config) {
   return kConfigs[config].name;
 }
 
-bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int64_t m, int64_t n,
-                               int64_t k) {
+bool Fp8BlockGemmCutlassCanRun(int config, int cc_major, int cc_minor,
+                               int64_t m, int64_t n, int64_t k) {
   if (config < 0 || config >= kNumConfigs) return false;
   const ConfigEntry& c = kConfigs[config];
-  // A config's device code exists only for the family it was built for.
+  // A config's device code exists only for the capability it was built for.
   if (c.cc_major != cc_major) return false;
+  if (c.cc_minor >= 0 && c.cc_minor != cc_minor) return false;
   // The scale grids have to be whole. Nothing constrains m: vLLM needs m % 4
   // for its plain configs because an MN-major activation scale is copied in
   // M-vectors, and K-major moves that vector onto an axis whose extent is the

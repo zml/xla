@@ -194,6 +194,7 @@ std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
       /*batch=*/batch,
       /*activation_batch_major=*/batch_major,
       /*w8a8=*/w8a8,
+      /*weight_scale_type=*/scale->shape().element_type(),
   };
 }
 
@@ -222,9 +223,15 @@ bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version) {
   if (cc == nullptr) return false;
   // Both Blackwell families, which take different collectives: the datacenter
   // parts get tcgen05, the consumer one warp-level mma. The table carries an
-  // instantiation for each and CanRun picks by this same major.
+  // instantiation for each, and CanRun applies this same test per config.
+  //
+  // Consumer Blackwell is 12.0 only. The build targets 12.0a, and a plain
+  // sm_121 cubin has TMA compiled out of the mainloop, so an sm_121 part must
+  // not be told the collective is there -- otherwise the arm claims the dot
+  // and every config then declines at emit time.
   return cc->major == se::CudaComputeCapability::kBlackwell ||
-         cc->major == se::CudaComputeCapability::kBlackwell_12;
+         (cc->major == se::CudaComputeCapability::kBlackwell_12 &&
+          cc->minor == 0);
 }
 
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(

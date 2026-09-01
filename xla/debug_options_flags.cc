@@ -411,8 +411,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   // kernel is the one cost that does not shrink when tensor parallelism halves
   // the GEMM, which is why W8A8 lost at TP=2 and won at TP=1.
   // Measured on Qwen3.6-27B-FP8: 20 -> 16 fusions per decode layer, TP=2 bs16
-  // from -7% against the weight-only path to parity, TP=1 bs64 +1.8%, and the
-  // greedy output is unchanged.
+  // from -7% against the weight-only path to parity, and TP=1 bs64 +1.8% on
+  // top of the +31% W8A8 already had there. Greedy output is unchanged.
   opts.set_xla_gpu_unsupported_enable_triton_multi_output_fusion(true);
   opts.set_xla_gpu_experimental_enable_same_shape_multi_output_fusion(false);
   opts.set_xla_gpu_enable_cudnn_int8x32_convolution_reordering(true);
