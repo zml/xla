@@ -38,16 +38,20 @@ struct Nvfp4DecodeLimits {
     int num_warps;
     int num_stages;
   } seed;
-  bool offer_tile_ir_rung;
-  int64_t tile_ir_min_weight_tile;
-  int64_t tile_ir_min_batch_tile;
-  int64_t tile_ir_max_batch_tile;
   // A ceiling on the arm's split-K; the block_k ladder is what usually binds.
   int64_t max_split_k;
 };
 
 const Nvfp4DecodeLimits& Nvfp4DecodeLimitsFor(
     const se::GpuComputeCapability& gpu_version);
+
+// The widest contracting tile the autotuner enumerates for `k`, or 0. One answer for the matcher,
+// the seed, the search and the split chooser.
+int64_t WidestNvfp4BlockK(int64_t k);
+
+bool HasNvfp4BlockK(int64_t k);
+
+int64_t Nvfp4BlockKAtMost(int64_t k, int64_t preferred);
 
 struct Nvfp4DecodeDotSpec {
   int64_t batch;

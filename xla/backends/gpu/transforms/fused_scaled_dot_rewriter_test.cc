@@ -185,6 +185,13 @@ TEST_F(Nvfp4SplitKTest, DoesNotSplitWhereTheTileCanNarrowInstead) {
               absl_testing::IsOkAndHolds(1));
 }
 
+TEST_F(Nvfp4SplitKTest, TakesASplitThatKeepsANarrowerTile) {
+  // Halving keeps a narrower tile alive; occupancy is what stops the split.
+  EXPECT_THAT(SplitFor(Projection(/*weight_rows=*/2048, /*k=*/1536), 10, 3,
+                       /*core_count=*/148),
+              absl_testing::IsOkAndHolds(4));
+}
+
 TEST_F(Nvfp4SplitKTest, RefusesASplitThatEmptiesTheBlockKLadder) {
   // Halving leaves a k no block_k divides.
   EXPECT_THAT(SplitFor(Projection(/*weight_rows=*/2048, /*k=*/640), 10, 3,

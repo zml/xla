@@ -44,10 +44,6 @@ constexpr Nvfp4DecodeLimits kTcgen05Limits = {
     /*min_batch_tile=*/16,
     /*seed=*/{/*weight_tile=*/128, /*block_k=*/256, /*num_warps=*/8,
               /*num_stages=*/4},
-    /*offer_tile_ir_rung=*/true,
-    /*tile_ir_min_weight_tile=*/128,
-    /*tile_ir_min_batch_tile=*/16,
-    /*tile_ir_max_batch_tile=*/16,
     /*max_split_k=*/4,
 };
 
@@ -60,15 +56,11 @@ constexpr Nvfp4DecodeLimits kSm120Limits = {
     /*min_batch_tile=*/16,
     /*seed=*/{/*weight_tile=*/128, /*block_k=*/256, /*num_warps=*/4,
               /*num_stages=*/3},
-    /*offer_tile_ir_rung=*/false,
-    /*tile_ir_min_weight_tile=*/0,
-    /*tile_ir_min_batch_tile=*/0,
-    /*tile_ir_max_batch_tile=*/0,
     /*max_split_k=*/4,
 };
 
 constexpr Nvfp4DecodeLimits kNoClaim = {
-    /*claim=*/false, /*swap=*/false, 0, 0, 0, 0, {0, 0, 0, 0}, false, 0, 0, 0,
+    /*claim=*/false, /*swap=*/false, 0, 0, 0, 0, {0, 0, 0, 0},
     /*max_split_k=*/1,
 };
 
@@ -77,6 +69,10 @@ bool IsNvfp4Operand(const HloInstruction& values, const HloInstruction& scales) 
          scales.shape().element_type() == F8E4M3FN;
 }
 
+// The contracting tiles the autotuner enumerates; nothing outside is a legal configuration.
+constexpr int64_t kMinBlockK = 128;
+constexpr int64_t kMaxBlockK = 512;
+
 int64_t RoundUpToPowerOfTwo(int64_t v) {
   int64_t p = 1;
   while (p < v) p *= 2;
@@ -84,6 +80,18 @@ int64_t RoundUpToPowerOfTwo(int64_t v) {
 }
 
 }  // namespace
+
+int64_t WidestNvfp4BlockK(int64_t k) { return Nvfp4BlockKAtMost(k, kMaxBlockK); }
+
+bool HasNvfp4BlockK(int64_t k) { return WidestNvfp4BlockK(k) != 0; }
+
+int64_t Nvfp4BlockKAtMost(int64_t k, int64_t preferred) {
+  int64_t best = 0;
+  for (int64_t block_k = kMinBlockK; block_k <= kMaxBlockK; block_k *= 2) {
+    if (block_k <= preferred && k % block_k == 0) best = block_k;
+  }
+  return best;
+}
 
 const Nvfp4DecodeLimits& Nvfp4DecodeLimitsFor(
     const se::GpuComputeCapability& gpu_version) {
@@ -147,6 +155,7 @@ std::optional<Nvfp4DecodeDotSpec> MatchNvfp4DecodeDot(
   if (n < limits.min_weight_rows) return std::nullopt;
 
   if (k % kNvfp4ScaleBlock != 0) return std::nullopt;
+  if (!HasNvfp4BlockK(k)) return std::nullopt;
   const Shape& lhs_scale = dot.operand(2)->shape();
   const Shape& rhs_scale = dot.operand(3)->shape();
   if (lhs_scale.dimensions().size() != rank ||
@@ -216,7 +225,7 @@ Nvfp4DecodeDotConfig Nvfp4DecodeDotSeed(const Nvfp4DecodeDotSpec& spec,
       /*weight_tile=*/limits.seed.weight_tile,
       /*batch_tile=*/std::max(limits.min_batch_tile,
                               RoundUpToPowerOfTwo(spec.batch)),
-      /*block_k=*/std::min<int64_t>(limits.seed.block_k, spec.k),
+      /*block_k=*/Nvfp4BlockKAtMost(spec.k, limits.seed.block_k),
       limits.seed.num_warps, limits.seed.num_stages, limits.swap};
 }
 

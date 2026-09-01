@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/nvfp4_decode_dot.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -67,13 +69,8 @@ class Nvfp4DecodeDotBackendTest : public HloHardwareIndependentTestBase {
         target_config_(stream_executor_),
         debug_options_(
             HloHardwareIndependentTestBase::GetDebugOptionsForTest()) {
-    debug_options_.set_xla_gpu_experimental_scaled_dot_with_tile_ir(true);
     triton_ = std::make_unique<Nvfp4DecodeDotBackend>(
-        &debug_options_, &compiler_, &target_config_, &mlir_context_,
-        Nvfp4DecodeDotBackend::Rung::kTriton);
-    tile_ir_ = std::make_unique<Nvfp4DecodeDotBackend>(
-        &debug_options_, &compiler_, &target_config_, &mlir_context_,
-        Nvfp4DecodeDotBackend::Rung::kTileIr);
+        &debug_options_, &compiler_, &target_config_, &mlir_context_);
   }
 
   const HloInstruction& RootOf(HloModule& module) {
@@ -91,10 +88,11 @@ class Nvfp4DecodeDotBackendTest : public HloHardwareIndependentTestBase {
   }
 
   // The batch side of a config's output tile, for a weight-on-M fusion.
-  static int64_t BatchTile(const BackendConfig& config, bool tile_ir) {
-    const TileIrFusionConfig& c =
-        tile_ir ? config.nvfp4_decode_dot_tile_ir() : config.nvfp4_decode_dot();
-    return c.block_level_fusion_config().output_tiles(0).sizes(1);
+  static int64_t BatchTile(const BackendConfig& config) {
+    return config.nvfp4_decode_dot()
+        .block_level_fusion_config()
+        .output_tiles(0)
+        .sizes(1);
   }
 
   NVPTXCompiler compiler_;
@@ -103,40 +101,9 @@ class Nvfp4DecodeDotBackendTest : public HloHardwareIndependentTestBase {
   DebugOptions debug_options_;
   mlir::MLIRContext mlir_context_;
   std::unique_ptr<Nvfp4DecodeDotBackend> triton_;
-  std::unique_ptr<Nvfp4DecodeDotBackend> tile_ir_;
 };
 
-TEST_F(Nvfp4DecodeDotBackendTest, TileIrRungTilesTheBatchExactlyOnSm103) {
-  if (!IsSm103()) {
-    GTEST_SKIP() << "The Tile IR rung's batch width is an sm_103 tileiras limit.";
-  }
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
-                                           absl::Substitute(kClaimedFusion, 5120, 16)));
-  EXPECT_TRUE(tile_ir_->IsSupported(RootOf(*module)));
-  TF_ASSERT_OK_AND_ASSIGN(auto configs,
-                          tile_ir_->GetSupportedConfigs(RootOf(*module)));
-  ASSERT_FALSE(configs.empty());
-  for (const auto& config : configs) {
-    ASSERT_TRUE(config->has_nvfp4_decode_dot_tile_ir());
-    EXPECT_EQ(BatchTile(*config, /*tile_ir=*/true), 16);
-    EXPECT_GE(
-        config->nvfp4_decode_dot_tile_ir().block_level_fusion_config().output_tiles(0).sizes(0),
-        128);
-  }
-}
-
-TEST_F(Nvfp4DecodeDotBackendTest, TileIrRungDeclinesABatchWiderThanTileirasRuns) {
-  if (!IsSm103()) {
-    GTEST_SKIP() << "The Tile IR rung's batch width is an sm_103 tileiras limit.";
-  }
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
-                                           absl::Substitute(kClaimedFusion, 5120, 32)));
-  TF_ASSERT_OK_AND_ASSIGN(auto configs,
-                          tile_ir_->GetSupportedConfigs(RootOf(*module)));
-  EXPECT_TRUE(configs.empty());
-}
-
-TEST_F(Nvfp4DecodeDotBackendTest, TritonRungStillSearchesWiderBatchTiles) {
+TEST_F(Nvfp4DecodeDotBackendTest, TritonRungTilesTheBatchNoWiderThanItIs) {
   if (!IsSm103() && !IsSm120()) {
     GTEST_SKIP() << "The arm claims on Blackwell only.";
   }
@@ -145,24 +112,23 @@ TEST_F(Nvfp4DecodeDotBackendTest, TritonRungStillSearchesWiderBatchTiles) {
   TF_ASSERT_OK_AND_ASSIGN(auto configs,
                           triton_->GetSupportedConfigs(RootOf(*module)));
   ASSERT_FALSE(configs.empty());
-  bool wider = false;
   for (const auto& config : configs) {
     ASSERT_TRUE(config->has_nvfp4_decode_dot());
-    wider |= BatchTile(*config, /*tile_ir=*/false) > 16;
+    EXPECT_EQ(BatchTile(*config), 16);
   }
-  EXPECT_TRUE(wider);
-}
 
-TEST_F(Nvfp4DecodeDotBackendTest, TileIrRungOffersNothingOnSm120) {
-  if (!IsSm120()) {
-    GTEST_SKIP() << "sm_120 has no Tile IR rung of its own.";
+  TF_ASSERT_OK_AND_ASSIGN(auto wide, ParseAndReturnVerifiedModule(
+                                         absl::Substitute(kClaimedFusion, 5120, 33)));
+  TF_ASSERT_OK_AND_ASSIGN(auto wide_configs,
+                          triton_->GetSupportedConfigs(RootOf(*wide)));
+  ASSERT_FALSE(wide_configs.empty());
+  int64_t widest = 0;
+  for (const auto& config : wide_configs) {
+    const int64_t tile = BatchTile(*config);
+    EXPECT_LE(tile, 64);
+    widest = std::max(widest, tile);
   }
-  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
-                                           absl::Substitute(kClaimedFusion, 5120, 16)));
-  EXPECT_FALSE(tile_ir_->IsSupported(RootOf(*module)));
-  TF_ASSERT_OK_AND_ASSIGN(auto configs,
-                          tile_ir_->GetSupportedConfigs(RootOf(*module)));
-  EXPECT_TRUE(configs.empty());
+  EXPECT_EQ(widest, 64);
 }
 
 }  // namespace

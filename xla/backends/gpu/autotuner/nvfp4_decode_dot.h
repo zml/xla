@@ -35,17 +35,13 @@ namespace gpu {
 
 class Nvfp4DecodeDotBackend : public GpuCodegenBackend {
  public:
-  enum class Rung { kTriton, kTileIr };
-
   explicit Nvfp4DecodeDotBackend(const DebugOptions* debug_options,
                                  Compiler* compiler,
                                  const Compiler::GpuTargetConfig* target_config,
-                                 mlir::MLIRContext* mlir_context,
-                                 Rung rung = Rung::kTriton)
-      : GpuCodegenBackend(BackendFor(rung), debug_options, compiler,
-                          target_config),
-        mlir_context_(mlir_context),
-        rung_(rung) {}
+                                 mlir::MLIRContext* mlir_context)
+      : GpuCodegenBackend(autotuner::Backend::NVFP4_DECODE_DOT, debug_options,
+                          compiler, target_config),
+        mlir_context_(mlir_context) {}
 
   absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
   GetSupportedConfigs(const HloInstruction& instr) override;
@@ -60,18 +56,10 @@ class Nvfp4DecodeDotBackend : public GpuCodegenBackend {
 
   bool CanProduceWrongResults() const override { return false; }
 
-  std::string version() const override {
-    return rung_ == Rung::kTileIr ? "tile_ir_13.3" : "1";
-  }
+  std::string version() const override { return "1"; }
 
  private:
-  static autotuner::Backend BackendFor(Rung rung) {
-    return rung == Rung::kTileIr ? autotuner::Backend::NVFP4_DECODE_DOT_TILE_IR
-                                 : autotuner::Backend::NVFP4_DECODE_DOT;
-  }
-
   mlir::MLIRContext* mlir_context_;
-  Rung rung_;
 };
 
 }  // namespace gpu

@@ -65,9 +65,6 @@ TEST_F(Nvfp4DecodeDotTest, LimitsAreKeyedOnTheArchitecture) {
   EXPECT_TRUE(sm103.claim);
   EXPECT_TRUE(sm103.swap);
   EXPECT_EQ(sm103.min_weight_tile, 128);  // the tcgen05 MMA's rows
-  EXPECT_TRUE(sm103.offer_tile_ir_rung);
-  EXPECT_EQ(sm103.tile_ir_min_batch_tile, 16);  // the one width tileiras runs
-  EXPECT_EQ(sm103.tile_ir_max_batch_tile, 16);
 
   EXPECT_TRUE(Nvfp4DecodeLimitsFor(Sm(10, 0)).claim);
 
@@ -76,7 +73,6 @@ TEST_F(Nvfp4DecodeDotTest, LimitsAreKeyedOnTheArchitecture) {
   EXPECT_TRUE(sm120.swap);
   EXPECT_EQ(sm120.min_weight_tile, 16);
   EXPECT_EQ(sm120.min_batch_tile, 16);
-  EXPECT_FALSE(sm120.offer_tile_ir_rung);
 
   EXPECT_FALSE(Nvfp4DecodeLimitsFor(Sm(9, 0)).claim);
   EXPECT_FALSE(Nvfp4DecodeLimitsFor(Sm(8, 9)).claim);
@@ -84,6 +80,35 @@ TEST_F(Nvfp4DecodeDotTest, LimitsAreKeyedOnTheArchitecture) {
       Nvfp4DecodeLimitsFor(se::GpuComputeCapability(se::RocmComputeCapability(
                                "gfx942")))
           .claim);
+}
+
+TEST_F(Nvfp4DecodeDotTest, ContractingTileLegalityIsOnePlace) {
+  EXPECT_EQ(WidestNvfp4BlockK(17408), 512);
+  EXPECT_EQ(WidestNvfp4BlockK(640), 128);  // 256 and 512 do not divide it
+  EXPECT_EQ(WidestNvfp4BlockK(144), 0);    // nothing does
+  EXPECT_TRUE(HasNvfp4BlockK(1536));
+  EXPECT_FALSE(HasNvfp4BlockK(144));
+
+  EXPECT_EQ(Nvfp4BlockKAtMost(4096, 256), 256);
+  EXPECT_EQ(Nvfp4BlockKAtMost(128, 256), 128);
+  EXPECT_EQ(Nvfp4BlockKAtMost(640, 256), 128);
+  EXPECT_EQ(Nvfp4BlockKAtMost(17408, 256), 256);  // capped, not widest
+}
+
+TEST_F(Nvfp4DecodeDotTest, TheSeedAlwaysDividesTheContraction) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
+                                           DecodeDotHlo(16, 5120, 640)));
+  std::optional<Nvfp4DecodeDotConfig> seed =
+      Nvfp4DecodeDotConfigFor(RootDot(*module), Sm(10, 3));
+  ASSERT_TRUE(seed.has_value());
+  EXPECT_EQ(seed->block_k, 128);
+  EXPECT_EQ(640 % seed->block_k, 0);
+}
+
+TEST_F(Nvfp4DecodeDotTest, DeclinesAContractionNoTileServes) {
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
+                                           DecodeDotHlo(16, 5120, 144)));
+  EXPECT_FALSE(MatchNvfp4DecodeDot(RootDot(*module), Sm(10, 3)).has_value());
 }
 
 TEST_F(Nvfp4DecodeDotTest, ClaimsADecodeProjectionOnSm103) {

@@ -49,29 +49,11 @@ namespace {
 
 constexpr int64_t kScaleBlock = 16;
 
-TileIrFusionConfig* SlotFor(Nvfp4DecodeDotBackend::Rung rung,
-                            BackendConfig& config) {
-  return rung == Nvfp4DecodeDotBackend::Rung::kTileIr
-             ? config.mutable_nvfp4_decode_dot_tile_ir()
-             : config.mutable_nvfp4_decode_dot();
-}
-
-const TileIrFusionConfig* ConstSlotFor(Nvfp4DecodeDotBackend::Rung rung,
-                                       const BackendConfig& config) {
-  if (rung == Nvfp4DecodeDotBackend::Rung::kTileIr) {
-    return config.has_nvfp4_decode_dot_tile_ir()
-               ? &config.nvfp4_decode_dot_tile_ir()
-               : nullptr;
-  }
-  return config.has_nvfp4_decode_dot() ? &config.nvfp4_decode_dot() : nullptr;
-}
-
-std::unique_ptr<BackendConfig> Pack(Nvfp4DecodeDotBackend::Rung rung,
-                                    int64_t block_m, int64_t block_n,
+std::unique_ptr<BackendConfig> Pack(int64_t block_m, int64_t block_n,
                                     int64_t block_k, int num_warps,
                                     int num_stages, bool tma_allowed) {
   auto config = std::make_unique<BackendConfig>();
-  TileIrFusionConfig& nvfp4 = *SlotFor(rung, *config);
+  TileIrFusionConfig& nvfp4 = *config->mutable_nvfp4_decode_dot();
   xla::xtile::BlockLevelFusionConfig& block =
       *nvfp4.mutable_block_level_fusion_config();
   xla::xtile::Tile& tile = *block.add_output_tiles();
@@ -80,9 +62,8 @@ std::unique_ptr<BackendConfig> Pack(Nvfp4DecodeDotBackend::Rung rung,
   block.set_num_warps(num_warps);
   block.set_num_stages(num_stages);
   block.set_num_ctas(1);
-  const bool triton = rung != Nvfp4DecodeDotBackend::Rung::kTileIr;
-  block.set_is_tma_allowed(triton && tma_allowed);
-  block.set_is_warp_specialization_allowed(triton);
+  block.set_is_tma_allowed(tma_allowed);
+  block.set_is_warp_specialization_allowed(true);
   nvfp4.set_contracting_tile_size(block_k);
   return config;
 }
@@ -95,28 +76,9 @@ bool Nvfp4DecodeDotBackend::IsSupported(const HloInstruction& instr) {
       instr.backend_config<GpuBackendConfig>();
   if (!gpu_config.ok()) return false;
   const absl::string_view kind = gpu_config->fusion_backend_config().kind();
-  if (kind != kTritonNestedGemmFusionKind && kind != kTileIrFusionKind) {
+  if (kind != kTritonNestedGemmFusionKind) {
     VLOG(1) << "nvfp4 backend declined " << instr.name() << ": kind is "
             << kind;
-    return false;
-  }
-  if (rung_ == Rung::kTileIr &&
-      (!debug_options().xla_gpu_experimental_scaled_dot_with_tile_ir() ||
-       !Nvfp4DecodeLimitsFor(
-            target_config().device_description.gpu_compute_capability())
-            .offer_tile_ir_rung)) {
-    return false;
-  }
-  if (rung_ == Rung::kTileIr && instr.shape().dimensions().size() > 2) {
-    // The lowering to cuda_tile rejects a batch dimension, so a dot the arm
-    // split cannot be served here. Decline it at bid time: offering it instead
-    // spends a tile search and an emit on something that can only compile-fail,
-    // and the failure is swallowed at VLOG(2). Worse, a lone surviving config
-    // is returned without ever being compiled, so a fusion that reached this
-    // rung by itself would hard-error at emission rather than fall back.
-    VLOG(1) << "nvfp4 backend declined " << instr.name()
-            << ": the Tile IR rung cannot serve a rank-"
-            << instr.shape().dimensions().size() << " (split) dot";
     return false;
   }
   if (!MatchNvfp4DecodeDotFusion(*Cast<HloFusionInstruction>(&instr))
@@ -144,44 +106,23 @@ Nvfp4DecodeDotBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const int64_t weight_rows = spec->weight_rows;
   const int64_t k = spec->k;
 
-  const bool tile_ir = rung_ == Rung::kTileIr;
-  const int64_t min_weight_tile =
-      tile_ir ? limits.tile_ir_min_weight_tile : limits.min_weight_tile;
-  const int64_t min_batch_tile =
-      tile_ir ? limits.tile_ir_min_batch_tile : limits.min_batch_tile;
-  // tileiras runs NVFP4 on sm_103 at block_n 16 only, so the Tile IR rung
-  // tiles the batch exactly instead of searching wider.
-  int64_t max_batch_tile = 256;
-  if (tile_ir) {
-    max_batch_tile = min_batch_tile;
-    while (max_batch_tile < spec->batch) max_batch_tile *= 2;
-    if (max_batch_tile > limits.tile_ir_max_batch_tile) {
-      VLOG(1) << "nvfp4 backend (tile_ir) declined " << instr.name()
-              << ": batch " << spec->batch << " needs a " << max_batch_tile
-              << "-wide tile, tileiras runs " << limits.tile_ir_max_batch_tile;
-      return configs;
-    }
-  }
+  int64_t max_batch_tile = limits.min_batch_tile;
+  while (max_batch_tile < spec->batch) max_batch_tile *= 2;
   const bool weight_on_lhs = spec->weight_on_lhs;
   auto pack = [&](int64_t weight_tile, int64_t batch_tile, int64_t block_k,
                   int num_warps, int num_stages) {
     const int64_t block_m = weight_on_lhs ? weight_tile : batch_tile;
     const int64_t block_n = weight_on_lhs ? batch_tile : weight_tile;
-    return Pack(rung_, block_m, block_n, block_k, num_warps, num_stages,
+    return Pack(block_m, block_n, block_k, num_warps, num_stages,
                 /*tma_allowed=*/block_m >= 128);
   };
-  for (int64_t weight_tile = min_weight_tile; weight_tile <= 256;
+  for (int64_t weight_tile = limits.min_weight_tile; weight_tile <= 256;
        weight_tile *= 2) {
     if (weight_tile > weight_rows) break;
-    for (int64_t batch_tile = tile_ir ? max_batch_tile : min_batch_tile;
+    for (int64_t batch_tile = limits.min_batch_tile;
          batch_tile <= max_batch_tile; batch_tile *= 2) {
       for (int64_t block_k = 128; block_k <= 512; block_k *= 2) {
         if (k % block_k != 0 || block_k % kScaleBlock != 0) continue;
-        if (tile_ir) {
-          configs.push_back(pack(weight_tile, batch_tile, block_k,
-                                 /*num_warps=*/4, /*num_stages=*/1));
-          continue;
-        }
         for (int num_warps = 4; num_warps <= 8; num_warps *= 2) {
           const int64_t elements_per_thread =
               (weight_tile * batch_tile) / (num_warps * 32);
@@ -194,8 +135,7 @@ Nvfp4DecodeDotBackend::GetSupportedConfigs(const HloInstruction& instr) {
       }
     }
   }
-  VLOG(1) << "nvfp4 backend (" << (tile_ir ? "tile_ir" : "triton")
-          << ") offering " << configs.size() << " configs for "
+  VLOG(1) << "nvfp4 backend offering " << configs.size() << " configs for "
           << instr.name() << " (batch=" << spec->batch
           << " weight_rows=" << weight_rows << " k=" << k
           << (weight_on_lhs ? ", weight on lhs)" : ", weight on rhs)");
@@ -232,18 +172,17 @@ Nvfp4DecodeDotBackend::GetDefaultConfig(const HloInstruction& instr) {
       spec->weight_on_lhs ? seed.weight_tile : seed.batch_tile;
   const int64_t block_n =
       spec->weight_on_lhs ? seed.batch_tile : seed.weight_tile;
-  return Pack(rung_, block_m, block_n, block_k, seed.num_warps,
-              seed.num_stages, /*tma_allowed=*/block_m >= 128);
+  return Pack(block_m, block_n, block_k, seed.num_warps, seed.num_stages,
+              /*tma_allowed=*/block_m >= 128);
 }
 
 absl::Status Nvfp4DecodeDotBackend::ApplyConfig(HloInstruction& instr,
                                                 const BackendConfig& config) {
-  const TileIrFusionConfig* slot = ConstSlotFor(rung_, config);
-  if (slot == nullptr) {
+  if (!config.has_nvfp4_decode_dot()) {
     return absl::InvalidArgumentError(
         "Expected an nvfp4_decode_dot config for Nvfp4DecodeDotBackend.");
   }
-  const TileIrFusionConfig& nvfp4 = *slot;
+  const TileIrFusionConfig& nvfp4 = config.nvfp4_decode_dot();
   const int64_t block_k = nvfp4.contracting_tile_size();
   if (block_k <= 0 || block_k % kScaleBlock != 0) {
     return absl::InvalidArgumentError(
@@ -267,9 +206,7 @@ absl::Status Nvfp4DecodeDotBackend::ApplyConfig(HloInstruction& instr,
                    instr.backend_config<GpuBackendConfig>());
   FusionBackendConfig& backend_config =
       *gpu_config.mutable_fusion_backend_config();
-  backend_config.set_kind(std::string(rung_ == Rung::kTileIr
-                                          ? kTileIrFusionKind
-                                          : kTritonNestedGemmFusionKind));
+  backend_config.set_kind(std::string(kTritonNestedGemmFusionKind));
   backend_config.clear_triton_gemm_config();
 
   const xla::xtile::BlockLevelFusionConfig& knobs = nvfp4.block_level_fusion_config();
