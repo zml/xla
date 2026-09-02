@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_CODEGEN_TILING_TILED_HLO_INSTRUCTION_H_
 #define XLA_CODEGEN_TILING_TILED_HLO_INSTRUCTION_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@ limitations under the License.
 namespace xla {
 
 class TiledHloInstruction;
+class SymbolicTile;
 
 // A region is a collection of instructions grouped to represent a nested
 // control flow (e.g., loops) or a distinct computation branch.
@@ -64,6 +66,10 @@ class TiledHloRegion {
 // `(block_id) -> (tile_offset0, tile_offset1, ...)`
 class TiledHloInstruction {
  public:
+  static void* operator new(std::size_t size);
+  static void operator delete(void* ptr) noexcept;
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+
   TiledHloInstruction& operator=(TiledHloInstruction&&) = default;
   TiledHloInstruction(TiledHloInstruction&&) = default;
 
@@ -79,15 +85,50 @@ class TiledHloInstruction {
   //   variables in tile_offsets_indexing map.
   static absl::StatusOr<std::unique_ptr<TiledHloInstruction>> Create(
       const HloInstruction* hlo,
-      llvm::SmallVector<const TiledHloInstruction*> operands,
-      llvm::SmallVector<const TiledHloInstruction*> runtime_variables,
-      llvm::SmallVector<int64_t> tile_sizes,
-      llvm::SmallVector<int64_t> tile_strides,
+      llvm::SmallVector<const TiledHloInstruction*>&& operands,
+      llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+      llvm::SmallVector<int64_t>&& tile_sizes,
+      llvm::SmallVector<int64_t>&& tile_strides,
       std::optional<IndexingMap> tile_offsets_indexing,
-      llvm::SmallVector<TiledHloRegion> regions = {});
+      llvm::SmallVector<TiledHloRegion>&& regions = {});
+
+  // Creates an instruction without rechecking shape and indexing invariants.
+  // Intended for SymbolicTileAnalysis after those invariants were established
+  // while constructing the symbolic computation.
+  static std::unique_ptr<TiledHloInstruction> CreateUnchecked(
+      const HloInstruction* hlo,
+      llvm::SmallVector<const TiledHloInstruction*>&& operands,
+      llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+      llvm::SmallVector<int64_t>&& tile_sizes,
+      llvm::SmallVector<int64_t>&& tile_strides,
+      std::optional<IndexingMap> tile_offsets_indexing,
+      llvm::SmallVector<TiledHloRegion>&& regions = {});
+
+  // Creates an instruction while evaluating tile sizes and strides directly
+  // into their final storage. Cached values, when provided, are copied once.
+  static std::unique_ptr<TiledHloInstruction>
+  CreateUncheckedFromSymbolicTile(
+      const HloInstruction* hlo,
+      llvm::SmallVector<const TiledHloInstruction*>&& operands,
+      llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+      const SymbolicTile& symbolic_tile,
+      absl::Span<const int64_t> flat_tiling_parameters,
+      std::optional<absl::Span<const int64_t>> cached_tile_sizes,
+      std::optional<absl::Span<const int64_t>> cached_tile_strides,
+      std::optional<IndexingMap> tile_offsets_indexing,
+      llvm::SmallVector<TiledHloRegion>&& regions = {});
 
   // Returns the original HLO instruction.
   const HloInstruction* hlo() const { return hlo_; }
+
+  // Returns cached fusion membership when this instruction was produced by
+  // SymbolicTileAnalysis. Manually constructed instructions leave it unset.
+  std::optional<bool> is_fusion_instruction() const {
+    return is_fusion_instruction_;
+  }
+  void set_is_fusion_instruction(bool value) {
+    is_fusion_instruction_ = value;
+  }
 
   // Operands of the instruction in the tiled computation graph.
   const TiledHloInstruction* operand(int64_t operand_id) const {
@@ -150,12 +191,12 @@ class TiledHloInstruction {
  protected:
   TiledHloInstruction(
       const HloInstruction* hlo,
-      llvm::SmallVector<const TiledHloInstruction*> operands,
-      llvm::SmallVector<const TiledHloInstruction*> runtime_variables,
-      llvm::SmallVector<int64_t> tile_sizes,
-      llvm::SmallVector<int64_t> tile_strides,
-      std::optional<IndexingMap> tile_offsets_indexing,
-      llvm::SmallVector<TiledHloRegion> regions = {})
+      llvm::SmallVector<const TiledHloInstruction*>&& operands,
+      llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+      llvm::SmallVector<int64_t>&& tile_sizes,
+      llvm::SmallVector<int64_t>&& tile_strides,
+      std::optional<IndexingMap>&& tile_offsets_indexing,
+      llvm::SmallVector<TiledHloRegion>&& regions)
       : hlo_(hlo),
         operands_(std::move(operands)),
         runtime_variables_(std::move(runtime_variables)),
@@ -170,9 +211,22 @@ class TiledHloInstruction {
     }
   }
 
+  TiledHloInstruction(
+      const HloInstruction* hlo,
+      llvm::SmallVector<const TiledHloInstruction*>&& operands,
+      llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+      const SymbolicTile& symbolic_tile,
+      absl::Span<const int64_t> flat_tiling_parameters,
+      std::optional<absl::Span<const int64_t>> cached_tile_sizes,
+      std::optional<absl::Span<const int64_t>> cached_tile_strides,
+      std::optional<IndexingMap>&& tile_offsets_indexing,
+      llvm::SmallVector<TiledHloRegion>&& regions);
+
  private:
   // Pointer to the original HLO instruction.
   const HloInstruction* hlo_;
+
+  std::optional<bool> is_fusion_instruction_;
 
   // Operands of the instruction in the tiled computation graph.
   llvm::SmallVector<const TiledHloInstruction*> operands_;
