@@ -2203,8 +2203,36 @@ SymbolicTileAnalysis::ComputeTiledComputation(
   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<TiledHloSchedule> tiled_hlo_schedule,
                    schedule_builder(GetTilingSpecification()));
 
+  return ComputeTiledComputation(flat_tiling_parameters, *tiled_hlo_schedule,
+                                 /*constraints_are_known_satisfied=*/true,
+                                 compute_all_tile_offset_indexing_maps);
+}
+
+absl::StatusOr<TiledHloComputation>
+SymbolicTileAnalysis::ComputeTiledComputation(
+    absl::Span<const int64_t> flat_tiling_parameters,
+    const TiledHloSchedule& tiled_hlo_schedule,
+    bool constraints_are_known_satisfied,
+    bool compute_all_tile_offset_indexing_maps) const {
+  if (flat_tiling_parameters.size() !=
+      GetTilingSpecification().num_parameters()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Expected ", GetTilingSpecification().num_parameters(),
+                     " flattened tiling parameters, but got ",
+                     flat_tiling_parameters.size(), "."));
+  }
+
+  if (!constraints_are_known_satisfied) {
+    ABSL_ASSIGN_OR_RETURN(
+        bool parameters_satisfy_constraints,
+        FlatParametersSatisfyConstraints(flat_tiling_parameters));
+    if (!parameters_satisfy_constraints) {
+      return absl::InvalidArgumentError("Tiling does not satisfy constraints.");
+    }
+  }
+
   return ComputeTiledComputationImpl(
-      *this, flat_tiling_parameters, *tiled_hlo_schedule,
+      *this, flat_tiling_parameters, tiled_hlo_schedule,
       /*major_to_minor_active_tiling_parameters=*/{},
       compute_all_tile_offset_indexing_maps,
       /*parent_output_tile_dim_bounds=*/std::nullopt, mlir_context_);
