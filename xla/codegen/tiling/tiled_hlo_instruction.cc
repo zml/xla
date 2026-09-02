@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/codegen/tiling/tiled_hlo_instruction.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -31,6 +32,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "llvm/ADT/SmallVector.h"
+#include "xla/codegen/tiling/symbolic_tile.h"
 #include "xla/hlo/analysis/indexing_map.h"
 #include "xla/hlo/analysis/indexing_map_serialization.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -40,6 +42,55 @@ limitations under the License.
 namespace xla {
 
 namespace {
+
+// Tiled cost-model searches construct and destroy the same short-lived graph
+// node type for every candidate. Recycle a bounded number of nodes per worker
+// thread to avoid sending that hot path through the general-purpose allocator.
+class TiledHloInstructionAllocationCache {
+ public:
+  ~TiledHloInstructionAllocationCache() {
+    while (free_list_ != nullptr) {
+      FreeNode* node = free_list_;
+      free_list_ = free_list_->next;
+      ::operator delete(node);
+    }
+  }
+
+  void* Allocate() {
+    if (free_list_ == nullptr) {
+      return ::operator new(sizeof(TiledHloInstruction));
+    }
+    FreeNode* node = free_list_;
+    free_list_ = node->next;
+    --size_;
+    return node;
+  }
+
+  void Deallocate(void* ptr) {
+    constexpr std::size_t kMaxCachedNodes = 4096;
+    if (size_ == kMaxCachedNodes) {
+      ::operator delete(ptr);
+      return;
+    }
+    FreeNode* node = static_cast<FreeNode*>(ptr);
+    node->next = free_list_;
+    free_list_ = node;
+    ++size_;
+  }
+
+ private:
+  struct FreeNode {
+    FreeNode* next;
+  };
+
+  FreeNode* free_list_ = nullptr;
+  std::size_t size_ = 0;
+};
+
+TiledHloInstructionAllocationCache& GetTiledHloInstructionAllocationCache() {
+  thread_local TiledHloInstructionAllocationCache cache;
+  return cache;
+}
 
 const Shape& GetIndexingShape(const HloInstruction& root) {
   if (root.shape().IsTuple()) {
@@ -56,9 +107,10 @@ const Shape& GetIndexingShape(const HloInstruction& root) {
 // Checks the preconditions that must be fulfilled when creating a
 // `TiledHloInstruction` or derived class.
 absl::Status VerifyTiledHloInstructionConstructorPreconditions(
-    const HloInstruction* hlo, llvm::SmallVector<int64_t> tile_sizes,
-    llvm::SmallVector<int64_t> tile_strides,
-    std::optional<IndexingMap> tile_offsets_indexing,
+    const HloInstruction* hlo,
+    const llvm::SmallVector<int64_t>& tile_sizes,
+    const llvm::SmallVector<int64_t>& tile_strides,
+    const std::optional<IndexingMap>& tile_offsets_indexing,
     const llvm::SmallVector<const TiledHloInstruction*>& runtime_variables) {
   // * Number of tile sizes, strides should match the rank of the HLO.
   const Shape& indexing_shape = GetIndexingShape(*hlo);
@@ -119,22 +171,106 @@ absl::Status VerifyTiledHloInstructionConstructorPreconditions(
 
 }  // namespace
 
+void* TiledHloInstruction::operator new(std::size_t size) {
+  if (size != sizeof(TiledHloInstruction)) {
+    return ::operator new(size);
+  }
+  return GetTiledHloInstructionAllocationCache().Allocate();
+}
+
+void TiledHloInstruction::operator delete(void* ptr) noexcept {
+  GetTiledHloInstructionAllocationCache().Deallocate(ptr);
+}
+
+void TiledHloInstruction::operator delete(void* ptr,
+                                          std::size_t size) noexcept {
+  if (size != sizeof(TiledHloInstruction)) {
+    ::operator delete(ptr);
+    return;
+  }
+  GetTiledHloInstructionAllocationCache().Deallocate(ptr);
+}
+
+TiledHloInstruction::TiledHloInstruction(
+    const HloInstruction* hlo,
+    llvm::SmallVector<const TiledHloInstruction*>&& operands,
+    llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+    const SymbolicTile& symbolic_tile,
+    absl::Span<const int64_t> flat_tiling_parameters,
+    std::optional<absl::Span<const int64_t>> cached_tile_sizes,
+    std::optional<absl::Span<const int64_t>> cached_tile_strides,
+    std::optional<IndexingMap>&& tile_offsets_indexing,
+    llvm::SmallVector<TiledHloRegion>&& regions)
+    : hlo_(hlo),
+      operands_(std::move(operands)),
+      runtime_variables_(std::move(runtime_variables)),
+      tile_sizes_(cached_tile_sizes
+                      ? llvm::SmallVector<int64_t>(cached_tile_sizes->begin(),
+                                                   cached_tile_sizes->end())
+                      : EvaluateTileSizes(symbolic_tile,
+                                          flat_tiling_parameters)),
+      tile_strides_(
+          cached_tile_strides
+              ? llvm::SmallVector<int64_t>(cached_tile_strides->begin(),
+                                           cached_tile_strides->end())
+              : EvaluateTileStrides(symbolic_tile, flat_tiling_parameters)),
+      tile_offsets_indexing_(std::move(tile_offsets_indexing)),
+      regions_(std::move(regions)) {
+  if (tile_offsets_indexing_.has_value()) {
+    CHECK_EQ(tile_offsets_indexing_->GetDimVarsCount(), 1);
+    CHECK_EQ(tile_offsets_indexing_->GetRTVarsCount(),
+             runtime_variables_.size());
+  }
+}
+
 /*static*/
 absl::StatusOr<std::unique_ptr<TiledHloInstruction>>
 TiledHloInstruction::Create(
     const HloInstruction* hlo,
-    llvm::SmallVector<const TiledHloInstruction*> operands,
-    llvm::SmallVector<const TiledHloInstruction*> runtime_variables,
-    llvm::SmallVector<int64_t> tile_sizes,
-    llvm::SmallVector<int64_t> tile_strides,
+    llvm::SmallVector<const TiledHloInstruction*>&& operands,
+    llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+    llvm::SmallVector<int64_t>&& tile_sizes,
+    llvm::SmallVector<int64_t>&& tile_strides,
     std::optional<IndexingMap> tile_offsets_indexing,
-    llvm::SmallVector<TiledHloRegion> regions) {
+    llvm::SmallVector<TiledHloRegion>&& regions) {
   ABSL_RETURN_IF_ERROR(VerifyTiledHloInstructionConstructorPreconditions(
       hlo, tile_sizes, tile_strides, tile_offsets_indexing, runtime_variables));
 
+  return CreateUnchecked(
+      hlo, std::move(operands), std::move(runtime_variables),
+      std::move(tile_sizes), std::move(tile_strides),
+      std::move(tile_offsets_indexing), std::move(regions));
+}
+
+/*static*/ std::unique_ptr<TiledHloInstruction>
+TiledHloInstruction::CreateUnchecked(
+    const HloInstruction* hlo,
+    llvm::SmallVector<const TiledHloInstruction*>&& operands,
+    llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+    llvm::SmallVector<int64_t>&& tile_sizes,
+    llvm::SmallVector<int64_t>&& tile_strides,
+    std::optional<IndexingMap> tile_offsets_indexing,
+    llvm::SmallVector<TiledHloRegion>&& regions) {
   return absl::WrapUnique(new TiledHloInstruction(
       hlo, std::move(operands), std::move(runtime_variables),
       std::move(tile_sizes), std::move(tile_strides),
+      std::move(tile_offsets_indexing), std::move(regions)));
+}
+
+/*static*/ std::unique_ptr<TiledHloInstruction>
+TiledHloInstruction::CreateUncheckedFromSymbolicTile(
+    const HloInstruction* hlo,
+    llvm::SmallVector<const TiledHloInstruction*>&& operands,
+    llvm::SmallVector<const TiledHloInstruction*>&& runtime_variables,
+    const SymbolicTile& symbolic_tile,
+    absl::Span<const int64_t> flat_tiling_parameters,
+    std::optional<absl::Span<const int64_t>> cached_tile_sizes,
+    std::optional<absl::Span<const int64_t>> cached_tile_strides,
+    std::optional<IndexingMap> tile_offsets_indexing,
+    llvm::SmallVector<TiledHloRegion>&& regions) {
+  return absl::WrapUnique(new TiledHloInstruction(
+      hlo, std::move(operands), std::move(runtime_variables), symbolic_tile,
+      flat_tiling_parameters, cached_tile_sizes, cached_tile_strides,
       std::move(tile_offsets_indexing), std::move(regions)));
 }
 

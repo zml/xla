@@ -49,16 +49,30 @@ class SymbolicTiledHloInstruction {
 
   virtual ~SymbolicTiledHloInstruction() = default;
 
+  int64_t id() const { return id_; }
+  void set_id(int64_t id) {
+    CHECK_LT(id_, 0);
+    id_ = id;
+  }
+
+  int64_t tile_parameter_bounds_id() const {
+    return tile_parameter_bounds_id_;
+  }
+  void set_tile_parameter_bounds_id(int64_t id) {
+    CHECK_LT(tile_parameter_bounds_id_, 0);
+    tile_parameter_bounds_id_ = id;
+  }
+
   const HloInstruction* hlo() const { return hlo_; }
+  bool is_fusion_instruction() const { return is_fusion_instruction_; }
+  void set_is_fusion_instruction(bool value) {
+    is_fusion_instruction_ = value;
+  }
   const IndexingMap& indexing_map() const { return indexing_map_; }
   void set_symbolic_tile(SymbolicTile symbolic_tile) {
     symbolic_tile_ = std::move(symbolic_tile);
   }
-  const SymbolicTile& symbolic_tile() const {
-    CHECK(symbolic_tile_.has_value())
-        << "Symbolic tile was not computed for " << hlo_->ToString();
-    return *symbolic_tile_;
-  }
+  const SymbolicTile& symbolic_tile() const { return *symbolic_tile_; }
 
   const SymbolicTiledHloInstruction* operand(int64_t operand_id) const {
     return operands_[operand_id];
@@ -102,8 +116,20 @@ class SymbolicTiledHloInstruction {
   std::string ToString(absl::string_view field_separator = "\n\t") const;
 
  private:
+  // Dense identifier assigned by SymbolicTileAnalysis and used by concrete
+  // tiling to index per-candidate data without pointer-keyed hash maps.
+  int64_t id_ = -1;
+
+  // Dense identifier of the tile-parameter upper-bound pattern. Assigned for
+  // top-level instructions by SymbolicTileAnalysis.
+  int64_t tile_parameter_bounds_id_ = -1;
+
   // Pointer to the original HLO instruction.
   const HloInstruction* hlo_;
+
+  // Whether this HLO is emitted inside the fusion rather than loaded as an
+  // external operand. Computed once while traversing the fusion adaptor.
+  bool is_fusion_instruction_ = false;
 
   // Indexing map from the computation root to this instruction output.
   IndexingMap indexing_map_;

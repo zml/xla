@@ -1220,6 +1220,20 @@ IndexingMap GetBitcastMap(const Shape& input_shape, const Shape& output_shape,
     return IndexingMap::GetUndefined();
   }
 
+  auto has_simple_descending_layout = [](const Shape& shape) {
+    const Layout& layout = shape.layout();
+    return layout.tiles().empty() && !layout.has_physical_shape() &&
+           std::is_sorted(layout.minor_to_major().begin(),
+                          layout.minor_to_major().end(),
+                          std::greater<int64_t>());
+  };
+  if (has_simple_descending_layout(input_shape) &&
+      has_simple_descending_layout(output_shape)) {
+    return IndexingMap::FromTensorSizes(
+        ComputeReshapeIndexingMap(output_shape, input_shape, mlir_context),
+        input_shape.dimensions(), {});
+  }
+
   // Allow empty shapes to to be handled by Reshape.
   if (!input_shape.dimensions().empty()) {
     if (std::optional<std::vector<int64_t>> transpose_dims =

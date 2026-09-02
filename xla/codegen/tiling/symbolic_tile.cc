@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -198,6 +199,12 @@ bool IndexingMapConstraintsCanBeIgnored(const IndexingMap& indexing_map) {
   size_expressions.reserve(offset_expressions.size());
   stride_expressions.reserve(offset_expressions.size());
 
+  // These bounds are identical for every result expression. Materialize them
+  // once instead of allocating and copying them for every result.
+  const std::vector<Interval> dimension_bounds =
+      indexing_map.GetDimensionBounds();
+  const std::vector<Interval> symbol_bounds = indexing_map.GetSymbolBounds();
+
   // strided_indexing_expressions =
   //     f(x0, ..., x{M-1})[x{M}, ..., x{M+P-1}] - offset_expressions
   for (auto [composite_indexing, offset] :
@@ -205,8 +212,7 @@ bool IndexingMapConstraintsCanBeIgnored(const IndexingMap& indexing_map) {
     std::optional<SizeAndStrideExpression> maybe_size_and_stride =
         ExtractSizeAndStride(SimplifySymbolicExpr(composite_indexing - offset,
                                                   /*reference=*/indexing_map),
-                             indexing_map.GetDimensionBounds(),
-                             indexing_map.GetSymbolBounds());
+                             dimension_bounds, symbol_bounds);
     if (!maybe_size_and_stride.has_value()) {
       VLOG(1) << "No size and stride extracted";
       return std::nullopt;
@@ -280,6 +286,32 @@ namespace {
 // The results of `SymbolicTile::tile_map_` can be split into 3 groups: offsets,
 // sizes, and strides.
 constexpr int kNumComponentsPerTiledDimension = 3;
+
+template <int64_t Component>
+llvm::SmallVector<int64_t> EvaluateTileMapComponent(
+    const SymbolicTile& symbolic_tile,
+    absl::Span<int64_t const> parameters) {
+  static_assert(Component >= 0 &&
+                Component < kNumComponentsPerTiledDimension);
+  const SymbolicMap& symbolic_map =
+      symbolic_tile.tile_map().GetSymbolicMap();
+
+  int64_t component_size =
+      symbolic_map.GetNumResults() / kNumComponentsPerTiledDimension;
+  llvm::ArrayRef<SymbolicExpr> expressions = symbolic_map.GetResults().slice(
+      Component * component_size, component_size);
+
+  // Size and stride expressions do not use runtime-variable symbols. Evaluate
+  // their result slice directly to avoid constructing a temporary SymbolicMap
+  // and copying the parameters into another vector for every instruction and
+  // tiling candidate.
+  llvm::SmallVector<int64_t> results;
+  results.resize_for_overwrite(expressions.size());
+  EvaluateSymbolicExprs(
+      absl::Span<const SymbolicExpr>(expressions.data(), expressions.size()),
+      parameters, absl::Span<int64_t>(results.data(), results.size()));
+  return results;
+}
 }  // namespace
 
 SymbolicMap SymbolicTile::offset_map() const {
@@ -329,11 +361,26 @@ llvm::SmallVector<int64_t> EvaluateTileOffsets(
 
 llvm::SmallVector<int64_t> EvaluateTileSizes(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters) {
-  return symbolic_tile.size_map().Evaluate(/*dim_values=*/parameters);
+  return EvaluateTileMapComponent<1>(symbolic_tile, parameters);
 }
 
 llvm::SmallVector<int64_t> EvaluateTileStrides(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters) {
+  const std::vector<IndexingMap::Variable>& dim_vars =
+      symbolic_tile.tile_map().GetDimVars();
+  CHECK_EQ(parameters.size(), dim_vars.size());
+
+  bool needs_clamping = false;
+  for (auto [parameter, dim_var] : llvm::zip(parameters, dim_vars)) {
+    if (parameter > dim_var.bounds.upper) {
+      needs_clamping = true;
+      break;
+    }
+  }
+  if (!needs_clamping) {
+    return EvaluateTileMapComponent<2>(symbolic_tile, parameters);
+  }
+
   llvm::SmallVector<int64_t> clamped_parameters;
   clamped_parameters.reserve(parameters.size());
   // We need to clamp the parameters to the dimension bounds, otherwise the
@@ -342,11 +389,16 @@ llvm::SmallVector<int64_t> EvaluateTileStrides(
   // for expanding reshapes assumes that the tile parameter is not bigger than
   // the dimension bound. To make the assumption hold, we clamp the parameters
   // accordingly.
-  for (auto [parameter, dim_bounds] :
-       llvm::zip(parameters, symbolic_tile.tile_map().GetDimensionBounds())) {
-    clamped_parameters.push_back(std::min(parameter, dim_bounds.upper));
+  for (auto [parameter, dim_var] : llvm::zip(parameters, dim_vars)) {
+    clamped_parameters.push_back(std::min(parameter, dim_var.bounds.upper));
   }
-  return symbolic_tile.stride_map().Evaluate(/*dim_values=*/clamped_parameters);
+  return EvaluateTileMapComponent<2>(symbolic_tile, clamped_parameters);
+}
+
+llvm::SmallVector<int64_t> EvaluateTileStridesWithClampedParameters(
+    const SymbolicTile& symbolic_tile,
+    absl::Span<int64_t const> clamped_parameters) {
+  return EvaluateTileMapComponent<2>(symbolic_tile, clamped_parameters);
 }
 
 }  // namespace xla

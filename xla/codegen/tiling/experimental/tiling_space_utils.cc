@@ -19,6 +19,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/functional/function_ref.h"
 #include "absl/numeric/bits.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -49,26 +50,48 @@ absl::StatusOr<std::vector<int64_t>> PossibleTileSizesForOneDimension(
   return result;
 }
 
+absl::Status EnumerateFlatTilings(
+    absl::Span<const std::vector<int64_t>> possible_tile_sizes,
+    int64_t dimension, FlatTiling& current,
+    absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback) {
+  if (dimension == possible_tile_sizes.size()) {
+    return callback(current);
+  }
+
+  for (int64_t tile_size : possible_tile_sizes[dimension]) {
+    current[dimension] = tile_size;
+    ABSL_RETURN_IF_ERROR(EnumerateFlatTilings(
+        possible_tile_sizes, dimension + 1, current, callback));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
+
+absl::Status ForEachFlatTilingForInputSpace(
+    absl::Span<const int64_t> input_space,
+    absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback) {
+  std::vector<std::vector<int64_t>> possible_tile_sizes;
+  possible_tile_sizes.reserve(input_space.size());
+  for (int64_t parameter_size : input_space) {
+    ABSL_ASSIGN_OR_RETURN(auto sizes,
+                          PossibleTileSizesForOneDimension(parameter_size));
+    possible_tile_sizes.push_back(std::move(sizes));
+  }
+
+  FlatTiling current(input_space.size(), 0);
+  return EnumerateFlatTilings(possible_tile_sizes, /*dimension=*/0, current,
+                              callback);
+}
 
 absl::StatusOr<std::vector<FlatTiling>> GetFlatTilingsForInputSpace(
     absl::Span<const int64_t> input_space) {
   std::vector<FlatTiling> flat_tilings;
-  flat_tilings.push_back({});
-  for (int64_t parameter_size : input_space) {
-    ABSL_ASSIGN_OR_RETURN(std::vector<int64_t> possible_tile_sizes,
-                     PossibleTileSizesForOneDimension(parameter_size));
-    std::vector<FlatTiling> extended_tilings;
-    extended_tilings.reserve(flat_tilings.size() * possible_tile_sizes.size());
-    for (const FlatTiling& flat_tile_sizes : flat_tilings) {
-      for (int64_t tile_size : possible_tile_sizes) {
-        FlatTiling extended_tiling = flat_tile_sizes;
-        extended_tiling.push_back(tile_size);
-        extended_tilings.push_back(extended_tiling);
-      }
-    }
-    flat_tilings = std::move(extended_tilings);
-  }
+  ABSL_RETURN_IF_ERROR(ForEachFlatTilingForInputSpace(
+      input_space, [&](absl::Span<const int64_t> flat_tiling) {
+        flat_tilings.emplace_back(flat_tiling.begin(), flat_tiling.end());
+        return absl::OkStatus();
+      }));
 
   return flat_tilings;
 }

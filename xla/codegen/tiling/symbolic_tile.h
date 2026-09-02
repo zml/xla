@@ -217,6 +217,12 @@ llvm::SmallVector<int64_t> EvaluateTileSizes(
 llvm::SmallVector<int64_t> EvaluateTileStrides(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters);
 
+// Evaluates tile strides without clamping `parameters` to the tile dimension
+// bounds. The caller must ensure that every parameter is within its bound.
+llvm::SmallVector<int64_t> EvaluateTileStridesWithClampedParameters(
+    const SymbolicTile& symbolic_tile,
+    absl::Span<int64_t const> clamped_parameters);
+
 }  // namespace xla
 
 #endif  // XLA_CODEGEN_TILING_SYMBOLIC_TILE_H_
