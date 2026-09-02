@@ -96,6 +96,77 @@ struct OperandReadInfo {
   double read_bandwidth_utilization_rate = 1.0;
 };
 
+int64_t GetShapeSizeRecursive(const Shape& shape,
+                              HloCostAnalysis::ShapeSizeFunction shape_size_fn);
+
+// Returns a conservative lower bound on the memory time of a concrete tiling
+// without constructing its TiledHloComputation. The bound counts one top-level
+// tile for every external operand and assumes ideal HBM utilization. Ignoring
+// additional tiles in regions and duplicate reads can only make the bound
+// smaller.
+absl::Duration EstimateTilingMemoryLowerBound(
+    const SymbolicTileAnalysis& analysis, absl::Span<const int64_t> flat_tiling,
+    const se::DeviceDescription& device_info,
+    HloCostAnalysis::ShapeSizeFunction shape_size) {
+  const HloInstruction* real_root =
+      analysis.GetRoot(analysis.real_root_index());
+  llvm::SmallVector<int64_t> root_tile_sizes;
+  absl::flat_hash_map<const HloInstruction*, int64_t> max_tile_bytes_by_operand;
+
+  for (const auto& symbolic_instruction :
+       analysis.GetSymbolicTiledHloComputation()) {
+    llvm::SmallVector<int64_t> tile_sizes =
+        EvaluateTileSizes(symbolic_instruction->symbolic_tile(), flat_tiling);
+    if (symbolic_instruction->hlo() == real_root) {
+      root_tile_sizes = tile_sizes;
+    }
+    if (symbolic_instruction->is_fusion_instruction()) {
+      continue;
+    }
+
+    int64_t tile_elements = 1;
+    for (auto [tile_size, dimension_size] : llvm::zip(
+             tile_sizes, symbolic_instruction->hlo()->shape().dimensions())) {
+      tile_elements *= std::min(tile_size, dimension_size);
+    }
+    int64_t tile_bytes =
+        tile_elements *
+        ShapeUtil::ByteSizeOfPrimitiveType(
+            symbolic_instruction->hlo()->shape().element_type());
+    int64_t& max_tile_bytes =
+        max_tile_bytes_by_operand[symbolic_instruction->hlo()];
+    max_tile_bytes = std::max(max_tile_bytes, tile_bytes);
+  }
+
+  if (root_tile_sizes.size() != real_root->shape().dimensions().size()) {
+    return absl::ZeroDuration();
+  }
+
+  int64_t num_blocks = 1;
+  for (auto [dimension_size, tile_size] :
+       llvm::zip(real_root->shape().dimensions(), root_tile_sizes)) {
+    num_blocks *= CeilOfRatio(dimension_size, tile_size);
+  }
+
+  absl::Duration read_time = absl::ZeroDuration();
+  for (const auto& [operand, tile_bytes] : max_tile_bytes_by_operand) {
+    int64_t total_bytes_read = tile_bytes * num_blocks;
+    int64_t net_bytes_read =
+        std::min(shape_size(operand->shape()), total_bytes_read);
+    read_time += GpuPerformanceModelBase::ReadTimeWithDRAMHeuristic(
+        device_info, num_blocks, net_bytes_read, total_bytes_read,
+        operand->shape().element_type(),
+        /*hbm_bandwidth_utilization_rate=*/1.0);
+  }
+
+  int64_t bytes_written = 0;
+  for (const HloInstruction* root : analysis.GetRoots()) {
+    bytes_written += GetShapeSizeRecursive(root->shape(), shape_size);
+  }
+  return read_time +
+         GpuPerformanceModelBase::WriteTime(device_info, bytes_written);
+}
+
 // Returns the number of elements in the tile after each dimension is padded to
 // the next power of 2.
 // TODO(b/353484968): Delete this function once we have constraints to only
@@ -820,13 +891,18 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
   int64_t valid_candidate_count = 0;
   auto retain_candidate = [&](TiledRunTimeData candidate) {
     ++valid_candidate_count;
-    candidates.push_back(std::move(candidate));
-    absl::c_stable_sort(
-        candidates, [](const TiledRunTimeData& a, const TiledRunTimeData& b) {
-          return a.runtime_data.exec_time < b.runtime_data.exec_time;
+    auto insertion_point = std::upper_bound(
+        candidates.begin(), candidates.end(), candidate.runtime_data.exec_time,
+        [](absl::Duration exec_time, const TiledRunTimeData& retained) {
+          return exec_time < retained.runtime_data.exec_time;
         });
+    if (candidates.size() == static_cast<size_t>(top_k) &&
+        insertion_point == candidates.end()) {
+      return;
+    }
+    candidates.insert(insertion_point, std::move(candidate));
     if (candidates.size() > static_cast<size_t>(top_k)) {
-      candidates.resize(top_k);
+      candidates.pop_back();
     }
   };
 
@@ -911,19 +987,29 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
 
     SymbolicTileAnalysis analysis =
         std::get<SymbolicTileAnalysis>(std::move(analysis_or_error));
+    MajorToMinorTiledHloSchedule tiled_hlo_schedule;
 
     int64_t tilings_evaluated = 0;
+    int64_t tilings_pruned_by_memory_bound = 0;
     ABSL_RETURN_IF_ERROR(analysis.ForEachValidFlatTiling(
         [&](absl::Span<const int64_t> flat_tiling) -> absl::Status {
           ++tilings_evaluated;
+          if (top_k > 0 && candidates.size() == static_cast<size_t>(top_k)) {
+            absl::Duration memory_lower_bound = EstimateTilingMemoryLowerBound(
+                analysis, flat_tiling, *device_info_, shape_size_);
+            if (memory_lower_bound >=
+                candidates.back().runtime_data.exec_time) {
+              ++tilings_pruned_by_memory_bound;
+              return absl::OkStatus();
+            }
+          }
           // TODO(b/372454662): This needs to be adjusted if we want to support
           // more than one "real root" (i.e. a root without users). Currently
           // ComputeTiledComputation() may fail and return an Unimplemented error
           // for cases of multi-output fusion that we do not support yet.
-          auto maybe_tiled_hlo_computation =
-              analysis.ComputeTiledComputation(
-                  flat_tiling, CreateMajorToMinorTiledHloSchedule,
-                  /*constraints_are_known_satisfied=*/true);
+          auto maybe_tiled_hlo_computation = analysis.ComputeTiledComputation(
+              flat_tiling, tiled_hlo_schedule,
+              /*constraints_are_known_satisfied=*/true);
           if (!maybe_tiled_hlo_computation.ok()) {
             if (maybe_tiled_hlo_computation.status().code() ==
                     absl::StatusCode::kUnimplemented &&
@@ -951,7 +1037,8 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
         }));
     VLOG(1) << absl::StrCat(
         "TryFindTopKBestTilingsForFusion symbolic analysis evaluated ",
-        tilings_evaluated, " tilings.");
+        tilings_evaluated, " tilings; memory bound pruned ",
+        tilings_pruned_by_memory_bound, ".");
   }
 
   VLOG(1) << absl::StrCat("Found ", valid_candidate_count,

@@ -13,8 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Repeatedly compiles captured HLO modules without executing them. This keeps
-// model loading and input preparation out of compiler performance experiments.
+// Repeatedly compiles captured HLO modules or PJRT MLIR compile-input dumps
+// without executing them. This keeps model loading and input preparation out
+// of compiler performance experiments while optionally including MLIR import.
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +27,7 @@ limitations under the License.
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -35,25 +37,38 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "mlir/IR/MLIRContext.h"
 #include "xla/debug_options_flags.h"
+#include "xla/pjrt/maybe_owning_mlir_module.h"
+#include "xla/pjrt/mlir_to_hlo.h"
+#include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_allocator_config.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
+#include "xla/pjrt/proto/compile_options.pb.h"
 #include "xla/tools/multihost_hlo_runner/create_client.h"
 #include "xla/tools/multihost_hlo_runner/functional_hlo_runner.h"
 #include "xla/tools/multihost_hlo_runner/hlo_input_output_format.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/util/command_line_flags.h"
 #include "tsl/platform/init_main.h"
+#include "tsl/platform/path.h"
 
 namespace xla {
 namespace {
 
 constexpr absl::string_view kUsage = R"(
-Repeatedly compiles one or more captured HLO modules without executing them.
+Repeatedly compiles captured HLO modules or PJRT MLIR input dumps without
+executing them.
 
 Example:
 
@@ -64,6 +79,11 @@ Example:
 Use --parallelism=1 to isolate each module. Set --parallelism to the number of
 modules to reproduce concurrent compilation. Repetitions share one PJRT client
 and process; invoke the binary repeatedly to measure fully cold processes.
+
+For an MLIR-to-executable replay, pass --input_format=pjrt_dump and provide
+directories containing module.mlir and compile_options.pb/textproto. Use
+--phase_sizes and --phase_parallelism to replay sequential compilation waves,
+for example --phase_sizes=12,4 --phase_parallelism=12,1.
 )";
 
 struct BenchmarkOptions {
@@ -75,9 +95,18 @@ struct BenchmarkOptions {
   std::string label;
   std::string run_id;
   std::string input_format = "text";
+  std::string phase_sizes;
+  std::string phase_parallelism;
+  std::string pjrt_option_override;
   float gpu_client_mem_fraction =
       xla::GpuAllocatorConfig{}.memory_fraction;
   int64_t gpu_client_initialization_timeout_sec = 300;
+};
+
+struct CompilePhase {
+  size_t begin = 0;
+  size_t end = 0;
+  int32_t parallelism = 1;
 };
 
 struct CompileMeasurement {
@@ -156,17 +185,214 @@ SummaryStats Summarize(std::vector<double> values) {
   };
 }
 
+absl::StatusOr<std::vector<int32_t>> ParsePositiveIntegerList(
+    absl::string_view value, absl::string_view option_name) {
+  std::vector<int32_t> values;
+  for (absl::string_view part : absl::StrSplit(value, ',')) {
+    part = absl::StripAsciiWhitespace(part);
+    int32_t parsed;
+    if (part.empty() || !absl::SimpleAtoi(part, &parsed) || parsed < 1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          option_name, " must be a comma-separated list of positive integers"));
+    }
+    values.push_back(parsed);
+  }
+  return values;
+}
+
+absl::StatusOr<std::vector<CompilePhase>> BuildCompilePhases(
+    const BenchmarkOptions& options, size_t input_count) {
+  if (options.phase_sizes.empty()) {
+    if (!options.phase_parallelism.empty()) {
+      return absl::InvalidArgumentError(
+          "--phase_parallelism requires --phase_sizes");
+    }
+    return std::vector<CompilePhase>{CompilePhase{
+        .begin = 0, .end = input_count, .parallelism = options.parallelism}};
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<int32_t> phase_sizes,
+      ParsePositiveIntegerList(options.phase_sizes, "--phase_sizes"));
+  std::vector<int32_t> phase_parallelism(phase_sizes.size(),
+                                         options.parallelism);
+  if (!options.phase_parallelism.empty()) {
+    ABSL_ASSIGN_OR_RETURN(phase_parallelism,
+                          ParsePositiveIntegerList(options.phase_parallelism,
+                                                   "--phase_parallelism"));
+    if (phase_parallelism.size() != phase_sizes.size()) {
+      return absl::InvalidArgumentError(
+          "--phase_parallelism and --phase_sizes must have the same length");
+    }
+  }
+
+  std::vector<CompilePhase> phases;
+  phases.reserve(phase_sizes.size());
+  size_t begin = 0;
+  for (size_t index = 0; index < phase_sizes.size(); ++index) {
+    const size_t end = begin + phase_sizes[index];
+    if (end > input_count) {
+      return absl::InvalidArgumentError(
+          "--phase_sizes includes more inputs than were provided");
+    }
+    phases.push_back(CompilePhase{
+        .begin = begin, .end = end, .parallelism = phase_parallelism[index]});
+    begin = end;
+  }
+  if (begin != input_count) {
+    return absl::InvalidArgumentError(
+        "--phase_sizes must account for every input");
+  }
+  return phases;
+}
+
+absl::StatusOr<std::string> FindCompileOptionsFile(absl::string_view dump_dir) {
+  tsl::Env* env = tsl::Env::Default();
+  for (absl::string_view file_name :
+       {"compile_options.pb", "compile_options.textproto"}) {
+    std::string path = tsl::io::JoinPath(dump_dir, file_name);
+    if (env->FileExists(path).ok()) {
+      return path;
+    }
+  }
+  return absl::NotFoundError(absl::StrCat(
+      "No compile_options.pb or compile_options.textproto in ", dump_dir));
+}
+
+absl::StatusOr<CompileOptions> LoadCompileOptions(
+    absl::string_view dump_dir, absl::string_view option_override) {
+  ABSL_ASSIGN_OR_RETURN(std::string options_path,
+                        FindCompileOptionsFile(dump_dir));
+  CompileOptionsProto proto;
+  absl::Status read_status =
+      absl::EndsWith(options_path, ".pb")
+          ? tsl::ReadBinaryProto(tsl::Env::Default(), options_path, &proto)
+          : tsl::ReadTextProto(tsl::Env::Default(), options_path, &proto);
+  ABSL_RETURN_IF_ERROR(read_status);
+  ABSL_ASSIGN_OR_RETURN(CompileOptions options,
+                        CompileOptions::FromProto(proto));
+  if (!option_override.empty()) {
+    std::pair<absl::string_view, absl::string_view> key_value =
+        absl::StrSplit(option_override, absl::MaxSplits('=', 1));
+    if (key_value.first.empty() || key_value.second.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("--pjrt_option_override must be NAME=VALUE, got '",
+                       option_override, "'"));
+    }
+    const auto* field =
+        DebugOptions::descriptor()->FindFieldByName(key_value.first);
+    if (field == nullptr) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Unknown DebugOptions field in --pjrt_option_override: ",
+                       key_value.first));
+    }
+    ABSL_RETURN_IF_ERROR(options.ApplyAllOptionOverrides());
+    options.env_option_overrides.clear();
+    std::string value(key_value.second);
+    if (field->type() == tsl::protobuf::FieldDescriptor::TYPE_BOOL) {
+      if (absl::EqualsIgnoreCase(value, "true")) {
+        value = "True";
+      } else if (absl::EqualsIgnoreCase(value, "false")) {
+        value = "False";
+      }
+    }
+    ABSL_RETURN_IF_ERROR(options.ApplyOptionFromString(field, value));
+  }
+  auto* debug_options =
+      options.executable_build_options.mutable_debug_options();
+  debug_options->clear_xla_dump_to();
+  debug_options->set_xla_enable_dumping(false);
+  debug_options->set_xla_dump_hlo_as_text(false);
+  debug_options->set_xla_dump_hlo_as_proto(false);
+  debug_options->set_xla_dump_hlo_as_riegeli(false);
+  debug_options->set_xla_dump_hlo_as_dot(false);
+  debug_options->set_xla_dump_hlo_as_html(false);
+  debug_options->set_xla_dump_hlo_as_url(false);
+  debug_options->set_xla_dump_hlo_snapshots(false);
+  debug_options->set_xla_dump_hlo_unoptimized_snapshots(false);
+  debug_options->set_xla_dump_fusion_visualization(false);
+  options.env_option_overrides.erase(
+      std::remove_if(options.env_option_overrides.begin(),
+                     options.env_option_overrides.end(),
+                     [](const auto& option) {
+                       return absl::StartsWith(option.first, "xla_dump_") ||
+                              option.first == "xla_enable_dumping";
+                     }),
+      options.env_option_overrides.end());
+  return options;
+}
+
+CompileMeasurement CompileOnePjrtDump(PjRtClient& client,
+                                      absl::string_view input_path,
+                                      absl::string_view option_override) {
+  CompileMeasurement measurement;
+  measurement.hlo_file = input_path;
+
+  const absl::Time parse_start = absl::Now();
+  const bool input_is_directory =
+      tsl::Env::Default()->IsDirectory(input_path).ok();
+  std::string dump_dir = input_is_directory
+                             ? std::string(input_path)
+                             : std::string(tsl::io::Dirname(input_path));
+  std::string module_path = input_is_directory
+                                ? tsl::io::JoinPath(dump_dir, "module.mlir")
+                                : std::string(input_path);
+  std::string module_text;
+  absl::Status read_status =
+      tsl::ReadFileToString(tsl::Env::Default(), module_path, &module_text);
+  if (!read_status.ok()) {
+    measurement.parse_ms = Milliseconds(absl::Now() - parse_start);
+    measurement.status = read_status;
+    return measurement;
+  }
+
+  auto context = std::make_shared<mlir::MLIRContext>();
+  absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> module =
+      ParseMlirModuleString(module_text, *context);
+  if (!module.ok()) {
+    measurement.parse_ms = Milliseconds(absl::Now() - parse_start);
+    measurement.status = module.status();
+    return measurement;
+  }
+  absl::StatusOr<CompileOptions> compile_options =
+      LoadCompileOptions(dump_dir, option_override);
+  measurement.parse_ms = Milliseconds(absl::Now() - parse_start);
+  if (!compile_options.ok()) {
+    measurement.status = compile_options.status();
+    return measurement;
+  }
+
+  const absl::Time compile_start = absl::Now();
+  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> executable =
+      client.CompileAndLoad(
+          MaybeOwningMlirModule(std::move(context), std::move(*module)),
+          std::move(*compile_options));
+  measurement.compile_ms = Milliseconds(absl::Now() - compile_start);
+  if (!executable.ok()) {
+    measurement.status = executable.status();
+    return measurement;
+  }
+
+  measurement.status = absl::OkStatus();
+  measurement.executable = std::move(*executable);
+  return measurement;
+}
+
 CompileMeasurement CompileOne(
     PjRtClient& client,
     const FunctionalHloRunner::PreprocessingOptions& preprocessing_options,
     const CompileOptions& compile_options, absl::string_view hlo_file,
-    InputFormat input_format) {
+    std::optional<InputFormat> input_format,
+    absl::string_view pjrt_option_override) {
+  if (!input_format.has_value()) {
+    return CompileOnePjrtDump(client, hlo_file, pjrt_option_override);
+  }
   CompileMeasurement measurement;
   measurement.hlo_file = hlo_file;
 
   const absl::Time parse_start = absl::Now();
   absl::StatusOr<FunctionalHloRunner::HloModuleAndArguments> loaded =
-      FunctionalHloRunner::LoadHloModuleAndArguments(hlo_file, input_format);
+      FunctionalHloRunner::LoadHloModuleAndArguments(hlo_file, *input_format);
   measurement.parse_ms = Milliseconds(absl::Now() - parse_start);
   if (!loaded.ok()) {
     measurement.status = loaded.status();
@@ -192,35 +418,39 @@ BatchMeasurement CompileBatch(
     PjRtClient& client,
     const FunctionalHloRunner::PreprocessingOptions& preprocessing_options,
     const CompileOptions& compile_options,
-    const std::vector<std::string>& hlo_files, InputFormat input_format,
-    int32_t parallelism, int32_t iteration, bool warmup) {
+    const std::vector<std::string>& hlo_files,
+    std::optional<InputFormat> input_format,
+    absl::Span<const CompilePhase> phases,
+    absl::string_view pjrt_option_override, int32_t iteration, bool warmup) {
   BatchMeasurement batch;
   batch.iteration = iteration;
   batch.warmup = warmup;
   batch.modules.resize(hlo_files.size());
 
   const absl::Time batch_start = absl::Now();
-  std::atomic<size_t> next_module = 0;
-  const size_t worker_count =
-      std::min(static_cast<size_t>(parallelism), hlo_files.size());
-  std::vector<std::thread> workers;
-  workers.reserve(worker_count);
-  for (size_t worker = 0; worker < worker_count; ++worker) {
-    workers.emplace_back([&] {
-      while (true) {
-        const size_t module_index = next_module.fetch_add(1);
-        if (module_index >= hlo_files.size()) {
-          return;
+  for (const CompilePhase& phase : phases) {
+    std::atomic<size_t> next_module = phase.begin;
+    const size_t worker_count = std::min(static_cast<size_t>(phase.parallelism),
+                                         phase.end - phase.begin);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+      workers.emplace_back([&] {
+        while (true) {
+          const size_t module_index = next_module.fetch_add(1);
+          if (module_index >= phase.end) {
+            return;
+          }
+          CompileMeasurement measurement = CompileOne(
+              client, preprocessing_options, compile_options,
+              hlo_files[module_index], input_format, pjrt_option_override);
+          batch.modules[module_index] = std::move(measurement);
         }
-        CompileMeasurement measurement = CompileOne(
-            client, preprocessing_options, compile_options,
-            hlo_files[module_index], input_format);
-        batch.modules[module_index] = std::move(measurement);
-      }
-    });
-  }
-  for (std::thread& worker : workers) {
-    worker.join();
+      });
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
   }
   batch.wall_ms = Milliseconds(absl::Now() - batch_start);
   return batch;
@@ -275,7 +505,7 @@ absl::Status RunBenchmark(const BenchmarkOptions& options,
     return absl::InvalidArgumentError("--parallelism must be at least 1");
   }
   if (hlo_files.empty()) {
-    return absl::InvalidArgumentError("At least one HLO file is required");
+    return absl::InvalidArgumentError("At least one input is required");
   }
   if (options.gpu_client_mem_fraction <= 0.0 ||
       options.gpu_client_mem_fraction >= 1.0) {
@@ -283,12 +513,22 @@ absl::Status RunBenchmark(const BenchmarkOptions& options,
         "--gpu_client_mem_fraction must be between 0 and 1");
   }
 
-  InputFormat input_format;
-  std::string input_format_error;
-  if (!AbslParseFlag(options.input_format, &input_format,
-                     &input_format_error)) {
-    return absl::InvalidArgumentError(input_format_error);
+  std::optional<InputFormat> input_format;
+  if (options.input_format != "pjrt_dump") {
+    if (!options.pjrt_option_override.empty()) {
+      return absl::InvalidArgumentError(
+          "--pjrt_option_override requires --input_format=pjrt_dump");
+    }
+    InputFormat parsed_input_format;
+    std::string input_format_error;
+    if (!AbslParseFlag(options.input_format, &parsed_input_format,
+                       &input_format_error)) {
+      return absl::InvalidArgumentError(input_format_error);
+    }
+    input_format = parsed_input_format;
   }
+  ABSL_ASSIGN_OR_RETURN(std::vector<CompilePhase> phases,
+                        BuildCompilePhases(options, hlo_files.size()));
 
   std::ofstream output_file;
   std::ostream* csv = &std::cout;
@@ -344,9 +584,15 @@ absl::Status RunBenchmark(const BenchmarkOptions& options,
 
   std::cout << "GPU client initialized in " << std::fixed
             << std::setprecision(1) << client_init_ms << "ms; compiling "
-            << hlo_files.size() << " module(s), repetitions="
-            << options.repetitions << ", parallelism=" << options.parallelism
-            << '\n';
+            << hlo_files.size()
+            << " module(s), repetitions=" << options.repetitions
+            << ", phases=" << phases.size()
+            << ", input_format=" << options.input_format << '\n';
+  for (size_t index = 0; index < phases.size(); ++index) {
+    std::cout << "  phase " << index
+              << ": modules=" << phases[index].end - phases[index].begin
+              << ", parallelism=" << phases[index].parallelism << '\n';
+  }
 
   std::vector<BatchMeasurement> measurements;
   measurements.reserve(options.repetitions);
@@ -356,9 +602,10 @@ absl::Status RunBenchmark(const BenchmarkOptions& options,
     const bool warmup = repetition < options.warmup_repetitions;
     const int32_t visible_iteration =
         warmup ? repetition : repetition - options.warmup_repetitions;
-    BatchMeasurement batch = CompileBatch(
-        *environment.client, preprocessing_options, compile_options, hlo_files,
-        input_format, options.parallelism, visible_iteration, warmup);
+    BatchMeasurement batch =
+        CompileBatch(*environment.client, preprocessing_options,
+                     compile_options, hlo_files, input_format, phases,
+                     options.pjrt_option_override, visible_iteration, warmup);
     WriteIterationRows(batch, options, *csv);
 
     for (const CompileMeasurement& module : batch.modules) {
@@ -415,8 +662,7 @@ int main(int argc, char** argv) {
                 "Number of unmeasured compile batches before measurements."),
       tsl::Flag("parallelism", &options.parallelism,
                 "Maximum number of HLO modules compiled concurrently."),
-      tsl::Flag("output_csv", &options.output_csv,
-                "CSV output path."),
+      tsl::Flag("output_csv", &options.output_csv, "CSV output path."),
       tsl::Flag("append_csv", &options.append_csv,
                 "Append rows to --output_csv instead of replacing it."),
       tsl::Flag("label", &options.label,
@@ -424,7 +670,14 @@ int main(int argc, char** argv) {
       tsl::Flag("run_id", &options.run_id,
                 "Identifier written to each CSV row for this invocation."),
       tsl::Flag("input_format", &options.input_format,
-                "Input format accepted by FunctionalHloRunner."),
+                "HLO input format accepted by FunctionalHloRunner, or "
+                "pjrt_dump for module.mlir plus compile options directories."),
+      tsl::Flag("phase_sizes", &options.phase_sizes,
+                "Comma-separated module counts for sequential compile phases."),
+      tsl::Flag("phase_parallelism", &options.phase_parallelism,
+                "Comma-separated parallelism for each --phase_sizes entry."),
+      tsl::Flag("pjrt_option_override", &options.pjrt_option_override,
+                "Replay-only DebugOptions override in NAME=VALUE form."),
       tsl::Flag("gpu_client_mem_fraction", &options.gpu_client_mem_fraction,
                 "Fraction of GPU memory available to the PJRT client."),
       tsl::Flag("gpu_client_initialization_timeout_sec",
