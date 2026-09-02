@@ -25,8 +25,10 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/inlined_vector.h"
+#include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "mlir/IR/MLIRContext.h"
@@ -154,6 +156,17 @@ class SymbolicTileAnalysis {
       bool constraints_are_known_satisfied = false,
       bool compute_all_tile_offset_indexing_maps = false) const;
 
+  // Equivalent to the overload above, but consumes parameters that are
+  // already flattened according to `GetTilingSpecification()`. This avoids
+  // constructing and repeatedly flattening a hash-map-backed `Tiling` while
+  // exhaustively evaluating generated candidates.
+  absl::StatusOr<TiledHloComputation> ComputeTiledComputation(
+      absl::Span<const int64_t> flat_tiling_parameters,
+      const TiledHloScheduleBuilder& schedule_builder =
+          CreateMajorToMinorTiledHloSchedule,
+      bool constraints_are_known_satisfied = false,
+      bool compute_all_tile_offset_indexing_maps = false) const;
+
   // Returns the roots of the computation in increasing order of their output
   // index.
   absl::Span<const HloInstruction* const> GetRoots() const {
@@ -196,8 +209,22 @@ class SymbolicTileAnalysis {
   // specification.
   absl::StatusOr<bool> ParametersSatisfyConstraints(const Tiling& tiling) const;
 
+  // Enumerates valid flattened tilings without materializing the Cartesian
+  // product. The callback may stop enumeration by returning an error.
+  absl::Status ForEachValidFlatTiling(
+      absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback)
+      const;
+
   // Return the underlying mlir::MLIRContext.
   mlir::MLIRContext* GetMLIRContext() const { return mlir_context_; };
+
+  int64_t num_symbolic_tiled_hlo_instructions() const {
+    return num_symbolic_tiled_hlo_instructions_;
+  }
+
+  const std::vector<std::vector<int64_t>>& tile_parameter_upper_bounds() const {
+    return tile_parameter_upper_bounds_;
+  }
 
   // Returns a string representation of the analysis. Used only for error
   // messages and debugging.
@@ -208,6 +235,9 @@ class SymbolicTileAnalysis {
   absl::StatusOr<std::vector<Tiling>> GetValidTilings() const;
 
  private:
+  absl::StatusOr<bool> FlatParametersSatisfyConstraints(
+      absl::Span<const int64_t> flat_tiling_parameters) const;
+
   SymbolicTileAnalysis(
       std::vector<std::unique_ptr<SymbolicTiledHloInstruction>>
           symbolic_tiled_hlo_instructions,
@@ -220,7 +250,37 @@ class SymbolicTileAnalysis {
         root_indexing_(std::move(root_indexing)),
         tiling_specification_(std::move(tiling_specification)),
         emitter_specific_constraints_(std::move(emitter_specific_constraints)),
-        mlir_context_(mlir_context) {}
+        mlir_context_(mlir_context) {
+    int64_t next_id = 0;
+    auto assign_ids = [&](auto&& self, const auto& instructions) -> void {
+      for (const auto& instruction : instructions) {
+        instruction->set_id(next_id++);
+        for (const auto& region : instruction->regions()) {
+          self(self, region);
+        }
+      }
+    };
+    assign_ids(assign_ids, symbolic_tiled_hlo_instructions_);
+    num_symbolic_tiled_hlo_instructions_ = next_id;
+
+    for (const auto& instruction : symbolic_tiled_hlo_instructions_) {
+      std::vector<int64_t> upper_bounds;
+      for (const IndexingMap::Variable& variable :
+           instruction->symbolic_tile().tile_map().GetDimVars()) {
+        upper_bounds.push_back(variable.bounds.upper);
+      }
+      int64_t bounds_id = 0;
+      for (; bounds_id < tile_parameter_upper_bounds_.size(); ++bounds_id) {
+        if (tile_parameter_upper_bounds_[bounds_id] == upper_bounds) {
+          break;
+        }
+      }
+      if (bounds_id == tile_parameter_upper_bounds_.size()) {
+        tile_parameter_upper_bounds_.push_back(std::move(upper_bounds));
+      }
+      instruction->set_tile_parameter_bounds_id(bounds_id);
+    }
+  }
 
   // Computes indexing information for the roots of the computation.
   static absl::StatusOr<RootIndexing> GetRootIndexing(
@@ -268,6 +328,12 @@ class SymbolicTileAnalysis {
   std::unique_ptr<EmitterSpecificConstraints> emitter_specific_constraints_;
 
   mlir::MLIRContext* mlir_context_;
+
+  int64_t num_symbolic_tiled_hlo_instructions_ = 0;
+
+  // Distinct tile-parameter upper-bound patterns for top-level symbolic
+  // instructions. Concrete tiling clamps once per pattern and candidate.
+  std::vector<std::vector<int64_t>> tile_parameter_upper_bounds_;
 };
 
 namespace detail {

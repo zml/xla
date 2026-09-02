@@ -48,6 +48,7 @@ limitations under the License.
 #include "xla/codegen/tiling/experimental/tiling_space.h"
 #include "xla/codegen/tiling/symbolic_tile_analysis.h"
 #include "xla/codegen/tiling/tiled_hlo_computation.h"
+#include "xla/codegen/tiling/tiled_hlo_schedule.h"
 #include "xla/codegen/tiling/tiling_specification.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/codegen/xtile/codegen/emitter_helpers.h"
@@ -197,8 +198,10 @@ void ForEachInstructionInTiledHloComputation(
     absl::FunctionRef<
         void(const typename TiledHloComputationType::InstructionType*, int64_t)>
         visitor) {
-  std::vector<std::pair<
-      const typename TiledHloComputationType::InstructionType*, int64_t>>
+  llvm::SmallVector<
+      std::pair<const typename TiledHloComputationType::InstructionType*,
+                int64_t>,
+      32>
       worklist;
   for (const auto* instruction : tiled_hlo_computation.instructions()) {
     worklist.push_back({instruction, num_blocks_at_root});
@@ -219,6 +222,20 @@ void ForEachInstructionInTiledHloComputation(
       }
     }
   }
+}
+
+bool IsFusionInstruction(const HloFusionAdaptor& fusion_adaptor,
+                         const TiledHloInstruction* tiled_hlo) {
+  if (std::optional<bool> cached = tiled_hlo->is_fusion_instruction()) {
+    return *cached;
+  }
+  return fusion_adaptor.ContainsInstruction(tiled_hlo->hlo());
+}
+
+template <typename TiledHloInstructionType>
+bool IsFusionInstruction(const HloFusionAdaptor& fusion_adaptor,
+                         const TiledHloInstructionType* tiled_hlo) {
+  return fusion_adaptor.ContainsInstruction(tiled_hlo->hlo());
 }
 
 // Checks if all tiles in the computation fit in registers.
@@ -249,7 +266,7 @@ bool DoesComputationFitInRegisters(
         if (!fits) {
           return;
         }
-        bool is_operand = !fusion_adaptor.ContainsInstruction(tiled_hlo->hlo());
+        bool is_operand = !IsFusionInstruction(fusion_adaptor, tiled_hlo);
         // Iota is not an operand, but usually needs to be materialized in
         // registers.
         if ((is_operand || tiled_hlo->hlo()->opcode() == HloOpcode::kIota) &&
@@ -381,7 +398,7 @@ absl::StatusOr<EstimateRunTimeData> EstimateRunTimeForTiledHloComputationImpl(
       [&](const typename TiledHloComputationType::InstructionType* tiled_hlo,
           int64_t num_blocks_cur_hlo) {
         const HloInstruction* hlo = tiled_hlo->hlo();
-        if (fusion_adaptor.ContainsInstruction(hlo)) {
+        if (IsFusionInstruction(fusion_adaptor, tiled_hlo)) {
           // Number of elements in the tile after padding.
           int64_t padded_tile_size = GetPaddedTileSize(tiled_hlo->tile_sizes());
 
@@ -797,6 +814,32 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
             << root.parent()->name();
   }
   absl::InlinedVector<TiledRunTimeData, 4> candidates;
+  if (top_k < 0) {
+    return absl::InvalidArgumentError("top_k must be non-negative.");
+  }
+  int64_t valid_candidate_count = 0;
+  auto retain_candidate = [&](TiledRunTimeData candidate) {
+    ++valid_candidate_count;
+    candidates.push_back(std::move(candidate));
+    absl::c_stable_sort(
+        candidates, [](const TiledRunTimeData& a, const TiledRunTimeData& b) {
+          return a.runtime_data.exec_time < b.runtime_data.exec_time;
+        });
+    if (candidates.size() > static_cast<size_t>(top_k)) {
+      candidates.resize(top_k);
+    }
+  };
+
+  absl::flat_hash_map<const HloInstruction*, int64_t> flops_per_element_cache;
+  auto get_flops_per_element = [&](const HloInstruction* hlo) {
+    auto cached = flops_per_element_cache.find(hlo);
+    if (cached != flops_per_element_cache.end()) {
+      return cached->second;
+    }
+    int64_t flops = FlopsPerElement(hlo);
+    flops_per_element_cache.emplace(hlo, flops);
+    return flops;
+  };
 
   if (use_experimental_tiling_) {
     using experimental::TiledHloComputation;
@@ -840,9 +883,7 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
       ABSL_ASSIGN_OR_RETURN(std::optional<TiledRunTimeData> tiled_run_time_data,
                        EstimateTiledRunTimeDataImpl(
                            fusion_adaptor, *tiled_computation, *device_info_,
-                           shape_size_, [this](const HloInstruction* hlo) {
-                             return FlopsPerElement(hlo);
-                           }));
+                           shape_size_, get_flops_per_element));
 
       if (tiled_run_time_data.has_value()) {
         VLOG(2) << "Accepted tile sizes ["
@@ -851,7 +892,7 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
                                  ",")
                 << "], exec_time "
                 << tiled_run_time_data->runtime_data.exec_time;
-        candidates.push_back(*tiled_run_time_data);
+        retain_candidate(std::move(*tiled_run_time_data));
       }
     }
   } else {
@@ -871,57 +912,51 @@ GpuPerformanceModelWithIndexingAnalysis::TryFindTopKBestTilingsForFusion(
     SymbolicTileAnalysis analysis =
         std::get<SymbolicTileAnalysis>(std::move(analysis_or_error));
 
-    ABSL_ASSIGN_OR_RETURN(auto tilings, analysis.GetValidTilings());
+    int64_t tilings_evaluated = 0;
+    ABSL_RETURN_IF_ERROR(analysis.ForEachValidFlatTiling(
+        [&](absl::Span<const int64_t> flat_tiling) -> absl::Status {
+          ++tilings_evaluated;
+          // TODO(b/372454662): This needs to be adjusted if we want to support
+          // more than one "real root" (i.e. a root without users). Currently
+          // ComputeTiledComputation() may fail and return an Unimplemented error
+          // for cases of multi-output fusion that we do not support yet.
+          auto maybe_tiled_hlo_computation =
+              analysis.ComputeTiledComputation(
+                  flat_tiling, CreateMajorToMinorTiledHloSchedule,
+                  /*constraints_are_known_satisfied=*/true);
+          if (!maybe_tiled_hlo_computation.ok()) {
+            if (maybe_tiled_hlo_computation.status().code() ==
+                    absl::StatusCode::kUnimplemented &&
+                absl::StrContains(
+                    maybe_tiled_hlo_computation.status().message(),
+                    "multi-output fusion")) {
+              return absl::OkStatus();
+            }
+            return maybe_tiled_hlo_computation.status();
+          }
+
+          ABSL_ASSIGN_OR_RETURN(
+              std::optional<TiledRunTimeData> tiled_run_time_data,
+              EstimateTiledRunTimeDataImpl(
+                  fusion_adaptor, *maybe_tiled_hlo_computation, *device_info_,
+                  shape_size_, get_flops_per_element));
+
+          if (tiled_run_time_data.has_value()) {
+            VLOG(2) << "Accepted tile sizes ["
+                    << absl::StrJoin(flat_tiling, ",") << "], exec_time "
+                    << tiled_run_time_data->runtime_data.exec_time;
+            retain_candidate(std::move(*tiled_run_time_data));
+          }
+          return absl::OkStatus();
+        }));
     VLOG(1) << absl::StrCat(
-        "TryFindTopKBestTilingsForFusion symbolic analysis evaluating ",
-        tilings.size(), " tilings.");
-    for (const auto& tiling : tilings) {
-      // TODO(b/372454662): This needs to be adjusted if we want to support more
-      // than one "real root" (i.e. a root without users).
-      // Currently ComputeTiledComputation() may fail and return an
-      // Unimplemented error for cases of multi-output fusion that we do not
-      // support yet.
-      auto maybe_tiled_hlo_computation =
-          analysis.ComputeTiledComputation(tiling);
-      if (!maybe_tiled_hlo_computation.ok()) {
-        if (maybe_tiled_hlo_computation.status().code() ==
-                absl::StatusCode::kUnimplemented &&
-            absl::StrContains(maybe_tiled_hlo_computation.status().message(),
-                              "multi-output fusion")) {
-          continue;
-        }
-        return maybe_tiled_hlo_computation.status();
-      }
-
-      ABSL_ASSIGN_OR_RETURN(
-          std::optional<TiledRunTimeData> tiled_run_time_data,
-          EstimateTiledRunTimeDataImpl(
-              fusion_adaptor, *maybe_tiled_hlo_computation, *device_info_,
-              shape_size_, [this](const HloInstruction* hlo) {
-                return FlopsPerElement(hlo);
-              }));
-
-      if (tiled_run_time_data.has_value()) {
-        ABSL_ASSIGN_OR_RETURN(FlatTiling flat_tiling,
-                         tiling.Flatten(analysis.GetTilingSpecification()));
-        VLOG(2) << "Accepted tile sizes [" << absl::StrJoin(flat_tiling, ",")
-                << "], exec_time "
-                << tiled_run_time_data->runtime_data.exec_time;
-        candidates.push_back(*tiled_run_time_data);
-      }
-    }
+        "TryFindTopKBestTilingsForFusion symbolic analysis evaluated ",
+        tilings_evaluated, " tilings.");
   }
 
-  VLOG(1) << absl::StrCat("Found ", candidates.size(),
-                          " valid tiling candidates.");
-  absl::c_stable_sort(
-      candidates, [](const TiledRunTimeData& a, const TiledRunTimeData& b) {
-        return a.runtime_data.exec_time < b.runtime_data.exec_time;
-      });
-
-  if (candidates.size() > top_k) {
-    candidates.resize(top_k);
-  }
+  VLOG(1) << absl::StrCat("Found ", valid_candidate_count,
+                          " valid tiling candidates; retained ",
+                          candidates.size(), ".");
 
   ABSL_RETURN_IF_ERROR(DumpAndLogTopKCandidates(fusion_adaptor, candidates));
 
