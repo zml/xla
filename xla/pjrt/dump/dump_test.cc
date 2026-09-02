@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_device_description.h"
 #include "xla/pjrt/pjrt_executable.h"
+#include "xla/pjrt/proto/compile_options.pb.h"
 #include "xla/pjrt/proto/topology_description.pb.h"
 #include "xla/service/llvm_ir/llvm_util.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -127,7 +128,7 @@ TEST(DumpTest, DumpCompileInputs) {
   const std::string temp_test_subdir =
       tsl::io::JoinPath(temp_test_dir, "compile_dump_test",
                         absl::StrCat(absl::ToUnixMillis(absl::Now())));
-  TF_ASSERT_OK(tsl::Env::Default()->RecursivelyCreateDir(temp_test_subdir));
+  ASSERT_OK(tsl::Env::Default()->RecursivelyCreateDir(temp_test_subdir));
   xla::CompileOptions compile_options;
   mlir::MLIRContext context;
   mlir::OpBuilder builder(&context);
@@ -195,6 +196,16 @@ TEST(DumpTest, DumpCompileInputsAsProto) {
               testing::UnorderedElementsAre(HasSubstr("module.mlir"),
                                             HasSubstr("compile_options.pb"),
                                             HasSubstr("topology.pb")));
+
+  xla::CompileOptionsProto dumped_options;
+  ASSERT_OK(tsl::ReadBinaryProto(
+      tsl::Env::Default(), tsl::io::JoinPath(dump_subdir, "compile_options.pb"),
+      &dumped_options));
+  const xla::DebugOptions& dumped_debug_options =
+      dumped_options.executable_build_options().debug_options();
+  EXPECT_TRUE(dumped_debug_options.xla_dump_to().empty());
+  EXPECT_FALSE(dumped_debug_options.xla_enable_dumping());
+  EXPECT_FALSE(dumped_debug_options.xla_dump_hlo_as_proto());
 }
 
 TEST(MaybeDumpCompileInputsTest, XlaDumpToNotSet) {
@@ -256,6 +267,49 @@ TEST(MaybeDumpCompileInputsTest, XlaDumpToSet) {
                               HasSubstr("module.mlir"),
                               HasSubstr("compile_options.textproto"),
                               HasSubstr("topology.textproto")));
+}
+
+TEST(MaybeDumpCompileInputsTest, XlaDumpToOptionOverrideSet) {
+  const std::string temp_test_dir = tsl::testing::TmpDir();
+  const std::string temp_test_subdir =
+      tsl::io::JoinPath(temp_test_dir, "compile_maybe_dump_test_override_set",
+                        absl::StrCat(absl::ToUnixMillis(absl::Now())));
+  ASSERT_OK(tsl::Env::Default()->RecursivelyCreateDir(temp_test_subdir));
+  xla::CompileOptions compile_options;
+  compile_options.env_option_overrides.emplace_back("xla_dump_to",
+                                                    temp_test_subdir);
+  mlir::MLIRContext context;
+  mlir::OpBuilder builder(&context);
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      xla::llvm_ir::CreateMlirModuleOp(builder.getUnknownLoc());
+  auto topology = std::make_unique<TestTopology>();
+
+  ASSERT_OK(
+      pjrt::MaybeDumpCompileInputs(compile_options, *module, *topology, 0));
+  std::vector<std::string> files;
+  ASSERT_OK(tsl::Env::Default()->GetMatchingPaths(
+      tsl::io::JoinPath(temp_test_subdir, "*"), &files));
+
+  ASSERT_EQ(files.size(), 1);
+  std::vector<std::string> dump_files;
+  ASSERT_OK(tsl::Env::Default()->GetMatchingPaths(
+      tsl::io::JoinPath(files[0], "*"), &dump_files));
+  EXPECT_THAT(dump_files, testing::UnorderedElementsAre(
+                              HasSubstr("module.mlir"),
+                              HasSubstr("compile_options.textproto"),
+                              HasSubstr("topology.textproto")));
+
+  xla::CompileOptionsProto dumped_options;
+  ASSERT_OK(tsl::ReadTextProto(
+      tsl::Env::Default(),
+      tsl::io::JoinPath(files[0], "compile_options.textproto"),
+      &dumped_options));
+  EXPECT_EQ(dumped_options.env_option_overrides().find("xla_dump_to"),
+            dumped_options.env_option_overrides().end());
+  EXPECT_TRUE(dumped_options.executable_build_options()
+                  .debug_options()
+                  .xla_dump_to()
+                  .empty());
 }
 
 class MaybeDumpCompileInputsModuleFilterTest : public ::testing::Test {
