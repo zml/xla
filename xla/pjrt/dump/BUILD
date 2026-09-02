@@ -60,6 +60,7 @@ xla_cc_test(
         "//xla/pjrt:pjrt_compiler",
         "//xla/pjrt:pjrt_device_description",
         "//xla/pjrt:pjrt_executable",
+        "//xla/pjrt/proto:compile_options_proto_cc",
         "//xla/pjrt/proto:topology_description_proto_cc",
         "//xla/service/llvm_ir:llvm_util",
         "//xla/tsl/lib/core:status_test_util",

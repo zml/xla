@@ -167,6 +167,15 @@ class SymbolicTileAnalysis {
       bool constraints_are_known_satisfied = false,
       bool compute_all_tile_offset_indexing_maps = false) const;
 
+  // Equivalent to the flat-parameter overload above, but reuses an existing
+  // schedule. This is useful for exhaustive searches where the schedule is
+  // independent of the concrete tiling parameters.
+  absl::StatusOr<TiledHloComputation> ComputeTiledComputation(
+      absl::Span<const int64_t> flat_tiling_parameters,
+      const TiledHloSchedule& tiled_hlo_schedule,
+      bool constraints_are_known_satisfied = false,
+      bool compute_all_tile_offset_indexing_maps = false) const;
+
   // Returns the roots of the computation in increasing order of their output
   // index.
   absl::Span<const HloInstruction* const> GetRoots() const {

@@ -14,12 +14,14 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/pjrt/dump/dump.h"
 
+#include <algorithm>
 #include <string>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -114,8 +116,27 @@ absl::Status DumpCompileInputs(absl::string_view dump_to_path,
       compile_options.executable_build_options.mutable_debug_options();
   bool dump_as_binary_proto = debug_options->xla_dump_hlo_as_proto();
 
-  // Unset xla_dump_to when dumping so that reproducers don't dump by default.
+  // Disable capture-only output settings so that replaying these options does
+  // not recursively dump or write compiler output to stdout.
   debug_options->clear_xla_dump_to();
+  debug_options->set_xla_enable_dumping(false);
+  debug_options->set_xla_dump_hlo_as_text(false);
+  debug_options->set_xla_dump_hlo_as_proto(false);
+  debug_options->set_xla_dump_hlo_as_riegeli(false);
+  debug_options->set_xla_dump_hlo_as_dot(false);
+  debug_options->set_xla_dump_hlo_as_html(false);
+  debug_options->set_xla_dump_hlo_as_url(false);
+  debug_options->set_xla_dump_hlo_snapshots(false);
+  debug_options->set_xla_dump_hlo_unoptimized_snapshots(false);
+  debug_options->set_xla_dump_fusion_visualization(false);
+  compile_options.env_option_overrides.erase(
+      std::remove_if(compile_options.env_option_overrides.begin(),
+                     compile_options.env_option_overrides.end(),
+                     [](const auto& option) {
+                       return absl::StartsWith(option.first, "xla_dump_") ||
+                              option.first == "xla_enable_dumping";
+                     }),
+      compile_options.env_option_overrides.end());
 
   ABSL_ASSIGN_OR_RETURN(auto options_proto, compile_options.ToProto());
   ABSL_RETURN_IF_ERROR(WriteProtoToFile(options_proto, "compile_options",
@@ -132,6 +153,11 @@ absl::Status MaybeDumpCompileInputs(
     const xla::PjRtTopologyDescription& topology, int module_id) {
   VLOG(3) << "[MaybeDumpCompileInputs] Dumping PJRT inputs for module: "
           << module.getName().value_or("unknown_module").str();
+
+  // Frontends commonly pass debug options through PJRT's option-overrides map.
+  // Apply them to this local copy before deciding whether input dumping is
+  // enabled. The normal compilation path applies the same overrides later.
+  ABSL_RETURN_IF_ERROR(compile_options.ApplyAllOptionOverrides());
 
   // Dump compile inputs to the specified path if populated.
   const auto& executable_build_options =

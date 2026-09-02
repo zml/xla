@@ -344,6 +344,41 @@ ENTRY main {
   EXPECT_EQ(p0_from_subtract0, p0_from_subtract1);
 }
 
+TEST_F(SymbolicTileAnalysisTest, ExistingScheduleCanBeReused) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[2,97] parameter(0)
+  ROOT negate = f32[2,97] negate(p0)
+}
+
+ENTRY main {
+  p0 = f32[2,97] parameter(0)
+  ROOT fusion = f32[2,97] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+
+  MajorToMinorTiledHloSchedule schedule;
+  ASSERT_OK_AND_ASSIGN(TiledHloComputation tiled_hlo_computation,
+                       analysis->ComputeTiledComputation(
+                           FlatTiling({1, 10}), schedule,
+                           /*constraints_are_known_satisfied=*/false,
+                           /*compute_all_tile_offset_indexing_maps=*/true));
+
+  EXPECT_THAT(*GetFirstRoot(tiled_hlo_computation),
+              MatchTiledHloInstruction(
+                  /*tile_sizes=*/{1, 10}, /*tile_strides=*/{1, 1},
+                  /*tile_offsets_indexing=*/R"(
+    (pid_0) -> (pid_0 / 10, (pid_0 mod 10) * 10),
+    domain:
+    pid_0 in [0, 19]
+  )"));
+  EXPECT_THAT(analysis->ComputeTiledComputation(FlatTiling({1}), schedule),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Expected 2 flattened tiling parameters")));
+}
+
 TEST_F(SymbolicTileAnalysisTest,
        ExpandingReshapeIsSupportedWithTileParamsOutsideBounds) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
