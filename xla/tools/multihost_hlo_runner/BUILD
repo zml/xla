@@ -135,6 +135,36 @@ xla_cc_binary(
     ]),
 )
 
+xla_cc_binary(
+    name = "hlo_compile_benchmark_gpu",
+    testonly = True,
+    srcs = ["hlo_compile_benchmark_main.cc"],
+    tags = [
+        "gpu",
+        "no_mac",
+    ] + tf_gpu_tests_tags(),
+    deps = [
+        ":create_client",
+        ":functional_hlo_runner",
+        "//xla:debug_options_flags",
+        "//xla/pjrt:pjrt_executable",
+        "//xla/pjrt/plugin/xla_gpu:xla_gpu_allocator_config",
+        "//xla/pjrt/plugin/xla_gpu:xla_gpu_client_options",
+        "//xla/service:gpu_plugin",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@tsl//tsl/platform:logging",
+    ] + if_cuda([
+        "//xla/stream_executor:cuda_platform",
+    ]) + if_rocm([
+        "//xla/stream_executor:rocm_platform",
+    ]),
+)
+
 cc_library(
     name = "create_client",
     srcs = ["create_client.cc"],

@@ -161,11 +161,21 @@ class SymbolicExpr {
   }
 
  private:
+  static int64_t EvaluateImpl(const ImplType* impl,
+                              absl::Span<const int64_t> variable_values);
+
   const ImplType* impl_ = nullptr;
 };
 
 SymbolicExpr operator+(int64_t lhs, SymbolicExpr rhs);
 SymbolicExpr operator*(int64_t lhs, SymbolicExpr rhs);
+
+// Evaluates a batch of expressions with the same variable values. Terminal
+// expressions are handled directly to avoid entering the recursive evaluator
+// once per result.
+void EvaluateSymbolicExprs(absl::Span<const SymbolicExpr> expressions,
+                           absl::Span<const int64_t> variable_values,
+                           absl::Span<int64_t> results);
 
 inline ::llvm::hash_code hash_value(SymbolicExpr expr) {
   return ::llvm::hash_value(expr.GetImpl());

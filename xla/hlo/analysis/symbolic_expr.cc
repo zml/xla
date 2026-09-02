@@ -16,6 +16,8 @@ limitations under the License.
 #include "xla/hlo/analysis/symbolic_expr.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -684,18 +686,26 @@ std::string SymbolicExpr::ToString(
 
 int64_t SymbolicExpr::Evaluate(
     absl::Span<const int64_t> variable_values) const {
-  int64_t lhs_value = GetLHS() ? GetLHS().Evaluate(variable_values) : 0;
-  int64_t rhs_value = GetRHS() ? GetRHS().Evaluate(variable_values) : 0;
-  switch (GetType()) {
-    case SymbolicExprType::kConstant:
-      return GetValue();
-    case SymbolicExprType::kVariable: {
-      int var_id = GetValue();
-      CHECK(var_id >= 0 && var_id < variable_values.size())
-          << "Evaluate has not provided a value for VariableID " << var_id
-          << ".";
-      return variable_values[var_id];
-    }
+  return EvaluateImpl(impl_, variable_values);
+}
+
+int64_t SymbolicExpr::EvaluateImpl(
+    const ImplType* impl, absl::Span<const int64_t> variable_values) {
+  const SymbolicExprType type = impl->type_;
+  if (type == SymbolicExprType::kConstant) {
+    return impl->value_;
+  }
+  if (type == SymbolicExprType::kVariable) {
+    const int64_t var_id = impl->value_;
+    CHECK(var_id >= 0 && var_id < variable_values.size())
+        << "Evaluate has not provided a value for VariableID " << var_id
+        << ".";
+    return variable_values[var_id];
+  }
+
+  const int64_t lhs_value = EvaluateImpl(impl->lhs_.impl_, variable_values);
+  const int64_t rhs_value = EvaluateImpl(impl->rhs_.impl_, variable_values);
+  switch (type) {
     case SymbolicExprType::kAdd:
       return lhs_value + rhs_value;
     case SymbolicExprType::kMul:
@@ -715,6 +725,24 @@ int64_t SymbolicExpr::Evaluate(
       return std::min(lhs_value, rhs_value);
     default:
       LOG(FATAL) << "Evaluate not implemented for this expression type.";
+  }
+}
+
+void EvaluateSymbolicExprs(absl::Span<const SymbolicExpr> expressions,
+                           absl::Span<const int64_t> variable_values,
+                           absl::Span<int64_t> results) {
+  CHECK_EQ(expressions.size(), results.size());
+  for (auto [expression, result] : llvm::zip(expressions, results)) {
+    const SymbolicExprType type = expression.GetType();
+    if (type == SymbolicExprType::kConstant) {
+      result = expression.GetValue();
+    } else if (type == SymbolicExprType::kVariable) {
+      const int64_t var_id = expression.GetValue();
+      CHECK(var_id >= 0 && var_id < variable_values.size());
+      result = variable_values[var_id];
+    } else {
+      result = expression.Evaluate(variable_values);
+    }
   }
 }
 
@@ -1064,6 +1092,51 @@ static absl::Mutex& getSymbolicExprStorageMutex() {
   return m;
 }
 
+namespace {
+
+constexpr int64_t kMinCachedConstant = -1;
+constexpr int64_t kMaxCachedConstant = 128;
+constexpr int64_t kNumCachedVariables = 64;
+
+std::atomic<uint64_t>& SymbolicExprStorageEpoch() {
+  static std::atomic<uint64_t> epoch{1};
+  return epoch;
+}
+
+struct ThreadLocalLeafExprCache {
+  mlir::MLIRContext* context = nullptr;
+  uint64_t epoch = 0;
+  std::array<SymbolicExpr,
+             kMaxCachedConstant - kMinCachedConstant + 1>
+      constants;
+  std::array<SymbolicExpr, kNumCachedVariables> variables;
+};
+
+SymbolicExpr* GetLeafExprCacheSlot(SymbolicExprType type, int64_t value,
+                                   mlir::MLIRContext* mlir_context) {
+  thread_local ThreadLocalLeafExprCache cache;
+  const uint64_t current_epoch =
+      SymbolicExprStorageEpoch().load(std::memory_order_relaxed);
+  if (cache.context != mlir_context || cache.epoch != current_epoch) {
+    cache.context = mlir_context;
+    cache.epoch = current_epoch;
+    cache.constants.fill(SymbolicExpr());
+    cache.variables.fill(SymbolicExpr());
+  }
+
+  if (type == SymbolicExprType::kConstant &&
+      value >= kMinCachedConstant && value <= kMaxCachedConstant) {
+    return &cache.constants[value - kMinCachedConstant];
+  }
+  if (type == SymbolicExprType::kVariable && value >= 0 &&
+      value < kNumCachedVariables) {
+    return &cache.variables[value];
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 void RegisterSymbolicExprStorage(mlir::MLIRContext* mlir_context) {
   CHECK(mlir_context != nullptr);
   auto* uniquer = &mlir_context->getAffineUniquer();
@@ -1074,6 +1147,7 @@ void RegisterSymbolicExprStorage(mlir::MLIRContext* mlir_context) {
       uniquer->registerParametricStorageType<SymbolicExprStorage>();
     }
   }
+  SymbolicExprStorageEpoch().fetch_add(1, std::memory_order_relaxed);
 }
 
 SymbolicExpr GetOrCreateSymbolicExpr(SymbolicExprType type, int64_t value,
@@ -1088,14 +1162,36 @@ SymbolicExpr GetOrCreateSymbolicExpr(SymbolicExprType type, int64_t value,
 
 SymbolicExpr CreateSymbolicConstant(int64_t value,
                                     mlir::MLIRContext* mlir_context) {
-  return GetOrCreateSymbolicExpr(SymbolicExprType::kConstant, value,
-                                 SymbolicExpr(), SymbolicExpr(), mlir_context);
+  SymbolicExpr* cached = GetLeafExprCacheSlot(
+      SymbolicExprType::kConstant, value, mlir_context);
+  if (cached == nullptr) {
+    return GetOrCreateSymbolicExpr(SymbolicExprType::kConstant, value,
+                                   SymbolicExpr(), SymbolicExpr(),
+                                   mlir_context);
+  }
+  if (!*cached) {
+    *cached = GetOrCreateSymbolicExpr(SymbolicExprType::kConstant, value,
+                                      SymbolicExpr(), SymbolicExpr(),
+                                      mlir_context);
+  }
+  return *cached;
 }
 
 SymbolicExpr CreateSymbolicVariable(int64_t var_id,
                                     mlir::MLIRContext* mlir_context) {
-  return GetOrCreateSymbolicExpr(SymbolicExprType::kVariable, var_id,
-                                 SymbolicExpr(), SymbolicExpr(), mlir_context);
+  SymbolicExpr* cached = GetLeafExprCacheSlot(
+      SymbolicExprType::kVariable, var_id, mlir_context);
+  if (cached == nullptr) {
+    return GetOrCreateSymbolicExpr(SymbolicExprType::kVariable, var_id,
+                                   SymbolicExpr(), SymbolicExpr(),
+                                   mlir_context);
+  }
+  if (!*cached) {
+    *cached = GetOrCreateSymbolicExpr(SymbolicExprType::kVariable, var_id,
+                                      SymbolicExpr(), SymbolicExpr(),
+                                      mlir_context);
+  }
+  return *cached;
 }
 
 SymbolicExpr CreateSymbolicBinaryOp(SymbolicExprType type, SymbolicExpr lhs,
