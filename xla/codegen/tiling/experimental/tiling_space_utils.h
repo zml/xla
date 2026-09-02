@@ -20,6 +20,8 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/inlined_vector.h"
+#include "absl/functional/function_ref.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 
@@ -29,6 +31,13 @@ namespace xla {
 //
 // This is an inlined vector to avoid too many heap allocations.
 using FlatTiling = absl::InlinedVector<int64_t, 4>;
+
+// Enumerates the Cartesian product of possible tile sizes without
+// materializing all tilings. The callback is invoked in the same order as
+// `GetFlatTilingsForInputSpace` and may stop enumeration by returning an error.
+absl::Status ForEachFlatTilingForInputSpace(
+    absl::Span<const int64_t> input_space,
+    absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback);
 
 absl::StatusOr<std::vector<FlatTiling>> GetFlatTilingsForInputSpace(
     absl::Span<const int64_t> input_space);

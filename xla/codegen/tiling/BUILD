@@ -24,6 +24,7 @@ cc_library(
         "tiled_hlo_instruction.h",
     ],
     deps = [
+        ":symbolic_tile",
         "//xla:shape_util",
         "//xla:util",
         "//xla/hlo/analysis:indexing_analysis",
@@ -378,6 +379,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/container:hash_container_defaults",
         "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/hash",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
