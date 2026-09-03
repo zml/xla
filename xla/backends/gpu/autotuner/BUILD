@@ -358,6 +358,33 @@ xla_test(
 )
 
 cc_library(
+    name = "fp8_block_gemv",
+    srcs = ["fp8_block_gemv.cc"],
+    hdrs = ["fp8_block_gemv.h"],
+    tags = ["gpu"],
+    deps = [
+        ":gpu_codegen_backend",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backend_config_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/codegen/kernels:fp8_block_gemv_kernel",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "nvfp4_decode_dot",
     srcs = ["nvfp4_decode_dot.cc"],
     hdrs = ["nvfp4_decode_dot.h"],
@@ -660,6 +687,7 @@ cc_library(
         ":factory",
         ":fission_backend",
         ":native_emitter",
+        ":fp8_block_gemv",
         ":tile_ir",
         ":triton",
         "//xla:xla_proto_cc",

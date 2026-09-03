@@ -22,6 +22,8 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+FusedScaledDotArm Fp8BlockGemvArm(const se::GpuComputeCapability& gpu_version);
+
 FusedScaledDotArm Nvfp4DecodeDotArm(
     const se::DeviceDescription& device_description);
 

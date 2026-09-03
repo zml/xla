@@ -36,6 +36,9 @@ message BackendConfig {
     xla.gpu.NativeEmitterBackendConfig native_emitter = 6;
     // 900+ keeps clear of upstream's ids.
     xla.gpu.TileIrFusionConfig tile_ir = 900;
+    xla.gpu.TileIrFusionConfig fp8_block_gemv = 901;
+    xla.gpu.TileIrFusionConfig fp8_block_gemv_tile_ir = 902;
+    xla.gpu.TileIrFusionConfig fp8_block_gemv_cuda = 903;
     xla.gpu.TileIrFusionConfig nvfp4_decode_dot = 904;
   }
 }

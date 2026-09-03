@@ -42,8 +42,8 @@ limitations under the License.
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/backends/gpu/codegen/triton/nvfp4_decode_dot.h"
-#include "xla/backends/gpu/transforms/cuda_fused_scaled_dot_arms.h"
 #include "xla/backends/gpu/transforms/algebraic_simplifier.h"
 #include "xla/backends/gpu/transforms/block_scaling_rewriter.h"
 #include "xla/backends/gpu/transforms/conv_fp8_fallback.h"
@@ -51,6 +51,7 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/conv_padding_legalization.h"
 #include "xla/backends/gpu/transforms/conv_rewriter.h"
 #include "xla/backends/gpu/transforms/cublas_pad_for_gemms.h"
+#include "xla/backends/gpu/transforms/cuda_fused_scaled_dot_arms.h"
 #include "xla/backends/gpu/transforms/cudnn_custom_call_compiler.h"
 #include "xla/backends/gpu/transforms/cudnn_fused_conv_rewriter.h"
 #include "xla/backends/gpu/transforms/cudnn_fusion_compiler.h"
@@ -303,6 +304,11 @@ bool NVPTXCompiler::IsScaledDotSupportedByBackend(
     return true;
   }
   if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
+    if (Fp8BlockGemvSupportsScaledDot(
+            *scaled_dot,
+            gpu_target_config.device_description.gpu_compute_capability())) {
+      return true;
+    }
     if (MatchNvfp4DecodeDot(*scaled_dot,
                             gpu_target_config.device_description
                                 .gpu_compute_capability())
@@ -322,6 +328,9 @@ std::vector<FusedScaledDotArm> NVPTXCompiler::FusedScaledDotArms(
       !debug_options.xla_gpu_enable_triton_gemm()) {
     return arms;
   }
+  const se::GpuComputeCapability& gpu_version =
+      gpu_target_config.device_description.gpu_compute_capability();
+  arms.push_back(Fp8BlockGemvArm(gpu_version));
   arms.push_back(Nvfp4DecodeDotArm(gpu_target_config.device_description));
   return arms;
 }
