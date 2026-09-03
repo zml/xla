@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "google/protobuf/any.pb.h"
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -58,6 +59,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/gpu_float_support.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/primitive_util.h"
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/service/gpu/model/triton_emitter_constraints.h"
 #include "xla/service/hlo_cost_analysis.h"
@@ -78,6 +80,37 @@ bool IsWarpSpecializationAvailable(
     se::GpuComputeCapability compute_capability) {
   return compute_capability.IsCuda() &&
          compute_capability.cuda_compute_capability()->IsAtLeastBlackwell();
+}
+
+// The default scaled-dot search; the whole space is behind --xla_gpu_exhaustive_tiling_search.
+constexpr struct {
+  int block_m, block_n, block_k, num_stages, num_warps;
+  bool tma;
+} kScaledDotDefaultTiles[] = {
+    {128, 128, 256, 4, 8, true},  {128, 128, 256, 3, 8, true},
+    {128, 128, 512, 2, 8, true},  {128, 128, 128, 1, 8, false},
+    {128, 64, 512, 3, 4, true},   {128, 64, 512, 2, 4, true},
+    {128, 64, 256, 3, 4, true},   {128, 64, 256, 2, 4, false},
+    {128, 64, 512, 3, 8, true},   {256, 64, 512, 2, 8, true},
+};
+
+std::vector<TritonGemmConfig> RestrictScaledDotConfigsToDefaults(
+    std::vector<TritonGemmConfig> configs) {
+  std::vector<TritonGemmConfig> kept;
+  for (const TritonGemmConfig& c : configs) {
+    bool keep = c.block_m < 128;
+    for (const auto& t : kScaledDotDefaultTiles) {
+      if (c.block_m == t.block_m && c.block_n == t.block_n &&
+          c.block_k == t.block_k && c.num_stages == t.num_stages &&
+          c.num_warps == t.num_warps && c.is_tma_allowed == t.tma) {
+        keep = true;
+        break;
+      }
+    }
+    if (keep) kept.push_back(c);
+  }
+  if (kept.empty()) return configs;
+  return kept;
 }
 
 }  // namespace
@@ -217,27 +250,75 @@ TritonBackend::GetSupportedConfigsForScaledDot(const HloInstruction* instr) {
 
   const bool exhaustive_search =
       debug_options().xla_gpu_exhaustive_tiling_search();
-  for (int block_m = 128; block_m <= 256; block_m *= 2) {
-    for (int block_n = 16; block_n <= 256; block_n *= 2) {
-      for (int block_k = 128; block_k <= 256; block_k *= 2) {
-        // TODO(b/436988479): fine tune the search space.
-        const int elements_per_thread = (block_m * block_n) / (4 * 32);
-        if (!exhaustive_search &&
-            (elements_per_thread > 64 ||
-             (block_k >= 256 && elements_per_thread >= 32))) {
-          VLOG(3) << "Ignoring spill over config: block_m=" << block_m
-                  << " block_n=" << block_n << " block_k=" << block_k;
-          continue;
-        }
 
-        configs.push_back(TritonGemmConfig(block_m, block_n,
-                                           /*block_k=*/block_k,
-                                           /*num_stages=*/1,
-                                           /*num_warps=*/4,
-                                           /*num_ctas=*/1,
-                                           /*is_tma_allowed=*/false));
+  const int64_t lhs_bits =
+      primitive_util::BitWidth(instr->operand(0)->shape().element_type());
+  const int64_t rhs_bits =
+      primitive_util::BitWidth(instr->operand(1)->shape().element_type());
+  const int64_t shared_memory_budget =
+      target_config().device_description.shared_memory_per_block_optin();
+
+  const DotDimensionNumbers& dnums = instr->dot_dimension_numbers();
+  const Shape& lhs_shape = instr->operand(0)->shape();
+  int64_t m = 1;
+  for (int64_t d = 0; d < lhs_shape.dimensions().size(); ++d) {
+    if (!absl::c_linear_search(dnums.lhs_contracting_dimensions(), d) &&
+        !absl::c_linear_search(dnums.lhs_batch_dimensions(), d)) {
+      m *= lhs_shape.dimensions(d);
+    }
+  }
+  const bool is_thin_m = m < 128;
+  const se::CudaComputeCapability* cuda_cc = gpu_cc.cuda_compute_capability();
+  const bool is_tcgen05 =
+      cuda_cc != nullptr &&
+      cuda_cc->major == se::CudaComputeCapability::kBlackwell;
+
+  // Below 128 rows a tcgen05 tile never reaches the block-scaled MMA and
+  // decomposes to bf16, so the floor is imposed rather than searched.
+  const int min_block_m = (is_thin_m && !is_tcgen05) ? 16 : 128;
+  const int max_block_m = is_thin_m ? 128 : 256;
+
+  for (int block_m = min_block_m; block_m <= max_block_m; block_m *= 2) {
+    for (int block_n = 16; block_n <= 256; block_n *= 2) {
+      for (int block_k = 128; block_k <= 512; block_k *= 2) {
+        const int max_stages = 8;
+        const int max_warps = 8;
+        for (int num_stages = 1; num_stages <= max_stages; ++num_stages) {
+          const int64_t operand_bytes_per_stage =
+              (block_m * block_k * lhs_bits + block_n * block_k * rhs_bits) / 8;
+          if ((num_stages - 1) * operand_bytes_per_stage >
+              shared_memory_budget) {
+            VLOG(3) << "Ignoring config that cannot fit in shared memory: "
+                    << "block_m=" << block_m << " block_n=" << block_n
+                    << " block_k=" << block_k << " num_stages=" << num_stages;
+            break;
+          }
+          for (int num_warps = 4; num_warps <= max_warps; num_warps *= 2) {
+            const int elements_per_thread =
+                (block_m * block_n) / (num_warps * 32);
+            if (!exhaustive_search && elements_per_thread > 64) {
+              VLOG(3) << "Ignoring spill over config: block_m=" << block_m
+                      << " block_n=" << block_n << " block_k=" << block_k
+                      << " num_warps=" << num_warps;
+              continue;
+            }
+            for (bool tma : {false, true}) {
+              if (tma && block_m < 128) {
+                continue;
+              }
+              configs.push_back(TritonGemmConfig(block_m, block_n,
+                                                 /*block_k=*/block_k,
+                                                 num_stages, num_warps,
+                                                 /*num_ctas=*/1,
+                                                 /*is_tma_allowed=*/tma));
+            }
+          }
+        }
       }
     }
+  }
+  if (!exhaustive_search) {
+    configs = RestrictScaledDotConfigsToDefaults(std::move(configs));
   }
   return configs;
 }
