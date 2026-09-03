@@ -165,6 +165,35 @@ cc_library(
 )
 
 cc_library(
+    name = "fp8_block_gemm_cutlass_fusion",
+    srcs = ["fp8_block_gemm_cutlass_fusion.cc"],
+    hdrs = ["fp8_block_gemm_cutlass_fusion.h"],
+    tags = ["cuda-only"],
+    visibility = [
+        "//xla/backends/gpu/codegen:__subpackages__",
+        "//xla/service/gpu:__subpackages__",
+    ],
+    deps = [
+        ":fusion_emitter",
+        "//xla/backends/gpu/codegen/kernels:fp8_block_gemm_cutlass",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
+        "//xla/backends/gpu/runtime:fp8_block_gemm_cutlass_thunk",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/codegen/emitters:kernel_arguments",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_constants",
+        "//xla/service/gpu:hlo_fusion_analysis",
+        "//xla/service/gpu:ir_emitter_context",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "fp8_block_gemv_fusion",
     srcs = ["fp8_block_gemv_fusion.cc"],
     hdrs = ["fp8_block_gemv_fusion.h"],
@@ -177,6 +206,7 @@ cc_library(
         "//xla/backends/gpu/codegen/kernels:custom_kernel",
         "//xla/backends/gpu/codegen/kernels:fp8_block_gemv_kernel",
         "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
+        "//xla:shape_util",
         "//xla/backends/gpu/runtime:custom_kernel_thunk",
         "//xla/backends/gpu/runtime:thunk",
         "//xla/codegen/emitters:kernel_arguments",
@@ -214,6 +244,7 @@ cc_library(
         "//xla/backends/gpu/codegen/emitters:reduction",
         "//xla/backends/gpu/codegen/emitters:scatter",
         "//xla/backends/gpu/codegen/emitters:transpose",
+        ":fp8_block_gemm_cutlass_fusion",
         ":fp8_block_gemv_fusion",
         "//xla/backends/gpu/codegen/tile_ir:fusion",
         "//xla/backends/gpu/codegen/triton:fusion",

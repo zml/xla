@@ -27,6 +27,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
 
@@ -34,13 +35,16 @@ struct Fp8BlockGemvSpec {
   int64_t activation_index;
   int64_t weight_index;
   int64_t scale_index;
+  // Only meaningful when w8a8: the activation's own [batch, k/128] scale.
+  int64_t act_scale_index;
   int64_t n;
   int64_t k;
   int64_t batch;
   bool activation_batch_major;
+  // f8e4m3fn activation with a per-row scale (W8A8), else bf16 with an identity scale (W8A16).
+  bool w8a8;
+  PrimitiveType weight_scale_type;
 };
-
-inline constexpr int64_t kMaxFp8BlockGemvReduceRows = 1;
 
 inline constexpr absl::string_view kFp8BlockGemvComputationPrefix =
     "fp8_block_gemv_";
@@ -59,7 +63,14 @@ std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
     const HloScaledDotInstruction& dot,
     const se::GpuComputeCapability& gpu_version);
 
-bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot);
+// Takes the capability: a batch neither one row nor a multiple of 16 is only the CUTLASS rung's.
+bool Fp8BlockGemvSupportsScaledDot(
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version);
+
+bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch);
+
+bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version);
 
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
     absl::string_view fn_name, const HloFusionInstruction& fusion,

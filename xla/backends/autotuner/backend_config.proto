@@ -40,5 +40,6 @@ message BackendConfig {
     xla.gpu.TileIrFusionConfig fp8_block_gemv_tile_ir = 902;
     xla.gpu.TileIrFusionConfig fp8_block_gemv_cuda = 903;
     xla.gpu.TileIrFusionConfig nvfp4_decode_dot = 904;
+    xla.gpu.Fp8BlockGemmCutlassConfig fp8_block_gemm_cutlass = 905;
   }
 }

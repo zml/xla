@@ -23,15 +23,16 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/custom.h"
 #include "xla/backends/gpu/codegen/emitters/concatenate.h"
 #include "xla/backends/gpu/codegen/emitters/in_place_dynamic_update_slice.h"
-#include "xla/backends/gpu/codegen/fp8_block_gemv_fusion.h"
-#include "xla/backends/gpu/codegen/tile_ir/fusion.h"
 #include "xla/backends/gpu/codegen/emitters/loop.h"
 #include "xla/backends/gpu/codegen/emitters/mlir_kernel_emitter.h"
 #include "xla/backends/gpu/codegen/emitters/reduction.h"
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
+#include "xla/backends/gpu/codegen/fp8_block_gemm_cutlass_fusion.h"
+#include "xla/backends/gpu/codegen/fp8_block_gemv_fusion.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/sort.h"
+#include "xla/backends/gpu/codegen/tile_ir/fusion.h"
 #include "xla/backends/gpu/codegen/triton/fusion.h"
 #include "xla/codegen/ir_emission_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -112,6 +113,8 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       return std::make_unique<tile_ir::TileIrFusion>(analysis);
     case HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemvCuda:
       return std::make_unique<Fp8BlockGemvFusion>(analysis);
+    case HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemmCutlass:
+      return std::make_unique<Fp8BlockGemmCutlassFusion>(analysis);
   }
 }
 
