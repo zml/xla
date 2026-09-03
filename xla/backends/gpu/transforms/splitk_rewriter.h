@@ -26,6 +26,16 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+struct SplitScaledDot {
+  HloInstruction* root;
+  HloInstruction* dot;
+};
+
+// SplitkRewriter's rewrite, for an arm that claims before the pass runs. `split_k` must divide
+// every operand's contraction.
+absl::StatusOr<SplitScaledDot> SplitScaledDotContraction(
+    HloInstruction* scaled_dot, int64_t split_k);
+
 // Rewrites dot instructions that don't fully utilize cores but have a long K
 // dimension. For such dots, the input tensors are split along the K dimension
 // (forming a new batch dimension) and the resulting dot is reduced along the
