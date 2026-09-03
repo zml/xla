@@ -19,7 +19,9 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include "absl/log/check.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
 #include "xla/hlo/testlib/filecheck.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
@@ -213,6 +215,108 @@ CHECK: dot({{.*}}), lhs_batch_dims={1}, lhs_contracting_dims={2}, rhs_batch_dims
 CHECK: ROOT {{.*}} = f32[1024,2048]{1,0} reduce
   )")
                   .value_or(false));
+}
+
+constexpr absl::string_view kUnderOccupiedFp8Projection = R"(
+    HloModule module
+
+    ENTRY test {
+      w = f8e4m3fn[5120,6144]{1,0} parameter(0)
+      s = bf16[5120]{0} parameter(1)
+      a = bf16[6144,1]{1,0} parameter(2)
+      cw = bf16[5120,6144]{1,0} convert(w)
+      bs = bf16[5120,6144]{1,0} broadcast(s), dimensions={0}
+      m = bf16[5120,6144]{1,0} multiply(cw, bs)
+      ROOT d = bf16[5120,1]{1,0} dot(m, a),
+                             lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    })";
+
+int64_t SplitKOf(const HloModule& module) {
+  for (const HloInstruction* instr :
+       module.entry_computation()->instructions()) {
+    if (instr->opcode() != HloOpcode::kDot) {
+      continue;
+    }
+    const auto& dnums = instr->dot_dimension_numbers();
+    if (dnums.lhs_batch_dimensions().empty()) {
+      return 0;
+    }
+    return instr->operand(0)->shape().dimensions(
+        dnums.lhs_batch_dimensions(0));
+  }
+  return 0;
+}
+
+TEST_F(SplitkRewriterTest, TargetWavesNeverSplitsLessThanTheCostModel) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> floored,
+      ParseAndReturnVerifiedModule(kUnderOccupiedFp8Projection));
+  CHECK_OK(rewriter_.HloModulePass::Run(floored.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> plain,
+      ParseAndReturnVerifiedModule(kUnderOccupiedFp8Projection));
+  CHECK_OK(rewriter_.HloModulePass::Run(plain.get()));
+
+  EXPECT_GE(SplitKOf(*floored), SplitKOf(*plain));
+  EXPECT_GT(SplitKOf(*floored), 1);
+}
+
+TEST_F(SplitkRewriterTest, TargetWavesSplitsAnUnderOccupiedDot) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module,
+      ParseAndReturnVerifiedModule(kUnderOccupiedFp8Projection));
+
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          rewriter_.HloModulePass::Run(module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_TRUE(RunFileCheck(module->ToString(), R"(
+CHECK: dot({{.*}}), lhs_batch_dims={1}
+CHECK: reduce
+  )")
+                  .value_or(false));
+}
+
+TEST_F(SplitkRewriterTest, TargetWavesLeavesAWellOccupiedDotAlone) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      lhs = f32[16384,512]{1,0} parameter(0)
+      rhs = f32[512,16384]{1,0} parameter(1)
+      ROOT dot = f32[16384,16384]{1,0} dot(lhs, rhs),
+                             lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> with_floor,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed_with_floor,
+                          rewriter_.HloModulePass::Run(with_floor.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> without_floor,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed_without_floor,
+                          rewriter_.HloModulePass::Run(without_floor.get()));
+
+  EXPECT_EQ(changed_with_floor, changed_without_floor);
+  EXPECT_EQ(with_floor->ToString(), without_floor->ToString());
+}
+
+TEST_F(SplitkRewriterTest, TargetWavesLeavesADotJustUnderOneWaveAlone) {
+  const char* hlo_string = R"(
+    HloModule module
+
+    ENTRY test {
+      x = bf16[16,5120]{1,0} parameter(0)
+      w = f8e4m3fn[5120,16384]{1,0} parameter(1)
+      cw = bf16[5120,16384]{1,0} convert(w)
+      ROOT d = bf16[16,16384]{1,0} dot(x, cw),
+                             lhs_contracting_dims={1}, rhs_contracting_dims={0}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          rewriter_.HloModulePass::Run(module.get()));
+  EXPECT_FALSE(changed);
 }
 
 }  // namespace
