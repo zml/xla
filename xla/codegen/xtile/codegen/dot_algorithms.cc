@@ -108,7 +108,24 @@ absl::StatusOr<Value> ScaledDot(mlir::ImplicitLocOpBuilder& b,
     for (int64_t i = 0; i < rank; ++i) {
       permutation[i] = i;
     }
-    std::swap(permutation[rank - 2], permutation[rank - 1]);
+    const auto& dnums = dot.dot_dimension_numbers();
+    int64_t swap_a = rank - 2;
+    int64_t swap_b = rank - 1;
+    if (!dnums.rhs_batch_dimensions().empty() &&
+        dnums.rhs_contracting_dimensions_size() == 1 &&
+        rank == dot.operand(1)->shape().dimensions().size()) {
+      const int64_t contracting = dnums.rhs_contracting_dimensions(0);
+      for (int64_t d = 0; d < rank; ++d) {
+        if (d == contracting ||
+            absl::c_linear_search(dnums.rhs_batch_dimensions(), d)) {
+          continue;
+        }
+        swap_a = contracting;
+        swap_b = d;
+        break;
+      }
+    }
+    std::swap(permutation[swap_a], permutation[swap_b]);
     rhs_scale = mlir::stablehlo::TransposeOp::create(
         b, rhs_scale, b.getDenseI64ArrayAttr(permutation));
   }
