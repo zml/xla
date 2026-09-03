@@ -237,6 +237,12 @@ message CuDnnFusionConfig {
   PrecisionConfig precision_config = 2;
 }
 
+message TileIrFusionConfig {
+  xla.xtile.BlockLevelFusionConfig block_level_fusion_config = 1;
+
+  int64 contracting_tile_size = 2;
+}
+
 // The block-level tiling of a block-128 FP8 projection plus its contracting tile.
 message Fp8BlockGemvFusionConfig {
   xla.xtile.BlockLevelFusionConfig block_level_fusion_config = 1;
