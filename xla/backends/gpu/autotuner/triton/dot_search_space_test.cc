@@ -470,7 +470,17 @@ TEST_F(DotSearchSpaceTest, GenerateAndOptimizeConfigsFiltersConfigsByHints) {
   TritonGemmConfig hint = all_configs.front();
   std::vector<TritonGemmConfig> candidate_configs =
       search_space.GenerateAndOptimizeConfigs({hint});
-  EXPECT_THAT(candidate_configs, ElementsAre(hint));
+  // A hint admits both TMA twins of its tiling, so the hinted config comes back
+  // alongside the same tiling with TMA enabled.
+  EXPECT_THAT(candidate_configs,
+              ElementsAre(hint, AllOf(Field(&TritonGemmConfig::block_m,
+                                            hint.block_m),
+                                      Field(&TritonGemmConfig::block_n,
+                                            hint.block_n),
+                                      Field(&TritonGemmConfig::block_k,
+                                            hint.block_k),
+                                      Field(&TritonGemmConfig::is_tma_allowed,
+                                            true))));
 }
 
 TEST_F(DotSearchSpaceTest,
