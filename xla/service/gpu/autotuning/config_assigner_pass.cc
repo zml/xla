@@ -101,7 +101,7 @@ AutotuneDecision AllowRegSpillsForGpuInstruction(
     if (gpu_config.ok()) {
       const FusionBackendConfig& backend_config =
           gpu_config->fusion_backend_config();
-      if (backend_config.kind() == kTritonGemmFusionKind ||
+      if (IsGemmFusionAutotuneKind(backend_config.kind()) ||
           backend_config.kind() == kCuDnnFusionKind ||
           backend_config.kind() == kCustomFusionKind) {
         return AutotuneDecision::Forbid(
@@ -158,7 +158,7 @@ AutotuneDecision ShouldAssignConfigToGemmFusion(
   }
   const FusionBackendConfig& backend_config =
       gpu_config->fusion_backend_config();
-  if (backend_config.kind() == kTritonGemmFusionKind) {
+  if (IsGemmFusionAutotuneKind(backend_config.kind())) {
     if (backend_config.has_triton_gemm_config()) {
       return AutotuneDecision::Forbid(
           "Triton GEMM fusion already has a config");
@@ -216,7 +216,7 @@ AutotuneDecision ShouldAssignConfigToInstruction(
     }
     const FusionBackendConfig& backend_config =
         gpu_config->fusion_backend_config();
-    if (backend_config.kind() == kTritonGemmFusionKind ||
+    if (IsGemmFusionAutotuneKind(backend_config.kind()) ||
         backend_config.kind() == kCuDnnFusionKind ||
         backend_config.kind() == kCustomFusionKind) {
       return ShouldAssignConfigToGemmFusion(instruction);

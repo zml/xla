@@ -135,7 +135,7 @@ ENTRY entry {
   ROOT fusion = bf16[4,4] fusion(p0, p1, p2, p3),
     kind=kCustom, calls=scaled_dot, backend_config={
       "fusion_backend_config": {
-        "kind":"__triton_gemm",
+        "kind":"__scaled_gemm",
         "triton_gemm_config": {
           "block_m":"16", "block_n":"32", "block_k":"64",
           "num_stages":"1", "num_warps":"4", "num_ctas":"1"
