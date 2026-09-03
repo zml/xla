@@ -389,6 +389,7 @@ TEST_P(TritonBackendTest, ScaledDotConfigsAreGenerated) {
           *(module->entry_computation()->root_instruction()));
   EXPECT_THAT(configs, absl_testing::IsOk());
   EXPECT_GT(configs.value().size(), 0);
+  EXPECT_LE(configs.value().size(), 16);
 
   debug_options_.set_xla_gpu_exhaustive_tiling_search(true);
   ASSERT_OK_AND_ASSIGN(
