@@ -427,7 +427,8 @@ FusionDecision ShouldProceedWithSymbolicTileDerivation(
   // due to reshapes.
   if (hlo->opcode() == HloOpcode::kPad &&
       !IsWithinFusion(*hlo, {gpu::kTritonNestedGemmFusionKind,
-                             gpu::kTritonGemmFusionKind})) {
+                             gpu::kTritonGemmFusionKind,
+                             gpu::kScaledGemmFusionKind})) {
     return FusionDecision::Forbid("Bailing out on ") << hlo->ToString();
   }
 
