@@ -1044,7 +1044,8 @@ bool IsTritonFusedComputation(const HloComputation& computation) {
       static_cast<HloFusionInstruction*>(computation.FusionInstruction());
   return fusion != nullptr &&
          fusion->fusion_kind() == HloInstruction::FusionKind::kCustom &&
-         IsGpuFusionKind(*fusion, kTritonGemmFusionKind);
+         (IsGpuFusionKind(*fusion, kTritonGemmFusionKind) ||
+          IsGpuFusionKind(*fusion, kScaledGemmFusionKind));
 }
 
 bool IsTritonGemm(const HloInstruction& instr) {
@@ -1053,6 +1054,7 @@ bool IsTritonGemm(const HloInstruction& instr) {
     return false;
   }
   if (!IsGpuFusionKind(instr, kTritonGemmFusionKind) &&
+      !IsGpuFusionKind(instr, kScaledGemmFusionKind) &&
       !IsGpuFusionKind(instr, kTritonNestedGemmFusionKind)) {
     return false;
   }

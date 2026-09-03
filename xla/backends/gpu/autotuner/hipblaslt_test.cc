@@ -244,7 +244,7 @@ ENTRY %main (lhs: f8e4m3fn[32,256], rhs: f8e4m3fn[16,256], lhs_scale: f8e8m0fnu[
   %rhs = f8e4m3fn[16,256]{1,0} parameter(1)
   %lhs_scale = f8e8m0fnu[32,8]{1,0} parameter(2)
   %rhs_scale = f8e8m0fnu[16,8]{1,0} parameter(3)
-  ROOT %fusion = f32[32,16]{1,0} fusion(%lhs, %rhs, %lhs_scale, %rhs_scale), kind=kCustom, calls=%fusion_dot, backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+  ROOT %fusion = f32[32,16]{1,0} fusion(%lhs, %rhs, %lhs_scale, %rhs_scale), kind=kCustom, calls=%fusion_dot, backend_config={"fusion_backend_config":{"kind":"__scaled_gemm"}}
 })";
 
 const char kScaledDotFp4FusionHlo[] = R"(
@@ -263,7 +263,7 @@ ENTRY %main (lhs: f4e2m1fn[32,256], rhs: f4e2m1fn[16,256], lhs_scale: f8e8m0fnu[
   %rhs = f4e2m1fn[16,256]{1,0} parameter(1)
   %lhs_scale = f8e8m0fnu[32,8]{1,0} parameter(2)
   %rhs_scale = f8e8m0fnu[16,8]{1,0} parameter(3)
-  ROOT %fusion = f32[32,16]{1,0} fusion(%lhs, %rhs, %lhs_scale, %rhs_scale), kind=kCustom, calls=%fusion_dot, backend_config={"fusion_backend_config":{"kind":"__triton_gemm"}}
+  ROOT %fusion = f32[32,16]{1,0} fusion(%lhs, %rhs, %lhs_scale, %rhs_scale), kind=kCustom, calls=%fusion_dot, backend_config={"fusion_backend_config":{"kind":"__scaled_gemm"}}
 })";
 
 class HipblasLtScaledDotTest : public HipblasLtBackendTest {
