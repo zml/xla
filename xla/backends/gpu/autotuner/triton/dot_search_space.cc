@@ -189,13 +189,19 @@ std::vector<TritonGemmConfig> TritonDotFusionSearchSpace::OptimizeConfigSet(
         std::clamp(config.block_k, min_contracting_tile_size_,
                    GetMaxContractingTileSize({config.block_m, config.block_n}));
 
+    config.is_tma_allowed = false;
+    config.is_warp_specialization_allowed = false;
+
     VLOG(10) << "Adding config to hint filter: " << config.ToString();
     filter.insert(config);
   }
 
   std::vector<TritonGemmConfig> result_configs;
   for (const TritonGemmConfig& config : configs) {
-    if (!filter.contains(config)) {
+    TritonGemmConfig key = config;
+    key.is_tma_allowed = false;
+    key.is_warp_specialization_allowed = false;
+    if (!filter.contains(key)) {
       continue;
     }
     VLOG(10) << "Filtering out configs based on hints: surviving config = "
