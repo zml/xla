@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/compiler.h"
 #include "xla/service/gpu/backend_configs.pb.h"
@@ -120,6 +121,26 @@ absl::string_view kF64GemmFusionHlo = R"hlo(
     p1 = f64[3,28,32] parameter(1)
     ROOT _ = f64[3,32,32] fusion(p0, p1), kind=kCustom, calls=fusion1,
       backend_config={"fusion_backend_config": {kind: "__triton_gemm"}}
+  })hlo";
+
+absl::string_view kThinMScaledDotGemmFusionHlo = R"hlo(
+  block_scaled_dot {
+    lhs = f8e4m3fn[16,128] parameter(0)
+    rhs = f8e4m3fn[384,128] parameter(1)
+    lhs_scale = f8e8m0fnu[16,4] parameter(2)
+    rhs_scale = f8e8m0fnu[384,4] parameter(3)
+    ROOT result = f32[16,384] scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+        lhs_contracting_dims={1}, rhs_contracting_dims={1}
+  }
+
+  ENTRY main {
+    lhs = f8e4m3fn[16,128] parameter(0)
+    rhs = f8e4m3fn[384,128] parameter(1)
+    lhs_scale = f8e8m0fnu[16,4] parameter(2)
+    rhs_scale = f8e8m0fnu[384,4] parameter(3)
+    ROOT result = f32[16,384] fusion(lhs, rhs, lhs_scale, rhs_scale),
+        kind=kCustom, calls=block_scaled_dot,
+        backend_config={"fusion_backend_config":{kind:"__triton_gemm"}}
   })hlo";
 
 absl::string_view kScaledDotGemmFusionHlo = R"hlo(
@@ -262,6 +283,23 @@ TEST_F(CudnnBackendTest, GetSupportedConfigsFromScaledDotGemmFusion) {
   EXPECT_THAT(configs, absl_testing::IsOkAndHolds(SizeIs(Gt(0))));
 }
 
+TEST_F(CudnnBackendTest, DeclinesAThinMScaledDotOnSm103) {
+  se::CudaComputeCapability cc =
+      stream_executor_->GetDeviceDescription().cuda_compute_capability();
+  if (!(cc.major == se::CudaComputeCapability::kBlackwell && cc.minor == 3)) {
+    GTEST_SKIP() << "The thin-M block-scaled decline is sm_103 only.";
+  }
+
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> hlo_module,
+      ParseAndReturnVerifiedModule(kThinMScaledDotGemmFusionHlo));
+  CudnnBackend backend(stream_executor_, &debug_options_, &compiler_,
+                       &target_config_);
+  EXPECT_THAT(backend.GetSupportedConfigs(
+                  *hlo_module->entry_computation()->root_instruction()),
+              absl_testing::IsOkAndHolds(SizeIs(0)));
+}
+
 TEST_F(CudnnBackendTest, GetSupportedConfigsFromCudnnCustomCall) {
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
                        ParseAndReturnVerifiedModule(kCudnnCustomCallHlo));
@@ -371,6 +409,35 @@ TEST_F(CudnnBackendTest, ApplyConfigToCudnnFusion) {
                        fusion_instr->backend_config<GpuBackendConfig>());
   EXPECT_EQ(gpu_config.fusion_backend_config().cudnn_fusion_config().plan_id(),
             1);
+}
+
+TEST_F(CudnnBackendTest, ApplyConfigToScaledDotFusionSwizzlesScales) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                       ParseAndReturnVerifiedModule(kScaledDotGemmFusionHlo));
+  CudnnBackendConfig config;
+  config.set_algo_id(1);
+  BackendConfig backend_config;
+  *backend_config.mutable_algorithm() = config;
+  ASSERT_OK(backend_->ApplyConfig(
+      *hlo_module->entry_computation()->root_instruction(), backend_config));
+
+  const HloInstruction* fusion =
+      hlo_module->entry_computation()->root_instruction();
+  ASSERT_EQ(fusion->opcode(), HloOpcode::kFusion);
+
+  ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
+                       fusion->backend_config<GpuBackendConfig>());
+  EXPECT_EQ(gpu_config.fusion_backend_config().kind(), kCuDnnFusionKind);
+  EXPECT_EQ(gpu_config.fusion_backend_config().cudnn_fusion_config().plan_id(),
+            1);
+
+  for (int i = 2; i < 4; ++i) {
+    const HloInstruction* scale = fusion->operand(i);
+    EXPECT_NE(scale->opcode(), HloOpcode::kParameter)
+        << "scale operand " << i << " was passed to cuDNN unswizzled";
+    ASSERT_EQ(scale->opcode(), HloOpcode::kGetTupleElement);
+    EXPECT_EQ(scale->operand(0)->opcode(), HloOpcode::kCall);
+  }
 }
 
 TEST_F(CudnnBackendTest, ApplyConfigToTritonGemmFusionSetsCudnnKind) {
