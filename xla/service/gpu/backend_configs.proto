@@ -237,6 +237,12 @@ message CuDnnFusionConfig {
   PrecisionConfig precision_config = 2;
 }
 
+message TileIrFusionConfig {
+  xla.xtile.BlockLevelFusionConfig block_level_fusion_config = 1;
+
+  int64 contracting_tile_size = 2;
+}
+
 // A backend config for dynamic-slice and dynamic-update-slice instructions
 // whose runtime offset is a simple function of the parent loop iteration.
 // Only set on instructions where offset analysis succeeds; absence of this

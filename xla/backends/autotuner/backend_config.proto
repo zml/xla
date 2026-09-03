@@ -34,5 +34,7 @@ message BackendConfig {
     stream_executor.dnn.AlgorithmProto algorithm = 4;
     xla.cpu.LlvmKernelOptions llvm_kernel = 5;
     xla.gpu.NativeEmitterBackendConfig native_emitter = 6;
+    // 900+ keeps clear of upstream's ids.
+    xla.gpu.TileIrFusionConfig tile_ir = 900;
   }
 }

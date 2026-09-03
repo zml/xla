@@ -1763,6 +1763,9 @@ message DebugOptions {
   // We need this to enable triton scaled dot emitter for testing.
   optional bool xla_gpu_experimental_scaled_dot_with_triton = 410;
 
+  // 900+ keeps clear of upstream's ids.
+  optional bool xla_gpu_experimental_scaled_dot_with_tile_ir = 900;
+
   // If true, use MultiGpuBarrierWithNcclKernel in one-shot RaggedAllToAll
   // thunk.
   optional bool xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl =

@@ -39,4 +39,6 @@ enum Backend {
   CUBLASLT_FISSION = 13;
   CUSTOM_KERNEL_FISSION = 14;
   HIPBLASLT_FISSION = 16;
+  // 900+ keeps clear of upstream's ids.
+  TILE_IR = 900;
 }
