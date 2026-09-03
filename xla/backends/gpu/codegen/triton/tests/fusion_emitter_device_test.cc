@@ -2718,6 +2718,512 @@ INSTANTIATE_TEST_SUITE_P(
         ::testing::Bool(), ::testing::Bool(), ::testing::Bool()),
     Fp4ScaledDotTestParamToString);
 
+TEST_P(TritonScaledDotTest, Fp4ScaledDotCanonicalRhsAllOnes) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4CanonicalRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNonCanonicalRhsAllOnes) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NonCanonicalRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[256,128] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[256,8] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={1}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {256, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotScaleGroupProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ScaleGroupProbe
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  Literal ls = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f));
+  for (int m = 0; m < 128; ++m) {
+    ls.Set<tsl::float8_e4m3fn>({m, 0}, tsl::float8_e4m3fn(2.0f));
+  }
+  args.push_back(std::move(ls));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4KPairingProbe
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNonCanonicalKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NonCanonicalKPairing
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[256,128] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[256,8] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={1}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {256, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int n = 0; n < 256; ++n) {
+    for (int k = 1; k < 128; k += 2) {
+      rhs.Set<tsl::float4_e2m1fn>({n, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotExplicitTransposedRhsKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ExplicitTransposedRhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs_nk = f4e2m1fn[256,128] parameter(1)
+  rhs = f4e2m1fn[128,256] transpose(rhs_nk), dimensions={1,0}
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale_nk = f8e4m3fn[256,8] parameter(3)
+  rhs_scale = f8e4m3fn[8,256] transpose(rhs_scale_nk), dimensions={1,0}
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs_nk =
+      LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+          {256, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i) {
+    for (int k = 1; k < 128; k += 2) {
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  for (int n = 0; n < 256; ++n) {
+    for (int k = 1; k < 128; k += 2) {
+      rhs_nk.Set<tsl::float4_e2m1fn>({n, k}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs_nk));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {256, 8}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotRhsScaleGroupProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4RhsScaleGroup
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  Literal rs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f));
+  for (int n = 0; n < 256; ++n) {
+    rs.Set<tsl::float8_e4m3fn>({0, n}, tsl::float8_e4m3fn(2.0f));
+  }
+  args.push_back(std::move(rs));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotM1DecodeKPairingProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4M1Decode
+ENTRY e {
+  lhs = f4e2m1fn[1,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[1,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[1,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {1, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int k = 1; k < 128; k += 2) {
+    lhs.Set<tsl::float4_e2m1fn>({0, k}, tsl::float4_e2m1fn(2.0f));
+  }
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {1, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotComputedReshapedLhsProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4ComputedReshapedLhs
+ENTRY e {
+  x = bf16[128,8,16] parameter(0)
+  xf4 = f4e2m1fn[128,8,16] convert(x)
+  lhs = f4e2m1fn[128,128] reshape(xf4)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal x = LiteralUtil::CreateFullWithDescendingLayout<tsl::bfloat16>(
+      {128, 8, 16}, tsl::bfloat16{1.0f});
+  for (int m = 0; m < 128; ++m) {
+    for (int sc = 0; sc < 8; ++sc) {
+      for (int kb = 0; kb < 16; ++kb) {
+        int k = sc * 16 + kb;
+        if (k % 2 == 1) x.Set<tsl::bfloat16>({m, sc, kb}, tsl::bfloat16{2.0f});
+      }
+    }
+  }
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int k = 1; k < 128; k += 2) {
+    for (int n = 0; n < 256; ++n) {
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+    }
+  }
+  args.push_back(std::move(x));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotFusedGlobalMultiplyProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4FusedGlobalMul
+
+fusion_sd {
+  p0 = f4e2m1fn[128,128] parameter(0)
+  p1 = f4e2m1fn[128,256] parameter(1)
+  p2 = f8e4m3fn[128,8] parameter(2)
+  p3 = f8e4m3fn[8,256] parameter(3)
+  p4 = f32[] parameter(4)
+  sd = f32[128,256]{1,0} scaled-dot(p0, p1, p2, p3),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0},
+    backend_config={sizes:[128]}
+  b = f32[128,256]{1,0} broadcast(p4), dimensions={}
+  m = f32[128,256]{1,0} multiply(sd, b)
+  ROOT r = bf16[128,256]{1,0} convert(m)
+}
+
+ENTRY e {
+  p0 = f4e2m1fn[128,128] parameter(0)
+  p1 = f4e2m1fn[128,256] parameter(1)
+  p2 = f8e4m3fn[128,8] parameter(2)
+  p3 = f8e4m3fn[8,256] parameter(3)
+  p4 = f32[] parameter(4)
+  ROOT r = bf16[128,256]{1,0} fusion(p0, p1, p2, p3, p4), kind=kCustom,
+    calls=fusion_sd,
+    backend_config={"fusion_backend_config":{"kind":"__triton_nested_gemm_fusion",
+      "block_level_fusion_config":{"output_tiles":[{"sizes":["32","128"]}],
+      "num_warps":"4","num_stages":"1","num_ctas":"1"}}}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i)
+    for (int k = 1; k < 128; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(2.0f));
+  for (int k = 1; k < 128; k += 2)
+    for (int n = 0; n < 256; ++n)
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateR0<float>(0.5f));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotNegativeLhsProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4NegativeLhs
+ENTRY e {
+  lhs = f4e2m1fn[128,128] parameter(0)
+  rhs = f4e2m1fn[128,256] parameter(1)
+  lhs_scale = f8e4m3fn[128,8] parameter(2)
+  rhs_scale = f8e4m3fn[8,256] parameter(3)
+  ROOT _ = bf16[128,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 128}, tsl::float4_e2m1fn(1.0f));
+  for (int i = 0; i < 128; ++i)
+    for (int k = 1; k < 128; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({i, k}, tsl::float4_e2m1fn(-2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {128, 256}, tsl::float4_e2m1fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {128, 8}, tsl::float8_e4m3fn(1.0f)));
+  args.push_back(LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {8, 256}, tsl::float8_e4m3fn(1.0f)));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/0.5, /*arel=*/1e-2}));
+}
+
+TEST_P(TritonScaledDotTest, Fp4ScaledDotLargeKProbe) {
+  if (auto cc = GpuComputeCapability().cuda_compute_capability();
+      cc && !cc->IsAtLeastBlackwell()) {
+    GTEST_SKIP() << "NVFP4 scaled dot requires Blackwell+.";
+  }
+  constexpr absl::string_view kHloText = R"hlo(
+HloModule Fp4LargeK
+ENTRY e {
+  lhs = f4e2m1fn[16,3840] parameter(0)
+  rhs = f4e2m1fn[3840,256] parameter(1)
+  lhs_scale = f8e4m3fn[16,240] parameter(2)
+  rhs_scale = f8e4m3fn[240,256] parameter(3)
+  ROOT _ = bf16[16,256]{1,0} scaled-dot(lhs, rhs, lhs_scale, rhs_scale),
+    lhs_contracting_dims={1},
+    rhs_contracting_dims={0}
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, GetOptimizedModule(kHloText));
+  std::vector<Literal> args;
+  Literal lhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {16, 3840}, tsl::float4_e2m1fn(1.0f));
+  Literal rhs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float4_e2m1fn>(
+      {3840, 256}, tsl::float4_e2m1fn(1.0f));
+  for (int m = 0; m < 16; ++m)
+    for (int k = 1; k < 3840; k += 2)
+      lhs.Set<tsl::float4_e2m1fn>({m, k}, tsl::float4_e2m1fn(-2.0f));
+  for (int k = 1; k < 3840; k += 2)
+    for (int n = 0; n < 256; ++n)
+      rhs.Set<tsl::float4_e2m1fn>({k, n}, tsl::float4_e2m1fn(2.0f));
+  args.push_back(std::move(lhs));
+  args.push_back(std::move(rhs));
+  Literal ls = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {16, 240}, tsl::float8_e4m3fn(1.0f));
+  for (int m = 0; m < 16; ++m)
+    for (int g = 0; g < 240; ++g)
+      if (g % 2 == 1) ls.Set<tsl::float8_e4m3fn>({m, g}, tsl::float8_e4m3fn(2.0f));
+  Literal rs = LiteralUtil::CreateFullWithDescendingLayout<tsl::float8_e4m3fn>(
+      {240, 256}, tsl::float8_e4m3fn(1.0f));
+  for (int g = 0; g < 240; ++g)
+    if (g % 3 == 0)
+      for (int n = 0; n < 256; ++n)
+        rs.Set<tsl::float8_e4m3fn>({g, n}, tsl::float8_e4m3fn(3.0f));
+  args.push_back(std::move(ls));
+  args.push_back(std::move(rs));
+  EXPECT_TRUE(RunAndCompareNoHloPasses(std::move(module),
+                                       LiteralUtil::MakePointers(args),
+                                       ErrorSpec{/*aabs=*/2.0, /*arel=*/1e-2}));
+}
+
 TEST_P(TritonScaledDotTest,
        ScaledDotWithOmmittedLhsScaleGetFusedAndExecutedCorrectly) {
   if (auto cc = GpuComputeCapability().cuda_compute_capability();
