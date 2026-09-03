@@ -41,4 +41,5 @@ enum Backend {
   HIPBLASLT_FISSION = 16;
   // 900+ keeps clear of upstream's ids.
   TILE_IR = 900;
+  NVFP4_DECODE_DOT = 904;
 }

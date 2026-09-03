@@ -302,6 +302,34 @@ xla_test(
 )
 
 xla_test(
+    name = "nvfp4_decode_dot_test",
+    srcs = ["nvfp4_decode_dot_test.cc"],
+    backends = [
+        "b200",
+    ],
+    tags = [
+        "cuda-only",
+        "no_mac",
+    ],
+    use_legacy_runtime = True,
+    deps = [
+        ":nvfp4_decode_dot",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backend_config_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:compiler",
+        "//xla/service:platform_util",
+        "//xla/service/gpu:nvptx_compiler_impl",
+        "//xla/stream_executor:stream_executor_h",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
+xla_test(
     name = "tile_ir_test",
     srcs = ["tile_ir_test.cc"],
     backends = [
@@ -326,6 +354,37 @@ xla_test(
         "//xla/tsl/platform:statusor",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_library(
+    name = "nvfp4_decode_dot",
+    srcs = ["nvfp4_decode_dot.cc"],
+    hdrs = ["nvfp4_decode_dot.h"],
+    tags = ["gpu"],
+    deps = [
+        ":gpu_codegen_backend",
+        "//xla:xla_proto_cc",
+        "//xla/backends/autotuner:backend_config_proto_cc",
+        "//xla/backends/autotuner:backends_proto_cc",
+        "//xla/backends/autotuner:codegen_backend",
+        "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
+        "//xla/backends/gpu/transforms:convert_triton_gemm_config",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service/gpu:matmul_utils",
+        "//xla/codegen/xtile:block_level_parameters",
+        "@llvm-project//mlir:IR",
+        "@com_google_absl//absl/log",
+        "//xla/service:compiler",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -597,6 +656,7 @@ cc_library(
         ":block_level_emitter",
         ":cublaslt",
         ":cudnn",
+        ":nvfp4_decode_dot",
         ":factory",
         ":fission_backend",
         ":native_emitter",

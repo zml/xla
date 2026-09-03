@@ -3001,10 +3001,41 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "cuda_fused_scaled_dot_arms",
+    srcs = ["cuda_fused_scaled_dot_arms.cc"],
+    hdrs = ["cuda_fused_scaled_dot_arms.h"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":fused_scaled_dot_rewriter",
+        ":splitk_rewriter",
+        "//xla:shape_util",
+        "//xla/backends/gpu/codegen/triton:nvfp4_decode_dot",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
+        "//xla/service:matmul_indexing_utils",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/stream_executor:device_description",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 xla_cc_test(
     name = "fused_scaled_dot_rewriter_test",
     srcs = ["fused_scaled_dot_rewriter_test.cc"],
     deps = [
+        ":cuda_fused_scaled_dot_arms",
+        "//xla:shape_util",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "@com_google_absl//absl/status:status_matchers",
         ":fused_scaled_dot_rewriter",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
