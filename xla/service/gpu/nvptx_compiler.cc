@@ -42,6 +42,8 @@ limitations under the License.
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/MLIRContext.h"
+#include "xla/backends/gpu/codegen/triton/nvfp4_decode_dot.h"
+#include "xla/backends/gpu/transforms/cuda_fused_scaled_dot_arms.h"
 #include "xla/backends/gpu/transforms/algebraic_simplifier.h"
 #include "xla/backends/gpu/transforms/block_scaling_rewriter.h"
 #include "xla/backends/gpu/transforms/conv_fp8_fallback.h"
@@ -301,9 +303,27 @@ bool NVPTXCompiler::IsScaledDotSupportedByBackend(
     return true;
   }
   if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
+    if (MatchNvfp4DecodeDot(*scaled_dot,
+                            gpu_target_config.device_description
+                                .gpu_compute_capability())
+            .has_value()) {
+      return true;
+    }
     return CudnnScaledDotHelper::IsSupported(scaled_dot);
   }
   return false;
+}
+
+std::vector<FusedScaledDotArm> NVPTXCompiler::FusedScaledDotArms(
+    FusedScaledDotPhase phase, const DebugOptions& debug_options,
+    const GpuTargetConfig& gpu_target_config) const {
+  std::vector<FusedScaledDotArm> arms;
+  if (phase != FusedScaledDotPhase::kPostLayout ||
+      !debug_options.xla_gpu_enable_triton_gemm()) {
+    return arms;
+  }
+  arms.push_back(Nvfp4DecodeDotArm(gpu_target_config.device_description));
+  return arms;
 }
 
 absl::Status NVPTXCompiler::OptimizeHloPostLayoutAssignment(

@@ -74,6 +74,10 @@ class NVPTXCompiler : public GpuCompiler {
       const HloInstruction* instr,
       const GpuTargetConfig& gpu_target_config) const override;
 
+  std::vector<FusedScaledDotArm> FusedScaledDotArms(
+      FusedScaledDotPhase phase, const DebugOptions& debug_options,
+      const GpuTargetConfig& gpu_target_config) const override;
+
   absl::Status OptimizeHloPostLayoutAssignment(
       HloModule* hlo_module, se::StreamExecutor* stream_exec,
       const CompileOptions& options, const GpuTopology& gpu_topology,

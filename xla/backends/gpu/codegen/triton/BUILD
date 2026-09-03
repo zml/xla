@@ -242,6 +242,21 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "nvfp4_decode_dot",
+    srcs = ["nvfp4_decode_dot.cc"],
+    hdrs = ["nvfp4_decode_dot.h"],
+    tags = ["no-oneapi"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/stream_executor:device_description",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
     name = "fp8_block_gemv",
     srcs = ["fp8_block_gemv.cc"],
     hdrs = ["fp8_block_gemv.h"],
@@ -273,6 +288,24 @@ cc_library(
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TensorDialect",
         "@stablehlo//:stablehlo_ops",
+    ],
+)
+
+xla_cc_test(
+    name = "nvfp4_decode_dot_test",
+    srcs = ["nvfp4_decode_dot_test.cc"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":nvfp4_decode_dot",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
