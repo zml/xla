@@ -131,6 +131,10 @@ DotDimensions GetDotDimensions(const HloInstruction* instr) {
 
 namespace {
 
+constexpr double kSplitKTargetWaves = 2.0;
+
+constexpr int64_t kMinKPerSplit = 512;
+
 constexpr int64_t kMTileSize = 128;
 constexpr int64_t kNTileSize = 128;
 
@@ -209,6 +213,61 @@ double EstimateGemmCostAfterSplitK(const DotDimensions& gemm, int64_t splitk,
                           weights.reduction_memory_cost_weight;
 
   return total_dot_cost + weights.reduction_launch_overhead + reduction_cost;
+}
+
+size_t SplitKForOccupancy(const DotDimensions& dims,
+                          const se::DeviceDescription& device_description,
+                          double target_waves,
+                          int64_t preferred_contracting_elements = 0) {
+  if (target_waves <= 0.0) {
+    return 1;
+  }
+  const int64_t tiles = CeilOfRatio(dims.m, kMTileSize) *
+                        CeilOfRatio(dims.n, kNTileSize) * std::max<int64_t>(dims.b, 1);
+  const int64_t cores = device_description.core_count();
+  if (tiles <= 0 || tiles >= cores) {
+    return 1;
+  }
+  const int64_t want = static_cast<int64_t>(target_waves * cores);
+  if (tiles >= want) {
+    return 1;
+  }
+  const int64_t operand_bytes = (dims.m * dims.k * dims.lhs_element_bits +
+                                 dims.n * dims.k * dims.rhs_element_bits) /
+                                8;
+  const int64_t intermediate_bytes_per_split =
+      2 * dims.m * dims.n * dims.acc_element_bits / 8;
+  if (operand_bytes <= 0 || intermediate_bytes_per_split <= 0) {
+    return 1;
+  }
+  const bool tile_applies = preferred_contracting_elements > 0 &&
+                            dims.k % preferred_contracting_elements == 0;
+  const auto utilization = [cores](int64_t t) {
+    return static_cast<double>(t) / (CeilOfRatio(t, cores) * cores);
+  };
+  const double unsplit_utilization = utilization(tiles);
+  size_t split = 1;
+  while (split < 64 && tiles * static_cast<int64_t>(split) < want) {
+    const size_t next = split * 2;
+    if (static_cast<int64_t>(next) * intermediate_bytes_per_split >
+        operand_bytes) {
+      break;
+    }
+    if (utilization(tiles * static_cast<int64_t>(next)) <=
+        unsplit_utilization * 1.05) {
+      break;
+    }
+    if (dims.k / static_cast<int64_t>(next) < kMinKPerSplit) {
+      break;
+    }
+    if (tile_applies &&
+        dims.k % (static_cast<int64_t>(next) * preferred_contracting_elements) !=
+            0) {
+      break;
+    }
+    split = next;
+  }
+  return split;
 }
 
 size_t ChooseSplitK(const DotDimensions& dims,
@@ -368,6 +427,36 @@ absl::StatusOr<HloInstruction*> SplitKDimensionOfDot(HloDotInstruction* src_dot,
   return splitk_root;
 }
 
+bool FeedsFromBlockScaledDequantize(const HloInstruction* operand) {
+  constexpr int kMaxVisited = 32;
+  std::vector<const HloInstruction*> worklist = {operand};
+  for (int visited = 0; !worklist.empty() && visited < kMaxVisited; ++visited) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if ((instr->opcode() == HloOpcode::kBitcast ||
+         instr->opcode() == HloOpcode::kReshape) &&
+        instr->operand(0)->opcode() == HloOpcode::kBroadcast &&
+        instr->operand(0)->shape().dimensions().size() >
+            instr->shape().dimensions().size()) {
+      return true;
+    }
+    // kConcatenate is load-bearing: DotMerger runs first, and on a merged
+    // operand the dequantize is only reachable through the concat.
+    if (instr->IsElementwise() || instr->opcode() == HloOpcode::kBitcast ||
+        instr->opcode() == HloOpcode::kReshape ||
+        instr->opcode() == HloOpcode::kTranspose ||
+        instr->opcode() == HloOpcode::kBroadcast ||
+        instr->opcode() == HloOpcode::kConcatenate ||
+        instr->opcode() == HloOpcode::kCopy ||
+        instr->opcode() == HloOpcode::kPad ||
+        instr->opcode() == HloOpcode::kSlice) {
+      worklist.insert(worklist.end(), instr->operands().begin(),
+                      instr->operands().end());
+    }
+  }
+  return false;
+}
+
 class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
  public:
   explicit SplitkRewriterVisitor(se::DeviceDescription device_description)
@@ -388,6 +477,9 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
       // splitting K.
       return absl::OkStatus();
     }
+    if (absl::c_any_of(dot->operands(), FeedsFromBlockScaledDequantize)) {
+      return absl::OkStatus();
+    }
     size_t split_k = dot->parent()
                          ->parent()
                          ->config()
@@ -395,6 +487,10 @@ class SplitkRewriterVisitor : public DfsHloRewriteVisitor {
                          .xla_gpu_experimental_force_split_k();
     if (split_k == 0) {
       split_k = ChooseSplitK(GetDotDimensions(dot), device_description_);
+      split_k = std::max<size_t>(
+          split_k, SplitKForOccupancy(GetDotDimensions(dot),
+                                      device_description_,
+                                      kSplitKTargetWaves));
     }
     if (split_k == 1) {
       return absl::OkStatus();
