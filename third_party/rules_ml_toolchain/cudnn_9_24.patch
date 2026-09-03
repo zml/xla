@@ -1,0 +1,13 @@
+--- a/gpu/cuda/cuda_redist_versions.bzl
++++ b/gpu/cuda/cuda_redist_versions.bzl
+@@ -380,6 +380,10 @@
+         "https://developer.download.nvidia.com/compute/cudnn/redist/redistrib_9.22.0.json",
+         "3dbb9002d52112ef69aa09187f523ef1ff07f8baf3892ee01e540af639d8f55f",
+     ],
++    "9.24.0": [
++        "https://developer.download.nvidia.com/compute/cudnn/redist/redistrib_9.24.0.json",
++        "89a0626f1925d9f4ceb8d6bc0b2de160b30e92afaae5471e6cfbb50234ae5488",
++    ],
+ }
+ 
+ MIRRORED_TARS_CUDNN_REDIST_JSON_DICT = {
