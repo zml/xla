@@ -80,11 +80,24 @@ HloInstruction* Convert(HloInstruction* instr, PrimitiveType target_type) {
       HloInstruction::CreateConvert(shape, instr));
 }
 
+// A scale's storage width describes the checkpoint, not the arithmetic: only bf16 may absorb an
+// f32 scale (f16 lacks the exponent range), and never past the dot's own output type.
+PrimitiveType DequantizeType(const HloInstruction& dot, PrimitiveType operand,
+                             PrimitiveType scale) {
+  const PrimitiveType promoted = GetTargetType(operand, scale);
+  const PrimitiveType out = dot.shape().element_type();
+  if (out == BF16 &&
+      primitive_util::BitWidth(promoted) > primitive_util::BitWidth(out) &&
+      primitive_util::BitWidth(out) > primitive_util::BitWidth(operand)) {
+    return out;
+  }
+  return promoted;
+}
+
 // Returns a pair of instructions that upscale both operands to the same type.
 std::pair<HloInstruction*, HloInstruction*> UpscaleBoth(
-    HloInstruction* first, HloInstruction* second) {
-  PrimitiveType target_type = GetTargetType(first->shape().element_type(),
-                                            second->shape().element_type());
+    HloInstruction* first, HloInstruction* second,
+    PrimitiveType target_type) {
   first = Convert(first, target_type);
   second = Convert(second, target_type);
   return std::make_pair(first, second);
@@ -149,7 +162,10 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,
   HloComputation* computation = dot->parent();
   HloInstruction* operand = dot->mutable_operand(operand_index);
   HloInstruction* scale = dot->mutable_operand(scale_index);
-  std::tie(operand, scale) = UpscaleBoth(operand, scale);
+  std::tie(operand, scale) = UpscaleBoth(
+      operand, scale,
+      DequantizeType(*dot, operand->shape().element_type(),
+                     scale->shape().element_type()));
   // A rank-0 scale is still a real scale and has to be applied.
   if (scale->shape().dimensions().size() !=
       operand->shape().dimensions().size()) {
@@ -193,7 +209,10 @@ absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(
     ABSL_ASSIGN_OR_RETURN(HloInstruction * lhs, Dequantize(dot, 0, 2, "LHS"));
     ABSL_ASSIGN_OR_RETURN(HloInstruction * rhs, Dequantize(dot, 1, 3, "RHS"));
 
-    std::tie(lhs, rhs) = UpscaleBoth(lhs, rhs);
+    std::tie(lhs, rhs) = UpscaleBoth(
+        lhs, rhs,
+        GetTargetType(lhs->shape().element_type(),
+                      rhs->shape().element_type()));
 
     Shape dot_shape = dot->shape();
     dot_shape.set_element_type(GetTargetType(lhs->shape().element_type(),
