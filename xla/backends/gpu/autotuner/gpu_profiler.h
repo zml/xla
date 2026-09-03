@@ -60,6 +60,12 @@ class GpuProfiler : public Profiler {
                                  ScopedShapedBuffer& reference,
                                  float rtol) override;
 
+  ~GpuProfiler() override {
+    if (stream_executor_ != nullptr) {
+      stream_executor_->SetDeferModuleUnloads(false);
+    }
+  }
+
  private:
   explicit GpuProfiler(
       se::StreamExecutor* stream_executor,
@@ -70,7 +76,11 @@ class GpuProfiler : public Profiler {
         allocator_(allocator),
         owned_allocator_(std::move(owned_allocator)),
         stream_(stream),
-        options_(options) {}
+        options_(options) {
+    if (stream_executor_ != nullptr) {
+      stream_executor_->SetDeferModuleUnloads(true);
+    }
+  }
 
   absl::StatusOr<ExecutionOutput> Execute(Executable* executable,
                                           std::vector<ExecutionInput> inputs,
