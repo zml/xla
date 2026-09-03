@@ -4293,6 +4293,7 @@ xla_cc_test(
     name = "splitk_rewriter_test",
     srcs = ["splitk_rewriter_test.cc"],
     deps = [
+        "//xla/hlo/utils:hlo_query",
         ":splitk_rewriter",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
