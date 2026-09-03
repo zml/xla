@@ -1539,6 +1539,7 @@ TEST(ThunkProtoDeserializationTest, CollectiveKernelThunk) {
           shmem_bytes: 1024
           cubin: "my_cubin"
           use_pdl: false
+          collective_op_type: COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE
         }
       )pb");
 
@@ -1552,6 +1553,8 @@ TEST(ThunkProtoDeserializationTest, CollectiveKernelThunk) {
                             kTestPlatformName, se::GpuComputeCapability()));
   auto* kernel_thunk = dynamic_cast<CollectiveKernelThunk*>(thunk.get());
   ASSERT_NE(kernel_thunk, nullptr);
+  EXPECT_EQ(kernel_thunk->collective_op_type(),
+            COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE);
   ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, kernel_thunk->ToProto());
   EXPECT_THAT(round_trip_proto, EqualsProto(proto));
 }

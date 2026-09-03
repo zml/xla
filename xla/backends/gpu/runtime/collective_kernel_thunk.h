@@ -33,16 +33,18 @@ limitations under the License.*/
 #include "xla/backends/gpu/runtime/collective_kernel_thunk.pb.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
+#include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
-#include "xla/backends/gpu/runtime/traced_command.h"
 #include "xla/core/collectives/rank_id.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/launch_dimensions.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_handle.h"
 #include "xla/stream_executor/gpu/all_reduce_kernel.h"
 #include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/stream.h"
 
 namespace xla::gpu {
@@ -53,13 +55,17 @@ namespace xla::gpu {
 // Prepare:
 // - Add the clique key to the required resources.
 // Initialize:
-// - Allocated local buffers and signal flags.
+// - Allocate local buffers and signal flags.
+// - Rendezvous with all devices on the host and exchange buffer addresses.
 // ExecuteOnStream:
-// - Rendezvous with all devices on the host and sort the allocated buffers.
+// - Advance the invocation count.
 // - Launch the kernel.
+// Record:
+// - Record the kernel as a native command-buffer launch node.
+// - Refresh the invocation-count argument before every graph execution.
 // When codegen kernel is used, kernel_name, launch_dimensions, shmem_bytes
 // must be set.
-class CollectiveKernelThunk : public TracedCommand {
+class CollectiveKernelThunk : public Command {
  public:
   static constexpr auto kMaxNumExecutors =
       ::stream_executor::gpu::kMaxNumAllReduceInputPtrs;
@@ -73,8 +79,10 @@ class CollectiveKernelThunk : public TracedCommand {
       LaunchDimensions launch_dimensions,                  //
       int32_t shmem_bytes = 0,                             //
       std::optional<std::vector<uint8_t>> cubin = std::nullopt,
-      bool use_pdl = false)
-      : TracedCommand{Thunk::kCollectiveKernel, info},
+      bool use_pdl = false,
+      CollectiveKernelOpTypeProto collective_op_type =
+          COLLECTIVE_KERNEL_OP_TYPE_UNSPECIFIED)
+      : Command{Thunk::kCollectiveKernel, info},
         collective_kernel_enabled_(is_collective_kernel_enabled),
         collective_config_(std::move(collective_config)),
         kernel_spec_(std::move(kernel_spec)),
@@ -83,7 +91,8 @@ class CollectiveKernelThunk : public TracedCommand {
         cubin_(std::move(cubin)),
         shmem_bytes_(shmem_bytes),
         buffers_(std::move(buffers)),
-        use_pdl_(use_pdl) {
+        use_pdl_(use_pdl),
+        collective_op_type_(collective_op_type) {
     per_stream_state_.reserve(kMaxNumExecutors);
   }
 
@@ -98,6 +107,9 @@ class CollectiveKernelThunk : public TracedCommand {
 
   bool use_pdl() const { return use_pdl_; }
   const std::optional<std::vector<uint8_t>>& cubin() const { return cubin_; }
+  CollectiveKernelOpTypeProto collective_op_type() const {
+    return collective_op_type_;
+  }
 
   // Returns the reason why the collective kernel is not supported.
   // Returns OK if the collective kernel is supported.
@@ -115,6 +127,14 @@ class CollectiveKernelThunk : public TracedCommand {
 
   // Execute the kernel on all devices.
   absl::Status ExecuteOnStream(const ExecuteParams& params) final;
+
+  absl::StatusOr<const se::CommandBuffer::Command*> Record(
+      const ExecuteParams& execute_params, const RecordParams& record_params,
+      RecordAction record_action,
+      se::CommandBuffer* command_buffer) final;
+
+  // The invocation count is a kernel argument and changes on every execution.
+  bool requires_update_on_execute() const final { return true; }
 
   BufferUses buffer_uses() const override;
 
@@ -155,6 +175,16 @@ class CollectiveKernelThunk : public TracedCommand {
           kernel(std::move(kernel_arg)) {}
   };
 
+  struct KernelWithArgs {
+    se::Kernel* kernel;
+    std::vector<se::KernelArg> args;
+  };
+
+  // Builds arguments for the corresponding eager launch or command-buffer
+  // node update. Advances the per-executor invocation count when requested.
+  absl::StatusOr<KernelWithArgs> GetKernelAndArgs(
+      const ExecuteParams& params, bool advance_invocation_count);
+
   // Returns the input size in bytes for the collective.
   int64_t GetInputSizeBytes() const;
 
@@ -189,6 +219,9 @@ class CollectiveKernelThunk : public TracedCommand {
 
   // Programmatic Dependent Launch.
   const bool use_pdl_;
+
+  // Source collective operation used by command-buffer filtering.
+  const CollectiveKernelOpTypeProto collective_op_type_;
 };
 }  // namespace xla::gpu
 

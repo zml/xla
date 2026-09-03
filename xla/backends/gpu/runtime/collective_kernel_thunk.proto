@@ -38,6 +38,15 @@ enum SymmetricMemoryTypeProto {
   SYMMETRIC_MEMORY_TYPE_XLA_RENDEZVOUS = 2;
 }
 
+// Collective operation implemented by the generated kernel. This is kept
+// separately from the thunk kind because all generated collective kernels use
+// Thunk::kCollectiveKernel at runtime.
+enum CollectiveKernelOpTypeProto {
+  COLLECTIVE_KERNEL_OP_TYPE_UNSPECIFIED = 0;
+  COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE = 1;
+  COLLECTIVE_KERNEL_OP_TYPE_ALL_GATHER = 2;
+}
+
 message IoBufferSpecProto {
   bool requires_multimem = 1;
   SymmetricMemoryTypeProto symmetric_memory_type = 2;
@@ -99,6 +108,10 @@ message CollectiveKernelThunkProto {
   // Used to find runtime requirements for an emitted kernel.
   // See collective_params.h for more details.
   CollectiveKernelSpecProto kernel_spec = 12;
+
+  // Source collective operation. Older serialized thunks leave this
+  // unspecified and are only eligible for an ALLCOLLECTIVES filter.
+  CollectiveKernelOpTypeProto collective_op_type = 13;
 
   reserved 2;  // Was reduction_kind.
   reserved 3;  // Was is_async.

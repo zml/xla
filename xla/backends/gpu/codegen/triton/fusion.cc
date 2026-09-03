@@ -94,6 +94,19 @@ absl::StatusOr<EmitArgs> EmitCollectiveFusion(
 
   CollectiveConfig config = GetCollectiveConfig(&collective_hero.instruction(),
                                                 use_global_device_ids);
+  CollectiveKernelOpTypeProto collective_op_type;
+  switch (collective_hero.instruction().opcode()) {
+    case HloOpcode::kAllReduce:
+      collective_op_type = COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE;
+      break;
+    case HloOpcode::kAllGather:
+      collective_op_type = COLLECTIVE_KERNEL_OP_TYPE_ALL_GATHER;
+      break;
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unsupported collective kernel opcode: ",
+          HloOpcodeString(collective_hero.instruction().opcode())));
+  }
   const HloFusionInstruction* fusion_instr = &fusion;
   std::vector<CollectiveThunk::Buffer> buffers;
   ABSL_ASSIGN_OR_RETURN(buffers, GetCollectiveBuffers(
@@ -103,7 +116,7 @@ absl::StatusOr<EmitArgs> EmitCollectiveFusion(
 
   TritonFusion::EmitThunk make_thunk =
       [info = std::move(info), buffers = std::move(buffers), config,
-       fusion_instr](TritonFusion::EmitResult result) mutable
+       fusion_instr, collective_op_type](TritonFusion::EmitResult result) mutable
       -> absl::StatusOr<ThunkSequence> {
     ABSL_ASSIGN_OR_RETURN(CollectiveKernelSpec kernel_spec,
                      CreateCollectiveKernelSpec(
@@ -115,7 +128,7 @@ absl::StatusOr<EmitArgs> EmitCollectiveFusion(
         std::move(info), config, std::move(kernel_spec), std::move(buffers),
         /*is_collective_kernel_enabled=*/true, result.entry.kernel_name,
         result.entry.launch_dimensions, result.entry.shmem_bytes,
-        std::move(cubin), result.entry.use_pdl);
+        std::move(cubin), result.entry.use_pdl, collective_op_type);
   };
   ABSL_ASSIGN_OR_RETURN(std::vector<Shape> unmanaged_arguments,
                    GetCollectiveUnmanagedKernelArguments(fusion_instr));

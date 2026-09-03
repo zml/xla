@@ -33,7 +33,9 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/all_gather_thunk.h"
 #include "xla/backends/gpu/runtime/async_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
+#include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
+#include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/convolution_thunk.h"
 #include "xla/backends/gpu/runtime/cudnn_thunk.h"
@@ -178,7 +180,8 @@ DynamicSliceConfig CreateDsfConfig(std::optional<int64_t> loop_index,
 
 std::unique_ptr<DynamicSliceFusionV2Thunk> CreateDynamicSliceFusionV2Thunk(
     const BufferAllocation& src_alloc, const BufferAllocation& dst_alloc,
-    DynamicSliceConfig slice_config, bool verify_offsets = false) {
+    DynamicSliceConfig slice_config, bool verify_offsets = false,
+    ThunkSequence embedded_thunks = {}) {
   constexpr int64_t kSrcBytes = sizeof(int32_t) * 16;
   constexpr int64_t kSliceBytes = sizeof(int32_t) * 4;
 
@@ -194,9 +197,11 @@ std::unique_ptr<DynamicSliceFusionV2Thunk> CreateDynamicSliceFusionV2Thunk(
   Shape src_shape = ShapeUtil::MakeShape(S32, {16});
   Shape slice_shape = ShapeUtil::MakeShape(S32, {4});
 
-  ThunkSequence embedded_thunks = ThunkSequence::Of<DeviceToDeviceCopyThunk>(
-      Thunk::ThunkInfo(), ShapedSlice{embedded_src, slice_shape},
-      ShapedSlice{embedded_dst, slice_shape}, kSliceBytes);
+  if (embedded_thunks.empty()) {
+    embedded_thunks = ThunkSequence::Of<DeviceToDeviceCopyThunk>(
+        Thunk::ThunkInfo(), ShapedSlice{embedded_src, slice_shape},
+        ShapedSlice{embedded_dst, slice_shape}, kSliceBytes);
+  }
 
   return std::make_unique<DynamicSliceFusionV2Thunk>(
       Thunk::ThunkInfo(),
@@ -347,6 +352,27 @@ std::unique_ptr<PartitionIdThunk> CreatePartitionIdThunk(
   return std::make_unique<PartitionIdThunk>(Thunk::ThunkInfo(), slice0);
 }
 
+class FakeCollectiveKernelThunk : public CollectiveKernelThunk {
+ public:
+  explicit FakeCollectiveKernelThunk(
+      CollectiveKernelOpTypeProto collective_op_type =
+          COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE)
+      : CollectiveKernelThunk(
+            Thunk::ThunkInfo(), CollectiveConfig{}, CollectiveKernelSpec{}, {},
+            /*is_collective_kernel_enabled=*/true,
+            /*kernel_name=*/"fake_collective_kernel", LaunchDimensions{},
+            /*shmem_bytes=*/0, /*cubin=*/std::nullopt,
+            /*use_pdl=*/false, collective_op_type) {}
+};
+
+class FakeP2PCommand : public Command {
+ public:
+  explicit FakeP2PCommand(Thunk::Kind kind)
+      : Command(kind, Thunk::ThunkInfo()) {}
+
+  BufferUses buffer_uses() const override { return {}; }
+};
+
 class FakeErrorAllocator : public ThunkPassBufferAllocator {
  public:
   absl::StatusOr<BufferAllocation*> NewEmptyAllocation(int64_t size) override {
@@ -388,6 +414,212 @@ TEST(CommandBufferConversionPassTest, ConvertsToCommandBufferThunk) {
   const auto& thunks_in_command_buffer =
       command_buffer_thunk->thunks()->thunks();
   EXPECT_THAT(thunks_in_command_buffer, ThunkKindsAre(Thunk::kCopy));
+}
+
+TEST(CommandBufferConversionPassTest,
+     ConvertsCollectiveKernelToCollectivesCommandBuffer) {
+  ThunkSequence thunks;
+  thunks.push_back(std::make_unique<FakeCollectiveKernelThunk>());
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+
+  se::DeviceDescription device_info =
+      CudaDeviceInfoWithVersion(se::SemanticVersion{12, 3, 0});
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(true));
+
+  EXPECT_THAT(thunks, ThunkKindsAre(Thunk::kCommandBuffer));
+  const auto* command_buffer_thunk =
+      static_cast<const CommandBufferThunk*>(thunks[0].get());
+  EXPECT_THAT(command_buffer_thunk->thunks()->thunks(),
+              ThunkKindsAre(Thunk::kCollectiveKernel));
+}
+
+TEST(CommandBufferConversionPassTest,
+     CollectiveKernelFilterMatchesSourceOperation) {
+  struct TestCase {
+    CollectiveKernelOpTypeProto collective_op_type;
+    DebugOptions::CollectiveOpType enabled_op_type;
+    bool expect_conversion;
+  };
+  const TestCase test_cases[] = {
+      {COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE, DebugOptions::ALLREDUCE, true},
+      {COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE, DebugOptions::ALLGATHER, false},
+      {COLLECTIVE_KERNEL_OP_TYPE_ALL_GATHER, DebugOptions::ALLGATHER, true},
+      {COLLECTIVE_KERNEL_OP_TYPE_ALL_GATHER, DebugOptions::ALLREDUCE, false},
+      {COLLECTIVE_KERNEL_OP_TYPE_UNSPECIFIED, DebugOptions::ALLREDUCE, false},
+  };
+
+  for (const TestCase& test_case : test_cases) {
+    SCOPED_TRACE(testing::Message()
+                 << "collective_op_type=" << test_case.collective_op_type
+                 << ", enabled_op_type=" << test_case.enabled_op_type);
+    ThunkSequence thunks;
+    thunks.push_back(std::make_unique<FakeCollectiveKernelThunk>(
+        test_case.collective_op_type));
+
+    DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+    debug_options.set_xla_gpu_graph_min_graph_size(1);
+    debug_options.clear_xla_gpu_enable_command_buffer();
+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+    debug_options.clear_xla_gpu_enable_collectives_command_buffer_filter();
+    debug_options.add_xla_gpu_enable_collectives_command_buffer_filter(
+        test_case.enabled_op_type);
+
+    se::DeviceDescription device_info =
+        CudaDeviceInfoWithVersion(se::SemanticVersion{12, 3, 0});
+    FakeErrorAllocator allocator;
+    CommandBufferConversionPass pass{"test"};
+    ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                         device_info, allocator),
+                IsOkAndHolds(test_case.expect_conversion));
+    EXPECT_THAT(thunks,
+                ThunkKindsAre(test_case.expect_conversion
+                                  ? Thunk::kCommandBuffer
+                                  : Thunk::kCollectiveKernel));
+  }
+}
+
+TEST(CommandBufferConversionPassTest,
+     NarrowCollectivesFilterPreservesUnmappedP2PBehavior) {
+  ThunkSequence thunks;
+  thunks.push_back(std::make_unique<FakeP2PCommand>(Thunk::kSend));
+  thunks.push_back(std::make_unique<FakeP2PCommand>(Thunk::kRecv));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+  debug_options.clear_xla_gpu_enable_collectives_command_buffer_filter();
+  debug_options.add_xla_gpu_enable_collectives_command_buffer_filter(
+      DebugOptions::ALLREDUCE);
+
+  se::DeviceDescription device_info =
+      CudaDeviceInfoWithVersion(se::SemanticVersion{12, 3, 0});
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(true));
+  EXPECT_THAT(thunks, ThunkKindsAre(Thunk::kCommandBuffer));
+}
+
+TEST(CommandBufferConversionPassTest,
+     ConvertsCollectiveKernelInsideDynamicSlice) {
+  BufferAllocation src_alloc(0, sizeof(int32_t) * 16, 0);
+  BufferAllocation dst_alloc(1, sizeof(int32_t) * 4, 0);
+  ThunkSequence embedded_thunks;
+  embedded_thunks.push_back(std::make_unique<FakeCollectiveKernelThunk>());
+
+  ThunkSequence thunks;
+  thunks.push_back(CreateDynamicSliceFusionV2Thunk(
+      src_alloc, dst_alloc,
+      CreateDsfConfig(/*loop_index=*/std::nullopt, /*byte_offset=*/0,
+                      /*byte_stride=*/0),
+      /*verify_offsets=*/false, std::move(embedded_thunks)));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(
+      DebugOptions::DYNAMIC_SLICE_FUSION);
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+  debug_options.clear_xla_gpu_enable_collectives_command_buffer_filter();
+  debug_options.add_xla_gpu_enable_collectives_command_buffer_filter(
+      DebugOptions::ALLREDUCE);
+
+  se::DeviceDescription device_info =
+      CudaDeviceInfoWithVersion(se::SemanticVersion{12, 9, 0});
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(true));
+  ASSERT_THAT(thunks, ThunkKindsAre(Thunk::kCommandBuffer));
+  const auto* command_buffer_thunk =
+      static_cast<const CommandBufferThunk*>(thunks[0].get());
+  EXPECT_THAT(command_buffer_thunk->thunks()->thunks(),
+              ThunkKindsAre(Thunk::kDynamicSliceFusion));
+}
+
+TEST(CommandBufferConversionPassTest,
+     ConvertsCollectiveKernelInsideWhileBodyOnly) {
+  ThunkSequence body_thunks;
+  body_thunks.push_back(std::make_unique<FakeCollectiveKernelThunk>());
+
+  BufferAllocation condition_result_alloc(0, 1024, 0);
+  ThunkSequence thunks;
+  thunks.push_back(CreateWhileThunk(/*condition_thunks=*/{},
+                                    std::move(body_thunks),
+                                    condition_result_alloc));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::WHILE);
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+
+  se::DeviceDescription device_info =
+      CudaDeviceInfoWithVersion(se::SemanticVersion{12, 3, 0});
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(true));
+
+  EXPECT_THAT(thunks, ThunkKindsAre(Thunk::kWhile));
+  const auto* while_thunk = static_cast<const WhileThunk*>(thunks[0].get());
+  EXPECT_THAT(while_thunk->body_executor().thunks(),
+              ThunkKindsAre(Thunk::kCommandBuffer));
+  const auto* command_buffer_thunk = static_cast<const CommandBufferThunk*>(
+      while_thunk->body_executor().thunks()[0].get());
+  EXPECT_THAT(command_buffer_thunk->thunks()->thunks(),
+              ThunkKindsAre(Thunk::kCollectiveKernel));
+}
+
+TEST(CommandBufferConversionPassTest,
+     ConvertsCollectiveKernelInsideConditionalBranchOnly) {
+  ThunkSequence branch;
+  branch.push_back(std::make_unique<FakeCollectiveKernelThunk>());
+  std::vector<ThunkSequence> branches;
+  branches.push_back(std::move(branch));
+
+  ThunkSequence thunks;
+  thunks.push_back(CreateConditionalThunk(std::move(branches)));
+
+  DebugOptions debug_options = xla::GetDebugOptionsFromFlags();
+  debug_options.set_xla_gpu_graph_min_graph_size(1);
+  debug_options.clear_xla_gpu_enable_command_buffer();
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CONDITIONAL);
+  debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);
+
+  se::DeviceDescription device_info =
+      CudaDeviceInfoWithVersion(se::SemanticVersion{12, 3, 0});
+  FakeErrorAllocator allocator;
+  CommandBufferConversionPass pass{"test"};
+
+  ASSERT_THAT(pass.Run(&thunks, debug_options, /*hlo_module=*/nullptr,
+                       device_info, allocator),
+              IsOkAndHolds(true));
+
+  EXPECT_THAT(thunks, ThunkKindsAre(Thunk::kConditional));
+  const auto* conditional_thunk =
+      static_cast<const ConditionalThunk*>(thunks[0].get());
+  ASSERT_EQ(conditional_thunk->branch_executors().size(), 1);
+  EXPECT_THAT(conditional_thunk->branch_executors()[0].thunks(),
+              ThunkKindsAre(Thunk::kCommandBuffer));
+  const auto* command_buffer_thunk = static_cast<const CommandBufferThunk*>(
+      conditional_thunk->branch_executors()[0].thunks()[0].get());
+  EXPECT_THAT(command_buffer_thunk->thunks()->thunks(),
+              ThunkKindsAre(Thunk::kCollectiveKernel));
 }
 
 TEST(CommandBufferConversionPassTest,

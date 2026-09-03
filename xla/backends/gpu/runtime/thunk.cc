@@ -436,6 +436,7 @@ bool Thunk::IsCollective() const {
     case kAllReduce:
     case kAllToAll:
     case kCollectiveBroadcast:
+    case kCollectiveKernel:
     case kCollectivePermute:
     case kGroup:
     case kRaggedAllToAll:

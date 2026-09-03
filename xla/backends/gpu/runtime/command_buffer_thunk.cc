@@ -325,8 +325,6 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
   bool is_first_record =
       cmd_buffer->command_buffer->state() == se::CommandBuffer::State::kCreate;
 
-  bool has_dynamic_allocations = cmd_buffer->HasDynamicAllocations(
-      commands_, *params.persistent_alloc_indices);
   auto updated_allocs = cmd_buffer->UpdateBufferAllocations(
       commands_, params, *params.persistent_alloc_indices);
   bool needs_update =
@@ -354,9 +352,11 @@ absl::Status CommandBufferThunk::ExecuteOnStream(const ExecuteParams& params) {
 
     Command::RecordParams record_params = {
         cmd_buffer->state, std::move(updated_allocs),
-        /*is_initialization=*/is_first_record && !has_dynamic_allocations};
+        // This graph will be submitted below, even when this is its first
+        // record. Initialization-only recording happens in Initialize().
+        /*is_initialization=*/false};
     ABSL_RETURN_IF_ERROR(commands_.Record(params, record_params,
-                                     cmd_buffer->command_buffer.get()));
+                                          cmd_buffer->command_buffer.get()));
 
     uint64_t end_micros = tsl::Env::Default()->NowMicros();
     XLA_VLOG_DEVICE(3, executor->device_ordinal())

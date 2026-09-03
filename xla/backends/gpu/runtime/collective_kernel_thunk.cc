@@ -20,6 +20,7 @@ limitations under the License.*/
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -41,6 +42,7 @@ limitations under the License.*/
 #include "xla/backends/gpu/runtime/collective_params.h"
 #include "xla/backends/gpu/runtime/collective_thunk.h"
 #include "xla/backends/gpu/runtime/collective_thunk.pb.h"
+#include "xla/backends/gpu/runtime/command.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/core/collectives/rank_id.h"
@@ -53,6 +55,7 @@ limitations under the License.*/
 #include "xla/service/gpu/stream_executor_util.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/device_address_handle.h"
 #include "xla/stream_executor/gpu/collective_kernel_metadata.h"
@@ -497,8 +500,9 @@ absl::Status CollectiveKernelThunk::Initialize(const InitializeParams& params) {
   return absl::OkStatus();
 }
 
-absl::Status CollectiveKernelThunk::ExecuteOnStream(
-    const ExecuteParams& params) {
+absl::StatusOr<CollectiveKernelThunk::KernelWithArgs>
+CollectiveKernelThunk::GetKernelAndArgs(const ExecuteParams& params,
+                                        bool advance_invocation_count) {
   se::Stream* stream = params.stream;
   TF_RET_CHECK(stream != nullptr);
   ABSL_ASSIGN_OR_RETURN(
@@ -510,18 +514,27 @@ absl::Status CollectiveKernelThunk::ExecuteOnStream(
   TF_RET_CHECK(rank.has_value())
       << "Device " << params.collective_params->global_device_id
       << "is not in the clique.";
-  StreamState* state = nullptr;
+  se::Kernel* kernel = nullptr;
+  RankId state_rank = RankId(0);
+  uint32_t invocation_count = 0;
+  se::DeviceAddressBase metadata;
   {
     absl::MutexLock lock(mutex_);
     auto it = per_stream_state_.find(stream->parent());
     TF_RET_CHECK(it != per_stream_state_.end())
         << "Stream not found in per_stream_state_";
-    state = it->second.get();
-  }
+    StreamState* state = it->second.get();
+    TF_RET_CHECK(state->kernel != nullptr)
+        << "Kernel is not initialized for collective kernel thunk.";
 
-  state->invocation_count += kernel_spec_.sync_count_increment;
-  TF_RET_CHECK(state->kernel != nullptr)
-      << "Kernel is not initialized for collective kernel thunk.";
+    if (advance_invocation_count) {
+      state->invocation_count += kernel_spec_.sync_count_increment;
+    }
+    kernel = state->kernel.get();
+    state_rank = state->rank;
+    invocation_count = state->invocation_count;
+    metadata = state->metadata;
+  }
 
   static constexpr auto has_multimem = [](const auto& buffer_spec) {
     return buffer_spec.requires_multimem;
@@ -533,12 +546,59 @@ absl::Status CollectiveKernelThunk::ExecuteOnStream(
 
   ABSL_ASSIGN_OR_RETURN(
       std::vector<se::KernelArg> kernel_args,
-      BuildKernelArguments(kernel_spec_, buffers_, params, state->rank,
-                           state->invocation_count, state->metadata, clique_key,
+      BuildKernelArguments(kernel_spec_, buffers_, params, state_rank,
+                           invocation_count, metadata, clique_key,
                            num_parameters));
 
-  return ExecuteKernelOnStream(*state->kernel, kernel_args, launch_dimensions_,
-                               /*cluster_dim=*/std::nullopt, stream);
+  return KernelWithArgs{kernel, std::move(kernel_args)};
+}
+
+absl::Status CollectiveKernelThunk::ExecuteOnStream(
+    const ExecuteParams& params) {
+  ABSL_ASSIGN_OR_RETURN(KernelWithArgs kernel_with_args,
+                        GetKernelAndArgs(params,
+                                         /*advance_invocation_count=*/true));
+
+  return ExecuteKernelOnStream(
+      *kernel_with_args.kernel, kernel_with_args.args, launch_dimensions_,
+      /*cluster_dim=*/std::nullopt, params.stream);
+}
+
+absl::StatusOr<const se::CommandBuffer::Command*>
+CollectiveKernelThunk::Record(const ExecuteParams& execute_params,
+                              const RecordParams& record_params,
+                              RecordAction record_action,
+                              se::CommandBuffer* command_buffer) {
+  // CommandBufferThunk can record and instantiate graphs during Initialize,
+  // before they are submitted for execution. Do not consume an invocation for
+  // that bookkeeping record: requires_update_on_execute() guarantees that the
+  // launch node is refreshed with the next invocation immediately before the
+  // graph is submitted.
+  ABSL_ASSIGN_OR_RETURN(KernelWithArgs kernel_with_args,
+                        GetKernelAndArgs(
+                            execute_params,
+                            /*advance_invocation_count=*/
+                                !record_params.is_initialization));
+  std::unique_ptr<se::KernelArgsPackedArrayBase> packed_args =
+      se::PackKernelArgs(kernel_with_args.args, shmem_bytes_);
+
+  if (auto* create = std::get_if<RecordCreate>(&record_action)) {
+    return command_buffer->CreateLaunch(
+        launch_dimensions_.thread_counts_per_block(),
+        launch_dimensions_.block_counts(), /*cluster_dim=*/std::nullopt,
+        *kernel_with_args.kernel, *packed_args, create->dependencies,
+        priority());
+  }
+
+  if (auto* update = std::get_if<RecordUpdate>(&record_action)) {
+    ABSL_RETURN_IF_ERROR(command_buffer->UpdateLaunch(
+        update->command, launch_dimensions_.thread_counts_per_block(),
+        launch_dimensions_.block_counts(), /*cluster_dim=*/std::nullopt,
+        *kernel_with_args.kernel, *packed_args));
+    return update->command;
+  }
+
+  return Internal("Invalid record action");
 }
 
 Thunk::BufferUses CollectiveKernelThunk::buffer_uses() const {
@@ -684,7 +744,7 @@ CollectiveKernelThunk::FromProto(
       thunk_info, collective_config, std::move(kernel_spec), std::move(buffers),
       thunk_proto.collective_kernel_enabled(), thunk_proto.kernel_name(),
       launch_dimensions, thunk_proto.shmem_bytes(), std::move(cubin),
-      thunk_proto.use_pdl());
+      thunk_proto.use_pdl(), thunk_proto.collective_op_type());
 }
 
 absl::StatusOr<ThunkProto> CollectiveKernelThunk::ToProto() const {
@@ -750,6 +810,7 @@ absl::StatusOr<ThunkProto> CollectiveKernelThunk::ToProto() const {
   }
 
   thunk_proto->set_use_pdl(use_pdl_);
+  thunk_proto->set_collective_op_type(collective_op_type_);
 
   return proto;
 }

@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/command_buffer_cmd_emitter.h"
 #include "xla/backends/gpu/runtime/command_buffer_thunk.h"
 #include "xla/backends/gpu/runtime/command_executor.h"
+#include "xla/backends/gpu/runtime/collective_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/conditional_thunk.h"
 #include "xla/backends/gpu/runtime/custom_call_thunk.h"
 #include "xla/backends/gpu/runtime/device_to_device_copy_thunk.h"
@@ -69,8 +70,8 @@ namespace {
 using CommandBufferConfig = CommandBufferConversionPass::CommandBufferConfig;
 
 std::optional<DebugOptions::CollectiveOpType> GetCollectiveOpType(
-    Thunk::Kind kind) {
-  switch (kind) {
+    const Thunk& thunk) {
+  switch (thunk.kind()) {
     case Thunk::kAllGather:
       return DebugOptions::ALLGATHER;
     case Thunk::kAllReduce:
@@ -85,6 +86,17 @@ std::optional<DebugOptions::CollectiveOpType> GetCollectiveOpType(
       return DebugOptions::RAGGEDALLTOALL;
     case Thunk::kReduceScatter:
       return DebugOptions::REDUCESCATTER;
+    case Thunk::kCollectiveKernel:
+      switch (static_cast<const CollectiveKernelThunk&>(thunk)
+                  .collective_op_type()) {
+        case COLLECTIVE_KERNEL_OP_TYPE_ALL_REDUCE:
+          return DebugOptions::ALLREDUCE;
+        case COLLECTIVE_KERNEL_OP_TYPE_ALL_GATHER:
+          return DebugOptions::ALLGATHER;
+        case COLLECTIVE_KERNEL_OP_TYPE_UNSPECIFIED:
+          return std::nullopt;
+      }
+      return std::nullopt;
     default:
       return std::nullopt;
   }
@@ -194,6 +206,7 @@ std::optional<DebugOptions::CommandBufferCmdType> GetCommandBufferCmdType(
     case Thunk::kAllReduce:
     case Thunk::kAllToAll:
     case Thunk::kCollectiveBroadcast:
+    case Thunk::kCollectiveKernel:
     case Thunk::kCollectivePermute:
     case Thunk::kRaggedAllToAll:
     case Thunk::kReduceScatter:
@@ -249,11 +262,38 @@ bool HasLoopDependentDynamicSliceFusionV2(const ThunkSequence& thunks) {
   return has_loop_dependent_dsf;
 }
 
+bool HasCollectiveKernel(const ThunkSequence& thunks) {
+  bool has_collective_kernel = false;
+  for (const std::unique_ptr<Thunk>& thunk : thunks) {
+    thunk->Walk([&](const Thunk* nested) {
+      has_collective_kernel |= nested->kind() == Thunk::kCollectiveKernel;
+      if (const auto* dsf =
+              dynamic_cast<const DynamicSliceFusionV2Thunk*>(nested)) {
+        has_collective_kernel |= HasCollectiveKernel(dsf->thunks());
+      }
+    });
+  }
+  return has_collective_kernel;
+}
+
 // Returns true if the WhileThunk is convertible to a command buffer operation.
 // This requires that all thunks in both the condition and body sequences are
 // convertible.
 bool IsConvertible(const WhileThunk& while_thunk,
                    const CommandBufferConfig& config) {
+  // A native command-buffer while node records its body once and replays the
+  // same launch arguments for every device-side iteration. Collective kernels
+  // require a new invocation count (and potentially a different scratch-buffer
+  // parity) for every iteration, so keep the while on the host. The recursive
+  // conversion pass can still put eligible regions inside its body into their
+  // own command buffers, which updates the invocation before each iteration.
+  if (HasCollectiveKernel(while_thunk.condition_executor().thunks()) ||
+      HasCollectiveKernel(while_thunk.body_executor().thunks())) {
+    VLOG(2) << "WhileThunk is not convertible to command buffers because it "
+               "contains a CollectiveKernelThunk whose invocation count must "
+               "advance on every loop iteration";
+    return false;
+  }
   if (HasLoopDependentDynamicSliceFusionV2(
           while_thunk.body_executor().thunks()) &&
       !(config.enable_loop_unroll && while_thunk.trip_count().has_value())) {
@@ -273,6 +313,19 @@ bool IsConvertible(const WhileThunk& while_thunk,
 // convertible.
 bool IsConvertible(const ConditionalThunk& conditional_thunk,
                    const CommandBufferConfig& config) {
+  // Recording a command-buffer conditional updates all branch graphs, while
+  // direct ConditionalThunk execution advances only the selected branch's
+  // collective invocation count. Keep the conditional on the host so that
+  // recursively converted branch command buffers preserve that behavior.
+  if (absl::c_any_of(conditional_thunk.branch_executors(),
+                     [](const ThunkExecutor& branch) {
+                       return HasCollectiveKernel(branch.thunks());
+                     })) {
+    VLOG(2) << "ConditionalThunk is not convertible to command buffers because "
+               "a branch contains a CollectiveKernelThunk whose invocation "
+               "count must advance only when the branch executes";
+    return false;
+  }
   return absl::c_all_of(
       conditional_thunk.branch_executors(), [&](const auto& branch) {
         return ThunkSequenceIsConvertible(branch.thunks(), config);
@@ -388,8 +441,15 @@ bool IsConvertible(const Thunk& thunk, const CommandBufferConfig& config) {
 
   if (*cmd_type == DebugOptions::COLLECTIVES) {
     if (!config.enabled_collectives.test(DebugOptions::ALLCOLLECTIVES)) {
-      auto op_type = GetCollectiveOpType(thunk.kind());
-      if (op_type.has_value() && !config.enabled_collectives.test(*op_type)) {
+      auto op_type = GetCollectiveOpType(thunk);
+      // Preserve the existing behavior for collectives that have no dedicated
+      // filter enum (currently send and receive). A generated collective kernel
+      // with unknown source operation is different: accepting it under a
+      // narrow filter could capture an all-gather when only all-reduce was
+      // requested.
+      if ((op_type.has_value() &&
+           !config.enabled_collectives.test(*op_type)) ||
+          (!op_type.has_value() && thunk.kind() == Thunk::kCollectiveKernel)) {
         VLOG(2) << "Collective thunk kind " << Thunk::KindToString(thunk.kind())
                 << " is not enabled by the collectives filter";
         return false;
