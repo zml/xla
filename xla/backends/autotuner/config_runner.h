@@ -52,6 +52,24 @@ class ConfigRunner {
     bool crash_on_failure = false;
   };
 
+  struct AdaptiveRemeasurementOptions {
+    bool enabled = false;
+    // Profile every candidate once, then collect this many total samples for
+    // the closest candidates and compare their medians.
+    int total_samples = 3;
+    // Bounds serialized GPU work when many short kernels fall in the timer
+    // quantization window.
+    int max_finalists = 2;
+    // A candidate is ambiguous when it is within the larger of these absolute
+    // and relative distances from the fastest initial measurement.
+    absl::Duration absolute_window = absl::Nanoseconds(64);
+    double relative_window = 0.01;
+  };
+
+  static absl::Duration MeasurementNoiseWindow(
+      absl::Duration duration,
+      const AdaptiveRemeasurementOptions& options);
+
   // TODO(b/519057668): Move these types to a shared header file.
   using Config = CodegenOrchestrator::Config;
   struct ExecutableCandidate {
@@ -90,6 +108,9 @@ class ConfigRunner {
 
   static absl::StatusOr<std::unique_ptr<ConfigRunner>> Create(
       std::unique_ptr<Profiler> profiler, CorrectnessCheckOptions options);
+  static absl::StatusOr<std::unique_ptr<ConfigRunner>> Create(
+      std::unique_ptr<Profiler> profiler, CorrectnessCheckOptions options,
+      AdaptiveRemeasurementOptions remeasurement_options);
 
   absl::StatusOr<std::vector<ConfigProfile>> ProfileAll(
       std::vector<ExecutableCandidate> candidates,
@@ -97,8 +118,11 @@ class ConfigRunner {
 
  private:
   ConfigRunner(std::unique_ptr<Profiler> profiler,
-               CorrectnessCheckOptions options)
-      : profiler_(std::move(profiler)), options_(options) {}
+               CorrectnessCheckOptions options,
+               AdaptiveRemeasurementOptions remeasurement_options)
+      : profiler_(std::move(profiler)),
+        options_(options),
+        remeasurement_options_(remeasurement_options) {}
 
   struct OutputCluster {
     ScopedShapedBuffer representative;
@@ -106,7 +130,7 @@ class ConfigRunner {
     bool has_trusted_member = false;
   };
 
-  ConfigProfile ProfileCandidate(ExecutableCandidate candidate,
+  ConfigProfile ProfileCandidate(ExecutableCandidate& candidate,
                                  InputBuffers& input_buffers,
                                  std::vector<OutputCluster>& clusters,
                                  bool is_trusted_config, bool allow_new_cluster)
@@ -124,6 +148,7 @@ class ConfigRunner {
  public:
   std::unique_ptr<Profiler> profiler_ ABSL_GUARDED_BY(profiler_m_);
   CorrectnessCheckOptions options_;
+  AdaptiveRemeasurementOptions remeasurement_options_;
   absl::Mutex profiler_m_;
 };
 

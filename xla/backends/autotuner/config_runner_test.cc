@@ -126,6 +126,71 @@ TEST_F(ConfigRunnerTest, ProfileAllCorrectnessCheckDisabled) {
   EXPECT_EQ(profiles[1].scratch_bytes, 200);
 }
 
+TEST_F(ConfigRunnerTest, AdaptiveRemeasurementSkipsClearLoser) {
+  auto profiler = std::make_unique<MockProfiler>();
+  EXPECT_CALL(*profiler, CreateInputBuffers(_, _)).WillOnce([] {
+    return std::make_unique<InputBuffers>();
+  });
+  EXPECT_CALL(*profiler, Profile(_, _))
+      .WillOnce(Return(ProfileResult({absl::Nanoseconds(100)})))
+      .WillOnce(Return(ProfileResult({absl::Nanoseconds(1000)})));
+
+  ConfigRunner::CorrectnessCheckOptions correctness;
+  correctness.enable_correctness_check = false;
+  ConfigRunner::AdaptiveRemeasurementOptions remeasurement{.enabled = true};
+  ASSERT_OK_AND_ASSIGN(
+      auto runner, ConfigRunner::Create(std::move(profiler), correctness,
+                                        remeasurement));
+
+  MockCodegenBackend backend;
+  std::vector<ConfigRunner::ExecutableCandidate> candidates;
+  candidates.push_back({{&backend, GetTestConfig("fast")},
+                        std::make_unique<CountingDestructorExecutable>()});
+  candidates.push_back({{&backend, GetTestConfig("slow")},
+                        std::make_unique<CountingDestructorExecutable>()});
+
+  ASSERT_OK_AND_ASSIGN(auto profiles,
+                       runner->ProfileAll(std::move(candidates)));
+  EXPECT_EQ(profiles[0].duration, absl::Nanoseconds(100));
+  EXPECT_EQ(profiles[1].duration, absl::Nanoseconds(1000));
+}
+
+TEST_F(ConfigRunnerTest, AdaptiveRemeasurementUsesRoundRobinMedian) {
+  auto profiler = std::make_unique<MockProfiler>();
+  EXPECT_CALL(*profiler, CreateInputBuffers(_, _)).WillOnce([] {
+    return std::make_unique<InputBuffers>();
+  });
+  {
+    testing::InSequence sequence;
+    EXPECT_CALL(*profiler, Profile(_, _))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(100)})))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(101)})))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(500)})))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(102)})))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(99)})))
+        .WillOnce(Return(ProfileResult({absl::Nanoseconds(501)})));
+  }
+
+  ConfigRunner::CorrectnessCheckOptions correctness;
+  correctness.enable_correctness_check = false;
+  ConfigRunner::AdaptiveRemeasurementOptions remeasurement{.enabled = true};
+  ASSERT_OK_AND_ASSIGN(
+      auto runner, ConfigRunner::Create(std::move(profiler), correctness,
+                                        remeasurement));
+
+  MockCodegenBackend backend;
+  std::vector<ConfigRunner::ExecutableCandidate> candidates;
+  candidates.push_back({{&backend, GetTestConfig("candidate_0")},
+                        std::make_unique<CountingDestructorExecutable>()});
+  candidates.push_back({{&backend, GetTestConfig("candidate_1")},
+                        std::make_unique<CountingDestructorExecutable>()});
+
+  ASSERT_OK_AND_ASSIGN(auto profiles,
+                       runner->ProfileAll(std::move(candidates)));
+  EXPECT_EQ(profiles[0].duration, absl::Nanoseconds(100));
+  EXPECT_EQ(profiles[1].duration, absl::Nanoseconds(102));
+}
+
 TEST_F(ConfigRunnerTest, ProfileAllExecutionError) {
   auto profiler = std::make_unique<MockProfiler>();
   EXPECT_CALL(*profiler, CreateInputBuffers(_, _)).WillOnce([] {

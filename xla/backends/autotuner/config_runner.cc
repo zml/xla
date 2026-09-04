@@ -48,15 +48,42 @@ limitations under the License.
 
 namespace xla {
 
+absl::Duration ConfigRunner::MeasurementNoiseWindow(
+    absl::Duration duration,
+    const AdaptiveRemeasurementOptions& options) {
+  return std::max(options.absolute_window,
+                  absl::Seconds(absl::ToDoubleSeconds(duration) *
+                                options.relative_window));
+}
+
 absl::StatusOr<std::unique_ptr<ConfigRunner>> ConfigRunner::Create(
     std::unique_ptr<Profiler> profiler,
     ConfigRunner::CorrectnessCheckOptions options) {
+  return Create(std::move(profiler), std::move(options), {});
+}
+
+absl::StatusOr<std::unique_ptr<ConfigRunner>> ConfigRunner::Create(
+    std::unique_ptr<Profiler> profiler,
+    ConfigRunner::CorrectnessCheckOptions options,
+    ConfigRunner::AdaptiveRemeasurementOptions remeasurement_options) {
   if (profiler == nullptr) {
     return absl::InvalidArgumentError(
         "ConfigRunner initialization failed. Profiler is null.");
   }
+  if (remeasurement_options.enabled &&
+      (remeasurement_options.total_samples < 3 ||
+       remeasurement_options.total_samples % 2 == 0)) {
+    return absl::InvalidArgumentError(
+        "Adaptive remeasurement requires an odd sample count of at least 3.");
+  }
+  if (remeasurement_options.enabled &&
+      remeasurement_options.max_finalists < 2) {
+    return absl::InvalidArgumentError(
+        "Adaptive remeasurement requires at least two finalists.");
+  }
   return absl::WrapUnique(
-      new ConfigRunner(std::move(profiler), std::move(options)));
+      new ConfigRunner(std::move(profiler), std::move(options),
+                       std::move(remeasurement_options)));
 }
 
 absl::StatusOr<std::vector<ConfigRunner::ConfigProfile>>
@@ -93,7 +120,7 @@ ConfigRunner::ProfileAll(
   for (auto it = profile_order.begin(); it != first_untrusted; ++it) {
     const int i = *it;
     config_results[i] =
-        ProfileCandidate(std::move(candidates[i]), *input_buffers, clusters,
+        ProfileCandidate(candidates[i], *input_buffers, clusters,
                          /*is_trusted_config=*/true,
                          /*allow_new_cluster=*/true);
   }
@@ -102,7 +129,7 @@ ConfigRunner::ProfileAll(
   for (auto it = first_untrusted; it != profile_order.end(); ++it) {
     const int i = *it;
     config_results[i] =
-        ProfileCandidate(std::move(candidates[i]), *input_buffers, clusters,
+        ProfileCandidate(candidates[i], *input_buffers, clusters,
                          /*is_trusted_config=*/false,
                          /*allow_new_cluster=*/!has_trusted_reference);
   }
@@ -118,12 +145,83 @@ ConfigRunner::ProfileAll(
       }
     }
   }
+  if (remeasurement_options_.enabled &&
+      remeasurement_options_.total_samples > 1) {
+    absl::Duration fastest = absl::InfiniteDuration();
+    for (const ConfigProfile& result : config_results) {
+      if (!result.failure.has_value()) {
+        fastest = std::min(fastest, result.duration);
+      }
+    }
+    if (fastest == absl::InfiniteDuration()) {
+      candidates.clear();
+      return config_results;
+    }
+    const absl::Duration finalist_window =
+        MeasurementNoiseWindow(fastest, remeasurement_options_);
+    std::vector<int> ranked_candidates;
+    std::vector<std::vector<absl::Duration>> samples(candidates.size());
+    for (int i = 0; i < config_results.size(); ++i) {
+      if (!config_results[i].failure.has_value()) {
+        ranked_candidates.push_back(i);
+      }
+    }
+    std::stable_sort(ranked_candidates.begin(), ranked_candidates.end(),
+                     [&](int lhs, int rhs) {
+                       return config_results[lhs].duration <
+                              config_results[rhs].duration;
+                     });
+    std::vector<int> finalists;
+    for (int i : ranked_candidates) {
+      if (finalists.size() >=
+              static_cast<size_t>(remeasurement_options_.max_finalists) ||
+          config_results[i].duration > fastest + finalist_window) {
+        break;
+      }
+      finalists.push_back(i);
+      samples[i].push_back(config_results[i].duration);
+    }
+
+    if (finalists.size() > 1) {
+      for (int sample = 1; sample < remeasurement_options_.total_samples;
+           ++sample) {
+        for (int i : finalists) {
+          if (config_results[i].failure.has_value()) {
+            continue;
+          }
+          absl::StatusOr<ProfileResult> repeated = profiler_->Profile(
+              candidates[i].executable.get(), *input_buffers);
+          if (!repeated.ok()) {
+            config_results[i].failure = Failure{
+                FailureKind::kExecutionFailed, repeated.status().ToString()};
+            continue;
+          }
+          if (options_.enable_correctness_check) {
+            absl::Status redzone = profiler_->CheckInputBuffers(*input_buffers);
+            if (!redzone.ok()) {
+              config_results[i].failure = Failure{
+                  FailureKind::kRedzoneCheckFailed, redzone.ToString()};
+              continue;
+            }
+          }
+          samples[i].push_back(repeated->duration);
+        }
+      }
+      for (int i : finalists) {
+        if (config_results[i].failure.has_value() || samples[i].empty()) {
+          continue;
+        }
+        std::sort(samples[i].begin(), samples[i].end());
+        config_results[i].duration = samples[i][samples[i].size() / 2];
+      }
+    }
+  }
   candidates.clear();
   return config_results;
 }
 
 ConfigRunner::ConfigProfile ConfigRunner::ProfileCandidate(
-    ConfigRunner::ExecutableCandidate candidate, InputBuffers& input_buffers,
+    ConfigRunner::ExecutableCandidate& candidate, InputBuffers& input_buffers,
     std::vector<OutputCluster>& clusters, bool is_trusted_config,
     bool allow_new_cluster) {
   absl::StatusOr<ProfileResult> profile_result =

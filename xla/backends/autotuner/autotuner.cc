@@ -81,7 +81,8 @@ absl::StatusOr<std::unique_ptr<Autotuner>> Autotuner::Create(
   for (auto& profiler : profilers) {
     ABSL_ASSIGN_OR_RETURN(config_runners.emplace_back(),
                      ConfigRunner::Create(std::move(profiler),
-                                          options.correctness_check_options));
+                                          options.correctness_check_options,
+                                          options.remeasurement_options));
   }
 
   CodegenOrchestrator* orchestrator_ptr = orchestrator.get();
@@ -101,7 +102,8 @@ absl::StatusOr<std::unique_ptr<Autotuner>> Autotuner::Create(
   for (auto& profiler : profilers) {
     ABSL_ASSIGN_OR_RETURN(config_runners.emplace_back(),
                      ConfigRunner::Create(std::move(profiler),
-                                          options.correctness_check_options));
+                                          options.correctness_check_options,
+                                          options.remeasurement_options));
   }
 
   return absl::WrapUnique(new Autotuner(nullptr, orchestrator,
@@ -238,7 +240,8 @@ tsl::Future<Autotuner::Config> Autotuner::GetTunedConfig(
 
         ABSL_ASSIGN_OR_RETURN(
             ConfigRunner::ConfigProfile best_profile,
-            PickBestConfig(profiles, options_.scratch_bytes_window_size_us));
+            PickBestConfig(profiles, options_.scratch_bytes_window_size_us,
+                           options_.remeasurement_options));
 
         return std::move(best_profile.config);
       });

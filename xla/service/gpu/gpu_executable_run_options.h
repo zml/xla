@@ -83,6 +83,16 @@ class GpuExecutableRunOptions {
     return *this;
   }
 
+  // Whether the caller already holds the mutex returned by GetGpuMutex for
+  // the executor. This is used to make a sequence of executable invocations
+  // one atomic GPU operation without recursively acquiring the mutex.
+  bool gpu_lock_already_held() const { return gpu_lock_already_held_; }
+
+  GpuExecutableRunOptions& set_gpu_lock_already_held() {
+    gpu_lock_already_held_ = true;
+    return *this;
+  }
+
   bool enable_mock_collectives() const { return enable_mock_collectives_; }
 
   // Enables mocking nccl collective operations on the GPU.
@@ -97,6 +107,7 @@ class GpuExecutableRunOptions {
 
  private:
   bool requires_exclusive_lock_on_gpu_ = false;
+  bool gpu_lock_already_held_ = false;
   bool enable_mock_collectives_ = false;
   std::optional<DeviceIdMap> gpu_global_device_ids_;
   CliqueIdCallback clique_id_callback_;

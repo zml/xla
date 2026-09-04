@@ -48,6 +48,8 @@ class Autotuner {
   struct Options {
     int scratch_bytes_window_size_us = 2;
     ConfigRunner::CorrectnessCheckOptions correctness_check_options;
+    ConfigRunner::AdaptiveRemeasurementOptions remeasurement_options = {
+        .enabled = true};
     // File path to dump the profiles for all configs profiled for each HLO
     // instruction.
     std::string dump_logs_to = "";

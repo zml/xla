@@ -279,6 +279,10 @@ absl::StatusOr<std::unique_ptr<InputBuffers>> GpuProfiler::CreateInputBuffers(
 
 absl::StatusOr<ProfileResult> GpuProfiler::Profile(
     Executable* executable, const InputBuffers& buffers) {
+  // Keep the warmup, its completion, and the measured execution adjacent on
+  // the GPU. Execute() marks the nested invocations as already locked so they
+  // do not recursively acquire this mutex.
+  absl::WriterMutexLock gpu_lock(GetGpuMutex(stream_executor_));
   const GpuInputBuffers& gpu_buffers =
       absl::down_cast<const GpuInputBuffers&>(buffers);
   const RedzoneBuffers& rz_buffers = gpu_buffers.redzone_buffers;
@@ -319,7 +323,7 @@ absl::StatusOr<ExecutionOutput> GpuProfiler::Execute(
     ExecutionProfile* profile) {
   // Require exclusive GPU lock to prevent other runs during autotuning.
   GpuExecutableRunOptions gpu_opts;
-  gpu_opts.set_requires_exclusive_lock_on_gpu();
+  gpu_opts.set_requires_exclusive_lock_on_gpu().set_gpu_lock_already_held();
 
   ExecutableRunOptions run_options;
   run_options.set_device_ordinal(stream_executor_->device_ordinal());

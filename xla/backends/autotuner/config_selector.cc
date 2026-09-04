@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,7 +34,9 @@ namespace xla {
 
 absl::StatusOr<ConfigRunner::ConfigProfile> PickBestConfig(
     std::vector<ConfigRunner::ConfigProfile>& results,
-    int scratch_bytes_window_size_us) {
+    int scratch_bytes_window_size_us,
+    std::optional<ConfigRunner::AdaptiveRemeasurementOptions>
+        remeasurement_options) {
   absl::Duration min_duration = absl::InfiniteDuration();
   ConfigRunner::ConfigProfile* best_result = nullptr;
   std::vector<std::string> failures;
@@ -57,8 +60,14 @@ absl::StatusOr<ConfigRunner::ConfigProfile> PickBestConfig(
 
   const ConfigRunner::ConfigProfile* fastest_result = best_result;
   int64_t min_scratch_bytes = std::numeric_limits<int64_t>::max();
-  absl::Duration duration_limit =
-      min_duration + absl::Microseconds(scratch_bytes_window_size_us);
+  absl::Duration scratch_selection_window =
+      absl::Microseconds(scratch_bytes_window_size_us);
+  if (remeasurement_options.has_value() && remeasurement_options->enabled) {
+    scratch_selection_window = std::min(
+        scratch_selection_window, ConfigRunner::MeasurementNoiseWindow(
+                                      min_duration, *remeasurement_options));
+  }
+  absl::Duration duration_limit = min_duration + scratch_selection_window;
   absl::Duration min_duration_with_optimized_scratch_bytes =
       absl::InfiniteDuration();
   for (ConfigRunner::ConfigProfile& result : results) {
@@ -78,7 +87,7 @@ absl::StatusOr<ConfigRunner::ConfigProfile> PickBestConfig(
     VLOG(2) << "Autotuner picked a slower config to save scratch memory. "
             << "Fastest config: " << fastest_result->ToString() << ". "
             << "Selected config: " << best_result->ToString() << ". "
-            << "Tolerance: " << scratch_bytes_window_size_us << "us.";
+            << "Tolerance: " << scratch_selection_window << ".";
   }
 
   return std::move(*best_result);

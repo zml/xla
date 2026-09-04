@@ -16,16 +16,20 @@ limitations under the License.
 #ifndef XLA_BACKENDS_AUTOTUNER_CONFIG_SELECTOR_H_
 #define XLA_BACKENDS_AUTOTUNER_CONFIG_SELECTOR_H_
 
+#include <optional>
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "xla/backends/autotuner/config_runner.h"
 
 namespace xla {
 
 absl::StatusOr<ConfigRunner::ConfigProfile> PickBestConfig(
     std::vector<ConfigRunner::ConfigProfile>& results,
-    int scratch_bytes_window_size_us);
+    int scratch_bytes_window_size_us,
+    std::optional<ConfigRunner::AdaptiveRemeasurementOptions>
+        remeasurement_options = std::nullopt);
 
 }  // namespace xla
 

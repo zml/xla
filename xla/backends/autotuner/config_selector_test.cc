@@ -135,5 +135,23 @@ TEST(ConfigSelectorTest, IgnoresScratchBytesOutsideWindow) {
   EXPECT_EQ(best.scratch_bytes, 200);
 }
 
+TEST(ConfigSelectorTest, AdaptiveNoiseWindowCapsScratchPreference) {
+  MockCodegenBackend backend;
+  std::vector<ConfigRunner::ConfigProfile> profiles;
+  profiles.push_back(CreateProfile(&backend, "fast_more_scratch",
+                                   absl::Nanoseconds(1000), 200));
+  profiles.push_back(CreateProfile(&backend, "near_less_scratch",
+                                   absl::Nanoseconds(1064), 100));
+  profiles.push_back(CreateProfile(&backend, "slow_no_scratch",
+                                   absl::Nanoseconds(1065), 0));
+
+  ConfigRunner::AdaptiveRemeasurementOptions remeasurement{.enabled = true};
+  ASSERT_OK_AND_ASSIGN(
+      auto best,
+      PickBestConfig(profiles, /*scratch_bytes_window_size_us=*/2,
+                     remeasurement));
+  EXPECT_THAT(*best.config.backend_config, ConfigMatcher("near_less_scratch"));
+}
+
 }  // namespace
 }  // namespace xla

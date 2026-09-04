@@ -970,13 +970,18 @@ absl::StatusOr<ExecutionOutput> GpuExecutable::ExecuteAsyncOnStreamImpl(
   // that may be running during JIT compilation while allowing multiple XLA
   // computations to use the same GPU simultaneously. We do not add locking for
   // "recursive" invocations, which are done when holding a lock already.
-  std::variant<absl::ReaderMutexLock, absl::WriterMutexLock> gpu_lock(
-      std::in_place_index_t<0>{}, GetGpuMutex(executor));
+  using GpuLock =
+      std::variant<absl::ReaderMutexLock, absl::WriterMutexLock>;
+  const auto* gpu_opts =
+      run_options->run_options().gpu_executable_run_options();
+  std::optional<GpuLock> gpu_lock;
+  if (gpu_opts == nullptr || !gpu_opts->gpu_lock_already_held()) {
+    gpu_lock.emplace(std::in_place_index_t<0>{}, GetGpuMutex(executor));
 
-  // Maybe update to a writer lock to get exclusive access to underlying GPU.
-  if (auto* gpu_opts = run_options->run_options().gpu_executable_run_options();
-      gpu_opts && gpu_opts->requires_exclusive_lock_on_gpu()) {
-    gpu_lock.emplace<1>(GetGpuMutex(executor));
+    // Maybe update to a writer lock to get exclusive access to underlying GPU.
+    if (gpu_opts && gpu_opts->requires_exclusive_lock_on_gpu()) {
+      gpu_lock->emplace<1>(GetGpuMutex(executor));
+    }
   }
 
   const GpuExecutable::BufferAllocToDeviceMemoryMap* globals;
