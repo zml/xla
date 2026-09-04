@@ -6603,6 +6603,12 @@ absl::Status SpmdPartitioningVisitor::HandleScaledDot(HloInstruction* hlo) {
   CHECK(hlo->parent()->parent()->config().use_shardy_partitioner())
       << "ScaledDot is only supported with Shardy.";
 
+  // Preprocess temporarily represents pure-manual operations as single-device
+  // so the partitioner leaves their already-local operands unchanged.
+  if (hlo->sharding().IsSingleDevice()) {
+    return DefaultAction(hlo);
+  }
+
   const DotDimensionNumbers& dot_dnums = hlo->dot_dimension_numbers();
 
   PartitionedHlo& lhs = GetPartitionedHlo(hlo->operand(0));
