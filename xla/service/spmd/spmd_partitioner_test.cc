@@ -6005,6 +6005,30 @@ ENTRY entry {
                           op::Shape("f32[4,5]")));
 }
 
+TEST_P(SpmdPartitioningTest, ScaledDotManualDoesNotReplicateScales) {
+  absl::string_view hlo_string = R"(
+HloModule module
+
+ENTRY entry {
+  lhs = f8e4m3fn[384,4096] parameter(0), sharding={manual}
+  rhs = f8e4m3fn[2048,4096] parameter(1), sharding={manual}
+  lhs_scale = f32[384,32] parameter(2), sharding={manual}
+  rhs_scale = f32[16,32] parameter(3), sharding={manual}
+  ROOT scaled_dot = bf16[384,2048] scaled-dot(
+      lhs, rhs, lhs_scale, rhs_scale),
+      lhs_contracting_dims={1}, rhs_contracting_dims={1}, sharding={manual}
+})";
+
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       PartitionComputation(hlo_string, /*num_devices=*/2));
+
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_EQ(root->opcode(), HloOpcode::kScaledDot);
+  EXPECT_EQ(root->operand(2)->opcode(), HloOpcode::kParameter);
+  EXPECT_EQ(root->operand(3)->opcode(), HloOpcode::kParameter);
+  VerifyNoCollectives(module.get());
+}
+
 TEST_P(SpmdPartitioningTest, ConditionalPartialManual) {
   absl::string_view hlo_string = R"(
 HloModule module
