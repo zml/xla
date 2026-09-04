@@ -1832,8 +1832,15 @@ absl::StatusOr<tsl::AllocatorStats> StreamExecutorGpuDevice::GetAllocatorStats()
         "GetAllocatorStats() is allowed only for addressable devices");
   }
 
-  auto* allocator_adapter = dynamic_cast<se::MultiDeviceAdapter*>(
-      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator());
+  se::DeviceAddressAllocator* device_allocator =
+      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator();
+  if (auto* vmm_allocator =
+          dynamic_cast<se::DeviceAddressVmmAllocator*>(device_allocator)) {
+    return vmm_allocator->GetAllocatorStats(local_device_id().value());
+  }
+
+  auto* allocator_adapter =
+      dynamic_cast<se::MultiDeviceAdapter*>(device_allocator);
   if (!allocator_adapter) {
     return Unimplemented(
         "GetAllocatorStats() is only implemented with MultiDeviceAdapter "
@@ -1857,8 +1864,19 @@ absl::Status StreamExecutorGpuDevice::ClearMemoryStats() {
         "ClearMemoryStats() is allowed only for addressable devices");
   }
 
-  auto* allocator_adapter = dynamic_cast<se::MultiDeviceAdapter*>(
-      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator());
+  se::DeviceAddressAllocator* device_allocator =
+      tensorflow::down_cast<PjRtStreamExecutorClient*>(client())->allocator();
+  if (auto* vmm_allocator =
+          dynamic_cast<se::DeviceAddressVmmAllocator*>(device_allocator)) {
+    if (vmm_allocator->ClearAllocatorStats(local_device_id().value())) {
+      return absl::OkStatus();
+    }
+    return absl::UnavailableError(
+        "ClearStats not supported by the VMM allocator");
+  }
+
+  auto* allocator_adapter =
+      dynamic_cast<se::MultiDeviceAdapter*>(device_allocator);
   if (!allocator_adapter) {
     return absl::UnimplementedError(
         "ClearMemoryStats() is only implemented with MultiDeviceAdapter "

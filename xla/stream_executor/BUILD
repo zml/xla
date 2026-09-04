@@ -369,6 +369,7 @@ cc_library(
         ":stream",
         ":stream_executor_h",
         "//xla/service:device_assignment",
+        "//xla/tsl/framework:allocator",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",

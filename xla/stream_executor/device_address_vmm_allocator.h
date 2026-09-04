@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/framework/allocator.h"
 
 namespace xla {
 class DeviceAssignment;
@@ -253,6 +254,15 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
   // Returns the stream for the given device ordinal.
   absl::StatusOr<Stream*> GetStream(int device_ordinal) override;
 
+  // Returns physical-memory accounting for the given device. VMM virtual
+  // reservations are not charged; retained allocations remain in use until
+  // their stream-ordered deallocation completes.
+  absl::StatusOr<tsl::AllocatorStats> GetAllocatorStats(
+      int device_ordinal) const;
+
+  // Clears cumulative allocation statistics while preserving current usage.
+  bool ClearAllocatorStats(int device_ordinal) override;
+
   // Waits for all pending stream-ordered deallocations and unmaps on the given
   // device to complete, then drops the corresponding deferred bookkeeping.
   absl::Status SynchronizePendingOperations(int device_ordinal);
@@ -436,6 +446,9 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
 
     mutable absl::Mutex mu;
     uint64_t pa_allocated ABSL_GUARDED_BY(mu) = 0;
+    uint64_t peak_pa_allocated ABSL_GUARDED_BY(mu) = 0;
+    uint64_t num_allocs ABSL_GUARDED_BY(mu) = 0;
+    uint64_t largest_alloc_size ABSL_GUARDED_BY(mu) = 0;
     // Monotonically increasing counter for timeline sequence numbers.
     uint64_t next_seqno ABSL_GUARDED_BY(mu) = 1;
     // Open trailing batch of deferred deallocations. Pending entries in the
