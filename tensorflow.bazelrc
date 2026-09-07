@@ -187,6 +187,7 @@ common:rocm_base --copt=-Wno-gnu-offsetof-extensions
 common:rocm_base --define=using_rocm_hipcc=true
 common:rocm_base --define=tensorflow_mkldnn_contraction_kernel=0
 common:rocm_base --repo_env TF_NEED_ROCM=1
+common:rocm_base --copt=-Wno-error=unused-command-line-argument
 common:rocm_base --define=using_rocm_hipcc=true
 common:rocm_base --define=tensorflow_mkldnn_contraction_kernel=0
 common:rocm_base --action_env=HIPCC_COMPILE_FLAGS_APPEND="--offload-compress"
@@ -230,4 +231,3 @@ build --test_tag_filters -no_oss
 
 test  --build_tag_filters -no_oss
 test  --test_tag_filters -no_oss
-
