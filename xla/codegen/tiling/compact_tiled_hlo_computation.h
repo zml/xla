@@ -107,6 +107,9 @@ class CompactTiledHloComputation {
 
   TilingEvaluationWorkspace& workspace_;
   std::vector<InstructionType> records_;
+  // Equality requires identical HLO pointers. Unique symbolic occurrences can
+  // bypass candidate hashing; repeated HLOs still use the complete equality.
+  std::vector<uint8_t> may_deduplicate_;
   std::vector<int64_t> canonical_ids_;
   std::vector<const InstructionType*> instructions_;
   std::vector<const SymbolicTiledHloInstruction*> symbolic_instructions_;

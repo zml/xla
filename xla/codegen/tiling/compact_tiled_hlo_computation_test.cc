@@ -164,6 +164,58 @@ ENTRY main {
 })"));
 }
 
+TEST_F(CompactTiledHloComputationTest,
+       UniqueInstructionsWithRepeatedOperandsMatchEveryCandidate) {
+  ASSERT_OK(CompareAllCandidates(R"(
+HloModule repeated_operands
+ENTRY main {
+  p0 = f32[3,17] parameter(0)
+  abs = f32[3,17] abs(p0)
+  square = f32[3,17] multiply(abs, abs)
+  ROOT add = f32[3,17] add(square, square)
+})"));
+}
+
+TEST_F(CompactTiledHloComputationTest,
+       CandidateDependentDedupPreservesOperandIdentity) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+HloModule candidate_dependent_dedup
+ENTRY main {
+  p0 = f32[8,8] parameter(0)
+  abs = f32[8,8] abs(p0)
+  transpose = f32[8,8] transpose(abs), dimensions={1,0}
+  ROOT add = f32[8,8] add(abs, transpose)
+})"));
+  SymbolicTileAnalysisOrError result = Analyze(*module);
+  auto* analysis = std::get_if<SymbolicTileAnalysis>(&result);
+  ASSERT_NE(analysis, nullptr);
+  ASSERT_TRUE(CompactTiledHloComputation::CanUse(*analysis).IsAllowed());
+  TilingEvaluationWorkspace workspace(*analysis);
+  CompactTiledHloComputation compact(workspace);
+  const HloInstruction* parameter =
+      module->entry_computation()->parameter_instruction(0);
+  // Full tiles merge the transposed parameter/abs occurrences. Smaller tiles
+  // can distinguish their sizes or offsets. Revisiting both cases ensures
+  // that unique consumers keep following the current canonical operands.
+  const std::vector<std::vector<int64_t>> tilings = {
+      {1, 1}, {8, 8}, {1, 1}, {1, 8}, {8, 8}, {8, 1}};
+  for (const std::vector<int64_t>& parameters : tilings) {
+    ASSERT_OK_AND_ASSIGN(TiledHloComputation full,
+                         analysis->ComputeTiledComputation(parameters));
+    workspace.Reset(parameters);
+    ASSERT_OK_AND_ASSIGN(Decision decision, compact.Update());
+    ASSERT_TRUE(decision.IsAllowed());
+    Compare(full, compact);
+    const int64_t parameter_tiles = llvm::count_if(
+        full.instructions(), [parameter](const TiledHloInstruction* instruction) {
+          return instruction->hlo() == parameter;
+        });
+    const bool full_tile = parameters[0] == 8 && parameters[1] == 8;
+    EXPECT_EQ(parameter_tiles, full_tile ? 1 : 2);
+  }
+}
+
 TEST_F(CompactTiledHloComputationTest, ScalarMatchesEveryCandidate) {
   ASSERT_OK(CompareAllCandidates(R"(
 HloModule scalar

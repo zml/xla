@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/status/status_macros.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "xla/hlo/analysis/indexing_map.h"
 #include "xla/hlo/analysis/interval.h"
@@ -84,12 +85,14 @@ CompactTiledHloComputation::CompactTiledHloComputation(
     TilingEvaluationWorkspace& workspace)
     : workspace_(workspace),
       records_(workspace.analysis().num_symbolic_tiled_hlo_instructions()),
+      may_deduplicate_(records_.size(), false),
       canonical_ids_(records_.size()),
       dedup_(0, Hash{this}, Eq{this}) {
   CHECK(CanUse(workspace.analysis()).IsAllowed());
   instructions_.reserve(records_.size());
   symbolic_instructions_.reserve(records_.size());
-  dedup_.reserve(records_.size());
+  llvm::DenseMap<const HloInstruction*, int64_t> first_occurrence;
+  first_occurrence.reserve(records_.size());
   for (const auto& symbolic :
        workspace.analysis().GetSymbolicTiledHloComputation()) {
     InstructionType& record = records_[symbolic->id()];
@@ -98,7 +101,14 @@ CompactTiledHloComputation::CompactTiledHloComputation(
     record.sizes_ = &workspace.tile_sizes(symbolic.get());
     record.strides_ = &workspace.tile_strides(symbolic.get());
     record.operand_ids_.resize(symbolic->operands().size());
+    const auto [it, inserted] =
+        first_occurrence.try_emplace(symbolic->hlo(), symbolic->id());
+    if (!inserted) {
+      may_deduplicate_[it->second] = true;
+      may_deduplicate_[symbolic->id()] = true;
+    }
   }
+  dedup_.reserve(llvm::count(may_deduplicate_, true));
 }
 
 size_t CompactTiledHloComputation::Hash::operator()(int64_t index) const {
@@ -158,11 +168,17 @@ absl::StatusOr<Decision> CompactTiledHloComputation::Update(
       for (auto [i, operand] : llvm::enumerate(symbolic->operands())) {
         record.operand_ids_[i] = canonical_ids_[operand->id()];
       }
-      const auto [it, inserted] = dedup_.insert(id);
+      int64_t canonical_id = id;
+      bool inserted = true;
+      if (may_deduplicate_[id]) {
+        const auto [it, was_inserted] = dedup_.insert(id);
+        canonical_id = *it;
+        inserted = was_inserted;
+      }
       if (!inserted && record.operands().empty() && !offsets_ready_) {
         return false;
       }
-      canonical_ids_[id] = *it;
+      canonical_ids_[id] = canonical_id;
       if (inserted) {
         instructions_.push_back(&record);
         symbolic_instructions_.push_back(symbolic.get());
