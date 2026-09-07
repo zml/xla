@@ -1237,8 +1237,8 @@ const std::vector<OperandIndexingSet>& GetOperandIndexingMaps(
   } else {
     for (const auto& map_set : operands_indexing.indexing_maps) {
       CHECK_EQ(map_set.size(), 1);  // Crash OK
-      indexing_maps.push_back(map_set);
     }
+    indexing_maps = std::move(operands_indexing.indexing_maps);
   }
   return cache.emplace(&hlo, std::move(indexing_maps)).first->second;
 }
