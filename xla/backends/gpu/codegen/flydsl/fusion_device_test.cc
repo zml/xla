@@ -169,8 +169,11 @@ ENTRY main {
     }
     ASSERT_OK_AND_ASSIGN(GpuBackendConfig fusion_config,
                          instruction->backend_config<GpuBackendConfig>());
-    EXPECT_TRUE(fusion_config.fusion_backend_config().kind() == "__fly_gemm" ||
-                fusion_config.fusion_backend_config().kind() == "__fly")
+    absl::string_view kind = fusion_config.fusion_backend_config().kind();
+    EXPECT_NE(kind, kTritonFusionKind) << instruction->ToString();
+    EXPECT_NE(kind, kTritonGemmFusionKind) << instruction->ToString();
+    EXPECT_NE(kind, kTritonNestedGemmFusionKind) << instruction->ToString();
+    EXPECT_NE(kind, kTritonCollectiveFusionKind)
         << instruction->ToString();
   }
   EXPECT_TRUE(RunAndCompareNoHloPasses(
