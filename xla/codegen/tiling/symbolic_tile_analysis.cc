@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/codegen/tiling/symbolic_tile_analysis.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -45,6 +46,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -142,8 +144,9 @@ bool IsSomeDot(const HloInstruction& hlo) {
          hlo.opcode() == HloOpcode::kScaledDot;
 }
 
+template <typename TiledInstruction>
 llvm::SmallVector<int64_t> GetNumberOfTilesPerDimension(
-    const TiledHloInstruction& tiled_hlo_instr) {
+    const TiledInstruction& tiled_hlo_instr) {
   llvm::SmallVector<int64_t> result;
   absl::Span<const int64_t> dimensions =
       tiled_hlo_instr.hlo()->shape().dimensions();
@@ -1562,21 +1565,293 @@ absl::StatusOr<bool> SymbolicTileAnalysis::ParametersSatisfyConstraints(
 }
 
 absl::Status SymbolicTileAnalysis::ForEachValidFlatTiling(
-    absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback) const {
+    absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback,
+    TilingEnumerationStats* stats) const {
+  if (stats != nullptr) *stats = {};
   const TilingSpecification::ParameterMapping& parameter_mapping =
       tiling_specification_.parameter_mapping();
 
   return ForEachFlatTilingForInputSpace(
       InputSpaceForParameterMapping(parameter_mapping),
       [&](absl::Span<const int64_t> flat_tiling_parameters) {
-        ABSL_ASSIGN_OR_RETURN(
-            bool parameters_satisfy_constraints,
-            FlatParametersSatisfyConstraints(flat_tiling_parameters));
+        std::chrono::steady_clock::time_point start;
+        if (stats != nullptr) {
+          ++stats->enumerated;
+          start = std::chrono::steady_clock::now();
+        }
+        absl::StatusOr<bool> constraint_result =
+            FlatParametersSatisfyConstraints(flat_tiling_parameters);
+        if (stats != nullptr) {
+          stats->constraint_time += absl::Nanoseconds(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count());
+        }
+        ABSL_ASSIGN_OR_RETURN(bool parameters_satisfy_constraints,
+                              std::move(constraint_result));
         if (!parameters_satisfy_constraints) {
+          if (stats != nullptr) ++stats->constraint_rejections;
           return absl::OkStatus();
         }
         return callback(flat_tiling_parameters);
       });
+}
+
+struct TilingEvaluationWorkspace::Impl {
+  // The original, unclamped parameter environment is used for sizes. The
+  // program describes expressions only; scratch and results are overwritten
+  // on every evaluation. Strides retain direct evaluation with their clamped
+  // environments and the negative-stride check after each instruction.
+  struct PreparedBatch {
+    PreparedBatch() {}
+
+    struct Output {
+      int64_t storage_index;
+      int64_t offset;
+      int64_t size;
+    };
+
+    static llvm::ArrayRef<SymbolicExpr> Expressions(
+        const SymbolicTiledHloInstruction& instruction) {
+      const auto expressions =
+          instruction.symbolic_tile().tile_map().GetSymbolicMap().GetResults();
+      // The tile map concatenates offsets, sizes, and strides in that order.
+      CHECK_EQ(expressions.size() % 3, 0);
+      const int64_t rank = expressions.size() / 3;
+      return expressions.slice(rank, rank);
+    }
+
+    void AddInstruction(const SymbolicTiledHloInstruction& instruction,
+                        int64_t storage_index) {
+      const auto component = Expressions(instruction);
+      const int64_t rank = component.size();
+      outputs.push_back(
+          {storage_index, static_cast<int64_t>(roots.size()), rank});
+      for (SymbolicExpr expression : component) {
+        roots.push_back(expression);
+      }
+    }
+
+    void Prepare() {
+      program.emplace(roots);
+      scratch.resize(program->scratch_size());
+      results.resize(program->result_count());
+      // The program owns scalar instructions; no expression handles are needed
+      // while evaluating subsequent candidates.
+      std::vector<SymbolicExpr>().swap(roots);
+    }
+
+    void Evaluate(absl::Span<const int64_t> parameters,
+                  std::vector<llvm::SmallVector<int64_t>>& values) {
+      program->Evaluate(parameters, absl::MakeSpan(scratch),
+                        absl::MakeSpan(results));
+      for (const Output& output : outputs) {
+        values[output.storage_index].assign(
+            results.begin() + output.offset,
+            results.begin() + output.offset + output.size);
+      }
+    }
+
+    std::vector<SymbolicExpr> roots;
+    std::vector<Output> outputs;
+    std::optional<SymbolicExprProgram> program;
+    std::vector<int64_t> scratch;
+    std::vector<int64_t> results;
+  };
+
+  Impl(const SymbolicTileAnalysis& analysis, ExpressionEvaluationMode mode,
+       int64_t preparation_threshold, bool collect_preparation_time)
+      : analysis(analysis),
+        sizes(analysis.GetSymbolicTiledHloComputation().size()),
+        strides(sizes.size()),
+        clamped_parameters(analysis.tile_parameter_upper_bounds().size()),
+        mode(mode),
+        preparation_threshold(preparation_threshold),
+        collect_preparation_time(collect_preparation_time) {
+    CHECK_GE(preparation_threshold, 1);
+    // IDs include nested regions in preorder, while workspace values belong
+    // only to top-level instructions. Without regions, IDs already match dense
+    // storage indices and no mapping is needed.
+    if (analysis.num_symbolic_tiled_hlo_instructions() != sizes.size()) {
+      storage_indices.resize(analysis.num_symbolic_tiled_hlo_instructions(),
+                             -1);
+      for (auto [index, instruction] :
+           llvm::enumerate(analysis.GetSymbolicTiledHloComputation())) {
+        storage_indices[instruction->id()] = index;
+      }
+    }
+  }
+
+  int64_t StorageIndex(const SymbolicTiledHloInstruction& instruction) const {
+    return storage_indices.empty() ? instruction.id()
+                                   : storage_indices[instruction.id()];
+  }
+
+  void BeginSizeEvaluation() {
+    if (size_evaluation_started) return;
+    size_evaluation_started = true;
+    if (mode == ExpressionEvaluationMode::kPrepared &&
+        ++size_evaluations == preparation_threshold) {
+      PrepareSizeExpressions();
+    }
+  }
+
+  void PrepareSizeExpressions() {
+    std::chrono::steady_clock::time_point start;
+    if (collect_preparation_time) start = std::chrono::steady_clock::now();
+    const bool has_nonterminal = absl::c_any_of(
+        analysis.GetSymbolicTiledHloComputation(),
+        [&](const auto& instruction) {
+          return absl::c_any_of(
+              PreparedBatch::Expressions(*instruction),
+              [](SymbolicExpr expression) { return expression.IsBinaryOp(); });
+        });
+    if (has_nonterminal) {
+      size_program.emplace();
+      for (auto [index, instruction] :
+           llvm::enumerate(analysis.GetSymbolicTiledHloComputation())) {
+        size_program->AddInstruction(*instruction, index);
+      }
+      size_program->Prepare();
+      ++statistics.preparations;
+    }
+    RecordPreparationTime(start);
+  }
+
+  void RecordPreparationTime(std::chrono::steady_clock::time_point start) {
+    if (collect_preparation_time) {
+      statistics.preparation_nanoseconds +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+    }
+  }
+
+  const SymbolicTileAnalysis& analysis;
+  llvm::SmallVector<int64_t> parameters;
+  std::vector<llvm::SmallVector<int64_t>> sizes;
+  std::vector<llvm::SmallVector<int64_t>> strides;
+  // Set once during construction. Region IDs have no workspace storage.
+  std::vector<int64_t> storage_indices;
+  std::vector<llvm::SmallVector<int64_t>> clamped_parameters;
+  // Allocated only when individual sizes are requested. Values are reset for
+  // every candidate; vector object addresses remain stable.
+  llvm::SmallBitVector partial_sizes_ready;
+  bool sizes_ready = false;
+  bool size_evaluation_started = false;
+  bool strides_ready = false;
+  const ExpressionEvaluationMode mode;
+  const int64_t preparation_threshold;
+  const bool collect_preparation_time;
+  int64_t size_evaluations = 0;
+  ExpressionEvaluationStatistics statistics;
+  std::optional<PreparedBatch> size_program;
+};
+
+TilingEvaluationWorkspace::TilingEvaluationWorkspace(
+    const SymbolicTileAnalysis& analysis)
+    : TilingEvaluationWorkspace(analysis, ExpressionEvaluationMode::kDirect) {}
+TilingEvaluationWorkspace::TilingEvaluationWorkspace(
+    const SymbolicTileAnalysis& analysis, ExpressionEvaluationMode mode,
+    int64_t preparation_threshold, bool collect_preparation_time)
+    : impl_(std::make_unique<Impl>(analysis, mode, preparation_threshold,
+                                   collect_preparation_time)) {}
+TilingEvaluationWorkspace::~TilingEvaluationWorkspace() = default;
+
+void TilingEvaluationWorkspace::Reset(absl::Span<const int64_t> flat_tiling) {
+  impl_->parameters.assign(flat_tiling.begin(), flat_tiling.end());
+  impl_->sizes_ready = false;
+  impl_->size_evaluation_started = false;
+  impl_->partial_sizes_ready.reset();
+  impl_->strides_ready = false;
+}
+
+void TilingEvaluationWorkspace::EvaluateTileSizes() {
+  if (impl_->sizes_ready) return;
+  impl_->BeginSizeEvaluation();
+  if (impl_->size_program.has_value()) {
+    impl_->size_program->Evaluate(impl_->parameters, impl_->sizes);
+    ++impl_->statistics.prepared_evaluations;
+  } else {
+    for (auto [index, instruction] :
+         llvm::enumerate(impl_->analysis.GetSymbolicTiledHloComputation())) {
+      if (!impl_->partial_sizes_ready.empty() &&
+          impl_->partial_sizes_ready.test(index)) {
+        continue;
+      }
+      xla::EvaluateTileSizes(instruction->symbolic_tile(), impl_->parameters,
+                             impl_->sizes[index]);
+    }
+  }
+  impl_->sizes_ready = true;
+}
+
+const llvm::SmallVector<int64_t>&
+TilingEvaluationWorkspace::EvaluateTileSizesFor(
+    const SymbolicTiledHloInstruction* instruction) {
+  const int64_t index = impl_->StorageIndex(*instruction);
+  if (impl_->sizes_ready) return impl_->sizes[index];
+  impl_->BeginSizeEvaluation();
+  if (impl_->size_program.has_value()) {
+    EvaluateTileSizes();
+  } else {
+    if (impl_->partial_sizes_ready.empty()) {
+      impl_->partial_sizes_ready.resize(impl_->sizes.size());
+    }
+    if (!impl_->partial_sizes_ready.test(index)) {
+      xla::EvaluateTileSizes(instruction->symbolic_tile(), impl_->parameters,
+                             impl_->sizes[index]);
+      impl_->partial_sizes_ready.set(index);
+    }
+  }
+  return impl_->sizes[index];
+}
+
+absl::Status TilingEvaluationWorkspace::EvaluateTileStrides() {
+  if (impl_->strides_ready) return absl::OkStatus();
+  for (auto [bounds_id, bounds] :
+       llvm::enumerate(impl_->analysis.tile_parameter_upper_bounds())) {
+    TF_RET_CHECK(bounds.size() == impl_->parameters.size());
+    auto& clamped = impl_->clamped_parameters[bounds_id];
+    clamped.resize_for_overwrite(bounds.size());
+    for (size_t i = 0; i < bounds.size(); ++i) {
+      clamped[i] = std::min(impl_->parameters[i], bounds[i]);
+    }
+  }
+  for (auto [index, instruction] :
+       llvm::enumerate(impl_->analysis.GetSymbolicTiledHloComputation())) {
+    const int64_t bounds_id = instruction->tile_parameter_bounds_id();
+    auto& strides = impl_->strides[index];
+    EvaluateTileStridesWithClampedParameters(
+        instruction->symbolic_tile(), impl_->clamped_parameters[bounds_id],
+        strides);
+    if (absl::c_any_of(strides, [](int64_t stride) { return stride < 0; })) {
+      return absl::UnimplementedError(
+          absl::StrCat("Full support for negative strides is not implemented ",
+                       instruction->ToString()));
+    }
+  }
+  impl_->strides_ready = true;
+  return absl::OkStatus();
+}
+
+const llvm::SmallVector<int64_t>& TilingEvaluationWorkspace::tile_sizes(
+    const SymbolicTiledHloInstruction* instruction) const {
+  return impl_->sizes[impl_->StorageIndex(*instruction)];
+}
+const llvm::SmallVector<int64_t>& TilingEvaluationWorkspace::tile_strides(
+    const SymbolicTiledHloInstruction* instruction) const {
+  return impl_->strides[impl_->StorageIndex(*instruction)];
+}
+absl::Span<const int64_t> TilingEvaluationWorkspace::flat_tiling() const {
+  return impl_->parameters;
+}
+const SymbolicTileAnalysis& TilingEvaluationWorkspace::analysis() const {
+  return impl_->analysis;
+}
+const TilingEvaluationWorkspace::ExpressionEvaluationStatistics&
+TilingEvaluationWorkspace::expression_evaluation_statistics() const {
+  return impl_->statistics;
 }
 
 namespace {
@@ -1617,7 +1892,8 @@ namespace {
 // the buffer sharing logic is adapted.
 // This method assumes that `output` has tile_offset_indexing computed, and
 // returns a FailedPrecondition error if not.
-absl::StatusOr<bool> IsSafeForBufferSharing(const TiledHloInstruction& output,
+template <typename TiledInstruction>
+absl::StatusOr<bool> IsSafeForBufferSharing(const TiledInstruction& output,
                                             int64_t reference_num_output_tiles,
                                             const TiledHloSchedule& schedule,
                                             MLIRContext* mlir_context) {
@@ -1674,13 +1950,12 @@ absl::StatusOr<bool> IsSafeForBufferSharing(const TiledHloInstruction& output,
          tiling_info.linear_output_tile_offset_indexing;
 }
 
-absl::StatusOr<std::vector<const TiledHloInstruction*>> InitializeTiledRoots(
-    absl::Span<const HloInstruction* const> roots,
-    const std::vector<std::unique_ptr<TiledHloInstruction>>&
-        tiled_hlo_instructions,
-    const TiledHloSchedule& schedule,
-    absl::Span<const int64_t> num_output_tiles_per_dim,
-    MLIRContext* mlir_context) {
+template <typename Reference, typename GetInstruction, typename GetHlo,
+          typename CheckBufferSharing>
+absl::StatusOr<std::vector<Reference>> InitializeTiledRootsImpl(
+    absl::Span<const HloInstruction* const> roots, int64_t instruction_count,
+    GetInstruction get_instruction, GetHlo get_hlo,
+    CheckBufferSharing check_buffer_sharing, Reference missing) {
   // TODO(b/390559452): Investigate whether it is faster to use linear lookup.
   absl::flat_hash_map<const HloInstruction*, int64_t> roots_to_output_index;
   roots_to_output_index.reserve(roots.size());
@@ -1693,38 +1968,35 @@ absl::StatusOr<std::vector<const TiledHloInstruction*>> InitializeTiledRoots(
   // Collect a tiled hlo instruction for each root. The roots which are extra
   // outputs can reference "internal" tiled hlo instructions and may appear
   // multiple times in `instructions_`.
-  std::vector<const TiledHloInstruction*> tiled_roots(roots.size(), nullptr);
+  std::vector<Reference> tiled_roots(roots.size(), missing);
   // Handle the real root as special case. Then we don't need to do any extra
   // work in case we are not dealing with a multi-output fusion.
-  auto real_root = tiled_hlo_instructions.back().get();
-  tiled_roots[roots_to_output_index[real_root->hlo()]] = real_root;
+  Reference real_root = get_instruction(instruction_count - 1);
+  tiled_roots[roots_to_output_index[get_hlo(real_root)]] = real_root;
 
-  for (const auto& tiled_hlo_instr : llvm::drop_end(tiled_hlo_instructions)) {
-    auto it = roots_to_output_index.find(tiled_hlo_instr->hlo());
+  for (int64_t index = 0; index + 1 < instruction_count; ++index) {
+    Reference tiled_hlo_instr = get_instruction(index);
+    auto it = roots_to_output_index.find(get_hlo(tiled_hlo_instr));
     if (it == roots_to_output_index.end()) {
       continue;
     }
     // We potentially allow sharing an input buffer with an output buffer.
     // Therefore we need to make sure that we use an input tile only in the
     // iteration in which we overwrite it.
-    ABSL_ASSIGN_OR_RETURN(bool valid,
-                     IsSafeForBufferSharing(*tiled_hlo_instr,
-                                            /*reference_num_output_tiles=*/
-                                            Product(num_output_tiles_per_dim),
-                                            schedule, mlir_context));
+    ABSL_ASSIGN_OR_RETURN(bool valid, check_buffer_sharing(tiled_hlo_instr));
     if (!valid) {
       continue;
     }
     // We may overwrite a previous value, but in case there are multiple
     // tiled hlo instructions for the root, we arbitrarily prefer the last one
     // in def-before-use order.
-    tiled_roots[it->second] = tiled_hlo_instr.get();
+    tiled_roots[it->second] = tiled_hlo_instr;
   }
 
   // We expect that we found at least one tiled hlo instruction for each root.
   // If not, return an error.
   for (auto [tiled_root, root] : llvm::zip(tiled_roots, roots)) {
-    if (tiled_root == nullptr) {
+    if (tiled_root == missing) {
       return absl::UnimplementedError(
           absl::StrCat("Unsupported case of multi-output fusion, we found no "
                        "tiling to reuse for ",
@@ -1733,6 +2005,63 @@ absl::StatusOr<std::vector<const TiledHloInstruction*>> InitializeTiledRoots(
   }
   return tiled_roots;
 }
+
+absl::StatusOr<std::vector<const TiledHloInstruction*>> InitializeTiledRoots(
+    absl::Span<const HloInstruction* const> roots,
+    const std::vector<std::unique_ptr<TiledHloInstruction>>& instructions,
+    const TiledHloSchedule& schedule,
+    absl::Span<const int64_t> num_output_tiles_per_dim,
+    MLIRContext* mlir_context) {
+  return InitializeTiledRootsImpl(
+      roots, instructions.size(),
+      [&](int64_t index) -> const TiledHloInstruction* {
+        return instructions[index].get();
+      },
+      [](const TiledHloInstruction* instruction) { return instruction->hlo(); },
+      [&](const TiledHloInstruction* instruction) {
+        return IsSafeForBufferSharing(*instruction,
+                                      Product(num_output_tiles_per_dim),
+                                      schedule, mlir_context);
+      },
+      static_cast<const TiledHloInstruction*>(nullptr));
+}
+
+// A temporary field view for the shared buffer-sharing check. It does not
+// allocate an instruction graph or own candidate values.
+struct CostModelTiledRoot {
+  const SymbolicTiledHloInstruction* symbolic;
+  const TilingEvaluationWorkspace& workspace;
+  const IndexingMap* offsets;
+
+  const HloInstruction* hlo() const { return symbolic->hlo(); }
+  const llvm::SmallVector<int64_t>& tile_sizes() const {
+    return workspace.tile_sizes(symbolic);
+  }
+  absl::StatusOr<IndexingMap> tile_offsets_indexing() const {
+    if (offsets == nullptr) {
+      return absl::FailedPreconditionError("Tile offsets were not computed");
+    }
+    return *offsets;
+  }
+  std::string ToString() const {
+    // Match TiledHloInstruction::ToString for the regionless/runtime-free
+    // instructions admitted by this helper, including its error diagnostics.
+    std::stringstream ss;
+    ss << "hlo: " << hlo()->ToString() << "\n";
+    ss << "tile_sizes: (" << absl::StrJoin(tile_sizes(), ", ") << ")\n";
+    ss << "tile_strides: ("
+       << absl::StrJoin(workspace.tile_strides(symbolic), ", ") << ")\n";
+    ss << "tile_offsets_indexing: "
+       << (offsets == nullptr ? "nullopt" : xla::ToString(*offsets));
+    if (!symbolic->operands().empty()) {
+      ss << "\noperands:";
+      for (const auto* operand : symbolic->operands()) {
+        ss << "\n  " << operand->hlo()->ToShortString();
+      }
+    }
+    return ss.str();
+  }
+};
 
 // Returns the list of positions of dimensions expressions that appear in
 // `expr`. No guarantee is made about their order in the resulting vector.
@@ -1804,7 +2133,31 @@ ComputeTiledInstructions(
         parameters_with_offset_indexing,
     std::vector<TiledHloInstruction*>& symbolic_to_tiled_hlo_map,
     const std::optional<absl::Span<const Interval>>&
-        parent_output_tile_dim_bounds);
+        parent_output_tile_dim_bounds,
+    TilingEvaluationWorkspace* workspace);
+
+// Exact offset-selection heuristic shared by materialized and compact views.
+// Deliberately keep hash collisions: changing this to exact size comparison
+// could suppress offset construction errors seen by the original path.
+template <typename HashTileSizes>
+void CollectInstructionsRequiringOffsets(
+    absl::Span<const std::unique_ptr<SymbolicTiledHloInstruction>> instructions,
+    absl::Span<const HloInstruction* const> roots,
+    HashTileSizes hash_tile_sizes,
+    llvm::SmallPtrSet<const HloInstruction*, 8>& parameters) {
+  absl::flat_hash_set<size_t> hashes;
+  for (const auto& instruction : instructions) {
+    if (!instruction->operands().empty()) {
+      continue;
+    }
+    if (!hashes.insert(hash_tile_sizes(instruction.get())).second) {
+      parameters.insert(instruction->hlo());
+    }
+  }
+  if (roots.size() > 1) {
+    parameters.insert(roots.begin(), roots.end());
+  }
+}
 
 // Creates a concrete tiling of HLO computation with provided
 // `flat_tiling_parameters` sizes based on the given symbolic tiling `analysis`.
@@ -1816,7 +2169,7 @@ absl::StatusOr<TiledHloComputation> ComputeTiledComputationImpl(
     bool compute_all_tile_offset_indexing_maps,
     const std::optional<absl::Span<const Interval>>&
         parent_output_tile_dim_bounds,
-    MLIRContext* mlir_context) {
+    MLIRContext* mlir_context, TilingEvaluationWorkspace* workspace = nullptr) {
   VLOG(4) << "ComputeTiledComputationImpl of analysis: " << analysis.ToString();
   const IndexingMap& real_root_indexing = analysis.GetRealRootIndexing();
   std::vector<TiledHloInstruction*> symbolic_to_tiled_hlo_map(
@@ -1825,43 +2178,48 @@ absl::StatusOr<TiledHloComputation> ComputeTiledComputationImpl(
   AppendActiveParameters(real_root_indexing,
                          major_to_minor_active_tiling_parameters);
 
-  llvm::SmallVector<llvm::SmallVector<int64_t>, 4>
-      stride_parameters_by_bounds;
-  stride_parameters_by_bounds.reserve(
-      analysis.tile_parameter_upper_bounds().size());
-  for (const std::vector<int64_t>& upper_bounds :
-       analysis.tile_parameter_upper_bounds()) {
-    CHECK_EQ(flat_tiling_parameters.size(), upper_bounds.size());
-    llvm::SmallVector<int64_t> clamped_parameters;
-    clamped_parameters.reserve(flat_tiling_parameters.size());
-    for (auto [parameter, upper_bound] :
-         llvm::zip(flat_tiling_parameters, upper_bounds)) {
-      clamped_parameters.push_back(std::min(parameter, upper_bound));
-    }
-    stride_parameters_by_bounds.push_back(std::move(clamped_parameters));
-  }
-
-  // Check that all strides are >= 0. Our codegen doesn't support negative
-  // strides at the moment if padding is required. Also, for the Reverse op it
-  // might make sense to emit code for it, and normalizing strides to >= 0.
   DenseTileValueMap tile_strides_map(
-      analysis.num_symbolic_tiled_hlo_instructions());
-  tile_strides_map.Reserve(
-      analysis.GetSymbolicTiledHloComputation().size());
-  for (const std::unique_ptr<SymbolicTiledHloInstruction>& symbolic_tiled_hlo :
-       analysis.GetSymbolicTiledHloComputation()) {
-    llvm::SmallVector<int64_t> tile_strides =
-        EvaluateTileStridesWithClampedParameters(
-            symbolic_tiled_hlo->symbolic_tile(),
-            stride_parameters_by_bounds[
-                symbolic_tiled_hlo->tile_parameter_bounds_id()]);
-    if (absl::c_any_of(tile_strides,
-                       [](int64_t stride) { return stride < 0; })) {
-      return absl::UnimplementedError(
-          absl::StrCat("Full support for negative strides is not implemented ",
-                       symbolic_tiled_hlo->ToString()));
+      workspace ? 0 : analysis.num_symbolic_tiled_hlo_instructions());
+  if (workspace != nullptr) {
+    ABSL_RETURN_IF_ERROR(workspace->EvaluateTileStrides());
+    workspace->EvaluateTileSizes();
+  } else {
+    llvm::SmallVector<llvm::SmallVector<int64_t>, 4>
+        stride_parameters_by_bounds;
+    stride_parameters_by_bounds.reserve(
+        analysis.tile_parameter_upper_bounds().size());
+    for (const std::vector<int64_t>& upper_bounds :
+         analysis.tile_parameter_upper_bounds()) {
+      CHECK_EQ(flat_tiling_parameters.size(), upper_bounds.size());
+      llvm::SmallVector<int64_t> clamped_parameters;
+      clamped_parameters.reserve(flat_tiling_parameters.size());
+      for (auto [parameter, upper_bound] :
+           llvm::zip(flat_tiling_parameters, upper_bounds)) {
+        clamped_parameters.push_back(std::min(parameter, upper_bound));
+      }
+      stride_parameters_by_bounds.push_back(std::move(clamped_parameters));
     }
-    tile_strides_map.Insert(symbolic_tiled_hlo.get(), std::move(tile_strides));
+
+    // Check that all strides are >= 0. Our codegen doesn't support negative
+    // strides at the moment if padding is required. Also, for the Reverse op it
+    // might make sense to emit code for it, and normalizing strides to >= 0.
+    tile_strides_map.Reserve(analysis.GetSymbolicTiledHloComputation().size());
+    for (const std::unique_ptr<SymbolicTiledHloInstruction>&
+             symbolic_tiled_hlo : analysis.GetSymbolicTiledHloComputation()) {
+      llvm::SmallVector<int64_t> tile_strides =
+          EvaluateTileStridesWithClampedParameters(
+              symbolic_tiled_hlo->symbolic_tile(),
+              stride_parameters_by_bounds[symbolic_tiled_hlo
+                                              ->tile_parameter_bounds_id()]);
+      if (absl::c_any_of(tile_strides,
+                         [](int64_t stride) { return stride < 0; })) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Full support for negative strides is not implemented ",
+            symbolic_tiled_hlo->ToString()));
+      }
+      tile_strides_map.Insert(symbolic_tiled_hlo.get(),
+                              std::move(tile_strides));
+    }
   }
 
   // Offset indexing is needed to emit loads/stores and to deduplicate
@@ -1880,37 +2238,30 @@ absl::StatusOr<TiledHloComputation> ComputeTiledComputationImpl(
   // offset indexing maps for all instructions.
   llvm::SmallPtrSet<const HloInstruction*, 8> parameters_with_offset_indexing;
   DenseTileValueMap tile_sizes_map(
-      analysis.num_symbolic_tiled_hlo_instructions());
-  tile_sizes_map.Reserve(
-      analysis.GetSymbolicTiledHloComputation().size());
+      workspace ? 0 : analysis.num_symbolic_tiled_hlo_instructions());
+  if (workspace == nullptr) {
+    tile_sizes_map.Reserve(analysis.GetSymbolicTiledHloComputation().size());
+  }
   if (!compute_all_tile_offset_indexing_maps) {
-    absl::flat_hash_set<size_t> hashes;
-    for (const std::unique_ptr<SymbolicTiledHloInstruction>& symbolic_tiling :
-         analysis.GetSymbolicTiledHloComputation()) {
-      if (!symbolic_tiling->operands().empty()) {
-        continue;
-      }
-
-      llvm::SmallVector<int64_t> tile_sizes = EvaluateTileSizes(
-          symbolic_tiling->symbolic_tile(), flat_tiling_parameters);
-      size_t hash_value = absl::HashOf(symbolic_tiling->hlo(),
-                                       absl::Span<const int64_t>(tile_sizes));
-      tile_sizes_map.Insert(symbolic_tiling.get(), std::move(tile_sizes));
-
-      auto [it, inserted] = hashes.insert(hash_value);
-      // Two SymbolicTiledHloInstructions have identical hash when looking only
-      // at HLO instruction pointer and tile sizes. We need to compute tile
-      // offset indexing maps for all tiles of this HLO instruction.
-      if (!inserted) {
-        parameters_with_offset_indexing.insert(symbolic_tiling->hlo());
-      }
-    }
-    if (analysis.GetRoots().size() > 1) {
-      // We need tile_offset_indexing to check whether we can reuse a tile for
-      // another root.
-      parameters_with_offset_indexing.insert(analysis.GetRoots().begin(),
-                                             analysis.GetRoots().end());
-    }
+    CollectInstructionsRequiringOffsets(
+        analysis.GetSymbolicTiledHloComputation(), analysis.GetRoots(),
+        [&](const SymbolicTiledHloInstruction* symbolic_tiling) {
+          llvm::SmallVector<int64_t> owned_tile_sizes;
+          absl::Span<const int64_t> tile_sizes;
+          if (workspace != nullptr) {
+            tile_sizes = workspace->tile_sizes(symbolic_tiling);
+          } else {
+            owned_tile_sizes = EvaluateTileSizes(
+                symbolic_tiling->symbolic_tile(), flat_tiling_parameters);
+            tile_sizes = owned_tile_sizes;
+          }
+          size_t hash_value = absl::HashOf(symbolic_tiling->hlo(), tile_sizes);
+          if (workspace == nullptr) {
+            tile_sizes_map.Insert(symbolic_tiling, std::move(owned_tile_sizes));
+          }
+          return hash_value;
+        },
+        parameters_with_offset_indexing);
   }
 
   // TODO(b/390569102): This assumes that there is only one root that matters
@@ -1936,7 +2287,7 @@ absl::StatusOr<TiledHloComputation> ComputeTiledComputationImpl(
           compute_all_tile_offset_indexing_maps, mlir_context,
           output_tiling_info, tile_sizes_map, tile_strides_map,
           parameters_with_offset_indexing, symbolic_to_tiled_hlo_map,
-          parent_output_tile_dim_bounds));
+          parent_output_tile_dim_bounds, workspace));
   ABSL_ASSIGN_OR_RETURN(
       std::vector<const TiledHloInstruction*> tiled_roots,
       InitializeTiledRoots(
@@ -1961,16 +2312,21 @@ absl::StatusOr<std::unique_ptr<TiledHloInstruction>> ComputeTiledHloInstruction(
     MLIRContext* mlir_context,
     std::vector<TiledHloInstruction*>& symbolic_to_tiled_hlo_map,
     const std::optional<absl::Span<const Interval>>&
-        parent_output_tile_dim_bounds) {
+        parent_output_tile_dim_bounds,
+    TilingEvaluationWorkspace* workspace) {
   VLOG(4) << "ComputeTiledHloInstruction: " << symbolic_tiled_hlo->ToString();
   const bool is_top_level = symbolic_tiled_hlo->tile_parameter_bounds_id() >= 0;
   std::optional<absl::Span<const int64_t>> cached_tile_sizes;
-  if (!compute_all_tile_offset_indexing_maps && is_top_level &&
-      symbolic_tiled_hlo->operands().empty()) {
+  if (workspace != nullptr && is_top_level) {
+    cached_tile_sizes = workspace->tile_sizes(symbolic_tiled_hlo);
+  } else if (!compute_all_tile_offset_indexing_maps && is_top_level &&
+             symbolic_tiled_hlo->operands().empty()) {
     cached_tile_sizes = tile_sizes_map.At(symbolic_tiled_hlo);
   }
   std::optional<absl::Span<const int64_t>> cached_tile_strides;
-  if (is_top_level) {
+  if (workspace != nullptr && is_top_level) {
+    cached_tile_strides = workspace->tile_strides(symbolic_tiled_hlo);
+  } else if (is_top_level) {
     cached_tile_strides = tile_strides_map.At(symbolic_tiled_hlo);
   }
 
@@ -2046,7 +2402,7 @@ absl::StatusOr<std::unique_ptr<TiledHloInstruction>> ComputeTiledHloInstruction(
               region_tiling_parameters, compute_all_tile_offset_indexing_maps,
               mlir_context, region_output_tiling_info, tile_sizes_map,
               tile_strides_map, parameters_with_offset_indexing,
-              symbolic_to_tiled_hlo_map, region_tile_dim_bounds));
+              symbolic_to_tiled_hlo_map, region_tile_dim_bounds, workspace));
       tiled_regions.push_back(TiledHloRegion{std::move(tiled_region)});
     }
     std::unique_ptr<TiledHloInstruction> tiled_instruction =
@@ -2091,7 +2447,8 @@ ComputeTiledInstructions(
         parameters_with_offset_indexing,
     std::vector<TiledHloInstruction*>& symbolic_to_tiled_hlo_map,
     const std::optional<absl::Span<const Interval>>&
-        parent_output_tile_dim_bounds) {
+        parent_output_tile_dim_bounds,
+    TilingEvaluationWorkspace* workspace) {
   OrderedUniquePtrValueHashSet<TiledHloInstruction> tiled_hlo_instructions_set;
   // The actual number of `TiledHloInstruction`s can be smaller than the number
   // of `SymbolicTiledHloInstruction`s, because some instruction will be
@@ -2108,7 +2465,7 @@ ComputeTiledInstructions(
             compute_all_tile_offset_indexing_maps, output_tiling_info,
             tile_sizes_map, tile_strides_map, parameters_with_offset_indexing,
             mlir_context, symbolic_to_tiled_hlo_map,
-            parent_output_tile_dim_bounds));
+            parent_output_tile_dim_bounds, workspace));
     symbolic_to_tiled_hlo_map[instruction->id()] =
         tiled_hlo_instructions_set.Insert(std::move(tiled_instruction)).first;
   }
@@ -2152,6 +2509,68 @@ std::string TiledHloInstructionsToString(
   return ss.str();
 }
 }  // namespace
+
+absl::Status SymbolicTileAnalysis::ComputeTileOffsetsForCostModel(
+    TilingEvaluationWorkspace& workspace, const TiledHloSchedule& schedule,
+    TilingCandidateOffsets& offsets) const {
+  CHECK_EQ(&workspace.analysis(), this);
+  offsets.offset_indices.assign(num_symbolic_tiled_hlo_instructions(), -1);
+  offsets.tile_offsets.clear();
+  offsets.num_output_tiles_per_dim.clear();
+  ABSL_RETURN_IF_ERROR(workspace.EvaluateTileStrides());
+  workspace.EvaluateTileSizes();
+  llvm::SmallPtrSet<const HloInstruction*, 8> parameters;
+  CollectInstructionsRequiringOffsets(
+      GetSymbolicTiledHloComputation(), GetRoots(),
+      [&](const SymbolicTiledHloInstruction* instruction) {
+        return absl::HashOf(
+            instruction->hlo(),
+            absl::Span<const int64_t>(workspace.tile_sizes(instruction)));
+      },
+      parameters);
+  std::vector<int64_t> active_parameters;
+  AppendActiveParameters(GetRealRootIndexing(), active_parameters);
+  ABSL_ASSIGN_OR_RETURN(
+      OutputTilingInfo output,
+      ComputeOutputTilingInfo(GetRealRootIndexing(), workspace.flat_tiling(),
+                              active_parameters, schedule, mlir_context_));
+  offsets.num_output_tiles_per_dim = output.num_output_tiles_per_dim;
+  for (const auto& instruction : GetSymbolicTiledHloComputation()) {
+    if (!parameters.contains(instruction->hlo()) &&
+        instruction->hlo()->opcode() != HloOpcode::kIota) {
+      continue;
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        IndexingMap map,
+        ComputeTileOffsetIndexing(*instruction,
+                                  output.linear_output_tile_offset_indexing,
+                                  mlir_context_));
+    map.RemoveUnusedSymbols();
+    offsets.offset_indices[instruction->id()] = offsets.tile_offsets.size();
+    offsets.tile_offsets.push_back(std::move(map));
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<int64_t>>
+SymbolicTileAnalysis::InitializeTiledRootsForCostModel(
+    const TilingEvaluationWorkspace& workspace,
+    const TiledHloSchedule& schedule,
+    absl::Span<const SymbolicTiledHloInstruction* const> instructions,
+    const TilingCandidateOffsets& offsets) const {
+  CHECK_EQ(&workspace.analysis(), this);
+  return InitializeTiledRootsImpl(
+      GetRoots(), instructions.size(), [](int64_t index) { return index; },
+      [&](int64_t index) { return instructions[index]->hlo(); },
+      [&](int64_t index) {
+        const auto* instruction = instructions[index];
+        return IsSafeForBufferSharing(
+            CostModelTiledRoot{instruction, workspace,
+                               offsets.Get(instruction)},
+            Product(offsets.num_output_tiles_per_dim), schedule, mlir_context_);
+      },
+      int64_t{-1});
+}
 
 absl::StatusOr<TiledHloComputation>
 SymbolicTileAnalysis::ComputeTiledComputation(
@@ -2238,6 +2657,39 @@ SymbolicTileAnalysis::ComputeTiledComputation(
       /*major_to_minor_active_tiling_parameters=*/{},
       compute_all_tile_offset_indexing_maps,
       /*parent_output_tile_dim_bounds=*/std::nullopt, mlir_context_);
+}
+
+absl::StatusOr<TiledHloComputation>
+SymbolicTileAnalysis::ComputeTiledComputation(
+    TilingEvaluationWorkspace& workspace,
+    const TiledHloSchedule& tiled_hlo_schedule,
+    bool constraints_are_known_satisfied,
+    bool compute_all_tile_offset_indexing_maps) const {
+  TF_RET_CHECK(&workspace.analysis() == this);
+  const auto flat_tiling_parameters = workspace.flat_tiling();
+  if (flat_tiling_parameters.size() !=
+      GetTilingSpecification().num_parameters()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Expected ", GetTilingSpecification().num_parameters(),
+                     " flattened tiling parameters, but got ",
+                     flat_tiling_parameters.size(), "."));
+  }
+
+  if (!constraints_are_known_satisfied) {
+    ABSL_ASSIGN_OR_RETURN(
+        bool parameters_satisfy_constraints,
+        FlatParametersSatisfyConstraints(flat_tiling_parameters));
+    if (!parameters_satisfy_constraints) {
+      return absl::InvalidArgumentError("Tiling does not satisfy constraints.");
+    }
+  }
+
+  return ComputeTiledComputationImpl(
+      *this, flat_tiling_parameters, tiled_hlo_schedule,
+      /*major_to_minor_active_tiling_parameters=*/{},
+      compute_all_tile_offset_indexing_maps,
+      /*parent_output_tile_dim_bounds=*/std::nullopt, mlir_context_,
+      &workspace);
 }
 
 std::string SymbolicTileAnalysis::ToString() const {

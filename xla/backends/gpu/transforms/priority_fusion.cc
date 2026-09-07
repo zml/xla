@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -31,6 +30,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
@@ -38,6 +38,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/STLExtras.h"
@@ -273,24 +274,60 @@ class PriorityFusionQueue {
 
   absl::StatusOr<std::vector<Priority>> ComputePriorities(
       const std::vector<HloInstruction*>& instructions) {
-    auto schedule_or_run = [this](std::function<void()> fn) {
-      if (thread_pool_) {
-        thread_pool_->Schedule(std::move(fn));
-      } else {
-        fn();
-      }
-    };
+    const bool collect_stats = VLOG_IS_ON(1);
+    const absl::Time batch_start =
+        collect_stats ? absl::Now() : absl::InfinitePast();
+    std::vector<absl::Duration> task_times(collect_stats ? instructions.size()
+                                                         : 0);
+    int64_t scheduled_tasks = 0;
+    int64_t inline_tasks = 0;
     absl::BlockingCounter counter(instructions.size());
     std::vector<absl::StatusOr<Priority>> priorities_or_status(
         instructions.size());
 
     for (size_t i = 0; i < instructions.size(); ++i) {
-      schedule_or_run([&, i] {
+      auto task = [&, i] {
+        const absl::Time task_start =
+            collect_stats ? absl::Now() : absl::InfinitePast();
         priorities_or_status[i] = CalculateProducerPriority(instructions[i]);
+        if (collect_stats) task_times[i] = absl::Now() - task_start;
         counter.DecrementCount();
-      });
+      };
+      if (thread_pool_ != nullptr) {
+        if (collect_stats) ++scheduled_tasks;
+        thread_pool_->Schedule(std::move(task));
+      } else {
+        if (collect_stats) {
+          ++inline_tasks;
+        }
+        task();
+      }
     }
     counter.Wait();
+
+    if (collect_stats) {
+      const absl::Duration wall_time = absl::Now() - batch_start;
+      absl::Duration sum_task_time = absl::ZeroDuration();
+      absl::Duration max_task_time = absl::ZeroDuration();
+      const HloInstruction* longest_producer = nullptr;
+      for (size_t i = 0; i < task_times.size(); ++i) {
+        sum_task_time += task_times[i];
+        if (longest_producer == nullptr || task_times[i] > max_task_time) {
+          max_task_time = task_times[i];
+          longest_producer = instructions[i];
+        }
+      }
+      VLOG(1) << "PriorityFusionBatch computation=" << computation_->name()
+              << " tasks=" << instructions.size()
+              << " scheduled=" << scheduled_tasks << " inline=" << inline_tasks
+              << " trivial_inline=0 pool_threads="
+              << (thread_pool_ ? thread_pool_->NumThreads() : 0)
+              << " wall=" << wall_time << " sum_task=" << sum_task_time
+              << " max_task=" << max_task_time << " longest_producer="
+              << (longest_producer ? longest_producer->name() : "")
+              << " longest_users="
+              << (longest_producer ? longest_producer->user_count() : 0);
+    }
 
     std::vector<Priority> priorities(instructions.size());
     for (size_t i = 0; i < instructions.size(); ++i) {

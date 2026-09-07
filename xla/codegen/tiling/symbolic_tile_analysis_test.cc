@@ -41,6 +41,7 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "xla/codegen/tiling/constraint_expression.h"
 #include "xla/codegen/tiling/experimental/tiling_space_utils.h"
+#include "xla/codegen/tiling/symbolic_tile.h"
 #include "xla/codegen/tiling/symbolic_tiled_hlo_instruction.h"
 #include "xla/codegen/tiling/tiled_hlo_computation.h"
 #include "xla/codegen/tiling/tiled_hlo_instruction.h"
@@ -231,6 +232,95 @@ class SymbolicTileAnalysisTest : public HloHardwareIndependentTestBase {
     return std::nullopt;
   }
 
+  // Retain workspace capacity while resetting all candidate-dependent values.
+  // The reference path materializes every candidate independently.
+  void ExpectWorkspaceMatchesReference(
+      const SymbolicTileAnalysis& analysis,
+      absl::Span<const FlatTiling> candidates) {
+    MajorToMinorTiledHloSchedule schedule;
+    using Mode = TilingEvaluationWorkspace::ExpressionEvaluationMode;
+    for (Mode mode : {Mode::kDirect, Mode::kPrepared}) {
+      TilingEvaluationWorkspace workspace(analysis, mode,
+                                          /*preparation_threshold=*/1);
+      std::vector<const llvm::SmallVector<int64_t>*> size_storage;
+      std::vector<const llvm::SmallVector<int64_t>*> stride_storage;
+      for (const auto& instruction :
+           analysis.GetSymbolicTiledHloComputation()) {
+        size_storage.push_back(&workspace.tile_sizes(instruction.get()));
+        stride_storage.push_back(&workspace.tile_strides(instruction.get()));
+      }
+      for (bool all_offsets : {false, true}) {
+        for (const FlatTiling& candidate : candidates) {
+          SCOPED_TRACE(absl::StrJoin(candidate, ","));
+          SCOPED_TRACE(all_offsets);
+          workspace.Reset(candidate);
+          const auto& instructions = analysis.GetSymbolicTiledHloComputation();
+          // Exercise partial evaluation and dense ID lookup before completing
+          // the candidate. Prepared batches may fill all sizes on first use.
+          for (const SymbolicTiledHloInstruction* instruction :
+               {instructions.back().get(), instructions.front().get()}) {
+            EXPECT_EQ(workspace.EvaluateTileSizesFor(instruction),
+                      xla::EvaluateTileSizes(instruction->symbolic_tile(),
+                                             candidate));
+            EXPECT_EQ(&workspace.EvaluateTileSizesFor(instruction),
+                      &workspace.tile_sizes(instruction));
+          }
+          // A caller such as the memory bound may request these repeatedly
+          // before constructing the tiled computation. Repeat the requests as
+          // well.
+          workspace.EvaluateTileSizes();
+          workspace.EvaluateTileSizes();
+          ASSERT_THAT(workspace.EvaluateTileStrides(), IsOk());
+          ASSERT_THAT(workspace.EvaluateTileStrides(), IsOk());
+          for (auto [index, instruction] :
+               llvm::enumerate(analysis.GetSymbolicTiledHloComputation())) {
+            EXPECT_EQ(&workspace.tile_sizes(instruction.get()),
+                      size_storage[index]);
+            EXPECT_EQ(&workspace.tile_strides(instruction.get()),
+                      stride_storage[index]);
+            EXPECT_EQ(workspace.tile_sizes(instruction.get()),
+                      xla::EvaluateTileSizes(instruction->symbolic_tile(),
+                                             candidate));
+            EXPECT_EQ(workspace.tile_strides(instruction.get()),
+                      xla::EvaluateTileStrides(instruction->symbolic_tile(),
+                                               candidate));
+          }
+          ASSERT_OK_AND_ASSIGN(
+              TiledHloComputation expected,
+              analysis.ComputeTiledComputation(
+                  candidate, schedule, /*constraints_are_known_satisfied=*/true,
+                  /*compute_all_tile_offset_indexing_maps=*/all_offsets));
+          ASSERT_OK_AND_ASSIGN(
+              TiledHloComputation actual,
+              analysis.ComputeTiledComputation(
+                  workspace, schedule, /*constraints_are_known_satisfied=*/true,
+                  /*compute_all_tile_offset_indexing_maps=*/all_offsets));
+          EXPECT_EQ(actual.ToString(), expected.ToString());
+          EXPECT_THAT(actual.num_output_tiles_per_dim(),
+                      ElementsAreArray(expected.num_output_tiles_per_dim()));
+          EXPECT_EQ(std::distance(actual.instructions().begin(),
+                                  actual.instructions().end()),
+                    std::distance(expected.instructions().begin(),
+                                  expected.instructions().end()));
+          ASSERT_EQ(actual.roots().size(), expected.roots().size());
+          for (int64_t index = 0; index < actual.roots().size(); ++index) {
+            const TiledHloInstruction* actual_root = actual.roots()[index];
+            const TiledHloInstruction* expected_root = expected.roots()[index];
+            EXPECT_EQ(actual_root->hlo(), expected_root->hlo());
+            EXPECT_THAT(actual_root->tile_sizes(),
+                        ElementsAreArray(expected_root->tile_sizes()));
+            EXPECT_THAT(actual_root->tile_strides(),
+                        ElementsAreArray(expected_root->tile_strides()));
+            for (int64_t other = 0; other < index; ++other) {
+              EXPECT_EQ(actual_root == actual.roots()[other],
+                        expected_root == expected.roots()[other]);
+            }
+          }
+        }
+      }
+    }
+  }
+
   DebugOptions GetDebugOptionsForTest() const override {
     DebugOptions debug_options =
         HloHardwareIndependentTestBase::GetDebugOptionsForTest();
@@ -246,6 +336,485 @@ class SymbolicTileAnalysisTest : public HloHardwareIndependentTestBase {
   TiledHloScheduleBuilder default_schedule_builder_ =
       CreateMajorToMinorTiledHloSchedule;
 };
+
+TEST_F(SymbolicTileAnalysisTest, WorkspaceReusesStorageAcrossIrregularTiles) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[3,17] parameter(0)
+  ROOT abs = f32[3,17] abs(p0)
+}
+ENTRY main {
+  p0 = f32[3,17] parameter(0)
+  ROOT fusion = f32[3,17] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{1, 1}, {2, 4}, {4, 32}, {2, 8}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+
+  TilingEvaluationWorkspace terminals(
+      *analysis, TilingEvaluationWorkspace::ExpressionEvaluationMode::kPrepared,
+      /*preparation_threshold=*/1);
+  for (const FlatTiling& candidate : candidates) {
+    terminals.Reset(candidate);
+    terminals.EvaluateTileSizes();
+    ASSERT_THAT(terminals.EvaluateTileStrides(), IsOk());
+  }
+  EXPECT_EQ(terminals.expression_evaluation_statistics().preparations, 0);
+  EXPECT_EQ(terminals.expression_evaluation_statistics().prepared_evaluations,
+            0);
+
+  TilingEvaluationWorkspace workspace(*analysis);
+  FlatTiling temporary = {2, 4};
+  workspace.Reset(temporary);
+  temporary[0] = 1;
+  temporary[1] = 1;
+  EXPECT_THAT(workspace.flat_tiling(), ElementsAre(2, 4));
+  MajorToMinorTiledHloSchedule schedule;
+  // Also exercise lazy evaluation when the caller has not requested sizes or
+  // strides before materialization.
+  ASSERT_OK_AND_ASSIGN(
+      TiledHloComputation actual,
+      analysis->ComputeTiledComputation(workspace, schedule, true));
+  EXPECT_THAT(actual.roots()[0]->tile_sizes(), ElementsAre(2, 4));
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspaceDelaysPreparationUntilEvaluations) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[20] parameter(0)
+  abs = f32[20] abs(p0)
+  ROOT reshape = f32[4,5] reshape(abs)
+}
+ENTRY main {
+  p0 = f32[20] parameter(0)
+  ROOT fusion = f32[4,5] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  TilingEvaluationWorkspace workspace(
+      *analysis, TilingEvaluationWorkspace::ExpressionEvaluationMode::kPrepared,
+      /*preparation_threshold=*/3);
+  // Resets alone and repeated getters must not accelerate preparation.
+  for (int64_t index = 0; index < 8; ++index) {
+    workspace.Reset(FlatTiling({1, 1}));
+  }
+  const auto& instructions = analysis->GetSymbolicTiledHloComputation();
+  const SymbolicTiledHloInstruction* root = instructions.back().get();
+  for (int64_t index = 0; index < 8; ++index) {
+    workspace.EvaluateTileSizesFor(root);
+  }
+  for (int64_t index = 0; index < 8; ++index) workspace.EvaluateTileSizes();
+  EXPECT_EQ(workspace.expression_evaluation_statistics().preparations, 0);
+  workspace.Reset(FlatTiling({1, 8}));
+  workspace.EvaluateTileSizesFor(root);
+  EXPECT_EQ(workspace.expression_evaluation_statistics().preparations, 0);
+  workspace.Reset(FlatTiling({1, 2}));
+  workspace.EvaluateTileSizesFor(root);
+  EXPECT_EQ(workspace.expression_evaluation_statistics().preparations, 1);
+  EXPECT_EQ(workspace.expression_evaluation_statistics().prepared_evaluations,
+            1);
+  // Preparation keeps size-program evaluation eager even though the caller
+  // requested only the root. All outputs share the original size environment.
+  for (const auto& instruction : instructions) {
+    EXPECT_EQ(workspace.tile_sizes(instruction.get()),
+              xla::EvaluateTileSizes(instruction->symbolic_tile(), {1, 2}));
+  }
+  workspace.EvaluateTileSizes();
+  EXPECT_EQ(workspace.expression_evaluation_statistics().prepared_evaluations,
+            1);
+  // Strides use direct evaluation and do not prepare another program.
+  ASSERT_THAT(workspace.EvaluateTileStrides(), IsOk());
+  EXPECT_EQ(workspace.expression_evaluation_statistics().preparations, 1);
+  EXPECT_EQ(
+      workspace.expression_evaluation_statistics().preparation_nanoseconds, 0);
+  for (const auto& instruction : analysis->GetSymbolicTiledHloComputation()) {
+    EXPECT_EQ(workspace.tile_sizes(instruction.get()),
+              xla::EvaluateTileSizes(instruction->symbolic_tile(), {1, 2}));
+    EXPECT_EQ(workspace.tile_strides(instruction.get()),
+              xla::EvaluateTileStrides(instruction->symbolic_tile(), {1, 2}));
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest,
+       WorkspaceEvaluatesIndividualTerminalSizesUntilCompletion) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[3,17] parameter(0)
+  negate = f32[3,17] negate(p0)
+  ROOT abs = f32[3,17] abs(negate)
+}
+ENTRY main {
+  p0 = f32[3,17] parameter(0)
+  ROOT fusion = f32[3,17] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const auto& instructions = analysis->GetSymbolicTiledHloComputation();
+  ASSERT_EQ(instructions.size(), 3);
+  using Mode = TilingEvaluationWorkspace::ExpressionEvaluationMode;
+  for (Mode mode : {Mode::kDirect, Mode::kPrepared}) {
+    TilingEvaluationWorkspace workspace(*analysis, mode,
+                                        /*preparation_threshold=*/1);
+    workspace.Reset(FlatTiling({2, 8}));
+    const auto* root_storage =
+        &workspace.EvaluateTileSizesFor(instructions.back().get());
+    EXPECT_THAT(*root_storage, ElementsAre(2, 8));
+    // No nonterminal program exists to require evaluating these other tiles.
+    EXPECT_TRUE(workspace.tile_sizes(instructions.front().get()).empty());
+    EXPECT_TRUE(workspace.tile_sizes(instructions[1].get()).empty());
+    for (const FlatTiling& candidate :
+         TilingVector{{4, 32}, {1, 1}, {2, 8}, {2, 8}}) {
+      workspace.Reset(candidate);
+      EXPECT_EQ(&workspace.EvaluateTileSizesFor(instructions.back().get()),
+                root_storage);
+      EXPECT_THAT(*root_storage, ElementsAreArray(candidate));
+      workspace.EvaluateTileSizes();
+      for (const auto& instruction : instructions) {
+        EXPECT_EQ(workspace.tile_sizes(instruction.get()),
+                  xla::EvaluateTileSizes(instruction->symbolic_tile(),
+                                         candidate));
+      }
+    }
+    EXPECT_EQ(workspace.expression_evaluation_statistics().preparations, 0);
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest,
+       WorkspaceStridesPreserveFirstErrorBeforeLaterInvalidExpression) {
+  for (bool missing_variable : {false, true}) {
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                         ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[16] parameter(0)
+  negate = f32[16] negate(p0)
+  ROOT abs = f32[16] abs(negate)
+}
+ENTRY main {
+  p0 = f32[16] parameter(0)
+  ROOT fusion = f32[16] fusion(p0), kind=kLoop, calls=fusion
+})"));
+    std::optional<SymbolicTileAnalysis> analysis =
+        TryAnalyzeModule(module.get());
+    ASSERT_TRUE(analysis.has_value());
+    const auto& instructions = analysis->GetSymbolicTiledHloComputation();
+    ASSERT_GE(instructions.size(), 2);
+    SymbolicExpr parameter = CreateSymbolicVariable(0, &mlir_context_);
+    // Inject two independent failures before constructing either evaluator.
+    // An eager evaluation of all roots in this group would reach the fatal
+    // second expression before returning the recoverable first stride error.
+    SymbolicMap& first = const_cast<SymbolicMap&>(
+        instructions[0]->symbolic_tile().tile_map().GetSymbolicMap());
+    SymbolicMap& second = const_cast<SymbolicMap&>(
+        instructions[1]->symbolic_tile().tile_map().GetSymbolicMap());
+    ASSERT_EQ(first.GetNumResults(), 3);
+    ASSERT_EQ(second.GetNumResults(), 3);
+    first.SetResult(2, parameter * -1);
+    second.SetResult(2, missing_variable
+                            ? CreateSymbolicVariable(9, &mlir_context_)
+                            : parameter % 0);
+    TilingEvaluationWorkspace workspace(*analysis);
+    MajorToMinorTiledHloSchedule schedule;
+    for (const FlatTiling& candidate : TilingVector{{1}, {32}, {2}, {1}}) {
+      workspace.Reset(candidate);
+      const absl::Status reference =
+          analysis->ComputeTiledComputation(candidate, schedule, true).status();
+      ASSERT_THAT(reference, StatusIs(absl::StatusCode::kUnimplemented,
+                                      HasSubstr("negative stride")));
+      EXPECT_EQ(workspace.EvaluateTileStrides(), reference);
+      // A retry without Reset must report the same first error.
+      EXPECT_EQ(workspace.EvaluateTileStrides(), reference);
+    }
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest,
+       WorkspaceStridesKeepInterleavedClampedEnvironmentsSeparate) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[10,1] parameter(0)
+  p1 = f32[10,2] parameter(1)
+  negate0 = f32[10,1] negate(p0)
+  negate1 = f32[10,2] negate(p1)
+  zero = f32[] constant(0)
+  pad0 = f32[10,115] pad(negate0, zero), padding=0_0x0_114
+  pad1 = f32[10,115] pad(negate1, zero), padding=0_0x0_113
+  ROOT add = f32[10,115] add(pad0, pad1)
+}
+ENTRY main {
+  p0 = f32[10,1] parameter(0)
+  p1 = f32[10,2] parameter(1)
+  ROOT fusion = f32[10,115] fusion(p0, p1), kind=kCustom, calls=fusion,
+    backend_config={"fusion_backend_config":{
+      "kind":"__triton_nested_gemm_fusion"}}
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  ASSERT_GT(analysis->tile_parameter_upper_bounds().size(), 1);
+  absl::flat_hash_set<int64_t> seen_groups;
+  int64_t previous_group = -1;
+  bool interleaved = false;
+  for (const auto& instruction : analysis->GetSymbolicTiledHloComputation()) {
+    const int64_t group = instruction->tile_parameter_bounds_id();
+    interleaved |= group != previous_group && seen_groups.contains(group);
+    seen_groups.insert(group);
+    previous_group = group;
+    SymbolicMap& map = const_cast<SymbolicMap&>(
+        instruction->symbolic_tile().tile_map().GetSymbolicMap());
+    const int64_t rank = map.GetNumResults() / 3;
+    // The same symbolic expression must use different clamped values in each
+    // environment. Scalar instructions exercise empty slices within a group.
+    for (int64_t dim = 0; dim < rank; ++dim) {
+      map.SetResult(2 * rank + dim,
+                    CreateSymbolicVariable(1, &mlir_context_) + dim + 1);
+    }
+  }
+  ASSERT_TRUE(interleaved);
+  TilingEvaluationWorkspace workspace(*analysis);
+  for (const FlatTiling& candidate :
+       TilingVector{{2, 128}, {1, 2}, {4, 64}, {2, 128}}) {
+    workspace.Reset(candidate);
+    ASSERT_OK(workspace.EvaluateTileStrides());
+    ASSERT_OK(workspace.EvaluateTileStrides());
+    for (const auto& instruction : analysis->GetSymbolicTiledHloComputation()) {
+      EXPECT_EQ(
+          workspace.tile_strides(instruction.get()),
+          xla::EvaluateTileStrides(instruction->symbolic_tile(), candidate));
+    }
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspaceCanResetEmptyScalarParameters) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[] parameter(0)
+  ROOT abs = f32[] abs(p0)
+}
+ENTRY main {
+  p0 = f32[] parameter(0)
+  ROOT fusion = f32[] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{}, {}, {}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+}
+
+TEST_F(SymbolicTileAnalysisTest,
+       WorkspacePreservesOffsetSensitiveDeduplication) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[8,12] parameter(0)
+  slice0 = f32[4,8] slice(p0), slice={[0:4], [2:10]}
+  slice1 = f32[4,8] slice(p0), slice={[3:7], [4:12]}
+  ROOT add = f32[4,8] add(slice0, slice1)
+}
+ENTRY main {
+  p0 = f32[8,12] parameter(0)
+  ROOT fusion = f32[4,8] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{1, 1}, {2, 2}, {4, 8}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+  TilingEvaluationWorkspace workspace(*analysis);
+  workspace.Reset(candidates[1]);
+  MajorToMinorTiledHloSchedule schedule;
+  ASSERT_OK_AND_ASSIGN(
+      TiledHloComputation actual,
+      analysis->ComputeTiledComputation(workspace, schedule, true));
+  const TiledHloInstruction* root = GetFirstRoot(actual);
+  EXPECT_NE(root->operand(0)->operand(0), root->operand(1)->operand(0));
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesMultipleRoots) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[8,8] parameter(0)
+  abs = f32[8,8] abs(p0)
+  neg = f32[8,8] negate(abs)
+  ROOT tuple = (f32[8,8], f32[8,8]) tuple(abs, neg)
+}
+ENTRY main {
+  p0 = f32[8,8] parameter(0)
+  ROOT fusion = (f32[8,8], f32[8,8]) fusion(p0),
+    kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{1, 1}, {2, 4}, {8, 8}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesRepeatedRootRejection) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[8,8] parameter(0)
+  abs = f32[8,8] abs(p0)
+  neg = f32[8,8] negate(abs)
+  ROOT tuple = (f32[8,8], f32[8,8], f32[8,8]) tuple(abs, neg, abs)
+}
+ENTRY main {
+  p0 = f32[8,8] parameter(0)
+  ROOT fusion = (f32[8,8], f32[8,8], f32[8,8]) fusion(p0),
+    kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{1, 1}, {2, 4}, {8, 8}, {1, 1}};
+  // InitializeTiledRoots maps each HLO to one output index, so the baseline
+  // rejects repeated tuple operands even when their tiling is otherwise valid.
+  TilingEvaluationWorkspace workspace(*analysis);
+  MajorToMinorTiledHloSchedule schedule;
+  for (bool all_offsets : {false, true}) {
+    for (const FlatTiling& candidate : candidates) {
+      workspace.Reset(candidate);
+      const auto expected = analysis->ComputeTiledComputation(
+          candidate, schedule, true, all_offsets);
+      const auto actual = analysis->ComputeTiledComputation(workspace, schedule,
+                                                            true, all_offsets);
+      EXPECT_THAT(
+          expected.status(),
+          StatusIs(absl::StatusCode::kUnimplemented,
+                   HasSubstr("Unsupported case of multi-output fusion")));
+      EXPECT_EQ(actual.status(), expected.status());
+    }
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesUnsupportedMultipleRoots) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[8] parameter(0)
+  abs = f32[8] abs(p0)
+  broadcast = f32[8,8] broadcast(abs), dimensions={1}
+  ROOT tuple = (f32[8,8], f32[8]) tuple(broadcast, abs)
+}
+ENTRY main {
+  p0 = f32[8] parameter(0)
+  ROOT fusion = (f32[8,8], f32[8]) fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  TilingEvaluationWorkspace workspace(*analysis);
+  MajorToMinorTiledHloSchedule schedule;
+  const TilingVector candidates = {{1, 2}, {2, 4}, {1, 2}};
+  for (const FlatTiling& candidate : candidates) {
+    workspace.Reset(candidate);
+    const auto expected =
+        analysis->ComputeTiledComputation(candidate, schedule);
+    const auto actual = analysis->ComputeTiledComputation(workspace, schedule);
+    EXPECT_THAT(expected.status(),
+                StatusIs(absl::StatusCode::kUnimplemented,
+                         HasSubstr("Unsupported case of multi-output fusion")));
+    EXPECT_EQ(actual.status(), expected.status());
+  }
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesRegionBoundsAndPadding) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[10,2] parameter(0)
+  p1 = f32[10,1] parameter(1)
+  ROOT concat = f32[10,3] concatenate(p0, p1), dimensions={1}
+}
+ENTRY main {
+  p0 = f32[10,2] parameter(0)
+  p1 = f32[10,1] parameter(1)
+  ROOT fusion = f32[10,3] fusion(p0, p1), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{1, 1}, {2, 2}, {4, 2}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesInterleavedRegionIds) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[10,2] parameter(0)
+  p1 = f32[10,1] parameter(1)
+  concat = f32[10,3] concatenate(p0, p1), dimensions={1}
+  ROOT abs = f32[10,3] abs(concat)
+}
+ENTRY main {
+  p0 = f32[10,2] parameter(0)
+  p1 = f32[10,1] parameter(1)
+  ROOT fusion = f32[10,3] fusion(p0, p1), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const auto& instructions = analysis->GetSymbolicTiledHloComputation();
+  ASSERT_GT(instructions.size(), 1);
+  // Nested-region IDs precede a later top-level instruction, so its global ID
+  // cannot directly index the workspace's dense top-level storage.
+  ASSERT_GE(instructions.back()->id(), instructions.size());
+  const TilingVector candidates = {{1, 1}, {2, 2}, {4, 2}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesDotRegionTiling) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[4,8] parameter(0)
+  p1 = f32[8,16] parameter(1)
+  ROOT dot = f32[4,16] dot(p0, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+ENTRY main {
+  p0 = f32[4,8] parameter(0)
+  p1 = f32[8,16] parameter(1)
+  ROOT fusion = f32[4,16] fusion(p0, p1), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  const TilingVector candidates = {{2, 1, 1}, {8, 2, 4}, {4, 1, 2}, {2, 1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, candidates);
+}
+
+TEST_F(SymbolicTileAnalysisTest, WorkspacePreservesNegativeStrideErrors) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+fusion {
+  p0 = f32[16] parameter(0)
+  ROOT reverse = f32[16] reverse(p0), dimensions={0}
+}
+ENTRY main {
+  p0 = f32[16] parameter(0)
+  ROOT fusion = f32[16] fusion(p0), kind=kLoop, calls=fusion
+})"));
+  std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
+  ASSERT_TRUE(analysis.has_value());
+  TilingEvaluationWorkspace workspace(
+      *analysis, TilingEvaluationWorkspace::ExpressionEvaluationMode::kPrepared,
+      /*preparation_threshold=*/1);
+  MajorToMinorTiledHloSchedule schedule;
+  const TilingVector candidates = {{2}, {8}, {2}};
+  for (const FlatTiling& candidate : candidates) {
+    workspace.Reset(candidate);
+    workspace.EvaluateTileSizes();
+    const absl::Status stride_status = workspace.EvaluateTileStrides();
+    EXPECT_THAT(stride_status, StatusIs(absl::StatusCode::kUnimplemented,
+                                        HasSubstr("negative stride")));
+    EXPECT_EQ(workspace.EvaluateTileStrides(), stride_status);
+    const auto expected =
+        analysis->ComputeTiledComputation(candidate, schedule);
+    const auto actual = analysis->ComputeTiledComputation(workspace, schedule);
+    EXPECT_EQ(actual.status(), expected.status());
+  }
+}
 
 TEST_F(SymbolicTileAnalysisTest, SimpleNormalizationDiamondIsSupported) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
@@ -395,6 +964,8 @@ ENTRY entry_computation {
 })"));
   std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
   ASSERT_TRUE(analysis.has_value());
+  const TilingVector workspace_candidates = {{1, 1}, {1, 8}, {1, 2}, {1, 1}};
+  ExpectWorkspaceMatchesReference(*analysis, workspace_candidates);
   const HloInstruction* fusion_root =
       module->entry_computation()->root_instruction()->fused_expression_root();
 
@@ -1647,6 +2218,8 @@ ENTRY entry_computation {
 
   std::optional<SymbolicTileAnalysis> analysis = TryAnalyzeModule(module.get());
   ASSERT_TRUE(analysis.has_value());
+  const TilingVector workspace_candidates = {{1}, {2}, {1}};
+  ExpectWorkspaceMatchesReference(*analysis, workspace_candidates);
   const HloInstruction* fusion_root =
       module->entry_computation()->root_instruction()->fused_expression_root();
 

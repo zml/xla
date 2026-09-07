@@ -1,5 +1,6 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm_is_configured")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_is_configured")
@@ -575,6 +576,7 @@ cc_library(
         "//xla:shape_util",
         "//xla:util",
         "//xla/backends/gpu/codegen/triton:fusion",
+        "//xla/codegen/tiling:compact_tiled_hlo_computation",
         "//xla/codegen/tiling:symbolic_tile_analysis",
         "//xla/codegen/tiling:tiled_hlo_computation",
         "//xla/codegen/tiling:tiled_hlo_schedule",
@@ -1387,4 +1389,65 @@ cc_embed_data(
     ],
     embedopts = ["--namespace=xla::gpu::config"],
     flatten = True,
+)
+
+cc_binary(
+    name = "tiling_search_benchmark",
+    testonly = True,
+    srcs = ["tiling_search_benchmark.cc"],
+    deps = [
+        ":fusion_analysis_cache",
+        ":gpu_indexing_performance_model",
+        ":triton_emitter_constraints",
+        "//xla/codegen/tiling:symbolic_tile_analysis",
+        "//xla/hlo/analysis:symbolic_map",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_traversal",
+        "//xla/service:hlo_cost_analysis",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:device_description_proto_cc",
+        "//xla/tools:hlo_module_loader",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_protobuf//:protobuf",
+        "@llvm-project//mlir:IR",
+        "@tsl//tsl/platform:platform_port",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_indexing_performance_model_search_test",
+    srcs = ["gpu_indexing_performance_model_search_test.cc"],
+    deps = [
+        ":fusion_analysis_cache",
+        ":gpu_indexing_performance_model",
+        ":gpu_performance_model_base",
+        "//xla/hlo/analysis:symbolic_map",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/utils:hlo_traversal",
+        "//xla/service:hlo_cost_analysis",
+        "//xla/service/gpu:gpu_device_info_for_tests",
+        "//xla/stream_executor:device_description",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@llvm-project//mlir:IR",
+        "@tsl//tsl/platform:status_matchers",
+    ],
 )

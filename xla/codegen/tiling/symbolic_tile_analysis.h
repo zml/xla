@@ -30,7 +30,9 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/codegen/tiling/constraint_expression.h"
 #include "xla/codegen/tiling/symbolic_tiled_hlo_instruction.h"
@@ -54,8 +56,82 @@ namespace xla {
 // we call it the "real root" of the computation.
 
 class SymbolicTileAnalysis;
+
+// Sparse offset maps for one concrete cost-model candidate. Vector capacity is
+// reused by a search, but map values are replaced for every candidate.
+struct TilingCandidateOffsets {
+  std::vector<int64_t> offset_indices;
+  std::vector<IndexingMap> tile_offsets;
+  llvm::SmallVector<int64_t> num_output_tiles_per_dim;
+
+  const IndexingMap* Get(const SymbolicTiledHloInstruction* instruction) const {
+    const int64_t index = offset_indices[instruction->id()];
+    return index < 0 ? nullptr : &tile_offsets[index];
+  }
+};
+
+struct TilingEnumerationStats {
+  int64_t enumerated = 0;
+  int64_t constraint_rejections = 0;
+  absl::Duration constraint_time = absl::ZeroDuration();
+};
 using SymbolicTileAnalysisOrError =
     std::variant<SymbolicTileAnalysis, FusionDecision>;
+
+// Scratch storage for evaluating candidates of one immutable analysis. Reset
+// starts a new candidate: no evaluated results survive across candidates. The
+// analysis must outlive this workspace, which is not shared between threads.
+class TilingEvaluationWorkspace {
+ public:
+  enum class ExpressionEvaluationMode { kDirect, kPrepared };
+
+  struct ExpressionEvaluationStatistics {
+    int64_t preparations = 0;
+    int64_t prepared_evaluations = 0;
+    int64_t preparation_nanoseconds = 0;
+  };
+
+  explicit TilingEvaluationWorkspace(const SymbolicTileAnalysis& analysis);
+  // Prepared size evaluation is experimental and opt-in. Preparation occurs
+  // after preparation_threshold evaluated candidates. A value of 1 prepares
+  // on first use; repeated calls for one candidate do not advance the count.
+  // Terminal-only sizes and all strides retain direct expression evaluation.
+  TilingEvaluationWorkspace(const SymbolicTileAnalysis& analysis,
+                            ExpressionEvaluationMode mode,
+                            int64_t preparation_threshold = 32,
+                            bool collect_preparation_time = false);
+  ~TilingEvaluationWorkspace();
+  TilingEvaluationWorkspace(const TilingEvaluationWorkspace&) = delete;
+  TilingEvaluationWorkspace& operator=(const TilingEvaluationWorkspace&) =
+      delete;
+
+  void Reset(absl::Span<const int64_t> flat_tiling);
+  void EvaluateTileSizes();
+  // Evaluates only this top-level instruction, retaining the result until
+  // Reset. An active prepared size program evaluates all instructions instead.
+  // Callers which change evaluation order must already know that every size
+  // expression evaluates successfully. EvaluateTileSizes subsequently fills
+  // the remaining instructions in their original order.
+  const llvm::SmallVector<int64_t>& EvaluateTileSizesFor(
+      const SymbolicTiledHloInstruction* instruction);
+  absl::Status EvaluateTileStrides();
+  // Accessors accept top-level instructions from
+  // GetSymbolicTiledHloComputation. The vector objects remain at stable
+  // addresses for this workspace's lifetime; their contents are valid only
+  // after evaluation for the current candidate.
+  const llvm::SmallVector<int64_t>& tile_sizes(
+      const SymbolicTiledHloInstruction* instruction) const;
+  const llvm::SmallVector<int64_t>& tile_strides(
+      const SymbolicTiledHloInstruction* instruction) const;
+  absl::Span<const int64_t> flat_tiling() const;
+  const SymbolicTileAnalysis& analysis() const;
+  const ExpressionEvaluationStatistics& expression_evaluation_statistics()
+      const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 // Holds the indexing information for the roots of the computation.
 struct RootIndexing {
@@ -176,6 +252,31 @@ class SymbolicTileAnalysis {
       bool constraints_are_known_satisfied = false,
       bool compute_all_tile_offset_indexing_maps = false) const;
 
+  // Uses values and scratch storage for the candidate most recently passed to
+  // workspace.Reset(). Values may already have been evaluated by a cost bound.
+  absl::StatusOr<TiledHloComputation> ComputeTiledComputation(
+      TilingEvaluationWorkspace& workspace,
+      const TiledHloSchedule& tiled_hlo_schedule,
+      bool constraints_are_known_satisfied = false,
+      bool compute_all_tile_offset_indexing_maps = false) const;
+
+  // Cost-model helpers using the same offset heuristic, map construction and
+  // root validation as full materialization. These require no nested regions
+  // or runtime indexing, and consume the candidate selected by workspace.Reset.
+  absl::Status ComputeTileOffsetsForCostModel(
+      TilingEvaluationWorkspace& workspace,
+      const TiledHloSchedule& tiled_hlo_schedule,
+      TilingCandidateOffsets& offsets) const;
+
+  // Returns indices in the deduplicated, def-before-use instruction sequence.
+  // Duplicate roots and unsupported buffer-sharing tilings preserve the full
+  // materialization path's errors and last-valid-root selection.
+  absl::StatusOr<std::vector<int64_t>> InitializeTiledRootsForCostModel(
+      const TilingEvaluationWorkspace& workspace,
+      const TiledHloSchedule& tiled_hlo_schedule,
+      absl::Span<const SymbolicTiledHloInstruction* const> instructions,
+      const TilingCandidateOffsets& offsets) const;
+
   // Returns the roots of the computation in increasing order of their output
   // index.
   absl::Span<const HloInstruction* const> GetRoots() const {
@@ -219,10 +320,11 @@ class SymbolicTileAnalysis {
   absl::StatusOr<bool> ParametersSatisfyConstraints(const Tiling& tiling) const;
 
   // Enumerates valid flattened tilings without materializing the Cartesian
-  // product. The callback may stop enumeration by returning an error.
+  // product. The callback may stop enumeration by returning an error. Optional
+  // statistics are reset on entry; timing is collected only when provided.
   absl::Status ForEachValidFlatTiling(
-      absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback)
-      const;
+      absl::FunctionRef<absl::Status(absl::Span<const int64_t>)> callback,
+      TilingEnumerationStats* stats = nullptr) const;
 
   // Return the underlying mlir::MLIRContext.
   mlir::MLIRContext* GetMLIRContext() const { return mlir_context_; };

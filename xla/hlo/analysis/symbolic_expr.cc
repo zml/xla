@@ -746,6 +746,103 @@ void EvaluateSymbolicExprs(absl::Span<const SymbolicExpr> expressions,
   }
 }
 
+SymbolicExprProgram::SymbolicExprProgram(
+    absl::Span<const SymbolicExpr> expressions) {
+  llvm::DenseMap<SymbolicExpr, int64_t> indices;
+  llvm::SmallVector<SymbolicExpr> pending;
+  result_indices_.reserve(expressions.size());
+  for (SymbolicExpr root : expressions) {
+    pending.push_back(root);
+    while (!pending.empty()) {
+      SymbolicExpr expression = pending.back();
+      if (indices.contains(expression)) {
+        pending.pop_back();
+        continue;
+      }
+      const SymbolicExprType type = expression.GetType();
+      if (type == SymbolicExprType::kConstant ||
+          type == SymbolicExprType::kVariable) {
+        indices.try_emplace(expression, instructions_.size());
+        instructions_.push_back({type, expression.GetValue()});
+        pending.pop_back();
+        continue;
+      }
+      // Visit the LHS first, matching the recursive evaluator's ordering of
+      // variable checks and arithmetic preconditions. Already prepared children
+      // are skipped, including those shared with an earlier result.
+      auto lhs = indices.find(expression.GetLHS());
+      if (lhs == indices.end()) {
+        pending.push_back(expression.GetLHS());
+        continue;
+      }
+      auto rhs = indices.find(expression.GetRHS());
+      if (rhs == indices.end()) {
+        pending.push_back(expression.GetRHS());
+        continue;
+      }
+      const int64_t lhs_index = lhs->second;
+      const int64_t rhs_index = rhs->second;
+      indices.try_emplace(expression, instructions_.size());
+      instructions_.push_back({type, lhs_index, rhs_index});
+      pending.pop_back();
+    }
+    result_indices_.push_back(indices.lookup(root));
+  }
+}
+
+void SymbolicExprProgram::Evaluate(absl::Span<const int64_t> variable_values,
+                                   absl::Span<int64_t> scratch,
+                                   absl::Span<int64_t> results) const {
+  CHECK_GE(scratch.size(), instructions_.size());
+  CHECK_EQ(results.size(), result_indices_.size());
+  for (int64_t index = 0; index < instructions_.size(); ++index) {
+    const Instruction& instruction = instructions_[index];
+    if (instruction.type == SymbolicExprType::kConstant) {
+      scratch[index] = instruction.lhs_or_value;
+      continue;
+    }
+    if (instruction.type == SymbolicExprType::kVariable) {
+      const int64_t var_id = instruction.lhs_or_value;
+      CHECK(var_id >= 0 && var_id < variable_values.size())
+          << "Evaluate has not provided a value for VariableID " << var_id
+          << ".";
+      scratch[index] = variable_values[var_id];
+      continue;
+    }
+    const int64_t lhs = scratch[instruction.lhs_or_value];
+    const int64_t rhs = scratch[instruction.rhs];
+    switch (instruction.type) {
+      case SymbolicExprType::kAdd:
+        scratch[index] = lhs + rhs;
+        break;
+      case SymbolicExprType::kMul:
+        scratch[index] = lhs * rhs;
+        break;
+      case SymbolicExprType::kFloorDiv:
+        scratch[index] = llvm::divideFloorSigned(lhs, rhs);
+        break;
+      case SymbolicExprType::kCeilDiv:
+        scratch[index] = llvm::divideCeilSigned(lhs, rhs);
+        break;
+      case SymbolicExprType::kMod:
+        CHECK_NE(rhs, 0);
+        scratch[index] = (lhs % rhs + std::abs(rhs)) % rhs;
+        break;
+      case SymbolicExprType::kMax:
+        scratch[index] = std::max(lhs, rhs);
+        break;
+      case SymbolicExprType::kMin:
+        scratch[index] = std::min(lhs, rhs);
+        break;
+      default:
+        LOG(FATAL) << "Evaluate not implemented for this expression type.";
+    }
+  }
+  for (int64_t index = 0; index < result_indices_.size(); ++index) {
+    results[index] = scratch[result_indices_[index]];
+  }
+}
+
 std::optional<int64_t> SafeEvaluateSymbolicExpr(
     SymbolicExpr expr, absl::Span<int64_t const> dims,
     absl::Span<int64_t const> syms) {

@@ -111,22 +111,19 @@ bool IsReadCoalescedHeuristic(HloFusionAnalysis::EmitterFusionKind fusion_kind,
 
 namespace {
 
-template <typename TiledHloInstructionType>
+template <typename TileSize, typename TileStride>
 double BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
-    const TiledHloInstructionType& hbm_access_instr,
+    const Shape& shape, TileSize tile_size_at, TileStride tile_stride_at,
     const se::DeviceDescription& device_info) {
-  const HloInstruction* hlo = hbm_access_instr.hlo();
-  const Shape& shape = hlo->shape();
-
   // Compute the number of elements in the contiguous part of the tile.
   int64_t contiguous_elements = 1;
   for (const auto dim_idx : shape.layout().minor_to_major()) {
     // This dimension is strided, so it's not contiguous.
-    if (hbm_access_instr.tile_stride(dim_idx) != 1) {
+    if (tile_stride_at(dim_idx) != 1) {
       break;
     }
 
-    int64_t tile_size = hbm_access_instr.tile_size(dim_idx);
+    int64_t tile_size = tile_size_at(dim_idx);
     int64_t dim_size = shape.dimensions(dim_idx);
 
     // Make sure to ignore the mask if there is one.
@@ -142,7 +139,7 @@ double BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
   // Compute the size of the contiguous part of the tile in bytes.
   int64_t contiguous_bytes_accessed =
       contiguous_elements *
-      ShapeUtil::ByteSizeOfPrimitiveType(hlo->shape().element_type());
+      ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
 
   // Memory accesses are fully coalesced if the memory access uses exactly a
   // multiple of the DRAM->L2 cache line size contiguously.
@@ -153,20 +150,36 @@ double BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
       CeilOfRatio(contiguous_bytes_accessed, transaction_size_bytes);
   return 1.0 * contiguous_bytes_accessed / effective_bytes_accessed;
 }
+
 }  // namespace
+
+double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
+    const Shape& shape, absl::Span<const int64_t> tile_sizes,
+    absl::Span<const int64_t> tile_strides,
+    const se::DeviceDescription& device_info) {
+  return BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
+      shape, [&](int64_t dim) { return tile_sizes[dim]; },
+      [&](int64_t dim) { return tile_strides[dim]; }, device_info);
+}
 
 double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
     const TiledHloInstruction& hbm_access_instr,
     const se::DeviceDescription& device_info) {
   return BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
-      hbm_access_instr, device_info);
+      hbm_access_instr.hlo()->shape(),
+      [&](int64_t dim) { return hbm_access_instr.tile_size(dim); },
+      [&](int64_t dim) { return hbm_access_instr.tile_stride(dim); },
+      device_info);
 }
 
 double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
     const experimental::TiledHloInstruction& hbm_access_instr,
     const se::DeviceDescription& device_info) {
   return BandwidthUtilizationRateHeuristicForTiledMemoryAccessImpl(
-      hbm_access_instr, device_info);
+      hbm_access_instr.hlo()->shape(),
+      [&](int64_t dim) { return hbm_access_instr.tile_size(dim); },
+      [&](int64_t dim) { return hbm_access_instr.tile_stride(dim); },
+      device_info);
 }
 
 namespace {

@@ -288,13 +288,11 @@ namespace {
 constexpr int kNumComponentsPerTiledDimension = 3;
 
 template <int64_t Component>
-llvm::SmallVector<int64_t> EvaluateTileMapComponent(
-    const SymbolicTile& symbolic_tile,
-    absl::Span<int64_t const> parameters) {
-  static_assert(Component >= 0 &&
-                Component < kNumComponentsPerTiledDimension);
-  const SymbolicMap& symbolic_map =
-      symbolic_tile.tile_map().GetSymbolicMap();
+void EvaluateTileMapComponent(const SymbolicTile& symbolic_tile,
+                              absl::Span<int64_t const> parameters,
+                              llvm::SmallVectorImpl<int64_t>& results) {
+  static_assert(Component >= 0 && Component < kNumComponentsPerTiledDimension);
+  const SymbolicMap& symbolic_map = symbolic_tile.tile_map().GetSymbolicMap();
 
   int64_t component_size =
       symbolic_map.GetNumResults() / kNumComponentsPerTiledDimension;
@@ -305,11 +303,17 @@ llvm::SmallVector<int64_t> EvaluateTileMapComponent(
   // their result slice directly to avoid constructing a temporary SymbolicMap
   // and copying the parameters into another vector for every instruction and
   // tiling candidate.
-  llvm::SmallVector<int64_t> results;
   results.resize_for_overwrite(expressions.size());
   EvaluateSymbolicExprs(
       absl::Span<const SymbolicExpr>(expressions.data(), expressions.size()),
       parameters, absl::Span<int64_t>(results.data(), results.size()));
+}
+
+template <int64_t Component>
+llvm::SmallVector<int64_t> EvaluateTileMapComponent(
+    const SymbolicTile& symbolic_tile, absl::Span<const int64_t> parameters) {
+  llvm::SmallVector<int64_t> results;
+  EvaluateTileMapComponent<Component>(symbolic_tile, parameters, results);
   return results;
 }
 }  // namespace
@@ -364,6 +368,12 @@ llvm::SmallVector<int64_t> EvaluateTileSizes(
   return EvaluateTileMapComponent<1>(symbolic_tile, parameters);
 }
 
+void EvaluateTileSizes(const SymbolicTile& symbolic_tile,
+                       absl::Span<const int64_t> parameters,
+                       llvm::SmallVectorImpl<int64_t>& results) {
+  EvaluateTileMapComponent<1>(symbolic_tile, parameters, results);
+}
+
 llvm::SmallVector<int64_t> EvaluateTileStrides(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters) {
   const std::vector<IndexingMap::Variable>& dim_vars =
@@ -399,6 +409,13 @@ llvm::SmallVector<int64_t> EvaluateTileStridesWithClampedParameters(
     const SymbolicTile& symbolic_tile,
     absl::Span<int64_t const> clamped_parameters) {
   return EvaluateTileMapComponent<2>(symbolic_tile, clamped_parameters);
+}
+
+void EvaluateTileStridesWithClampedParameters(
+    const SymbolicTile& symbolic_tile,
+    absl::Span<const int64_t> clamped_parameters,
+    llvm::SmallVectorImpl<int64_t>& results) {
+  EvaluateTileMapComponent<2>(symbolic_tile, clamped_parameters, results);
 }
 
 }  // namespace xla

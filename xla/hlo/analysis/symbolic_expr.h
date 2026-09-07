@@ -21,6 +21,7 @@ limitations under the License.
 #include <optional>
 #include <ostream>
 #include <string>
+#include <vector>
 
 #include "absl/types/span.h"
 #include "llvm/ADT/DenseMap.h"
@@ -176,6 +177,42 @@ SymbolicExpr operator*(int64_t lhs, SymbolicExpr rhs);
 void EvaluateSymbolicExprs(absl::Span<const SymbolicExpr> expressions,
                            absl::Span<const int64_t> variable_values,
                            absl::Span<int64_t> results);
+
+// An immutable evaluation program for a batch of expressions sharing variable
+// values. Preparation records each distinct subexpression once in dependency
+// order. Evaluation neither allocates storage nor accesses the MLIR context, so
+// the program can outlive the expressions and can be shared between threads
+// with separate scratch and result buffers.
+//
+// This has the same arithmetic preconditions as SymbolicExpr::Evaluate; it is
+// not a substitute for SafeEvaluateSymbolicExpr. In particular, callers must
+// avoid integer overflow and division by zero.
+class SymbolicExprProgram {
+ public:
+  explicit SymbolicExprProgram(absl::Span<const SymbolicExpr> expressions);
+
+  int64_t scratch_size() const { return instructions_.size(); }
+  int64_t result_count() const { return result_indices_.size(); }
+
+  // Scratch must contain at least scratch_size() elements, results must contain
+  // exactly result_count() elements, and the three spans must not overlap.
+  // Every scratch value is overwritten, so the same storage can be reused for
+  // the next set of variable values without clearing it.
+  void Evaluate(absl::Span<const int64_t> variable_values,
+                absl::Span<int64_t> scratch, absl::Span<int64_t> results) const;
+
+ private:
+  struct Instruction {
+    SymbolicExprType type;
+    // Constants and variables use lhs_or_value for their value or variable ID.
+    // Binary operations use both fields as indices into scratch.
+    int64_t lhs_or_value;
+    int64_t rhs = 0;
+  };
+
+  std::vector<Instruction> instructions_;
+  std::vector<int64_t> result_indices_;
+};
 
 inline ::llvm::hash_code hash_value(SymbolicExpr expr) {
   return ::llvm::hash_value(expr.GetImpl());

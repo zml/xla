@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/hlo/analysis/symbolic_expr.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
 #include "xla/service/gpu/backend_configs.pb.h"
@@ -1453,6 +1454,57 @@ class HerolessPriorityFusionTest : public PriorityFusionTest {
         .set_xla_gpu_experimental_enable_triton_heroless_priority_fusion(true);
     return debug_options;
   }
+
+  void ExpectSameFusionAcrossWorkerCounts(absl::string_view hlo,
+                                          bool enable_multi_output) {
+    std::optional<std::string> serial_hlo;
+    for (int workers : {0, 1, 2, 8}) {
+      for (int repetition = 0; repetition < 2; ++repetition) {
+        SCOPED_TRACE(
+            absl::StrFormat("workers=%d repetition=%d", workers, repetition));
+        ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo));
+        module->mutable_config()
+            .mutable_debug_options()
+            .set_xla_gpu_unsupported_enable_triton_multi_output_fusion(
+                enable_multi_output);
+        // Each run owns its analysis state, just as independent compilations
+        // do.
+        mlir::MLIRContext context;
+        RegisterSymbolicExprStorage(&context);
+        AliasInfo alias_info;
+        std::unique_ptr<tsl::thread::ThreadPool> pool;
+        if (workers != 0) {
+          pool = std::make_unique<tsl::thread::ThreadPool>(
+              tsl::Env::Default(), "priority-fusion-determinism", workers);
+        }
+        GpuHloCostAnalysis::Options options;
+        options.count_multiple_input_accesses = true;
+        PriorityFusion fusion(pool.get(), device_info_, &alias_info, options,
+                              &context);
+        ASSERT_THAT(fusion.Run(module.get()), absl_testing::IsOkAndHolds(true));
+        ASSERT_OK(module->RemoveUnusedComputations());
+        ASSERT_OK(verifier().Run(module.get()).status());
+        int triton_fusions = 0;
+        for (const HloInstruction* instruction :
+             module->entry_computation()->instructions()) {
+          triton_fusions += IsGenericTritonFusion(*instruction);
+        }
+        ASSERT_GT(triton_fusions, 0);
+        // Fingerprint normalizes generated names, but omits backend configs by
+        // default. Include them and all constants to check compiler decisions.
+        std::string result =
+            module->ToString(HloPrintOptions::Fingerprint()
+                                 .set_print_backend_config(true)
+                                 .set_sort_backend_config(true)
+                                 .set_print_only_essential_constants(false));
+        if (!serial_hlo.has_value()) {
+          serial_hlo = std::move(result);
+        } else {
+          EXPECT_EQ(result, *serial_hlo);
+        }
+      }
+    }
+  }
 };
 
 INSTANTIATE_TEST_SUITE_P(
@@ -1461,6 +1513,85 @@ INSTANTIATE_TEST_SUITE_P(
            info) {
       return info.param ? "TilingPropagation" : "SymbolicAnalysis";
     });
+
+TEST_P(HerolessPriorityFusionTest,
+       WorkerCountsPreserveDiamondAndReductionFusion) {
+  ExpectSameFusionAcrossWorkerCounts(R"(
+HloModule independent_diamonds
+
+sum {
+  lhs = f32[] parameter(0)
+  rhs = f32[] parameter(1)
+  ROOT add = f32[] add(lhs, rhs)
+}
+
+ENTRY main {
+  p0 = f32[19,65]{1,0} parameter(0)
+  p1 = f32[17,33]{1,0} parameter(1)
+  zero = f32[] constant(0)
+  negate = f32[19,65]{1,0} negate(p0)
+  exp = f32[19,65]{1,0} exponential(p0)
+  diamond = f32[19,65]{1,0} add(negate, exp)
+  sum0 = f32[19]{0} reduce(diamond, zero), dimensions={1}, to_apply=sum
+  broadcast0 = f32[19,65]{1,0} broadcast(sum0), dimensions={0}
+  result0 = f32[19,65]{1,0} subtract(diamond, broadcast0)
+  abs = f32[17,33]{1,0} abs(p1)
+  square = f32[17,33]{1,0} multiply(p1, p1)
+  diamond1 = f32[17,33]{1,0} add(abs, square)
+  sum1 = f32[17]{0} reduce(diamond1, zero), dimensions={1}, to_apply=sum
+  broadcast1 = f32[17,33]{1,0} broadcast(sum1), dimensions={0}
+  result1 = f32[17,33]{1,0} subtract(diamond1, broadcast1)
+  ROOT tuple = (f32[19,65]{1,0}, f32[17,33]{1,0}, f32[19,65]{1,0})
+      tuple(result0, result1, diamond)
+})",
+                                     /*enable_multi_output=*/false);
+}
+
+TEST_P(HerolessPriorityFusionTest, WorkerCountsPreserveBitcastsAndConstants) {
+  ExpectSameFusionAcrossWorkerCounts(R"(
+HloModule bitcasts_and_constants
+
+ENTRY main {
+  p0 = f32[17,33]{1,0} parameter(0)
+  p1 = f32[19,65]{1,0} parameter(1)
+  flat0 = f32[561]{0} bitcast(p0)
+  flat1 = f32[1235]{0} bitcast(p1)
+  zero = f32[] constant(0)
+  one = f32[] constant(1)
+  zeros = f32[561]{0} broadcast(zero), dimensions={}
+  ones = f32[1235]{0} broadcast(one), dimensions={}
+  negate = f32[561]{0} negate(flat0)
+  abs = f32[561]{0} abs(flat0)
+  sum0 = f32[561]{0} add(negate, abs)
+  result0 = f32[561]{0} add(sum0, zeros)
+  square = f32[1235]{0} multiply(flat1, flat1)
+  result1 = f32[1235]{0} add(square, ones)
+  shaped0 = f32[17,33]{1,0} bitcast(result0)
+  shaped1 = f32[19,65]{1,0} bitcast(result1)
+  ROOT tuple = (f32[17,33]{1,0}, f32[19,65]{1,0}) tuple(shaped0, shaped1)
+})",
+                                     /*enable_multi_output=*/false);
+}
+
+TEST_P(HerolessPriorityFusionTest, WorkerCountsPreserveMultiOutputFusion) {
+  if (GetParam()) {
+    GTEST_SKIP() << "Multi-output fusions are not supported with tile-based "
+                    "block-level emitter";
+  }
+  ExpectSameFusionAcrossWorkerCounts(R"(
+HloModule multi_output_candidates
+
+ENTRY main {
+  p0 = f32[] parameter(0)
+  negate = f32[] negate(p0)
+  log = f32[] log(negate)
+  p1 = f32[] parameter(1)
+  exp = f32[] exponential(p1)
+  add = f32[] add(exp, log)
+  ROOT tuple = (f32[], f32[], f32[]) tuple(add, negate, exp)
+})",
+                                     /*enable_multi_output=*/true);
+}
 
 TEST_P(HerolessPriorityFusionTest, TwoElementwiseOpsAreFusedWithTriton) {
   auto module = *ParseAndReturnVerifiedModule(R"(

@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_MODEL_COALESCING_ANALYSIS_H_
 #define XLA_SERVICE_GPU_MODEL_COALESCING_ANALYSIS_H_
 
+#include <cstdint>
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
@@ -25,6 +26,7 @@ limitations under the License.
 #include "xla/codegen/tiling/tiled_hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
+#include "xla/shape.h"
 #include "xla/stream_executor/device_description.h"
 
 namespace xla::gpu {
@@ -89,6 +91,13 @@ double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
 
 double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
     const experimental::TiledHloInstruction& hbm_access_instr,
+    const se::DeviceDescription& device_info);
+
+// Equivalent field-based interface for cost-model views that do not own a
+// materialized tiled instruction.
+double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
+    const Shape& shape, absl::Span<const int64_t> tile_sizes,
+    absl::Span<const int64_t> tile_strides,
     const se::DeviceDescription& device_info);
 
 }  // namespace xla::gpu

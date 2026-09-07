@@ -15,9 +15,11 @@ limitations under the License.
 
 #include "xla/hlo/analysis/symbolic_expr.h"
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -26,6 +28,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/IR/AffineExpr.h"
@@ -105,6 +108,204 @@ TEST_F(SymbolicExprTest, Evaluate) {
 
   // ((((5 + 42) * max(min(1, 2), 0)) / 2) ceildiv 2) = 23 ceildiv 2 = 12
   EXPECT_EQ(expr.Evaluate({5, 1}), 12);
+}
+
+TEST_F(SymbolicExprTest, ProgramEmpty) {
+  SymbolicExprProgram program({});
+  EXPECT_EQ(program.scratch_size(), 0);
+  EXPECT_EQ(program.result_count(), 0);
+  program.Evaluate({}, {}, {});
+}
+
+TEST_F(SymbolicExprTest, ProgramTerminalsAndRepeatedResults) {
+  SymbolicExprProgram program({c5, v1, c0, v0, c5, v1});
+  EXPECT_EQ(program.scratch_size(), 4);
+  EXPECT_EQ(program.result_count(), 6);
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> results(program.result_count());
+  program.Evaluate({-7, 13}, absl::MakeSpan(scratch), absl::MakeSpan(results));
+  EXPECT_THAT(results, ::testing::ElementsAre(5, 13, 0, -7, 5, 13));
+  program.Evaluate({17, -23}, absl::MakeSpan(scratch), absl::MakeSpan(results));
+  EXPECT_THAT(results, ::testing::ElementsAre(5, -23, 0, 17, 5, -23));
+}
+
+TEST_F(SymbolicExprTest, ProgramSharedSubexpressions) {
+  SymbolicExpr shared = (v0 + 42) * v1;
+  SymbolicExprProgram program({shared, shared + shared, shared.min(5), shared});
+  // v0, 42, add, v1, mul, add, 5, min: both output duplication and
+  // subexpression duplication share the original evaluation slot.
+  EXPECT_EQ(program.scratch_size(), 8);
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> results(program.result_count());
+  program.Evaluate({-40, -3}, absl::MakeSpan(scratch), absl::MakeSpan(results));
+  EXPECT_THAT(results, ::testing::ElementsAre(-6, -12, -6, -6));
+  program.Evaluate({0, 2}, absl::MakeSpan(scratch), absl::MakeSpan(results));
+  EXPECT_THAT(results, ::testing::ElementsAre(84, 168, 5, 84));
+}
+
+TEST_F(SymbolicExprTest, ProgramSignedDivisionAndModulo) {
+  const std::vector<SymbolicExpr> expressions = {v0.floorDiv(v1),
+                                                 v0.ceilDiv(v1), v0 % v1};
+  SymbolicExprProgram program(expressions);
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> expected(expressions.size());
+  std::vector<int64_t> actual(expressions.size());
+  for (int64_t numerator = -17; numerator <= 17; ++numerator) {
+    for (int64_t denominator = -9; denominator <= 9; ++denominator) {
+      if (denominator == 0) continue;
+      const std::array<int64_t, 2> values = {numerator, denominator};
+      EvaluateSymbolicExprs(expressions, values, absl::MakeSpan(expected));
+      program.Evaluate(values, absl::MakeSpan(scratch), absl::MakeSpan(actual));
+      EXPECT_EQ(actual, expected)
+          << numerator << " divided or reduced modulo " << denominator;
+    }
+  }
+}
+
+TEST_F(SymbolicExprTest, ProgramClampingBoundaries) {
+  const std::vector<SymbolicExpr> expressions = {
+      v0.min(16).max(1), (v0 + 15).floorDiv(16), v0.min(v1).max(0).ceilDiv(8)};
+  SymbolicExprProgram program(expressions);
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> expected(expressions.size());
+  std::vector<int64_t> actual(expressions.size());
+  for (int64_t value : {-17, -1, 0, 1, 7, 8, 9, 15, 16, 17, 32}) {
+    const std::array<int64_t, 2> values = {value, 9};
+    EvaluateSymbolicExprs(expressions, values, absl::MakeSpan(expected));
+    program.Evaluate(values, absl::MakeSpan(scratch), absl::MakeSpan(actual));
+    EXPECT_EQ(actual, expected) << value;
+  }
+}
+
+TEST_F(SymbolicExprTest, ProgramBoundedRandomExpressions) {
+  std::mt19937 random(0);
+  std::vector<SymbolicExpr> expressions = {v0, v1, c3};
+  for (int64_t index = 0; index < 256; ++index) {
+    SymbolicExpr lhs =
+        expressions[random() % expressions.size()].min(512).max(-512);
+    SymbolicExpr rhs =
+        expressions[random() % expressions.size()].min(512).max(-512);
+    int64_t divisor = 1 + random() % 8;
+    if (random() % 2 == 0) divisor = -divisor;
+    switch (random() % 7) {
+      case 0:
+        expressions.push_back(lhs + rhs);
+        break;
+      case 1:
+        expressions.push_back(lhs * rhs);
+        break;
+      case 2:
+        expressions.push_back(lhs.floorDiv(divisor));
+        break;
+      case 3:
+        expressions.push_back(lhs.ceilDiv(divisor));
+        break;
+      case 4:
+        expressions.push_back(lhs % divisor);
+        break;
+      case 5:
+        expressions.push_back(lhs.min(rhs));
+        break;
+      case 6:
+        expressions.push_back(lhs.max(rhs));
+        break;
+    }
+  }
+  SymbolicExprProgram program(expressions);
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> expected(expressions.size());
+  std::vector<int64_t> actual(expressions.size());
+  for (int64_t iteration = 0; iteration < 64; ++iteration) {
+    const std::array<int64_t, 2> values = {
+        static_cast<int64_t>(random() % 2049) - 1024,
+        static_cast<int64_t>(random() % 2049) - 1024};
+    EvaluateSymbolicExprs(expressions, values, absl::MakeSpan(expected));
+    program.Evaluate(values, absl::MakeSpan(scratch), absl::MakeSpan(actual));
+    EXPECT_EQ(actual, expected) << "iteration " << iteration;
+  }
+}
+
+TEST_F(SymbolicExprTest, ProgramOutlivesContext) {
+  std::optional<SymbolicExprProgram> program;
+  {
+    mlir::MLIRContext temporary_context;
+    RegisterSymbolicExprStorage(&temporary_context);
+    SymbolicExpr variable = CreateSymbolicVariable(0, &temporary_context);
+    const std::array<SymbolicExpr, 2> expressions = {variable + 42,
+                                                     variable * 2};
+    program.emplace(expressions);
+  }
+  std::vector<int64_t> scratch(program->scratch_size());
+  std::vector<int64_t> results(program->result_count());
+  program->Evaluate({-7}, absl::MakeSpan(scratch), absl::MakeSpan(results));
+  EXPECT_THAT(results, ::testing::ElementsAre(35, -14));
+}
+
+TEST_F(SymbolicExprTest, ProgramMissingVariable) {
+  SymbolicExprProgram program({v0 + v1});
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> results(program.result_count());
+  EXPECT_DEATH(
+      program.Evaluate({5}, absl::MakeSpan(scratch), absl::MakeSpan(results)),
+      "Evaluate has not provided a value for VariableID 1.");
+}
+
+TEST_F(SymbolicExprTest, ProgramModuloByZero) {
+  SymbolicExprProgram program({v0 % v1});
+  std::vector<int64_t> scratch(program.scratch_size());
+  std::vector<int64_t> results(program.result_count());
+  EXPECT_DEATH(program.Evaluate({5, 0}, absl::MakeSpan(scratch),
+                                absl::MakeSpan(results)),
+               "Check failed");
+}
+
+TEST_F(SymbolicExprTest, ProgramPreservesFirstErrorAcrossResults) {
+  SymbolicExpr missing = CreateSymbolicVariable(2, &ctx);
+  SymbolicExpr modulo = v0 % v1;
+  for (bool modulo_first : {false, true}) {
+    const std::vector<SymbolicExpr> expressions =
+        modulo_first ? std::vector<SymbolicExpr>{modulo, missing}
+                     : std::vector<SymbolicExpr>{missing, modulo};
+    SymbolicExprProgram program(expressions);
+    std::vector<int64_t> scratch(program.scratch_size());
+    std::vector<int64_t> results(program.result_count());
+    // Match the check being violated rather than source locations or the
+    // descriptive suffix, which differs for terminal and recursive variables.
+    const char* failure =
+        modulo_first ? "Check failed: rhs" : "Check failed: var_id";
+    EXPECT_DEATH(
+        EvaluateSymbolicExprs(expressions, {5, 0}, absl::MakeSpan(results)),
+        failure);
+    EXPECT_DEATH(program.Evaluate({5, 0}, absl::MakeSpan(scratch),
+                                  absl::MakeSpan(results)),
+                 failure);
+  }
+}
+
+TEST_F(SymbolicExprTest,
+       ProgramPreservesNestedErrorOrderWithSharedExpressions) {
+  SymbolicExpr shared = v0 + 1;
+  SymbolicExpr missing = CreateSymbolicVariable(2, &ctx);
+  SymbolicExpr modulo = shared % v1;
+  for (bool modulo_first : {false, true}) {
+    SymbolicExpr nested = modulo_first ? (shared + modulo) * missing
+                                       : (shared + missing) * modulo;
+    // The shared subtree is evaluated successfully before it reappears within
+    // either failing expression. Removing its repeated evaluations must not
+    // change which remaining operation fails first.
+    const std::vector<SymbolicExpr> expressions = {shared, nested, shared};
+    SymbolicExprProgram program(expressions);
+    std::vector<int64_t> scratch(program.scratch_size());
+    std::vector<int64_t> results(program.result_count());
+    const char* failure =
+        modulo_first ? "Check failed: rhs" : "Check failed: var_id";
+    EXPECT_DEATH(
+        EvaluateSymbolicExprs(expressions, {5, 0}, absl::MakeSpan(results)),
+        failure);
+    EXPECT_DEATH(program.Evaluate({5, 0}, absl::MakeSpan(scratch),
+                                  absl::MakeSpan(results)),
+                 failure);
+  }
 }
 
 TEST_F(SymbolicExprTest, SafeEvaluate) {

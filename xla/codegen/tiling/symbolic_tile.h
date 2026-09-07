@@ -213,6 +213,11 @@ llvm::SmallVector<int64_t> EvaluateTileOffsets(
 llvm::SmallVector<int64_t> EvaluateTileSizes(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters);
 
+// Reuses the caller's storage when evaluating a sequence of candidates.
+void EvaluateTileSizes(const SymbolicTile& symbolic_tile,
+                       absl::Span<const int64_t> parameters,
+                       llvm::SmallVectorImpl<int64_t>& results);
+
 // Evaluates the tile strides of `symbolic_tile` given tile parameters.
 llvm::SmallVector<int64_t> EvaluateTileStrides(
     const SymbolicTile& symbolic_tile, absl::Span<int64_t const> parameters);
@@ -222,6 +227,11 @@ llvm::SmallVector<int64_t> EvaluateTileStrides(
 llvm::SmallVector<int64_t> EvaluateTileStridesWithClampedParameters(
     const SymbolicTile& symbolic_tile,
     absl::Span<int64_t const> clamped_parameters);
+
+void EvaluateTileStridesWithClampedParameters(
+    const SymbolicTile& symbolic_tile,
+    absl::Span<const int64_t> clamped_parameters,
+    llvm::SmallVectorImpl<int64_t>& results);
 
 }  // namespace xla
 

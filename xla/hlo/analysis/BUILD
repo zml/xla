@@ -6,7 +6,7 @@ load(
     "xla_cc_test",
 )
 load("//xla/tsl:tsl.bzl", "internal_visibility")
-load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
+load("//xla/tsl/platform:rules_cc.bzl", "cc_binary", "cc_library")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -814,8 +814,22 @@ xla_cc_test(
         ":symbolic_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_binary(
+    name = "symbolic_expr_benchmark",
+    testonly = True,
+    srcs = ["symbolic_expr_benchmark.cc"],
+    deps = [
+        ":symbolic_map",
+        "@com_google_absl//absl/types:span",
+        "@com_google_benchmark//:benchmark",
+        "@com_google_benchmark//:benchmark_main",
         "@llvm-project//mlir:IR",
     ],
 )

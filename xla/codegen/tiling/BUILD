@@ -350,6 +350,7 @@ cc_library(
     srcs = ["symbolic_tile_analysis.cc"],
     hdrs = ["symbolic_tile_analysis.h"],
     deps = [
+        "@com_google_absl//absl/time",
         ":constraint_expression",
         ":symbolic_tile",
         ":symbolic_tiled_hlo_instruction",
@@ -399,6 +400,7 @@ xla_cc_test(
     name = "symbolic_tile_analysis_test",
     srcs = ["symbolic_tile_analysis_test.cc"],
     deps = [
+        ":symbolic_tile",
         ":constraint_expression",
         ":symbolic_tile_analysis",
         ":symbolic_tiled_hlo_instruction",
@@ -461,5 +463,52 @@ xla_cc_test(
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/hlo/utils:hlo_traversal",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "compact_tiled_hlo_computation",
+    srcs = ["compact_tiled_hlo_computation.cc"],
+    hdrs = ["compact_tiled_hlo_computation.h"],
+    deps = [
+        ":symbolic_tile_analysis",
+        ":symbolic_tiled_hlo_instruction",
+        "//xla:util",
+        "//xla/hlo/analysis:indexing_analysis",
+        "//xla/hlo/analysis:interval",
+        "//xla/hlo/analysis:symbolic_map",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:decision",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
+xla_cc_test(
+    name = "compact_tiled_hlo_computation_test",
+    srcs = ["compact_tiled_hlo_computation_test.cc"],
+    deps = [
+        ":compact_tiled_hlo_computation",
+        ":symbolic_tile_analysis",
+        ":tiled_hlo_computation",
+        ":tiled_hlo_instruction",
+        ":tiled_hlo_schedule",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/testlib:verified_hlo_module",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:IR",
     ],
 )
