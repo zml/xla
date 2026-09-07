@@ -1209,10 +1209,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalPagedAttnThunk(
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
     const HloCustomCallInstruction* instr) {
-  if (instr->operand_count() != 8) {
+  if (instr->operand_count() != 9) {
     return absl::InvalidArgumentError(
-        "zml$gdn expects 8 operands "
-        "(q, k, v, g, beta, h0, cu_seqlens, slot_mapping).");
+        "zml$gdn expects 9 operands (q, k, v, g, beta, state_pool, cu_seqlens, "
+        "state_slots, final_state_slots).");
   }
   const Shape& q_shape = instr->operand(0)->shape();
   const Shape& k_shape = instr->operand(1)->shape();
@@ -1221,7 +1221,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
   const Shape& beta_shape = instr->operand(4)->shape();
   const Shape& h0_shape = instr->operand(5)->shape();
   const Shape& cu_seqlens_shape = instr->operand(6)->shape();
-  const Shape& slot_mapping_shape = instr->operand(7)->shape();
+  const Shape& state_slots_shape = instr->operand(7)->shape();
+  const Shape& final_state_slots_shape = instr->operand(8)->shape();
 
   if (!instr->shape().IsTuple() || instr->shape().tuple_shapes().size() != 2) {
     return absl::UnimplementedError(
@@ -1235,7 +1236,8 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
       beta_shape.dimensions().size() != 2 ||
       h0_shape.dimensions().size() != 4 ||
       cu_seqlens_shape.dimensions().size() != 1 ||
-      slot_mapping_shape.dimensions().size() != 1) {
+      state_slots_shape.dimensions().size() != 1 ||
+      final_state_slots_shape.dimensions().size() != 1) {
     return absl::UnimplementedError("zml$gdn: unexpected operand ranks.");
   }
 
@@ -1244,7 +1246,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
   const int64_t dk = q_shape.dimensions(2);
   const int64_t hv = v_shape.dimensions(1);
   const int64_t dv = v_shape.dimensions(2);
-  const int64_t num_seqs = h0_shape.dimensions(0);
+  const int64_t num_seqs = state_slots_shape.dimensions(0);
 
   if (hk == 0 || hv == 0 || dk == 0 || dv == 0 || num_seqs == 0) {
     return absl::UnimplementedError("zml$gdn: invalid dimension (must be > 0).");
@@ -1258,11 +1260,16 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
       g_shape.dimensions(0) != total_tokens || g_shape.dimensions(1) != hv ||
       beta_shape.dimensions(0) != total_tokens ||
       beta_shape.dimensions(1) != hv || h0_shape.dimensions(1) != hv ||
-      h0_shape.dimensions(2) != dk || h0_shape.dimensions(3) != dv ||
+      h0_shape.dimensions(2) != dv || h0_shape.dimensions(3) != dk ||
       cu_seqlens_shape.dimensions(0) != num_seqs + 1 ||
-      slot_mapping_shape.dimensions(0) != num_seqs) {
+      final_state_slots_shape.dimensions(0) != num_seqs) {
     return absl::UnimplementedError(
-        "zml$gdn: inconsistent q/k/v/g/beta/h0/cu_seqlens/slot_mapping shapes.");
+        "zml$gdn: inconsistent q/k/v/g/beta/state_pool/cu_seqlens/state_slots "
+        "shapes.");
+  }
+  if (ht_shape != h0_shape) {
+    return absl::UnimplementedError(
+        "zml$gdn: ht must alias the state pool operand.");
   }
   const PrimitiveType et = q_shape.element_type();
   if (et != F32 && et != F16 && et != BF16) {
@@ -1290,8 +1297,10 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
                       GetAllocationSlice(instr->operand(5), {}));
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice cu_seqlens,
                       GetAllocationSlice(instr->operand(6), {}));
-  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slot_mapping,
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice state_slots,
                       GetAllocationSlice(instr->operand(7), {}));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice final_state_slots,
+                      GetAllocationSlice(instr->operand(8), {}));
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice y,
                       GetAllocationSlice(instr, {0}));
   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice ht,
@@ -1301,8 +1310,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitMetalGdnThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(
           instr, ir_emitter_context_->GetNextThunkId()),
       q, q_shape, k, k_shape, v, v_shape, g, g_shape, beta, beta_shape, h0,
-      h0_shape, cu_seqlens, cu_seqlens_shape, slot_mapping, slot_mapping_shape,
-      y, y_shape, ht, ht_shape, num_seqs, hk, hv, dk, dv, et);
+      h0_shape, cu_seqlens, cu_seqlens_shape, state_slots, state_slots_shape,
+      final_state_slots, final_state_slots_shape, y, y_shape, ht, ht_shape,
+      num_seqs, hk, hv, dk, dv, et);
   return ThunkSequence::Of(std::move(thunk));
 }
 

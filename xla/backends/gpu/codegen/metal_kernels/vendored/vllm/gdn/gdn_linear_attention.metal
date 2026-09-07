@@ -9,14 +9,15 @@ template <typename T>
     const device T *__restrict__ g          [[buffer(3)]],
     const device T *__restrict__ beta       [[buffer(4)]],
     device T *__restrict__ state_pool       [[buffer(5)]],
-    const device int *__restrict__ cu_seqlens    [[buffer(6)]],
-    const device int *__restrict__ slot_mapping  [[buffer(7)]],
-    device T *__restrict__ y                [[buffer(8)]],
-    constant int &num_requests              [[buffer(9)]],
-    constant int &Hk                        [[buffer(10)]],
-    constant int &Hv                        [[buffer(11)]],
-    constant int &Dk                        [[buffer(12)]],
-    constant int &Dv                        [[buffer(13)]],
+    const device int *__restrict__ cu_seqlens          [[buffer(6)]],
+    const device int *__restrict__ state_slots         [[buffer(7)]],
+    const device int *__restrict__ final_state_slots   [[buffer(8)]],
+    device T *__restrict__ y                [[buffer(9)]],
+    constant int &num_requests              [[buffer(10)]],
+    constant int &Hk                        [[buffer(11)]],
+    constant int &Hv                        [[buffer(12)]],
+    constant int &Dk                        [[buffer(13)]],
+    constant int &Dv                        [[buffer(14)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_simdgroup]])
 {
@@ -35,10 +36,15 @@ template <typename T>
     const int seq_end = cu_seqlens[req_idx + 1];
     const int seq_len = seq_end - seq_start;
 
-    // State pool slot for this request: [max_seqs, Hv, Dv, Dk]
-    const int slot = slot_mapping[req_idx];
-    device T *state_ptr = state_pool
-        + ((slot * Hv + hv_idx) * Dv + dv_idx) * Dk;
+    // State pool slots for this request: [num_slots, Hv, Dv, Dk]. The slot read
+    // and the slot written differ: a sequence starting a prompt reads a zeroed
+    // sink slot while writing its own.
+    const int head_offset = (hv_idx * Dv + dv_idx) * Dk;
+    const int slot_stride = Hv * Dv * Dk;
+    const device T *in_state_ptr =
+        state_pool + state_slots[req_idx] * slot_stride + head_offset;
+    device T *out_state_ptr =
+        state_pool + final_state_slots[req_idx] * slot_stride + head_offset;
 
     // n_per_t = Dk / 32 elements per thread (supports Dk up to 256)
     const int n_per_t = Dk / 32;
@@ -46,7 +52,7 @@ template <typename T>
     for (int i = 0; i < n_per_t; ++i) {
         int s_idx = n_per_t * dk_idx + i;
         state[i] = (s_idx < Dk)
-            ? static_cast<float>(state_ptr[s_idx]) : 0.0f;
+            ? static_cast<float>(in_state_ptr[s_idx]) : 0.0f;
     }
 
     // Pointers into packed input tensors (offset by seq_start)
@@ -101,7 +107,7 @@ template <typename T>
     for (int i = 0; i < n_per_t; ++i) {
         int s_idx = n_per_t * dk_idx + i;
         if (s_idx < Dk) {
-            state_ptr[s_idx] = static_cast<T>(state[i]);
+            out_state_ptr[s_idx] = static_cast<T>(state[i]);
         }
     }
 }
@@ -113,7 +119,7 @@ template <typename T>
       const device type*, const device type*,                      \
       const device type*, const device type*,                      \
       const device type*, device type*,                            \
-      const device int*, const device int*,                        \
+      const device int*, const device int*, const device int*,     \
       device type*,                                                \
       constant int&, constant int&, constant int&,                 \
       constant int&, constant int&,                                \

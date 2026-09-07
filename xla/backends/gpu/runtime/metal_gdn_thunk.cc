@@ -72,7 +72,8 @@ MetalGdnThunk::MetalGdnThunk(
     Shape v_shape, BufferAllocation::Slice g, Shape g_shape,
     BufferAllocation::Slice beta, Shape beta_shape, BufferAllocation::Slice h0,
     Shape h0_shape, BufferAllocation::Slice cu_seqlens, Shape cu_seqlens_shape,
-    BufferAllocation::Slice slot_mapping, Shape slot_mapping_shape,
+    BufferAllocation::Slice state_slots, Shape state_slots_shape,
+    BufferAllocation::Slice final_state_slots, Shape final_state_slots_shape,
     BufferAllocation::Slice y, Shape y_shape, BufferAllocation::Slice ht,
     Shape ht_shape, int64_t num_seqs, int64_t hk, int64_t hv, int64_t dk,
     int64_t dv, PrimitiveType element_type)
@@ -84,7 +85,8 @@ MetalGdnThunk::MetalGdnThunk(
       beta_(beta),
       h0_(h0),
       cu_seqlens_(cu_seqlens),
-      slot_mapping_(slot_mapping),
+      state_slots_(state_slots),
+      final_state_slots_(final_state_slots),
       y_(y),
       ht_(ht),
       q_shape_(std::move(q_shape)),
@@ -94,7 +96,8 @@ MetalGdnThunk::MetalGdnThunk(
       beta_shape_(std::move(beta_shape)),
       h0_shape_(std::move(h0_shape)),
       cu_seqlens_shape_(std::move(cu_seqlens_shape)),
-      slot_mapping_shape_(std::move(slot_mapping_shape)),
+      state_slots_shape_(std::move(state_slots_shape)),
+      final_state_slots_shape_(std::move(final_state_slots_shape)),
       y_shape_(std::move(y_shape)),
       ht_shape_(std::move(ht_shape)),
       num_seqs_(num_seqs),
@@ -121,7 +124,7 @@ absl::Status MetalGdnThunk::EnsureLoaded(se::StreamExecutor* executor) {
   TF_ASSIGN_OR_RETURN(std::vector<uint8_t> lib,
                       CompileMetalSourceToMetallibCached(src));
   TF_ASSIGN_OR_RETURN(
-      kernel_, metal_exec->LoadKernelWithConstants(lib, name, /*arity=*/14, {}));
+      kernel_, metal_exec->LoadKernelWithConstants(lib, name, /*arity=*/15, {}));
 
   auto stage = [&](se::DeviceAddressBase& dst, const void* val,
                    size_t n) -> absl::Status {
@@ -159,21 +162,23 @@ absl::Status MetalGdnThunk::ExecuteOnStream(const ExecuteParams& params) {
 
   se::DeviceAddressBase state_pool = allocs.GetDeviceAddress(ht_);
 
-  se::KernelArgsPackedArray args(/*num_args=*/14);
+  se::KernelArgsPackedArray args(/*num_args=*/15);
   args.add_argument(allocs.GetDeviceAddress(q_));             // 0  q
   args.add_argument(allocs.GetDeviceAddress(k_));             // 1  k
   args.add_argument(allocs.GetDeviceAddress(v_));             // 2  v
   args.add_argument(allocs.GetDeviceAddress(g_));             // 3  g (exp decay)
   args.add_argument(allocs.GetDeviceAddress(beta_));          // 4  beta
   args.add_argument(state_pool);                             // 5  state_pool
-  args.add_argument(allocs.GetDeviceAddress(cu_seqlens_));    // 6  cu_seqlens
-  args.add_argument(allocs.GetDeviceAddress(slot_mapping_));  // 7  slot_mapping
-  args.add_argument(allocs.GetDeviceAddress(y_));             // 8  y
-  args.add_argument(p_num_requests_);                        // 9  num_requests
-  args.add_argument(p_hk_);                                  // 10 Hk
-  args.add_argument(p_hv_);                                  // 11 Hv
-  args.add_argument(p_dk_);                                  // 12 Dk
-  args.add_argument(p_dv_);                                  // 13 Dv
+  args.add_argument(allocs.GetDeviceAddress(cu_seqlens_));   // 6  cu_seqlens
+  args.add_argument(allocs.GetDeviceAddress(state_slots_));  // 7  state_slots
+  args.add_argument(
+      allocs.GetDeviceAddress(final_state_slots_));          // 8  final slots
+  args.add_argument(allocs.GetDeviceAddress(y_));            // 9  y
+  args.add_argument(p_num_requests_);                        // 10 num_requests
+  args.add_argument(p_hk_);                                  // 11 Hk
+  args.add_argument(p_hv_);                                  // 12 Hv
+  args.add_argument(p_dk_);                                  // 13 Dk
+  args.add_argument(p_dv_);                                  // 14 Dv
 
   return kernel_->Launch(se::ThreadDim(32, 1, 1),
                          se::BlockDim(static_cast<uint64_t>(dv_), 1,
@@ -190,7 +195,8 @@ Thunk::BufferUses MetalGdnThunk::buffer_uses() const {
       BufferUse::Read(beta_, beta_shape_),
       BufferUse::Read(h0_, h0_shape_),
       BufferUse::Read(cu_seqlens_, cu_seqlens_shape_),
-      BufferUse::Read(slot_mapping_, slot_mapping_shape_),
+      BufferUse::Read(state_slots_, state_slots_shape_),
+      BufferUse::Read(final_state_slots_, final_state_slots_shape_),
       BufferUse::Write(y_, y_shape_),
       BufferUse::Write(ht_, ht_shape_),
   };

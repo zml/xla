@@ -41,8 +41,10 @@ class MetalGdnThunk : public Thunk {
                 BufferAllocation::Slice beta, Shape beta_shape,
                 BufferAllocation::Slice h0, Shape h0_shape,
                 BufferAllocation::Slice cu_seqlens, Shape cu_seqlens_shape,
-                BufferAllocation::Slice slot_mapping, Shape slot_mapping_shape,
-                BufferAllocation::Slice y, Shape y_shape,
+                BufferAllocation::Slice state_slots, Shape state_slots_shape,
+                BufferAllocation::Slice final_state_slots,
+                Shape final_state_slots_shape, BufferAllocation::Slice y,
+                Shape y_shape,
                 BufferAllocation::Slice ht, Shape ht_shape, int64_t num_seqs,
                 int64_t hk, int64_t hv, int64_t dk, int64_t dv,
                 PrimitiveType element_type);
@@ -59,9 +61,10 @@ class MetalGdnThunk : public Thunk {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   const BufferAllocation::Slice q_, k_, v_, g_, beta_, h0_, cu_seqlens_,
-      slot_mapping_, y_, ht_;
+      state_slots_, final_state_slots_, y_, ht_;
   const Shape q_shape_, k_shape_, v_shape_, g_shape_, beta_shape_, h0_shape_,
-      cu_seqlens_shape_, slot_mapping_shape_, y_shape_, ht_shape_;
+      cu_seqlens_shape_, state_slots_shape_, final_state_slots_shape_, y_shape_,
+      ht_shape_;
   const int64_t num_seqs_, hk_, hv_, dk_, dv_;
   const PrimitiveType element_type_;
 
