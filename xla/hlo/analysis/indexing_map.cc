@@ -1734,23 +1734,25 @@ IndexingMap ComposeIndexingMaps(const IndexingMap& first,
   // create an SymbolicMap
   // (dims of producer_symbolic_map)[symbols_of_producer_symbolic_map] =
   //   (constraint_1, ..., constraint_N) and then compose.
-  llvm::SmallVector<SymbolicExpr> constraints;
-  llvm::SmallVector<Interval> constraints_ranges;
-  for (const auto& [expr, range] : second.GetSymbolicConstraints()) {
-    constraints.push_back(expr);
-    constraints_ranges.push_back(range);
-  }
-  auto constraints_map =
-      SymbolicMap::Get(mlir_context, producer_symbolic_map.GetNumDims(),
-                       producer_symbolic_map.GetNumSymbols(), constraints);
-  auto remapped_constraints =
-      constraints_map.Compose(first.GetSymbolicMap())
-          .ReplaceDimsAndSymbols(/*dim_replacements=*/{}, symbol_replacements,
-                                 composed_indexing_map.GetDimensionCount(),
-                                 composed_indexing_map.GetSymbolCount());
-  for (const auto& [expr, range] :
-       llvm::zip(remapped_constraints.GetResults(), constraints_ranges)) {
-    composed_indexing_map.AddConstraint(expr, range);
+  if (!second.GetSymbolicConstraints().empty()) {
+    llvm::SmallVector<SymbolicExpr> constraints;
+    llvm::SmallVector<Interval> constraints_ranges;
+    for (const auto& [expr, range] : second.GetSymbolicConstraints()) {
+      constraints.push_back(expr);
+      constraints_ranges.push_back(range);
+    }
+    auto constraints_map =
+        SymbolicMap::Get(mlir_context, producer_symbolic_map.GetNumDims(),
+                         producer_symbolic_map.GetNumSymbols(), constraints);
+    auto remapped_constraints =
+        constraints_map.Compose(first.GetSymbolicMap())
+            .ReplaceDimsAndSymbols(/*dim_replacements=*/{}, symbol_replacements,
+                                   composed_indexing_map.GetDimensionCount(),
+                                   composed_indexing_map.GetSymbolCount());
+    for (const auto& [expr, range] :
+         llvm::zip(remapped_constraints.GetResults(), constraints_ranges)) {
+      composed_indexing_map.AddConstraint(expr, range);
+    }
   }
   // Remap symbol ids and add constraints that are already present in the
   // consumer_map.

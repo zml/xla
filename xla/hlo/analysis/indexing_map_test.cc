@@ -274,6 +274,40 @@ TEST_F(IndexingMapTest, Composition_ProducerAndConsumerHaveConstraints) {
                         )"));
 }
 
+TEST_F(IndexingMapTest, Composition_EmptyProducerConstraintsPreservesDomain) {
+  IndexingMap producer = Parse(R"(
+    (d0)[pr]{pt} -> (d0 + pr + pt),
+    domain:
+      d0 in [2, 8],
+      pr in [0, 4],
+      pt in [0, 5]
+  )");
+  IndexingMap consumer = Parse(R"(
+    (d0)[cr]{ct} -> (d0 + cr + ct),
+    domain:
+      d0 in [0, 9],
+      cr in [0, 3],
+      ct in [0, 2],
+      (cr + ct) mod 2 in [0, 0]
+  )");
+  ASSERT_TRUE(producer.GetSymbolicConstraints().empty());
+
+  // An empty explicit constraint list still restricts the consumer's codomain.
+  // Its own constraint must follow the range/runtime symbol permutation too.
+  auto composed = ComposeIndexingMaps(consumer, producer);
+  EXPECT_THAT(composed, MatchIndexingMap(R"(
+    (d0)[pr, cr]{pt, ct} -> (d0 + cr + ct + pr + pt),
+    domain:
+      d0 in [0, 9],
+      pr in [0, 4],
+      cr in [0, 3],
+      pt in [0, 5],
+      ct in [0, 2],
+      (cr + ct) mod 2 in [0, 0],
+      d0 + cr + ct in [2, 8]
+  )"));
+}
+
 TEST_F(IndexingMapTest, Composition_RTVar) {
   std::vector<IndexingMap::Variable> rt_vars{
       IndexingMap::Variable{Interval{0, 0}},
