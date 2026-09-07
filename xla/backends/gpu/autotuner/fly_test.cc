@@ -2262,8 +2262,7 @@ ENTRY main {
   indices = s32[191,1]{1,0} parameter(1)
   updates = bf16[191,1,259]{2,1,0} parameter(2)
   ROOT fusion = bf16[257,259]{1,0} fusion(base, indices, updates),
-    kind=kCustom, calls=elementwise,
-    backend_config={"fusion_backend_config":{"kind":"__triton"}}
+    kind=kInput, calls=elementwise
 }
 )";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,

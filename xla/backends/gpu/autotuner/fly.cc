@@ -3354,6 +3354,9 @@ bool FlyFusionBackend::IsSupported(const HloInstruction& instr) {
   if (flydsl::IsFlyXTileRowReductionFusion(analysis)) {
     return true;
   }
+  if (flydsl::IsFlyXTileOverwriteRowScatterFusion(analysis)) {
+    return true;
+  }
   if (flydsl::IsFlyXTileElementwiseFusion(analysis)) {
     // Input fusions are already owned by XLA's native reduction emitter; they
     // are not Triton fusions that strict replacement needs to cover. Keep the
