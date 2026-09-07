@@ -53,6 +53,7 @@ class HloFusionAnalysis {
     kCuDnn,
     kSort,
     kTileIr,
+    kFp8BlockGemvCuda,
   };
 
   // Precomputed information about inputs (arguments) and outputs (roots) of the

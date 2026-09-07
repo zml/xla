@@ -34,11 +34,15 @@ namespace gpu {
 
 class Fp8BlockGemvBackend : public GpuCodegenBackend {
  public:
+  enum class Rung { kTriton, kTileIr, kCuda };
+
   explicit Fp8BlockGemvBackend(const DebugOptions* debug_options,
                                Compiler* compiler,
-                               const Compiler::GpuTargetConfig* target_config)
-      : GpuCodegenBackend(autotuner::Backend::FP8_BLOCK_GEMV, debug_options,
-                          compiler, target_config) {}
+                               const Compiler::GpuTargetConfig* target_config,
+                               Rung rung = Rung::kTriton)
+      : GpuCodegenBackend(BackendFor(rung), debug_options, compiler,
+                          target_config),
+        rung_(rung) {}
 
   absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
   GetSupportedConfigs(const HloInstruction& instr) override;
@@ -51,7 +55,34 @@ class Fp8BlockGemvBackend : public GpuCodegenBackend {
 
   bool IsSupported(const HloInstruction& instr) override;
 
-  std::string version() const override { return "1"; }
+  bool CanProduceWrongResults() const override {
+    return rung_ == Rung::kCuda;
+  }
+
+  std::string version() const override {
+    switch (rung_) {
+      case Rung::kTriton:
+        return "1";
+      case Rung::kTileIr:
+        return "tile_ir_13.3";
+      case Rung::kCuda:
+        return "cuda_1";
+    }
+  }
+
+ private:
+  static autotuner::Backend BackendFor(Rung rung) {
+    switch (rung) {
+      case Rung::kTriton:
+        return autotuner::Backend::FP8_BLOCK_GEMV;
+      case Rung::kTileIr:
+        return autotuner::Backend::FP8_BLOCK_GEMV_TILE_IR;
+      case Rung::kCuda:
+        return autotuner::Backend::FP8_BLOCK_GEMV_CUDA;
+    }
+  }
+
+  Rung rung_;
 };
 
 }  // namespace gpu

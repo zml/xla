@@ -126,6 +126,7 @@ class KernelConverter {
   mlir::LogicalResult ConvertDotScaled(::xla::xtile::DotScaledOp op);
   mlir::LogicalResult ConvertFor(mlir::scf::ForOp op);
   mlir::LogicalResult ConvertConstant(ma::ConstantOp op);
+  mlir::LogicalResult ConvertReduce(mlir::stablehlo::ReduceOp op);
 
   absl::StatusOr<Value> GetPartitionView(Value buffer,
                                          llvm::ArrayRef<int64_t> tile_shape);
@@ -453,6 +454,68 @@ mlir::LogicalResult KernelConverter::ConvertConstant(ma::ConstantOp op) {
   return op.emitOpError("only splat and scalar constants are supported");
 }
 
+mlir::LogicalResult KernelConverter::ConvertReduce(
+    mlir::stablehlo::ReduceOp op) {
+  if (op.getInputs().size() != 1 || op.getDimensions().size() != 1) {
+    return op.emitOpError(
+        "only single-operand, single-dimension reductions are supported");
+  }
+  mlir::Type result = ConvertType(op.getResult(0).getType());
+  if (!result) return op.emitOpError("unsupported reduce result type");
+  mlir::Type element = mlir::cast<ct::TileType>(result).getElementType();
+  if (!mlir::isa<mlir::FloatType>(element)) {
+    return op.emitOpError("only float reductions are supported");
+  }
+
+  mlir::Attribute identity;
+  if (auto init = op.getInitValues()[0].getDefiningOp<ma::ConstantOp>()) {
+    if (auto splat = mlir::dyn_cast<mlir::SplatElementsAttr>(init.getValue())) {
+      identity = splat.getSplatValue<mlir::Attribute>();
+    } else if (!mlir::isa<mlir::ElementsAttr>(init.getValue())) {
+      identity = init.getValue();
+    }
+  }
+  if (!identity) return op.emitOpError("reduce init value is not a constant");
+
+  mlir::Block& body = op.getBody().front();
+  if (!llvm::hasSingleElement(body.without_terminator())) {
+    return op.emitOpError("reduce body must be a single combiner op");
+  }
+  mlir::Operation& combiner = *body.begin();
+
+  auto reduce = ct::ReduceOp::create(
+      b_, mlir::TypeRange{result},
+      mlir::ValueRange{map_.lookup(op.getInputs()[0])},
+      static_cast<uint32_t>(op.getDimensions()[0]),
+      b_.getArrayAttr({identity}));
+
+  auto scalar = ct::TileType::get({}, element);
+  mlir::OpBuilder::InsertionGuard guard(b_);
+  mlir::Block* block =
+      b_.createBlock(&reduce.getBody(), {}, {scalar, scalar},
+                     {b_.getLoc(), b_.getLoc()});
+  Value lhs = block->getArgument(0);
+  Value rhs = block->getArgument(1);
+  Value combined;
+  if (mlir::isa<mlir::stablehlo::AddOp>(combiner)) {
+    combined = ct::AddFOp::create(b_, lhs, rhs, ct::RoundingMode::NEAREST_EVEN);
+  } else if (mlir::isa<mlir::stablehlo::MulOp>(combiner)) {
+    combined = ct::MulFOp::create(b_, lhs, rhs, ct::RoundingMode::NEAREST_EVEN);
+  } else if (mlir::isa<mlir::stablehlo::MaxOp>(combiner)) {
+    combined = ct::MaxFOp::create(b_, lhs, rhs, /*propagate_nan=*/true,
+                                  /*flush_to_zero=*/false);
+  } else if (mlir::isa<mlir::stablehlo::MinOp>(combiner)) {
+    combined = ct::MinFOp::create(b_, lhs, rhs, /*propagate_nan=*/true,
+                                  /*flush_to_zero=*/false);
+  } else {
+    return combiner.emitOpError("unsupported reduce combiner");
+  }
+  ct::YieldOp::create(b_, combined);
+
+  map_.map(op.getResult(0), reduce.getResult(0));
+  return success();
+}
+
 mlir::LogicalResult KernelConverter::ConvertOp(mlir::Operation* op) {
   if (auto extract = mlir::dyn_cast<::xla::xtile::ExtractTileOp>(op)) {
     return ConvertExtract(extract);
@@ -470,6 +533,17 @@ mlir::LogicalResult KernelConverter::ConvertOp(mlir::Operation* op) {
     return ConvertConstant(constant);
   }
   if (mlir::isa<ma::AddFOp>(op) && map_.contains(op->getResult(0))) {
+    return success();
+  }
+  if (auto reduce = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+    return ConvertReduce(reduce);
+  }
+  if (auto reshape = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(op)) {
+    mlir::Type result = ConvertType(reshape.getType());
+    if (!result) return op->emitOpError("unsupported reshape result type");
+    map_.map(op->getResult(0),
+             ct::ReshapeOp::create(b_, result,
+                                   map_.lookup(reshape.getOperand())));
     return success();
   }
   if (auto broadcast = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(op)) {
@@ -668,7 +742,7 @@ class XTileLowerToCudaTilePass
 bool IsLowerableToCudaTile(mlir::Operation* module) {
   int64_t num_dots = 0;
   module->walk([&](::xla::xtile::DotScaledOp) { ++num_dots; });
-  if (num_dots != 1) return false;
+  if (num_dots > 1) return false;
 
   bool lowerable = true;
   module->walk([&](::xla::xtile::DotScaledOp dot) {
@@ -715,7 +789,8 @@ bool IsLowerableToCudaTile(mlir::Operation* module) {
                   mlir::stablehlo::ConvertOp, mlir::stablehlo::MulOp,
                   mlir::stablehlo::AddOp, mlir::stablehlo::SubtractOp,
                   mlir::stablehlo::DivOp, mlir::stablehlo::MaxOp,
-                  mlir::stablehlo::MinOp>(op)) {
+                  mlir::stablehlo::MinOp, mlir::stablehlo::ReshapeOp,
+                  mlir::stablehlo::ReduceOp, mlir::stablehlo::ReturnOp>(op)) {
       return mlir::WalkResult::advance();
     }
     if (mlir::isa<mlir::stablehlo::TransposeOp>(op)) {

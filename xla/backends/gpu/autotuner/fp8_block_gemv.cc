@@ -32,6 +32,7 @@ limitations under the License.
 #include "xla/backends/autotuner/backend_config.pb.h"
 #include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/backends/gpu/codegen/kernels/fp8_block_gemv_kernel.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -48,14 +49,41 @@ namespace {
 
 constexpr int64_t kScaleBlock = 128;
 
-std::unique_ptr<BackendConfig> Pack(int64_t block_m, int64_t block_n,
+Fp8BlockGemvFusionConfig* SlotFor(Fp8BlockGemvBackend::Rung rung,
+                            BackendConfig& config) {
+  switch (rung) {
+    case Fp8BlockGemvBackend::Rung::kTriton:
+      return config.mutable_fp8_block_gemv();
+    case Fp8BlockGemvBackend::Rung::kTileIr:
+      return config.mutable_fp8_block_gemv_tile_ir();
+    case Fp8BlockGemvBackend::Rung::kCuda:
+      return config.mutable_fp8_block_gemv_cuda();
+  }
+}
+
+const Fp8BlockGemvFusionConfig* ConstSlotFor(Fp8BlockGemvBackend::Rung rung,
+                                       const BackendConfig& config) {
+  switch (rung) {
+    case Fp8BlockGemvBackend::Rung::kTriton:
+      return config.has_fp8_block_gemv() ? &config.fp8_block_gemv() : nullptr;
+    case Fp8BlockGemvBackend::Rung::kTileIr:
+      return config.has_fp8_block_gemv_tile_ir()
+                 ? &config.fp8_block_gemv_tile_ir()
+                 : nullptr;
+    case Fp8BlockGemvBackend::Rung::kCuda:
+      return config.has_fp8_block_gemv_cuda() ? &config.fp8_block_gemv_cuda()
+                                              : nullptr;
+  }
+}
+
+std::unique_ptr<BackendConfig> Pack(Fp8BlockGemvBackend::Rung rung,
+                                    int64_t block_m, int64_t block_n,
                                     int64_t block_k, int num_warps,
                                     int num_stages, bool tma = false,
                                     bool warp_specialization = false) {
   auto config = std::make_unique<BackendConfig>();
-  Fp8BlockGemvFusionConfig& fp8 = *config->mutable_fp8_block_gemv();
-  xla::xtile::BlockLevelFusionConfig& block =
-      *fp8.mutable_block_level_fusion_config();
+  Fp8BlockGemvFusionConfig& fp8 = *SlotFor(rung, *config);
+  xla::xtile::BlockLevelFusionConfig& block = *fp8.mutable_block_level_fusion_config();
   xla::xtile::Tile& tile = *block.add_output_tiles();
   tile.add_sizes(block_m);
   tile.add_sizes(block_n);
@@ -74,11 +102,19 @@ bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) return false;
   auto gpu_config = instr.backend_config<GpuBackendConfig>();
   if (!gpu_config.ok()) return false;
-  if (gpu_config->fusion_backend_config().kind() !=
-      kTritonNestedGemmFusionKind) {
+  absl::string_view kind = gpu_config->fusion_backend_config().kind();
+  if (kind != kTritonNestedGemmFusionKind && kind != kTileIrFusionKind &&
+      kind != kFp8BlockGemvCudaFusionKind) {
     return false;
   }
-  return MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr)).has_value();
+  if (rung_ == Rung::kTileIr &&
+      !debug_options().xla_gpu_experimental_scaled_dot_with_tile_ir()) {
+    return false;
+  }
+  std::optional<Fp8BlockGemvSpec> spec =
+      MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+  if (!spec.has_value()) return false;
+  return true;
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -95,6 +131,31 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const bool is_prefill = batch > 16;
   const int64_t min_block_k = single_row ? kScaleBlock : 2 * kScaleBlock;
   const int max_warps = single_row ? 16 : 8;
+  const bool tile_ir = rung_ == Rung::kTileIr;
+  if (tile_ir && (is_prefill || spec->w8a8)) return configs;
+
+  if (rung_ == Rung::kCuda) {
+    if (!single_row || k % 16 != 0 || spec->w8a8 ||
+        spec->weight_scale_type != BF16) {
+      return configs;
+    }
+    for (int num_warps : {2, 4, 8, 16}) {
+      for (int rows_per_warp : {2, 4}) {
+        const int64_t rows_per_block = num_warps * rows_per_warp;
+        if (kScaleBlock % rows_per_block != 0) continue;
+        if (n % rows_per_block != 0) continue;
+        for (int unroll : {4, 8}) {
+          if (!kernel::IsSupportedFp8BlockGemvKernelConfig(
+                  {num_warps, rows_per_warp, unroll})) {
+            continue;
+          }
+          configs.push_back(Pack(rung_, batch, rows_per_block, kScaleBlock,
+                                 num_warps, unroll));  // batch == 1 here
+        }
+      }
+    }
+    return configs;
+  }
 
   llvm::SmallVector<int64_t, 5> block_ms;
   if (single_row) {
@@ -136,15 +197,20 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
       for (int64_t block_k = is_prefill ? min_prefill_block_k : min_block_k;
            block_k <= max_block_k; block_k *= 2) {
         if (k % block_k != 0) continue;
+        if (tile_ir) {
+          configs.push_back(Pack(rung_, block_m, block_n, block_k,
+                                 /*num_warps=*/4, /*num_stages=*/1));
+          continue;
+        }
         for (int num_warps = is_prefill ? 4 : 2; num_warps <= max_warps;
              num_warps *= 2) {
           for (int num_stages = 2; num_stages <= 6; ++num_stages) {
             if (!fits(block_m, block_n, block_k, num_stages)) break;
-            configs.push_back(
-                Pack(block_m, block_n, block_k, num_warps, num_stages));
+            configs.push_back(Pack(rung_, block_m, block_n, block_k, num_warps,
+                                   num_stages));
             if (is_prefill && block_m >= 128) {
-              configs.push_back(Pack(block_m, block_n, block_k, num_warps,
-                                     num_stages, /*tma=*/true));
+              configs.push_back(Pack(rung_, block_m, block_n, block_k,
+                                     num_warps, num_stages, /*tma=*/true));
             }
           }
         }
@@ -185,20 +251,43 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
         " and the emitter would not choose one"));
   }
   auto config = std::make_unique<BackendConfig>();
-  Fp8BlockGemvFusionConfig& fp8 = *config->mutable_fp8_block_gemv();
+  Fp8BlockGemvFusionConfig& fp8 = *SlotFor(rung_, *config);
   *fp8.mutable_block_level_fusion_config() =
       gpu_config.fusion_backend_config().block_level_fusion_config();
   fp8.set_contracting_tile_size(block_k);
+
+  if (rung_ == Rung::kCuda) {
+    xla::xtile::BlockLevelFusionConfig& block = *fp8.mutable_block_level_fusion_config();
+    const int64_t rows = block.output_tiles_size() > 0 &&
+                                 block.output_tiles(0).sizes_size() > 1
+                             ? block.output_tiles(0).sizes(1)
+                             : 0;
+    const int warps = block.num_warps();
+    const bool ok =
+        warps > 0 && rows > 0 && rows % warps == 0 &&
+        kernel::IsSupportedFp8BlockGemvKernelConfig(
+            {warps, static_cast<int>(rows / warps), block.num_stages()});
+    if (!ok) {
+      block.clear_output_tiles();
+      xla::xtile::Tile& tile = *block.add_output_tiles();
+      tile.add_sizes(1);
+      tile.add_sizes(16);
+      block.set_num_warps(8);
+      block.set_num_stages(8);
+    }
+  }
   return config;
 }
 
 absl::Status Fp8BlockGemvBackend::ApplyConfig(HloInstruction& instr,
                                               const BackendConfig& config) {
-  if (!config.has_fp8_block_gemv()) {
+  const bool tile_ir = rung_ == Rung::kTileIr;
+  const Fp8BlockGemvFusionConfig* slot = ConstSlotFor(rung_, config);
+  if (slot == nullptr) {
     return absl::InvalidArgumentError(
         "Expected an fp8_block_gemv config for Fp8BlockGemvBackend.");
   }
-  const Fp8BlockGemvFusionConfig& fp8 = config.fp8_block_gemv();
+  const Fp8BlockGemvFusionConfig& fp8 = *slot;
   const int64_t block_k = fp8.contracting_tile_size();
   if (block_k <= 0 || block_k % kScaleBlock != 0) {
     return absl::InvalidArgumentError(
@@ -222,7 +311,10 @@ absl::Status Fp8BlockGemvBackend::ApplyConfig(HloInstruction& instr,
                    instr.backend_config<GpuBackendConfig>());
   FusionBackendConfig& backend_config =
       *gpu_config.mutable_fusion_backend_config();
-  backend_config.set_kind(std::string(kTritonNestedGemmFusionKind));
+  backend_config.set_kind(std::string(
+      rung_ == Rung::kCuda
+          ? kFp8BlockGemvCudaFusionKind
+          : (tile_ir ? kTileIrFusionKind : kTritonNestedGemmFusionKind)));
   backend_config.clear_triton_gemm_config();
   *backend_config.mutable_block_level_fusion_config() =
       fp8.block_level_fusion_config();

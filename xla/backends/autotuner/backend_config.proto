@@ -39,6 +39,8 @@ message BackendConfig {
     // 900+ keeps clear of upstream's ids.
     xla.gpu.TileIrFusionConfig tile_ir = 900;
     xla.gpu.Fp8BlockGemvFusionConfig fp8_block_gemv = 901;
+    xla.gpu.Fp8BlockGemvFusionConfig fp8_block_gemv_tile_ir = 902;
+    xla.gpu.Fp8BlockGemvFusionConfig fp8_block_gemv_cuda = 903;
     xla.gpu.TileIrFusionConfig nvfp4_decode_dot = 904;
   }
 }

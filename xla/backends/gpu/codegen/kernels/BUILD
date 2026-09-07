@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/tests:build_defs.bzl", "xla_test")
@@ -82,6 +83,27 @@ xla_cc_test(
 #===--------------------------------------------------------------------------------------------===#
 # PTX Custom Kernels
 #===--------------------------------------------------------------------------------------------===#
+
+cuda_library(
+    name = "fp8_block_gemv_kernel",
+    srcs = ["fp8_block_gemv_kernel.cu.cc"],
+    hdrs = ["fp8_block_gemv_kernel.h"],
+    tags = [
+        "cuda-only",
+        "gpu",
+    ],
+    visibility = [":friends"],
+    deps = [
+        ":custom_kernel",
+        "//xla:util",
+        "//xla/stream_executor:kernel_args_packing_spec",
+        "//xla/stream_executor:kernel_spec",
+        "//xla/stream_executor:launch_dim",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
 
 cc_library(
     name = "ptx_custom_kernel",

@@ -1360,6 +1360,7 @@ HloInstruction::FusionKind PriorityFusion::ChooseKind(
     case HloFusionAnalysis::EmitterFusionKind::kCuDnn:
     case HloFusionAnalysis::EmitterFusionKind::kSort:
     case HloFusionAnalysis::EmitterFusionKind::kTileIr:
+    case HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemvCuda:
       return HloInstruction::FusionKind::kCustom;
     case HloFusionAnalysis::EmitterFusionKind::kConcatenate:
     case HloFusionAnalysis::EmitterFusionKind::kReduction:
