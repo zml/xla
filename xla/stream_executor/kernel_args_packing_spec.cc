@@ -58,7 +58,7 @@ absl::StatusOr<KernelArgPackingRelocation::Kind> FromProtoKind(
 }  // namespace
 
 absl::StatusOr<std::vector<char>> KernelArgPackingSpec::BuildArgument(
-    absl::Span<const std::unique_ptr<PackedArgBase>> args) const {
+    absl::Span<const PackedArgBase* const> args) const {
   if (relocation_.has_value()) {
     CHECK(constant_.empty());
     switch (relocation_->kind()) {
@@ -92,7 +92,7 @@ KernelArgPackingSpec KernelArgPackingSpec::BuildArgRelocation(
 
 absl::StatusOr<std::unique_ptr<KernelArgsPackedVector>>
 KernelArgsPackingSpec::BuildArguments(
-    absl::Span<const std::unique_ptr<PackedArgBase>> args,
+    absl::Span<const PackedArgBase* const> args,
     size_t shared_memory_bytes) const {
   std::vector<std::vector<char>> result;
   result.reserve(kernel_arguments_.size());
