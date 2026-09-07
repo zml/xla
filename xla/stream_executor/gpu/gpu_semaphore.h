@@ -38,6 +38,12 @@ class GpuSemaphore {
   // `executor`.
   static absl::StatusOr<GpuSemaphore> Create(StreamExecutor* executor);
 
+  // Creates a valid semaphore backed by `allocation`, which must be at least
+  // `sizeof(GpuSemaphoreState)` bytes of host memory that is directly
+  // accessible by the device at the same virtual address, and that the device
+  // can both read and write while a kernel is running.
+  static GpuSemaphore Create(std::unique_ptr<MemoryAllocation> allocation);
+
   // Returns true if this semaphore is valid, otherwise false.
   explicit operator bool() const { return bool{ptr_}; }
 
