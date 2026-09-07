@@ -2824,6 +2824,55 @@ GpuClientOptions VmmClientOptions() {
   return options;
 }
 
+TEST_F(VmmTest, PinnedHostStridedTransfer) {
+  ASSERT_OK_AND_ASSIGN(auto client,
+                       GetStreamExecutorGpuClient(VmmClientOptions()));
+  auto* se_client = absl::down_cast<PjRtStreamExecutorClient*>(client.get());
+  auto* device = client->addressable_devices()[0];
+  ASSERT_OK_AND_ASSIGN(
+      auto* host_space,
+      device->memory_space_by_kind(PinnedHostMemorySpace::kKind));
+  ASSERT_OK_AND_ASSIGN(auto* device_space, device->default_memory_space());
+  auto* executor = absl::down_cast<PjRtStreamExecutorDevice*>(device)
+                       ->local_device_state()->executor();
+
+  // Check the physical memory kind before any host write, so a device-only
+  // allocation fails this assertion instead of crashing in the transpose.
+  {
+    ASSERT_OK_AND_ASSIGN(
+        auto raw, se_client->raw_client()->AllocateRawBuffer(
+                      host_space, 1024, /*retry_on_oom=*/false, {}));
+    ASSERT_OK_AND_ASSIGN(auto kind,
+                         executor->GetPointerMemorySpace(raw->GetHostPointer()));
+    ASSERT_EQ(kind, se::MemorySpace::kHost);
+  }
+
+  const std::vector<int32_t> data{1, 4, 2, 5, 3, 6};
+  const std::vector<int64_t> dims{2, 3};
+  const std::vector<int64_t> strides{sizeof(int32_t), 2 * sizeof(int32_t)};
+  Literal expected = LiteralUtil::CreateR2<int32_t>({{1, 2, 3}, {4, 5, 6}});
+  for (auto semantics : {
+           PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+           PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes}) {
+    SCOPED_TRACE(static_cast<int>(semantics));
+    ASSERT_OK_AND_ASSIGN(
+        auto host_buffer,
+        client->BufferFromHostBuffer(data.data(), S32, dims, strides, semantics,
+                                     /*on_done_with_host_buffer=*/nullptr,
+                                     host_space, /*device_layout=*/nullptr));
+    ASSERT_OK_AND_ASSIGN(auto host_literal, host_buffer->ToLiteral().Await());
+    EXPECT_TRUE(LiteralTestUtil::Equal(expected, *host_literal));
+    ASSERT_OK_AND_ASSIGN(auto device_buffer,
+                         host_buffer->CopyToMemorySpace(device_space));
+    ASSERT_OK_AND_ASSIGN(auto device_literal, device_buffer->ToLiteral().Await());
+    EXPECT_TRUE(LiteralTestUtil::Equal(expected, *device_literal));
+    ASSERT_OK_AND_ASSIGN(auto round_trip,
+                         device_buffer->CopyToMemorySpace(host_space));
+    ASSERT_OK_AND_ASSIGN(auto round_trip_literal, round_trip->ToLiteral().Await());
+    EXPECT_TRUE(LiteralTestUtil::Equal(expected, *round_trip_literal));
+  }
+}
+
 CompileOptions SkipTempCommandBufferOptions() {
   CompileOptions options;
   auto* debug_options =
@@ -2837,6 +2886,34 @@ CompileOptions SkipTempCommandBufferOptions() {
   debug_options->set_xla_gpu_gemm_rewrite_size_threshold(0);
   debug_options->set_xla_gpu_enable_triton_gemm(false);
   return options;
+}
+
+TEST_F(VmmTest, PinnedHostOutputWithSkipTemp) {
+  ASSERT_OK_AND_ASSIGN(auto client,
+                       GetStreamExecutorGpuClient(VmmClientOptions()));
+  auto* device = client->addressable_devices()[0];
+  auto* executor = absl::down_cast<PjRtStreamExecutorDevice*>(device)
+                       ->local_device_state()->executor();
+  ASSERT_OK_AND_ASSIGN(auto input, CreateDeviceBufferForTest(client.get()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executable,
+      CompileExecutable(kD2HProgram, *client, SkipTempCommandBufferOptions()));
+  for (int run = 0; run < 3; ++run) {
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         executable->Execute({{input.get()}}, ExecuteOptions()));
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), 1);
+    auto& output = result[0][0];
+    ASSERT_OK(output->GetReadyFuture().Await());
+    EXPECT_EQ(output->memory_space()->kind(), PinnedHostMemorySpace::kKind);
+    ASSERT_OK_AND_ASSIGN(auto ref, output->AcquireExternalReference());
+    ASSERT_OK_AND_ASSIGN(auto kind, executor->GetPointerMemorySpace(
+                                       ref->OpaqueDeviceMemoryDataPointer()));
+    ASSERT_EQ(kind, se::MemorySpace::kHost);
+    ASSERT_OK_AND_ASSIGN(auto literal, output->ToLiteral().Await());
+    EXPECT_TRUE(LiteralTestUtil::Equal(
+        LiteralUtil::CreateR1<int32_t>({1, 2, 3, 4}), *literal));
+  }
 }
 
 CompileOptions SkipProfiledCommandBufferOptions() {

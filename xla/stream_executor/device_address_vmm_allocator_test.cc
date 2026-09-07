@@ -19,6 +19,8 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -29,6 +31,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_reservation.h"
+#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/mock_platform.h"
 #include "xla/stream_executor/mock_stream.h"
 #include "xla/stream_executor/mock_stream_executor.h"
@@ -50,8 +53,15 @@ uint64_t RoundUpTestSize(uint64_t size) {
 
 class TestMemoryAllocation final : public MemoryAllocation {
  public:
-  explicit TestMemoryAllocation(uint64_t size)
-      : storage_(std::make_unique<uint8_t[]>(size)), size_(size) {}
+  explicit TestMemoryAllocation(uint64_t size,
+                                std::function<void()> on_destroy = nullptr)
+      : storage_(std::make_unique<uint8_t[]>(size)),
+        size_(size),
+        on_destroy_(std::move(on_destroy)) {}
+
+  ~TestMemoryAllocation() override {
+    if (on_destroy_) on_destroy_();
+  }
 
   DeviceAddressBase address() const override {
     return DeviceAddressBase(storage_.get(), size_);
@@ -60,6 +70,7 @@ class TestMemoryAllocation final : public MemoryAllocation {
  private:
   std::unique_ptr<uint8_t[]> storage_;
   uint64_t size_;
+  std::function<void()> on_destroy_;
 };
 
 class TestMemoryReservation final : public MemoryReservation {
@@ -121,6 +132,17 @@ class TestDeviceAddressVmmAllocator final : public DeviceAddressVmmAllocator {
 
   int allocation_count() const { return allocation_count_; }
 
+  void set_defer_timeline_writes(bool defer) {
+    defer_timeline_writes_ = defer;
+  }
+
+  void CompleteTimelineWrites() {
+    for (const auto& [timeline, seqno] : pending_timeline_writes_) {
+      __atomic_store_n(timeline, seqno, __ATOMIC_RELEASE);
+    }
+    pending_timeline_writes_.clear();
+  }
+
  protected:
   absl::Status InitializeDeviceState(PerDeviceState& state) override {
     state.allocation_granularity = kGranularity;
@@ -152,6 +174,10 @@ class TestDeviceAddressVmmAllocator final : public DeviceAddressVmmAllocator {
 
   absl::Status EnqueueDeferredDeallocation(PerDeviceState& state,
                                            uint64_t seqno) override {
+    if (defer_timeline_writes_) {
+      pending_timeline_writes_.emplace_back(state.pinned_timeline, seqno);
+      return absl::OkStatus();
+    }
     __atomic_store_n(state.pinned_timeline, seqno, __ATOMIC_RELEASE);
     return absl::OkStatus();
   }
@@ -167,6 +193,9 @@ class TestDeviceAddressVmmAllocator final : public DeviceAddressVmmAllocator {
   uint64_t physical_size_padding_;
   std::function<void(int)> on_device_destroy_;
   int allocation_count_ = 0;
+  bool defer_timeline_writes_ = false;
+  std::vector<std::pair<volatile uint64_t*, uint64_t>>
+      pending_timeline_writes_;
 };
 
 class DeviceAddressVmmAllocatorTest : public ::testing::Test {
@@ -256,6 +285,68 @@ TEST_F(DeviceAddressVmmAllocatorTest,
 
   allocator.reset();
   EXPECT_EQ(destroyed_devices, 2);
+}
+
+TEST_F(DeviceAddressVmmAllocatorTest,
+       HostAllocationUsesExecutorAndHasStreamOrderedLifetime) {
+  bool host_allocation_destroyed = false;
+  EXPECT_CALL(executor_, HostMemoryAllocate(kGranularity))
+      .WillOnce([&](uint64_t size)
+                    -> absl::StatusOr<std::unique_ptr<MemoryAllocation>> {
+        return std::make_unique<TestMemoryAllocation>(
+            size, [&] { host_allocation_destroyed = true; });
+      });
+  ASSERT_OK_AND_ASSIGN(auto allocator, TestDeviceAddressVmmAllocator::Create(
+                                           &platform_, {Config(/*pa_budget=*/0)}));
+  allocator->set_defer_timeline_writes(true);
+
+  ASSERT_OK_AND_ASSIGN(
+      auto host_address,
+      allocator->Allocate(
+          /*device_ordinal=*/0, kGranularity,
+          /*retry_on_failure=*/false,
+          /*memory_space=*/static_cast<int64_t>(MemorySpace::kHost)));
+  EXPECT_EQ(allocator->allocation_count(), 0);
+  auto* bytes = static_cast<uint8_t*>(host_address->opaque());
+  bytes[0] = 7;
+  EXPECT_EQ(bytes[0], 7);
+
+  DeviceAddressBase wrong_size(host_address->opaque(), kGranularity / 2);
+  EXPECT_THAT(allocator->Deallocate(/*device_ordinal=*/0, wrong_size),
+              StatusIs(absl::StatusCode::kNotFound));
+  ASSERT_THAT(
+      allocator->Deallocate(/*device_ordinal=*/0, host_address.Release()),
+      absl_testing::IsOk());
+  EXPECT_FALSE(host_allocation_destroyed);
+
+  allocator->CompleteTimelineWrites();
+  ASSERT_THAT(allocator->SynchronizePendingOperations(/*device_ordinal=*/0),
+              absl_testing::IsOk());
+  EXPECT_TRUE(host_allocation_destroyed);
+}
+
+TEST_F(DeviceAddressVmmAllocatorTest,
+       HostAllocationRejectsMappedAllocationAndPropagatesFailure) {
+  EXPECT_CALL(executor_, HostMemoryAllocate(kGranularity))
+      .WillOnce(Return(absl::ResourceExhaustedError("host allocation failed")));
+  ASSERT_OK_AND_ASSIGN(auto allocator, TestDeviceAddressVmmAllocator::Create(
+                                           &platform_, {Config(UINT64_MAX)}));
+
+  EXPECT_THAT(allocator->Allocate(
+                  /*device_ordinal=*/0, kGranularity,
+                  /*retry_on_failure=*/false,
+                  /*memory_space=*/static_cast<int64_t>(MemorySpace::kHost)),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+
+  auto reservation = std::make_unique<TestMemoryReservation>(kGranularity);
+  EXPECT_THAT(
+      allocator->Allocate(
+          /*device_ordinal=*/0, /*allocation_size=*/kGranularity,
+          /*retry_on_failure=*/false,
+          /*memory_space=*/static_cast<int64_t>(MemorySpace::kHost),
+          reservation.get(), /*reservation_offset=*/0,
+          /*mapping_size=*/kGranularity),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(DeviceAddressVmmAllocatorTest, RetryFlagDoesNotDisablePendingReclaim) {

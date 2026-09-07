@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/memory_allocation.h"
 #include "xla/stream_executor/memory_reservation.h"
+#include "xla/stream_executor/memory_space.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -270,6 +271,8 @@ DeviceAddressVmmAllocator::~DeviceAddressVmmAllocator() {
         state->pending_deallocations.pop_front();
         CompletePendingDeallocation(*state, pending);
       }
+      state->pending_host_deallocations.clear();
+      state->host_allocations.clear();
     }
 
     // Free platform-specific per-device resources (e.g. pinned timeline).
@@ -337,7 +340,22 @@ absl::Status DeviceAddressVmmAllocator::SynchronizePendingOperations(
     int device_ordinal) {
   ABSL_ASSIGN_OR_RETURN(auto state, GetPerDeviceState(device_ordinal));
   absl::MutexLock lock(state->mu);
-  return DrainPendingDeallocations(*state);
+  ABSL_RETURN_IF_ERROR(DrainPendingDeallocations(*state));
+  if (!state->pending_host_deallocations.empty()) {
+    ABSL_RETURN_IF_ERROR(WaitUntilSeqno(
+        *state, state->pending_host_deallocations.back().seqno));
+    CompleteReadyHostDeallocations(*state);
+  }
+  return absl::OkStatus();
+}
+
+void DeviceAddressVmmAllocator::CompleteReadyHostDeallocations(
+    PerDeviceState& state) {
+  uint64_t completed_seqno = LoadTimeline(state.pinned_timeline);
+  while (!state.pending_host_deallocations.empty() &&
+         state.pending_host_deallocations.front().seqno <= completed_seqno) {
+    state.pending_host_deallocations.pop_front();
+  }
 }
 
 absl::StatusOr<StreamExecutor*> DeviceAddressVmmAllocator::GetStreamExecutor(
@@ -718,6 +736,14 @@ DeviceAddressVmmAllocator::Allocate(int device_ordinal, uint64_t size,
   const bool multi_device = CurrentMultiDevice();
 
   absl::MutexLock lock(state->mu);
+  if (memory_space == static_cast<int64_t>(MemorySpace::kHost)) {
+    CompleteReadyHostDeallocations(*state);
+    ABSL_ASSIGN_OR_RETURN(auto allocation,
+                          state->executor->HostMemoryAllocate(size));
+    DeviceAddressBase address = allocation->address();
+    state->host_allocations.emplace(address.opaque(), std::move(allocation));
+    return ScopedDeviceAddress<uint8_t>(address, device_ordinal, this);
+  }
   // Clang cannot propagate TryWithPendingReclaim's state.mu lock requirement
   // into its callbacks. AssertHeld makes that invariant explicit within each
   // independently analyzed lambda.
@@ -813,6 +839,10 @@ DeviceAddressVmmAllocator::Allocate(
                                         this);
   }
 
+  if (memory_space == static_cast<int64_t>(MemorySpace::kHost)) {
+    return absl::InvalidArgumentError(
+        "Pinned host memory cannot be allocated into a device VMM reservation");
+  }
   ABSL_ASSIGN_OR_RETURN(auto state, GetPerDeviceState(device_ordinal));
   const bool multi_device = CurrentMultiDevice();
 
@@ -866,6 +896,24 @@ absl::Status DeviceAddressVmmAllocator::Deallocate(int device_ordinal,
   ABSL_ASSIGN_OR_RETURN(auto state, GetPerDeviceState(device_ordinal));
 
   absl::MutexLock lock(state->mu);
+
+  auto host_it = state->host_allocations.find(mem.opaque());
+  if (host_it != state->host_allocations.end()) {
+    if (!host_it->second->address().IsSameAs(mem)) {
+      return absl::NotFoundError("Pinned host allocation size does not match");
+    }
+    // Flush an older open device batch before publishing a newer timeline
+    // value. Host allocations have no VMM reuse, so publish their marker now
+    // and retire them after it completes, without waiting on the host thread.
+    ABSL_RETURN_IF_ERROR(FlushOpenDeallocationBatch(*state));
+    uint64_t seqno = state->next_seqno++;
+    ABSL_RETURN_IF_ERROR(EnqueueDeferredDeallocation(*state, seqno));
+    state->pending_host_deallocations.push_back(
+        PendingHostDeallocation{seqno, std::move(host_it->second)});
+    state->host_allocations.erase(host_it);
+    CompleteReadyHostDeallocations(*state);
+    return absl::OkStatus();
+  }
 
   auto record_it = state->records_by_allocator_address.find(mem.opaque());
   if (record_it == state->records_by_allocator_address.end() ||

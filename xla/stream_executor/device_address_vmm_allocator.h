@@ -170,6 +170,9 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
 
   ~DeviceAddressVmmAllocator() override;
 
+  // Host-memory requests use StreamExecutor::HostMemoryAllocate instead of
+  // device VMM. These addresses support stream-ordered Deallocate, but cannot
+  // be remapped with Map() or the mapped Allocate overload.
   absl::StatusOr<ScopedDeviceAddress<uint8_t>> Allocate(
       int device_ordinal, uint64_t size, bool retry_on_failure,
       int64_t memory_space) override;
@@ -418,6 +421,11 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
     DeviceAddressBase addr;
   };
 
+  struct PendingHostDeallocation {
+    uint64_t seqno;
+    std::unique_ptr<MemoryAllocation> allocation;
+  };
+
   struct PerDeviceState {
     StreamExecutor* executor;
     Stream* stream;
@@ -445,6 +453,12 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
     std::function<void()> destroy_fn;
 
     mutable absl::Mutex mu;
+    // Pinned-host addresses cannot be backed by device VMM mappings. Keep
+    // their ownership separate from device physical-memory budget and reuse.
+    absl::flat_hash_map<void*, std::unique_ptr<MemoryAllocation>>
+        host_allocations ABSL_GUARDED_BY(mu);
+    std::deque<PendingHostDeallocation> pending_host_deallocations
+        ABSL_GUARDED_BY(mu);
     uint64_t pa_allocated ABSL_GUARDED_BY(mu) = 0;
     uint64_t peak_pa_allocated ABSL_GUARDED_BY(mu) = 0;
     uint64_t num_allocs ABSL_GUARDED_BY(mu) = 0;
@@ -687,6 +701,9 @@ class DeviceAddressVmmAllocator : public DeviceAddressAllocator {
   // the last pending sequence number, and completes every pending entry up to
   // it. Shared by SynchronizePendingOperations() and, transitively,
   // SynchronizeAllPendingOperations().
+  void CompleteReadyHostDeallocations(PerDeviceState& state)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(state.mu);
+
   absl::Status DrainPendingDeallocations(PerDeviceState& state)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(state.mu);
 
