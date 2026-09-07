@@ -1,0 +1,235 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "xla/backends/gpu/autotuner/fp8_block_gemv.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "llvm/ADT/SmallVector.h"
+#include "xla/backends/autotuner/backend_config.pb.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/utils/hlo_query.h"
+#include "xla/service/gpu/backend_configs.pb.h"
+#include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
+
+namespace xla {
+namespace gpu {
+namespace {
+
+constexpr int64_t kScaleBlock = 128;
+
+std::unique_ptr<BackendConfig> Pack(int64_t block_m, int64_t block_n,
+                                    int64_t block_k, int num_warps,
+                                    int num_stages, bool tma = false,
+                                    bool warp_specialization = false) {
+  auto config = std::make_unique<BackendConfig>();
+  Fp8BlockGemvFusionConfig& fp8 = *config->mutable_fp8_block_gemv();
+  xla::xtile::BlockLevelFusionConfig& block =
+      *fp8.mutable_block_level_fusion_config();
+  xla::xtile::Tile& tile = *block.add_output_tiles();
+  tile.add_sizes(block_m);
+  tile.add_sizes(block_n);
+  block.set_num_warps(num_warps);
+  block.set_num_stages(num_stages);
+  block.set_num_ctas(1);
+  block.set_is_tma_allowed(tma);
+  block.set_is_warp_specialization_allowed(warp_specialization);
+  fp8.set_contracting_tile_size(block_k);
+  return config;
+}
+
+}  // namespace
+
+bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kFusion) return false;
+  auto gpu_config = instr.backend_config<GpuBackendConfig>();
+  if (!gpu_config.ok()) return false;
+  if (gpu_config->fusion_backend_config().kind() !=
+      kTritonNestedGemmFusionKind) {
+    return false;
+  }
+  return MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr)).has_value();
+}
+
+absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
+  std::vector<std::unique_ptr<BackendConfig>> configs;
+  if (!IsSupported(instr)) return configs;
+  std::optional<Fp8BlockGemvSpec> spec =
+      MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+  const int64_t batch = spec->batch;
+  const int64_t n = spec->n;
+  const int64_t k = spec->k;
+
+  const bool single_row = batch == 1;
+  const bool is_prefill = batch > 16;
+  const int64_t min_block_k = single_row ? kScaleBlock : 2 * kScaleBlock;
+  const int max_warps = single_row ? 16 : 8;
+
+  llvm::SmallVector<int64_t, 5> block_ms;
+  if (single_row) {
+    block_ms.push_back(1);
+  } else {
+    for (int64_t candidate : {16, 32, 64, 128, 256}) {
+      if (candidate <= batch && batch % candidate == 0 &&
+          (is_prefill || candidate <= 128)) {
+        block_ms.push_back(candidate);
+      }
+    }
+    // xtile.extract does not mask, so no tile the batch does not divide.
+    if (block_ms.empty()) return configs;
+  }
+  if (is_prefill) {
+    llvm::SmallVector<int64_t, 5> wide;
+    for (int64_t block_m : block_ms) {
+      if (block_m >= 64) wide.push_back(block_m);
+    }
+    if (!wide.empty()) block_ms = wide;
+  }
+
+  const int64_t smem =
+      target_config().device_description.shared_memory_per_block_optin();
+  const int64_t act_bytes = spec->w8a8 ? 1 : 2;
+  auto fits = [&](int64_t block_m, int64_t block_n, int64_t block_k,
+                  int num_stages) {
+    const int64_t per_stage =
+        block_m * block_k * act_bytes + block_n * block_k;
+    return num_stages * per_stage <= smem;
+  };
+
+  const int64_t max_block_k = is_prefill ? 512 : 2048;
+  const int64_t min_prefill_block_k = kScaleBlock;
+  for (int64_t block_m : block_ms) {
+    for (int64_t block_n = is_prefill ? 64 : 4; block_n <= kScaleBlock;
+         block_n *= 2) {
+      if (n % block_n != 0 || kScaleBlock % block_n != 0) continue;
+      for (int64_t block_k = is_prefill ? min_prefill_block_k : min_block_k;
+           block_k <= max_block_k; block_k *= 2) {
+        if (k % block_k != 0) continue;
+        for (int num_warps = is_prefill ? 4 : 2; num_warps <= max_warps;
+             num_warps *= 2) {
+          for (int num_stages = 2; num_stages <= 6; ++num_stages) {
+            if (!fits(block_m, block_n, block_k, num_stages)) break;
+            configs.push_back(
+                Pack(block_m, block_n, block_k, num_warps, num_stages));
+            if (is_prefill && block_m >= 128) {
+              configs.push_back(Pack(block_m, block_n, block_k, num_warps,
+                                     num_stages, /*tma=*/true));
+            }
+          }
+        }
+      }
+    }
+  }
+  return configs;
+}
+
+absl::StatusOr<std::unique_ptr<BackendConfig>>
+Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
+  if (!IsSupported(instr)) {
+    return absl::InvalidArgumentError(
+        "Fp8BlockGemvBackend does not support this instruction.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   instr.backend_config<GpuBackendConfig>());
+  const HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
+      *instr.fused_instructions_computation(), HloOpcode::kScaledDot);
+  int64_t block_k = 0;
+  if (dot != nullptr) {
+    if (absl::StatusOr<xla::xtile::Tile> tile = dot->backend_config<xla::xtile::Tile>();
+        tile.ok() && tile->sizes_size() > 0) {
+      block_k = tile->sizes(tile->sizes_size() - 1);
+    }
+    if (block_k <= 0) {
+      if (std::optional<Fp8BlockGemvConfig> seed =
+              Fp8BlockGemvConfigFor(*Cast<HloScaledDotInstruction>(dot));
+          seed.has_value()) {
+        block_k = seed->block_k;
+      }
+    }
+  }
+  if (block_k <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "no contracting tile for ", instr.name(),
+        " and the emitter would not choose one"));
+  }
+  auto config = std::make_unique<BackendConfig>();
+  Fp8BlockGemvFusionConfig& fp8 = *config->mutable_fp8_block_gemv();
+  *fp8.mutable_block_level_fusion_config() =
+      gpu_config.fusion_backend_config().block_level_fusion_config();
+  fp8.set_contracting_tile_size(block_k);
+  return config;
+}
+
+absl::Status Fp8BlockGemvBackend::ApplyConfig(HloInstruction& instr,
+                                              const BackendConfig& config) {
+  if (!config.has_fp8_block_gemv()) {
+    return absl::InvalidArgumentError(
+        "Expected an fp8_block_gemv config for Fp8BlockGemvBackend.");
+  }
+  const Fp8BlockGemvFusionConfig& fp8 = config.fp8_block_gemv();
+  const int64_t block_k = fp8.contracting_tile_size();
+  if (block_k <= 0 || block_k % kScaleBlock != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("contracting tile ", block_k,
+                     " must be a positive multiple of ", kScaleBlock));
+  }
+  if (instr.opcode() != HloOpcode::kFusion) {
+    return absl::InvalidArgumentError("expected a fusion");
+  }
+  HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
+      *instr.fused_instructions_computation(), HloOpcode::kScaledDot);
+  if (dot == nullptr) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("no scaled dot in fusion ", instr.name()));
+  }
+  xla::xtile::Tile dot_tile;
+  dot_tile.add_sizes(block_k);
+  ABSL_RETURN_IF_ERROR(dot->set_backend_config(dot_tile));
+
+  ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   instr.backend_config<GpuBackendConfig>());
+  FusionBackendConfig& backend_config =
+      *gpu_config.mutable_fusion_backend_config();
+  backend_config.set_kind(std::string(kTritonNestedGemmFusionKind));
+  backend_config.clear_triton_gemm_config();
+  *backend_config.mutable_block_level_fusion_config() =
+      fp8.block_level_fusion_config();
+  ABSL_RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+  instr.set_fusion_kind(HloInstruction::FusionKind::kCustom);
+  return absl::OkStatus();
+}
+
+}  // namespace gpu
+}  // namespace xla

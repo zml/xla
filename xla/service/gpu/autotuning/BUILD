@@ -300,6 +300,7 @@ cc_library(
         "//xla/backends/gpu/autotuner:gpu_profiler",
         "//xla/backends/gpu/autotuner:legacy_cache",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/utils:hlo_query",
         "//xla/hlo/pass:hlo_pass",
         "//xla/pjrt/distributed:key_value_store_interface",
         "//xla/service:compiler",

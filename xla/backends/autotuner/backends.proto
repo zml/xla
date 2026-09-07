@@ -40,4 +40,6 @@ enum Backend {
   CUSTOM_KERNEL_FISSION = 14;
   HIPBLASLT_FISSION = 16;
   YNNPACK = 17;
+  // 900+ keeps clear of upstream's ids.
+  FP8_BLOCK_GEMV = 901;
 }

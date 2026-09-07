@@ -31,6 +31,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
@@ -83,6 +84,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/backends/gpu/codegen/triton/collective_emitter.h"
 #include "xla/backends/gpu/codegen/triton/compilation_pipeline.h"
+#include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/backends/gpu/codegen/triton/ir/triton_xla_ops.h"
 #include "xla/backends/gpu/codegen/triton/lowering_util.h"
 #include "xla/backends/gpu/codegen/triton/transforms/passes.h"
@@ -350,6 +352,62 @@ absl::StatusOr<TritonKernelSource> CreateTritonModule(
 
   if (!absl::c_linear_search(kSupportedFusionKinds, fusion_kind)) {
     return Internal("Unsupported fusion kind: %s", fusion_kind);
+  }
+
+  // A claimed fusion must emit or fail; an opportunistic match may fall through to the generic tiling.
+  const bool claimed_scaled_dot =
+      absl::StartsWith(hlo_computation->name(), kFp8BlockGemvComputationPrefix);
+  {
+    std::optional<Fp8BlockGemvSpec> spec = MatchFp8BlockGemv(fusion);
+    if (spec.has_value()) {
+      absl::Status status = absl::OkStatus();
+      absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> gemv_module =
+          EmitFp8BlockGemvXTileModule(fn_name, fusion, *spec,
+                                      block_level_parameters, mlir_context);
+      if (gemv_module.ok()) {
+        const DebugOptions& pre_opts =
+            fusion.GetModule()->config().debug_options();
+        if (DumpingEnabledForHloModule(*hlo_computation->parent()) &&
+            DumpingEnabledForEmitter("triton-fusion", pre_opts)) {
+          DumpToFileInDirOrStdout(
+              *hlo_computation->parent(), "",
+              absl::StrCat(fusion.name(), ".fp8_block_gemv.xtile.txt"),
+              GetModuleIrString(gemv_module->get()));
+        }
+      }
+      if (!gemv_module.ok()) {
+        status = gemv_module.status();
+      } else {
+        status = ir_emitter_triton_internal::LowerXTileToTriton(
+            gemv_module->get(), mlir_context, fusion, device_info,
+            block_level_parameters);
+        if (status.ok()) {
+          const DebugOptions& dump_opts =
+              fusion.GetModule()->config().debug_options();
+          if (DumpingEnabledForHloModule(*hlo_computation->parent()) &&
+              DumpingEnabledForEmitter("triton-fusion", dump_opts)) {
+            DumpToFileInDirOrStdout(
+                *hlo_computation->parent(), "",
+                absl::StrCat(fusion.name(), ".fp8_block_gemv.ttir.txt"),
+                GetModuleIrString(gemv_module->get()));
+          }
+          return TritonKernelSource(std::move(*gemv_module));
+        }
+      }
+      absl::string_view reason = status.message();
+      reason = reason.substr(0, reason.find('\n'));
+      VLOG(1) << "fp8 block gemv declined " << fusion.name() << ": " << reason;
+      if (claimed_scaled_dot) {
+        return status;
+      }
+    } else {
+      VLOG(1) << "fp8 block gemv no match " << fusion.name();
+      if (claimed_scaled_dot) {
+        return Internal(
+            "fp8 block gemv was given a claimed scaled dot it cannot match: %s",
+            hlo_computation->ToString());
+      }
+    }
   }
 
   llvm::SmallVector<mlir::Type> opaque_args_types;
@@ -681,8 +739,9 @@ absl::Status LowerXTileToTriton(
             diagnostic_handler.consumeStatus(pm.run(xtile_dialect_module));
         !status.ok()) {
       return CreateInternalError(
-          "Failed to lower from shared dialect to Triton.", fusion,
-          xtile_dialect_module);
+          absl::StrCat("Failed to lower from shared dialect to Triton: ",
+                       status.message()),
+          fusion, xtile_dialect_module);
     }
   }
 
