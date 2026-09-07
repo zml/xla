@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/gpu/gpu_test_kernels.h"
@@ -350,26 +351,80 @@ TEST_F(RocmStreamTest, WaitForOtherStream) {
 // HIP stream handle cache tests
 // ---------------------------------------------------------------------------
 
-// Core invariant: after a RocmStream is destroyed its underlying hipStream_t
-// is placed in the cache and returned by the very next Create() call that uses
-// the same (device, flags, priority) key.
+// Core invariant: after a completed RocmStream is destroyed its underlying
+// hipStream_t becomes reusable once the retirement tail event is complete.
 TEST_F(RocmStreamTest, StreamHandleIsReusedAfterDestruction) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<RocmStream> stream,
       RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
   hipStream_t original_handle = stream->stream_handle();
 
-  // Destroying the stream should deposit the handle into the cache.
+  ASSERT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
   stream.reset();
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-  // The very next Create() with identical parameters must return the cached
-  // handle rather than allocating a new one.
+  // Creation polls completed retirement events before consulting the cache.
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<RocmStream> new_stream,
       RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
 
   EXPECT_EQ(new_stream->stream_handle(), original_handle)
       << "hipStream_t handle was not reused from the cache";
+}
+
+TEST_F(RocmStreamTest, ActiveStreamIsRetiredBeforeHandleReuse) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<RocmStream> stream,
+      RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+  hipStream_t original_handle = stream->stream_handle();
+
+  absl::Notification callback_started;
+  absl::Notification release_callback;
+  absl::Notification callback_finished;
+  ASSERT_THAT(stream->DoHostCallback([&]() {
+                callback_started.Notify();
+                release_callback.WaitForNotification();
+                callback_finished.Notify();
+              }),
+              absl_testing::IsOk());
+  callback_started.WaitForNotification();
+
+  // Wrapper destruction must not wait for the active callback. Its handle
+  // remains retired because the tail event cannot yet be complete.
+  stream.reset();
+  EXPECT_FALSE(callback_finished.HasBeenNotified());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<RocmStream> concurrent_stream,
+      RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+  EXPECT_NE(concurrent_stream->stream_handle(), original_handle);
+
+  release_callback.Notify();
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+  EXPECT_TRUE(callback_finished.HasBeenNotified());
+
+  // Keep the second stream alive so the only reusable handle is the one whose
+  // retirement event just completed.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<RocmStream> reused_stream,
+      RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+  EXPECT_EQ(reused_stream->stream_handle(), original_handle);
+}
+
+TEST_F(RocmStreamTest, HandlesRemainReusableAcrossHeavyStreamChurn) {
+  constexpr int kIterations = 1000;
+  for (int i = 0; i < kIterations; ++i) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RocmStream> stream,
+        RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+    ASSERT_THAT(stream->BlockHostUntilDone(), absl_testing::IsOk());
+  }
+
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<RocmStream> reused_stream,
+      RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
+  EXPECT_NE(reused_stream->stream_handle(), nullptr);
 }
 
 TEST_F(RocmStreamTest, StreamIsNonBlocking) {
@@ -399,8 +454,9 @@ TEST_F(RocmStreamTest, MultipleStreamHandlesAreCachedAndReused) {
       original_handles.push_back(s->stream_handle());
       streams.push_back(std::move(s));
     }
-    // All kNumStreams handles are deposited into the cache here.
+    // All kNumStreams handles enter retirement here.
   }
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
   // Every new stream must come from the cache (no fresh hipStreamCreate calls).
   std::vector<hipStream_t> reused_handles;
@@ -431,6 +487,7 @@ TEST_F(RocmStreamTest, ReusedStreamIsFullyFunctional) {
         std::unique_ptr<RocmStream> stream,
         RocmStream::Create(&executor_.value(), /*priority=*/std::nullopt));
   }
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
   // This stream is obtained from the cache (not freshly created).
   TF_ASSERT_OK_AND_ASSIGN(
@@ -484,6 +541,7 @@ TEST_F(RocmStreamTest, CacheIsolatesStreamsByPriority) {
   // Destroy default first, highest second → highest handle is on top.
   default_stream.reset();
   highest_stream.reset();
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
   // Create in reverse order: highest first, default second.
   TF_ASSERT_OK_AND_ASSIGN(
