@@ -377,6 +377,17 @@ void MetalExecutor::CommitOpenBufferThrough(uint64_t value) {
   CommitOpenBufferThroughLocked(value);
 }
 
+absl::Status MetalExecutor::DrainAllStreams() {
+  {
+    absl::MutexLock cb_lock(command_buffer_mu_);
+    absl::MutexLock lock(streams_mu_);
+    for (MetalStream* stream : streams_) {
+      stream->CommitOpenBufferLocked();
+    }
+  }
+  return metal::SynchronizeCommandQueue(command_queue_);
+}
+
 void MetalExecutor::CommitOpenBufferThroughLocked(uint64_t value) {
   if (value == 0) return;
   absl::MutexLock lock(streams_mu_);

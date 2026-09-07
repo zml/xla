@@ -195,9 +195,12 @@ absl::Status MetalStream::MemZero(DeviceAddressBase* location, uint64_t size) {
 
 absl::Status MetalStream::Memcpy(DeviceAddressBase* device_dst,
                                  const void* host_src, uint64_t size) {
-  // Drain first: the GPU may still read this buffer, and host-side readers of
-  // staged scalars rely on the copy being complete on return.
-  TF_RETURN_IF_ERROR(BlockHostUntilDone());
+  // Unified memory: this writes the device buffer with the CPU, so it has to be
+  // ordered against every stream's queued work, not just this stream's. One
+  // command queue is shared by all of the executor's streams, and the allocator
+  // hands out memory that a kernel or blit fill on another stream may still be
+  // writing.
+  TF_RETURN_IF_ERROR(executor_->DrainAllStreams());
   std::memcpy(device_dst->opaque(), host_src, size);
   return absl::OkStatus();
 }
@@ -205,7 +208,7 @@ absl::Status MetalStream::Memcpy(DeviceAddressBase* device_dst,
 absl::Status MetalStream::Memcpy(void* host_dst,
                                  const DeviceAddressBase& device_src,
                                  uint64_t size) {
-  TF_RETURN_IF_ERROR(BlockHostUntilDone());
+  TF_RETURN_IF_ERROR(executor_->DrainAllStreams());
   std::memcpy(host_dst, device_src.opaque(), size);
   return absl::OkStatus();
 }
@@ -305,6 +308,8 @@ absl::Status MetalStream::CommitBatchedWorkNoWait() {
   CommitOpenBufferNoWait();
   return absl::OkStatus();
 }
+
+void MetalStream::CommitOpenBufferLocked() { CommitOpenBufferNoWait(); }
 
 void MetalStream::CommitOpenBufferNoWait() {
   if (command_buffer_ == nullptr) return;

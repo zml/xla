@@ -74,6 +74,7 @@ class MetalStream : public StreamCommon {
       int64_t shmem_bytes, bool use_pdl);
 
   void FlushOpenBufferIfCarrying(uint64_t value);
+  void CommitOpenBufferLocked();
 
  private:
   void EnsureOpenCommandBuffer();

@@ -119,6 +119,7 @@ class MetalExecutor : public gpu::GpuExecutor {
   void UnregisterStream(MetalStream* stream);
   void CommitOpenBufferThrough(uint64_t value);
   void CommitOpenBufferThroughLocked(uint64_t value);
+  absl::Status DrainAllStreams();
 
   absl::Mutex& command_buffer_mu() const { return command_buffer_mu_; }
 
