@@ -106,19 +106,38 @@ hipfftType ROCMFftType(fft::Type type) {
   }
 }
 
-// Associates the given stream with the given rocFFT plan.
-bool SetStream(StreamExecutor *parent, hipfftHandle plan, Stream *stream) {
-  auto ret = wrap::hipfftSetStream(
-      parent, plan,
-      static_cast<hipStream_t>(stream->platform_specific_handle().stream));
+}  // namespace
+
+ROCMFftPlan::ROCMFftPlan(ROCMFft* owner)
+    : owner_(owner),
+      parent_(nullptr),
+      plan_(),
+      fft_type_(fft::Type::kInvalid),
+      scratch_(nullptr),
+      scratch_size_bytes_(0),
+      is_initialized_(false) {
+  owner_->RegisterPlan(this);
+}
+
+bool ROCMFftPlan::SetStream(Stream* stream) {
+  hipStream_t handle = static_cast<hipStream_t>(
+      stream->platform_specific_handle().stream);
+  if (current_stream_.load(std::memory_order_acquire) == handle) return true;
+
+  auto ret = wrap::hipfftSetStream(parent_, plan_, handle);
   if (ret != HIPFFT_SUCCESS) {
     LOG(ERROR) << "failed to run rocFFT routine hipfftSetStream: " << ret;
     return false;
   }
+  current_stream_.store(handle, std::memory_order_release);
   return true;
 }
 
-}  // namespace
+void ROCMFftPlan::NotifyStreamDestroyed(hipStream_t stream) {
+  hipStream_t expected = stream;
+  current_stream_.compare_exchange_strong(expected, nullptr,
+                                          std::memory_order_acq_rel);
+}
 
 absl::Status ROCMFftPlan::Initialize(
     StreamExecutor *parent, Stream *stream, int rank, uint64_t *elem_count,
@@ -286,7 +305,7 @@ absl::Status ROCMFftPlan::Initialize(StreamExecutor *parent, Stream *stream,
                                      int rank, uint64_t *elem_count,
                                      fft::Type type,
                                      ScratchAllocator *scratch_allocator) {
-  return Initialize(parent_, stream, rank, elem_count,
+  return Initialize(parent, stream, rank, elem_count,
                     /*input_embed=*/nullptr, /*input_stride=*/0,
                     /*input_distance=*/0,
                     /*output_embed=*/nullptr, /*output_stride=*/0,
@@ -303,16 +322,25 @@ absl::Status ROCMFftPlan::UpdateScratchAllocator(
       return allocated.status();
     }
   }
+  void* work_area = scratch_.opaque();
+  if (current_work_area_ && *current_work_area_ == work_area) {
+    return absl::OkStatus();
+  }
+
   // Connect work area with allocated space.
   auto ret = wrap::hipfftSetWorkArea(parent_, plan_, scratch_.opaque());
   if (ret != HIPFFT_SUCCESS) {
     LOG(ERROR) << "failed to set work area for rocFFT plan:" << ret;
     return absl::InternalError("Failed to set work area for rocFFT plan.");
   }
+  current_work_area_ = work_area;
   return absl::OkStatus();
 }
 
-ROCMFftPlan::~ROCMFftPlan() { wrap::hipfftDestroy(parent_, plan_); }
+ROCMFftPlan::~ROCMFftPlan() {
+  owner_->UnregisterPlan(this);
+  wrap::hipfftDestroy(parent_, plan_);
+}
 
 int ROCMFftPlan::GetFftDirection() const {
   if (!IsInitialized()) {
@@ -340,7 +368,7 @@ std::unique_ptr<fft::Plan> ROCMFft::CreateBatchedPlanWithScratchAllocator(
     uint64_t input_stride, uint64_t input_distance, uint64_t *output_embed,
     uint64_t output_stride, uint64_t output_distance, fft::Type type,
     bool in_place_fft, int batch_count, ScratchAllocator *scratch_allocator) {
-  std::unique_ptr<ROCMFftPlan> fft_plan_ptr{new ROCMFftPlan()};
+  std::unique_ptr<ROCMFftPlan> fft_plan_ptr{new ROCMFftPlan(this)};
   absl::Status status = fft_plan_ptr->Initialize(
       parent_, stream, rank, elem_count, input_embed, input_stride,
       input_distance, output_embed, output_stride, output_distance, type,
@@ -374,7 +402,7 @@ bool ROCMFft::DoFftInternal(Stream* stream, fft::Plan* plan, FuncT hipfftExec,
     return false;
   }
 
-  if (!SetStream(parent_, rocm_fft_plan->GetPlan(), stream)) {
+  if (!rocm_fft_plan->SetStream(stream)) {
     return false;
   }
 
@@ -425,7 +453,7 @@ bool ROCMFft::DoFftWithDirectionInternal(Stream* stream, fft::Plan* plan,
     return false;
   }
 
-  if (!SetStream(parent_, rocm_fft_plan->GetPlan(), stream)) {
+  if (!rocm_fft_plan->SetStream(stream)) {
     return false;
   }
 
@@ -467,6 +495,23 @@ STREAM_EXECUTOR_ROCM_DEFINE_FFT(float, C2C, R2C, C2R)
 STREAM_EXECUTOR_ROCM_DEFINE_FFT(double, Z2Z, D2Z, Z2D)
 
 #undef STREAM_EXECUTOR_ROCM_DEFINE_FFT
+
+void ROCMFft::RegisterPlan(ROCMFftPlan* plan) {
+  absl::MutexLock lock(plans_mu_);
+  plans_.insert(plan);
+}
+
+void ROCMFft::UnregisterPlan(ROCMFftPlan* plan) {
+  absl::MutexLock lock(plans_mu_);
+  plans_.erase(plan);
+}
+
+void ROCMFft::NotifyStreamDestroyed(Stream* stream) {
+  hipStream_t handle = static_cast<hipStream_t>(
+      stream->platform_specific_handle().stream);
+  absl::MutexLock lock(plans_mu_);
+  for (ROCMFftPlan* plan : plans_) plan->NotifyStreamDestroyed(handle);
+}
 
 }  // namespace gpu
 
