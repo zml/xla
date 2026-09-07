@@ -242,6 +242,57 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "fp8_block_gemv",
+    srcs = ["fp8_block_gemv.cc"],
+    hdrs = ["fp8_block_gemv.h"],
+    tags = ["no-oneapi"],
+    deps = [
+        "//xla:literal",
+        "//xla:shape_util",
+        "//xla:xla_data_proto_cc",
+        "//xla/codegen/xtile/codegen:emitter_helpers",
+        "//xla/codegen/xtile/ir:xtile",
+        "//xla/codegen/xtile/ir/transforms:passes",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/codegen/xtile:block_level_parameters",
+        "//xla/service/llvm_ir:llvm_util",
+        "//xla/tsl/framework/mlir:status_scoped_diagnostic_handler",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
+xla_cc_test(
+    name = "fp8_block_gemv_test",
+    srcs = ["fp8_block_gemv_test.cc"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":fp8_block_gemv",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "xtile_compiler",
     srcs =
         [
@@ -254,6 +305,7 @@ cc_library(
     deps = [
         ":collective_emitter",
         ":compilation_pipeline",
+        ":fp8_block_gemv",
         ":lowering_util",
         ":triton_kernel_source",
         ":triton_wrapper_result",

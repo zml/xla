@@ -52,6 +52,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/utils/hlo_query.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
 #include "xla/service/compiler.h"
 #include "xla/service/decision.h"
@@ -220,6 +221,12 @@ AutotuneDecision ShouldAssignConfigToInstruction(
         backend_config.kind() == kCuDnnFusionKind ||
         backend_config.kind() == kCustomFusionKind) {
       return ShouldAssignConfigToGemmFusion(instruction);
+    }
+    if (backend_config.kind() == kTritonNestedGemmFusionKind &&
+        hlo_query::GetFirstInstructionWithOpcode(
+            *instruction.fused_instructions_computation(),
+            HloOpcode::kScaledDot) != nullptr) {
+      return AutotuneDecision::Allow();
     }
     // 3. Generic fusions.
     return ShouldAssignConfigToGenericFusion(enable_fusion_autotuner,

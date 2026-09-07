@@ -3001,6 +3001,27 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fp8_block_gemv_arm",
+    srcs = ["fp8_block_gemv_arm.cc"],
+    hdrs = ["fp8_block_gemv_arm.h"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":fused_scaled_dot_rewriter",
+        "//xla:shape_util",
+        "//xla/backends/gpu/codegen/triton:fp8_block_gemv",
+        "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:ir_emission_utils",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 xla_cc_test(
     name = "fused_scaled_dot_rewriter_test",
     srcs = ["fused_scaled_dot_rewriter_test.cc"],
