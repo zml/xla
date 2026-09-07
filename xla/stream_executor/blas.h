@@ -234,6 +234,10 @@ class BlasSupport {
   // has stream 0 set as its current stream.
   virtual absl::StatusOr<bool> IsMainStreamSet() const = 0;
 
+  // Notifies stateful library handles before a Stream wrapper is destroyed.
+  // Backends that retain raw stream handles can invalidate cached state here.
+  virtual void NotifyStreamDestroyed(Stream* stream) {}
+
   // Computes the product of a vector by a scalar: x <- a*x.
   virtual bool DoBlasScal(Stream* stream, uint64_t elem_count, float alpha,
                           DeviceAddress<float>* x, int incx) = 0;

@@ -465,6 +465,7 @@ cc_library(
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/util:determinism",
+        "//xla/tsl/util:env_var",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
