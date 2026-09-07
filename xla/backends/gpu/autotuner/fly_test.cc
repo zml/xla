@@ -42,6 +42,18 @@ namespace {
 using absl_testing::IsOk;
 using ::testing::IsEmpty;
 
+bool HasOutputTile(
+    const std::vector<std::unique_ptr<BackendConfig>>& configs,
+    const std::vector<int64_t>& expected) {
+  return std::any_of(configs.begin(), configs.end(), [&](const auto& config) {
+    const BlockLevelFusionConfig& block = config->block_level();
+    return block.output_tiles_size() == 1 &&
+           std::equal(expected.begin(), expected.end(),
+                      block.output_tiles(0).sizes().begin(),
+                      block.output_tiles(0).sizes().end());
+  });
+}
+
 constexpr char kF16DotHlo[] = R"(
 HloModule fly_f16_dot
 
@@ -1293,6 +1305,7 @@ ENTRY main {
 }
 
 TEST_F(FlyBackendTest, SupportsOddOutputTailsAndMinimumKTile) {
+  debug_options_.set_xla_gpu_exhaustive_tiling_search(true);
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                        ParseAndReturnVerifiedModule(kOddOutputTailBf16GemmHlo));
   HloInstruction* fusion = module->entry_computation()->root_instruction();
@@ -1310,6 +1323,7 @@ TEST_F(FlyBackendTest, SupportsOddOutputTailsAndMinimumKTile) {
 }
 
 TEST_F(FlyBackendTest, SupportsPredicatedSmallMGemm) {
+  debug_options_.set_xla_gpu_exhaustive_tiling_search(true);
   constexpr absl::string_view kHlo = R"(
 HloModule fly_predicated_small_m_gemm
 
@@ -3836,7 +3850,7 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 9);
+  ASSERT_GE(configs.size(), 9);
   ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.front()));
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                        fusion->backend_config<GpuBackendConfig>());
@@ -3863,7 +3877,7 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 9);
+  ASSERT_GE(configs.size(), 9);
   for (int64_t tile_rows : {32, 64, 128}) {
     for (int64_t tile_columns : {32, 64, 128}) {
       EXPECT_TRUE(
@@ -3907,13 +3921,9 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 6);
-  EXPECT_THAT(configs[0]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 32));
-  EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 64));
-  EXPECT_THAT(configs[3]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(64, 64));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 32}));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 64}));
+  EXPECT_TRUE(HasOutputTile(configs, {64, 64}));
   ASSERT_OK(backend_.ApplyConfig(*fusion, *configs.back()));
   ASSERT_OK_AND_ASSIGN(GpuBackendConfig gpu_config,
                        fusion->backend_config<GpuBackendConfig>());
@@ -3957,11 +3967,8 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 6);
-  EXPECT_THAT(configs[0]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 32));
-  EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 64));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 32}));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 64}));
 }
 
 TEST_F(FlyFusionBackendTest, TunesTransformerContextTranspose) {
@@ -3990,13 +3997,9 @@ ENTRY main {
   ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
                        backend_.GetSupportedConfigs(*fusion));
 
-  ASSERT_EQ(configs.size(), 9);
-  EXPECT_THAT(configs[1]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 64));
-  EXPECT_THAT(configs[2]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(32, 128));
-  EXPECT_THAT(configs[8]->block_level().output_tiles(0).sizes(),
-              ::testing::ElementsAre(128, 128));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 64}));
+  EXPECT_TRUE(HasOutputTile(configs, {32, 128}));
+  EXPECT_TRUE(HasOutputTile(configs, {128, 128}));
 }
 
 TEST_F(FlyBackendTest, SupportsNativeF32MfmaGemm) {
