@@ -33,6 +33,7 @@ limitations under the License.
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/ir_emission_utils.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -42,8 +43,10 @@ namespace gpu {
 namespace {
 
 absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
-    HloComputation* comp, HloScaledDotInstruction* dot) {
-  std::optional<Fp8BlockGemvConfig> config = Fp8BlockGemvConfigFor(*dot);
+    HloComputation* comp, HloScaledDotInstruction* dot,
+    const se::GpuComputeCapability& gpu_version) {
+  std::optional<Fp8BlockGemvConfig> config =
+      Fp8BlockGemvConfigFor(*dot, gpu_version);
   if (!config.has_value()) return nullptr;
   VLOG(1) << "fused scaled dot claimed " << dot->name() << ": "
           << dot->shape().ToString() << " tile " << dot->shape().dimensions(0)
@@ -57,7 +60,7 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
   std::vector<HloInstruction*> parameters;
   operands.reserve(dot->operand_count());
   parameters.reserve(dot->operand_count());
-  // The scales are read as f32, so the convert stays outside the fusion.
+  // The CUTLASS rung reads f32 scales straight from the buffers, so the convert stays outside the fusion.
   const bool w8a8 = dot->operand(0)->shape().element_type() == F8E4M3FN;
   for (int64_t i = 0; i < dot->operand_count(); ++i) {
     HloInstruction* operand = dot->mutable_operand(i);
@@ -107,9 +110,10 @@ absl::StatusOr<HloInstruction*> TryEmitFp8BlockGemvFusion(
 
 }  // namespace
 
-FusedScaledDotArm Fp8BlockGemvArm() {
-  return [](HloComputation* comp, HloScaledDotInstruction* dot) {
-    return TryEmitFp8BlockGemvFusion(comp, dot);
+FusedScaledDotArm Fp8BlockGemvArm(
+    const se::GpuComputeCapability& gpu_version) {
+  return [gpu_version](HloComputation* comp, HloScaledDotInstruction* dot) {
+    return TryEmitFp8BlockGemvFusion(comp, dot, gpu_version);
   };
 }
 

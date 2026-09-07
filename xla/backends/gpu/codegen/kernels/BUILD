@@ -105,6 +105,24 @@ cuda_library(
     ],
 )
 
+# Every config is a separate CUTLASS instantiation compiled into this target, so
+# it is slow to build (minutes) and wants its own translation unit rather than a
+# place inside a larger one.
+cuda_library(
+    name = "fp8_block_gemm_cutlass",
+    srcs = ["fp8_block_gemm_cutlass.cu.cc"],
+    hdrs = ["fp8_block_gemm_cutlass.h"],
+    tags = [
+        "cuda-only",
+        "gpu",
+        "no-oneapi",
+    ],
+    visibility = [":friends"],
+    deps = [
+        "@cutlass_archive//:cutlass",
+    ],
+)
+
 cc_library(
     name = "ptx_custom_kernel",
     srcs = ["ptx_custom_kernel.cc"],

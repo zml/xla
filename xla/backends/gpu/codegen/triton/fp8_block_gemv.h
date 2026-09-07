@@ -26,6 +26,7 @@ limitations under the License.
 #include "mlir/IR/OwningOpRef.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::gpu {
@@ -59,9 +60,17 @@ struct Fp8BlockGemvConfig {
   int num_stages;
 };
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
-    const HloScaledDotInstruction& dot);
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version);
 
-bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot);
+// Takes the capability: a batch neither one row nor a multiple of 16 is only the CUTLASS rung's.
+bool Fp8BlockGemvSupportsScaledDot(
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version);
+
+bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch);
+
+bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version);
 
 absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> EmitFp8BlockGemvXTileModule(
     absl::string_view fn_name, const HloFusionInstruction& fusion,

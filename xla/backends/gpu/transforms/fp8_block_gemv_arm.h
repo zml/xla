@@ -17,12 +17,13 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_TRANSFORMS_FP8_BLOCK_GEMV_ARM_H_
 
 #include "xla/backends/gpu/transforms/fused_scaled_dot_rewriter.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla {
 namespace gpu {
 
-// Claims a block-128 FP8 projection for the Triton block-gemv emitter.
-FusedScaledDotArm Fp8BlockGemvArm();
+// Claims a block-128 FP8 projection for the block-gemv rungs.
+FusedScaledDotArm Fp8BlockGemvArm(const se::GpuComputeCapability& gpu_version);
 
 }  // namespace gpu
 }  // namespace xla

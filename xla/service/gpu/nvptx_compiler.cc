@@ -305,7 +305,9 @@ bool NVPTXCompiler::IsScaledDotSupportedByBackend(
     return true;
   }
   if (const auto* scaled_dot = DynCast<HloScaledDotInstruction>(instr)) {
-    if (Fp8BlockGemvSupportsScaledDot(*scaled_dot)) {
+    if (Fp8BlockGemvSupportsScaledDot(
+            *scaled_dot,
+            gpu_target_config.device_description.gpu_compute_capability())) {
       return true;
     }
     if (MatchNvfp4DecodeDot(*scaled_dot,
@@ -327,7 +329,9 @@ std::vector<FusedScaledDotArm> NVPTXCompiler::FusedScaledDotArms(
       !debug_options.xla_gpu_enable_triton_gemm()) {
     return arms;
   }
-  arms.push_back(Fp8BlockGemvArm());
+  const se::GpuComputeCapability& gpu_version =
+      gpu_target_config.device_description.gpu_compute_capability();
+  arms.push_back(Fp8BlockGemvArm(gpu_version));
   arms.push_back(Nvfp4DecodeDotArm(gpu_target_config.device_description));
   return arms;
 }

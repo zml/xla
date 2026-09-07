@@ -133,8 +133,7 @@ std::optional<Fp8BlockGemvSpec> MatchScaledDotStructure(
   const bool batch_major = act_contracting == 1;
   const int64_t batch = activation->shape().dimensions(batch_major ? 0 : 1);
   if (batch < 1) return no("batch-range");
-  // xtile.extract does not mask, so a batch the block tile does not divide has no tiling.
-  if (batch > 1 && batch % 16 != 0) return no("batch-range");
+  if (!w8a8 && batch > 1 && batch % 16 != 0) return no("batch-range");
   // A bf16 activation above a decode batch loses to the generic route; only W8A8 claims wider.
   if (!w8a8 && batch > 16) return no("w8a16-batch-cap");
   if (w8a8 && !batch_major) return no("w8a8-act-layout");
@@ -204,11 +203,29 @@ int64_t ChooseBlockK(int64_t block_n, int64_t k, int64_t max_block_k) {
 }
 }  // namespace
 
+bool Fp8BlockGemvBatchNeedsCutlass(int64_t batch) {
+  return batch != 1 && batch % 16 != 0;
+}
+
+bool HasCutlassBlockGemm(const se::GpuComputeCapability& gpu_version) {
+  const se::CudaComputeCapability* cc = gpu_version.cuda_compute_capability();
+  if (cc == nullptr) return false;
+  // Consumer Blackwell is 12.0 only: the build targets 12.0a and a plain sm_121 cubin has TMA compiled out.
+  return cc->major == se::CudaComputeCapability::kBlackwell ||
+         (cc->major == se::CudaComputeCapability::kBlackwell_12 &&
+          cc->minor == 0);
+}
+
 std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
-    const HloScaledDotInstruction& dot) {
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version) {
   std::optional<Fp8BlockGemvSpec> spec =
       MatchScaledDotStructure(dot, [](const HloInstruction* v) { return v; });
   if (!spec.has_value()) return std::nullopt;
+  if (Fp8BlockGemvBatchNeedsCutlass(spec->batch) &&
+      !HasCutlassBlockGemm(gpu_version)) {
+    return std::nullopt;
+  }
 
   const bool single_row = spec->batch == 1;
   if (spec->batch > 16) {
@@ -226,9 +243,11 @@ std::optional<Fp8BlockGemvConfig> Fp8BlockGemvConfigFor(
       single_row ? 8 : 4, single_row ? 3 : 4};
 }
 
-bool Fp8BlockGemvSupportsScaledDot(const HloScaledDotInstruction& dot) {
+bool Fp8BlockGemvSupportsScaledDot(
+    const HloScaledDotInstruction& dot,
+    const se::GpuComputeCapability& gpu_version) {
   // Must match the arm's predicate: an op kept alive that the arm then declines fails at the floor.
-  const bool supported = Fp8BlockGemvConfigFor(dot).has_value();
+  const bool supported = Fp8BlockGemvConfigFor(dot, gpu_version).has_value();
   VLOG(1) << "fp8 block gemv scaled-dot capability: supported=" << supported
           << " " << dot.ToString();
   return supported;

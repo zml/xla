@@ -140,6 +140,10 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
     return HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemvCuda;
   }
 
+  if (fusion_backend_config.kind() == kFp8BlockGemmCutlassFusionKind) {
+    return HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemmCutlass;
+  }
+
   std::optional<HloInstructionAdaptor> first_reduce_hero;
   for (auto [root, hero] : llvm::zip(fusion_roots, fusion_heroes)) {
     if (IsRealReductionHero(root.instruction(), hero.instruction(),

@@ -28,6 +28,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/emitters/reduction.h"
 #include "xla/backends/gpu/codegen/emitters/scatter.h"
 #include "xla/backends/gpu/codegen/emitters/transpose.h"
+#include "xla/backends/gpu/codegen/fp8_block_gemm_cutlass_fusion.h"
 #include "xla/backends/gpu/codegen/fp8_block_gemv_fusion.h"
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/sort.h"
@@ -112,6 +113,8 @@ std::unique_ptr<FusionInterface> GetFusionEmitter(
       return std::make_unique<tile_ir::TileIrFusion>(analysis);
     case HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemvCuda:
       return std::make_unique<Fp8BlockGemvFusion>(analysis);
+    case HloFusionAnalysis::EmitterFusionKind::kFp8BlockGemmCutlass:
+      return std::make_unique<Fp8BlockGemmCutlassFusion>(analysis);
   }
 }
 

@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/SmallVector.h"
 #include "xla/backends/autotuner/backend_config.pb.h"
+#include "xla/backends/gpu/codegen/kernels/fp8_block_gemm_cutlass.h"
 #include "xla/backends/gpu/codegen/triton/fp8_block_gemv.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/backends/gpu/codegen/kernels/fp8_block_gemv_kernel.h"
@@ -58,6 +59,8 @@ Fp8BlockGemvFusionConfig* SlotFor(Fp8BlockGemvBackend::Rung rung,
       return config.mutable_fp8_block_gemv_tile_ir();
     case Fp8BlockGemvBackend::Rung::kCuda:
       return config.mutable_fp8_block_gemv_cuda();
+    case Fp8BlockGemvBackend::Rung::kCutlass:
+      LOG(FATAL) << "the CUTLASS rung has no tile slot";
   }
 }
 
@@ -73,6 +76,8 @@ const Fp8BlockGemvFusionConfig* ConstSlotFor(Fp8BlockGemvBackend::Rung rung,
     case Fp8BlockGemvBackend::Rung::kCuda:
       return config.has_fp8_block_gemv_cuda() ? &config.fp8_block_gemv_cuda()
                                               : nullptr;
+    case Fp8BlockGemvBackend::Rung::kCutlass:
+      return nullptr;
   }
 }
 
@@ -96,7 +101,21 @@ std::unique_ptr<BackendConfig> Pack(Fp8BlockGemvBackend::Rung rung,
   return config;
 }
 
+std::unique_ptr<BackendConfig> PackCutlass(int config_index) {
+  auto config = std::make_unique<BackendConfig>();
+  config->mutable_fp8_block_gemm_cutlass()->set_config_index(config_index);
+  return config;
+}
+
 }  // namespace
+
+std::pair<int, int> Fp8BlockGemvBackend::CutlassCc() const {
+  const se::CudaComputeCapability* cc =
+      target_config().device_description.gpu_compute_capability()
+          .cuda_compute_capability();
+  return cc == nullptr ? std::pair<int, int>{0, 0}
+                       : std::pair<int, int>{cc->major, cc->minor};
+}
 
 bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   if (instr.opcode() != HloOpcode::kFusion) return false;
@@ -104,7 +123,8 @@ bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   if (!gpu_config.ok()) return false;
   absl::string_view kind = gpu_config->fusion_backend_config().kind();
   if (kind != kTritonNestedGemmFusionKind && kind != kTileIrFusionKind &&
-      kind != kFp8BlockGemvCudaFusionKind) {
+      kind != kFp8BlockGemvCudaFusionKind &&
+      kind != kFp8BlockGemmCutlassFusionKind) {
     return false;
   }
   if (rung_ == Rung::kTileIr &&
@@ -114,6 +134,13 @@ bool Fp8BlockGemvBackend::IsSupported(const HloInstruction& instr) {
   std::optional<Fp8BlockGemvSpec> spec =
       MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
   if (!spec.has_value()) return false;
+  if (rung_ == Rung::kCutlass) {
+    if (!HasCutlassBlockGemm(
+            target_config().device_description.gpu_compute_capability())) {
+      return false;
+    }
+    if (!spec->w8a8) return false;
+  }
   return true;
 }
 
@@ -126,6 +153,18 @@ Fp8BlockGemvBackend::GetSupportedConfigs(const HloInstruction& instr) {
   const int64_t batch = spec->batch;
   const int64_t n = spec->n;
   const int64_t k = spec->k;
+
+  if (rung_ == Rung::kCutlass) {
+    const auto [cc_major, cc_minor] = CutlassCc();
+    for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
+      if (!kernel::Fp8BlockGemmCutlassCanRun(i, cc_major, cc_minor, batch, n,
+                                             k)) {
+        continue;
+      }
+      configs.push_back(PackCutlass(i));
+    }
+    return configs;
+  }
 
   const bool single_row = batch == 1;
   const bool is_prefill = batch > 16;
@@ -226,6 +265,20 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
     return absl::InvalidArgumentError(
         "Fp8BlockGemvBackend does not support this instruction.");
   }
+  if (rung_ == Rung::kCutlass) {
+    std::optional<Fp8BlockGemvSpec> spec =
+        MatchFp8BlockGemv(*Cast<HloFusionInstruction>(&instr));
+    const auto [cc_major, cc_minor] = CutlassCc();
+    for (int i = 0; i < kernel::Fp8BlockGemmCutlassNumConfigs(); ++i) {
+      if (kernel::Fp8BlockGemmCutlassCanRun(i, cc_major, cc_minor, spec->batch,
+                                            spec->n, spec->k)) {
+        return PackCutlass(i);
+      }
+    }
+    return absl::InvalidArgumentError(absl::StrCat(
+        "no CUTLASS block gemm config runs m=", spec->batch, " n=", spec->n,
+        " k=", spec->k));
+  }
 
   ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
                    instr.backend_config<GpuBackendConfig>());
@@ -238,8 +291,9 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
       block_k = tile->sizes(tile->sizes_size() - 1);
     }
     if (block_k <= 0) {
-      if (std::optional<Fp8BlockGemvConfig> seed =
-              Fp8BlockGemvConfigFor(*Cast<HloScaledDotInstruction>(dot));
+      if (std::optional<Fp8BlockGemvConfig> seed = Fp8BlockGemvConfigFor(
+              *Cast<HloScaledDotInstruction>(dot),
+              target_config().device_description.gpu_compute_capability());
           seed.has_value()) {
         block_k = seed->block_k;
       }
@@ -281,6 +335,28 @@ Fp8BlockGemvBackend::GetDefaultConfig(const HloInstruction& instr) {
 
 absl::Status Fp8BlockGemvBackend::ApplyConfig(HloInstruction& instr,
                                               const BackendConfig& config) {
+  if (rung_ == Rung::kCutlass) {
+    if (!config.has_fp8_block_gemm_cutlass()) {
+      return absl::InvalidArgumentError(
+          "Expected an fp8_block_gemm_cutlass config for the CUTLASS rung.");
+    }
+    if (instr.opcode() != HloOpcode::kFusion) {
+      return absl::InvalidArgumentError("expected a fusion");
+    }
+    ABSL_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                          instr.backend_config<GpuBackendConfig>());
+    FusionBackendConfig& backend_config =
+        *gpu_config.mutable_fusion_backend_config();
+    backend_config.set_kind(std::string(kFp8BlockGemmCutlassFusionKind));
+    backend_config.clear_triton_gemm_config();
+    backend_config.clear_block_level_fusion_config();
+    backend_config.mutable_fp8_block_gemm_cutlass_config()->set_config_index(
+        config.fp8_block_gemm_cutlass().config_index());
+    ABSL_RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+    instr.set_fusion_kind(HloInstruction::FusionKind::kCustom);
+    return absl::OkStatus();
+  }
+
   const bool tile_ir = rung_ == Rung::kTileIr;
   const Fp8BlockGemvFusionConfig* slot = ConstSlotFor(rung_, config);
   if (slot == nullptr) {

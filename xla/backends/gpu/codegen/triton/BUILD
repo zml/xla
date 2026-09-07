@@ -256,6 +256,42 @@ cc_library(
     ],
 )
 
+xla_cc_test(
+    name = "fp8_block_gemv_test",
+    srcs = ["fp8_block_gemv_test.cc"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":fp8_block_gemv",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "nvfp4_decode_dot_test",
+    srcs = ["nvfp4_decode_dot_test.cc"],
+    tags = ["no-oneapi"],
+    deps = [
+        ":nvfp4_decode_dot",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "fp8_block_gemv",
     srcs = ["fp8_block_gemv.cc"],
@@ -288,40 +324,6 @@ cc_library(
         "@llvm-project//mlir:Support",
         "@llvm-project//mlir:TensorDialect",
         "@stablehlo//:stablehlo_ops",
-    ],
-)
-
-xla_cc_test(
-    name = "nvfp4_decode_dot_test",
-    srcs = ["nvfp4_decode_dot_test.cc"],
-    tags = ["no-oneapi"],
-    deps = [
-        ":nvfp4_decode_dot",
-        "//xla/hlo/ir:hlo",
-        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
-        "//xla/stream_executor:device_description",
-        "//xla/stream_executor/cuda:cuda_compute_capability",
-        "//xla/tsl/platform:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-xla_cc_test(
-    name = "fp8_block_gemv_test",
-    srcs = ["fp8_block_gemv_test.cc"],
-    tags = ["no-oneapi"],
-    deps = [
-        ":fp8_block_gemv",
-        "//xla/hlo/ir:hlo",
-        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
-        "//xla/tsl/platform:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
     ],
 )
 

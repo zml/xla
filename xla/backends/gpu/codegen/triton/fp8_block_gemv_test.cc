@@ -25,10 +25,16 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/device_description.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla::gpu {
 namespace {
+
+se::GpuComputeCapability Sm(int major, int minor) {
+  return se::GpuComputeCapability(se::CudaComputeCapability(major, minor));
+}
 
 std::string W8A8Hlo(int m, int n, int k,
                     absl::string_view scale_type = "f32") {
@@ -68,29 +74,44 @@ class Fp8BlockGemvTest : public HloHardwareIndependentTestBase {
   }
 };
 
-TEST_F(Fp8BlockGemvTest, ClaimsAW8A8ProjectionAtEveryTileableBatch) {
-  for (int m : {1, 16, 64, 2048}) {
+TEST_F(Fp8BlockGemvTest, ClaimsAW8A8ProjectionAtEveryBatch) {
+  // 24 is the batch only the CUTLASS rung tiles.
+  for (int m : {1, 16, 24, 64, 2048}) {
     TF_ASSERT_OK_AND_ASSIGN(auto module,
                             ParseAndReturnVerifiedModule(W8A8Hlo(m, 5120, 512)));
-    EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)))
+    EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)))
         << "m = " << m;
   }
 }
 
-TEST_F(Fp8BlockGemvTest, DeclinesABatchNoBlockTileDivides) {
+TEST_F(Fp8BlockGemvTest, AnUntileableBatchNeedsTheCutlassRung) {
+  EXPECT_FALSE(Fp8BlockGemvBatchNeedsCutlass(1));
+  EXPECT_FALSE(Fp8BlockGemvBatchNeedsCutlass(16));
+  EXPECT_FALSE(Fp8BlockGemvBatchNeedsCutlass(64));
+  EXPECT_TRUE(Fp8BlockGemvBatchNeedsCutlass(24));
+
   TF_ASSERT_OK_AND_ASSIGN(auto module,
                           ParseAndReturnVerifiedModule(W8A8Hlo(24, 5120, 512)));
-  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)));
+  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(9, 0)));
+  EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)));
+}
+
+TEST_F(Fp8BlockGemvTest, ConsumerBlackwellIsTwelvePointZeroOnly) {
+  EXPECT_TRUE(HasCutlassBlockGemm(Sm(10, 0)));
+  EXPECT_TRUE(HasCutlassBlockGemm(Sm(10, 3)));
+  EXPECT_TRUE(HasCutlassBlockGemm(Sm(12, 0)));
+  EXPECT_FALSE(HasCutlassBlockGemm(Sm(12, 1)));
+  EXPECT_FALSE(HasCutlassBlockGemm(Sm(9, 0)));
 }
 
 TEST_F(Fp8BlockGemvTest, ClaimsAWeightOnlyProjectionUpToSixteenRows) {
   TF_ASSERT_OK_AND_ASSIGN(auto module,
                           ParseAndReturnVerifiedModule(W8A16Hlo(1, 5120, 512)));
-  EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)));
+  EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto prefill, ParseAndReturnVerifiedModule(W8A16Hlo(512, 5120, 512)));
-  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*prefill)));
+  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*prefill), Sm(10, 3)));
 }
 
 TEST_F(Fp8BlockGemvTest, TakesEveryScaleSpelling) {
@@ -98,7 +119,7 @@ TEST_F(Fp8BlockGemvTest, TakesEveryScaleSpelling) {
     TF_ASSERT_OK_AND_ASSIGN(
         auto module,
         ParseAndReturnVerifiedModule(W8A16Hlo(1, 5120, 512, scale)));
-    EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)))
+    EXPECT_TRUE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)))
         << scale;
   }
 }
@@ -115,7 +136,7 @@ TEST_F(Fp8BlockGemvTest, DeclinesAScaleGridThatIsNotBlock128) {
           lhs_contracting_dims={1}, rhs_contracting_dims={1}
     })";
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(mxfp8));
-  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)));
+  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)));
 }
 
 TEST_F(Fp8BlockGemvTest, DeclinesABatchedDot) {
@@ -131,7 +152,7 @@ TEST_F(Fp8BlockGemvTest, DeclinesABatchedDot) {
           rhs_batch_dims={0}, rhs_contracting_dims={2}
     })";
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(batched));
-  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module)));
+  EXPECT_FALSE(Fp8BlockGemvSupportsScaledDot(RootDot(*module), Sm(10, 3)));
 }
 
 }  // namespace
