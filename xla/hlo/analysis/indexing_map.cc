@@ -1140,7 +1140,7 @@ Interval RangeEvaluator::ComputeExpressionRange(SymbolicExpr expr) {
   }
 
   if (use_constraints_) {
-    auto constraints_map = indexing_map_.GetSymbolicConstraints();
+    const auto& constraints_map = indexing_map_.GetSymbolicConstraints();
     auto constraint = constraints_map.find(expr);
     if (constraint != constraints_map.end()) {
       return result.Intersect(constraint->second);
