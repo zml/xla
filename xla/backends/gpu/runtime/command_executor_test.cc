@@ -112,7 +112,7 @@ TEST(CommandExecutorTest, DuplicateAllocsCollapsedToOne) {
 class CommandExecutorUpdateTest : public ::testing::Test {
  protected:
   void ExpectUpdateCount(
-      std::optional<std::vector<BufferAllocation::Index>> updated_allocs,
+      std::optional<Command::UpdatedAllocations> updated_allocs,
       std::vector<BufferAllocation::Index> persistent_alloc_indices,
       bool is_initialization, bool requires_update_on_initialize,
       bool requires_update_on_execute, int expected_update_count) {
@@ -167,7 +167,7 @@ class CommandExecutorUpdateTest : public ::testing::Test {
 };
 
 TEST_F(CommandExecutorUpdateTest, EmptyUpdatedAllocationsSkipRegularCommand) {
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{},
                     /*persistent_alloc_indices=*/{1},
                     /*is_initialization=*/false,
                     /*requires_update_on_initialize=*/false,
@@ -177,7 +177,7 @@ TEST_F(CommandExecutorUpdateTest, EmptyUpdatedAllocationsSkipRegularCommand) {
 
 TEST_F(CommandExecutorUpdateTest,
        EmptyUpdatedAllocationsDoNotSkipRequiredCommand) {
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{},
                     /*persistent_alloc_indices=*/{0},
                     /*is_initialization=*/false,
                     /*requires_update_on_initialize=*/false,
@@ -195,19 +195,19 @@ TEST_F(CommandExecutorUpdateTest, UnknownUpdatedAllocationsUpdateCommand) {
 }
 
 TEST_F(CommandExecutorUpdateTest, UpdatedAllocationIntersectionControlsUpdate) {
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{0},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{0},
                     /*persistent_alloc_indices=*/{1},
                     /*is_initialization=*/false,
                     /*requires_update_on_initialize=*/false,
                     /*requires_update_on_execute=*/false,
                     /*expected_update_count=*/1);
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{1},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{1},
                     /*persistent_alloc_indices=*/{1},
                     /*is_initialization=*/false,
                     /*requires_update_on_initialize=*/false,
                     /*requires_update_on_execute=*/false,
                     /*expected_update_count=*/0);
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{0},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{0},
                     /*persistent_alloc_indices=*/{0},
                     /*is_initialization=*/false,
                     /*requires_update_on_initialize=*/false,
@@ -217,13 +217,13 @@ TEST_F(CommandExecutorUpdateTest, UpdatedAllocationIntersectionControlsUpdate) {
 
 TEST_F(CommandExecutorUpdateTest,
        InitializationUpdatePreservesPersistentException) {
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{},
                     /*persistent_alloc_indices=*/{1},
                     /*is_initialization=*/true,
                     /*requires_update_on_initialize=*/true,
                     /*requires_update_on_execute=*/false,
                     /*expected_update_count=*/1);
-  ExpectUpdateCount(/*updated_allocs=*/std::vector<BufferAllocation::Index>{},
+  ExpectUpdateCount(/*updated_allocs=*/Command::UpdatedAllocations{},
                     /*persistent_alloc_indices=*/{0},
                     /*is_initialization=*/true,
                     /*requires_update_on_initialize=*/true,
