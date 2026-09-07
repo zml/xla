@@ -50,6 +50,8 @@ limitations under the License.
 #include "xla/literal_util.h"
 #include "xla/pjrt/abstract_tracked_device_buffer.h"
 #include "xla/pjrt/common_pjrt_client.h"
+#include "xla/pjrt/host_memory_allocator.h"
+#include "xla/pjrt/host_memory_spaces.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_executable.h"
@@ -65,11 +67,13 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/stream_executor/device_address_allocator.h"
 #include "xla/stream_executor/host/host_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform/initialize.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/concurrency/async_value.h"
+#include "xla/tsl/framework/allocator.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/statusor.h"
@@ -195,9 +199,12 @@ MakeTestPjRtStreamExecutorClient(
   return result;
 }
 
-absl::StatusOr<std::unique_ptr<PjRtStreamExecutorClient>> GetClient() {
+absl::StatusOr<std::unique_ptr<PjRtStreamExecutorClient>> GetClient(
+    std::unique_ptr<se::DeviceAddressAllocator> allocator = nullptr,
+    std::unique_ptr<HostMemoryAllocator> host_memory_allocator = nullptr) {
   LocalClient* local_client = xla::ClientLibrary::LocalClientOrDie();
-  ABSL_ASSIGN_OR_RETURN(se::Platform * platform, PlatformUtil::GetPlatform("Host"));
+  ABSL_ASSIGN_OR_RETURN(se::Platform * platform,
+                        PlatformUtil::GetPlatform("Host"));
   ABSL_ASSIGN_OR_RETURN(se::StreamExecutor * executor,
                    platform->ExecutorForDevice(0));
   std::vector<std::unique_ptr<LocalDeviceState>> local_device_states;
@@ -215,15 +222,149 @@ absl::StatusOr<std::unique_ptr<PjRtStreamExecutorClient>> GetClient() {
       0, devices.back().get(), "cpu", 0));
   devices.back()->AttachMemorySpace(memory_spaces.back().get(),
                                     /*is_default=*/true);
+  if (host_memory_allocator != nullptr) {
+    memory_spaces.emplace_back(std::make_unique<PjRtStreamExecutorMemorySpace>(
+        1, devices.back().get(), PinnedHostMemorySpace::kKind,
+        PinnedHostMemorySpace::kKindId));
+    devices.back()->AttachMemorySpace(memory_spaces.back().get());
+  }
   auto topology = CreateCpuTopologyDescription(devices.size());
   return MakeTestPjRtStreamExecutorClient(
       "cpu", local_client, std::move(devices), std::move(local_device_states),
       /*process_index=*/0, std::move(memory_spaces),
-      /*topology=*/std::move(topology), /*allocator=*/nullptr,
-      /*host_memory_allocator=*/nullptr,
+      /*topology=*/std::move(topology), std::move(allocator),
+      std::move(host_memory_allocator),
       /*should_stage_host_to_device_transfers=*/false,
       /*gpu_run_options=*/nullptr);
 }
+
+// A device allocator that fails even for host requests, as a device-only
+// allocator is permitted to do. Pinned-host buffers must not depend on it.
+class RejectingDeviceAllocator : public se::DeviceAddressAllocator {
+ public:
+  explicit RejectingDeviceAllocator(const se::Platform* platform)
+      : DeviceAddressAllocator(platform) {}
+
+  absl::StatusOr<se::ScopedDeviceAddress<uint8_t>> Allocate(
+      int device_ordinal, uint64_t size, bool retry_on_failure,
+      int64_t memory_space) override {
+    ++allocation_count;
+    return absl::ResourceExhaustedError("Device allocation rejected");
+  }
+  absl::Status Deallocate(int device_ordinal,
+                          se::DeviceAddressBase mem) override {
+    ADD_FAILURE() << "Unexpected device deallocation";
+    return absl::OkStatus();
+  }
+  absl::StatusOr<se::Stream*> GetStream(int device_ordinal) override {
+    return absl::UnimplementedError("No device allocation stream");
+  }
+
+  int allocation_count = 0;
+};
+
+class RecordingHostBackingAllocator : public tsl::Allocator {
+ public:
+  std::string Name() override { return "recording_host"; }
+  void* AllocateRaw(size_t alignment, size_t num_bytes) override {
+    ++allocation_count;
+    EXPECT_LE(alignment, alignof(decltype(storage_)));
+    EXPECT_LE(num_bytes, sizeof(storage_));
+    if (fail) return nullptr;
+    return storage_.data;
+  }
+  void DeallocateRaw(void* ptr) override {
+    EXPECT_EQ(ptr, storage_.data);
+    ++deallocation_count;
+  }
+
+  void* data() { return storage_.data; }
+  bool fail = false;
+  int allocation_count = 0;
+  int deallocation_count = 0;
+
+ private:
+  struct alignas(tsl::Allocator::kAllocatorAlignment) Storage {
+    uint8_t data[1024];
+  } storage_;
+};
+
+// Exercises the custom allocator path with the same backing allocation and
+// lifetime checks as BasicHostMemoryAllocator.
+class ForwardingHostAllocator : public HostMemoryAllocator {
+ public:
+  explicit ForwardingHostAllocator(
+      std::unique_ptr<HostMemoryAllocator> allocator)
+      : allocator_(std::move(allocator)) {}
+  OwnedPtr Allocate(size_t size, const AllocateOptions& options) override {
+    return allocator_->Allocate(size, options);
+  }
+
+ private:
+  std::unique_ptr<HostMemoryAllocator> allocator_;
+};
+
+class PinnedHostAllocatorTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(PinnedHostAllocatorTest, UsesHostAllocator) {
+  ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                       PlatformUtil::GetPlatform("Host"));
+  auto device_allocator = std::make_unique<RejectingDeviceAllocator>(platform);
+  auto* device_allocator_ptr = device_allocator.get();
+  auto backing_allocator = std::make_unique<RecordingHostBackingAllocator>();
+  auto* backing_allocator_ptr = backing_allocator.get();
+  std::unique_ptr<HostMemoryAllocator> host_allocator =
+      std::make_unique<BasicHostMemoryAllocator>(std::move(backing_allocator));
+  if (GetParam()) {
+    host_allocator =
+        std::make_unique<ForwardingHostAllocator>(std::move(host_allocator));
+  }
+  ASSERT_OK_AND_ASSIGN(auto client,
+                       GetClient(std::move(device_allocator),
+                                 std::move(host_allocator)));
+  auto* device = client->addressable_devices()[0];
+  ASSERT_OK_AND_ASSIGN(
+      auto* host_space,
+      device->memory_space_by_kind(PinnedHostMemorySpace::kKind));
+  {
+    ASSERT_OK_AND_ASSIGN(
+        auto buffer, client->raw_client()->AllocateRawBuffer(
+                         host_space, 1024, /*retry_on_oom=*/false, {}));
+    EXPECT_EQ(buffer->GetHostPointer(), backing_allocator_ptr->data());
+    EXPECT_EQ(backing_allocator_ptr->allocation_count, 1);
+    EXPECT_EQ(backing_allocator_ptr->deallocation_count, 0);
+    EXPECT_EQ(device_allocator_ptr->allocation_count, 0);
+    auto retained_buffer = buffer.CopyRef();
+    buffer.reset();
+    EXPECT_EQ(backing_allocator_ptr->deallocation_count, 0);
+  }
+  EXPECT_EQ(backing_allocator_ptr->deallocation_count, 1);
+
+  // BasicHostMemoryAllocator intentionally returns null for an empty buffer.
+  ASSERT_OK_AND_ASSIGN(
+      auto empty, client->raw_client()->AllocateRawBuffer(
+                      host_space, 0, /*retry_on_oom=*/false, {}));
+  EXPECT_EQ(empty->GetHostPointer(), nullptr);
+  EXPECT_EQ(backing_allocator_ptr->allocation_count, 1);
+
+  backing_allocator_ptr->fail = true;
+  auto failed = client->raw_client()->AllocateRawBuffer(
+      host_space, 1024, /*retry_on_oom=*/false, {});
+  EXPECT_EQ(failed.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_THAT(failed.status().message(), HasSubstr("host"));
+  EXPECT_EQ(backing_allocator_ptr->allocation_count, 2);
+  EXPECT_EQ(device_allocator_ptr->allocation_count, 0);
+
+  ASSERT_OK_AND_ASSIGN(auto* device_space, device->default_memory_space());
+  auto device_buffer = client->raw_client()->AllocateRawBuffer(
+      device_space, 1024, /*retry_on_oom=*/false, {});
+  EXPECT_THAT(device_buffer.status().message(),
+              HasSubstr("Device allocation rejected"));
+  EXPECT_EQ(device_allocator_ptr->allocation_count, 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(BasicAndCustom, PinnedHostAllocatorTest,
+                         ::testing::Bool());
 
 // Variant of GetClient() that creates `num_addressable_devices` Host-platform
 // devices and optional `num_non_addressable_devices` non-addressable devices,

@@ -304,9 +304,6 @@ PjRtStreamExecutorRawClient::PjRtStreamExecutorRawClient(
     : owned_allocator_(std::move(allocator)),
       client_(client),
       host_memory_allocator_(std::move(host_memory_allocator)),
-      has_custom_host_memory_allocator_(dynamic_cast<BasicHostMemoryAllocator*>(
-                                            host_memory_allocator_.get()) ==
-                                        nullptr),
       should_stage_host_to_device_transfers_(
           should_stage_host_to_device_transfers),
       executor_(executor),
@@ -441,27 +438,34 @@ absl::StatusOr<PjRtRawBufferRef> PjRtStreamExecutorRawClient::AllocateRawBuffer(
         absl::StrCat("Buffer allocation: invalid memory space: ",
                      memory_space->DebugString()));
   }
-  if (allocator_ == nullptr) {
-    return absl::InternalError(
-        "se::DeviceAddressAllocator is null in PjRtStreamExecutorRawClient.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      auto buffer,
-      allocator_->Allocate(local_device->local_device_id().value(),
-                           on_device_bytes_count, true, layout_memory_space));
   tsl::AsyncValueRef<RawSEDeviceMemory> mem;
-  if (has_custom_host_memory_allocator_ &&
-      layout_memory_space == Layout::kHostMemorySpace) {
+  if (layout_memory_space == Layout::kHostMemorySpace) {
+    // Device allocators (in particular VMM) need not return CPU-accessible
+    // memory. Pinned-host buffers must use the host allocator, including when
+    // it is the default BasicHostMemoryAllocator.
     xla::HostMemoryAllocator::AllocateOptions alloc_opts = {
         /*numa_node=*/local_device->executor()->numa_node(),
         /*local_device_id=*/local_device->local_device_id(),
     };
     auto buffer =
         GetHostMemoryAllocator()->Allocate(on_device_bytes_count, alloc_opts);
+    if (buffer == nullptr && on_device_bytes_count != 0) {
+      return absl::ResourceExhaustedError(
+          absl::StrCat("Failed to allocate ", on_device_bytes_count,
+                       " bytes of pinned host memory"));
+    }
     se::DeviceAddressBase address(buffer.get(), on_device_bytes_count);
     mem = RawSEDeviceMemory::CreateForeign(address,
                                            [buffer = std::move(buffer)]() {});
   } else {
+    if (allocator_ == nullptr) {
+      return absl::InternalError(
+          "se::DeviceAddressAllocator is null in PjRtStreamExecutorRawClient.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        auto buffer,
+        allocator_->Allocate(local_device->local_device_id().value(),
+                             on_device_bytes_count, true, layout_memory_space));
     mem = RawSEDeviceMemory::Create(buffer.Release(), local_device, allocator_);
   }
   if (client_ != nullptr && local_device->allocation_model() !=
