@@ -6,27 +6,26 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
-#include <variant>
 #include <vector>
 
+#include "absl/base/call_once.h"
 #include "absl/base/no_destructor.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
-#include "absl/synchronization/notification.h"
-#include "absl/time/time.h"
-
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/stream_executor/cuda/subprocess_compilation.h"
-#include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/semantic_version.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
@@ -36,17 +35,14 @@
 
 namespace xla::gpu::tile_ir {
 
-absl::StatusOr<std::string> FindTileIrAssembler(
-    absl::string_view preferred_cuda_dir) {
-  static constexpr stream_executor::SemanticVersion kMinimumVersion{13, 3, 0};
-  static constexpr absl::Span<const stream_executor::SemanticVersion>
-      kNoExcludedVersions{};
-  return stream_executor::FindCudaExecutable("tileiras", preferred_cuda_dir,
-                                             kMinimumVersion,
-                                             kNoExcludedVersions);
-}
-
 namespace {
+
+constexpr stream_executor::SemanticVersion kMinimumTileirasVersion{13, 3, 0};
+
+// tileiras wants plain sm_120; it passes sm_120a to ptxas itself.
+std::string ArchName(const se::CudaComputeCapability& cc) {
+  return absl::StrCat("sm_", cc.major, cc.minor);
+}
 
 absl::Mutex& CubinCacheMutex() {
   static absl::NoDestructor<absl::Mutex> mutex;
@@ -77,6 +73,15 @@ absl::Duration TileIrCompilerTimeout() {
 
 }  // namespace
 
+absl::StatusOr<std::string> FindTileIrAssembler(
+    absl::string_view preferred_cuda_dir) {
+  static constexpr absl::Span<const stream_executor::SemanticVersion>
+      kNoExcludedVersions{};
+  return stream_executor::FindCudaExecutable("tileiras", preferred_cuda_dir,
+                                             kMinimumTileirasVersion,
+                                             kNoExcludedVersions);
+}
+
 absl::StatusOr<std::vector<uint8_t>> CompileTileIrBytecode(
     absl::string_view bytecode, const se::DeviceDescription& device_info,
     const DebugOptions& debug_options) {
@@ -87,8 +92,7 @@ absl::StatusOr<std::vector<uint8_t>> CompileTileIrBytecode(
         "CUDA Tile IR codegen is only available on NVIDIA GPUs.");
   }
 
-  std::string cache_key =
-      absl::StrCat("sm_", cc->major, cc->minor, "\0", bytecode);
+  std::string cache_key = absl::StrCat(ArchName(*cc), ":", bytecode);
   {
     absl::MutexLock lock(&CubinCacheMutex());
     auto it = CubinCache().find(cache_key);
@@ -100,15 +104,15 @@ absl::StatusOr<std::vector<uint8_t>> CompileTileIrBytecode(
   if (!tileiras_path.ok()) {
     static absl::once_flag once;
     absl::call_once(once, [&] {
-      LOG(ERROR) << "xla_gpu_experimental_scaled_dot_with_tile_ir is on but no "
-                    "`tileiras` of version 13.3 or newer was found ("
-                 << tileiras_path.status().message()
-                 << "). Every CUDA Tile IR candidate will fail and the "
-                    "autotuner will silently fall back to Triton. Point "
-                    "$XLA_FLAGS --xla_gpu_cuda_data_dir at a CUDA 13.3+ root "
-                    "whose bin/ holds both tileiras and ptxas -- tileiras "
-                    "shells out to ptxas and reports nothing but \"failed to "
-                    "compile Tile IR program\" when it cannot find one.";
+      LOG(ERROR) << "No `tileiras` of version "
+                 << kMinimumTileirasVersion.ToString()
+                 << " or newer was found (" << tileiras_path.status().message()
+                 << "). CUDA Tile IR kernels cannot be compiled and there is "
+                    "no fallback. Point $XLA_FLAGS --xla_gpu_cuda_data_dir at "
+                    "a CUDA 13.3+ root whose bin/ holds both tileiras and "
+                    "ptxas -- tileiras shells out to ptxas and reports "
+                    "nothing but \"failed to compile Tile IR program\" when "
+                    "it cannot find one.";
     });
     return tileiras_path.status();
   }
@@ -126,10 +130,8 @@ absl::StatusOr<std::vector<uint8_t>> CompileTileIrBytecode(
   };
   ABSL_RETURN_IF_ERROR(tsl::WriteStringToFile(env, bytecode_path, bytecode));
 
-  // tileiras wants plain sm_120; it passes sm_120a to ptxas itself.
-  std::vector<std::string> args = {
-      *tileiras_path, bytecode_path, "-o", cubin_path, "--gpu-name",
-      absl::StrCat("sm_", cc->major, cc->minor)};
+  std::vector<std::string> args = {*tileiras_path, bytecode_path, "-o",
+                                   cubin_path,     "--gpu-name",  ArchName(*cc)};
 
   VLOG(3) << "Running: " << absl::StrJoin(args, " ");
   tsl::SubProcess tileiras;

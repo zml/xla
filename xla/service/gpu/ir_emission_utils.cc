@@ -214,6 +214,11 @@ bool IsCustomCallToPtxKernel(const HloInstruction& hlo) {
          hlo.custom_call_target() == "__gpu$xla.gpu.ptx";
 }
 
+bool IsCustomCallToCudaTileKernel(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kCudaTileCustomCallTarget;
+}
+
 bool IsCustomCallToMosaicGpu(const HloInstruction& hlo) {
   return hlo.opcode() == HloOpcode::kCustomCall &&
          (hlo.custom_call_target() == "mosaic_gpu" ||

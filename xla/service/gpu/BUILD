@@ -438,6 +438,92 @@ cc_library(
 )
 
 cc_library(
+    name = "cuda_tile_custom_kernel_emitter_cuda",
+    srcs = ["cuda_tile_custom_kernel_emitter_cuda.cc"],
+    hdrs = ["cuda_tile_custom_kernel_emitter.h"],
+    tags = [
+        "cuda-only",
+        "gpu",
+    ],
+    deps = [
+        ":cuda_tile_call",
+        ":gpu_constants",
+        ":ir_emitter_context",
+        ":kernel_reuse_cache",
+        ":launch_dimensions",
+        "//xla:future",
+        "//xla/backends/gpu/codegen:kernel_compiler",
+        "//xla/backends/gpu/codegen/kernels:custom_kernel",
+        "//xla/backends/gpu/codegen/kernels:ptx_custom_kernel",
+        "//xla/backends/gpu/codegen/tile_ir:tile_ir_module",
+        "//xla/backends/gpu/codegen/tile_ir:tileiras_compiler",
+        "//xla/backends/gpu/runtime:custom_kernel_thunk",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/codegen/emitters:kernel_arguments",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:dump",
+        "//xla/stream_executor:launch_dim",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "cuda_tile_custom_kernel_emitter_rocm",
+    srcs = ["cuda_tile_custom_kernel_emitter_rocm.cc"],
+    hdrs = ["cuda_tile_custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "rocm-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla:future",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
+    name = "cuda_tile_custom_kernel_emitter_sycl",
+    srcs = ["cuda_tile_custom_kernel_emitter_sycl_stub.cc"],
+    hdrs = ["cuda_tile_custom_kernel_emitter.h"],
+    tags = [
+        "gpu",
+        "oneapi-only",
+    ],
+    deps = [
+        ":ir_emitter_context",
+        "//xla:future",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_library(
+    name = "cuda_tile_custom_kernel_emitter",
+    hdrs = ["cuda_tile_custom_kernel_emitter.h"],
+    tags = ["gpu"],
+    deps = if_cuda_is_configured([
+        ":cuda_tile_custom_kernel_emitter_cuda",
+    ]) + if_rocm_is_configured([
+        ":cuda_tile_custom_kernel_emitter_rocm",
+    ]) + if_sycl_is_configured([
+        ":cuda_tile_custom_kernel_emitter_sycl",
+    ]) + [
+        "//xla:future",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/hlo/ir:hlo",
+    ],
+)
+
+cc_library(
     name = "ir_emitter_context",
     hdrs = ["ir_emitter_context.h"],
     deps = [
@@ -475,6 +561,7 @@ cc_library(
     deps = [
         ":backend_configs_cc",
         ":cublas_cudnn",
+        ":cuda_tile_custom_kernel_emitter",
         ":dense_data_intermediate",
         ":execution_stream_assignment",
         ":gpu_constants",
@@ -636,6 +723,40 @@ xla_cc_test(
         ":kernel_call",
         "//xla/tests:xla_internal_test_main",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+        "@llvm-project//mlir:IR",
+    ],
+)
+
+cc_library(
+    name = "cuda_tile_call",
+    srcs = ["cuda_tile_call.cc"],
+    hdrs = ["cuda_tile_call.h"],
+    deps = [
+        "//xla/mlir/utils:error_util",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AsmParser",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+xla_cc_test(
+    name = "cuda_tile_call_test",
+    srcs = ["cuda_tile_call_test.cc"],
+    deps = [
+        ":cuda_tile_call",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
         "@llvm-project//mlir:IR",

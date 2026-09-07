@@ -458,6 +458,42 @@ TEST_F(LayoutAssignmentTest, TopKLayout) {
                       .WithShape(F32, {6, 2048}, {1, 0}))));
 }
 
+// A CUDA Tile IR kernel reads raw pointers, so its operands and result are
+// pinned to the default layout even when the neighbours would prefer another
+// one. The call sits between two transposes so neither the entry parameter
+// nor the result layout pins it for free.
+TEST_F(LayoutAssignmentTest, CudaTileCustomCallGetsDefaultLayouts) {
+  const char* hlo_text = R"(
+  HloModule cuda_tile
+
+  ENTRY main {
+    p = f32[32,4]{1,0} parameter(0)
+    t = f32[4,32] transpose(p), dimensions={1,0}
+    cc = f32[4,32] custom-call(t), custom_call_target="__gpu$xla.gpu.cuda_tile"
+    ROOT r = f32[32,4] transpose(cc), dimensions={1,0}
+  })";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_text));
+
+  ComputationLayout computation_layout(
+      module->entry_computation()->ComputeProgramShape(),
+      /*ignore_layouts=*/false);
+  GpuLayoutAssignment layout_assignment(&computation_layout, default_gpu_cc_,
+                                        default_device_description_);
+
+  EXPECT_THAT(layout_assignment.Run(module.get()),
+              absl_testing::IsOkAndHolds(true));
+
+  const HloInstruction* cc = FindInstruction(module.get(), "cc");
+  ASSERT_NE(cc, nullptr);
+  EXPECT_TRUE(LayoutUtil::Equal(cc->shape().layout(),
+                                LayoutUtil::MakeLayout({1, 0})))
+      << module->ToString();
+  EXPECT_TRUE(LayoutUtil::Equal(cc->operand(0)->shape().layout(),
+                                LayoutUtil::MakeLayout({1, 0})))
+      << module->ToString();
+}
+
 TEST_F(LayoutAssignmentTest,
        BitcastConvertFromNarrowerTypeGetsOptimalInputLayout) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,

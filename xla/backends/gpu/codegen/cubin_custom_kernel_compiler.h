@@ -91,6 +91,10 @@ class CubinCustomKernelCompiler final : public KernelCompiler {
       TritonKernelSource triton_source, BorrowedMlirContext borrowed_context,
       bool is_xla_fusion) override;
 
+  tsl::Executor* executor() override {
+    return thread_pool_ ? thread_pool_->AsExecutor() : nullptr;
+  }
+
  private:
   absl::StatusOr<std::vector<uint8_t>> CompileToCubinImpl(
       LlvmKernelSource kernel_source);

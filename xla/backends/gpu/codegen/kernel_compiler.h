@@ -93,6 +93,10 @@ class KernelCompiler {
   virtual xla::Future<std::vector<uint8_t>> CompileToTargetBinary(
       LlvmKernelSource kernel_source) = 0;
 
+  // The executor compilation work may be offloaded to, or nullptr when the
+  // compiler has none and callers must run on the calling thread.
+  virtual tsl::Executor* executor() { return nullptr; }
+
   // Sets a callback to be called prior to llvm::Module compilation.
   void SetPreOptimizationHook(ModuleHook hook) {
     pre_optimization_hook_ = std::move(hook);

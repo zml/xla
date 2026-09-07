@@ -1145,6 +1145,29 @@ xla_test(
     ],
 )
 
+xla_test(
+    name = "cuda_tile_kernel_test",
+    srcs = ["cuda_tile_kernel_test.cc"],
+    backends = ["gpu"],
+    tags = ["cuda-only"],
+    deps = [
+        "//xla:debug_options_flags",
+        "//xla:literal",
+        "//xla:literal_util",
+        "//xla:xla_proto_cc",
+        "//xla/backends/gpu/codegen/tile_ir:tileiras_compiler",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_module_config",
+        "//xla/tests:hlo_pjrt_test_base",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "collective_ops_e2e_test_base",
     testonly = True,

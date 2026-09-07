@@ -138,6 +138,7 @@ limitations under the License.
 #include "xla/service/collective_opt_utils.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
+#include "xla/service/gpu/cuda_tile_custom_kernel_emitter.h"
 #include "xla/service/gpu/custom_kernel_emitter.h"
 #include "xla/service/gpu/dense_data_intermediate.h"
 #include "xla/service/gpu/execution_stream_assignment.h"
@@ -411,6 +412,9 @@ Future<ThunkSequence> ThunkEmitter::DispatchCustomCall(
   }
   if (IsCustomCallToPtxKernel(*hlo)) {
     return EmitPtxCustomCall(custom_call);
+  }
+  if (IsCustomCallToCudaTileKernel(*hlo)) {
+    return EmitCudaTileCustomCall(custom_call);
   }
   if (IsCustomCallToTopK(*hlo)) {
     return EmitTopKCustomCall(custom_call);
@@ -1125,6 +1129,11 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitPtxCustomCall(
   ABSL_ASSIGN_OR_RETURN(auto thunk,
                    EmitPtxCustomKernelThunk(instr, ir_emitter_context_));
   return ThunkSequence::Of(std::move(thunk));
+}
+
+Future<ThunkSequence> ThunkEmitter::EmitCudaTileCustomCall(
+    const HloCustomCallInstruction* instr) {
+  return EmitCudaTileCustomKernelThunk(instr, ir_emitter_context_);
 }
 
 std::optional<BufferAllocation::Slice> ThunkEmitter::GetAllocationOverride(

@@ -282,6 +282,9 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitPtxCustomCall(
       const HloCustomCallInstruction* instr);
 
+  Future<ThunkSequence> EmitCudaTileCustomCall(
+      const HloCustomCallInstruction* instr);
+
   // Emits device send/recv as synchronous operations without async wrapping.
   // These instructions have `is_host_transfer() == false`;
   // DispatchSend/DispatchRecv use their parent computation to decide whether

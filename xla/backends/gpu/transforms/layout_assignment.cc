@@ -604,6 +604,18 @@ absl::Status GpuLayoutAssignment::AddBackendConstraints(
           auto indices_buffer,
           points_to_analysis_->GetBufferDefinedAt(instruction, {1}));
       ABSL_RETURN_IF_ERROR(SetBufferLayout(default_layout, *indices_buffer));
+    } else if (IsCustomCallToCudaTileKernel(*instruction)) {
+      // A CUDA Tile IR kernel reads raw device pointers, so every operand and
+      // result must arrive in the default layout. Pinning them here keeps the
+      // call off the layout-constrained path, which copies aliased operands.
+      for (int64_t i = 0; i < instruction->operand_count(); ++i) {
+        Shape operand_shape = instruction->operand(i)->shape();
+        LayoutUtil::SetToDefaultLayout(&operand_shape);
+        ABSL_RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction, i));
+      }
+      Shape output_shape = instruction->shape();
+      LayoutUtil::SetToDefaultLayout(&output_shape);
+      ABSL_RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction));
     } else if (HloPredicateIsOp<HloOpcode::kBitcastConvert>(instruction)) {
       Shape operand_shape = instruction->operand(0)->shape();
       Shape output_shape = instruction->shape();

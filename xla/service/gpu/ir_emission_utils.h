@@ -142,6 +142,11 @@ inline constexpr absl::string_view kUncompilableFusion =
 
 inline constexpr absl::string_view kTopKCustomCallTarget = "__gpu$TopK";
 
+// Custom calls whose backend_config carries a textual cuda_tile module, to be
+// assembled with tileiras and launched as a custom kernel.
+inline constexpr absl::string_view kCudaTileCustomCallTarget =
+    "__gpu$xla.gpu.cuda_tile";
+
 // The number of shared memory banks.
 inline constexpr int64_t kNumShmemBanks = 32;
 
@@ -166,6 +171,10 @@ bool IsCustomCallToTopK(const HloInstruction& hlo);
 // Returns true if `hlo` will be implmented as a call to a custom PTX kernel
 // implementation.
 bool IsCustomCallToPtxKernel(const HloInstruction& hlo);
+
+// Returns true if `hlo` will be implemented as a call to a CUDA Tile IR
+// kernel.
+bool IsCustomCallToCudaTileKernel(const HloInstruction& hlo);
 
 // Returns true if `hlo` will be implemented as a call to a Mosaic GPU kernel
 // with parameter uses symmetric memory.
