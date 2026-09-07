@@ -43,7 +43,7 @@ struct AirArg {
   bool read_only = true;    // device buffers only: air.read vs air.read_write
 };
 
-void StampAirModuleEnvelope(llvm::Module& module);
+void StampAirModuleEnvelope(llvm::Module& module, bool fast_math);
 
 void AttachAirKernelMetadata(llvm::Function* f, absl::Span<const AirArg> args);
 

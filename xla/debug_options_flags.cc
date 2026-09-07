@@ -488,6 +488,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 
   opts.set_xla_gpu_use_new_autotune_cache_format(true);
 
+  opts.set_xla_gpu_metal_fast_math(true);
+
   opts.set_xla_compile_all_supported_configs(false);
   opts.set_xla_deduplicate_backend_configs_min_size(
       std::numeric_limits<int64_t>::max());
@@ -3065,6 +3067,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_gpu_use_new_autotune_cache_format(),
       "Whether to use the new protos for the autotune cache"
       " (xla.autotuner.AutotuneCache rather than xla.AutotuneResults."));
+
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_metal_fast_math",
+      bool_setter_for(&DebugOptions::set_xla_gpu_metal_fast_math),
+      debug_options->xla_gpu_metal_fast_math(),
+      "Stamp air.compile.fast_math_enable on the AIR modules the Metal backend "
+      "emits. Fast math permits assuming no NaNs, so is_finite(NaN) can return "
+      "true."));
 
   flag_list->push_back(tsl::Flag(
       "xla_compile_all_supported_configs",

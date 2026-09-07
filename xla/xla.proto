@@ -1847,6 +1847,11 @@ message DebugOptions {
 
   // Next id: 545
 
+  // Fork-only flags live at 900+ so upstream can keep taking ids from 543 up.
+  // 900 is xla_gpu_experimental_scaled_dot_with_tile_ir on the cuda branch.
+
+  optional bool xla_gpu_metal_fast_math = 901;
+
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.
   map<string, string> xla_backend_extra_options = 500;

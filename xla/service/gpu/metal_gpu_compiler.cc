@@ -822,7 +822,8 @@ MetalGpuCompiler::CompileTargetBinary(
         "Metal AIR backend does not support relocatable compilation.");
   }
 
-  metal::StampAirModuleEnvelope(*llvm_module);
+  metal::StampAirModuleEnvelope(
+      *llvm_module, module_config.debug_options().xla_gpu_metal_fast_math());
 
   std::string air_ll;
   llvm::raw_string_ostream os(air_ll);

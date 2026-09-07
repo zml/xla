@@ -43,7 +43,7 @@ constexpr char kAirDataLayout[] =
 
 }  // namespace
 
-void StampAirModuleEnvelope(llvm::Module& module) {
+void StampAirModuleEnvelope(llvm::Module& module, bool fast_math) {
   llvm::LLVMContext& ctx = module.getContext();
   auto I32 = [&ctx](int v) -> llvm::Metadata* {
     return llvm::ConstantAsMetadata::get(
@@ -85,8 +85,10 @@ void StampAirModuleEnvelope(llvm::Module& module) {
         module.getOrInsertNamedMetadata("air.compile_options");
     opts->addOperand(
         llvm::MDNode::get(ctx, {Str("air.compile.denorms_disable")}));
-    opts->addOperand(
-        llvm::MDNode::get(ctx, {Str("air.compile.fast_math_enable")}));
+    if (fast_math) {
+      opts->addOperand(
+          llvm::MDNode::get(ctx, {Str("air.compile.fast_math_enable")}));
+    }
     opts->addOperand(
         llvm::MDNode::get(ctx, {Str("air.compile.framebuffer_fetch_enable")}));
   }
