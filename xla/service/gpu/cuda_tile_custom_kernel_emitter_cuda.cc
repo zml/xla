@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -15,6 +16,7 @@
 #include "xla/backends/gpu/codegen/tile_ir/tile_ir_module.h"
 #include "xla/backends/gpu/codegen/tile_ir/tileiras_compiler.h"
 #include "xla/backends/gpu/runtime/custom_kernel_thunk.h"
+#include "xla/backends/gpu/runtime/memset_thunk.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/future.h"
@@ -27,6 +29,10 @@
 #include "xla/service/gpu/ir_emitter_context.h"
 #include "xla/service/gpu/kernel_reuse_cache.h"
 #include "xla/service/gpu/launch_dimensions.h"
+#include "xla/service/buffer_assignment.h"
+#include "xla/service/shaped_slice.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -65,6 +71,44 @@ xla::Future<ThunkSequence> EmitCudaTileCustomKernelThunk(
                             GetDefaultBufferAlignment(), instr,
                             call.output_indices));
   const int num_args = kernel_arguments.args().size();
+
+  // `zeroed_outputs` names array result leaves; resolve them to slices here,
+  // beside the grid check, so a cache hit does not skip the validation.
+  ThunkSequence thunks;
+  if (!call.zeroed_outputs.empty()) {
+    std::vector<std::pair<Shape, ShapeIndex>> leaves;
+    ShapeUtil::ForEachSubshape(
+        instr->shape(), [&](const Shape& subshape, const ShapeIndex& index) {
+          if (subshape.IsArray()) leaves.emplace_back(subshape, index);
+        });
+    for (int32_t leaf : call.zeroed_outputs) {
+      if (leaf >= leaves.size()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "backend_config field 'zeroed_outputs' names result leaf ", leaf,
+            " but the custom call has only ", leaves.size(),
+            " array results"));
+      }
+      const auto& [subshape, index] = leaves[leaf];
+      ABSL_ASSIGN_OR_RETURN(
+          BufferAllocation::Slice slice,
+          context->buffer_assignment().GetUniqueSlice(instr, index));
+      // Zeroing an aliased result would destroy the kernel's input.
+      int uses = 0;
+      for (const auto& arg : kernel_arguments.args()) {
+        if (arg.slice() == slice) ++uses;
+      }
+      if (uses > 1) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "backend_config field 'zeroed_outputs' names result leaf ", leaf,
+            ", which aliases an operand; zeroing it would destroy the "
+            "kernel's input"));
+      }
+      thunks.emplace_back(std::make_unique<MemzeroThunk>(
+          Thunk::ThunkInfo::WithProfileAnnotation(instr,
+                                                  context->GetNextThunkId()),
+          ShapedSlice{slice, subshape}));
+    }
+  }
 
   // cuda-tile's launch ABI: the grid counts tile blocks, the block is (1,1,1)
   // and shared memory is 0. Kept here rather than read back from the cache
@@ -126,7 +170,8 @@ xla::Future<ThunkSequence> EmitCudaTileCustomKernelThunk(
       Thunk::ThunkInfo::WithProfileAnnotation(instr, context->GetNextThunkId());
   return entry_future.Map(
       [info = std::move(info), kernel_arguments = std::move(kernel_arguments),
-       grid, block](const KernelReuseCache::Entry* entry) mutable
+       thunks = std::move(thunks), grid,
+       block](const KernelReuseCache::Entry* entry) mutable
           -> absl::StatusOr<ThunkSequence> {
         ABSL_ASSIGN_OR_RETURN(
             CustomKernel kernel,
@@ -134,8 +179,9 @@ xla::Future<ThunkSequence> EmitCudaTileCustomKernelThunk(
                 entry->kernel_name, entry->binary,
                 kernel_arguments.args().size(), grid, block,
                 kSharedMemoryBytes));
-        return ThunkSequence::Of<CustomKernelThunk>(
-            std::move(info), std::move(kernel), std::move(kernel_arguments));
+        thunks.emplace_back(std::make_unique<CustomKernelThunk>(
+            std::move(info), std::move(kernel), kernel_arguments));
+        return std::move(thunks);
       });
 }
 

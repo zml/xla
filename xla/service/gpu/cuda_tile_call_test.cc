@@ -80,7 +80,7 @@ TEST_F(CudaTileCallTest, NonDictionaryConfigIsAnErrorNotACrash) {
 TEST_F(CudaTileCallTest, RejectsLaunchShapeKeys) {
   for (absl::string_view key :
        {"block_x", "block_y", "block_z", "shared_mem_bytes", "num_warps",
-        "num_stages", "num_ctas", "kernel_data", "zeroed_outputs"}) {
+        "num_stages", "num_ctas", "kernel_data", "zeroed_args"}) {
     absl::Status status =
         ParseStatus(Config("", absl::StrCat(key, " = 1")));
     EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument) << key;
@@ -159,6 +159,30 @@ TEST_F(CudaTileCallTest, IrEscapesRoundTrip) {
       CudaTileCall call,
       Parse(Config("ir", R"(ir = "a\"b\\c\nd")")));
   EXPECT_EQ(call.ir, "a\"b\\c\nd");
+}
+
+TEST_F(CudaTileCallTest, ParsesZeroedOutputs) {
+  TF_ASSERT_OK_AND_ASSIGN(CudaTileCall call,
+                          Parse(Config("", "zeroed_outputs = [0, 2]")));
+  EXPECT_THAT(call.zeroed_outputs, ElementsAre(0, 2));
+  EXPECT_TRUE(Parse(Config()).value().zeroed_outputs.empty());
+  for (absl::string_view bad :
+       {"zeroed_outputs = [\"a\"]", "zeroed_outputs = 0",
+        "zeroed_outputs = [-1]", "zeroed_outputs = [4294967296]"}) {
+    EXPECT_EQ(ParseStatus(Config("", bad)).code(),
+              absl::StatusCode::kInvalidArgument)
+        << bad;
+  }
+}
+
+// Ascending lets the emitter skip sorting and de-duplicating.
+TEST_F(CudaTileCallTest, ZeroedOutputsMustBeStrictlyAscending) {
+  for (absl::string_view bad :
+       {"zeroed_outputs = [1, 0]", "zeroed_outputs = [1, 1]"}) {
+    absl::Status status = ParseStatus(Config("", bad));
+    EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument) << bad;
+    EXPECT_THAT(status.message(), HasSubstr("strictly ascending"));
+  }
 }
 
 }  // namespace

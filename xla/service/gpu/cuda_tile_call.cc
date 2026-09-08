@@ -31,12 +31,13 @@ constexpr int64_t kMaxGridAxis = (int64_t{1} << 24) - 1;
 
 // Keys the PTX and Triton configs carry that have no Tile IR meaning; a caller
 // who copies one of those schemas is told, not silently mis-served.
+// `zeroed_args` stays rejected: a cuda_tile kernel has no scratch argument.
 constexpr absl::string_view kRejectedKeys[] = {
-    "block_x",        "block_y",       "block_z",
-    "shared_mem_bytes", "num_warps",   "num_stages",
-    "num_ctas",       "is_tma_allowed", "global_scratch_memory_size",
-    "zeroed_outputs", "zeroed_args",   "cluster_x",
-    "cluster_y",      "cluster_z",     "kernel_data",
+    "block_x",   "block_y",        "block_z",
+    "shared_mem_bytes", "num_warps", "num_stages",
+    "num_ctas",  "is_tma_allowed", "global_scratch_memory_size",
+    "zeroed_args", "cluster_x",    "cluster_y",
+    "cluster_z", "kernel_data",
 };
 
 llvm::StringRef ToStringRef(absl::string_view s) {
@@ -75,6 +76,42 @@ absl::StatusOr<int32_t> GetGridAxis(mlir::DictionaryAttr attrs,
   }
   return static_cast<int32_t>(value);
 }
+
+absl::Status ParseIndexArray(mlir::DictionaryAttr attrs,
+                             absl::string_view key, bool require_ascending,
+                             std::vector<int32_t>* out) {
+  mlir::Attribute raw = attrs.get(ToStringRef(key));
+  if (!raw) {
+    return absl::OkStatus();
+  }
+  auto array = mlir::dyn_cast<mlir::ArrayAttr>(raw);
+  if (!array) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "backend_config field '", key, "' must be an array of integers"));
+  }
+  for (const mlir::Attribute& index : array) {
+    auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(index);
+    if (!int_attr) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Invalid ", key, ": all elements must be integers"));
+    }
+    std::optional<int64_t> value = int_attr.getValue().trySExtValue();
+    if (!value.has_value() || *value < 0 ||
+        *value > std::numeric_limits<int32_t>::max()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Invalid ", key,
+                       ": every element must be a non-negative 32-bit "
+                       "position"));
+    }
+    if (require_ascending && !out->empty() && *value <= out->back()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Invalid ", key, ": elements must be strictly ascending"));
+    }
+    out->push_back(static_cast<int32_t>(*value));
+  }
+  return absl::OkStatus();
+}
+
 
 absl::Status ParseIrVersion(absl::string_view text, uint8_t* major,
                             uint8_t* minor) {
@@ -153,29 +190,12 @@ absl::StatusOr<CudaTileCall> CudaTileCall::Parse(
         &call.bytecode_major, &call.bytecode_minor));
   }
 
-  if (mlir::Attribute raw = attrs.get("output_indices")) {
-    auto output_indices = mlir::dyn_cast<mlir::ArrayAttr>(raw);
-    if (!output_indices) {
-      return absl::InvalidArgumentError(
-          "backend_config field 'output_indices' must be an array of "
-          "integers");
-    }
-    for (const mlir::Attribute& index : output_indices) {
-      auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(index);
-      if (!int_attr) {
-        return absl::InvalidArgumentError(
-            "Invalid output_indices: all elements must be integers");
-      }
-      std::optional<int64_t> value = int_attr.getValue().trySExtValue();
-      if (!value.has_value() || *value < 0 ||
-          *value > std::numeric_limits<int32_t>::max()) {
-        return absl::InvalidArgumentError(
-            "Invalid output_indices: every element must be a non-negative "
-            "32-bit position");
-      }
-      call.output_indices.push_back(static_cast<int32_t>(*value));
-    }
-  }
+  ABSL_RETURN_IF_ERROR(ParseIndexArray(attrs, "output_indices",
+                                       /*require_ascending=*/false,
+                                       &call.output_indices));
+  ABSL_RETURN_IF_ERROR(ParseIndexArray(attrs, "zeroed_outputs",
+                                       /*require_ascending=*/true,
+                                       &call.zeroed_outputs));
 
   return call;
 }

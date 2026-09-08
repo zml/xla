@@ -131,6 +131,28 @@ cuda_tile.module @m {
 }
 )";
 
+// out[i] = in[i] + 1 for the first half only.
+constexpr absl::string_view kHalf = R"(
+cuda_tile.module @m {
+  entry @half(%in : tile<ptr<f32>>, %out : tile<ptr<f32>>) {
+    %offsets = iota : tile<64xi32>
+    %in_r = reshape %in : tile<ptr<f32>> -> tile<1xptr<f32>>
+    %in_b = broadcast %in_r : tile<1xptr<f32>> -> tile<64xptr<f32>>
+    %in_p = offset %in_b, %offsets : tile<64xptr<f32>>, tile<64xi32> -> tile<64xptr<f32>>
+    %v, %t0 = load_ptr_tko weak %in_p : tile<64xptr<f32>> -> tile<64xf32>, token
+    %one = constant <f32: 1.000000e+00> : tile<f32>
+    %one_r = reshape %one : tile<f32> -> tile<1xf32>
+    %one_b = broadcast %one_r : tile<1xf32> -> tile<64xf32>
+    %sum = addf %v, %one_b rounding<nearest_even> : tile<64xf32>
+    %out_r = reshape %out : tile<ptr<f32>> -> tile<1xptr<f32>>
+    %out_b = broadcast %out_r : tile<1xptr<f32>> -> tile<64xptr<f32>>
+    %out_p = offset %out_b, %offsets : tile<64xptr<f32>>, tile<64xi32> -> tile<64xptr<f32>>
+    %tok = store_ptr_tko weak %out_p, %sum : tile<64xptr<f32>>, tile<64xf32> -> token
+    return
+  }
+}
+)";
+
 // MLIR text inside a printed dictionary inside HLO text: every level escapes
 // backslash and quote.
 std::string EscapeIr(absl::string_view ir) {
@@ -368,6 +390,44 @@ TEST_F(CudaTileKernelE2ETest, CommandBufferCapture) {
   TF_ASSERT_OK_AND_ASSIGN(Literal result, Execute(std::move(module), {&a}));
   ExpectRamp(result, 11);
 }
+
+// The memzero must land before the launch: if it ran after, the half the
+// kernel wrote would be zero too.
+TEST_F(CudaTileKernelE2ETest, ZeroedOutputs) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(UnaryHlo(
+                       Config("half", kHalf, ", zeroed_outputs = [0]"))));
+  Literal a = Ramp(10);
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, Execute(std::move(module), {&a}));
+  for (int i = 0; i < 64; ++i) {
+    EXPECT_EQ(result.Get<float>({i}), 11 + i) << "at " << i;
+  }
+  for (int i = 64; i < kN; ++i) {
+    EXPECT_EQ(result.Get<float>({i}), 0) << "at " << i;
+  }
+}
+
+TEST_F(CudaTileKernelE2ETest, ZeroedOutputsRejectsAnOutOfRangeLeaf) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(UnaryHlo(
+                       Config("add_one", kAddOne, ", zeroed_outputs = [1]"))));
+  Literal a = Ramp(10);
+  absl::Status status = Execute(std::move(module), {&a}).status();
+  EXPECT_THAT(status.message(), HasSubstr("only 1 array results"));
+}
+
+// Zeroing an aliased result would wipe the kernel's own input.
+TEST_F(CudaTileKernelE2ETest, ZeroedOutputsRejectsAnAliasedLeaf) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module,
+      ParseAndReturnVerifiedModule(UnaryHlo(
+          Config("add_one", kAddOne, ", zeroed_outputs = [0]"),
+          "output_to_operand_aliasing={{}: (0, {})},")));
+  Literal a = Ramp(10);
+  absl::Status status = Execute(std::move(module), {&a}).status();
+  EXPECT_THAT(status.message(), HasSubstr("aliases an operand"));
+}
+
 
 }  // namespace
 }  // namespace gpu

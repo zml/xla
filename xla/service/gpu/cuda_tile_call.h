@@ -13,9 +13,10 @@ namespace xla::gpu {
 
 // The backend_config of a __gpu$xla.gpu.cuda_tile custom call: a printed MLIR
 // dictionary of `name` (the cuda_tile.entry symbol), `kernel_type`, `ir`
-// (textual module), `grid_x/y/z`, optional `ir_version` and `output_indices`.
-// Launch-shape keys are rejected: cuda-tile fixes the block at (1,1,1) with no
-// shared memory, and warp/CTA tuning is optimization_hints inside the IR.
+// (textual module), `grid_x/y/z`, optional `ir_version`, `output_indices` and
+// `zeroed_outputs`. Launch-shape keys are rejected: cuda-tile fixes the block
+// at (1,1,1) with no shared memory, and warp/CTA tuning is optimization_hints
+// inside the IR.
 struct CudaTileCall {
   std::string name;
   std::string ir;
@@ -25,6 +26,9 @@ struct CudaTileCall {
   uint8_t bytecode_major = 13;
   uint8_t bytecode_minor = 3;
   std::vector<int32_t> output_indices;
+  // Result leaves zeroed before the launch, strictly ascending. Leaf indices,
+  // not kernel-argument positions, so `output_indices` cannot move them.
+  std::vector<int32_t> zeroed_outputs;
 
   static absl::StatusOr<CudaTileCall> Parse(absl::string_view backend_config,
                                             mlir::MLIRContext* mlir_context);
