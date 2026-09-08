@@ -1,0 +1,35 @@
+cuDNN dlopens its engine sublibraries by soname. Every other engine is a link
+dependency of `:cudnn`, so it is already in the link map when cuDNN asks for it;
+`libcudnn_engines_tensor_ir` was not, so it had to be found on disk. It never
+is: `libcudnn.so.9`'s RUNPATH is `$ORIGIN`, and bazel gives every cc_import its
+own `_solib_*` directory holding one symlink, so `$ORIGIN` is a directory that
+contains nothing else.
+
+The result is that every block-scaled dot (the tensor_ir engines serve
+CUDNN_TENSOR_REORDERING_F8_128x4) fails to build its graph with
+CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED, the autotuner drops cuDNN, and the
+fusion silently falls back to Triton.
+
+--- a/gpu/cuda/build_templates/cuda_cudnn.BUILD.tpl
++++ b/gpu/cuda/build_templates/cuda_cudnn.BUILD.tpl
+@@ -55,6 +55,12 @@
+ )
+
+ cc_import(
++    name = "cudnn_engines_tensor_ir",
++    hdrs = [":headers"],
++    shared_library = "lib/libcudnn_engines_tensor_ir.so.%{libcudnn_version}",
++)
++
++cc_import(
+     name = "cudnn_main",
+     hdrs = [":headers"],
+     shared_library = "lib/libcudnn.so.%{libcudnn_version}",
+@@ -131,6 +137,7 @@
+       %{comment}":cudnn_cnn",
+       %{comment}":cudnn_adv",
+       %{comment}":cudnn_engines_runtime_compiled",
++      %{comment}":cudnn_engines_tensor_ir",
+       %{comment}":cudnn_heuristic",
+       %{comment}":cudnn_main",
+       %{comment}]) + ["@cuda_nvrtc//:nvrtc"],

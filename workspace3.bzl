@@ -76,6 +76,7 @@ def workspace():
         name = "rules_ml_toolchain",
         patch_file = [
             "@xla//third_party/rules_ml_toolchain:cudnn_9_24.patch",
+            "@xla//third_party/rules_ml_toolchain:cudnn_tensor_ir_engine.patch",
             "@xla//third_party/rules_ml_toolchain:nvcc_wrapper_no_log.patch",
         ],
         sha256 = "66d823b6c6b4ea6f09d79ef6fe49e181e5301759ee07d176a6c82a01e1227d6b",
