@@ -1560,6 +1560,34 @@ CHECK: "uid": 7
 )"));
 }
 
+TEST_F(CuDnnFusionExecutionTest, BlockScaledDotExecutes) {
+  if (!get_cuda_cc().IsBlackwell() || !IsAtLeastCuDnnVersion(9, 24)) {
+    GTEST_SKIP() << "Block-scaled cuDNN needs Blackwell and cuDNN 9.24.";
+  }
+  // The autotuner's allowlist declines anything thinner than 128 on a
+  // trailing output dimension: cuDNN rejects every engine config for those.
+  const std::string kHloText = R"(
+block_scaled_dot {
+  %lhs = f8e4m3fn[256,128] parameter(0)
+  %rhs = f8e4m3fn[384,128] parameter(1)
+  %lhs_scale = f8e8m0fnu[256,4] parameter(2)
+  %rhs_scale = f8e8m0fnu[384,4] parameter(3)
+  ROOT %result = f32[256,384] scaled-dot(%lhs, %rhs, %lhs_scale, %rhs_scale),
+      lhs_contracting_dims={1}, rhs_contracting_dims={1}
+}
+
+ENTRY main {
+  %lhs = f8e4m3fn[256,128] parameter(0)
+  %rhs = f8e4m3fn[384,128] parameter(1)
+  %lhs_scale = f8e8m0fnu[256,4] parameter(2)
+  %rhs_scale = f8e8m0fnu[384,4] parameter(3)
+  ROOT %result = f32[256,384] fusion(%lhs, %rhs, %lhs_scale, %rhs_scale),
+      kind=kCustom, calls=block_scaled_dot,
+      backend_config={"fusion_backend_config":{kind:"__cudnn$fusion"}}
+})";
+  EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+}
+
 TEST_F(CuDnnFusionFileCheckTest, ConvFpropGraphConvertedCorrectly) {
   // Crashes on CUDA 12 + cuDNN 9.10. Works on CUDA 13 + cuDNN 9.23. It's
   // unclear at which point between it got fixed. Conservatively skip on

@@ -115,8 +115,12 @@ absl::Status ApplyConfigAndUpdateWorkspaceInOutputTuple(
   return absl::OkStatus();
 }
 
-// True below 128 on either trailing output dimension: cuDNN's block-scaled
-// kernels execute an illegal instruction there and poison the CUDA context.
+// True below 128 on either trailing output dimension. cuDNN's block-scaled
+// kernels executed an illegal instruction there and poisoned the CUDA context;
+// on sm_103 with cuDNN 9.24 they now decline cleanly instead, but they still
+// cannot serve the shape -- `create_execution_plans` rejects all 19 engine
+// configs with "Unsupported node in the graph". Declining here keeps the
+// autotuner from offering configs that are all going to fail to compile.
 bool ScaledDotOutputIsThin(const HloInstruction& scaled_dot) {
   const Shape& shape = scaled_dot.shape();
   const int64_t rank = shape.dimensions().size();
