@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/stream_executor/kernel_args.h"
 #include "xla/stream_executor/kernel_args_packing_spec.h"
 #include "xla/stream_executor/kernel_spec.pb.h"
+#include "xla/stream_executor/musa_mubin_spec.h"
 
 namespace stream_executor {
 
@@ -120,6 +121,10 @@ class KernelLoaderSpec {
     return std::holds_alternative<CudaPtxInMemory>(payload_) ||
            std::holds_alternative<OwningCudaPtxInMemory>(payload_);
   }
+  bool has_musa_mubin_in_memory() const {
+    return std::holds_alternative<MusaMubinInMemory>(payload_) ||
+           std::holds_alternative<OwningMusaMubinInMemory>(payload_);
+  }
 
   // Accessors for platform variant kernel load specifications.
   std::optional<InProcessSymbol> in_process_symbol() const {
@@ -150,6 +155,17 @@ class KernelLoaderSpec {
     return std::nullopt;
   }
 
+  std::optional<MusaMubinInMemory> musa_mubin_in_memory() const {
+    if (std::holds_alternative<MusaMubinInMemory>(payload_)) {
+      return std::get<MusaMubinInMemory>(payload_);
+    }
+    if (std::holds_alternative<OwningMusaMubinInMemory>(payload_)) {
+      return MusaMubinInMemory{
+          std::get<OwningMusaMubinInMemory>(payload_).mubin_bytes};
+    }
+    return std::nullopt;
+  }
+
   // Use these factory functions to create a spec of any supported type.
   //
   // Note that the kernel_name parameter must be consistent with the kernel in
@@ -174,6 +190,13 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateOwningCudaPtxInMemorySpec(
       std::string ptx, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateMusaMubinInMemorySpec(
+      absl::Span<const uint8_t> mubin_bytes, std::string kernel_name,
+      size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
+  static KernelLoaderSpec CreateOwningMusaMubinInMemorySpec(
+      std::vector<uint8_t> mubin_bytes, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
 
   void set_kernel_args_packing(KernelArgsPacking kernel_args_packing) {
     kernel_args_packing_ = std::move(kernel_args_packing);
@@ -197,7 +220,8 @@ class KernelLoaderSpec {
  private:
   using Payload =
       std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory>;
+                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
+                   MusaMubinInMemory, OwningMusaMubinInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

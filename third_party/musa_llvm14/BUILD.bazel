@@ -1,0 +1,17 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+licenses(["notice"])  # Apache 2.0
+
+cc_test(
+    name = "parse_smoke",
+    srcs = ["parse_smoke.cc"],
+    tags = [
+        "manual",
+        "no_oss",
+    ],
+    target_compatible_with = select({
+        "@local_config_musa//musa:using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = ["@local_config_musa//musa:musa_llvm14"],
+)

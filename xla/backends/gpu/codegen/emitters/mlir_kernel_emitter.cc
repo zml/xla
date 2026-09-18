@@ -87,6 +87,7 @@ limitations under the License.
 #include "xla/backends/gpu/codegen/fusion_emitter.h"
 #include "xla/backends/gpu/codegen/kernel_compiler.h"
 #include "xla/backends/gpu/codegen/kernels/custom_kernel.h"
+#include "xla/backends/gpu/codegen/kernels/musa_custom_kernel.h"
 #include "xla/backends/gpu/codegen/kernels/ptx_custom_kernel.h"
 #include "xla/backends/gpu/runtime/custom_kernel_thunk.h"
 #include "xla/backends/gpu/runtime/thunk.h"
@@ -96,6 +97,7 @@ limitations under the License.
 #include "xla/codegen/emitters/kernel_api_builder.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/transforms/lower_to_llvm_gpu.h"
+#include "xla/codegen/emitters/transforms/musa_gpu_to_llvm.h"
 #include "xla/codegen/emitters/transforms/pass_pipelines.h"
 #include "xla/codegen/emitters/transforms/passes.h"
 #include "xla/codegen/ir_printing.h"
@@ -127,6 +129,7 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_target_contract.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/framework/mlir/status_scoped_diagnostic_handler.h"
@@ -333,8 +336,8 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
             buffer_assignment = &parent_context.buffer_assignment(),
             &gpu_device_info = parent_context.gpu_device_info(), kernel_name,
             launch_dims = launch_dimensions(),
-            data_layout = parent_context.data_layout(),
-            fusion = &fusion](LlvmKernelSource source)
+            data_layout = parent_context.data_layout(), fusion = &fusion](
+               LlvmKernelSource source)
                -> absl::StatusOr<KernelDefinition<LlvmKernelSource>> {
         llvm::orc::ThreadSafeModule safe_module =
             std::move(source).thread_safe_module();
@@ -342,13 +345,27 @@ MlirKernelFusion::EmitLlvmModule(const HloFusionInstruction& fusion,
 
         auto* kernel_func = module->getFunction(kernel_name);
 
-        AddRanges(kernel_func, launch_dims, module);
-
-        module->setDataLayout(data_layout);
-        module->setTargetTriple(target_triple);
-
-        llvm::IRBuilder<> builder(module->getContext());
-        AnnotateFunctionAsGpuKernel(module, kernel_func, &builder);
+        if (!gpu_device_info.gpu_compute_capability().IsMusa()) {
+          module->setDataLayout(data_layout);
+          module->setTargetTriple(target_triple);
+          AddRanges(kernel_func, launch_dims, module);
+          llvm::IRBuilder<> builder(module->getContext());
+          AnnotateFunctionAsGpuKernel(module, kernel_func, &builder);
+        } else {
+          // MUSA keeps the C calling convention in current-LLVM IR. The vendor
+          // bridge consumes the versioned marker and applies the native ABI.
+          TF_RET_CHECK(target_triple.str() ==
+                       stream_executor::musa::kMusaTargetTriple);
+          TF_RET_CHECK(data_layout ==
+                       stream_executor::musa::kMusaTargetDataLayout);
+          TF_RET_CHECK(module->getTargetTriple().str() ==
+                       stream_executor::musa::kMusaTargetTriple);
+          TF_RET_CHECK(module->getDataLayoutStr() ==
+                       stream_executor::musa::kMusaTargetDataLayout);
+          TF_RET_CHECK(kernel_func->getCallingConv() == llvm::CallingConv::C);
+          TF_RET_CHECK(
+              kernel_func->hasFnAttribute(::xla::emitters::kMusaKernelMarker));
+        }
         ABSL_RETURN_IF_ERROR(AnnotateKernelLaunchDimensions(
             gpu_device_info, launch_dims, kernel_func, module));
 
@@ -405,22 +422,29 @@ AsyncThunkSequence MlirKernelFusion::Emit(
   Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(
       &fusion, ir_emitter_context.GetNextThunkId());
   bool kernel_cached = cached;
+  bool is_musa = ir_emitter_context.gpu_compute_capability().IsMusa();
   return future_entry.Map([&fusion, thunk_info = std::move(thunk_info),
-                           args = std::move(args), kernel_cached](
-                              const KernelReuseCache::Entry* entry) mutable
+                           args = std::move(args), kernel_cached,
+                           is_musa](const KernelReuseCache::Entry* entry) mutable
                               -> absl::StatusOr<ThunkSequence> {
     if (kernel_cached) {
       VLOG(3) << "Reuse: " << fusion.name() << " -> " << entry->kernel_name;
     }
-    ABSL_ASSIGN_OR_RETURN(CustomKernel custom_kernel,
-                     kernel::CreateOwnedCubinCustomKernel(
-                         entry->kernel_name, entry->binary, args.args().size(),
-                         entry->launch_dimensions.block_counts(),
-                         entry->launch_dimensions.thread_counts_per_block(),
-                         entry->shmem_bytes));
+    absl::StatusOr<CustomKernel> custom_kernel =
+        is_musa ? kernel::CreateOwnedMubinCustomKernel(
+                      entry->kernel_name, entry->binary, args.args().size(),
+                      entry->launch_dimensions.block_counts(),
+                      entry->launch_dimensions.thread_counts_per_block(),
+                      entry->shmem_bytes)
+                : kernel::CreateOwnedCubinCustomKernel(
+                      entry->kernel_name, entry->binary, args.args().size(),
+                      entry->launch_dimensions.block_counts(),
+                      entry->launch_dimensions.thread_counts_per_block(),
+                      entry->shmem_bytes);
+    ABSL_RETURN_IF_ERROR(custom_kernel.status());
 
-    return ThunkSequence::Of<CustomKernelThunk>(
-        thunk_info, std::move(custom_kernel), args, entry->use_pdl);
+    return ThunkSequence::Of(std::make_unique<CustomKernelThunk>(
+        thunk_info, *std::move(custom_kernel), args, entry->use_pdl));
   });
 }
 
@@ -559,7 +583,7 @@ void AddLoopTransformationPasses(mlir::OpPassManager& pm,
                                  int max_unroll_factor) {
   pm.addNestedPass<FuncOp>(createLowerXlaSharedPass());
   emitters::LowerXlaToScfPassOptions lower_xla_to_scf_options;
-  lower_xla_to_scf_options.warp_size = device.threads_per_warp();
+  lower_xla_to_scf_options.warp_size = WarpSize(device);
   pm.addNestedPass<FuncOp>(
       emitters::createLowerXlaToScfPass(lower_xla_to_scf_options));
   pm.addPass(mlir::createInlinerPass({}, [&](mlir::OpPassManager& pm) {
@@ -661,6 +685,13 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   auto llvm_context = std::make_unique<llvm::LLVMContext>();
   mlir::OwningOpRef<mlir::ModuleOp> module = std::move(source).TakeModule();
 
+  if (device.gpu_compute_capability().IsMusa()) {
+    if (mlir::failed(emitters::ConfigureMusaLLVMModule(*module))) {
+      return absl::InvalidArgumentError(
+          "MUSA MLIR module violates the qualified target contract");
+    }
+  }
+
   mlir::PassManager pm(module->getContext());
   // Only enable verifier in debug builds.
   bool should_verify =
@@ -685,6 +716,14 @@ absl::StatusOr<LlvmKernelSource> CompileMlirToLlvm(
   auto llvm_module = mlir::translateModuleToLLVMIR(module.get(), *llvm_context);
   TF_RET_CHECK(llvm_module != nullptr)
       << "Failed to translate module to LLVM IR.";
+
+  if (device.gpu_compute_capability().IsMusa()) {
+    llvm::Function* kernel = llvm_module->getFunction(entry_function_name);
+    TF_RET_CHECK(kernel != nullptr)
+        << "MUSA entry function is missing after MLIR translation.";
+    TF_RET_CHECK(kernel->getCallingConv() == llvm::CallingConv::C);
+    kernel->addFnAttr(::xla::emitters::kMusaKernelMarker);
+  }
 
   return LlvmKernelSource{std::move(llvm_context), std::move(llvm_module)};
 }

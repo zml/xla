@@ -628,6 +628,22 @@ GpuCompiler::GpuCompiler(se::Platform::Id platform_id,
       mlir_context_pool_(CreateMlirContext, kPreallocateMlirContexts) {}
 
 void GpuCompiler::ClearMlirContextPool() { mlir_context_pool_.Clear(); }
+absl::StatusOr<stream_executor::ExecutableAbiVersion>
+GpuCompiler::CreateExecutableAbiVersion(
+    const HloModule& module,
+    const stream_executor::DeviceDescription& device_description,
+    absl::Span<const uint8_t> main_binary) const {
+  (void)module;
+  (void)main_binary;
+  return stream_executor::ExecutableAbiVersion::FromDeviceDescription(
+      device_description);
+}
+
+absl::Status GpuCompiler::ValidatePersistentKernelCache(
+    const HloModuleConfig& module_config) const {
+  (void)module_config;
+  return absl::OkStatus();
+}
 
 namespace {
 // Adds the HloVerifier for GPU to the given pipeline.
@@ -846,7 +862,7 @@ absl::Status RunOptimizationPasses(
   // would do.
   pipeline.AddPass<PermutationSortExpander>();
 
-  if (debug_options.xla_gpu_enable_cub_radix_sort()) {
+  if (!gpu_version.IsMusa() && debug_options.xla_gpu_enable_cub_radix_sort()) {
     pipeline.AddPass<SortRewriter>(gpu_target_config.device_description,
                                    is_deviceless, is_early_exit_with_layouts);
   }
@@ -912,6 +928,14 @@ absl::Status RunOptimizationPasses(
     pipeline.AddPass<ReduceWindowResizer>();
   }
   pipeline.AddPass<ScanExpander>();
+  if (gpu_version.IsMusa()) {
+    // AssociativeScanRewriter creates a reducer wrapper containing a call.
+    // The MUSA MLIR fusion emitter requires calls to be inlined before
+    // indexing analysis.
+    pipeline.AddPass<CallInliner>(
+        /*single_call_site=*/false, /*update_domain=*/false,
+        /*composites_to_preserve=*/absl::flat_hash_set<std::string>());
+  }
 
   DynamicPadderOptions dynamic_padder_options;
 
@@ -944,7 +968,7 @@ absl::Status RunOptimizationPasses(
   // DynamicPadder creates a stable KeyValue sort for dynamic reshapes.
   pipeline.AddPass<DynamicPadder>(dynamic_padder_options);
   // SortRewriter needs to run before StableSortExpander.
-  if (debug_options.xla_gpu_enable_cub_radix_sort()) {
+  if (!gpu_version.IsMusa() && debug_options.xla_gpu_enable_cub_radix_sort()) {
     pipeline.AddPass<SortRewriter>(gpu_target_config.device_description,
                                    is_deviceless, is_early_exit_with_layouts);
   }
@@ -1734,6 +1758,13 @@ bool RequiresCollectiveScheduleLinearizer(const HloModule* module,
   return false;
 }
 
+bool UsesRocmConvolutionCanonicalization(absl::string_view platform_name) {
+  // ROCm and MUSA convolution canonicalization both recognize backward-filter
+  // patterns before vendor-library routing. Swapping operands in the earlier
+  // layout-insensitive simplifier destroys those patterns.
+  return platform_name == "ROCM" || platform_name == "MUSA";
+}
+
 }  // namespace
 
 bool GpuCompiler::IsScaledDotSupportedByBackend(
@@ -1853,7 +1884,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kLayoutInsensitive,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM");
+          UsesRocmConvolutionCanonicalization(
+              gpu_topology.gpu_target_config().platform_name));
 
   {
     HloPassPipeline pipeline("annotate-host-compute", compilation_stats);
@@ -1910,7 +1942,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
       hlo_module, gpu_version,
       se::dnn::VersionInfo(
           gpu_topology.gpu_target_config().device_description.dnn_version()),
-      device_description.runtime_version(), compilation_stats));
+      device_description.runtime_version(), /*is_deviceless=*/stream_exec == nullptr, compilation_stats));
 
   ABSL_RETURN_IF_ERROR(RunLayoutAssignmentPasses(
       hlo_module, gpu_version, device_description, compilation_stats));
@@ -1923,7 +1955,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kLayoutNormalization,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM"),
+          UsesRocmConvolutionCanonicalization(
+              gpu_topology.gpu_target_config().platform_name)),
       gpu_version, compilation_stats));
 
   // Run target-specific HLO optimization passes after layout assignment.
@@ -1947,7 +1980,8 @@ absl::Status GpuCompiler::OptimizeHloModule(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kPostFusionSimplification,
           hlo_module->config().debug_options(),
-          gpu_topology.gpu_target_config().platform_name == "ROCM"),
+          UsesRocmConvolutionCanonicalization(
+              gpu_topology.gpu_target_config().platform_name)),
       gpu_version, gpu_topology.gpu_target_config(), compilation_stats));
 
   ABSL_RETURN_IF_ERROR(RunPostFusionVerificationPasses(
@@ -2003,11 +2037,10 @@ absl::Status GpuCompiler::RunPreSchedulingCopyInsertion(
       .status();
 }
 
-namespace {
-void AddGemmRewriterPasses(HloPassPipeline& pipeline,
-                           const DebugOptions& debug_options,
-                           const se::GpuComputeCapability gpu_version,
-                           const se::SemanticVersion& toolkit_version) {
+void GpuCompiler::AddGemmRewriterPasses(
+    HloPassPipeline& pipeline, const DebugOptions& debug_options,
+    const se::GpuComputeCapability& gpu_version,
+    const se::SemanticVersion& toolkit_version) {
   // Adding bias to GEMMs is helpful for skipping kernel launches for `add`
   // operations. However, the bias term can add dependencies between the GEMMs
   // that could otherwise be parallelized. Because of this, we disable bias
@@ -2031,7 +2064,6 @@ void AddGemmRewriterPasses(HloPassPipeline& pipeline,
       gpu_version, toolkit_version,
       GemmRewriterOptions{GemmRewriterOptions::DType::kNonFp8Only, bias_mode});
 }
-}  // namespace
 
 absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
     HloModule* hlo_module, se::StreamExecutor* stream_exec,
@@ -2047,7 +2079,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
       GetAlgebraicSimplifierOptions(
           AlgebraicSimplifierMode::kPostLayoutAssignment,
           hlo_module->config().debug_options(),
-          gpu_target_config.platform_name == "ROCM");
+          UsesRocmConvolutionCanonicalization(gpu_target_config.platform_name));
   // Lambdas and related constants:
   const GpuFloatSupport bf16_support(gpu_version, BF16);
   const GpuFloatSupport f8e5m2_support(gpu_version, F8E5M2, F16);
@@ -2275,7 +2307,7 @@ absl::Status GpuCompiler::OptimizeHloPostLayoutAssignment(
             "remove-no-op-reduce-precision-algebraic-simplifier");
     AlgebraicSimplifierOptions options = GetAlgebraicSimplifierOptions(
         AlgebraicSimplifierMode::kAfterSimplifyFPConversions, debug_options,
-        gpu_target_config.platform_name == "ROCM");
+        UsesRocmConvolutionCanonicalization(gpu_target_config.platform_name));
     remove_no_op_reduce_precision_pipeline
         .AddPass<HloPassFix<GpuAlgebraicSimplifier>>(options, gpu_version);
   }
@@ -2802,6 +2834,8 @@ GpuCompiler::CompileToBackendResult(
     mlir::MLIRContext* mlir_context) {
   tsl::profiler::TraceMe traceme("CompileToBackendResult");
 
+  ABSL_RETURN_IF_ERROR(ValidatePersistentKernelCache(module->config()));
+
   absl::string_view cache_path =
       module->config().debug_options().xla_gpu_kernel_cache_file();
   const bool use_cache = !cache_path.empty();
@@ -3023,8 +3057,8 @@ absl::StatusOr<std::unique_ptr<Executable>> GpuCompiler::RunBackend(
   std::unique_ptr<GpuAliasInfo> alias_info = GetAliasInfo(gpu_device_info);
 
   ABSL_ASSIGN_OR_RETURN(stream_executor::ExecutableAbiVersion executable_abi_version,
-                   stream_executor::ExecutableAbiVersion::FromDeviceDescription(
-                       gpu_device_info));
+                   CreateExecutableAbiVersion(*module, gpu_device_info,
+                                              res.backend_result.binary));
 
   std::string buffer_allocations_debug_summary =
       res.compile_module_results.buffer_assignment->ToVerboseString(

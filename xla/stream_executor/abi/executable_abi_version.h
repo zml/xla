@@ -37,7 +37,7 @@ class ExecutableAbiVersion {
   absl::string_view platform_name() const;
 
   // Creates an `ExecutableAbiVersion` from the given `DeviceDescription`.
-  // Currently only implemented for CUDA.
+  // Platform-specific version detail is populated where it is available.
   static absl::StatusOr<ExecutableAbiVersion> FromDeviceDescription(
       const DeviceDescription& device_description);
 

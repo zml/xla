@@ -68,6 +68,7 @@ limitations under the License.
 #include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/codegen/emitters/transforms/atomic_rmw_utils.h"
 #include "xla/codegen/emitters/transforms/passes.h"
+#include "xla/service/gpu/musa/musa_shim_abi.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_description.pb.h"
@@ -836,6 +837,43 @@ bool IsAtomicIntegral(Type element_type) {
   return element_bitwidth == 32 || element_bitwidth == 64;
 }
 
+// Route qualified scalar operations through the i32 cmpxchg contract. Packed
+// BF16 replacement preserves the other half of the word on every CAS retry.
+// Require complete words rather than relying on padding beyond the tensor.
+bool IsQualifiedMusaAtomicRmw(AtomicRMWOp op) {
+  auto input_type = op.getInput().getType();
+  Type element_type = input_type.getElementType();
+  auto& operations = op.getBody()->getOperations();
+  if (element_type.isBF16() && input_type.hasStaticShape() &&
+      input_type.getNumElements() % 2 == 0 && operations.size() == 1) {
+    Operation* terminator = op.getBody()->getTerminator();
+    return terminator->getNumOperands() == 1 &&
+           terminator->getOperand(0).getType() == element_type;
+  }
+
+  auto modifier_parameters = GetAtomicModifierParameters(op);
+  if (!modifier_parameters.has_value() ||
+      mlir::isa<mlir::VectorType>(modifier_parameters->first.getType())) {
+    return false;
+  }
+
+  ml::AtomicBinOp bin_op = modifier_parameters->second;
+  if (!((element_type.isInteger(32) && bin_op == ml::AtomicBinOp::add) ||
+        (element_type.isF32() && bin_op == ml::AtomicBinOp::fadd))) {
+    return false;
+  }
+
+  if (operations.size() != 2) return false;
+  Operation& modifier = operations.front();
+  Operation* terminator = op.getBody()->getTerminator();
+  if (modifier.getNumResults() != 1 || terminator->getNumOperands() != 1 ||
+      terminator->getOperand(0) != modifier.getResult(0)) {
+    return false;
+  }
+  return llvm::is_contained(modifier.getOperands(),
+                            op.getBody()->getArgument(0));
+}
+
 Value CreateBitcast(mlir::ImplicitLocOpBuilder& b, mlir::Operation* op,
                     Value value, Type ty) {
   if (value.getType().isIntOrFloat() && ty.isIntOrFloat()) {
@@ -871,6 +909,15 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
 
   LogicalResult matchAndRewrite(
       AtomicRMWOp op, mlir::PatternRewriter& rewriter) const override {
+    if (device_spec_.IsMusaGpu()) {
+      if (!IsQualifiedMusaAtomicRmw(op)) {
+        return rewriter.notifyMatchFailure(
+            op, "atomic operation is outside the MUSA cmpxchg contract");
+      }
+      rewriteAsAtomicCAS(op, rewriter);
+      rewriter.replaceOp(op, op.getInput());
+      return success();
+    }
     auto modifier_parameters = GetAtomicModifierParameters(op);
     if (modifier_parameters.has_value()) {
       if (mlir::isa<mlir::VectorType>(modifier_parameters->first.getType()) &&
@@ -1296,6 +1343,12 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
           ml::ShlOp::create(rewriter, loc, bits_short, shift));
     }
 
+    if (device_spec_.IsMusaGpu()) {
+      auto global_ptr_ty = ml::LLVMPointerType::get(
+          op.getContext(), gpu::musa::kMusaAtomicCmpXchgAddressSpace);
+      addr = ml::AddrSpaceCastOp::create(rewriter, loc, global_ptr_ty, addr);
+    }
+
     // Load initial atomic value and create the loop.
     Value initial = ml::LoadOp::create(rewriter, loc, atomic_ty, addr);
     scf::WhileOp::create(
@@ -1342,7 +1395,9 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
           Value cmpxchg = ml::AtomicCmpXchgOp::create(
               b, loc, addr, old_value, new_value,
               /*success_ordering=*/ml::AtomicOrdering::monotonic,
-              /*failure_ordering=*/ml::AtomicOrdering::monotonic, sync_scope);
+              /*failure_ordering=*/ml::AtomicOrdering::monotonic, sync_scope,
+              device_spec_.IsMusaGpu() ? gpu::musa::kMusaAtomicCmpXchgAlignment
+                                       : 0);
           Value next = ml::ExtractValueOp::create(b, cmpxchg, 0);
           Value ok = ml::ExtractValueOp::create(b, cmpxchg, 1);
           Value low_bit =
@@ -1432,6 +1487,8 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
       *device_spec_.mutable_type() = CpuDeviceSpec{};
     }
 
+    if (mlir::failed(RejectUnqualifiedMusaAtomics())) return;
+
     MLIRContext* mlir_context = &getContext();
     mlir::RewritePatternSet tensor_patterns(mlir_context);
 
@@ -1446,6 +1503,9 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
       signalPassFailure();
       return;
     }
+    // Re-check because packed-element tensor rewrites can introduce an
+    // AtomicRMWOp even when the input module did not contain one.
+    if (mlir::failed(RejectUnqualifiedMusaAtomics())) return;
 
     mlir::RewritePatternSet function_patterns(mlir_context);
     function_patterns.add<RewriteFunctionSignatures>(mlir_context,
@@ -1488,6 +1548,19 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
   }
 
  private:
+  mlir::LogicalResult RejectUnqualifiedMusaAtomics() {
+    if (!device_spec_.IsMusaGpu()) return mlir::success();
+    mlir::WalkResult result = getOperation()->walk([](AtomicRMWOp op) {
+      if (IsQualifiedMusaAtomicRmw(op)) return mlir::WalkResult::advance();
+      op.emitOpError() << "is unsupported by MUSA shim mapping version "
+                       << gpu::musa::kMusaShimMappingVersion;
+      return mlir::WalkResult::interrupt();
+    });
+    if (!result.wasInterrupted()) return mlir::success();
+    signalPassFailure();
+    return mlir::failure();
+  }
+
   DeviceSpec device_spec_;
 };
 

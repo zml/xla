@@ -2058,6 +2058,7 @@ xla_cc_test(
         "//xla/service/gpu:triton_fusion_analysis",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/musa:musa_compute_capability",
         "//xla/stream_executor/rocm:rocm_compute_capability",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
@@ -2185,6 +2186,24 @@ xla_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_gemm_rewriter_test",
+    srcs = ["musa_gemm_rewriter_test.cc"],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":gemm_rewriter",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:semantic_version",
+        "//xla/stream_executor/musa:musa_compute_capability",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )

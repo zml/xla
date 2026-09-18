@@ -28,6 +28,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
@@ -120,6 +121,19 @@ absl::StatusOr<DeviceDescription> DeviceDescription::FromProto(
     device_description.gpu_compute_capability_ =
         OneAPIComputeCapability(proto.oneapi_compute_capability());
   }
+  if (proto.has_musa_compute_capability()) {
+    MusaComputeCapability musa_compute_capability;
+    ABSL_ASSIGN_OR_RETURN(
+        musa_compute_capability,
+        MusaComputeCapability::FromProto(proto.musa_compute_capability()));
+    if (musa_compute_capability.hardware_warp_size() != 0 &&
+        proto.threads_per_warp() !=
+            musa_compute_capability.hardware_warp_size()) {
+      return absl::InvalidArgumentError(
+          "MUSA hardware warp size does not match threads_per_warp.");
+    }
+    device_description.gpu_compute_capability_ = musa_compute_capability;
+  }
   device_description.core_count_ = proto.core_count();
   device_description.fpus_per_core_ = proto.fpus_per_core();
 
@@ -178,6 +192,9 @@ GpuDeviceInfoProto DeviceDescription::ToProto() const {
   }
   if (auto* ptr = gpu_compute_capability_.oneapi_compute_capability()) {
     *proto.mutable_oneapi_compute_capability() = ptr->ToProto();
+  }
+  if (auto* ptr = gpu_compute_capability_.musa_compute_capability()) {
+    *proto.mutable_musa_compute_capability() = ptr->ToProto();
   }
 
   proto.set_device_vendor(device_vendor_);
@@ -365,6 +382,13 @@ OneAPIComputeCapability DeviceDescription::oneapi_compute_capability() const {
   return OneAPIComputeCapability{};
 }
 
+MusaComputeCapability DeviceDescription::musa_compute_capability() const {
+  if (auto* ptr = gpu_compute_capability_.musa_compute_capability()) {
+    return *ptr;
+  }
+  return MusaComputeCapability{};
+}
+
 bool ThreadDimOk(const DeviceDescription& device_description,
                  const ThreadDim& thread_dim) {
   const int64_t total_threads = thread_dim.x * thread_dim.y * thread_dim.z;
@@ -402,6 +426,9 @@ GpuComputeCapabilityProto GpuComputeCapability::ToProto() const {
   if (IsCuda()) {
     *proto.mutable_cuda_compute_capability() =
         cuda_compute_capability()->ToProto();
+  } else if (IsMusa()) {
+    *proto.mutable_musa_compute_capability() =
+        musa_compute_capability()->ToProto();
   } else if (IsOneAPI()) {
     *proto.mutable_oneapi_compute_capability() =
         oneapi_compute_capability()->ToProto();
@@ -431,6 +458,13 @@ absl::StatusOr<GpuComputeCapability> GpuComputeCapability::FromProto(
         OneAPIComputeCapability::FromProto(proto.oneapi_compute_capability()));
   }
 
+  if (proto.has_musa_compute_capability()) {
+    ABSL_ASSIGN_OR_RETURN(
+        MusaComputeCapability musa_compute_capability,
+        MusaComputeCapability::FromProto(proto.musa_compute_capability()));
+    return GpuComputeCapability(musa_compute_capability);
+  }
+
   return absl::InvalidArgumentError(
       "The serialized GpuComputeCapability has no compute capability set.");
 }
@@ -445,6 +479,10 @@ std::string MakeComputeCapabilityAttributeString(
   if (cc.IsRocm()) {
     auto* rocmcc = cc.rocm_compute_capability();
     return rocmcc->gfx_version();
+  }
+  if (cc.IsMusa()) {
+    auto* musacc = cc.musa_compute_capability();
+    return musacc->architecture();
   }
   return "unknown";
 }

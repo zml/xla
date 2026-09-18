@@ -1,0 +1,118 @@
+/* Copyright 2026 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "xla/stream_executor/musa/musa_platform.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
+#include "absl/status/status_macros.h"
+#include "xla/stream_executor/abi/runtime_abi_version.h"
+#include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_driver.h"
+#include "xla/stream_executor/musa/musa_executor.h"
+#include "xla/stream_executor/musa/musa_optional_libraries.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
+#include "xla/stream_executor/musa/musa_runtime.h"
+#include "xla/stream_executor/musa/musa_runtime_abi_version.h"
+#include "xla/stream_executor/musa/musa_version_parser.h"
+#include "xla/stream_executor/platform.h"
+#include "xla/stream_executor/platform/initialize.h"
+#include "xla/stream_executor/platform_manager.h"
+#include "xla/stream_executor/semantic_version.h"
+#include "xla/stream_executor/stream_executor.h"
+
+#ifndef XLA_MUSA_TOOLKIT_VERSION
+#define XLA_MUSA_TOOLKIT_VERSION 0
+#endif
+
+namespace stream_executor::musa {
+MusaPlatform::MusaPlatform() : name_(kMusaPlatformId->ToName()) {}
+
+Platform::Id MusaPlatform::id() const { return kMusaPlatformId; }
+
+int MusaPlatform::VisibleDeviceCount() const {
+  // Initialize and enumerate through the driver API first. MUSA 5.1 on S4000
+  // does not tolerate calling muInit after musaGetDeviceCount has implicitly
+  // initialized the driver, and reports MUSA_ERROR_OUT_OF_MEMORY on that
+  // second initialization attempt.
+  auto count = MusaDriver::Instance().DeviceCount();
+  if (!count.ok()) {
+    LOG(ERROR) << "Failed to get MUSA device count: " << count.status();
+    return -1;
+  }
+  return *count;
+}
+
+const std::string& MusaPlatform::Name() const { return name_; }
+
+absl::StatusOr<std::unique_ptr<DeviceDescription>>
+MusaPlatform::DescriptionForDevice(int ordinal) const {
+  return MusaExecutor::CreateDeviceDescription(ordinal);
+}
+
+absl::StatusOr<StreamExecutor*> MusaPlatform::ExecutorForDevice(int ordinal) {
+  return executor_cache_.GetOrCreate(
+      ordinal, [this, ordinal]() { return GetUncachedExecutor(ordinal); });
+}
+
+absl::StatusOr<StreamExecutor*> MusaPlatform::FindExisting(int ordinal) {
+  return executor_cache_.Get(ordinal);
+}
+
+absl::StatusOr<std::unique_ptr<RuntimeAbiVersion>>
+MusaPlatform::GetRuntimeAbiVersion() const {
+  ABSL_ASSIGN_OR_RETURN(int driver_version, MusaDriver::Instance().DriverVersion());
+  ABSL_ASSIGN_OR_RETURN(int runtime_version, MusaRuntime::Get()->RuntimeVersion());
+  ABSL_ASSIGN_OR_RETURN(SemanticVersion kernel_driver_version,
+                   GetMusaKernelDriverVersion());
+  ABSL_ASSIGN_OR_RETURN(std::vector<MusaOptionalLibraryAbi> optional_libraries,
+                   GetAvailableMusaOptionalLibraryAbis());
+  ABSL_ASSIGN_OR_RETURN(
+      MusaRuntimeAbiVersion version,
+      MusaRuntimeAbiVersion::CreateFromApiVersions(
+          runtime_version, driver_version, kernel_driver_version,
+          XLA_MUSA_TOOLKIT_VERSION, std::move(optional_libraries)));
+  return std::make_unique<MusaRuntimeAbiVersion>(std::move(version));
+}
+
+absl::StatusOr<std::unique_ptr<StreamExecutor>>
+MusaPlatform::GetUncachedExecutor(int ordinal) {
+  auto executor = std::make_unique<MusaExecutor>(this, ordinal);
+  ABSL_RETURN_IF_ERROR(executor->Init());
+  return std::move(executor);
+}
+
+}  // namespace stream_executor::musa
+
+namespace stream_executor {
+
+static void InitializeMusaPlatform() {
+  auto status = PlatformManager::PlatformWithName("MUSA");
+  if (!status.ok()) {
+    CHECK_OK(PlatformManager::RegisterPlatform(
+        std::make_unique<musa::MusaPlatform>()));
+  }
+}
+
+}  // namespace stream_executor
+
+STREAM_EXECUTOR_REGISTER_MODULE_INITIALIZER(
+    musa_platform, stream_executor::InitializeMusaPlatform());

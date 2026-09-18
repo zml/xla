@@ -18,9 +18,13 @@ limitations under the License.
 
 #include <cstdint>
 #include <iosfwd>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include "xla/stream_executor/musa_mubin_spec.h"
 #include "xla/tsl/platform/logging.h"
 
 namespace stream_executor {
@@ -88,6 +92,21 @@ class MultiModuleLoaderSpec {
     return cuda_ptx_in_memory_;
   }
 
+  bool has_musa_mubin_in_memory() const {
+    return !std::holds_alternative<std::monostate>(musa_mubin_in_memory_);
+  }
+  bool owns_musa_mubin_in_memory() const {
+    return std::holds_alternative<OwningMusaMubinInMemory>(
+        musa_mubin_in_memory_);
+  }
+  absl::Span<const uint8_t> musa_mubin_in_memory() const {
+    CHECK(has_musa_mubin_in_memory());
+    if (std::holds_alternative<MusaMubinInMemory>(musa_mubin_in_memory_)) {
+      return std::get<MusaMubinInMemory>(musa_mubin_in_memory_).mubin_bytes;
+    }
+    return std::get<OwningMusaMubinInMemory>(musa_mubin_in_memory_).mubin_bytes;
+  }
+
   void AddCudaCubinInMemory(absl::Span<const uint8_t> cubin_bytes) {
     CHECK(!cubin_bytes.empty());
     has_cuda_cubin_in_memory_ = true;
@@ -100,11 +119,23 @@ class MultiModuleLoaderSpec {
     cuda_ptx_in_memory_ = *ptx ? ptx : nullptr;
   }
 
+  void AddMusaMubinInMemory(absl::Span<const uint8_t> mubin_bytes) {
+    CHECK(!mubin_bytes.empty());
+    musa_mubin_in_memory_ = MusaMubinInMemory{mubin_bytes};
+  }
+
+  void AddOwningMusaMubinInMemory(std::vector<uint8_t> mubin_bytes) {
+    CHECK(!mubin_bytes.empty());
+    musa_mubin_in_memory_ = OwningMusaMubinInMemory{std::move(mubin_bytes)};
+  }
+
  private:
   absl::Span<const uint8_t> cuda_cubin_in_memory_;
   bool has_cuda_cubin_in_memory_ = false;
   const char* cuda_ptx_in_memory_;
   bool has_cuda_ptx_in_memory_ = false;
+  std::variant<std::monostate, MusaMubinInMemory, OwningMusaMubinInMemory>
+      musa_mubin_in_memory_;
 };
 
 }  // namespace stream_executor

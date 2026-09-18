@@ -1145,6 +1145,25 @@ xla_test(
     ],
 )
 
+
+xla_cc_test(
+    name = "musa_scatter_test",
+    srcs = ["musa_scatter_test.cc"],
+    tags = ["musa-only"],
+    deps = [
+        "//xla:literal",
+        "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:gpu_plugin",
+        "//xla/stream_executor/musa:all_runtime",
+        "//xla/tests:hlo_pjrt_test_base",
+        "//xla/tests:pjrt_gpu_client_registry",
+        "//xla/tsl/platform:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "collective_ops_e2e_test_base",
     testonly = True,

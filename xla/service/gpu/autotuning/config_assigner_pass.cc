@@ -116,20 +116,23 @@ AutotuneDecision ShouldAssignConfigToCustomCall(
     bool do_not_autotune_cublas, bool do_not_autotune_cudnn,
     const HloInstruction& instruction) {
   auto gpu_config = instruction.backend_config<GpuBackendConfig>();
-  if (IsCublasLtGemm(instruction)) {
+  if (IsCublasLtGemm(instruction) || IsMusaGemm(instruction)) {
+    const bool is_musa = IsMusaGemm(instruction);
+    const absl::string_view library_name = is_musa ? "muBLAS" : "cuBLAS";
     if (do_not_autotune_cublas) {
-      return AutotuneDecision::Forbid("Autotuning cuBLAS is disabled");
+      return AutotuneDecision::Forbid(
+          absl::StrCat("Autotuning ", library_name, " is disabled"));
     }
     if (gpu_config.ok()) {
       // Grouped matmul stores the selected algorithm in the nested
       // grouped_gemm_backend_config, not the top-level gemm_backend_config.
       const GemmBackendConfig& gemm_config =
-          IsCublasLtGroupedMatmul(instruction)
+          !is_musa && IsCublasLtGroupedMatmul(instruction)
               ? gpu_config->grouped_gemm_backend_config().gemm_backend_config()
               : gpu_config->gemm_backend_config();
       if (gemm_config.has_selected_algorithm()) {
-        return AutotuneDecision::Forbid(
-            "cuBLAS GEMM already has a selected algorithm");
+        return AutotuneDecision::Forbid(absl::StrCat(
+            library_name, " GEMM already has a selected algorithm"));
       }
     }
     return AutotuneDecision::Allow();
@@ -358,6 +361,7 @@ Autotuner::Options GetAutotunerOptions(const DebugOptions& debug_options,
 InstructionFilterFn GetShouldAssignConfigToInstructionFn(
     const DebugOptions& debug_options,
     const se::GpuComputeCapability& gpu_version) {
+  const bool is_musa = gpu_version.IsMusa();
   bool do_not_autotune_cublas =
       debug_options.xla_gpu_experimental_disable_binary_libraries() ||
       debug_options.xla_gpu_autotune_level() == 0;
@@ -372,10 +376,15 @@ InstructionFilterFn GetShouldAssignConfigToInstructionFn(
       debug_options.xla_gpu_experimental_enable_fusion_autotuner();
 
   return [do_not_autotune_cublas, do_not_autotune_cudnn,
-          enable_fusion_autotuner](const HloInstruction& instruction) -> bool {
-    AutotuneDecision decision = ShouldAssignConfigToInstruction(
-        do_not_autotune_cublas, do_not_autotune_cudnn, enable_fusion_autotuner,
-        instruction);
+          enable_fusion_autotuner,
+          is_musa](const HloInstruction& instruction) -> bool {
+    AutotuneDecision decision =
+        is_musa && instruction.opcode() == HloOpcode::kFusion
+            ? AutotuneDecision::Forbid(
+                  "MUSA fusion autotuning has no registered fusion backend")
+            : ShouldAssignConfigToInstruction(do_not_autotune_cublas,
+                                        do_not_autotune_cudnn,
+                                        enable_fusion_autotuner, instruction);
     if (!decision) {
       VLOG(3) << "Not assigning configs to " << instruction.name() << ": "
               << decision.Explain();
@@ -403,6 +412,7 @@ ConfigAssignerPass::GetEnabledBackends(
     disabled_autotune_backends.push_back(autotuner::Backend::CUBLASLT);
     disabled_autotune_backends.push_back(autotuner::Backend::CUDNN);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT);
+    disabled_autotune_backends.push_back(autotuner::Backend::MUBLAS);
     disabled_autotune_backends.push_back(autotuner::Backend::MIOPEN);
     disabled_autotune_backends.push_back(autotuner::Backend::HIPBLASLT_FISSION);
   }
@@ -473,7 +483,8 @@ absl::StatusOr<std::unique_ptr<ConfigAssignerPass>> ConfigAssignerPass::Create(
       // BufferComparatorKernel and RedzoneAllocatorKernel are registered for
       // SYCL platform.
       bool is_buffer_check_supported = stream_executor->GetPlatform()->id() !=
-                                       stream_executor::sycl::kSyclPlatformId;
+                                       stream_executor::sycl::kSyclPlatformId &&
+                                       !gpu_version.IsMusa();
       std::unique_ptr<Profiler> profiler = GpuProfiler::Create(
           stream_executor,
           GetProfileOptions(debug_options, is_buffer_check_supported),

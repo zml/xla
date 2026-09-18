@@ -149,6 +149,12 @@ TEST(GpuComputeCapability, ProtoConversion) {
       GpuComputeCapability::FromProto(
           GpuComputeCapability(RocmComputeCapability("gfx908")).ToProto()),
       IsOkAndHolds(GpuComputeCapability(RocmComputeCapability("gfx908"))));
+  MusaComputeCapability musa("mp_21", 2, 1,
+                             /*hardware_warp_size=*/128,
+                             /*logical_subgroup_size=*/32);
+  EXPECT_THAT(
+      GpuComputeCapability::FromProto(GpuComputeCapability(musa).ToProto()),
+      IsOkAndHolds(GpuComputeCapability(musa)));
 }
 
 TEST(ExecutionUnitDescription, ProtoConversion) {
@@ -192,6 +198,20 @@ TEST(DeviceDescription, ProtoConversion) {
       DeviceDescription from_proto,
       DeviceDescription::FromProto(device_description.ToProto()));
   EXPECT_THAT(from_proto, Eq(device_description));
+}
+
+TEST(DeviceDescription, RejectsInconsistentMusaWarpSize) {
+  GpuDeviceInfoProto proto;
+  proto.set_threads_per_warp(32);
+  MusaComputeCapabilityProto* capability =
+      proto.mutable_musa_compute_capability();
+  capability->set_architecture("mp_21");
+  capability->set_major(2);
+  capability->set_minor(1);
+  capability->set_hardware_warp_size(128);
+  capability->set_logical_subgroup_size(32);
+
+  EXPECT_FALSE(DeviceDescription::FromProto(proto).ok());
 }
 
 TEST(DeviceDescription, EqualsToIgnoringVersionNumbers) {

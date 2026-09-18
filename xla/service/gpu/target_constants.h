@@ -69,6 +69,35 @@ inline const char* DataLayout() {
 }
 }  // namespace spir
 
+namespace musa {
+
+inline const char* TargetTriple() {
+  static constexpr char kTargetTriple[] = "mtgpu-mt-musa";
+  return kTargetTriple;
+}
+
+inline const char* TargetCpu(int compute_capability_major,
+                             int compute_capability_minor) {
+  if (compute_capability_major == 2 && compute_capability_minor == 1) {
+    return "mp_21";
+  }
+  if (compute_capability_major == 2 && compute_capability_minor == 2) {
+    return "mp_22";
+  }
+  return "";
+}
+
+inline const char* DataLayout() {
+  // Shared by the qualified MUSA LLVM 14 targets: S80 (mp_21) and S4000
+  // (mp_22). This is a target ABI contract, not a fallback for other devices.
+  static constexpr char kDataLayout[] =
+      "e-p:64:64:64:64-p1:64:64:64:64-p2:64:64:64:64-p3:32:32-"
+      "p4:32:32-p5:64:64-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128";
+  return kDataLayout;
+}
+
+}  // namespace musa
+
 }  // namespace gpu
 }  // namespace xla
 

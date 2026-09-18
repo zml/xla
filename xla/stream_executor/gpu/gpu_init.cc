@@ -47,6 +47,8 @@ Platform* GPUMachineManager() {
 std::string GpuPlatformName() {
 #if TENSORFLOW_USE_ROCM
   return "ROCM";
+#elif TENSORFLOW_USE_MUSA
+  return "MUSA";
 #elif TENSORFLOW_USE_SYCL
   return "SYCL";
 #else

@@ -949,6 +949,10 @@ absl::Status EnsureTritonSupportsComputeCapability(
 
 CodegenDecision IsTritonSupportedInstruction(
     const HloInstruction& instr, const se::GpuComputeCapability& gpu_version) {
+  if (gpu_version.IsMusa()) {
+    return CodegenDecision::Forbid(
+        "Triton code generation is not supported on MUSA.");
+  }
   CodegenDecision decision =
       IsTritonSupportedInstructionImpl(instr, gpu_version);
   VLOG(2) << absl::StrCat("IsTritonSupportedInstruction: ", instr.ToString(),

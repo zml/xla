@@ -14,6 +14,10 @@
 # ==============================================================================
 
 load(
+    "@local_config_musa//musa:build_defs.bzl",
+    "if_musa",
+)
+load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
 )
@@ -627,6 +631,8 @@ cc_library(
     local_defines = (
         if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
             "TENSORFLOW_USE_ROCM=1",
+        ]) + if_musa([
+            "TENSORFLOW_USE_MUSA=1",
         ]) + if_sycl_is_configured(["TENSORFLOW_USE_SYCL=1"])
     ),
     visibility = ["//visibility:public"],
@@ -733,6 +739,8 @@ xla_cc_binary(
         "//xla/stream_executor:cuda_platform",
     ]) + if_rocm_is_configured([
         "//xla/stream_executor:rocm_platform",
+    ]) + if_musa([
+        "//xla/stream_executor:musa_platform",
     ]) + if_sycl_is_configured([
         "//xla/stream_executor:sycl_platform",
     ]),

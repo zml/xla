@@ -71,6 +71,7 @@ cc_library(
         ":semantic_version",
         "//xla:xla_data_proto_cc",
         "//xla/stream_executor/cuda:cuda_compute_capability",
+        "//xla/stream_executor/musa:musa_compute_capability",
         "//xla/stream_executor/rocm:rocm_compute_capability",
         "//xla/stream_executor/sycl:oneapi_compute_capability",
         "//xla/tsl/lib/math:math_util",
@@ -181,12 +182,28 @@ cc_library(
 )
 
 cc_library(
+    name = "musa_mubin_spec",
+    hdrs = ["musa_mubin_spec.h"],
+    deps = ["@com_google_absl//absl/types:span"],
+)
+
+cc_library(
     name = "module_spec",
     hdrs = ["module_spec.h"],
     deps = [
+        ":musa_mubin_spec",
         "//xla/tsl/platform:logging",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "module_spec_test",
+    srcs = ["module_spec_test.cc"],
+    deps = [
+        ":module_spec",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -275,6 +292,7 @@ cc_library(
         ":platform",
         ":stream",
         "//xla/hlo/testlib:test",
+        "//xla/stream_executor/musa:musa_compute_capability",
         "//xla/stream_executor/sycl:oneapi_compute_capability",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
@@ -879,6 +897,7 @@ cc_library(
         ":kernel_args",
         ":kernel_args_packing_spec",
         ":kernel_spec_proto_cc",
+        ":musa_mubin_spec",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/log:check",
@@ -1482,5 +1501,14 @@ alias(
     actual = "//xla/stream_executor/sycl:all_runtime",
     tags = [
         "gpu",
+    ],
+)
+
+alias(
+    name = "musa_platform",
+    actual = "//xla/stream_executor/musa:all_runtime",
+    tags = [
+        "gpu",
+        "musa-only",
     ],
 )

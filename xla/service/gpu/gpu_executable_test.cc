@@ -80,6 +80,7 @@ limitations under the License.
 #include "xla/stream_executor/gpu/tma_metadata.h"
 #include "xla/stream_executor/mock_stream.h"
 #include "xla/stream_executor/mock_stream_executor.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -665,6 +666,39 @@ TEST_F(GpuExecutableTest, ProtoConversion) {
   EXPECT_EQ(reconstructed_executable->cpu_target_machine_options().value(),
             xla::cpu::TargetMachineOptions("test_triple", "test_cpu",
                                            "+test_features"));
+}
+
+TEST_F(GpuExecutableTest,
+       FromProtoRejectsMusaCapabilityMismatchBeforeAbiValidation) {
+  GpuExecutableProto proto = ParseTextProtoOrDie<GpuExecutableProto>(R"pb(
+    binary: "not a valid MUBIN"
+    buffer_assignment {}
+    gpu_compute_capability {
+      musa_compute_capability {
+        architecture: "mp_21"
+        major: 2
+        minor: 1
+        hardware_warp_size: 128
+        logical_subgroup_size: 32
+      }
+    }
+  )pb");
+
+  se::DeviceDescription device_description;
+  device_description.set_gpu_compute_capability(se::GpuComputeCapability{
+      se::MusaComputeCapability("mp_22", 2, 2,
+                                /*hardware_warp_size=*/128,
+                                /*logical_subgroup_size=*/32)});
+
+  // Deliberately omit the executable ABI and use malformed binary bytes. A
+  // target mismatch must be rejected before MUSA executable validation or live
+  // runtime/optional-DSO discovery is attempted.
+  EXPECT_THAT(
+      GpuExecutable::FromProto(proto, device_description, "MUSA",
+                               GetDebugOptionsFromFlags()),
+      absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          testing::HasSubstr("doesn't match target device capability")));
 }
 
 TEST_F(GpuExecutableTest, ProtoConversionWithBackendConfigInterning) {

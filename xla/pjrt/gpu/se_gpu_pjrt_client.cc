@@ -145,7 +145,7 @@ limitations under the License.
 #include "tsl/profiler/lib/traceme.h"
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
 #include "xla/backends/gpu/runtime/thunk_executor.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
@@ -160,7 +160,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address_vmm_allocator.h"
 #include "xla/tsl/framework/scoped_allocation_trace.h"
 #include "xla/xla.pb.h"
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_SYCL
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA || TENSORFLOW_USE_SYCL
 
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
@@ -271,6 +271,9 @@ static std::string GpuPlatformVersionFromDevices(
       const int encoded_version =
           v.major_version() * 1000 + v.minor_version() * 10 + v.patch_version();
       return absl::StrCat("cuda ", encoded_version);
+    }
+    if (cc.IsMusa()) {
+      return absl::StrCat("musa ", v.ToString());
     }
     if (cc.oneapi_compute_capability() != nullptr) {
       // TODO(intel-tf): Oneapi multiple platform version support
@@ -1192,7 +1195,7 @@ StreamExecutorGpuRawClient::GetOrImportFabricHandle(
 void StreamExecutorGpuRawClient::RecordMemoryStats(
     LocalDeviceState* local_device_state) {
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
   int64_t free_memory, total_memory;
   if (local_device_state != nullptr) {
     se::StreamExecutor* executor = local_device_state->executor();
@@ -1943,6 +1946,8 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
     const GpuClientOptions& options) {
 #if TENSORFLOW_USE_ROCM
   auto pjrt_platform_name = xla::RocmName();
+#elif TENSORFLOW_USE_MUSA
+  auto pjrt_platform_name = xla::MusaName();
 #elif TENSORFLOW_USE_SYCL
   auto pjrt_platform_name = xla::OneapiName();
 #else   // TENSORFLOW_USE_ROCM
@@ -1966,6 +1971,12 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
   EnablePeerAccess(xla_client->backend().stream_executors());
 
   GpuAllocatorConfig allocator_config = options.allocator_config;
+#if TENSORFLOW_USE_MUSA
+  if (allocator_config.kind == GpuAllocatorConfig::Kind::kDefault) {
+    allocator_config.kind = GpuAllocatorConfig::Kind::kPlatform;
+    LOG(INFO) << "Using platform allocator by default for MUSA.";
+  }
+#endif
   bool preallocate_device_memory = allocator_config.preallocate;
   auto memory_registration =
       CreateAllocatorMemoryRegistration(&allocator_config);
@@ -2123,6 +2134,8 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetSharedStreamExecutorGpuClient(
   auto gpu_run_options = std::make_unique<gpu::GpuExecutableRunOptions>();
 #if TENSORFLOW_USE_ROCM
   auto platform_name = RocmName();
+#elif TENSORFLOW_USE_MUSA
+  auto platform_name = MusaName();
 #elif TENSORFLOW_USE_SYCL
   auto platform_name = SyclName();
 #else   // TENSORFLOW_USE_ROCM
@@ -2183,6 +2196,8 @@ absl::Status ExchangeEmptyStreamExecutorGpuTopology(
     absl::Duration get_global_topology_timeout) {
 #if TENSORFLOW_USE_ROCM
   auto platform_name = xla::RocmName();
+#elif TENSORFLOW_USE_MUSA
+  auto platform_name = xla::MusaName();
 #elif TENSORFLOW_USE_SYCL
   auto platform_name = xla::SyclName();
 #else   // TENSORFLOW_USE_ROCM
@@ -2198,7 +2213,7 @@ absl::Status ExchangeEmptyStreamExecutorGpuTopology(
 }
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM) || \
-    defined(TENSORFLOW_USE_SYCL)
+    defined(TENSORFLOW_USE_MUSA) || defined(TENSORFLOW_USE_SYCL)
 
 static absl::StatusOr<PjRtStreamExecutorExecutionOutput> RunGpuAsync(
     LocalExecutable& exec, PjRtStreamExecutorRawClient* raw_client,

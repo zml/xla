@@ -84,7 +84,12 @@ bool IsTritonSupportedRaggedDot(
     const se::GpuComputeCapability& gpu_compute_capability,
     const HloInstruction& instr);
 
-constexpr int64_t WarpSize(const se::DeviceDescription& gpu_device_info) {
+inline int64_t WarpSize(const se::DeviceDescription& gpu_device_info) {
+  if (const auto* musa =
+          gpu_device_info.gpu_compute_capability().musa_compute_capability();
+      musa != nullptr && musa->logical_subgroup_size() > 0) {
+    return musa->logical_subgroup_size();
+  }
   return gpu_device_info.threads_per_warp();
 }
 

@@ -156,6 +156,11 @@ StreamExecutorGpuTopologyDescription::CreateDeviceDescription(
           target_config_->gpu_device_info().cuda_compute_capability();
       compute_capability = absl::StrCat(cap.major(), ".", cap.minor());
       gpu_vendor = "NVIDIA Corporation";
+    } else if (target_config_->gpu_device_info().has_musa_compute_capability()) {
+      compute_capability = target_config_->gpu_device_info()
+                               .musa_compute_capability()
+                               .architecture();
+      gpu_vendor = "Moore Threads";
     }
 
     StreamExecutorGpuTopologyDescription::SetupDeviceDescription(
@@ -367,7 +372,7 @@ StreamExecutorGpuTopologyDescription::FromProto(
                        proto.platform_name() == xla::CudaName();
   const bool is_rocm = proto.platform_id() == xla::RocmId() ||
                        proto.platform_name() == xla::RocmName();
-  if (!is_cuda && !is_rocm) {
+  if (!is_cuda && !is_rocm && proto.platform_id() != xla::MusaId()) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The platform is not a GPU platform. platform_id: ",
         proto.platform_id(), ", platform_name: '", proto.platform_name(), "'"));

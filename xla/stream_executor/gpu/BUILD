@@ -16,6 +16,7 @@
 # Description:
 #   GPU-platform specific StreamExecutor support code.
 
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
@@ -60,6 +61,40 @@ package(
 package_group(
     name = "friends",
     packages = stream_executor_gpu_friends(),
+)
+
+cc_library(
+    name = "host_callback_registry",
+    srcs = ["host_callback_registry.cc"],
+    hdrs = ["host_callback_registry.h"],
+    deps = [
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+xla_cc_test(
+    name = "host_callback_registry_test",
+    srcs = ["host_callback_registry_test.cc"],
+    deps = [
+        ":host_callback_registry",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:test_benchmark",
+        "//xla/tsl/platform:test_main",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+    ],
 )
 
 cc_library(
@@ -283,6 +318,9 @@ cc_library(
         "gpu_init.h",
     ],
     copts = tsl_copts(),
+    local_defines = if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]),
     linkstatic = True,
     visibility = internal_visibility([
         "//tensorflow/compiler/tf2xla:__subpackages__",
@@ -298,6 +336,18 @@ cc_library(
         "@tsl//tsl/platform:logging",
     ],
     alwayslink = True,
+)
+
+xla_cc_test(
+    name = "gpu_init_test",
+    srcs = ["gpu_init_test.cc"],
+    local_defines = if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]),
+    deps = [
+        ":gpu_init_impl",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(

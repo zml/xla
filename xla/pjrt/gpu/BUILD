@@ -14,11 +14,12 @@
 # ==============================================================================
 
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load("//xla/pjrt/gpu:package_groups.bzl", "xla_gpu_internal_packages")
-load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm")
+load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm_or_musa")
 load("//xla/tests:build_defs.bzl", "xla_test")
 load("//xla/tsl:tsl.bzl", "if_google", "internal_visibility")
 load("//xla/tsl:tsl.default.bzl", "get_compatible_with_libtpu_portable", "get_compatible_with_portable")
@@ -74,7 +75,9 @@ cc_library(
     name = "se_gpu_pjrt_client_impl",
     srcs = ["se_gpu_pjrt_client.cc"],
     hdrs = ["se_gpu_pjrt_client.h"],
-    defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
+    defines = if_cuda(["GOOGLE_CUDA=1"]) + if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
     ]),
     deps = [
@@ -222,7 +225,7 @@ cc_library(
         "@tsl//tsl/profiler/lib:connected_traceme",
         "@tsl//tsl/profiler/lib:nvtx_utils",
         "@tsl//tsl/profiler/lib:traceme",
-    ] + if_cuda_or_rocm([
+    ] + if_cuda_or_rocm_or_musa([
         # keep sorted
         "//xla/backends/gpu/runtime:thunk_executor",
         "//xla/service/gpu:gpu_compiler",
@@ -820,6 +823,27 @@ cc_library(
     alwayslink = 1,
 )
 
+
+cc_library(
+    name = "se_gpu_pjrt_compiler_musa_registration",
+    srcs = ["se_gpu_pjrt_compiler_musa_registration.cc"],
+    compatible_with = [],
+    tags = [
+        "gpu",
+        "musa-only",
+    ],
+    deps = [
+        ":se_gpu_pjrt_compiler_impl",
+        "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt/se:stream_executor_platform_id_mapping",
+        "//xla/service/gpu:musa_gpu_compiler",  # buildcleaner: keep
+        "//xla/stream_executor/musa:musa_platform_id",
+        "//xla/stream_executor/platform:initialize",
+        "@com_google_absl//absl/log:check",
+    ],
+    alwayslink = 1,
+)
+
 cc_library(
     name = "se_gpu_pjrt_compiler_sycl_registration",
     srcs = ["se_gpu_pjrt_compiler_sycl_registration.cc"],
@@ -873,6 +897,8 @@ cc_library(
         "@riegeli//riegeli/bytes:reader",
     ] + if_rocm([
         ":se_gpu_pjrt_compiler_rocm_registration",
+    ]) + if_musa([
+        ":se_gpu_pjrt_compiler_musa_registration",
     ]) + if_sycl([
         ":se_gpu_pjrt_compiler_sycl_registration",
     ]),
@@ -1025,6 +1051,7 @@ cc_library(
     ],
     alwayslink = True,
 )
+
 
 xla_cc_test(
     name = "se_gpu_topology_description_test",

@@ -43,12 +43,11 @@ bazel_dep(name = "rules_ml_toolchain")
 # To calculate integrity:
 # wget -O temp_module_archive.tar.gz <archive URL>
 # HASH=$(openssl dgst -sha256 -binary temp_module_archive.tar.gz | openssl base64 -A)
-# echo "sha256-${HASH}"
-archive_override(
+# echo "sha256-${HASH}"archive_override(
     module_name = "rules_ml_toolchain",
-    integrity = "sha256-Ztgjtsa06m8J1572/knhgeUwF1nuB9F2psgqAeEifWs=",
-    strip_prefix = "rules_ml_toolchain-e8709f15382e4da1de5ca15672cb4412da3d989d",
-    urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/e8709f15382e4da1de5ca15672cb4412da3d989d.tar.gz"],
+    integrity = "sha256-Z6fReUWEiWhAPxqVhU2BvYqHMZgjrQw7D385yUpeT10=",
+    strip_prefix = "rules_ml_toolchain-d228f60a9bc8823629809c221c1d025001b0cbdf",
+    urls = ["https://github.com/neudinger/rules_ml_toolchain/archive/d228f60a9bc8823629809c221c1d025001b0cbdf.tar.gz"],
 )
 
 # TODO: Upstream the patch?
@@ -88,6 +87,7 @@ single_version_override(
 # Use an unreleased version of googletest
 archive_override(
     module_name = "googletest",
+    integrity = "sha256-8lPKGgcmL4796DKOSyxol55A3fz8AB9w0dX2EsfeKXQ=",
     patch_strip = 1,
     patches = [
         "//third_party/googletest:0001-Add-ASSERT_OK-EXPECT_OK-ASSERT_OK_AND_ASSIGN-macros.patch",
@@ -244,6 +244,9 @@ use_repo(nccl_redist, "cuda_nccl")
 sycl_configure = use_extension("@rules_ml_toolchain//extensions:sycl_configure.bzl", "sycl_configure_ext")
 use_repo(sycl_configure, "level_zero", "local_config_sycl", "oneapi", "zero_loader")
 
+musa_configure = use_extension("@rules_ml_toolchain//extensions:musa_configure.bzl", "musa_configure_ext")
+use_repo(musa_configure, "local_config_musa")
+
 local_sysroot = use_extension("@rules_ml_toolchain//extensions:local_sysroot_configure.bzl", "local_sysroot_ext")
 use_repo(local_sysroot, "local_sysroot_config")
 
@@ -290,6 +293,7 @@ register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_rocm")
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_musa")
 
 register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
 

@@ -72,14 +72,24 @@ def workspace():
 
     # Toolchains for ML projects hermetic builds.
     # Details: https://github.com/google-ml-infra/rules_ml_toolchain
+
+    # tf_http_archive(
+    #     name = "rules_ml_toolchain",
+    #     sha256 = "66d823b6c6b4ea6f09d79ef6fe49e181e5301759ee07d176a6c82a01e1227d6b",
+    #     strip_prefix = "rules_ml_toolchain-e8709f15382e4da1de5ca15672cb4412da3d989d",
+    #     urls = tf_mirror_urls(
+    #         "https://github.com/google-ml-infra/rules_ml_toolchain/archive/e8709f15382e4da1de5ca15672cb4412da3d989d.tar.gz",
+    #     ),
+    # )
+
     tf_http_archive(
         name = "rules_ml_toolchain",
-        sha256 = "66d823b6c6b4ea6f09d79ef6fe49e181e5301759ee07d176a6c82a01e1227d6b",
-        strip_prefix = "rules_ml_toolchain-e8709f15382e4da1de5ca15672cb4412da3d989d",
-        urls = tf_mirror_urls(
-            "https://github.com/google-ml-infra/rules_ml_toolchain/archive/e8709f15382e4da1de5ca15672cb4412da3d989d.tar.gz",
-        ),
+        sha256 = "67a7d17945848968403f1a95854d81bd8a87319823ad0c3b0f7f39c94a5e4f5d",
+        strip_prefix = "rules_ml_toolchain-d228f60a9bc8823629809c221c1d025001b0cbdf",
+        urls = ["https://github.com/neudinger/rules_ml_toolchain/archive/d228f60a9bc8823629809c221c1d025001b0cbdf.tar.gz"],
     )
+
+
 
     # Maven dependencies.
     RULES_JVM_EXTERNAL_TAG = "4.3"

@@ -49,6 +49,7 @@ limitations under the License.
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -383,6 +384,13 @@ static std::unique_ptr<xla::TransferManager> CreateSYCLTransferManager() {
           .getPointerSize(0 /* default address space */));
 }
 
+static std::unique_ptr<xla::TransferManager> CreateMUSATransferManager() {
+  return std::make_unique<xla::gpu::GpuTransferManager>(
+      /*id=*/stream_executor::musa::kMusaPlatformId,
+      /*pointer_size=*/llvm::DataLayout(xla::gpu::musa::DataLayout())
+          .getPointerSize(0 /* default address space */));
+}
+
 static bool InitModule() {
   xla::TransferManager::RegisterTransferManager(
       stream_executor::cuda::kCudaPlatformId, &CreateNVPTXTransferManager);
@@ -390,6 +398,8 @@ static bool InitModule() {
       stream_executor::rocm::kROCmPlatformId, &CreateAMDGPUTransferManager);
   xla::TransferManager::RegisterTransferManager(
       stream_executor::sycl::kSyclPlatformId, &CreateSYCLTransferManager);
+  xla::TransferManager::RegisterTransferManager(
+      stream_executor::musa::kMusaPlatformId, &CreateMUSATransferManager);
   return true;
 }
 

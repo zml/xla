@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/stream_executor/semantic_version.h"
 #include "xla/stream_executor/sycl/oneapi_compute_capability.h"
@@ -105,6 +106,8 @@ class GpuComputeCapability {
   explicit GpuComputeCapability(
       const OneAPIComputeCapability& compute_capability)
       : compute_capability_(compute_capability) {}
+  explicit GpuComputeCapability(const MusaComputeCapability& compute_capability)
+      : compute_capability_(compute_capability) {}
 
   GpuComputeCapability& operator=(
       const CudaComputeCapability& compute_capability) {
@@ -124,6 +127,12 @@ class GpuComputeCapability {
     return *this;
   }
 
+  GpuComputeCapability& operator=(
+      const MusaComputeCapability& compute_capability) {
+    compute_capability_ = compute_capability;
+    return *this;
+  }
+
   bool IsCuda() const {
     return std::holds_alternative<CudaComputeCapability>(compute_capability_);
   }
@@ -134,6 +143,10 @@ class GpuComputeCapability {
 
   bool IsOneAPI() const {
     return std::holds_alternative<OneAPIComputeCapability>(compute_capability_);
+  }
+
+  bool IsMusa() const {
+    return std::holds_alternative<MusaComputeCapability>(compute_capability_);
   }
 
   const CudaComputeCapability* cuda_compute_capability() const {
@@ -148,8 +161,15 @@ class GpuComputeCapability {
     return std::get_if<OneAPIComputeCapability>(&compute_capability_);
   }
 
+  const MusaComputeCapability* musa_compute_capability() const {
+    return std::get_if<MusaComputeCapability>(&compute_capability_);
+  }
+
   std::string ToString() const {
     if (auto ptr = cuda_compute_capability()) {
+      return ptr->ToString();
+    }
+    if (auto ptr = musa_compute_capability()) {
       return ptr->ToString();
     }
     if (auto ptr = oneapi_compute_capability()) {
@@ -175,7 +195,7 @@ class GpuComputeCapability {
 
  private:
   std::variant<CudaComputeCapability, RocmComputeCapability,
-               OneAPIComputeCapability>
+               OneAPIComputeCapability, MusaComputeCapability>
       compute_capability_;
 };
 
@@ -386,6 +406,11 @@ class DeviceDescription {
   // will be 0 which is invalid.
   OneAPIComputeCapability oneapi_compute_capability() const;
 
+  // Returns the MUSA compute capability if we're running on the MUSA platform.
+  // If a MUSA compute capability is not available, the architecture will be
+  // "unknown".
+  MusaComputeCapability musa_compute_capability() const;
+
   const GpuComputeCapability& gpu_compute_capability() const;
 
   // Returns the maximum amount of shared memory present on a single core
@@ -576,6 +601,10 @@ class DeviceDescription {
 
   void set_oneapi_compute_capability(uint32_t ip_version) {
     gpu_compute_capability_ = OneAPIComputeCapability(ip_version);
+  }
+
+  void set_musa_compute_capability(std::string architecture) {
+    gpu_compute_capability_ = MusaComputeCapability(std::move(architecture));
   }
 
   void set_numa_node(int value) { numa_node_ = value; }

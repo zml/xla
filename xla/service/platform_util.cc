@@ -38,6 +38,7 @@ limitations under the License.
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/host/host_platform_id.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
@@ -70,9 +71,12 @@ std::string CanonicalPlatformName(absl::string_view platform_name) {
   // When configured on CUDA, "gpu" and "cuda" mean the same thing.
   // When configured on ROCm, "gpu" and "rocm" mean the same thing.
   // When configured on SYCL, "gpu", "sycl", and "oneapi" mean the same thing.
+  // When configured on MUSA, "gpu" and "musa" mean the same thing.
   if (lowercase_platform_name == "gpu") {
 #if TENSORFLOW_USE_ROCM
     return "rocm";
+#elif TENSORFLOW_USE_MUSA
+    return "musa";
 #elif TENSORFLOW_USE_SYCL
     return "sycl";
 #else
@@ -179,6 +183,7 @@ absl::StatusOr<se::Platform::Id> PlatformUtil::GetPlatformIdFromCanonicalName(
       se::cuda::kCudaPlatformId,
       se::rocm::kROCmPlatformId,
       se::sycl::kSyclPlatformId,
+      se::musa::kMusaPlatformId,
   };
 
   for (se::Platform::Id id : kKnownPlatforms) {

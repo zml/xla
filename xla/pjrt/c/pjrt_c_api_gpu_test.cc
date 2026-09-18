@@ -102,6 +102,10 @@ using ::testing::VariantWith;
 const bool kUnused = (RegisterPjRtCApiTestFactory([]() { return GetPjrtApi(); },
                                                   /*platform_name=*/"rocm"),
                       true);
+#elif defined(TENSORFLOW_USE_MUSA)
+const bool kUnused = (RegisterPjRtCApiTestFactory([]() { return GetPjrtApi(); },
+                                                  /*platform_name=*/"musa"),
+                      true);
 #elif defined(TENSORFLOW_USE_SYCL)
 const bool kUnused = (RegisterPjRtCApiTestFactory([]() { return GetPjrtApi(); },
                                                   /*platform_name=*/"oneapi"),
@@ -699,9 +703,10 @@ TEST(PjrtCApiGpuAllocatorTest, ValidOptionsParsing) {
   std::vector<std::string> allocator_options = {"default", "platform", "bfc",
                                                 "cuda_async"};
   for (const std::string& allocator_option : allocator_options) {
-#if defined(TENSORFLOW_USE_ROCM) || defined(TENSORFLOW_USE_SYCL)
+#if defined(TENSORFLOW_USE_ROCM) || defined(TENSORFLOW_USE_MUSA) || \
+    defined(TENSORFLOW_USE_SYCL)
     if (allocator_option == "cuda_async") {
-      VLOG(1) << "cuda_async allocator not available on ROCm! or SYCL!";
+      VLOG(1) << "cuda_async allocator not available on ROCm, MUSA, or SYCL.";
       continue;
     }
 #endif
@@ -861,6 +866,7 @@ TEST(PjrtCApiPlatformNameTest, AvailablePlatformName) {
   auto api = GetPjrtApi();
   std::string expected_platform_name_for_cuda = "cuda";
   std::string expected_platform_name_for_rocm = "rocm";
+  std::string expected_platform_name_for_musa = "musa";
   std::string expected_platform_name_for_oneapi = "oneapi";
   absl::flat_hash_map<std::string, xla::PjRtValueType> options = {
       {"platform_name", static_cast<std::string>("gpu")},
@@ -895,6 +901,7 @@ TEST(PjrtCApiPlatformNameTest, AvailablePlatformName) {
   EXPECT_THAT(platform_name_args.platform_name,
               testing::AnyOf(expected_platform_name_for_cuda,
                              expected_platform_name_for_rocm,
+                             expected_platform_name_for_musa,
                              expected_platform_name_for_oneapi));
 
   PJRT_Client_Destroy_Args destroy_args;
@@ -1046,6 +1053,8 @@ TEST(PJRTGpuDeviceTopologyTest, CreateGpuTopology) {
                pjrt_topology->topology->platform_name() == xla::CudaName()) ||
               (pjrt_topology->topology->platform_id() == xla::RocmId() &&
                pjrt_topology->topology->platform_name() == xla::RocmName()) ||
+              (pjrt_topology->topology->platform_id() == xla::MusaId() &&
+               pjrt_topology->topology->platform_name() == xla::MusaName()) ||
               (pjrt_topology->topology->platform_id() == xla::OneapiId() &&
                pjrt_topology->topology->platform_name() == xla::OneapiName()));
 
@@ -1118,6 +1127,8 @@ TEST(PJRTGpuDeviceTopologyTest, CreateExplicitGpuTopologyAndTargetConfig) {
                pjrt_topology->topology->platform_name() == xla::CudaName()) ||
               (pjrt_topology->topology->platform_id() == xla::RocmId() &&
                pjrt_topology->topology->platform_name() == xla::RocmName()) ||
+              (pjrt_topology->topology->platform_id() == xla::MusaId() &&
+               pjrt_topology->topology->platform_name() == xla::MusaName()) ||
               (pjrt_topology->topology->platform_id() == xla::OneapiId() &&
                pjrt_topology->topology->platform_name() == xla::OneapiName()));
 

@@ -109,8 +109,14 @@ limitations under the License.
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/event_based_timer.h"
 #include "xla/stream_executor/kernel_stats.h"
+#include "xla/stream_executor/memory_allocation.h"
+#include "xla/stream_executor/memory_reservation.h"
+#include "xla/stream_executor/module_spec.h"
+#include "xla/stream_executor/musa/musa_executable_abi.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_id.h"
+#include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
@@ -546,6 +552,16 @@ absl::Status GpuExecutable::CheckCompatibilityWithServiceExecutableRunOptions(
         << "}, but was {" << cc.ToString() << "}";
   } else if (platform_id == se::sycl::kSyclPlatformId) {
     // TODO: Add check.
+  } else if (platform_id == se::musa::kMusaPlatformId) {
+    auto cc = main_stream->GetMusaComputeCapability();
+    if (auto* executable_cc = gpu_version_.musa_compute_capability();
+        executable_cc != nullptr && executable_cc->architecture() != "unknown" &&
+        cc.architecture() != "unknown") {
+      TF_RET_CHECK(cc == *executable_cc)
+          << "MUSA architecture mismatch; expected {"
+          << executable_cc->ToString() << "}, but was {" << cc.ToString()
+          << "}";
+    }
   } else {
     return Internal("Unknown platform");
   }
@@ -1465,6 +1481,22 @@ absl::StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::FromProto(
         "device capability. (serialized: %s, target: %s)",
         gpu_compute_capability.ToString(),
         device_description.gpu_compute_capability().ToString()));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      params.executable_abi_version,
+      se::ExecutableAbiVersion::FromProto(proto.executable_abi_version()));
+  if (gpu_compute_capability.IsMusa()) {
+    ABSL_RETURN_IF_ERROR(se::musa::ValidateMusaExecutableAbi(
+        params.executable_abi_version, params.binary));
+    // Keep live runtime and optional-library discovery behind the platform
+    // boundary so shared GPU executable code remains vendor-DSO independent.
+    ABSL_ASSIGN_OR_RETURN(se::Platform * platform,
+                     se::PlatformManager::PlatformWithName(platform_name));
+    ABSL_ASSIGN_OR_RETURN(std::unique_ptr<se::RuntimeAbiVersion> runtime_abi,
+                     platform->GetRuntimeAbiVersion());
+    ABSL_RETURN_IF_ERROR(
+        runtime_abi->IsCompatibleWith(params.executable_abi_version));
   }
 
   params.device_description = device_description;

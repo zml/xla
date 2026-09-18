@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/stream_executor/musa/musa_compute_capability.h"
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla.pb.h"
@@ -815,6 +816,41 @@ ENTRY entry {
 // CHECK-DAG: [[COPY_P0:[^ ]+]] = {{.*}}{3,1,2,0} copy([[P0]])
 // CHECK-DAG: [[COPY_P1:[^ ]+]] = {{.*}}{3,1,2,0} copy([[P1]])
 // CHECK:     [[CONV:[^ ]+]] = {{.*}}{3,1,2,0}, {{.*}} custom-call([[COPY_P0]], [[COPY_P1]])
+)"),
+      absl_testing::IsOkAndHolds(true));
+}
+
+TEST_F(LayoutAssignmentTest, MuDNNConvolutionHasContiguousNCHWLayout) {
+  const char* hlo = R"(
+ENTRY entry {
+  p0 = f32[2,64,64,16]{3,2,1,0} parameter(0)
+  p1 = f32[6,16,3,32]{3,2,1,0} parameter(1)
+  ROOT conv = (f32[2,64,64,32]{3,2,1,0}, u8[0]{0}) custom-call(p0, p1),
+    window={size=3x3 pad=1_1x1_1}, dim_labels=b10f_o10i->b10f,
+    custom_call_target="__cudnn$convForward"
+})";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                          ParseAndReturnVerifiedModule(hlo));
+  ComputationLayout computation_layout(
+      hlo_module->entry_computation()->ComputeProgramShape());
+  GpuLayoutAssignment layout_assignment(
+      &computation_layout,
+      se::GpuComputeCapability{se::MusaComputeCapability(
+          "mp_21", 2, 1, /*hardware_warp_size=*/128,
+          /*logical_subgroup_size=*/32)},
+      default_device_description_);
+
+  EXPECT_THAT(layout_assignment.Run(hlo_module.get()),
+              absl_testing::IsOkAndHolds(true));
+
+  EXPECT_THAT(
+      RunFileCheck(hlo_module->ToString(HloPrintOptions::ShortParsable()), R"(
+// CHECK-DAG: [[P0:[^ ]+]] = {{.*}} parameter(0)
+// CHECK-DAG: [[P1:[^ ]+]] = {{.*}} parameter(1)
+// CHECK-DAG: [[COPY_P0:[^ ]+]] = {{.*}}{1,2,3,0} copy([[P0]])
+// CHECK-DAG: [[COPY_P1:[^ ]+]] = {{.*}}{1,2,3,0} copy([[P1]])
+// CHECK:     [[CONV:[^ ]+]] = {{.*}}{1,2,3,0}, {{.*}} custom-call([[COPY_P0]], [[COPY_P1]])
 )"),
       absl_testing::IsOkAndHolds(true));
 }

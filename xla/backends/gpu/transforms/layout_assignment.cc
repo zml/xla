@@ -102,6 +102,17 @@ HeuristicLayoutAssignment(const HloInstruction* instr,
       std::make_tuple(DataLayout::kBatchYXDepth, FilterLayout::kOutputYXInput,
                       DataLayout::kBatchYXDepth);
 
+  // muDNN 2.8.0 requires every convolution tensor to be contiguous. XLA's
+  // shared NHWC convolution ABI uses a physically contiguous OHWI filter,
+  // while muDNN's channel-last filter contract is HWIO. Re-expressing OHWI as
+  // HWIO requires non-contiguous strides and the vendor rejects it. Keep only
+  // MUSA DNN custom calls on the shared NCHW/OIHW/NCHW layout, which is
+  // contiguous for all three tensors. Generic MUSA convolutions retain the
+  // normal GPU heuristic.
+  if (gpu_version.IsMusa() && IsCustomCallToDnnConvolution(*instr)) {
+    return kAllNCHW;
+  }
+
   // Integer convolution must use NHWC or NCHW_VECT_C.
   //
   // TODO(jlebar): Do non-VECT_C int8_t convs still require NHWC with new

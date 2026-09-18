@@ -15,7 +15,10 @@ limitations under the License.
 
 #include "xla/service/gpu/stream_executor_util.h"
 
+#include <array>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -27,6 +30,13 @@ limitations under the License.
 #include "xla/autotuning.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/hlo_module_config.h"
+#include "xla/stream_executor/kernel.h"
+#include "xla/stream_executor/kernel_spec.h"
+#include "xla/stream_executor/mock_platform.h"
+#include "xla/stream_executor/mock_stream_executor.h"
+#include "xla/stream_executor/musa/musa_platform_id.h"
+#include "xla/stream_executor/platform_id.h"
+#include "xla/stream_executor/rocm/rocm_platform_id.h"
 #include "xla/tsl/protobuf/dnn.pb.h"
 #include "xla/tsl/util/proto/proto_utils.h"
 
@@ -35,6 +45,8 @@ namespace {
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::stream_executor::dnn::ConvolutionKind;
+using ::testing::ElementsAre;
+using ::testing::Return;
 
 struct Result {
   int64_t run_time_ns;
@@ -64,6 +76,44 @@ std::vector<AutotuneResult> Results(const std::vector<Result>& stats) {
   std::vector<AutotuneResult> results;
   for (const auto& s : stats) results.push_back(AutotuneResult(s));
   return results;
+}
+
+void ExpectBinaryKernelFormat(stream_executor::PlatformId platform_id,
+                              bool expect_mubin) {
+  stream_executor::MockPlatform platform;
+  stream_executor::MockStreamExecutor executor;
+  static constexpr std::array<uint8_t, 4> kBinary = {0x7f, 'E', 'L', 'F'};
+
+  EXPECT_CALL(platform, id).WillRepeatedly(Return(platform_id));
+  EXPECT_CALL(executor, GetPlatform).WillRepeatedly(Return(&platform));
+  EXPECT_CALL(executor, LoadKernel)
+      .WillOnce(
+          [expect_mubin](const stream_executor::KernelLoaderSpec& spec)
+              -> absl::StatusOr<std::unique_ptr<stream_executor::Kernel>> {
+            EXPECT_EQ(spec.has_musa_mubin_in_memory(), expect_mubin);
+            EXPECT_EQ(spec.has_cuda_cubin_in_memory(), !expect_mubin);
+            EXPECT_EQ(spec.kernel_name(), "test_kernel");
+            EXPECT_EQ(spec.arity(), 3);
+            if (expect_mubin) {
+              std::optional<stream_executor::MusaMubinInMemory> mubin =
+                  spec.musa_mubin_in_memory();
+              if (mubin.has_value()) {
+                EXPECT_THAT(mubin->mubin_bytes,
+                            ElementsAre(0x7f, 'E', 'L', 'F'));
+              }
+            } else {
+              std::optional<stream_executor::CudaCubinInMemory> cubin =
+                  spec.cuda_cubin_in_memory();
+              if (cubin.has_value()) {
+                EXPECT_THAT(cubin->cubin_bytes,
+                            ElementsAre(0x7f, 'E', 'L', 'F'));
+              }
+            }
+            return absl::CancelledError("loader spec inspected");
+          });
+
+  EXPECT_THAT(CreateKernel("test_kernel", /*num_args=*/3, kBinary, &executor),
+              StatusIs(absl::StatusCode::kCancelled, "loader spec inspected"));
 }
 
 TEST(StreamExecutorTest, PickBestResult) {
@@ -109,6 +159,16 @@ TEST(StreamExecutorUtilTest, CudnnConvKindFromProto) {
 
   EXPECT_THAT(CudnnConvKindFromProto(ConvolutionKind::INVALID),
               StatusIs(absl::StatusCode::kInternal));
+}
+
+TEST(StreamExecutorUtilTest, RoutesMusaBinaryToMubinLoaderSpec) {
+  ExpectBinaryKernelFormat(stream_executor::musa::kMusaPlatformId,
+                           /*expect_mubin=*/true);
+}
+
+TEST(StreamExecutorUtilTest, PreservesRocmCubinLoaderSpecCompatibility) {
+  ExpectBinaryKernelFormat(stream_executor::rocm::kROCmPlatformId,
+                           /*expect_mubin=*/false);
 }
 
 }  // namespace

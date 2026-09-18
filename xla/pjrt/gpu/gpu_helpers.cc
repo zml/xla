@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
@@ -128,6 +129,16 @@ absl::StatusOr<std::shared_ptr<tsl::BFCAllocator>> CreateBFCAllocator(
         std::move(unified_memory_allocator),
         stream_executor::MemorySpace::kUnified, device_ordinal,
         sub_allocator_alloc_visitors, sub_allocator_free_visitors);
+  } else if (executor->GetPlatform() != nullptr &&
+             absl::EqualsIgnoreCase(executor->GetPlatform()->Name(), "MUSA")) {
+    // MUSA's owning allocator aligns the arena and retains its original base
+    // pointer. Raw SDK allocations are not consistently 256-byte aligned.
+    ABSL_ASSIGN_OR_RETURN(auto device_memory_allocator,
+                     executor->CreateMemoryAllocator(se::MemorySpace::kDevice));
+    sub_allocator = std::make_unique<se::StreamExecutorAllocator>(
+        std::move(device_memory_allocator), se::MemorySpace::kDevice,
+        device_ordinal, sub_allocator_alloc_visitors,
+        sub_allocator_free_visitors);
   } else {
     sub_allocator = std::make_unique<se::DeviceMemAllocator>(
         executor, tsl::PlatformDeviceId(device_ordinal),

@@ -158,6 +158,11 @@ CommandBufferConfig GetCommandBufferConfig(
     }
   };
 
+  // MUSA executes thunks on ordinary streams.
+  if (device_info.gpu_compute_capability().IsMusa()) {
+    config.enabled_commands.clear();
+  }
+
   // Check if CUDA/ROCM driver supports required features.
   if (device_info.gpu_compute_capability().IsCuda()) {
     if (std::min(device_info.runtime_version(), device_info.driver_version()) <

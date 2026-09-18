@@ -3,6 +3,7 @@
 
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_musa//musa:build_defs.bzl", "if_musa")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm", "if_rocm_is_configured")
 load("@local_config_sycl//sycl:build_defs.bzl", "if_sycl", "if_sycl_is_configured")
 load(
@@ -1242,7 +1243,9 @@ cc_library(
     name = "platform_util",
     srcs = ["platform_util.cc"],
     hdrs = ["platform_util.h"],
-    local_defines = if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_sycl([
+    local_defines = if_rocm(["TENSORFLOW_USE_ROCM=1"]) + if_musa([
+        "TENSORFLOW_USE_MUSA=1",
+    ]) + if_sycl([
         "TENSORFLOW_USE_SYCL=1",
     ]),
     deps = [
@@ -1258,6 +1261,7 @@ cc_library(
         "//xla/stream_executor/cuda:cuda_compute_capability",
         "//xla/stream_executor/cuda:cuda_platform_id",
         "//xla/stream_executor/host:host_platform_id",
+        "//xla/stream_executor/musa:musa_platform_id",
         "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/stream_executor/sycl:sycl_platform_id",
         "//xla/tsl/platform:env",
@@ -1673,6 +1677,9 @@ cc_library(
     ]) + if_rocm_is_configured([
         "//xla/service/gpu:amdgpu_compiler",
         "//xla/stream_executor/rocm:stream_executor_rocm",
+    ]) + if_musa([
+        "//xla/service/gpu:musa_gpu_compiler",
+        "//xla/stream_executor:musa_platform",
     ]) + if_sycl_is_configured([
         "//xla/service/gpu:intel_gpu_compiler",
     ]),
